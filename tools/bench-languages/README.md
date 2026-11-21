@@ -24,7 +24,7 @@ lease for that program's builds/runs, and releases it before the next program.
 Each hold is capped at 600 seconds; a cap failure aborts the result instead of
 publishing incomplete ratios. It uses a fixed CPU (`BENCH_CPU=24`). Queue time is outside the clock. The host
 remains shared: there is no isolated-core, fixed-frequency or cold-page-cache claim.
-Do not wrap an entire long run in a shared-slot lease; each operation releases it.
+Do not wrap an entire long run in a shared-slot lease; each program releases it.
 Run long sessions under a user systemd unit so they survive an agent turn.
 
 ## Workloads
@@ -85,7 +85,8 @@ resolution, not a zero-memory claim; ratios with a zero C denominator are null.
 `results.json` has schemaVersion=1, metadata, samples and
 `programs[task].languages[language]`. Each verified row has wallSeconds, rssBytes,
 compileSeconds `{median,min,max}`, rawBytes, strippedBytes and ratiosToC. Hello adds
-startupSeconds; HTTP adds requestsPerSecond. Raw samples, source/binary hashes,
+startupSeconds; HTTP adds requestsPerSecond, with corresponding ratiosToC fields.
+Raw samples, source/binary hashes,
 compiler version/hash, Nix pin, tool paths, CPU details and pre-acquisition load
 are retained. Min/max ranges and raw data matter more than a single ratio on this
 busy host. `report.md` includes ratios **language/C** (smaller is less time/space),

@@ -18,6 +18,31 @@ jq -e "$check" "$work/results.json" >/dev/null
 # An altered observation MUST break the expected ratio.
 jq '(.samples[]|select(.language=="abla" and .kind=="runtime").wallSeconds)=80' "$work/raw.json" | jq -f "$root/tools/bench-languages/summarize.jq" > "$work/mutated.json"
 if jq -e "$check" "$work/mutated.json" >/dev/null; then echo 'ratio mutation escaped' >&2; exit 1; fi
+# Startup and throughput use their own units and directions. All raw metrics
+# remain in seconds/bytes; only the rendered table rounds values.
+jq '.samples += [
+ {kind:"runtime",program:"hello",language:"c",wallSeconds:1,rssBytes:100},
+ {kind:"runtime",program:"hello",language:"abla",wallSeconds:1,rssBytes:100},
+ {kind:"compile",program:"hello",language:"c",wallSeconds:1},
+ {kind:"compile",program:"hello",language:"abla",wallSeconds:1},
+ {kind:"size",program:"hello",language:"c",rawBytes:10,strippedBytes:10},
+ {kind:"size",program:"hello",language:"abla",rawBytes:10,strippedBytes:10},
+ {kind:"startup",program:"hello",language:"c",wallSeconds:0.002},
+ {kind:"startup",program:"hello",language:"abla",wallSeconds:0.001},
+ {kind:"runtime",program:"http-echo",language:"c",wallSeconds:1,rssBytes:100,requestsPerSecond:100},
+ {kind:"runtime",program:"http-echo",language:"abla",wallSeconds:0.5,rssBytes:100,requestsPerSecond:200},
+ {kind:"compile",program:"http-echo",language:"c",wallSeconds:1},
+ {kind:"compile",program:"http-echo",language:"abla",wallSeconds:1},
+ {kind:"size",program:"http-echo",language:"c",rawBytes:10,strippedBytes:10},
+ {kind:"size",program:"http-echo",language:"abla",rawBytes:10,strippedBytes:10}
+]' "$work/raw.json" | jq -f "$root/tools/bench-languages/summarize.jq" > "$work/extra.json"
+jq -e '.programs.hello.languages.abla.ratiosToC.startupSeconds==0.5 and .programs["http-echo"].languages.abla.ratiosToC.requestsPerSecond==2' "$work/extra.json" > /dev/null
+"$root/tools/bench-languages/report.sh" "$work/extra.json" > "$work/extra.md"
+rg -q '^\| abla \| 1 \| 0.5 \|$' "$work/extra.md"
+rg -q '^\| abla \| 200 \| 2 \|$' "$work/extra.md"
+if jq 'del(.samples[] | select(.kind=="compile"))' "$work/raw.json" | jq -f "$root/tools/bench-languages/summarize.jq" >/dev/null 2>&1; then
+    echo 'missing compile samples escaped' >&2; exit 1
+fi
 # Zero C RSS is unavailable and cannot create infinity or a zero-memory ratio.
 jq '(.samples[]|select(.language=="c" and .kind=="runtime").rssBytes)=0' "$work/raw.json" | jq -f "$root/tools/bench-languages/summarize.jq" | jq -e '.programs.fannkuch.languages.abla.ratiosToC.rssBytes==null' > /dev/null
 "$root/tools/bench-languages/report.sh" "$work/results.json" > "$work/report.md"
