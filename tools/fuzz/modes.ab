@@ -206,12 +206,17 @@ fun fuzzWasmResults(runner: FuzzRunner, job: FuzzJob, directory: string, var res
 /** Writes program.ab and program-ct.ab under `directory` (relative to the root) and runs every mode. */
 fun FuzzRunner.allModes(directory: string, prelude: string, checks: array<FuzzCheck>, includeWasm: bool): array<FuzzResult> {
     Path("${this.root}/$directory").createDirectories()
+    // The libc campaign's programs call C at compile time: the root manifest (the nearest abla.toml) must grant it.
+    if (fuzzSkipInterpreter) Path("${this.root}/$directory/abla.toml").writeText("compileCapabilities = [\"trusted.native\"]\n")
     val plain = "$directory/program.ab"
     val ct = "$directory/program-ct.ab"
     Path("${this.root}/$plain").writeText(fuzzAssemble(prelude, checks, false))
     Path("${this.root}/$ct").writeText(fuzzAssemble(prelude, checks, true))
     this.modesOf(directory, plain, ct, includeWasm)
 }
+
+// The libc campaign (main.ab --libc) calls C functions at compile time, which only the native tier can: no interpreter mode.
+var fuzzSkipInterpreter: bool = false
 
 /** Every mode of an existing program; `ct` is "" when there is no compile-time variant (it runs four ways). */
 fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: string, includeWasm: bool): array<FuzzResult> {
@@ -222,10 +227,9 @@ fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: stri
         fuzzNativeJob(this, plain, "$directory/fast", true, ""),
         fuzzNativeJob(this, plain, "$directory/release", false, "")
     ]
-    if (ct != "") {
-        jobs.append(fuzzNativeJob(this, ct, "$directory/ct", true, "interp"))
-        jobs.append(fuzzNativeJob(this, ct, "$directory/ctjit", true, "jit"))
-    }
+    val interpreter = ct != "" && !fuzzSkipInterpreter
+    if (interpreter) jobs.append(fuzzNativeJob(this, ct, "$directory/ct", true, "interp"))
+    if (ct != "") jobs.append(fuzzNativeJob(this, ct, "$directory/ctjit", true, "jit"))
     if (includeWasm) jobs.append(fuzzWasmJob(this, plain, directory))
     // Extra axes (environment, so every campaign takes them): ABLA_FUZZ_OTHER_COMPILER=<path> builds the program with another compiler too
     // (the static one against the dynamic: its own C library at compile time, its own link), ABLA_FUZZ_PRUNE=1 with the runtime prune on.
@@ -252,10 +256,13 @@ fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: stri
         fuzzNativeResult("release", jobs[1], "$directory/release")
     ]
     var next = 2
+    if (interpreter) {
+        results.append(fuzzNativeResult("ct", jobs[next], "$directory/ct"))
+        next = next + 1
+    }
     if (ct != "") {
-        results.append(fuzzNativeResult("ct", jobs[2], "$directory/ct"))
-        results.append(fuzzNativeResult("ct-jit", jobs[3], "$directory/ctjit"))
-        next = 4
+        results.append(fuzzNativeResult("ct-jit", jobs[next], "$directory/ctjit"))
+        next = next + 1
     }
     var axis = if (includeWasm) next + 1 else next
     for (name in axes) {

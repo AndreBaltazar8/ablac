@@ -1,0 +1,108 @@
+// libc_check (#648, #806): C library functions through `extern:"c"`, called two ways that must agree: at run time in a native build (glibc,
+// the oracle), and at compile time by the native tier (the compiler's own C library when the compiler is the static one: Abla's libc over
+// the JIT symbol table, src/static_libc). The functions are the non-variadic ones a program can declare: strtod, strtof, strtol and the
+// libm functions the static libc provides. A value prints as its bits (nan as "nan"), so a last-bit difference is a disagreement.
+// tools/fuzz/run --libc [--seeds ...] draws only these checks and has no interpreter mode (the interpreter cannot call C).
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+import "./oracle.ab"
+
+val FUZZ_LIBC_UNARY: array<string> = ["sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "exp", "log", "log2", "log10", "log1p",
+    "sqrt", "floor", "ceil", "round", "fabs", "erf"]
+
+/** The program's prelude: the externs, a trusted wrapper for each (a check is untrusted code), and the printing of a value. */
+fun fuzzLibcPrelude(): string {
+    val lines: array<string> = ["import \"abla/io\"", "import \"abla/float\"", "import \"abla/compiler\"",
+        "#compilerGrant(\"trusted.native\")", "import \"abla/unsafe/native\"", "import \"abla/unsafe/memory/raw\"",
+        "trusted noescape extern:\"c\" fun strtod(text: cstring, end: i64*): f64",
+        "trusted noescape extern:\"c\" fun strtof(text: cstring, end: i64*): f32",
+        "trusted noescape extern:\"c\" fun strtol(text: cstring, end: i64*, base: i32): i64",
+        "trusted noescape extern:\"c\" fun pow(x: f64, y: f64): f64",
+        "trusted noescape extern:\"c\" fun atan2(y: f64, x: f64): f64"]
+    for (name in FUZZ_LIBC_UNARY) lines.append("trusted noescape extern:\"c\" fun $name(x: f64): f64")
+    lines.append("fun libcBits(value: f64): string = if (value != value) \"nan\" else \"\${f64ToBits(value)}\"")
+    lines.append("fun libcBitsF(value: f32): string = if (value != value) \"nan\" else \"\${f32ToBits(value)}\"")
+    lines.append("trusted fun libcStrtod(text: string): string = libcBits(strtod(text, nativeNullPointer()))")
+    lines.append("trusted fun libcStrtof(text: string): string = libcBitsF(strtof(text, nativeNullPointer()))")
+    lines.append("trusted fun libcStrtol(text: string, base: i32): string = \"\${strtol(text, nativeNullPointer(), base)}\"")
+    for (name in FUZZ_LIBC_UNARY) lines.append("trusted fun libc_$name(x: f64): string = libcBits($name(x))")
+    for (name in ["pow", "atan2"]) lines.append("trusted fun libc_$name(x: f64, y: f64): string = libcBits($name(x, y))")
+    textJoin(lines, "\n") + "\n"
+}
+
+val FUZZ_LIBC_SPECIAL: array<string> = ["inf", "-inf", "INFINITY", "nan", "NaN", "-0", "+0.0", "0e999999", "1e-400", "1e400", "-1e400",
+    ".5", "5.", "-.5e2", "1e", "1e+", "e5", ".", "-", "+", "  12.5abc", "\t-7e2", "0x", "00012", "1_000", "4.9e-324", "2.2250738585072014e-308",
+    "2.2250738585072011e-308", "1.7976931348623157e308", "1.7976931348623159e308", "9007199254740993", "9007199254740992.5",
+    "0.1", "0.2", "0.3", "1e22", "1e23", "123456789012345678901234567890", "0.000000000000000000000000000001"]
+
+/** A random decimal text for strtod/strtof: plain, long, exponent forms, then sometimes a special string or a damaged one. */
+fun FuzzGen.libcDecimal(): string {
+    if (this.r.chance(0.12)) return this.r.pick(FUZZ_LIBC_SPECIAL)
+    var text = ""
+    if (this.r.chance(0.3)) text = if (this.r.chance(0.5)) "-" else "+"
+    val integerDigits = this.r.range(0, 12)
+    val fractionDigits = this.r.range(0, 24)
+    for (i in 0 until integerDigits) text = text + "${this.r.below(10)}"
+    if (integerDigits == 0 && fractionDigits == 0) text = text + "7"
+    if (fractionDigits > 0 || this.r.chance(0.1)) text = text + "."
+    for (i in 0 until fractionDigits) text = text + "${this.r.below(10)}"
+    if (this.r.chance(0.5)) {
+        val exponent = if (this.r.chance(0.7)) this.r.range(-330, 330) else this.r.range(-40, 40)
+        text = text + (if (this.r.chance(0.5)) "e" else "E") + (if (exponent >= 0 && this.r.chance(0.4)) "+" else "") + "$exponent"
+    }
+    if (this.r.chance(0.08)) text = text + this.r.pick(["x", " ", "f", "e", ".", "0x1"])
+    text
+}
+
+/** A double's bits from a biased exponent in [low, high] (1 to 2046 are the normal ones, 0 subnormal) and a random mantissa. */
+fun FuzzGen.libcBitsIn(low: int, high: int): int {
+    val sign = this.r.below(2)
+    val exponent = this.r.range(low, high)
+    val mantissa = this.r.range(0, 4503599627370495)
+    (sign << 63) | (exponent << 52) | mantissa
+}
+
+/** An argument for a math function: ordinary, tiny, huge, an integer or near one, a unit-range value or a special. */
+fun FuzzGen.libcArgument(): string {
+    val kind = this.r.below(9)
+    var bits = 0
+    if (kind == 0) bits = this.libcBitsIn(1015, 1030)
+    else if (kind == 1) bits = this.libcBitsIn(900, 1060)
+    else if (kind == 2) bits = this.libcBitsIn(1, 2046)
+    else if (kind == 3) bits = this.libcBitsIn(0, 5)
+    else if (kind == 4) bits = this.libcBitsIn(1018, 1023)
+    else if (kind == 5) bits = (this.r.below(2) << 63) | (this.r.range(1023, 1033) << 52) | (this.r.range(0, 7) << 49)
+    else if (kind == 6) bits = this.r.pickInt([0, -9223372036854775808, 4607182418800017408, -4616189618054758400, 9218868437227405312,
+        -4503599627370496, 4611686018427387904, 4602678819172646912, 4614256656552045848])
+    else bits = this.libcBitsIn(1000, 1040)
+    "f64FromBits($bits)"
+}
+
+fun FuzzGen.libcCheck(index: int): FuzzCheck {
+    val kind = this.r.below(10)
+    val lines: array<string> = ["fun c$index(): string {"]
+    if (kind <= 2) {
+        lines.append("    libcStrtod(${fuzzLiteral(this.libcDecimal())})")
+    } else if (kind == 3) {
+        lines.append("    libcStrtof(${fuzzLiteral(this.libcDecimal())})")
+    } else if (kind == 4) {
+        val bases = [0, 2, 8, 10, 16, 36, 7]
+        val base = bases[this.r.below(bases.size)]
+        var text = ""
+        if (this.r.chance(0.4)) text = this.r.pick(["-", "+", " ", "\t"])
+        if (this.r.chance(0.3) && (base == 0 || base == 16)) text = text + "0x"
+        else if (this.r.chance(0.15) && (base == 0 || base == 2)) text = text + "0b"
+        val count = this.r.range(1, 22)
+        for (i in 0 until count) text = text + this.r.pick(["0", "1", "7", "9", "a", "F", "z", "Z", "5"])
+        lines.append("    libcStrtol(${fuzzLiteral(text)}, $base)")
+    } else if (kind <= 8) {
+        val name = this.r.pick(FUZZ_LIBC_UNARY)
+        lines.append("    libc_$name(${this.libcArgument()})")
+    } else {
+        val name = this.r.pick(["pow", "atan2"])
+        lines.append("    libc_$name(${this.libcArgument()}, ${this.libcArgument()})")
+    }
+    lines.append("}")
+    FuzzCheck(lines, "c$index()", "str", index)
+}

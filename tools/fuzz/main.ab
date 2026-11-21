@@ -7,6 +7,7 @@
 //   tools/fuzz/run --seeds 100000-100039 [--checks 24] [--compiler build/ablac] [--focus json_check] [--keep]
 //   tools/fuzz/run --seeds ... --panics             also one panicking program per seed (native and Wasm)
 //   tools/fuzz/run --seeds ... --hosted-tasks       task_check only, the four hosted modes (Wasm has no tasks)
+//   tools/fuzz/run --seeds ... --libc               libc_check only (strtod, strtof, strtol, libm): native run vs compile-time jit, no interpreter, no Wasm
 //   tools/fuzz/run --seeds ... --shared-globals     compile-time code sharing ordinary globals, interp/jit/auto
 //   tools/fuzz/run --seeds ... --module-graphs      provider graphs: no cache, then cached phases and provider edits
 //   tools/fuzz/run --seeds ... --subparser-graphs   subparser-built calls: no cache, cached phases, a provider edit
@@ -42,6 +43,7 @@ import "./gen_regex.ab"
 import "./stores.ab"
 import "./strictflat.ab"
 import "./campaigns.ab"
+import "./gen_libc.ab"
 import "./prng.ab"
 
 class FuzzOptions(
@@ -72,7 +74,8 @@ class FuzzOptions(
     var regexCorpus: string,
     var integerStores: bool,
     var compileTimeTiers: bool,
-    var strictFlat: bool
+    var strictFlat: bool,
+    var libc: bool
 )
 
 val FUZZ_WORK = "build/fuzz-abla"
@@ -105,7 +108,7 @@ fun fuzzSeedRange(text: string, var into: array<int>): void {
 }
 
 fun fuzzOptions(root: string): FuzzOptions {
-    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false, "", false, false, false, false, false, false, false, false, false, false, 2000, "", false, false, false)
+    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false, "", false, false, false, false, false, false, false, false, false, false, 2000, "", false, false, false, false)
     var seedText = "1"
     var index = 0
     val count = processArgumentCount()
@@ -163,6 +166,8 @@ fun fuzzOptions(root: string): FuzzOptions {
                 options.integerStores = true
             } else if (argument == "--compile-time-tiers") {
                 options.compileTimeTiers = true
+            } else if (argument == "--libc") {
+                options.libc = true
             } else if (argument == "--strict-flat") {
                 options.strictFlat = true
             } else if (argument == "--regex") {
@@ -186,10 +191,18 @@ fun fuzzOptions(root: string): FuzzOptions {
     } else if (options.focus == "task_check") {
         fuzzUsageError = "task_check requires --hosted-tasks; it is not a hostless Wasm check"
     }
+    if (options.libc) {
+        if (options.focus != "" && options.focus != "libc_check") fuzzUsageError = "--libc draws libc_check only"
+        if (options.panics || options.program != "") fuzzUsageError = "--libc cannot be combined with --panics or --program"
+        options.focus = "libc_check"
+        fuzzSkipInterpreter = true
+    } else if (options.focus == "libc_check") {
+        fuzzUsageError = "libc_check requires --libc (no interpreter, no Wasm mode)"
+    }
     var campaigns = 0
     for (on in [options.sharedGlobals, options.moduleGraphs, options.subparserGraphs, options.crossTargetTiers,
         options.hostedTasks, options.checkRefusals, options.checkHostless, options.integerStores, options.compileTimeTiers,
-        options.strictFlat]) {
+        options.strictFlat, options.libc]) {
         if (on) campaigns = campaigns + 1
     }
     if (campaigns > 1) fuzzUsageError = "choose one campaign at a time"
@@ -200,7 +213,7 @@ fun fuzzOptions(root: string): FuzzOptions {
     if (options.sharedGlobals && (options.hostedTasks || options.focus != "" || options.panics || options.program != "")) {
         fuzzUsageError = "--shared-globals cannot be combined with other campaigns"
     }
-    if (options.focus != "" && options.focus != "task_check" && !fuzzHasFamily(options.focus)) {
+    if (options.focus != "" && options.focus != "task_check" && options.focus != "libc_check" && !fuzzHasFamily(options.focus)) {
         fuzzUsageError = "--focus ${options.focus}: no such generator (have: ${textJoin(FUZZ_FAMILIES, ", ")})"
     }
     options
@@ -279,7 +292,7 @@ fun fuzzMinimise(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed
 fun fuzzStill(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed: int, key: string, check: FuzzCheck,
     lines: array<string>, tag: string): string {
     val directory = "$FUZZ_WORK/min$seed-$key-$tag"
-    val got = runner.allModes(directory, prelude, [FuzzCheck(lines, check.call, check.ty, check.index)], !options.hostedTasks)
+    val got = runner.allModes(directory, prelude, [FuzzCheck(lines, check.call, check.ty, check.index)], !(options.hostedTasks || options.libc))
     var ok = fuzzVerdict(got) != ""
     for (result in got) {
         if (!result.built) ok = false
@@ -306,7 +319,7 @@ fun fuzzRunSeed(runner: FuzzRunner, options: FuzzOptions, prelude: string, seed:
     val checks: array<FuzzCheck> = []
     for (index in 0 until options.checks) checks.append(gen.check(index))
     val directory = "$FUZZ_WORK/seed$seed"
-    val results = runner.allModes(directory, prelude, checks, !options.hostedTasks)
+    val results = runner.allModes(directory, prelude, checks, !(options.hostedTasks || options.libc))
     val bad = fuzzVerdict(results)
     if (bad == "") {
         if (!options.keep) fuzzRemove("${runner.root}/$directory")
@@ -575,7 +588,7 @@ fun main: int {
         }
         return if (failed == 0) 0 else 1
     }
-    val prelude = if (options.hostedTasks) FUZZ_PRELUDE_TASK else fuzzPrelude(root)
+    val prelude = if (options.libc) fuzzLibcPrelude() else if (options.hostedTasks) FUZZ_PRELUDE_TASK else fuzzPrelude(root)
     if (options.controlMinimise) return fuzzControlMinimise(runner, options, prelude)
     if (options.controlOracle != "") {
         for (family in options.controlOracle.split(",")) {
@@ -593,7 +606,7 @@ fun main: int {
             failures = failures + 1
             println(found)
         } else {
-            val modes = if (options.hostedTasks) "four hosted modes (Wasm unsupported)" else "all six modes"
+            val modes = if (options.libc) "fast, release and compile-time jit (and the extra axes)" else if (options.hostedTasks) "four hosted modes (Wasm unsupported)" else "all six modes"
             println("seed $seed: ${options.checks} checks agree in $modes")
         }
     }
