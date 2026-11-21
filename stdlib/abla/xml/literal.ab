@@ -1,0 +1,318 @@
+import "abla/compiler/parser"
+import "abla/bytes"
+import "abla/text"
+import "abla/xml/chars"
+import "tree.ab"
+
+compile class XmlLiteralAttribute(
+    val name: string, val prefix: string, val local: string, val uri: string,
+    val value: SyntaxExpression, val declaration: bool, val declaredPrefix: string
+)
+
+compile class XmlLiteralNode(
+    val kind: string, val name: string, val prefix: string, val uri: string,
+    val attributes: array<XmlLiteralAttribute>, val children: array<XmlLiteralNode>,
+    val value: SyntaxExpression
+)
+
+compile class XmlLiteralBinding(val prefix: string, val uri: string)
+
+compile class XmlLiteralParser(val cursor: ParserCursor, val begin: int, var failed: bool,
+    val bindings: array<XmlLiteralBinding>, var count: int)
+
+compile fun ablaXmlLiteral_fail(var parser: XmlLiteralParser, message: string): void {
+    if (!parser.failed) parserFail(parser.cursor, message)
+    parser.failed = true
+    return
+}
+
+compile fun ablaXmlLiteral_expect(var parser: XmlLiteralParser, text: string): void {
+    if (!parserRawConsume(parser.cursor, text)) ablaXmlLiteral_fail(parser, "expected '$text' in XML literal")
+    return
+}
+
+compile fun ablaXmlLiteral_space(var parser: XmlLiteralParser): bool {
+    val start = parserRawPosition(parser.cursor)
+    parserRawSkipWhitespace(parser.cursor)
+    parserRawPosition(parser.cursor) > start
+}
+
+compile fun ablaXmlLiteral_lookup(var parser: XmlLiteralParser, prefix: string): string {
+    if (prefix == "xml") return xmlNamespaceXml
+    var i = parser.bindings.size
+    while (i > 0) {
+        i -= 1
+        if (parser.bindings[i].prefix == prefix) return parser.bindings[i].uri
+    }
+    ""
+}
+
+compile fun ablaXmlLiteral_checkBudget(var parser: XmlLiteralParser): void {
+    parser.count += 1
+    if (parser.count > 16384 || parserRawPosition(parser.cursor) - parser.begin > 262144) {
+        ablaXmlLiteral_fail(parser, "XML literal exceeds its size limit")
+    }
+    return
+}
+
+compile fun ablaXmlLiteral_hole(var parser: XmlLiteralParser): SyntaxExpression {
+    ablaXmlLiteral_expect(parser, "{")
+    val value = parserParseAblaExpression(parser.cursor)
+    ablaXmlLiteral_expect(parser, "}")
+    value
+}
+
+compile fun ablaXmlLiteral_decode(var parser: XmlLiteralParser, source: string, attribute: bool, references: bool): string {
+    if (xmlFirstInvalidChar(source) >= 0) {
+        ablaXmlLiteral_fail(parser, "invalid XML character in literal")
+        return ""
+    }
+    val normalized = source.replace("\r\n", "\n").replace("\r", "\n")
+    if (!references) return normalized
+    if (attribute && normalized.contains("<")) ablaXmlLiteral_fail(parser, "unexpected '<' in XML attribute")
+    if (!attribute && normalized.contains("]]>")) ablaXmlLiteral_fail(parser, "unexpected ']]>' in XML text")
+    val text = if (attribute) normalized.replace("\n", " ").replace("\t", " ") else normalized
+    if (!text.contains("&")) return text
+    val out = byteBuffer()
+    var position = 0
+    while (position < text.size && !parser.failed) {
+        val amp = text.indexOf("&", position)
+        if (amp < 0) {
+            out.appendText(text.slice(position, text.size))
+            return out.toText()
+        }
+        out.appendText(text.slice(position, amp))
+        val end = text.indexOf(";", amp + 1)
+        if (end < 0) {
+            ablaXmlLiteral_fail(parser, "unterminated XML character reference")
+            return ""
+        }
+        out.appendText(ablaXmlLiteral_reference(parser, text.slice(amp + 1, end)))
+        position = end + 1
+    }
+    out.toText()
+}
+
+compile fun ablaXmlLiteral_reference(var parser: XmlLiteralParser, name: string): string {
+    if (name == "amp") return "&"
+    if (name == "lt") return "<"
+    if (name == "gt") return ">"
+    if (name == "apos") return "'"
+    if (name == "quot") return "\""
+    if (!name.startsWith("#")) {
+        ablaXmlLiteral_fail(parser, "unknown XML entity '&$name;'")
+        return ""
+    }
+    val hex = name.startsWith("#x")
+    val start = if (hex) 2 else 1
+    val radix = if (hex) 16 else 10
+    var point = 0
+    for (i in start until name.size) {
+        val byte = name[i]
+        val digit = if (byte >= 48 && byte <= 57) byte - 48
+            else if (hex && byte >= 65 && byte <= 70) byte - 55
+            else if (hex && byte >= 97 && byte <= 102) byte - 87 else -1
+        if (digit < 0 || point > 1114111) {
+            ablaXmlLiteral_fail(parser, "invalid XML numeric character reference")
+            return ""
+        }
+        point = point * radix + digit
+    }
+    if (start == name.size || !xmlIsChar(point)) {
+        ablaXmlLiteral_fail(parser, "invalid XML numeric character reference")
+        return ""
+    }
+    utf8Encode(point)
+}
+
+compile fun ablaXmlLiteral_attribute(var parser: XmlLiteralParser): XmlLiteralAttribute {
+    ablaXmlLiteral_checkBudget(parser)
+    val name = parserRawTakeUntil(parser.cursor, " \t\r\n=/>")
+    if (!xmlIsQName(name)) ablaXmlLiteral_fail(parser, "invalid XML attribute name")
+    ablaXmlLiteral_space(parser)
+    ablaXmlLiteral_expect(parser, "=")
+    ablaXmlLiteral_space(parser)
+    val prefix = xmlPrefixOf(name)
+    val local = xmlLocalOf(name)
+    val declaration = name == "xmlns" || prefix == "xmlns"
+    val declaredPrefix = if (prefix == "xmlns") local else ""
+    if (!declaration && parserRawAt(parser.cursor, "{")) {
+        return XmlLiteralAttribute(name, prefix, local, "", syntaxCall("ablaXmlLiteralScalar",
+            [ablaXmlLiteral_hole(parser)]), false, "")
+    }
+    val quote = if (parserRawConsume(parser.cursor, "\"")) "\""
+        else if (parserRawConsume(parser.cursor, "'")) "'" else ""
+    var value = ""
+    if (quote == "") {
+        ablaXmlLiteral_fail(parser, "expected a quoted XML attribute value")
+    } else {
+        value = ablaXmlLiteral_decode(parser, parserRawTakeUntil(parser.cursor, quote), true, true)
+        ablaXmlLiteral_expect(parser, quote)
+    }
+    if (declaration && !parser.failed) {
+        val problem = xmlNamespaceDeclarationError(declaredPrefix, value)
+        if (problem != "") ablaXmlLiteral_fail(parser, "invalid XML namespace declaration: $problem")
+        parser.bindings.append(XmlLiteralBinding(declaredPrefix, value))
+    }
+    XmlLiteralAttribute(name, prefix, local, if (declaration) xmlNamespaceXmlns else "",
+        syntaxString(value), declaration, declaredPrefix)
+}
+
+compile fun ablaXmlLiteral_content(var parser: XmlLiteralParser, depth: int): XmlLiteralNode {
+    ablaXmlLiteral_checkBudget(parser)
+    if (parserRawConsume(parser.cursor, "<!--")) {
+        val text = ablaXmlLiteral_decode(parser, parserRawTakeUntilText(parser.cursor, "-->"), false, false)
+        if (text.contains("--") || text.endsWith("-")) ablaXmlLiteral_fail(parser, "invalid XML comment")
+        ablaXmlLiteral_expect(parser, "-->")
+        return ablaXmlLiteralLeaf("comment", "", syntaxString(text))
+    }
+    if (parserRawConsume(parser.cursor, "<![CDATA[")) {
+        val text = ablaXmlLiteral_decode(parser, parserRawTakeUntilText(parser.cursor, "]]>"), false, false)
+        ablaXmlLiteral_expect(parser, "]]>")
+        return ablaXmlLiteralLeaf("cdata", "", syntaxString(text))
+    }
+    if (parserRawConsume(parser.cursor, "<?")) {
+        val name = parserRawTakeUntil(parser.cursor, " \t\r\n?")
+        if (!xmlIsName(name) || name.lowercase() == "xml") {
+            ablaXmlLiteral_fail(parser, "invalid XML processing instruction target")
+        }
+        val spaced = ablaXmlLiteral_space(parser)
+        val data = ablaXmlLiteral_decode(parser, parserRawTakeUntilText(parser.cursor, "?>"), false, false)
+        if (!spaced && data != "") ablaXmlLiteral_fail(parser, "expected space after XML instruction target")
+        ablaXmlLiteral_expect(parser, "?>")
+        return ablaXmlLiteralLeaf("instruction", name, syntaxString(data))
+    }
+    if (parserRawAt(parser.cursor, "<!")) {
+        ablaXmlLiteral_fail(parser, "XML literals do not allow document type declarations")
+        return ablaXmlLiteralLeaf("text", "", syntaxString(""))
+    }
+    if (parserRawAt(parser.cursor, "<")) return ablaXmlLiteral_element(parser, depth)
+    if (parserRawAt(parser.cursor, "{")) {
+        if (parserRawConsume(parser.cursor, "{node ")) {
+            val value = parserParseAblaExpression(parser.cursor)
+            ablaXmlLiteral_expect(parser, "}")
+            return ablaXmlLiteralLeaf("node", "", value)
+        }
+        if (parserRawConsume(parser.cursor, "{nodes ")) {
+            val value = parserParseAblaExpression(parser.cursor)
+            ablaXmlLiteral_expect(parser, "}")
+            return ablaXmlLiteralLeaf("nodes", "", value)
+        }
+        return ablaXmlLiteralLeaf("text", "", syntaxCall("ablaXmlLiteralScalar", [ablaXmlLiteral_hole(parser)]))
+    }
+    val text = ablaXmlLiteral_decode(parser, parserRawTakeUntil(parser.cursor, "<{"), false, true)
+    ablaXmlLiteralLeaf("text", "", syntaxString(text))
+}
+
+compile fun ablaXmlLiteral_element(var parser: XmlLiteralParser, depth: int): XmlLiteralNode {
+    if (depth > 96) ablaXmlLiteral_fail(parser, "XML literal exceeds its nesting limit")
+    ablaXmlLiteral_expect(parser, "<")
+    val name = parserRawTakeUntil(parser.cursor, " \t\r\n/>")
+    if (!xmlIsQName(name)) ablaXmlLiteral_fail(parser, "invalid XML element name")
+    val prefix = xmlPrefixOf(name)
+    val mark = parser.bindings.size
+    val attributes: array<XmlLiteralAttribute> = []
+    var spaced = ablaXmlLiteral_space(parser)
+    while (!parser.failed && !parserRawAt(parser.cursor, ">") && !parserRawAt(parser.cursor, "/>")) {
+        if (!spaced) {
+            ablaXmlLiteral_fail(parser, "expected space before XML attribute")
+            break
+        }
+        attributes.append(ablaXmlLiteral_attribute(parser))
+        spaced = ablaXmlLiteral_space(parser)
+    }
+    val uri = ablaXmlLiteral_lookup(parser, prefix)
+    if (prefix == "xmlns" || (prefix != "" && uri == "")) {
+        ablaXmlLiteral_fail(parser, "undeclared or reserved XML element prefix '$prefix'")
+    }
+    val names: Map<string, bool> = Map()
+    val resolved: array<XmlLiteralAttribute> = []
+    for (attribute in attributes) {
+        var namespace = attribute.uri
+        if (!attribute.declaration && attribute.prefix != "") {
+            namespace = ablaXmlLiteral_lookup(parser, attribute.prefix)
+            if (namespace == "") ablaXmlLiteral_fail(parser, "undeclared XML attribute prefix '${attribute.prefix}'")
+        }
+        val key = "${namespace.size}:$namespace${attribute.local}"
+        if (names.has(key)) ablaXmlLiteral_fail(parser, "duplicate XML attribute '${attribute.name}'")
+        names.set(key, true)
+        resolved.append(XmlLiteralAttribute(attribute.name, attribute.prefix, attribute.local,
+            namespace, attribute.value, attribute.declaration, attribute.declaredPrefix))
+    }
+    val children: array<XmlLiteralNode> = []
+    if (!parserRawConsume(parser.cursor, "/>")) {
+        ablaXmlLiteral_expect(parser, ">")
+        while (!parser.failed && !parserRawAt(parser.cursor, "</")) {
+            if (parserRawEnd(parser.cursor)) ablaXmlLiteral_fail(parser, "unterminated XML element '$name'")
+            else children.append(ablaXmlLiteral_content(parser, depth + 1))
+        }
+        if (!parser.failed) {
+            ablaXmlLiteral_expect(parser, "</")
+            val close = parserRawTakeUntil(parser.cursor, " \t\r\n>")
+            if (close != name) ablaXmlLiteral_fail(parser, "XML closing tag '$close' does not match '$name'")
+            ablaXmlLiteral_space(parser)
+            ablaXmlLiteral_expect(parser, ">")
+        }
+    }
+    parser.bindings.truncate(mark)
+    ablaXmlLiteral_checkBudget(parser)
+    XmlLiteralNode("element", name, prefix, uri, resolved, children, syntaxNull())
+}
+
+compile fun ablaXmlLiteralLeaf(kind: string, name: string, value: SyntaxExpression): XmlLiteralNode =
+    XmlLiteralNode(kind, name, "", "", [], [], value)
+
+compile fun ablaXmlLiteralRead(cursor: ParserCursor): XmlLiteralParser =
+    XmlLiteralParser(cursor, parserRawPosition(cursor), false, [], 0)
+
+compile fun ablaXmlLiteralTree(node: XmlLiteralNode): SyntaxExpression {
+    if (node.kind == "node") return syntaxCall("ablaXmlLiteralAsNode", [node.value])
+    if (node.kind == "comment") return syntaxCall("XmlComment", [node.value])
+    if (node.kind == "instruction") {
+        return syntaxCall("XmlProcessingInstruction", [syntaxString(node.name), node.value])
+    }
+    if (node.kind != "element") {
+        return syntaxCall("XmlText", [node.value, syntaxBoolean(node.kind == "cdata")])
+    }
+    val attributes: array<SyntaxExpression> = []
+    for (attr in node.attributes) attributes.append(syntaxCall("XmlAttribute", [
+        syntaxString(attr.name), syntaxString(attr.prefix), syntaxString(attr.local),
+        syntaxString(attr.uri), attr.value, syntaxBoolean(true)
+    ]))
+    val parts: array<SyntaxExpression> = []
+    for (child in node.children) {
+        if (child.kind == "nodes") parts.append(syntaxCall("ablaXmlLiteralNodes", [child.value]))
+        else parts.append(syntaxCall("ablaXmlLiteralNode", [ablaXmlLiteralTree(child)]))
+    }
+    syntaxCall("ablaXmlLiteralElement", [
+        syntaxString(node.name), syntaxString(node.prefix), syntaxString(xmlLocalOf(node.name)),
+        syntaxString(node.uri), syntaxArray(attributes), syntaxArray(parts)
+    ])
+}
+
+compile fun ablaXmlParseLiteral(cursor: ParserCursor): SyntaxExpression {
+    parserRawSkipWhitespace(cursor)
+    var parser = ablaXmlLiteralRead(cursor)
+    val node = ablaXmlLiteral_element(parser, 1)
+    if (parser.failed) syntaxNull() else ablaXmlLiteralTree(node)
+}
+
+fun ablaXmlLiteralScalar(value: string): string = value
+fun ablaXmlLiteralScalar(value: int): string = "$value"
+fun ablaXmlLiteralScalar(value: bool): string = "$value"
+fun ablaXmlLiteralAsNode(value: XmlNode): XmlNode = value
+fun ablaXmlLiteralNode(value: XmlNode): array<XmlNode> = [value]
+fun ablaXmlLiteralNodes(value: array<XmlNode>): array<XmlNode> {
+    val copy: array<XmlNode> = []
+    for (node in value) copy.append(node)
+    copy
+}
+
+fun ablaXmlLiteralElement(name: string, prefix: string, local: string, uri: string,
+    attributes: array<XmlAttribute>, parts: array<array<XmlNode>>): XmlElement {
+    val children: array<XmlNode> = []
+    for (part in parts) for (node in part) children.append(node)
+    XmlElement(name, prefix, local, uri, attributes, children, -1, 0, 0, true)
+}
+
+#compilerRegisterSubparser("xml", ablaXmlParseLiteral)

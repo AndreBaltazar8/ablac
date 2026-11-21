@@ -245,6 +245,7 @@ test-serial: ablac
 	tools/test-json-expressions.sh $(COMPILER)
 	tools/test-json-stream.sh $(COMPILER)
 	tools/test-json-literal-diagnostics.sh $(COMPILER)
+	tools/test-xml-literals.sh $(COMPILER)
 	tools/test-generators-tasks.sh $(COMPILER)
 	tools/test-generator-borrowed-container.sh $(COMPILER)
 	tools/test-owned-container-loop.sh $(COMPILER)
