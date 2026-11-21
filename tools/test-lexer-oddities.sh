@@ -36,6 +36,7 @@ escape_span '\q' 2
 unterminated() { # $1 = text after the first 24 bytes
     fails $'fun main: int {\n    0\n}\n'"$1"
     grep -Fq 'error[E_PARSE_UNTERMINATED_COMMENT]' "$out/case.log" || { echo "lexer oddities: unterminated comment lacks E_PARSE_UNTERMINATED_COMMENT" >&2; cat "$out/case.log" >&2; exit 1; }
+    grep -Fq "help: close the comment with" "$out/case.log"
     grep -Fq "case.ab:24:26" "$out/case.log" || { echo "lexer oddities: unterminated comment is not at 24:26" >&2; cat "$out/case.log" >&2; exit 1; }
     [[ $(grep -c '^error\[' "$out/case.log") -eq 1 ]] || { echo "lexer oddities: more than one error for an unterminated comment" >&2; cat "$out/case.log" >&2; exit 1; }
 }

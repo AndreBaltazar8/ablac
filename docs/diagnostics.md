@@ -52,6 +52,7 @@ only its parse errors.
 | `E_PARSE_TOP_LEVEL_DECLARATION` | expected a top-level declaration or compile expression: statements must be inside a function |
 | `E_PARSE_PARAMETER_SEPARATOR`, `E_PARSE_ARGUMENT_SEPARATOR`, `E_PARSE_ARRAY_SEPARATOR` | a missing `,` |
 | `E_PARSE_UNCLOSED_DELIMITER` | an unclosed `(`, `[` or `{` |
+| `E_PARSE_UNTERMINATED_COMMENT` | a block comment reaches the end of the file with no matching `*/` |
 | `E_PARSE_STRING_PART` | a malformed string or template |
 | `E_PARSE_EXTENSION_RECEIVER` | an extension's receiver type isn't followed by `.name` (e.g. an unclosed `array<int`) |
 | `E_PARSE_ELVIS` | Kotlin's `?:`: Abla writes it `??` ([null-safe operators](language.md#null-safe-operators)) |
@@ -69,6 +70,50 @@ only its parse errors.
 | `E_PARSE_DEFER_BODY`, `E_PARSE_REGION_BODY`, `E_PARSE_SUSPENDING_BODY` | `defer`, `region`, `generator`, `task` or `thread` without a block |
 | `E_PARSE_DECLARATION_BLOCK_*` | a malformed [declaration block](compile-time.md#declaration-blocks) |
 | `E_PARSE_*_PROGRESS` | the parser couldn't continue at that point; see the previous error |
+
+A block with no closing brace reports `E_PARSE_EXPECTED_TOKEN`. Close the
+block with `}`.
+
+```abla error
+fun main {
+// error: E_PARSE_EXPECTED_TOKEN
+// error: help: close the construct
+```
+
+A missing operand reports `E_PARSE_EXPRESSION`. Add the operand or remove
+the operator.
+
+```abla error
+fun main: int = (1 +)
+// error: E_PARSE_EXPRESSION
+// error: help: write a value here
+```
+
+Two statements on one line need a separator.
+
+```abla error
+fun main {
+    val first = 1 val second = 2
+}
+// error: E_PARSE_STATEMENT_SEPARATOR
+// error: help: put the next statement on a new line
+```
+
+Put a call that runs when the program starts inside `fun main`.
+
+```abla error
+println("hello")
+// error: E_PARSE_TOP_LEVEL_DECLARATION
+// error: help: put executable statements inside
+```
+
+Close a block comment with `*/`, or use `//` for a single line.
+
+```abla error
+/* comment
+// error: E_PARSE_UNTERMINATED_COMMENT
+// error: help: close the comment with
+```
 
 ## Names, calls and types
 
@@ -236,6 +281,7 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 |---|---|
 | `E_NO_MAIN` | the entry module has no `fun main` |
 | `E_IMPORT_NOT_FOUND` | an imported file doesn't exist; the message names the path it looked for |
+| `E_IMPORT_PATH_UNQUOTED` | a file or standard module path needs double quotes; the help line shows the import to write |
 | `E_IMPORT_UNQUALIFIED_AMBIGUOUS` | two unaliased imports expose the same name ([modules](language.md#modules-and-imports)) |
 | `E_NAME_NOT_IMPORTED` | a [strict](language.md#strict-imports) module uses a name of a module it doesn't import; `help:` is the import to add (a warning under `--strict-imports=warn`) |
 | `E_IMPORT_ALIAS_*` | alias errors: duplicate alias, module imported twice, unknown member, alias used as a value |
@@ -246,6 +292,34 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_IMPORT_PROVIDER_*` | a source provider expression or its result is invalid ([packages.md](packages.md)) |
 | `E_PACKAGE_*` | lockfile, fetch, cache, digest, cycle and capability errors of dependencies ([packages.md](packages.md)) |
 | `E_NATIVE_LIBRARY_MANIFEST` | invalid `nativeLibraries` in `abla.toml` |
+
+For a local module path, check the path relative to the file that imports it.
+
+```abla error
+import "missing/file.ab"
+fun main {}
+// error: E_IMPORT_NOT_FOUND
+// error: help: check the path and spelling
+```
+
+Write `import "abla/io"` for the standard-library module.
+
+```abla error
+import abla/io
+fun main {}
+// error: E_IMPORT_PATH_UNQUOTED
+// error: help: write
+```
+
+Aliasing an import does not expose private declarations. If `helpers.ab`
+defines `private fun answer(): int = 42`, this call reports
+`E_NAME_PRIVATE`. Use a public declaration in that module, or remove
+`private` if you own that declaration and mean to expose it.
+
+```abla fragment
+import "helpers.ab" as helpers
+fun main: int = helpers.answer()
+```
 
 ## Unused declarations and imports
 
@@ -264,6 +338,10 @@ see [the toolchain warning controls](toolchain.md). These are conservative
 source-use checks, not a proof that every unreachable declaration is reported.
 `@exportLocal` binding/signature failures remain errors, as described above;
 they are not unused-declaration warnings.
+
+For example, the compiler reports `W_UNUSED_IMPORT` for a helper imported by
+`main.ab` when nothing in the program uses its declarations. Remove the import,
+or use `export import` when a package entry is meant to pass that module on.
 
 ## Builds
 

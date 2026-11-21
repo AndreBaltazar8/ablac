@@ -21,6 +21,7 @@ expect() { # file text…
     done
 }
 
-expect import-missing "E_IMPORT_NOT_FOUND" "missing/file.ab"
+expect import-missing "E_IMPORT_NOT_FOUND" "missing/file.ab" "help: check the path and spelling; a relative import starts from the directory of the importing file"
+expect invalid-import-unquoted "E_IMPORT_PATH_UNQUOTED" 'help: write `import "abla/io"`'
 expect bitwise-comparison-precedence "bitwise.type" "parenthesize the bitwise part"
 echo "import and precedence diagnostics: missing import, & vs == hint"

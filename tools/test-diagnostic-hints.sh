@@ -32,6 +32,10 @@ check invalid-method-unknown-template 1 "method.unknown:C.fooBar"
 check invalid-safe-call 1 "safe-call.non-null:M"
 check invalid-unknown-in-arithmetic 1 "identifier:x"
 check invalid-elvis-template 1 "E_PARSE_ELVIS" "Abla writes Kotlin's \`?:\` as \`??\`"
+check invalid-expected-closing-brace 1 "E_PARSE_EXPECTED_TOKEN" "help: close the construct"
+check invalid-parse-stops-paren 1 "E_PARSE_EXPRESSION" "help: write a value here"
+check invalid-statement-separator 1 "E_PARSE_STATEMENT_SEPARATOR" "help: put the next statement on a new line"
+check invalid-top-level-statement 1 "E_PARSE_TOP_LEVEL_DECLARATION" "help: put executable statements inside"
 # A `{ ... }` statement whose value is dropped never runs (#824): one error each, with the fix named.
 check invalid-discarded-lambda 6 "E_PARSE_DISCARDED_LAMBDA" 'help: to run the statements here, write `if (true) { ... }`'
 

@@ -54,7 +54,7 @@ rejected() { # $1 = case, then the texts its diagnostics must contain
 }
 rejected use-function 'name.private:helper:' 'use-function.ab:3:17'
 rejected use-class 'name.private:Node:'
-rejected use-alias 'E_NAME_PRIVATE' '`helper` is private to'
+rejected use-alias 'E_NAME_PRIVATE' '`helper` is private to' "help: use a public declaration from that module"
 rejected use-extension 'name.private:Point.secret:'
 rejected use-field 'name.private:Point.tag:'
 rejected use-field-write 'name.private:Point.tag:' 'use-field-write.ab:4:5'
