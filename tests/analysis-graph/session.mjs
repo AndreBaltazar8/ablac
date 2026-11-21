@@ -586,6 +586,9 @@ async function documentation(mode) {
         '',
         'fun <T> mapArgs(items: Map<string, array<T>>, transform: (T) -> T): int = 0',
         '',
+        '/** A private helper. */',
+        'private fun secret(): int = 3',
+        '',
         'fun main: int = inc(1) + dec(2) + plain() + annotated() + Box(1, 2).twice()',
         '',
     ].join('\n');
@@ -607,6 +610,8 @@ async function documentation(mode) {
     assert.equal(docOf('main'), undefined);
     const symbolOf = (name) => d.symbols.find((x) => x.name === name);
     assert.equal(symbolOf('inc').signature, 'fun inc(n: int): int');
+    assert.equal(symbolOf('secret').signature, 'private fun secret(): int');
+    assert.equal(docOf('secret'), 'A private helper.');
     assert.equal(symbolOf('twice').signature, 'fun twice(): int');
     assert.equal(symbolOf('annotated').signature, '@noinline\nfun annotated(): int');
     assert.equal(symbolOf('withDocs').signature, [
