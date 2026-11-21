@@ -38,6 +38,8 @@ pkgs.mkShell {
     llvm.lld
     binaryen
     nodejs
+    # tools/readiness.sh: saved release and measurement evidence.
+    jq
     openssl
     # tools/test-http2.sh, tools/test-http2-server.sh: nghttpd, nghttp and h2load (HTTP/2 server, client and load generator).
     nghttp2

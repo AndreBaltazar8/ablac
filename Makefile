@@ -91,6 +91,7 @@ test-wide-integers-full: ablac
 	for type in uint256 int256 uint128 int128; do WIDE_FULL=1 tools/test-wide-integers.sh $(COMPILER) $$type || exit 1; done
 
 test-serial: ablac
+	tools/test-readiness.sh
 	tools/test-repo-language-guard.sh
 	tools/test-repo-language-guard-selftest.sh
 	tools/test-repo-shebang-guard.sh
