@@ -208,6 +208,67 @@ fun bootstrapClangHasFile(name: string): bool {
     text.size > 0 && text[0] == 47
 }
 
+// The `ld.lld` command line clang's driver comes to for the libc-free links (src/toolchain.ab's own `-nostdlib -static-pie` arguments), built here without asking
+// clang: for an x86-64 or AArch64 Linux static-pie with the arguments the compiler gives (`--target=`, -nostdlib, -nostartfiles, -static-pie, -fuse-ld=lld, `-Wl,`
+// pass-throughs, input files and -o). The fixed part is what the driver prints for them (`ld.lld [-EL] --hash-style=gnu --eh-frame-hdr -m <emulation> -static -pie
+// --no-dynamic-linker -z text -o <output>`, then the rest in the order it was given); the test (tools/test-builtin-link.sh) holds it to the driver's own command
+// and executables. Empty when anything else is asked (a library, -pthread, LTO, a sysroot, another target): the link then goes the way it always went.
+// `arguments` is the command: env, ZERO_AR_DATE=1, clang, then the arguments.
+fun bootstrapBuiltinLinkArguments(arguments: array<string>, outputPath: string): array<string> {
+    val none: array<string> = []
+    if (arguments.size < 4 || arguments[0] != "env" || arguments[1] != "ZERO_AR_DATE=1" || arguments[2] != "clang") return none
+    var emulation = "elf_x86_64"
+    var little = false
+    var staticPie = false
+    var noStdlib = false
+    val rest: array<string> = []
+    var index = 3
+    while (index < arguments.size) {
+        val argument = arguments[index]
+        if (argument == "-o") {
+            // Only the output the caller names: the object and runtime library are inputs, not the output.
+            if (index + 1 >= arguments.size || arguments[index + 1] != outputPath) return none
+            index = index + 2
+            continue
+        }
+        if (argument == "--target=aarch64-unknown-linux-gnu") {
+            emulation = "aarch64linux"
+            little = true
+        } else if (argument == "--target=x86_64-unknown-linux-gnu") {
+            emulation = "elf_x86_64"
+        } else if (argument == "-nostdlib") {
+            noStdlib = true
+        } else if (argument == "-static-pie") {
+            staticPie = true
+        } else if (argument == "-nostartfiles" || argument == "-fuse-ld=lld") {
+            // (-nostdlib already leaves the start files out; the linker is the one run.)
+        } else if (argument.startsWith("-Wl,")) {
+            for (piece in argument.slice(4, argument.size).split(",")) rest.append(piece)
+        } else if (argument.startsWith("-") || argument.size == 0) {
+            return none
+        } else {
+            rest.append(argument)
+        }
+        index = index + 1
+    }
+    if (!noStdlib || !staticPie) return none
+    val command: array<string> = []
+    if (little) command.append("-EL")
+    command.append("--hash-style=gnu")
+    command.append("--eh-frame-hdr")
+    command.append("-m")
+    command.append(emulation)
+    command.append("-static")
+    command.append("-pie")
+    command.append("--no-dynamic-linker")
+    command.append("-z")
+    command.append("text")
+    command.append("-o")
+    command.append(outputPath)
+    for (argument in rest) command.append(argument)
+    command
+}
+
 // A Linux link runs the `ld.lld` that clang would run, without clang. Through a Nix shell's
 // clang, a small program's link was 60 ms of 330: the wrapper's shell script and clang's own
 // start, ahead of 13 ms of linking. The first link asks clang (`-###`) for the command it
@@ -219,6 +280,20 @@ fun bootstrapClangHasFile(name: string): bool {
 fun bootstrapRunHostLink(link: LinuxCommand, objectPath: string, outputPath: string): int {
     val configured = linuxEnvironment("ABLA_LINK_DIRECT")
     if (configured.found && configured.value == "0") return link.run()
+    // The libc-free links need nothing from clang: their command is built here (ABLA_LINK_BUILTIN=0 asks clang as before). A link it fails goes the old way.
+    val builtinConfigured = linuxEnvironment("ABLA_LINK_BUILTIN")
+    if (!(builtinConfigured.found && builtinConfigured.value == "0")) {
+        val builtin = bootstrapBuiltinLinkArguments(link.arguments, outputPath)
+        if (builtin.size > 0) {
+            val own = linuxCommand("ld.lld")
+            for (argument in builtin) own.argument(argument)
+            val builtinErrors = "$outputPath.link-errors"
+            own.errors(builtinErrors)
+            val builtinStatus = own.run()
+            Path(builtinErrors).remove()
+            if (builtinStatus == 0) return 0
+        }
+    }
     val directory = Path(bootstrapCacheDirectory()).child("link")
     val probe = directory.child(bootstrapHostLinkKey(link.arguments, objectPath, outputPath))
     var kept = probe.readText()
@@ -251,7 +326,29 @@ fun bootstrapRunHostLink(link: LinuxCommand, objectPath: string, outputPath: str
 // Asking clang costs a process (the Nix wrapper, then the driver: 16-22 ms of a hello world's 270), and the answer is a path that depends on nothing but the
 // toolchain the environment names, so it is kept in the link cache next to the kept linker command, under the same environment key; a kept path that
 // is no longer a file is asked for again.
+// The toolchain's own copy comes first and needs no clang: ABLA_COMPILER_RT_BUILTINS names the archive, else a packaged toolchain has it in
+// <root>/lib/clang/<version>/lib/linux (the root is the directory above the sysroot's share/abla).
+fun bootstrapToolchainBuiltins(): string {
+    val configured = linuxEnvironment("ABLA_COMPILER_RT_BUILTINS")
+    if (configured.found && configured.value != "") {
+        if (Path(configured.value).info().isFile()) return configured.value
+    }
+    val clangDirectory = Path(bootstrapStandardLibraryRoot()).parent().parent().child("lib").child("clang")
+    if (!clangDirectory.info().isDirectory()) return ""
+    for (version in clangDirectory.entries()) {
+        val directory = version.child("lib").child("linux")
+        if (!directory.info().isDirectory()) continue
+        for (candidate in directory.entries()) {
+            // The builtins archive of the host architecture (the file name ends in `builtins-x86_64.a`).
+            if (candidate.name().endsWith("builtins-x86_64.a") && candidate.info().isFile()) return candidate.text
+        }
+    }
+    ""
+}
+
 fun bootstrapLibcFreeRuntimeLibrary(): string {
+    val packaged = bootstrapToolchainBuiltins()
+    if (packaged != "") return packaged
     var key = "abla-runtime-library 1"
     for (entry in linuxEnvironmentEntries()) {
         if (bootstrapLinkReadsEnvironment(entry)) key = "$key\n$entry"
