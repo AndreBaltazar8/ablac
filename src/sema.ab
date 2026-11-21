@@ -2127,13 +2127,16 @@ fun bootstrapFloatDemandPrepare(declarations: array<BootstrapDeclaration>): void
     }
 }
 
+/** Set while the editor analyses: a `$name` no subparser expanded is opaque (accepted everywhere) instead of an error. */
+var bootstrapOpaqueSubparsers = false
+
 fun bootstrapTypesCompatible(expected: string, actual: string): bool {
     if (bootstrapFloatDemandCounts() &&
         (expected == "any" || expected == "nullable:any") && bootstrapFloatDemandType(actual)) {
         bootstrapFloatDemandOrigin = true
     }
     var compatible = expected == actual || expected == "unknown" ||
-        actual == "unknown" || actual == "never" ||
+        actual == "unknown" || actual == "never" || expected == "opaque" || actual == "opaque" ||
         (expected == "any" && !bootstrapIsSecretType(actual))
     if (bootstrapIsBorrowType(actual) &&
         expected == bootstrapBorrowElementType(actual)) compatible = true
@@ -13086,8 +13089,16 @@ class BootstrapAnalyzer(
         }
         // A `$name` no registered subparser expanded: nothing imported registers it.
         else if ((kindHead == 115 && kind == "subparser.placeholder")) {
-            this.fail("subparser.unknown:${expression.text}@${expression.begin}")
-            result = "unknown"
+            if (bootstrapOpaqueSubparsers) {
+                // The editor does not run a package's or the user's subparser: one soft note at the site, and the value is opaque
+                // (every use of it is accepted, nothing after it cascades).
+                this.diagnostics =
+                    "${this.diagnostics}warning[W_SUBPARSER_NOT_EXPANDED]: ${this.currentSourceIdentity}: subparser `\$${expression.text}` is not expanded during analysis (its code is not run in the editor)\nsource[semantic]:${this.currentSourceIdentity}:${expression.begin}:${expression.end}\n"
+                result = "opaque"
+            } else {
+                this.fail("subparser.unknown:${expression.text}@${expression.begin}")
+                result = "unknown"
+            }
         }
         else if ((kindHead == 121 && kind == "yield")) {
             result = bootstrapInferYield(this, expression, result)
@@ -15350,6 +15361,7 @@ fun bootstrapInferMember(
     var result = initial
     val rawReceiver = analyzer.infer(expression.children[0])
     val receiver = bootstrapBorrowElementType(rawReceiver)
+    if (receiver == "opaque") return "opaque"
     // Another module's private extension field.
     val privateField = analyzer.privateExtensionModule(receiver, expression.text)
     if (privateField != "") {
@@ -15420,6 +15432,7 @@ fun bootstrapInferIndex(
     val rawReceiver = analyzer.infer(expression.children[0])
     val receiver = bootstrapBorrowElementType(rawReceiver)
     val index = analyzer.infer(expression.children[1])
+    if (receiver == "opaque") return "opaque"
     if (index != "i64" && analyzer.scalarTypeUnderlying(index) != "i64") {
         analyzer.fail("index.type")
     }
@@ -15512,6 +15525,14 @@ fun bootstrapInferMemberCall(
     initial: string
 ): string {
     var result = initial
+    if (receiver == "opaque") {
+        var argument = 1
+        while (argument < expression.children.size) {
+            analyzer.infer(expression.children[argument])
+            argument = argument + 1
+        }
+        return "opaque"
+    }
     var resolvedTarget = -1
     // Decided by the declaration the receiver's static type resolves to, when
     // it names one (#827); by the method's name otherwise.

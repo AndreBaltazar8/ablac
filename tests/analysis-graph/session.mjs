@@ -1,5 +1,5 @@
 // Protocol-only fixtures for `ablac analyze --stdio`. Run against a built compiler; never
-// executes source compile-time code. Usage: node session.mjs COMPILER
+// executes a package's or the user's compile-time code (the standard library's subparsers are expanded). Usage: node session.mjs COMPILER
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -938,7 +938,31 @@ async function since() {
     await legacy.close();
 }
 
-const tests = { documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+// A subparser of the standard library ($json) is expanded by the analysis, so the value is typed (a bad member is an error, a good one is
+// not); a subparser a program registers itself is not run in the editor: one soft note at its site and an opaque value, nothing cascading.
+async function subparsers() {
+    const json = fixture('subparser-stdlib', { 'main.ab': 'import "abla/io"\nimport "abla/json"\n\nfun main: int {\n    val count = 3\n    val doc = $json {"n": count, "name": "x"}\n    println(doc.get("name").asString())\n    0\n}\n' });
+    let s = await start(json, { mode: 'graph-v2' });
+    noErrors(await s.analyze());
+    await s.rpc('document/open', { uri: uri(path.join(json, 'main.ab')), version: 1, text: 'import "abla/io"\nimport "abla/json"\n\nfun main: int {\n    val doc = $json {"n": 1}\n    println(doc.get("name").nosuch())\n    0\n}\n' });
+    const bad = errors(await s.analyze());
+    assert.equal(bad.length, 1, JSON.stringify(bad));
+    assert.ok(bad[0][2].includes('method.unknown:Json.nosuch'), bad[0][2]);
+    await s.close();
+    const own = fixture('subparser-user', { 'main.ab': [
+        'import "abla/io"', 'import "abla/text"', 'import "abla/compiler/parser"', '',
+        'compile fun parseShout(cursor: ParserCursor): SyntaxExpression {',
+        '    parserRawExpect(cursor, "[")', '    val text = parserRawTakeUntil(cursor, "]")', '    parserRawExpect(cursor, "]")',
+        '    syntaxString(text.uppercase() + "!")', '}', '#compilerRegisterSubparser("shout", parseShout)', '',
+        'fun main: int {', '    val s = $shout[hello]', '    println(s.size)', '    val t = s.foo.bar(1, 2)[3]', '    println(t)', '    val n: int = s', '    n + 1', '}', ''].join('\n') });
+    s = await start(own, { mode: 'graph-v2' });
+    const notes = errors(await s.analyze());
+    assert.equal(notes.length, 1, JSON.stringify(notes));
+    assert.equal(notes[0][1], 'W_SUBPARSER_NOT_EXPANDED');
+    await s.close();
+}
+
+const tests = { subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;

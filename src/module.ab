@@ -41,6 +41,27 @@ fun bootstrapModuleIndexCheck(): bool {
     bootstrapModuleIndexCheckValue == 1
 }
 
+/** Whether `path` is a module of the standard library. */
+fun bootstrapPathIsStandardLibrary(path: string): bool {
+    val root = bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
+    path.startsWith(root)
+}
+
+/** Whether `source` writes `$name` (as tokens: a comment or a string naming it does not count) for a subparser of `registry`. */
+fun bootstrapSourceUsesSubparser(source: string, registry: BootstrapSubparserRegistry): bool {
+    if (registry.registrations.size == 0 || source.indexOf("\$") < 0) return false
+    val tokens = bootstrapLexShared(source)
+    for (index in 0 until tokens.size - 1) {
+        if (tokens[index].kind == BOOTSTRAP_TOKEN_DOLLAR && tokens[index + 1].kind == BOOTSTRAP_TOKEN_IDENTIFIER) {
+            val name = bootstrapTokenText(source, tokens[index + 1])
+            for (registration in registry.registrations) {
+                if (registration.name == name) return true
+            }
+        }
+    }
+    false
+}
+
 fun bootstrapActionsRegisterSubparser(
     actions: array<BootstrapExpression>
 ): bool {
@@ -890,8 +911,15 @@ class BootstrapModuleState(
         allowedCompileEffects: int
     ): BootstrapParseResult {
         // Editor syntax mode must not touch the staged cache: neither reuse a
-        // broader-policy result nor publish an incomplete parse into that cache.
-        if (this.syntaxOnly) return bootstrapParseWithIdentity(snapshot.source, snapshot.path)
+        // broader-policy result nor publish an incomplete parse into that cache. A module that uses a subparser of the
+        // standard library is expanded (the staged parse, no cache); the others are parsed raw.
+        if (this.syntaxOnly) {
+            if (!bootstrapSourceUsesSubparser(snapshot.source, registry)) return bootstrapParseWithIdentity(snapshot.source, snapshot.path)
+            return bootstrapParseStagedRegistered(
+                snapshot.source, snapshot.path, declarations, currentDeclarationBegin, currentDeclarationCount, registry,
+                allowedCompileEffects
+            )
+        }
         var existing = this.frontendIndex(
             snapshot,
             dependencyFingerprint
@@ -4863,7 +4891,9 @@ class BootstrapModuleGraph(
                 "parse.module.begin:$moduleIndex:${snapshot.path}"
             )
             var localRegistry = BootstrapSubparserRegistry([], 0, "")
-            if (!this.state.syntaxOnly && bootstrapActionsRegisterSubparser(
+            // The editor (syntax-only) expands the standard library's subparsers ($json, $html, ...): they are part of the
+            // compiler's trusted base. A package's or the user's own stay unexpanded there (analysis never runs their code).
+            if ((!this.state.syntaxOnly || bootstrapPathIsStandardLibrary(snapshot.path)) && bootstrapActionsRegisterSubparser(
                 snapshot.discovery.actions
             )) {
                 val visibleDeclarations: array<BootstrapDeclaration> = []
