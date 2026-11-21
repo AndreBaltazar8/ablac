@@ -33,11 +33,19 @@ and embeds a constant `Regex`, including its compiled VM program. Importing
 `abla/regex` registers the syntax; no extra `#` is required:
 
 ```abla
-val pages = $regex("(\\d+)-(\\d+)")
-val match = pages.find("pages 12-48")
-if (match != null) println(match.group(1) ?? "")
-val matched = $regex("[a-z]+").matches("hello")
-println("$matched")
+import "abla/io"
+import "abla/regex"
+
+fun main {
+    val pages = $regex("(\\d+)-(\\d+)")
+    val match = pages.find("pages 12-48")
+    if (match != null) println(match.group(1) ?? "")
+    val matched = $regex("[a-z]+").matches("hello")
+    println("$matched")
+}
+// output:
+// 12
+// true
 ```
 
 The argument must be a plain Abla string literal; it uses Abla string escaping,
@@ -76,11 +84,19 @@ A literal with `(?<name>...)` returns a typed matcher with one capture
 field per name:
 
 ```abla
-val date = $regex("(?<year>\\d{4})-(?<month>\\d{2})(?:-(?<day>\\d{2}))?")
-val match = date.matchFull("2026-11") ?? return
-val year: string = match.year
-val month: string = match.month
-val day: string? = match.day
+import "abla/io"
+import "abla/regex"
+
+fun main {
+    val date = $regex("(?<year>\\d{4})-(?<month>\\d{2})(?:-(?<day>\\d{2}))?")
+    val match = date.matchFull("2026-11") ?? return
+    val year: string = match.year
+    val month: string = match.month
+    val day: string? = match.day
+    println("$year-$month ${day ?? "no day"}")
+}
+// output:
+// 2026-11 no day
 ```
 
 `find` and `matchFull` return the literal's capture type or null.

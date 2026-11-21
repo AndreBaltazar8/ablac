@@ -35,7 +35,7 @@ With abla-xml, use `$xmlw(writer)` to write one balanced XML element into a
 buffered or streaming `XmlWriter`. This is also usable inside an element
 already opened on the writer.
 
-```abla
+```abla fragment
 import github("AndreBaltazar8/abla-xml")
 
 fun writeRow(var writer: XmlWriter, id: int, title: string): void {
