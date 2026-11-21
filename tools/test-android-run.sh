@@ -10,6 +10,10 @@
 # Needs the NDK (ABLA_ANDROID_NDK, ANDROID_NDK_ROOT, ... as the other Android tests), qemu-aarch64 and a bionic sysroot
 # made by tools/prepare-bionic-sysroot.sh (ABLA_BIONIC_ROOT=<directory>); without any of them it says so and skips.
 set -euo pipefail
+# Its build helper (abla/android/build) writes the generated project with compiler.writeFile (read against the working
+# directory) and builds into it with buildProgram (read against the build file, decision #91 A): until decision #95
+# settles the file API, the working-directory reading stays allowed here, with its warning.
+export ABLA_BUILD_PATH_CWD=warn
 compiler=${1:-build/ablac}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
