@@ -29,7 +29,7 @@ for source in "$cases"/*.ab; do
     esac
     cat >"$out/build.ab" <<EOF
 import "abla/wasm/build"
-val built = #wasmBuildModule("shared-state", "$source", "$out/result.wasm", true, false)
+val built = #wasmBuildModule("shared-state", "$root/$source", "$root/$out/result.wasm", true, false)
 fun main: int = if (built) 0 else 1
 EOF
     for target in $targets; do

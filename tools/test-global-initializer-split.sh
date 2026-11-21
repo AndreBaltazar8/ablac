@@ -36,8 +36,8 @@ import "abla/wasm/build"
 
 val built = #wasmBuildModule(
     "tables",
-    "build/global-initializer-split/tables.ab",
-    "build/global-initializer-split/tables.wasm",
+    "tables.ab",
+    "tables.wasm",
     true,
     false
 )

@@ -12,10 +12,10 @@ cases=tests/cases/crypto-encrypted-rsa
 # checks, and build wrappers filled in from templates.
 { cat stdlib/abla/crypto/pbe/entry.ab; echo; cat $cases/primitive-test.inc; echo; cat $cases/primitive-kats.inc; } > "$out/primitives.ab"
 fill() { sed -e "s|@SOURCE@|$2|" -e "s|@OUTPUT@|$3|" "$cases/$1" > "$out/$4"; }
-fill build-wasm.ab.in "$out/primitives.ab" "$out/primitives.wasm" wasm-build.ab
-fill build-arm.ab.in "$out/primitives.ab" "$out/primitives-arm.o" arm-build.ab
-fill build-wasm.ab.in "$out/reader.ab" "$out/reader.wasm" reader-wasm-build.ab
-fill build-arm.ab.in "$out/reader.ab" "$out/reader-arm.o" reader-arm-build.ab
+fill build-wasm.ab.in "primitives.ab" "primitives.wasm" wasm-build.ab
+fill build-arm.ab.in "primitives.ab" "primitives-arm.o" arm-build.ab
+fill build-wasm.ab.in "reader.ab" "reader.wasm" reader-wasm-build.ab
+fill build-arm.ab.in "reader.ab" "reader-arm.o" reader-arm-build.ab
 cp $cases/abla.toml "$out/abla.toml"
 p12hex=$(od -An -v -tx1 tests/vectors/crypto/encrypted-rsa/empty.p12 | tr -d ' \n')
 awk -v hex="$p12hex" '{ sub(/@P12HEX@/, hex); print }' $cases/reader.ab.in > "$out/reader.ab"

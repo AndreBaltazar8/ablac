@@ -28,10 +28,10 @@ for entry in env.env_log host.now_millis wasi_snapshot_preview1.fd_write; do
 done
 
 # Without a wasmHostImports list and without the flag, a build says nothing.
+rm -rf -- "${out:?}/plain"
 cp -r tests/cases/wasm-imports "$out/plain"
 sed -i '/^wasmHostImports/d' "$out/plain/abla.toml"
-sed -e "s#tests/cases/wasm-imports/main.ab#build/wasm-imports/plain/main.ab#" -e "s#wasm-imports/wasm-imports.wasm#wasm-imports/plain.wasm#" \
-    tests/cases/wasm-imports/build.ab >"$out/plain/build.ab"
+# (The copy is a whole package: its build file's paths are read against itself and stay inside it, decision #91 A.)
 "$compiler" build build/wasm-imports/plain/build.ab -o "$out/plain-driver" --fast >"$out/plain.txt" 2>&1
 "$out/plain-driver" >>"$out/plain.txt" 2>&1
 if grep -q 'imports\|warning' "$out/plain.txt"; then cat "$out/plain.txt"; echo "unexpected note"; exit 1; fi

@@ -539,6 +539,7 @@ test-serial: ablac
 	tools/test-emitted-value-runtime.sh $(COMPILER)
 	tools/test-unbounded-exports.sh $(COMPILER)
 	tools/test-programmable-build.sh $(COMPILER)
+	tools/test-build-paths.sh $(COMPILER)
 	tools/test-checked-export.sh $(COMPILER)
 	tools/test-export-global-roots.sh $(COMPILER)
 	tools/test-stm.sh $(COMPILER)

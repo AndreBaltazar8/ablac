@@ -26,7 +26,7 @@ table=(
 wasm_build() { # source output
     cat >"$out/build.ab" <<AB
 import "abla/wasm/build"
-val built = #wasmBuildModule("json", "$1", "$2", true, false)
+val built = #wasmBuildModule("json", "$root/$1", "$root/$2", true, false)
 fun main: int = if (built) 0 else 1
 AB
 }

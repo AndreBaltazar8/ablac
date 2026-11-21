@@ -30,7 +30,7 @@ done
 if command -v node > /dev/null; then
     cat > "$out/build.ab" <<BUILD
 import "abla/wasm/build"
-val built = #wasmBuildModule("memmove", "$source", "$out/memmove.wasm", true, false)
+val built = #wasmBuildModule("memmove", "$root/$source", "memmove.wasm", true, false)
 fun main: int = if (built) 0 else 1
 BUILD
     "$compiler" build "$out/build.ab" -o "$out/driver" --fast --no-cache

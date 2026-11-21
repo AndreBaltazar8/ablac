@@ -21,8 +21,8 @@ ABLA_CODEGEN_UNITS=4 ABLA_CODEGEN_UNITS_MINIMUM=0 "$compiler" build "$fixture" \
 cat > "$out/build-wasm.ab" <<WASM
 import "abla/wasm/build"
 import "abla/build"
-val a = #wasmBuildModule("float-containers", "build/erased-float-containers/containers.ab", "build/erased-float-containers/release.wasm", false, false)
-val b = #buildProgram("float-containers-fast", "build/erased-float-containers/containers.ab", "build/erased-float-containers/fast.wasm", "wasm32-module", "module", true, false)
+val a = #wasmBuildModule("float-containers", "$root/build/erased-float-containers/containers.ab", "$root/build/erased-float-containers/release.wasm", false, false)
+val b = #buildProgram("float-containers-fast", "$root/build/erased-float-containers/containers.ab", "$root/build/erased-float-containers/fast.wasm", "wasm32-module", "module", true, false)
 fun main: int = if (a && b) 0 else 1
 WASM
 "$compiler" build "$out/build-wasm.ab" -o "$out/build-wasm" --fast --no-cache

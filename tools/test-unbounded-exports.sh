@@ -25,8 +25,8 @@ import "abla/compiler"
 
 val scheduled = #compilerBuildProgram(
     "many-exports",
-    "build/unbounded-exports/many-exports.ab",
-    "build/unbounded-exports/libmany_exports.so",
+    "many-exports.ab",
+    "libmany_exports.so",
     "$host_target",
     "shared-library",
     true,

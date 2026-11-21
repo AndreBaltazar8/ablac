@@ -54,6 +54,9 @@ jobs=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 # A test that runs commands of its own at once (test-self-hosted, the compile-time parity harness) takes 2 workers
 # under the suite, not one per CPU on top of these jobs: ABLA_SUITE_JOBS says it is running here.
 export ABLA_SUITE_JOBS=$jobs
+# None of the suite's own build files may rely on the working-directory reading of a build call's paths (decision #91 A,
+# kept for v0.2.65 with W_BUILD_PATH_CWD): under the suite it is an error (tools/test-build-paths.sh clears it for its case).
+export ABLA_BUILD_PATH_CWD=${ABLA_BUILD_PATH_CWD:-error}
 min_free=${RUN_TESTS_MIN_FREE:-25}
 output=${RUN_TESTS_OUTPUT:-$project_root/build/test-results/suite}
 filter=${RUN_TESTS_FILTER:-}

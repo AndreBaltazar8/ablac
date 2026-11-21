@@ -24,6 +24,24 @@ val app = #compilerBuildProgram(
 fun main: int = if (app) 0 else 1
 ```
 
+**Paths are read against the build file (decision #91 A).** A relative entry or output of `compilerBuildProgram`,
+`buildProgram`, `wasmBuildModule` or an independent module's `emit` is read against the directory of the file whose
+`#` site makes the call, as an import is. The example above, in `tools/app.ab`, builds `tools/src/app.ab` into
+`tools/build/libabla-app`, whichever directory `ablac build` runs from. A missing entry is `E_SOURCE_NOT_FOUND`.
+
+The paths stay inside the build file's project (the compile-time effect boundary: a dependency's compile code, run by
+its consumer, writes only inside its own tree): the nearest directory above the build file with an `abla.toml` (a
+vendored or locked package's own, never the consumer's) that names a package (`name = ...`; a manifest that only grants
+capabilities, such as a test case's `compileCapabilities`, bounds nothing), else the repository root (`.git`), else the working
+directory. `"../../build/x"` from a file two directories down is inside; a path that leaves the project, absolute or
+relative, is `E_BUILD_PATH_OUTSIDE`, and nothing is built.
+
+*Transition (v0.2.65 only):* a build file written for the old reading, from the working directory, still builds: when
+the entry is not next to the build file but is there from the working directory, both paths of that call are read the
+old way, with `warning[W_BUILD_PATH_CWD]` (an entry found both ways is the build file's, silently). Rewrite such paths
+relative to the build file; the old reading goes in the following release. `ABLA_BUILD_PATH_CWD=error` makes it an
+error now (`E_BUILD_PATH_CWD`; the compiler's own suite runs with it).
+
 For a program assembled from declarations in the current compilation, the
 higher-level independent-module surface owns entry generation and the child
 node:

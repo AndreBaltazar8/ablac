@@ -18,7 +18,7 @@ cd "$project_root"
 
 cat > "$out/build-wasm.ab" <<WASM
 import "abla/wasm/build"
-val built = #wasmBuildModule("any-float-literal", "$fixture", "build/any-float-literal/main.wasm", false, false)
+val built = #wasmBuildModule("any-float-literal", "$project_root/$fixture", "main.wasm", false, false)
 fun main: int = if (built) 0 else 1
 WASM
 "$compiler" build "$out/build-wasm.ab" -o "$out/build-wasm" --fast --no-cache

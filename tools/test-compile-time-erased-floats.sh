@@ -43,8 +43,8 @@ echo "erased float lift: wire versions, exact kinds, static fallback and cycles"
 cat > "$out/wasm-driver.ab" <<'WASM'
 import "abla/wasm/build"
 import "abla/build"
-val release = #wasmBuildModule("ct-erased-floats", "tests/cases/compile-time-erased-floats/wasm.ab", "build/compile-time-erased-floats/release.wasm", false, false)
-val fast = #buildProgram("ct-erased-floats-fast", "tests/cases/compile-time-erased-floats/wasm.ab", "build/compile-time-erased-floats/fast.wasm", "wasm32-module", "module", true, false)
+val release = #wasmBuildModule("ct-erased-floats", "../../tests/cases/compile-time-erased-floats/wasm.ab", "release.wasm", false, false)
+val fast = #buildProgram("ct-erased-floats-fast", "../../tests/cases/compile-time-erased-floats/wasm.ab", "fast.wasm", "wasm32-module", "module", true, false)
 fun main: int = if (release && fast) 0 else 1
 WASM
 "$compiler" build "$out/wasm-driver.ab" -o "$out/wasm-driver" --fast --no-cache

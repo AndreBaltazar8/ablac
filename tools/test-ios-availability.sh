@@ -35,7 +35,7 @@ import "abla/build"
 import "abla/ios/build"
 compile fun checkAvailability(): bool {
     val target = $helper()
-    buildProgram("availability-$name", "$entry", "$object", target, "object", true, false)
+    buildProgram("availability-$name", "$root/$entry", "$root/$object", target, "object", true, false)
 }
 val accepted = #checkAvailability()
 fun main(): int = if (accepted) 0 else 1

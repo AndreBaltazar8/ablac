@@ -17,8 +17,8 @@ done
 cat > "$out/build-wasm.ab" <<WASM
 import "abla/wasm/build"
 import "abla/build"
-val a = #wasmBuildModule("float-boundaries", "build/erased-float-boundaries/representation.ab", "build/erased-float-boundaries/release.wasm", false, false)
-val b = #buildProgram("float-boundaries-fast", "build/erased-float-boundaries/representation.ab", "build/erased-float-boundaries/fast.wasm", "wasm32-module", "module", true, false)
+val a = #wasmBuildModule("float-boundaries", "$root/build/erased-float-boundaries/representation.ab", "$root/build/erased-float-boundaries/release.wasm", false, false)
+val b = #buildProgram("float-boundaries-fast", "$root/build/erased-float-boundaries/representation.ab", "$root/build/erased-float-boundaries/fast.wasm", "wasm32-module", "module", true, false)
 fun main: int = if (a && b) 0 else 1
 WASM
 "$compiler" build "$out/build-wasm.ab" -o "$out/build-wasm" --fast --no-cache

@@ -35,7 +35,7 @@ expect false "$out/plain.ll" "a program that erases no float still compares eras
 buildModule() {
     cat > "$out/build-$1.ab" <<WASM
 import "abla/wasm/build"
-val built = #wasmBuildModule("any-eq-$1", "$2", "build/any-eq-split/$1.wasm", false, false)
+val built = #wasmBuildModule("any-eq-$1", "$project_root/$2", "$1.wasm", false, false)
 fun main: int = if (built) 0 else 1
 WASM
     (cd "$project_root" && "$compiler" build "$out/build-$1.ab" -o "$out/build-$1" --fast --no-cache &&

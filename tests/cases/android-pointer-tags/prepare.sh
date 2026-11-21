@@ -44,7 +44,7 @@ import "abla/compiler"
 #compilerGrant("filesystem.write")
 compile fun taggedObject(): bool {
     val target = defineTarget("tagged-arm64", "aarch64-unknown-linux-gnu", "elf", "none", "none", false, false)
-    target && buildProgram("tagged-pointers", "$relative/fixture.ab", "$relative/$profile.o", "tagged-arm64", "object", $fast, false)
+    target && buildProgram("tagged-pointers", "fixture.ab", "$profile.o", "tagged-arm64", "object", $fast, false)
 }
 val built = #taggedObject()
 fun main: int = if (built) 0 else 1

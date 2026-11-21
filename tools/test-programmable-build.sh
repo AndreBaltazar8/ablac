@@ -191,7 +191,7 @@ set -e
 
 # A requested program whose entry is not there fails the build, naming it, and gets no output.
 [[ $missing_entry_status -ne 0 ]] || { echo "a program with a missing entry built" >&2; exit 1; }
-grep -qF "error[E_SOURCE_NOT_FOUND]: program 'ghost': no such file: tests/cases/program-build/no-such-entry.ab" \
+grep -qE "error\[E_SOURCE_NOT_FOUND\]: program 'ghost': no such file: ([^ ]*/)?tests/cases/program-build/no-such-entry.ab" \
     "$output_directory/missing-entry.err" || { cat "$output_directory/missing-entry.err" >&2; exit 1; }
 [[ ! -e $output_directory/ghost ]] || { echo "the missing entry still produced ghost" >&2; exit 1; }
 

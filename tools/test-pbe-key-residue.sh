@@ -26,7 +26,7 @@ pem=$(hex < "$fixtures/aes128-sha256.pem")
 sed -e "s|@P8HEX@|$p8|" -e "s|@P12HEX@|$p12|" -e "s|@PEMHEX@|$pem|" tests/cases/pbe-key-residue/main.ab.in > "$out/main.ab"
 cat > "$out/build.ab" <<EOF
 import "abla/wasm/build"
-val built = #wasmBuildModule("pbe-key-residue", "$out/main.ab", "$out/main.wasm", false, false)
+val built = #wasmBuildModule("pbe-key-residue", "main.ab", "main.wasm", false, false)
 fun main(): int = if (built) 0 else 1
 EOF
 "$compiler" build "$out/build.ab" -o "$out/builder" --fast --no-cache > "$out/build.log" 2>&1 ||

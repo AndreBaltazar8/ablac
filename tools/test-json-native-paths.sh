@@ -17,8 +17,8 @@ AB
     cat > "$output_directory/build-$name.ab" <<AB
 import "abla/wasm/build"
 val built = #wasmBuildModule(
-    "$name", "build/json-native-paths/$name.ab",
-    "build/json-native-paths/$name.wasm", false, false
+    "$name", "$name.ab",
+    "$name.wasm", false, false
 )
 fun main: int = if (built) 0 else 1
 AB

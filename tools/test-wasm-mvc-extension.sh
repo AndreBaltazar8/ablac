@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Its build helper writes the generated project with compiler.writeFile (read against the working directory) and builds
+# into it with buildProgram (read against the build file, decision #91 A): until decision #95 settles the file API, the
+# working-directory reading stays allowed here, with its warning.
+export ABLA_BUILD_PATH_CWD=warn
 # This test reads the module's LLVM text, which a development build keeps only when asked.
 export ABLA_KEEP_LLVM_TEXT=1
 
