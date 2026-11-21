@@ -96,6 +96,18 @@ const bootedHere = device.state !== "Booted";
 console.log("iOS Simulator:", device.name, udid);
 const simctl = (args, options) => spawnSync("xcrun", ["simctl", ...args], { encoding: "utf8", ...options });
 const checked = (result, what) => { assert.strictEqual(result.status, 0, what + ": " + (result.status === null ? result.signal : result.status) + " " + (result.stderr || "")); return result; };
+// BEGIN simulatorDeadlineControl (also exercised without a Simulator by the fixture test)
+function simulatorDeadlineControl(spawn, waitForReady, report) {
+  const marker = "ios-deadline-control: waiting for SIGALRM";
+  let result = spawn();
+  if (result.error && result.error.code === "ETIMEDOUT" && !(result.stderr || "").includes(marker)) {
+    report("iOS Simulator: deadline control timed out before entry; waiting for the Simulator and trying once more");
+    waitForReady();
+    result = spawn();
+  }
+  return result;
+}
+// END simulatorDeadlineControl
 try {
   if (bootedHere) checked(simctl(["boot", udid], { timeout: 60000 }), "boot");
   checked(simctl(["bootstatus", udid, "-b"], { timeout: 240000, stdio: "inherit" }), "bootstatus");
@@ -115,7 +127,11 @@ try {
   process.stdout.write(base.stdout);
   assert.ok(base.stdout.includes("pure C baseline ready"));
   console.log("iOS Simulator: deliberate execution-deadline control");
-  const control = simctl(["spawn", udid, path.resolve(negative)], { timeout: 120000 });
+  const control = simulatorDeadlineControl(
+    () => simctl(["spawn", udid, path.resolve(negative)], { timeout: 120000 }),
+    () => checked(simctl(["bootstatus", udid, "-b"], { timeout: 240000, stdio: "inherit" }), "bootstatus after an unstarted deadline control"),
+    message => console.log(message));
+  console.log("iOS Simulator: deadline control status=" + control.status + " signal=" + control.signal + " error=" + (control.error ? control.error.code : "none"));
   process.stdout.write(control.stdout || "");
   process.stderr.write(control.stderr || "");
   assert.ok((control.stderr || "").includes("ios-deadline-control: waiting for SIGALRM"));

@@ -49,15 +49,46 @@ The soak fixture now poisons all three selectors and checks that the actual
 shard helper still verifies the whole recipe. This is a deterministic context
 leak, distinct from a runtime race.
 
-Local full-suite and stress results are recorded separately once completed.
-After the lead's batch ED rebase, local verification uses master `c2e0a4b24fc10c3c9f08204330410ef4383a55c1`
-plus the registered soak-tool fixture. No compiler/runtime changes are made by this branch.
-Earlier queued gates ran no builds or suites and were stopped before rebasing.
-Under the lead's focused-validation rule, the unstarted full self-gate was
-cancelled. `cx6-build-focused-v3.service` runs `make ablac` and the focused tooling
-checks; its log is `build/flake-audit/build-focused.log`. No claim of local suite
-success follows from a queued job or from the historical CI passes above.
-The repeated campaign uses slot 4, sixteen disjoint shards per full suite, releasing
-and requeuing between shards. Loaded passes start eight busy loops on the same
-eight CPUs (24–31) as the eight suite jobs. Quiet means no intentional extra load;
-other work on the machine still runs. Each hold is capped below 600 seconds.
+The runner also accepted a nonexistent `compiler.bin` as the fingerprint path
+when given a bare compiler binary: `readlink -f` succeeds for a missing final
+component. That produced an empty stamp and discarded the cache every run. The
+runner now selects a companion only when it exists. Private controls fail with
+the original runner and pass with the fix, checking both cache reuse and
+invalidation for direct binaries and launcher payloads.
+
+The expanded audit inspected job/step metadata for all 100 workflows, including
+cancelled/successful workflows, and earlier attempts for all four rerun workflows:
+
+| Check | Failed then passed on the same commit | Finding |
+| --- | --- | --- |
+| Published Xtensa catalog | [43861818000](https://github.com/AndreBaltazar8/ablac/actions/runs/43861818000), attempts 1/2 | Three curl connection timeouts, exit 28; the rerun's published-checksum step passed. External network availability. |
+| macOS `unix-stream` fixture | [44459677615](https://github.com/AndreBaltazar8/ablac/actions/runs/44459677615), attempts 1/2 | Exit 4 identifies `httpOnce`; the rerun passed. The current fixture retries fork EAGAIN (`42f21c766`, #1032), though the old failure lacks an errno. |
+| Simulator C deadline control | [44586994389](https://github.com/AndreBaltazar8/ablac/actions/runs/44586994389), attempts 1/2 | The C baseline passed, but the negative control's entry marker was absent after a long spawn. The Mac owner identified Simulator launch/readiness; the old log does not print the spawn's error/status. |
+
+The Simulator harness now reports that status and retries once after `bootstatus`
+only for `ETIMEDOUT` before the C entry marker. Post-entry failures, crashes and
+other launch errors are still failures; actual Abla processes get no retry.
+`tools/test-ios-simulator-control.sh` exercises seven portable scenarios, including
+the retry bound and failed readiness. Removing the retry or retrying after entry
+both fail those controls. Real Simulator execution remains a separate Mac CI check.
+
+The fourth rerun, 44480305169, had an unnamed emutls SIGILL in attempt 1 and a
+cancelled attempt 2; it is not counted as a successful rerun. Cancelled workflows
+also exposed more existing emutls failures and a `dylib-plain.release _fork`
+allowlist gap (`3fb6828b3`). Missing compiler artifacts after cancelled setup
+remain infrastructure failures. Some cancelled-job downloads are partial; raw
+logs and metadata are retained rather than counting unavailable logs as passes.
+
+One pre-EF quiet sweep completed on compiler core `c2e0a4b2` with tooling at
+`716402c8`: **546 unique commands, 546 passed, 0 failed**, all release builds
+(`RUN_TESTS_FULL=1`). The partial second sweep was retired at the EF rebase and
+is not a completed sweep. Its evidence is archived under
+`~/archive/ablac-cx6-flakes/retired-716402c8/`.
+
+Subsequent campaign inputs use a detached snapshot of master `9b47085b`, isolated
+from the follow-up branch. Each full sweep uses sixteen disjoint shards with an
+exact recipe-union check. Worker build-slot holds are capped below 600 seconds
+and requeued between shards. Loaded passes add eight busy loops on the same
+eight CPUs (24–31) as the eight suite jobs; quiet means no intentional extra
+load, while other work on the machine still runs. Keep results from different
+compiler snapshots separate; a queued or partial run is never a full-suite pass.
