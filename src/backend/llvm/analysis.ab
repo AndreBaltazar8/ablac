@@ -13,6 +13,8 @@ import "abla/llvm/orc"
 import "functions.ab"
 import "../../module_paths.ab"
 import "abla/text"
+import "abla/bytes"
+import "abla/json"
 
 class BootstrapLlvmEmission(
     val output: string,
@@ -3877,19 +3879,41 @@ fun bootstrapLlvmStringSymbolFrom(
 ): string = "abla_string_${functionSymbol}_$result"
 
 fun bootstrapLlvmJsonEscape(value: string): string {
-    var output = ""
-    var index = 0
+    var first = 0
+    while (first < value.size) {
+        val byte = value[first]
+        if (byte == 34 || byte == 92 || byte == 10 || byte == 13 || byte == 9) break
+        first = first + 1
+    }
+    if (first == value.size) return value
+    val output = byteBuffer()
+    output.appendText(value.slice(0, first))
+    var index = first
     while (index < value.size) {
         val byte = value[index]
-        if (byte == 34) output = "$output\\\""
-        else if (byte == 92) output = "$output\\\\"
-        else if (byte == 10) output = "$output\\n"
-        else if (byte == 13) output = "$output\\r"
-        else if (byte == 9) output = "$output\\t"
-        else output = "$output${value.slice(index, index + 1)}"
+        if (byte == 34) output.appendText("\\\"")
+        else if (byte == 92) output.appendText("\\\\")
+        else if (byte == 10) output.appendText("\\n")
+        else if (byte == 13) output.appendText("\\r")
+        else if (byte == 9) output.appendText("\\t")
+        else output.appendByteValue(byte)
         index = index + 1
     }
-    output
+    output.toText()
+}
+
+fun bootstrapLlvmAppendOwnedBytesAbi(var output: ByteBuffer): void {
+    $jsonw(output) {
+        "abi": "owned-bytes-handle",
+        "ownership": "owned",
+        "nullable": false,
+        "data": "abla_owned_bytes_data",
+        "length": "abla_owned_bytes_length",
+        "release": "abla_owned_bytes_release",
+        "releaseExactlyOnce": true,
+        "validUntilRelease": true
+    }
+    return
 }
 
 fun bootstrapLlvmExportAbi(
@@ -3903,7 +3927,9 @@ fun bootstrapLlvmExportAbi(
         }
         exportIndex = exportIndex + 1
     }
-    var output = "["
+    if (publicExports.size == 0) return "[]"
+    val output = byteBuffer()
+    output.appendText("[")
     var index = 0
     while (index < publicExports.size) {
         val request = publicExports[index]
@@ -3915,7 +3941,7 @@ fun bootstrapLlvmExportAbi(
             abi = "owned-bytes-handle"
             ownership = "owned"
         }
-        if (index > 0) output = "$output,"
+        if (index > 0) output.appendText(",")
         var parameters = "["
         var parameter = 0
         while (parameter < request.parameterTypes.size) {
@@ -3938,30 +3964,37 @@ fun bootstrapLlvmExportAbi(
             parameter = parameter + 1
         }
         parameters = "$parameters]"
-        var result = "{\"abi\":\"$abi\",\"ownership\":\"$ownership\",\"nullable\":false}"
-        if (request.resultType == "string") {
-            result =
-                "{\"abi\":\"owned-bytes-handle\",\"ownership\":\"owned\",\"nullable\":false,\"data\":\"abla_owned_bytes_data\",\"length\":\"abla_owned_bytes_length\",\"release\":\"abla_owned_bytes_release\",\"releaseExactlyOnce\":true,\"validUntilRelease\":true}"
-        }
-        if (request.checked && request.resultType != "void") {
-            result = bootstrapLlvmReplaceAll(
-                result,
-                "{\"abi\":",
-                "{\"lowering\":[\"out-pointer\"],\"abi\":"
-            )
-        }
         var failure = "{\"panic\":\"not-contained\"}"
         if (request.checked) {
             failure =
                 "{\"panic\":\"contained\",\"statusAbi\":\"i32\",\"status\":{\"success\":0,\"panic\":1,\"invalidArguments\":2},\"message\":{\"data\":\"caller-buffer\",\"capacity\":\"u64\",\"requiredLength\":\"u64-out\",\"encoding\":\"bytes\",\"truncation\":\"prefix\"},\"cleanup\":\"abortive\",\"sideEffectsRolledBack\":false,\"concurrency\":\"single-threaded\"}"
         }
-        output = "$output\n    {\"source\":\"${bootstrapLlvmJsonEscape(
+        output.appendText("\n    {\"source\":\"${bootstrapLlvmJsonEscape(
             request.source
-        )}\",\"symbol\":\"${request.name}\",\"parameters\":$parameters,\"result\":$result,\"failure\":$failure}"
+        )}\",\"symbol\":\"${request.name}\",\"parameters\":$parameters,\"result\":")
+        if (!request.checked && request.resultType == "string") {
+            bootstrapLlvmAppendOwnedBytesAbi(output)
+        } else {
+            var result = if (request.resultType != "string") "{\"abi\":\"$abi\",\"ownership\":\"$ownership\",\"nullable\":false}" else {
+                val ownedResult = byteBuffer()
+                bootstrapLlvmAppendOwnedBytesAbi(ownedResult)
+                ownedResult.toText()
+            }
+            if (request.checked && request.resultType != "void") {
+                result = bootstrapLlvmReplaceAll(
+                    result,
+                    "{\"abi\":",
+                    "{\"lowering\":[\"out-pointer\"],\"abi\":"
+                )
+            }
+            output.appendText(result)
+        }
+        output.appendText(",\"failure\":$failure}")
         index = index + 1
     }
-    if (publicExports.size > 0) output = "$output\n  "
-    "$output]"
+    if (publicExports.size > 0) output.appendText("\n  ")
+    output.appendText("]")
+    output.toText()
 }
 
 // Checked exports install recovery frames. An ordinary executable without
