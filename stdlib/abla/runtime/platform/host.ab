@@ -1839,6 +1839,9 @@ trusted fun __ablaRuntimePlatformConditionBroadcast(condition: int): void {
 trusted fun __ablaRuntimePlatformRawAllocate(size: int): int {
     val address = ablaRuntimePointerAddress(__ablaRuntimeHostCalloc(1, size))
     if (address == 0) __ablaRuntimeHostOutOfMemory()
+    if (size > 0 && __ablaRuntimeHostCollectionGrowth == 0) {
+        ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostNativePressure(), size)
+    }
     address
 }
 
@@ -1938,11 +1941,25 @@ var __ablaRuntimeHostRegionPageCacheCount: int = 0
 // functions the compiler made safe points (every allocating one, unless the
 // program opted out with memorySetManualCollection) ever check this.
 var __ablaRuntimeHostCollectionEnabled: bool = true
-var __ablaRuntimeHostCollectionThreshold: int = 33554432
-// Least growth of the tracked heap past what a collection kept before the next
-// (ABLA_GC_GROWTH=<bytes>, read once at startup, sets it, and the first collection's
-// threshold with it; memorySetCollectionGrowth still changes it).
+val __ablaRuntimeHostGcFloor: int = 8388608
+val __ablaRuntimeHostGcCap: int = 134217728
+// A negative threshold compares the full pressure footprint. A positive one
+// compares payload alone, so explicit pacing keeps its single hot comparison.
+// Zero remains the stop-the-world and stress sentinel.
+var __ablaRuntimeHostCollectionThreshold: int = -__ablaRuntimeHostGcFloor
+// Zero selects adaptive pacing. An explicit growth setting uses the payload
+// step that tuned callers (including the compiler) have always configured.
 var __ablaRuntimeHostCollectionGrowth: int = __ablaRuntimeHostGcGrowthConfigured()
+
+// Raw allocations and native buffers freed between safepoints still represent
+// allocation work. Clear their charge once a collection finishes. Tracked
+// buffers still in use are already included in LiveBytes.
+@inline
+trusted fun __ablaRuntimeHostNativePressure(): int = nativeStaticAllocate(8)
+
+@inline
+trusted fun __ablaRuntimeHostTrackedPressure(): int =
+    __ablaRuntimeHostLiveBytes + __ablaRuntimeHostRegistrySlots * 48
 // The live bytes the last collection kept (memoryHeapStat(13)); 0 before the first.
 var __ablaRuntimeHostCollectionKept: int = 0
 // ABLA_GC_STRESS=1 (read once, at startup): every safe point collects, which
@@ -2483,6 +2500,9 @@ trusted fun __ablaRuntimeHostFreeUnlocked(address: int): void {
         if (size != 0) {
             val owner = ablaRuntimeLoadI64(header + 24)
             if (owner >= 0 && owner < 48) {
+                if (owner == 10 && __ablaRuntimeHostCollectionGrowth == 0) {
+                    ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostNativePressure(), size)
+                }
                 __ablaRuntimeHostUnregister(header)
                 __ablaRuntimeHostBlockFree(header, size)
             } else {
@@ -2590,6 +2610,8 @@ trusted fun __ablaRuntimePlatformMemorySetLimit(limit: int): void {
     val latest = limit - limit / 4
     if (__ablaRuntimeHostCollectionThreshold > latest) {
         __ablaRuntimeHostCollectionThreshold = latest
+    } else if (__ablaRuntimeHostCollectionThreshold < -latest) {
+        __ablaRuntimeHostCollectionThreshold = -latest
     }
     return
 }
@@ -2601,12 +2623,23 @@ trusted fun __ablaRuntimePlatformMemorySetLimit(limit: int): void {
 // the middle of a small build.
 trusted fun __ablaRuntimePlatformMemorySetCollectionGrowth(bytes: int): void {
     if (bytes <= 0) ablaRuntimeTrap()
+    val adaptive = __ablaRuntimeHostCollectionGrowth == 0
     __ablaRuntimeHostCollectionGrowth = bytes
     // Pressure collection caps its threshold below the limit: give it one.
     if (__ablaRuntimeHostLimit == 0) {
         __ablaRuntimeHostLimit = __ablaRuntimePlatformMemoryLimit()
     }
     __ablaRuntimeHostCollectionEnabled = true
+    if (adaptive) {
+        // A threshold in pressure bytes cannot carry over to payload mode.
+        if (!__ablaRuntimeHostGcStress) {
+            val growth = if (__ablaRuntimeHostCollected) bytes else bytes / 2
+            val live = __ablaRuntimeHostLiveBytes
+            val room = __ablaRuntimeHostLimit - live
+            __ablaRuntimeHostCollectionThreshold = live + if (growth < room) growth else room
+        }
+        return
+    }
     val next = __ablaRuntimeHostLiveBytes + bytes
     if (__ablaRuntimeHostCollectionThreshold > next) {
         __ablaRuntimeHostCollectionThreshold = next
@@ -3988,6 +4021,86 @@ trusted fun __ablaRuntimeHostFreeStart(): void {
     return
 }
 
+@inline
+trusted fun __ablaRuntimeHostTrimWorthwhile(working: int): bool {
+    val reserve = 16777216
+    val cached = __ablaRuntimeHostHeapCached
+    val surplus = __ablaRuntimeHostHeapMapped + cached - reserve
+    surplus >= 0 && working <= surplus / 5 &&
+        __ablaRuntimeHostSmallBytes + __ablaRuntimeHostHeapBinned +
+            __ablaRuntimeHostHeapParked + cached >= reserve
+}
+
+// If the native heap has a large reclaimable surplus, hand pages back.
+// Heap mappings are an allocator-side estimate. They exclude memory owned
+// by other subsystems and may include pages the kernel already discarded.
+@noinline
+trusted fun __ablaRuntimeHostTrimAfterGc(working: int): void {
+    if (!__ablaRuntimeHostTrimWorthwhile(working)) return
+    val keep = if (working > 4194304) working else 4194304
+    val lists = __ablaRuntimeHostSmallLists()
+    var total = 512
+    while (total > 0 && __ablaRuntimeHostSmallBytes > keep) {
+        val list = lists + total
+        var block = ablaRuntimeLoadI64(list)
+        while (block != 0 && __ablaRuntimeHostSmallBytes > keep) {
+            val next = ablaRuntimeLoadI64(block)
+            __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(block))
+            __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes - total
+            block = next
+        }
+        ablaRuntimeStoreI64(list, block)
+        total = total - 8
+    }
+    // A trim evicts blocks rather than serving allocations.
+    __ablaRuntimeHostSmallMarked = __ablaRuntimeHostSmallBytes
+    __ablaRuntimeHostSmallPushed = 0
+    __ablaRuntimeHostHeapTrim()
+}
+
+// Set the next automatic threshold while mutators are still parked. An
+// explicit collection publishes it through the same saved threshold as a stop.
+@noinline
+trusted fun __ablaRuntimeHostFinishAdaptiveGc(stopped: int): int {
+    val charged = if (__ablaRuntimeHostGcTrace) {
+        ablaRuntimeAtomicLoadI64(__ablaRuntimeHostNativePressure())
+    } else 0
+    ablaRuntimeAtomicStoreI64(__ablaRuntimeHostNativePressure(), 0)
+    val working = __ablaRuntimeHostTrackedPressure()
+    var growth = if (working >= __ablaRuntimeHostGcCap / 3) {
+        __ablaRuntimeHostGcCap
+    } else working * 3
+    if (growth < __ablaRuntimeHostGcFloor) growth = __ablaRuntimeHostGcFloor
+    val limit = __ablaRuntimeHostLimit
+    val reserve = if (limit / 4 < 67108864) limit / 4 else 67108864
+    val live = __ablaRuntimeHostLiveBytes
+    val available = limit - live - reserve
+    if (available > 0 && growth > available) growth = available
+    var next = -(working + growth)
+    if (available <= 0) {
+        // Below the hard limit, metadata and churn must not force repeated
+        // scans of almost the same live heap. Use a payload threshold here.
+        val remaining = limit - live
+        val step = if (remaining / 2 > limit / 64) remaining / 2 else limit / 64
+        next = live + if (step < remaining) step else remaining
+    }
+    if (__ablaRuntimeHostGcStress) next = 0
+    __ablaRuntimeHostCollectionThreshold = next
+    if (stopped == 1) ablaRuntimeStoreI64(__ablaRuntimeHostStwAddress() + 56, next)
+    if (__ablaRuntimeHostGcTrace) {
+        __ablaRuntimeHostStwTrace("gc: native charge ", 18, charged, " next ", 6)
+        __ablaRuntimeHostStwTrace("", 0, if (next < 0) -next else next, "\n", 1)
+    }
+    working
+}
+
+@inline
+trusted fun __ablaRuntimeHostTrimAfterAdaptiveGc(working: int): void {
+    if (__ablaRuntimeHostHeapNative() && !__ablaRuntimeHostGcStress) {
+        __ablaRuntimeHostTrimAfterGc(working)
+    }
+}
+
 trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     // Region pages are reclaimed as a unit and may contain references into
     // the persistent heap. Defer collection until the outermost region ends,
@@ -4012,6 +4125,9 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     // The registry's slots bound the allocations (freed ones leave holes).
     val allocationCount = __ablaRuntimeHostRegistrySlots
     if (allocationCount == 0) {
+        if (__ablaRuntimeHostCollectionGrowth == 0) {
+            __ablaRuntimeHostTrimAfterAdaptiveGc(__ablaRuntimeHostFinishAdaptiveGc(stopped))
+        }
         __ablaRuntimeHostHeapUnlock(mutex)
         __ablaRuntimeHostStwDone(stopped)
         return 0
@@ -4086,6 +4202,9 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     __ablaRuntimeHostCollectionRanges = 0
     val freed = before - __ablaRuntimeHostLiveBytes
     __ablaRuntimeHostCollectionKept = __ablaRuntimeHostLiveBytes
+    if (__ablaRuntimeHostCollectionGrowth == 0) {
+        __ablaRuntimeHostTrimAfterAdaptiveGc(__ablaRuntimeHostFinishAdaptiveGc(stopped))
+    }
     if (__ablaRuntimeHostGcTrace) {
         __ablaRuntimeHostStwTrace("gc: directory reason ", 21,
             __ablaRuntimeHostCollectionDirectoryReason, "\n", 1)
@@ -4118,6 +4237,9 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     // The registry's slots bound the allocations (freed ones leave holes).
     val allocationCount = __ablaRuntimeHostRegistrySlots
     if (allocationCount == 0) {
+        if (__ablaRuntimeHostCollectionGrowth == 0) {
+            __ablaRuntimeHostTrimAfterAdaptiveGc(__ablaRuntimeHostFinishAdaptiveGc(stopped))
+        }
         __ablaRuntimeHostHeapUnlock(mutex)
         __ablaRuntimeHostStwDone(stopped)
         return 0
@@ -4162,6 +4284,15 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     __ablaRuntimeHostCollectionRanges = 0
     val freed = before - __ablaRuntimeHostLiveBytes
     __ablaRuntimeHostCollectionKept = __ablaRuntimeHostLiveBytes
+    if (__ablaRuntimeHostCollectionGrowth == 0) {
+        val working = __ablaRuntimeHostFinishAdaptiveGc(stopped)
+        if (__ablaRuntimeHostHeapNative() && !__ablaRuntimeHostGcStress &&
+            __ablaRuntimeHostTrimWorthwhile(working)) {
+            // Join only when retaining this much is already excessive.
+            if (background) __ablaRuntimeHostFreeWait()
+            __ablaRuntimeHostTrimAfterGc(working)
+        }
+    }
     if (__ablaRuntimeHostGcTrace) {
         __ablaRuntimeHostStwTrace("gc: live ", 9, before, " bytes before, ", 15)
         __ablaRuntimeHostStwTrace("", 0, __ablaRuntimeHostLiveBytes, " after, ", 9)
@@ -4435,15 +4566,15 @@ trusted fun __ablaRuntimeRootsUnlink(frame: int): int {
     0
 }
 
-// ABLA_GC_GROWTH's bytes (decimal digits, at least 1 MiB), else 64 MiB. A smaller step
-// collects more often over less garbage: shorter pauses for more of them.
+// ABLA_GC_GROWTH selects a payload growth step (decimal bytes, at least 1 MiB).
+// Missing or invalid values leave the adaptive policy enabled.
 @noinline
 trusted fun __ablaRuntimeHostGcGrowthConfigured(): int {
     // A literal's data word is its bytes and a NUL (bootstrapLlvmConstStringPointer).
     val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
         __ablaRuntimeWord0("ABLA_GC_GROWTH")
     )))
-    if (value == 0) return 67108864
+    if (value == 0) return 0
     var bytes = 0
     var at = value
     var digit = ablaRuntimeLoadU8(at)
@@ -4452,10 +4583,8 @@ trusted fun __ablaRuntimeHostGcGrowthConfigured(): int {
         at = at + 1
         digit = ablaRuntimeLoadU8(at)
     }
-    if (digit != 0 || bytes < 1048576) return 67108864
-    if (__ablaRuntimeHostCollectionThreshold > bytes / 2) {
-        __ablaRuntimeHostCollectionThreshold = bytes / 2
-    }
+    if (digit != 0 || bytes < 1048576) return 0
+    __ablaRuntimeHostCollectionThreshold = if (bytes / 2 < 33554432) bytes / 2 else 33554432
     bytes
 }
 
@@ -4487,9 +4616,17 @@ trusted fun __ablaRuntimeHostGcPoisonConfigured(): bool {
 // is below it, and needs neither that TLS lookup nor collection.
 trusted fun __ablaRuntimeMemoryPressure(): int {
     // With pressure collection off (manual collection) only a stop under way gets past here: it set the threshold to 0.
-    if ((!__ablaRuntimeHostCollectionEnabled && __ablaRuntimeHostCollectionThreshold != 0) ||
-        __ablaRuntimeHostLiveBytes < __ablaRuntimeHostCollectionThreshold ||
-        __ablaRuntimeHostRegionLoad() != 0) return 0
+    val threshold = __ablaRuntimeHostCollectionThreshold
+    val live = __ablaRuntimeHostLiveBytes
+    if (live < threshold || (!__ablaRuntimeHostCollectionEnabled && threshold != 0)) return 0
+    if (threshold < 0) {
+        val tracked = live + __ablaRuntimeHostRegistrySlots * 48
+        val target = -threshold
+        if (tracked < target && u64(ablaRuntimeAtomicLoadI64(
+            __ablaRuntimeHostNativePressure()
+        )) < u64(target - tracked)) return 0
+    }
+    if (__ablaRuntimeHostRegionLoad() != 0) return 0
     if (!__ablaRuntimeHostCollectionEnabled && (ablaRuntimeAtomicLoadI64(__ablaRuntimeHostStwAddress()) & 1) == 0) return 0
     __ablaRuntimeHostPressureCollect()
 }
@@ -4513,6 +4650,11 @@ trusted fun __ablaRuntimeHostPressureCollect(): int {
     __ablaRuntimePlatformMemoryCollect()
     // Parked for another thread's collection: that one sets the threshold, and this thread's safe point goes on.
     if (__ablaRuntimeHostStwPressureEnd()) return 0
+    if (__ablaRuntimeHostCollectionGrowth == 0) {
+        if (__ablaRuntimeHostForkNoCollect) __ablaRuntimeHostCollectionThreshold = __ablaRuntimeHostLimit
+        __ablaRuntimeHostStwRelease(false)
+        return 0
+    }
     val reserve = 67108864
     val least = __ablaRuntimeHostCollectionGrowth
     val growth = if (__ablaRuntimeHostLiveBytes / 2 > least) {

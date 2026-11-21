@@ -205,3 +205,7 @@ scanning raw words. Reason 6 has a matching `gc: directory miss source <n> resul
 line. Source 1 is a root and 2 is a value reached during marking. Result 0
 means no tracked allocation contains the pointer, 1 is a payload start, and 2
 is an interior pointer.
+
+With adaptive pacing, `ABLA_GC_TRACE=1` also prints `gc: native charge <bytes> next <bytes>`.
+These are the native allocation volume accounted for since the preceding
+collection and the next pressure threshold.

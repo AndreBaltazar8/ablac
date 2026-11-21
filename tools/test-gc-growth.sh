@@ -18,13 +18,30 @@ fail() {
 
 expected='total 48778890 kept 7890'
 default=$("$program")
-[[ $default == "$expected small false" ]] || fail "default growth: '$default'"
+[[ $default == "$expected small true" ]] || fail "default growth: '$default'"
 stepped=$(ABLA_GC_GROWTH=2097152 "$program")
 [[ $stepped == "$expected small true" ]] || fail "ABLA_GC_GROWTH=2097152: '$stepped'"
+large=$(ABLA_GC_GROWTH=67108864 "$program")
+[[ $large == "$expected small false" ]] || fail "explicit large growth: '$large'"
 ignored=$(ABLA_GC_GROWTH=2mb "$program")
-[[ $ignored == "$expected small false" ]] || fail "ABLA_GC_GROWTH=2mb is not bytes, yet: '$ignored'"
+[[ $ignored == "$default" ]] || fail "ABLA_GC_GROWTH=2mb is not bytes, yet: '$ignored'"
 tiny=$(ABLA_GC_GROWTH=4096 "$program")
-[[ $tiny == "$expected small false" ]] || fail "ABLA_GC_GROWTH=4096 is under 1 MiB, yet: '$tiny'"
+[[ $tiny == "$default" ]] || fail "ABLA_GC_GROWTH=4096 is under 1 MiB, yet: '$tiny'"
+native="$output_directory/native-pressure"
+"$compiler" build "$project_root/tests/cases/gc-growth/native-pressure.ab" \
+    -o "$native" --fast --no-cache
+[[ $("$native") == "native pressure true small payload true" ]] ||
+    fail "discarded native buffers did not trigger automatic collection"
+[[ $(ABLA_GC_GROWTH=67108864 "$native") == "native pressure false small payload true" ]] ||
+    fail "explicit payload pacing counted discarded native buffers"
+
+trim="$output_directory/trim-pressure"
+"$compiler" build "$project_root/tests/cases/gc-growth/trim-pressure.ab" \
+    -o "$trim" --fast --no-cache
+trimmed=$("$trim")
+[[ $trimmed == "trim true" || $trimmed == "trim unavailable" ]] ||
+    fail "automatic collection retained the allocation burst"
+
 # Every round collects under stress, about two minutes in one process: the same
 # rounds, shared out among processes. Their totals add up to the whole run's.
 shards=10
@@ -43,4 +60,4 @@ for ((shard = 0; shard < shards; shard++)); do
     stressed_total=$((stressed_total + total))
 done
 [[ $stressed_total == 48778890 ]] || fail "under ABLA_GC_STRESS=1: total $stressed_total"
-echo 'gc growth: ABLA_GC_GROWTH sets the step between collections; other values are ignored'
+echo 'gc growth: adaptive pacing, native buffer pressure, explicit growth and stress'

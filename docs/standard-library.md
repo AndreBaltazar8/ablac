@@ -338,16 +338,21 @@ Collection has two modes:
   allocates, it collects once the tracked heap has grown past a threshold, so
   a loop that only builds strings or grows arrays collects too. (Comparing or indexing a
   string may flatten a rope, which allocates the rope's own copy; that alone
-  makes no safe point.) The first collection runs
-  at 32 MiB; each later one once the heap has grown by
-  `max(64 MiB, half of what the last collection kept)`, capped below the limit.
-  `memorySetCollectionGrowth(bytes)` sets the least growth (lower, for programs that
-  care about their footprint); called before the first collection (hosted), it also
-  starts that one at half of it. `memorySetFreeBlockLimit(bytes)` bounds the freed
-  small blocks kept for reuse by size (128 MiB by default). Without a rebuild, `ABLA_GC_GROWTH=<bytes>`
-  (decimal, at least 1 MiB; read once at startup) sets the least growth and
-  starts the first collection at half of it: a smaller step collects more often
-  over less garbage, so each pause is shorter. Run with `ABLA_GC_STRESS=1` to
+  makes no safe point.) The hosted default starts with an 8 MiB pressure
+  budget. After each collection its next budget is three times the surviving
+  footprint, clamped between 8 and 128 MiB and constrained by the payload
+  limit. Pressure includes tracked payload and estimated bookkeeping, as
+  well as native buffer allocation volume that would otherwise disappear
+  when a buffer is closed between safe points. On the runtime's native
+  heap, a collection trims excess free chunks when the mapped heap is large
+  relative to the surviving footprint. Public live bytes and the hard
+  payload limit retain their existing meaning.
+  `memorySetCollectionGrowth(bytes)` selects explicit payload pacing. It
+  sets the least growth between collections and starts the first collection
+  at half that value when set before allocations. `ABLA_GC_GROWTH=<bytes>`
+  also selects explicit pacing (decimal, at least 1 MiB, read at startup).
+  `memorySetFreeBlockLimit(bytes)` caps the small-block cache at 128 MiB by
+  default. Run with `ABLA_GC_STRESS=1` to
   collect at every safe point instead
   ([debugging.md](debugging.md#collector-stress-abla_gc_stress1)).
   `ABLA_GC_WORKERS=<n>` (2 to 8, read once at startup; unset, 0 or 1 is the serial collector, which is what a
