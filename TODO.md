@@ -3299,3 +3299,22 @@ abla/http/async speaks HTTP/2 when `HttpAsyncOptions.http2` is true (abla/http/h
 - Responses stay fully buffered (`maximumResponseBytes`); a streaming body API would need a change to HttpAsyncCompletion, not only to h2.
 - No server side, push, priorities (RFC 9218), `Upgrade: h2c`, or extended CONNECT (RFC 8441). HTTP/3 is a separate protocol.
 - The h2o interop of the design was not run (h2o is not in the pinned nix packages of the dev shell); nghttpd, `h2load` and `openssl s_server` are.
+
+## Known upstream LLVM miscompiles
+
+- [ ] **instcombine: `0.0 / (0.0 * v)` becomes a signed zero (LLVM 23.1.x; found by the differential fuzzer, seed 100097, 2026-11-21).** `%v = sitofp i64 %n
+  to double; %m = fmul double 0.0, %v; %d = fdiv double 0.0, %m` is NaN for every finite `v`, and `opt -passes=instcombine` (also `default<O1>` and `<O2>`) of the
+  pinned 23.1.3 rewrites it to `copysign(0.0, %v)` (and a following `fmul` gains `nnan ninf`): the program prints 0 in release, the compile-time jit and
+  both Wasm modes, `nan` in `--fast` and the interpreter. The IR is plain IEEE: our emitter sets no fast-math flag on that path (the backend never sets one),
+  and the pre-optimisation IR of the fuzz program has `fmul double 0.0, %x` / `fdiv double 0.0, %m` with none. Compiler Explorer: clang 22.1.0 and older keep
+  the `fdiv` (correct), 23.1.0 has the miscompile, trunk (24.0.0git c80ecb8d) folds it to `ret double +qnan` (correct): fixed after the 23.1 branch. The
+  4-line case is `tests/cases/llvm-miscompiles/fdiv-zero-by-zero-times-value.ll`; no test runs it (it would fail until LLVM is bumped to a release with the
+  fix). Whether to report it upstream (or ask for a 23.1.x backport) is André's decision; the report text is in ~/agents-memory (llvm-fdiv-zero-report.md).
+  Until the bump, a program that computes `0.0 / (0.0 * x)` with a non-literal `x` gets 0 instead of NaN in optimised builds; the fuzzer's seed 100097 shows it.
+- [ ] **fdlibm-exact `sinh`, `cosh`, `tanh`, `asin`, `acos`, `erf`, `log1p`, `log2`, `log10`, `expm1` (static libc, src/static_libc/math2.ab and math3.ab).**
+  These are built from the standard library's correctly rounded exp, log, atan2 and sqrt and are within an ulp (a few for erf) of glibc's, not bit for bit:
+  `tools/fuzz/run --libc` finds a 1-ulp difference in about 6% of calls (200 seeds: 57 of ~1100 calls; every f32 function and every other function agrees
+  exactly). LLVM folds an `extern:"c"` libm call with constant arguments using the compiler's own C library, so a constant folded by the static compiler may
+  differ in the last bit from the dynamic compiler's (docs/compile-time.md, "Native code at compile time"). Matching glibc bit for bit means porting the
+  algorithms glibc itself uses (fdlibm's s_tanh/e_sinh/e_cosh/s_erf/s_log1p/s_expm1, the IBM accurate asin/acos, the ARM-optimised log2/log10 and
+  glibc's own cbrt), with their coefficient tables; each port is checked by the campaign (a disagreement count of zero over a few thousand calls).

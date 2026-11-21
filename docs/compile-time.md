@@ -545,6 +545,16 @@ raw-memory code, including calls into `abla/unsafe`, needs `trusted.native`. `na
 gives C code an entry that calls back into `f`, so a C sort with an Abla
 comparison works as at run time.
 
+The statically linked compiler (the shipped one since v0.2.65, #806) has no C library to look in: its own C library is Abla's (src/static_libc), and
+a call that names a C function finds it in a table of what that library exports (the non-variadic functions of ISO C's `<string.h>`, `<ctype.h>`,
+`<stdlib.h>` and `<math.h>`, `strtod` and the libm functions in double and float forms, `printf` and `puts`, and what LLVM's optimiser introduces:
+`exp2` for `pow(2, x)`, wide-integer division, ...), not in glibc. Two differences follow. A name outside the table fails the compile-time call with
+"Symbols not found", and a shared object cannot be loaded at all (a `nativeLibraries` entry or `dlopen` of a library is refused, the diagnostic says why).
+And eleven libm functions (`sinh`, `cosh`, `tanh`, `asin`, `acos`, `erf`, `log1p`, `log2`, `log10`, `expm1` and `cbrt` in double form) are within
+an ulp, not bit for bit, of glibc's: LLVM folds a call with constant arguments using the compiler's own C library, so the last bit of such a folded
+constant may differ between the static compiler and the dynamic one (Abla's own `abla/math` functions are not affected: LLVM sees no library call).
+`tools/fuzz/run --libc` compares the two on random arguments.
+
 ```toml file=abla.toml
 compileCapabilities = ["trusted.native"]
 ```
