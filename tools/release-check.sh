@@ -12,7 +12,8 @@
 #   stage2      the Linux binary is byte for byte the local stage 2 (cmp)
 #   convergence a green bootstrap-convergence run exists for the release's source commit (tools/release-convergence.sh);
 #               required: without --source-ref (or the tag) and a run, this check fails
-#   static      (when the run built ablac-static-x86_64-linux, #806 step C) it has no PT_INTERP or DT_NEEDED, prints the version, builds and
+#   static      (when the run built ablac-static-x86_64-linux, #806 step C; `static-aarch64` for ablac-static-aarch64-linux, run natively or under
+#               qemu-aarch64, SKIP on a host with neither, never with the fixpoint) it has no PT_INTERP or DT_NEEDED, prints the version, builds and
 #               runs a smoke program and, with ABLA_STATIC_LLVM_LIB set, reaches the fixpoint (tools/test-static-artifact.sh)
 #   siblings    (with --siblings) the downstream repositories build and pass their tests with the candidate
 #               (tools/test-siblings.sh over tools/siblings.txt)
@@ -142,9 +143,9 @@ count=$(find "$out" -type f ! -name .release-check | wc -l | tr -d ' ')
 
 results=()
 failed=0
-report() { # PASS|FAIL name detail
+report() { # PASS|FAIL|SKIP name detail (a SKIP says what this host could not judge and does not fail the check)
     results+=("$(printf '%-5s %-8s %s' "$1" "$2" "$3")")
-    [[ $1 == PASS ]] || failed=1
+    [[ $1 == PASS || $1 == SKIP ]] || failed=1
 }
 
 # 1. assets: the previous release's names.
@@ -154,9 +155,10 @@ actual=$(mktemp)
 # only exists when nothing was given with --artifacts, and also removes the two temporary lists.)
 trap 'rm -f -- "$expected" "$actual"; [[ -z ${source_dir:-} || -n $artifacts ]] || rm -rf -- "$source_dir"' EXIT
 ( cd "$out" && ls ) | sort >"$actual"   # (ls leaves out the .release-check marker)
-# The static compiler (#806 step C) is an optional extra next to the dynamic one: its names are neither expected nor an extra; check 7 judges it.
-static_names=$(grep -E "^ablac-static-x86_64-linux(\.sha256)?\$" "$actual" || true)
-grep -vE "^ablac-static-x86_64-linux(\.sha256)?\$" "$actual" > "$actual.filtered" || true
+# The static compilers (#806 step C, one per architecture: x86_64 and aarch64) are optional extras next to the dynamic one: their names are neither
+# expected nor an extra; check 7 judges each that is present.
+static_names=$(grep -E "^ablac-static-(x86_64|aarch64)-linux(\.sha256)?\$" "$actual" || true)
+grep -vE "^ablac-static-(x86_64|aarch64)-linux(\.sha256)?\$" "$actual" > "$actual.filtered" || true
 mv -f "$actual.filtered" "$actual"
 if [[ -n $assets_from ]]; then
     sort "$assets_from" >"$expected"
@@ -176,7 +178,7 @@ else
         basis="(no previous release found)"
     fi
 fi
-grep -vE "^ablac-static-x86_64-linux(\.sha256)?\$" "$expected" > "$expected.filtered" || true
+grep -vE "^ablac-static-(x86_64|aarch64)-linux(\.sha256)?\$" "$expected" > "$expected.filtered" || true
 mv -f "$expected.filtered" "$expected"
 if ((count == 0)); then
     report FAIL assets "no files in the artifacts"
@@ -283,24 +285,33 @@ if [[ -n $siblings ]]; then
     fi
 fi
 
-# 7. static: the statically linked compiler, when the run built one (#806 step C; an extra next to the dynamic default).
-if [[ -n $static_names ]]; then
-    static=$out/ablac-static-x86_64-linux
+# 7. static: the statically linked compilers, when the run built them (#806 step C; extras next to the dynamic default), one line each:
+# `static` for ablac-static-x86_64-linux (it runs on a Linux x86-64 host), `static-aarch64` for ablac-static-aarch64-linux (it runs natively on a
+# Linux AArch64 host, under qemu-aarch64 on a Linux x86-64 one; with neither, or no qemu, the line is SKIP, not a failure of the file). The
+# AArch64 file is never run through the fixpoint here (it is minutes of emulation per build); its release job's own test does the rest.
+for static_arch in x86_64 aarch64; do
+    grep -qE "^ablac-static-$static_arch-linux(\.sha256)?\$" <<< "$static_names" || continue
+    static=$out/ablac-static-$static_arch-linux
+    static_label=static
+    [[ $static_arch == x86_64 ]] || static_label=static-$static_arch
+    host=$(uname -s)/$(uname -m)
     if [[ ! -f $static ]]; then
-        report FAIL static "the static compiler's checksum is here but not the compiler"
-    elif [[ $(uname -s)/$(uname -m) != Linux/x86_64 ]]; then
-        report FAIL static "this host cannot run ablac-static-x86_64-linux"
+        report FAIL "$static_label" "the static compiler's checksum is here but not the compiler"
+    elif [[ $static_arch == x86_64 && $host != Linux/x86_64 ]]; then
+        report FAIL "$static_label" "this host cannot run ablac-static-x86_64-linux"
+    elif [[ $static_arch == aarch64 && $host != Linux/aarch64 && ( $host != Linux/x86_64 || -z $(command -v qemu-aarch64 || true) ) ]]; then
+        report SKIP "$static_label" "this host cannot run ablac-static-aarch64-linux (needs Linux AArch64, or Linux x86-64 with qemu-aarch64)"
     else
         chmod +x "$static"
         static_args=("$static" "$version")
-        [[ -n ${ABLA_STATIC_LLVM_LIB:-} ]] || static_args+=(--no-fixpoint)
-        if (cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && STATIC_ARTIFACT_OUTPUT="$out/static-check" tools/test-static-artifact.sh "${static_args[@]}") > "$out/static.log" 2>&1; then
-            report PASS static "no PT_INTERP, no DT_NEEDED, smoke compile$([[ -n ${ABLA_STATIC_LLVM_LIB:-} ]] && echo ', fixpoint' || echo ' (no fixpoint: ABLA_STATIC_LLVM_LIB unset)')"
+        if [[ $static_arch == aarch64 || -z ${ABLA_STATIC_LLVM_LIB:-} ]]; then static_args+=(--no-fixpoint); fi
+        if (cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && STATIC_ARTIFACT_OUTPUT="$out/static-check-$static_arch" tools/test-static-artifact.sh "${static_args[@]}") > "$out/static-$static_arch.log" 2>&1; then
+            report PASS "$static_label" "no PT_INTERP, no DT_NEEDED, smoke compile$([[ $static_arch == x86_64 && -n ${ABLA_STATIC_LLVM_LIB:-} ]] && echo ', fixpoint' || echo ' (no fixpoint)')"
         else
-            report FAIL static "$(tail -n 1 "$out/static.log") ($out/static.log)"
+            report FAIL "$static_label" "$(tail -n 1 "$out/static-$static_arch.log") ($out/static-$static_arch.log)"
         fi
     fi
-fi
+done
 
 printf 'release-check %s  run %s  %s\n' "$tag" "$run_id" "$out"
 printf '%s\n' "${results[@]}"

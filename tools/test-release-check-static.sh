@@ -17,7 +17,7 @@ ls artifacts | sort > expected-without
 run() { # EXPECTED-FILE OUT -> the output lines
     "$root/tools/release-check.sh" v9.9.9 1 stage2 --artifacts artifacts --assets-from "$1" --out "$2" --source-ref 0000000000000000000000000000000000000000 2>&1 || true
 }
-line() { grep -E "^(PASS|FAIL) +$1 " <<< "$2" || true; }
+line() { grep -E "^(PASS|FAIL|SKIP) +$1 " <<< "$2" || true; }
 without=$(run expected-without out1)
 [[ $(line assets "$without") == PASS* ]] || { echo "assets without the static asset: $(line assets "$without")" >&2; exit 1; }
 [[ -z $(line static "$without") ]] || { echo "a static line without a static asset" >&2; exit 1; }
@@ -28,9 +28,33 @@ with=$(run expected-without out2)
 [[ $(line assets "$with") == PASS* ]] || { echo "assets with the static asset: $(line assets "$with")" >&2; exit 1; }
 [[ $(line sha256 "$with") == PASS* ]] || { echo "sha256 with the static asset: $(line sha256 "$with")" >&2; exit 1; }
 [[ $(line static "$with") == FAIL* ]] || { echo "a script passed as the static compiler: $(line static "$with")" >&2; exit 1; }
+# the AArch64 static asset: also an optional extra (neither expected nor an extra), judged by its own line, `static-aarch64`. A file that is
+# not an AArch64 ELF fails there where the host can run one; on a host without qemu-aarch64 (the PATH below has none) the line is SKIP, which
+# does not fail the check.
+printf '#!/bin/sh\necho "ablac 9.9.9"\n' > artifacts/ablac-static-aarch64-linux
+(cd artifacts && sha256sum ablac-static-aarch64-linux > ablac-static-aarch64-linux.sha256)
+aarch=$(run expected-without out4)
+[[ $(line assets "$aarch") == PASS* ]] || { echo "assets with the aarch64 static asset: $(line assets "$aarch")" >&2; exit 1; }
+[[ $(line sha256 "$aarch") == PASS* ]] || { echo "sha256 with the aarch64 static asset: $(line sha256 "$aarch")" >&2; exit 1; }
+if command -v qemu-aarch64 > /dev/null || [[ $(uname -m) == aarch64 ]]; then
+    [[ $(line static-aarch64 "$aarch") == FAIL* ]] || { echo "a script passed as the aarch64 static compiler: $(line static-aarch64 "$aarch")" >&2; exit 1; }
+fi
+bin=$(mktemp -d)
+for tool in bash env ls sort uniq comm diff grep awk sed mktemp rm cat tr head tail cmp dirname uname readelf sha256sum date printf mv cp mkdir chmod wc cut basename tee find xargs ln; do
+    path=$(command -v "$tool" 2> /dev/null || true)
+    [[ -z $path ]] || ln -s "$path" "$bin/$tool"
+done
+noqemu=$(PATH=$bin "$root/tools/release-check.sh" v9.9.9 1 stage2 --artifacts artifacts --assets-from expected-without --out out5 --source-ref 0000000000000000000000000000000000000000 2>&1 || true)
+! grep -q "command not found" <<< "$noqemu" || { echo "the restricted PATH lacks a tool release-check uses: $(grep "command not found" <<< "$noqemu" | head -2)" >&2; exit 1; }
+rm -rf -- "$bin"
+if [[ $(uname -m) != aarch64 ]]; then
+    [[ $(line static-aarch64 "$noqemu") == SKIP* ]] || { echo "no qemu-aarch64: the aarch64 static line is not a SKIP:" >&2; echo "$noqemu" >&2; exit 1; }
+    ! grep -q '^FAIL.*static-aarch64' <<< "$noqemu" || { echo "a SKIP failed the check" >&2; exit 1; }
+fi
+rm -f artifacts/ablac-static-aarch64-linux artifacts/ablac-static-aarch64-linux.sha256
 # the previous release's names include the static asset: a release without it is not missing it
 (cd artifacts && ls | sort) > expected-with
 rm -f artifacts/ablac-static-x86_64-linux artifacts/ablac-static-x86_64-linux.sha256
 again=$(run expected-with out3)
 [[ $(line assets "$again") == PASS* ]] || { echo "assets, static expected, none built: $(line assets "$again")" >&2; exit 1; }
-echo "release-check static: the optional asset is judged by its own check"
+echo "release-check static: the optional assets (x86-64 and AArch64) are judged by their own checks"
