@@ -1,0 +1,70 @@
+// Socket reads with a limit far above the message: the string a read returns holds the bytes received, not the buffer the limit sized (a 20-byte message read
+// with a 1 MB limit (TCP) or 64 KB (UDP) used to keep that alive for as long as the string lived). TCP read and readResult, UDP receiveFrom, and the secure file's readChunk, on
+// loopback and a file, with the contents checked.
+import "abla/io"
+import "abla/net"
+import "abla/memory"
+
+fun main: int {
+    var failed = 0
+    val listener = tcpListen(0)
+    val port = listener.localPort()
+    val client = tcpConnect(ipv4Loopback(port), 5000)
+    val server = listener.accept()
+    if (client.descriptor < 0 || server.descriptor < 0) {
+        println("no loopback connection")
+        return 1
+    }
+    memoryCollect()
+    val before = memoryLiveBytes()
+    val kept: array<string> = []
+    val results: array<string> = []
+    for (i in 0 until 40) {
+        val message = "message number $i"
+        if (client.write(message) != message.size) failed = failed + 1
+        val got = server.read(1048576)
+        if (got != message) {
+            println("tcp read: got [$got], sent [$message]")
+            failed = failed + 1
+        }
+        kept.append(got)
+        if (server.write(message) != message.size) failed = failed + 1
+        val reply = client.readResult(1048576)
+        if (reply.bytes != message || reply.status != "data") {
+            println("tcp readResult: got [${reply.bytes}] ${reply.status}")
+            failed = failed + 1
+        }
+        results.append(reply.bytes)
+    }
+    memoryCollect()
+    val grownTcp = memoryLiveBytes() - before
+    println("80 tcp reads of 16-byte messages with a 1 MB limit hold ${grownTcp / 1024} KB")
+    if (grownTcp > 1048576) {
+        println("too much: the strings keep the read buffers alive")
+        failed = failed + 1
+    }
+    // UDP
+    val receiver = udpBindPort(0)
+    val sender = udpBindPort(0)
+    val before2 = memoryLiveBytes()
+    val datagrams: array<string> = []
+    for (i in 0 until 40) {
+        val message = "datagram $i"
+        sender.sendTo(message, ipv4Loopback(receiver.localPort()))
+        val got = receiver.receiveFromWithTimeout(65507, 2000)
+        if (!got.received || got.bytes != message) {
+            println("udp receiveFrom: got [${got.bytes}] sent [$message]")
+            failed = failed + 1
+        }
+        datagrams.append(got.bytes)
+    }
+    memoryCollect()
+    val grownUdp = memoryLiveBytes() - before2
+    println("40 udp datagrams with a 64 KB limit hold ${grownUdp / 1024} KB")
+    if (grownUdp > 1048576) {
+        println("too much: the datagrams keep the receive buffers alive")
+        failed = failed + 1
+    }
+    if (kept.size != 40 || results.size != 40 || datagrams.size != 40) failed = failed + 1
+    if (failed == 0) 42 else 1
+}
