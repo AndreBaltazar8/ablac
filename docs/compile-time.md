@@ -558,10 +558,11 @@ a call that names a C function finds it in a table of what that library exports 
 `<stdlib.h>` and `<math.h>`, `strtod` and the libm functions in double and float forms, `printf` and `puts`, and what LLVM's optimiser introduces:
 `exp2` for `pow(2, x)`, wide-integer division, ...), not in glibc. Two differences follow. A name outside the table fails the compile-time call with
 "Symbols not found", and a shared object cannot be loaded at all (a `nativeLibraries` entry or `dlopen` of a library is refused, the diagnostic says why).
-And eleven libm functions (`sinh`, `cosh`, `tanh`, `asin`, `acos`, `erf`, `log1p`, `log2`, `log10`, `expm1` and `cbrt` in double form) are within
-an ulp, not bit for bit, of glibc's: LLVM folds a call with constant arguments using the compiler's own C library, so the last bit of such a folded
-constant may differ between the static compiler and the dynamic one (Abla's own `abla/math` functions are not affected: LLVM sees no library call).
-`tools/fuzz/run --libc` compares the two on random arguments.
+The libm functions `sinh`, `cosh`, `tanh`, `asin`, `acos`, `erf`, `erfc`, `log1p`, `log2`, `log10` and `expm1` (double form) are correctly rounded: each result is the
+double nearest to the exact value (src/static_libc/crmath.ab, computed with extra bits and rounded once; `tools/test-static-libm.sh` compares with MPFR). A glibc that
+rounds them the same way (glibc 2.44 does for `sinh`, `cosh`, `tanh`, `erf` and `erfc`) agrees bit for bit; an older glibc, or a libm that does not round
+correctly, can differ in the last bit from a folded constant, and so can another platform's libm. `cbrt` is within an ulp. (Abla's own `abla/math` functions are
+not affected: LLVM sees no library call.) `tools/fuzz/run --libc` compares the static and the dynamic compiler on random arguments.
 
 ```toml file=abla.toml
 compileCapabilities = ["trusted.native"]

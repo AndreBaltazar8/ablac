@@ -15,11 +15,11 @@ cd "$root"
 out=build/libc-functions
 rm -rf "$out"
 mkdir -p "$out"
-for name in math-functions iconv spawn wcsftime stack-chk-fail; do
+for name in math-functions correct-rounding iconv spawn wcsftime stack-chk-fail; do
     "$compiler" build "tests/cases/libc-$name/main.ab" -o "$out/$name" --no-cache > "$out/$name.build.log" 2>&1 ||
         { echo "libc functions: libc-$name did not build" >&2; tail -20 "$out/$name.build.log" >&2; exit 1; }
 done
-for name in math-functions iconv spawn wcsftime; do
+for name in math-functions correct-rounding iconv spawn wcsftime; do
     code=0
     "$out/$name" > "$out/$name.out" 2>&1 < /dev/null || code=$?
     [[ $code == 42 ]] || { echo "libc functions: libc-$name exited $code" >&2; cat "$out/$name.out" >&2; exit 1; }
@@ -33,11 +33,11 @@ echo 'libc functions: math, iconv, posix_spawn, wcsftime and __stack_chk_fail ag
 # The same modules for AArch64 Linux (#806 step C, the static compiler's second target): the programs that do not run another program are
 # built with --target aarch64-linux and run under qemu-aarch64 (posix_spawn's test starts the host's /bin/sh, which the guest cannot).
 if command -v qemu-aarch64 > /dev/null; then
-    for name in math-functions iconv wcsftime stack-chk-fail; do
+    for name in math-functions correct-rounding iconv wcsftime stack-chk-fail; do
         "$compiler" build "tests/cases/libc-$name/main.ab" -o "$out/$name.aarch64" --target aarch64-linux --no-cache > "$out/$name.aarch64.build.log" 2>&1 ||
             { echo "libc functions: libc-$name did not build for aarch64-linux" >&2; tail -20 "$out/$name.aarch64.build.log" >&2; exit 1; }
     done
-    for name in math-functions iconv wcsftime; do
+    for name in math-functions correct-rounding iconv wcsftime; do
         code=0
         qemu-aarch64 "$out/$name.aarch64" > "$out/$name.aarch64.out" 2>&1 < /dev/null || code=$?
         [[ $code == 42 ]] || { echo "libc functions: libc-$name exited $code under qemu-aarch64" >&2; cat "$out/$name.aarch64.out" >&2; exit 1; }

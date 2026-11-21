@@ -3343,10 +3343,4 @@ abla/http/async speaks HTTP/2 when `HttpAsyncOptions.http2` is true (abla/http/h
   stock 23.1.x, so `0.0 / (0.0 * v)` is still 0 in optimised macOS builds (the fuzz case `tests/cases/fuzz-differential/fdiv-zero-by-zero-times-value.ab`
   shows it; v0.2.65 lists it under known issues). Fix: a patched macOS LLVM, the fork's Mac build as in #579's companion cohort, with
   `nix/llvm-instcombine-fdiv-zero.patch` applied.
-- [ ] **fdlibm-exact `sinh`, `cosh`, `tanh`, `asin`, `acos`, `erf`, `log1p`, `log2`, `log10`, `expm1` (static libc, src/static_libc/math2.ab and math3.ab).**
-  These are built from the standard library's correctly rounded exp, log, atan2 and sqrt and are within an ulp (a few for erf) of glibc's, not bit for bit:
-  `tools/fuzz/run --libc` finds a 1-ulp difference in about 6% of calls (200 seeds: 57 of ~1100 calls; every f32 function and every other function agrees
-  exactly). LLVM folds an `extern:"c"` libm call with constant arguments using the compiler's own C library, so a constant folded by the static compiler may
-  differ in the last bit from the dynamic compiler's (docs/compile-time.md, "Native code at compile time"). Matching glibc bit for bit means porting the
-  algorithms glibc itself uses (fdlibm's s_tanh/e_sinh/e_cosh/s_erf/s_log1p/s_expm1, the IBM accurate asin/acos, the ARM-optimised log2/log10 and
-  glibc's own cbrt), with their coefficient tables; each port is checked by the campaign (a disagreement count of zero over a few thousand calls).
+- [x] **Correctly rounded `sinh`, `cosh`, `tanh`, `asin`, `acos`, `erf`, `erfc`, `log1p`, `log2`, `log10`, `expm1` (static libc, #1045).** Done: src/static_libc/bigfloat.ab and crmath.ab (clean-room, arbitrary precision, one rounding after Ziv's check), tests/cases/libc-correct-rounding and tools/test-static-libm.sh (MPFR). What stays: a host libm that does not round correctly (older glibc, macOS) can still differ from a folded constant in the last bit; `cbrt` and the float forms (computed in double and rounded again) are not claimed correctly rounded.
