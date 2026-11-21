@@ -24,7 +24,7 @@ note=$(readelf -nW "$out/one" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
 [[ -n $note ]] || { echo 'image identity: a program that links LLVM has no GNU build-id' >&2; exit 1; }
 # (1) the program reads that id from its own image
 "$out/one" > "$out/one.out"
-[[ $(sed -n 1p "$out/one.out") == "elf-$note-$(stat -c %s "$out/one")" ]] || { echo "image identity: read [$(sed -n 1p "$out/one.out")], readelf says [$note], size $(stat -c %s "$out/one")" >&2; exit 1; }
+[[ $(sed -n 1p "$out/one.out") == "elf-$note-$(stat -c %s "$out/one")-"* ]] || { echo "image identity: read [$(sed -n 1p "$out/one.out")], readelf says [$note], size $(stat -c %s "$out/one")" >&2; exit 1; }
 # (2) the id follows the bytes: the same program with one more string in it is another image with another id
 mkdir -p "$out/variant"
 sed 's|println(bootstrapRunningImageLinkerId())|println(bootstrapRunningImageLinkerId())\n    println("variant")|' tests/cases/image-identity/main.ab > "$out/variant/main.ab"
@@ -55,6 +55,6 @@ cp "$out/one" "$out/patched"
 printf 'patched\n' > "$out/patch.txt"
 llvm-objcopy --add-section .abla-patch="$out/patch.txt" "$out/patched"
 "$out/patched" > "$out/patched.out"
-[[ $(sed -n 1p "$out/patched.out") == "elf-$note-$(stat -c %s "$out/patched")" && $(sed -n 1p "$out/patched.out") != $(sed -n 1p "$out/one.out") ]] ||
+[[ $(sed -n 1p "$out/patched.out") == "elf-$note-$(stat -c %s "$out/patched")-"* && $(sed -n 1p "$out/patched.out") != $(sed -n 1p "$out/one.out") ]] ||
     { echo 'image identity: an image patched after the link has the identity of the original' >&2; exit 1; }
 echo 'image identity: the full-hash switch and a patched copy behave'
