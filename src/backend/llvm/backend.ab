@@ -902,6 +902,33 @@ fun bootstrapExpressionCallsNamed(expression: BootstrapExpression, name: string)
     false
 }
 
+/** Whether `expression` holds compile-time code (a `#` expression or one of its forms): `compile`, `compile.…`. */
+fun bootstrapExpressionHasCompileTime(expression: BootstrapExpression): bool {
+    if (expression.kind == "compile" || expression.kind.startsWith("compile.")) return true
+    for (child in expression.children) if (bootstrapExpressionHasCompileTime(child)) return true
+    false
+}
+
+/** Whether the program's own code (not the standard library's) runs code at compile time: a top-level action, a compile-time function, or a `#` anywhere in a declaration.
+ *  Such code can have effects that outlive a compile (a defined target, a staged file, a built program), so a compile that may be made twice (the runtime pruning's
+ *  fallback, runtime_prune.ab) is not made for it. */
+fun bootstrapProgramRunsCompileTimeCode(parsed: BootstrapParseResult): bool {
+    for (action in parsed.actions) {
+        // (A capability authorization or a grant only declares; running it again changes nothing.)
+        if (action.kind == "compile.capability.authorization") continue
+        if (action.kind == "compile" && action.children.size == 1 && action.children[0].kind == "call" &&
+            (action.children[0].text == "compilerGrant" || action.children[0].text == "compilerRegisterSubparser")) continue
+        if (bootstrapPruneRuntimeTrace()) linuxWriteStandardError("abla-prune-runtime action ${action.kind} ${action.text}\n")
+        return true
+    }
+    for (declaration in parsed.declarations) {
+        if (bootstrapStandardLibraryModuleSource(declaration.sourceIdentity)) continue
+        if (declaration.kind == "compile.fun" || bootstrapExpressionHasCompileTime(declaration.expression)) return true
+        for (method in declaration.methods) if (bootstrapExpressionHasCompileTime(method.expression)) return true
+    }
+    false
+}
+
 /** Whether the program's own code (not the standard library's) turns on background
  *  freeing (memorySetBackgroundFree, or the runtime's runtimeMemorySetBackgroundFree). */
 fun bootstrapProgramWantsBackgroundFree(parsed: BootstrapParseResult): bool {
@@ -1050,7 +1077,12 @@ fun bootstrapCompileLlvmParsedCached(
     if (bootstrapTextContains(targetTriple, "wasm")) {
         for (name in BOOTSTRAP_WASM_UNWINDING) hookNames.append(name)
     }
-    val prunedWritten = bootstrapPruneRuntime(written, hookNames)
+    // (Not for a program that runs code at compile time: a fallback would run it twice.)
+    var prunedWritten = written
+    bootstrapRuntimePruned = false
+    bootstrapRuntimeHint = []
+    if (!bootstrapProgramRunsCompileTimeCode(written)) prunedWritten = bootstrapPruneRuntime(written, hookNames)
+    else if (bootstrapPruneRuntimeTrace()) linuxWriteStandardError("abla-prune-runtime skipped: the program runs code at compile time\n")
     // (Locals: a compile-time site can build another program from inside the lowering, which prunes and records on its own.)
     val prunedHere = bootstrapRuntimePruned
     val hintHere = bootstrapRuntimeHint

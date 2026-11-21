@@ -55,7 +55,7 @@ done
 hint() { # program -> a hint file of its demand
     local program=$1 trace=$out/hint-$(basename -- "$1" .ab).trace file=$out/hint-$(basename -- "$1" .ab).txt
     ABLA_COMPILER_DEMAND_TRACE=1 "$compiler" build "$program" -o "$out/hint.bin" --no-cache --fast > /dev/null 2> "$trace" || fail "$program did not build for its hint"
-    { echo abla-runtime-demand-1; awk '$1 == "abla-demanded" && $3 == "fun" { n = $4; sub(/^\./, "", n); print n }' "$trace" | sort -u; } > "$file"
+    { echo abla-runtime-demand-1; awk '$1 == "abla-demanded" && $3 == "fun" && $4 ~ /^\./ && ($2 ~ /abla\/runtime\/platform\/(host|wasm)\.ab$/ || $2 ~ /abla\/runtime\/self\/entry\.ab$/ || $2 ~ /darwin\/entry\.ab$/) { n = $4; sub(/^\./, "", n); print n }' "$trace" | sort -u; } > "$file"
     echo "$file"
 }
 small=$(hint tests/cases/libc-imports/hello.ab)
@@ -74,6 +74,14 @@ for case in "missing:$small:tests/cases/modules/http-event.ab" "extra:$out/hint-
     cmp -s "$out/wrong-$kind.plain" "$out/wrong-$kind.bin" || fail "$kind hint: the fallback build differs from the unpruned one"
     wrong=$((wrong + 1))
 done
+# A program that runs code at compile time is never pruned (a fallback would run its compile-time code twice, and a target it defines or a program it builds
+# twice is an error): with a hint in hand, its build prunes nothing and runs.
+printf 'import "abla/io"\nfun fib(n: int): int = if (n < 2) n else fib(n - 1) + fib(n - 2)\nval answer = #fib(10)\nfun main: int {\n    println("answer $answer")\n    return 0\n}\n' > "$out/compile-time.ab"
+ABLA_PRUNE_RUNTIME_HINT=$PWD/$small ABLA_COMPILER_DEMAND_TRACE=1 "$compiler" build "$out/compile-time.ab" -o "$out/compile-time.bin" --no-cache --fast > /dev/null 2> "$out/compile-time.trace" || fail "the compile-time program did not build with a hint"
+grep -q '^abla-prune-runtime skipped' "$out/compile-time.trace" || fail "the guard did not skip the program with compile-time code"
+pruned=$(grep '^abla-prune-runtime' "$out/compile-time.trace" | grep -v 'skipped' || true)
+[[ -z $pruned ]] || fail "a program with compile-time code was pruned"
+[[ $("$out/compile-time.bin") == "answer 55" ]] || fail "the compile-time program printed the wrong text"
 # --no-cache never prunes (the hint of the cache is not read), and a file that is not a hint is ignored.
 ABLA_PRUNE_RUNTIME=1 ABLA_CACHE_DIR=$PWD/$out/nocache.cache ABLA_COMPILER_DEMAND_TRACE=1 "$compiler" build tests/cases/libc-imports/hello.ab -o "$out/nocache.bin" --fast > /dev/null 2> /dev/null || fail "hello did not build"
 { cat tests/cases/libc-imports/hello.ab; printf '\n// changed\n'; } > "$out/nocache.ab"
@@ -82,4 +90,4 @@ ABLA_PRUNE_RUNTIME=1 ABLA_CACHE_DIR=$PWD/$out/nocache.cache ABLA_COMPILER_DEMAND
 printf 'not a hint\n' > "$out/garbage.txt"
 ABLA_PRUNE_RUNTIME_HINT=$PWD/$out/garbage.txt ABLA_COMPILER_DEMAND_TRACE=1 "$compiler" build tests/cases/libc-imports/hello.ab -o "$out/garbage.bin" --no-cache --fast > /dev/null 2> "$out/garbage.trace" || fail "hello did not build with a garbage hint"
 ! grep -q '^abla-prune-runtime' "$out/garbage.trace" || fail "a file that is not a hint pruned"
-echo "runtime prune: $count builds (${#programs[@]} programs x ${#variants[@]} ways) pruned by the cache's hint, byte for byte the unpruned ones; $wrong wrong hints (missing, extra, background freeing) found and rebuilt with the same bytes; --no-cache and a garbage hint prune nothing"
+echo "runtime prune: $count builds (${#programs[@]} programs x ${#variants[@]} ways) pruned by the cache's hint, byte for byte the unpruned ones; $wrong wrong hints (missing, extra, background freeing) found and rebuilt with the same bytes; --no-cache, a garbage hint and a program with compile-time code prune nothing"
