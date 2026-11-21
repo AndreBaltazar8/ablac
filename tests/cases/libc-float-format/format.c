@@ -40,14 +40,26 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 4000; i++) {
             uint64_t bits = next();
             if ((bits & 0x7ff0000000000000ull) == 0x7ff0000000000000ull) bits &= ~0x0010000000000000ull;
-            printf("%c %d 0 %lld\n", conversions[next() % 7], (int)(next() % 19) - 1, (long long)bits);
+            printf("%c %d %d %lld\n", conversions[next() % 7], (int)(next() % 19) - 1, (int)(next() % 2), (long long)bits);
         }
         // Halfway cases: x.5, x.25, x.125 ... at precisions that land on the tie.
         for (int i = 0; i < 400; i++) {
             double value = (double)(next() % 100000) + (double)(1 << (next() % 6)) / (double)(1 << (next() % 6 + 1)) * 0.5;
             printf("f %d 0 %lld\n", (int)(next() % 6), (long long)bits_of(value));
             printf("e %d 0 %lld\n", (int)(next() % 8), (long long)bits_of(value));
-            printf("g %d 0 %lld\n", (int)(next() % 8), (long long)bits_of(value));
+            printf("g %d %d %lld\n", (int)(next() % 8), (int)(next() % 2), (long long)bits_of(value));
+        }
+        // Values just below and at a power of ten: roundings that carry into a new digit (glibc's # quirk is here).
+        for (int k = 1; k < 16; k++) {
+            double power = pow(10.0, k);
+            double nearby[] = {power - 0.5, power - 0.05, power - 0.4999, power - 0.0001, power - 0.5 / 10, power * 0.99999, power / 10 * 9.9999};
+            for (size_t i = 0; i < sizeof nearby / sizeof nearby[0]; i++)
+                for (int precision = -1; precision < 10; precision++)
+                    for (int alt = 0; alt < 2; alt++) {
+                        printf("g %d %d %lld\n", precision, alt, (long long)bits_of(nearby[i]));
+                        printf("e %d %d %lld\n", precision, alt, (long long)bits_of(nearby[i]));
+                        printf("f %d %d %lld\n", precision, alt, (long long)bits_of(nearby[i]));
+                    }
         }
         return 0;
     }

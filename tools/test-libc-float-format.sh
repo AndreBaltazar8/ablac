@@ -24,7 +24,7 @@ mkdir -p "$out"
 "$out/abla" < "$out/cases.txt" > "$out/abla.txt"
 count=$(wc -l < "$out/cases.txt")
 if ! cmp -s "$out/c.txt" "$out/abla.txt"; then
-    paste -d'\t' "$out/cases.txt" "$out/c.txt" "$out/abla.txt" | awk -F'\t' '$2 != $3 { print "case [" $1 "] host [" $2 "] abla [" $3 "]" }' | head -20 >&2
+    paste -d'\t' "$out/cases.txt" "$out/c.txt" "$out/abla.txt" | awk -F'\t' '(""$2) != (""$3) { print "case [" $1 "] host [" $2 "] abla [" $3 "]" }' | head -20 >&2
     echo "libc float format: $count cases, they differ from the host C library's printf" >&2
     exit 1
 fi
