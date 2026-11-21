@@ -127,6 +127,20 @@ for flags in "" "-g"; do
     [[ $segv_status -eq 139 ]] || fail "SIGSEGV$flags exited $segv_status"
     ! grep -q 'stack overflow' "$out/stack-segv.err" ||
         fail "SIGSEGV$flags taken for a stack overflow"
+    # A bad access (the kernel's SIGSEGV) says where it was in a release build, which has no stack to print; a sent
+    # one (above) has no address and says nothing of one. A debug build prints its fault report and the stack.
+    set +e
+    "$out/stack" store > /dev/null 2> "$out/stack-store.err"
+    store_status=$?
+    set -e
+    [[ $store_status -eq 139 ]] || fail "a bad store$flags exited $store_status"
+    if [[ $flags == "" ]]; then
+        grep -qx 'fatal signal: a bad memory access at 0x0000000000000010' "$out/stack-store.err" ||
+            fail "a bad store in a release build: $(head -3 "$out/stack-store.err")"
+        ! grep -q 'bad memory access' "$out/stack-segv.err" || fail "a sent SIGSEGV named an address"
+    else
+        grep -q '^fatal signal' "$out/stack-store.err" || fail "a bad store$flags: $(head -3 "$out/stack-store.err")"
+    fi
     [[ $("$out/stack") == "ok 500" ]] || fail "stack$flags without an overflow"
 done
 

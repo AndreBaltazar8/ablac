@@ -237,10 +237,24 @@ exact fmod.
 Pointers are addresses in the module's exported `memory`.
 
 A panic traps. A module that imports `abla_host.write` for another reason also
-writes `panic: <message>` and a newline to descriptor 2 first; no module gains
-an import for it. A development build decides when the module is optimized; a
-release build links without the message, and links again with it only if that
-first link imports `write`.
+writes `panic: <message>` and a newline to descriptor 2 first, in one write when
+the line fits in the heap's free memory; no module gains an import for it. A
+development build decides when the module is optimized; a release build links
+without the message, and links again with it only if that first link imports
+`write`.
+
+A recursion too deep for the engine's stack is the engine's to stop (a
+`RangeError` in JavaScript engines: "Maximum call stack size exceeded"); a host
+that calls into the module catches it and says `panic: stack overflow`, as the
+module would:
+
+```js
+try { exports.main(); }
+catch (error) {
+  if (error instanceof RangeError) console.error("panic: stack overflow");
+  else if (!(error instanceof WebAssembly.RuntimeError)) throw error; // a trap: the panic was written
+}
+```
 
 Development (`--fast`) builds carry debug information: DWARF line tables,
 readable function symbols and, natively, frame pointers and a printed stack on

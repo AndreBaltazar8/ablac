@@ -25,10 +25,11 @@ if (name === "data-marker") {
     if (bytes.indexOf(entry) < 0) throw new Error(`${name} ${mode}: the marker bytes are not in the module`);
 }
 let written = "";
+let writes = 0;
 const host = {
     write(fd, data, length) {
         const bytes = new Uint8Array(memory.buffer, data, length);
-        if (fd === 2) written += new TextDecoder().decode(bytes);
+        if (fd === 2) { written += new TextDecoder().decode(bytes); writes += 1; }
         return length;
     },
     exit() { throw new Error("exit"); },
@@ -51,4 +52,6 @@ const wanted = imports.includes("abla_host.write") ? line : "";
 if (written !== wanted) {
     throw new Error(`${name} ${mode}: wrote ${JSON.stringify(written)}, expected ${JSON.stringify(wanted)}`);
 }
+// One write, so a host that logs each (console.error) shows one line.
+if (wanted && writes !== 1) throw new Error(`${name} ${mode}: the panic took ${writes} writes`);
 console.log(`${name} ${mode}: ${imports.length === 0 ? "no imports" : imports.join(",")}${wanted ? ", panic message written" : ", no message"}`);

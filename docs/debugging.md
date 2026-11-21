@@ -64,7 +64,11 @@ What a debug build contains:
   with the signal as before. The frames are
   named by the symbol table; on macOS the image's load address follows, for
   `atos`. Return addresses are printed one byte back, inside their calls, so
-  `atos`/`addr2line` report the call's line.
+  `atos`/`addr2line` report the call's line. A release build prints the same
+  `panic: <message>` (exit status 101) without the stack, and a bad memory
+  access (a SIGSEGV or SIGBUS the kernel raised) as
+  `fatal signal: a bad memory access at 0x0000000000000010` before the process
+  ends by the signal.
 
 ## Native: lldb, atos, crash reports
 

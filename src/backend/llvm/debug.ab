@@ -1582,6 +1582,24 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
     val signal = LLVMBuildZExt(
         backend.builder, LLVMGetParam(handler, 0), i64, ""
     )
+    if (!bootstrapLlvmDebugHostedRuntime(backend)) {
+        // A release build says what ended it (it has no stack to print): the bad access and its address, as
+        // si_addr names it, when the kernel raised it (si_code at 8 above 0: SEGV_MAPERR, BUS_ADRERR, ...); a signal
+        // sent (raise, kill: si_code 0 or below) has no address and ends the process as before. The debug report
+        // below prints the stack instead.
+        val code = LLVMBuildLoad2(backend.builder, backend.i32Type, bootstrapLlvmByteAt(backend, info, 32, 8),
+            "fault.code")
+        val reported = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.report")
+        val quiet = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.default")
+        // SGT (38).
+        LLVMBuildCondBr(backend.builder, LLVMBuildICmp(backend.builder, 38, code,
+            LLVMConstInt(backend.i32Type, 0, 0), ""), reported, quiet)
+        LLVMPositionBuilderAtEnd(backend.builder, reported)
+        bootstrapLlvmDebugWrite(backend, "fatal signal: a bad memory access at ", "abla.fault.access")
+        bootstrapLlvmWriteHexCompact(backend, address)
+        LLVMBuildBr(backend.builder, quiet)
+        LLVMPositionBuilderAtEnd(backend.builder, quiet)
+    }
     if (bootstrapLlvmDebugHostedRuntime(backend)) {
         // The debug report, which restores the default action.
         val fault = bootstrapLlvmDeclare(
@@ -1635,6 +1653,54 @@ fun bootstrapLlvmDebugWrite(
         backend, 2, bootstrapLlvmGlobalStringPointer(backend, text, name),
         LLVMConstInt(backend.i64Type, text.size, 0)
     )
+    return
+}
+
+// The byte at `index` (a value) of an i8 array or buffer.
+fun bootstrapLlvmByteElement(backend: BootstrapLlvmBackend, bytes: i64*, index: i64*): i64* {
+    val indices = llvmPointerVector(1)
+    indices.set(0, index)
+    val element = LLVMBuildGEP2(backend.builder, backend.i8Type, bytes, indices.pointer(), 1, "")
+    indices.drop()
+    element
+}
+
+// bootstrapLlvmDebugWriteHex as a loop over a digit table, for code every release build carries (the fault
+// report): a fraction of the unrolled form's size. Ends the line.
+fun bootstrapLlvmWriteHexCompact(backend: BootstrapLlvmBackend, value: i64*): void {
+    val i64 = backend.i64Type
+    val function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(backend.builder))
+    val buffer = LLVMBuildAlloca(backend.builder, LLVMArrayType2(backend.i8Type, 19), "hex")
+    val digits = bootstrapLlvmGlobalStringPointer(backend, "0123456789abcdef", "abla.hex.digits")
+    LLVMBuildStore(backend.builder, LLVMConstInt(backend.i8Type, 48, 0), buffer)
+    LLVMBuildStore(backend.builder, LLVMConstInt(backend.i8Type, 120, 0),
+        bootstrapLlvmByteElement(backend, buffer, LLVMConstInt(i64, 1, 0)))
+    val cursor = LLVMBuildAlloca(backend.builder, i64, "hex.i")
+    LLVMBuildStore(backend.builder, LLVMConstInt(i64, 0, 0), cursor)
+    val loop = LLVMAppendBasicBlockInContext(backend.context, function, "hex.loop")
+    val body = LLVMAppendBasicBlockInContext(backend.context, function, "hex.body")
+    val done = LLVMAppendBasicBlockInContext(backend.context, function, "hex.done")
+    LLVMBuildBr(backend.builder, loop)
+    LLVMPositionBuilderAtEnd(backend.builder, loop)
+    val index = LLVMBuildLoad2(backend.builder, i64, cursor, "")
+    // ULT (36).
+    LLVMBuildCondBr(backend.builder, LLVMBuildICmp(backend.builder, 36, index, LLVMConstInt(i64, 16, 0), ""),
+        body, done)
+    LLVMPositionBuilderAtEnd(backend.builder, body)
+    // The digit of bits 60 - 4i down: the most significant first.
+    val shift = LLVMBuildSub(backend.builder, LLVMConstInt(i64, 60, 0),
+        LLVMBuildShl(backend.builder, index, LLVMConstInt(i64, 2, 0), ""), "")
+    val nibble = LLVMBuildAnd(backend.builder, LLVMBuildLShr(backend.builder, value, shift, ""),
+        LLVMConstInt(i64, 15, 0), "")
+    val digit = LLVMBuildLoad2(backend.builder, backend.i8Type, bootstrapLlvmByteElement(backend, digits, nibble), "")
+    LLVMBuildStore(backend.builder, digit, bootstrapLlvmByteElement(backend, buffer,
+        LLVMBuildAdd(backend.builder, index, LLVMConstInt(i64, 2, 0), "")))
+    LLVMBuildStore(backend.builder, LLVMBuildAdd(backend.builder, index, LLVMConstInt(i64, 1, 0), ""), cursor)
+    LLVMBuildBr(backend.builder, loop)
+    LLVMPositionBuilderAtEnd(backend.builder, done)
+    LLVMBuildStore(backend.builder, LLVMConstInt(backend.i8Type, 10, 0),
+        bootstrapLlvmByteElement(backend, buffer, LLVMConstInt(i64, 18, 0)))
+    bootstrapLlvmRuntimeWrite(backend, 2, buffer, LLVMConstInt(i64, 19, 0))
     return
 }
 
