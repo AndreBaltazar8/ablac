@@ -82,13 +82,53 @@ case $out in /*) ;; *) out=$PWD/$out ;; esac
 layout=$out/layout
 repos=()
 commands=()
-while IFS=$'\t' read -r name command; do
+services=()
+while IFS=$'\t' read -r name command service; do
     [[ -z $name || $name == \#* ]] && continue
     [[ -z $only || $only == *,$name,* ]] || continue
     [[ -d $projects/$name ]] || { echo "test-siblings: $name is listed but not beside ablac; skipped" >&2; continue; }
     repos+=("$name")
     commands+=("$command")
+    services+=("${service:-}")
 done < "$list"
+
+# A throwaway PostgreSQL for a repository whose list line has a third column `postgres=<database>`: nix's postgresql (the candidate's pinned nixpkgs),
+# its own temporary data and socket directory, a free port on 127.0.0.1 and trust authentication; the repository's tests get POSTGRES_HOST, POSTGRES_PORT,
+# POSTGRES_DB and POSTGRES_USER (what abla-postgres reads). It is stopped and removed when the repository's tests end (and on an interrupt); no system
+# service is touched.
+pg_dir=
+pg_bin=
+pg_port=
+pg_free_port() {
+    local port attempt
+    for attempt in $(seq 100); do
+        port=$((20000 + RANDOM % 20000))
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2> /dev/null || { echo "$port"; return 0; }
+    done
+    return 1
+}
+pg_stop() {
+    [[ -z $pg_dir ]] && return 0
+    "$pg_bin/pg_ctl" -D "$pg_dir/data" -m immediate -w stop > /dev/null 2>&1 || true
+    rm -rf -- "$pg_dir"
+    pg_dir=
+}
+pg_start() { # database -> 0, with pg_dir, pg_bin and pg_port set; a message on stderr and 1 when it cannot
+    local database=$1 package
+    command -v nix-build > /dev/null 2>&1 || { echo "test-siblings: a throwaway PostgreSQL needs nix" >&2; return 1; }
+    package=$(nix-build --no-out-link -E "(import $candidate/nix/nixpkgs.nix).postgresql" 2> /dev/null | tail -n 1)
+    [[ -x $package/bin/pg_ctl ]] || { echo "test-siblings: no postgresql from nix ($candidate/nix/nixpkgs.nix)" >&2; return 1; }
+    pg_bin=$package/bin
+    pg_dir=$(mktemp -d /tmp/siblings-pg.XXXXXX)
+    "$pg_bin/initdb" -D "$pg_dir/data" -U postgres --auth=trust -E UTF8 > "$pg_dir/initdb.log" 2>&1 || { cat "$pg_dir/initdb.log" >&2; pg_stop; return 1; }
+    pg_port=$(pg_free_port) || { echo "test-siblings: no free port for PostgreSQL" >&2; pg_stop; return 1; }
+    "$pg_bin/pg_ctl" -D "$pg_dir/data" -l "$pg_dir/server.log" -w -t 60 \
+        -o "-p $pg_port -k $pg_dir -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off" start > "$pg_dir/start.log" 2>&1 ||
+        { cat "$pg_dir/start.log" "$pg_dir/server.log" >&2; pg_stop; return 1; }
+    "$pg_bin/createdb" -h 127.0.0.1 -p "$pg_port" -U postgres "$database" || { pg_stop; return 1; }
+}
+trap pg_stop EXIT
+trap 'pg_stop; exit 130' INT TERM
 
 # The layout.
 remove_layout() {
@@ -190,7 +230,19 @@ if ((tests)); then
         [[ $command == - ]] && { echo "$name -" >> "$out/tests.txt"; continue; }
         log=$out/test-$name.log
         status=0
-        (cd "$layout/$name" && PATH="$out/bin:$PATH" ABLA_DEBUG=0 timeout 2400 bash -c "$command") > "$log" 2>&1 || status=$?
+        service_env=()
+        if [[ ${services[$i]} == postgres=* ]]; then
+            if pg_start "${services[$i]#postgres=}" > "$log" 2>&1; then
+                service_env=(POSTGRES_HOST=127.0.0.1 "POSTGRES_PORT=$pg_port" "POSTGRES_DB=${services[$i]#postgres=}" POSTGRES_USER=postgres)
+            else
+                echo "test-siblings: $name: the throwaway PostgreSQL did not start (see $log)" >&2
+                echo "$name 125" >> "$out/tests.txt"
+                continue
+            fi
+        fi
+        (cd "$layout/$name" && env ${service_env[@]+"${service_env[@]}"} PATH="$out/bin:$PATH" ABLA_DEBUG=0 timeout 2400 bash -c "$command") >> "$log" 2>&1 || status=$?
+        pg_stop
+        [[ -z ${service_env[*]:-} ]] || { echo "test-siblings: $name: ran against a throwaway PostgreSQL on 127.0.0.1:${service_env[1]#POSTGRES_PORT=} (stopped)" >> "$log"; }
         echo "$name $status" >> "$out/tests.txt"
         grep -a 'W_UNUSED_IMPORT' "$log" | sed "s#^#$name #" >> "$out/unused-raw.txt" || true
     done

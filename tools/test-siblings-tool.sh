@@ -89,4 +89,29 @@ PATH="$work/fakebin:$PATH" "$project_root/tools/test-siblings.sh" "$projects/can
     --expected-fail "$work/xfail2" --programs-only --out "$work/out4" > "$work/run4.log" 2>&1 || status=$?
 [[ $status == 1 ]] || fail "exit $status, wanted 1 for an unexpected pass" "$work/run4.log"
 grep -q 'unexpected pass' "$work/run4.log" || fail "the unexpected pass isn't reported" "$work/run4.log"
+
+# A third column `postgres=<database>`: the repository's tests run with POSTGRES_HOST/PORT/DB/USER set and a started (here: fake) PostgreSQL that is
+# stopped afterwards, also when the tests fail; a repository without the column gets none of it.
+mkdir -p "$projects/sib-pg" "$work/fakepg/bin" "$work/fakepgbin"
+echo 'fun main: int = 0' > "$projects/sib-pg/ok.ab"
+git -C "$projects/sib-pg" init --quiet --initial-branch=main
+commit "$projects/sib-pg"
+for tool in initdb createdb; do printf '#!/usr/bin/env bash\necho "%s $*" >> %q\n' "$tool" "$work/pg.log" > "$work/fakepg/bin/$tool"; done
+printf '#!/usr/bin/env bash\necho "pg_ctl $*" >> %q\n' "$work/pg.log" > "$work/fakepg/bin/pg_ctl"
+chmod +x "$work/fakepg/bin/"*
+printf '#!/usr/bin/env bash\necho %q\n' "$work/fakepg" > "$work/fakepgbin/nix-build"
+chmod +x "$work/fakepgbin/nix-build"
+rm -f "$work/pg.log"
+status=0
+PATH="$work/fakepgbin:$PATH" "$project_root/tools/test-siblings.sh" "$projects/cand" \
+    --list <(printf 'sib-pg\ttest "$POSTGRES_HOST" = 127.0.0.1 && test -n "$POSTGRES_PORT" && test "$POSTGRES_DB" = food && test "$POSTGRES_USER" = postgres\tpostgres=food\nsib-good\ttest -z "${POSTGRES_HOST:-}"\n') \
+    --projects "$projects" --tests-only --out "$work/out6" > "$work/run6.log" 2>&1 || status=$?
+[[ $status == 0 ]] || fail "exit $status for a repository with a throwaway PostgreSQL" "$work/run6.log"
+grep -q '^initdb ' "$work/pg.log" && grep -q '^pg_ctl .*start' "$work/pg.log" && grep -q '^createdb .* food' "$work/pg.log" || fail "the fake PostgreSQL was not set up" "$work/pg.log"
+grep -q '^pg_ctl .*stop' "$work/pg.log" || fail "the PostgreSQL was not stopped" "$work/pg.log"
+status=0
+PATH="$work/fakepgbin:$PATH" "$project_root/tools/test-siblings.sh" "$projects/cand" --list <(printf 'sib-pg\tfalse\tpostgres=food\n') \
+    --projects "$projects" --tests-only --out "$work/out7" > "$work/run7.log" 2>&1 || status=$?
+[[ $status == 1 ]] || fail "exit $status, wanted 1 for failing tests" "$work/run7.log"
+[[ $(grep -c '^pg_ctl .*stop' "$work/pg.log") == 2 ]] || fail "the PostgreSQL was not stopped after failing tests" "$work/pg.log"
 echo "siblings tool: expected-fail programs are no regression, and an unexpected pass fails; a repository shell.nix is used. A regression (with its error) and a failing test fail the run, unused imports are counted once from both layers, a missing sibling is skipped, nothing is left behind"
