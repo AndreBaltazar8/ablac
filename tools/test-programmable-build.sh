@@ -180,7 +180,20 @@ invalid_request_status=$?
     >"$output_directory/unsupported-artifact.out" \
     2>"$output_directory/unsupported-artifact.err"
 unsupported_artifact_status=$?
+rm -f "$output_directory/ghost"
+"$compiler" build \
+    "$project_root/tests/cases/program-build/missing-entry.ab" \
+    -o "$output_directory/missing-entry" --fast --no-cache \
+    >"$output_directory/missing-entry.out" \
+    2>"$output_directory/missing-entry.err"
+missing_entry_status=$?
 set -e
+
+# A requested program whose entry is not there fails the build, naming it, and gets no output.
+[[ $missing_entry_status -ne 0 ]] || { echo "a program with a missing entry built" >&2; exit 1; }
+grep -qF "error[E_SOURCE_NOT_FOUND]: program 'ghost': no such file: tests/cases/program-build/no-such-entry.ab" \
+    "$output_directory/missing-entry.err" || { cat "$output_directory/missing-entry.err" >&2; exit 1; }
+[[ ! -e $output_directory/ghost ]] || { echo "the missing entry still produced ghost" >&2; exit 1; }
 
 [[ $invalid_request_status -ne 0 ]] || exit 1
 grep -q 'error\[E_BUILD_PROGRAM_REQUEST\]' \
