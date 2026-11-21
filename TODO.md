@@ -3307,7 +3307,7 @@ abla/http/async speaks HTTP/2 when `HttpAsyncOptions.http2` is true (abla/http/h
   pinned 23.1.3 rewrites it to `copysign(0.0, %v)` (and a following `fmul` gains `nnan ninf`): the program prints 0 in release, the compile-time jit and
   both Wasm modes, `nan` in `--fast` and the interpreter. The IR is plain IEEE: our emitter sets no fast-math flag on that path (the backend never sets one),
   and the pre-optimisation IR of the fuzz program has `fmul double 0.0, %x` / `fdiv double 0.0, %m` with none. Compiler Explorer: clang 22.1.0 and older keep
-  the `fdiv` (correct), 23.1.0 has the miscompile, trunk (24.0.0git c80ecb8d) folds it to `ret double +qnan` (correct): fixed after the 23.1 branch. The
+  the `fdiv` (correct), 23.1.0 has the miscompile, trunk (24.0.0git c80ecb8d) folds it to `ret double +qnan` (correct): fixed after the 23.1 branch by llvm-project PR #202482, commit bcb4e7d061ac (2026-07-18, "[InstCombine] Fix 0.0 / x -> 0 folds when the divisor may be zero", SimplifyDemandedUseFPClass; `CanIgnoreZeroByZeroNan`); 23.1.0 is not an ancestor of it. The
   4-line case is `tests/cases/llvm-miscompiles/fdiv-zero-by-zero-times-value.ll`; no test runs it (it would fail until LLVM is bumped to a release with the
   fix). Whether to report it upstream (or ask for a 23.1.x backport) is André's decision; the report text is in ~/agents-memory (llvm-fdiv-zero-report.md).
   Until the bump, a program that computes `0.0 / (0.0 * x)` with a non-literal `x` gets 0 instead of NaN in optimised builds; the fuzzer's seed 100097 shows it.
