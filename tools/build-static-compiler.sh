@@ -3,7 +3,7 @@
 # ABLA_STATIC_LLVM_LIB (a directory with libLLVM*.a; ABLA_STATIC_ZLIB one with libz.a when the C compiler finds none). It runs single-threaded for now:
 # the pthread family of src/static_libc is not threads yet, so the script's check builds with ABLA_NATIVE_JOBS=1 ABLA_CODEGEN_JOBS=1.
 # ABLA_STATIC_TARGET=aarch64-linux cross-builds it for AArch64 Linux instead (the AArch64 archives in ABLA_STATIC_LLVM_LIB and the target's libstdc++.a, libz.a,
-# libgcc.a in ABLA_STATIC_TARGET_LIBS; nix/aarch64-static-deps.nix makes both); run it under qemu-aarch64 or on an AArch64 machine.
+# libgcc.a in ABLA_STATIC_TARGET_LIBS; nix/aarch64-static-native-deps.nix makes both); run it under qemu-aarch64 or on an AArch64 machine.
 # Usage: tools/build-static-compiler.sh [compiler] [output]
 set -euo pipefail
 compiler=${1:-build/ablac}

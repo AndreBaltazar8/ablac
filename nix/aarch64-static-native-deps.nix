@@ -1,6 +1,6 @@
 # The AArch64 inputs of the statically linked compiler for aarch64-linux (tools/test-static-compiler-aarch64.sh) from nixpkgs' NATIVE aarch64-linux
 # packages, which cache.nixos.org has built (a download of a few hundred MB; an x86-64 nix only fetches the files, nothing of the target runs), instead of
-# pkgsCross.aarch64-multiplatform's (nix/aarch64-static-deps.nix), which is in no binary cache and builds from source in about two hours.
+# pkgsCross.aarch64-multiplatform's (the first version of this file), which is in no binary cache and builds from source in about two hours.
 # llvm/ holds libLLVM*.a (ABLA_STATIC_LLVM_LIB) and libs/ the target's libstdc++.a, libz.a and libgcc.a (ABLA_STATIC_TARGET_LIBS).
 { pkgs ? import ./nixpkgs.nix }:
 let

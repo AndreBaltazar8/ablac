@@ -3,7 +3,7 @@
 # AArch64 LLVM archives and the target's libstdc++.a/libz.a/libgcc.a) is a static-pie image with no needed library, and run under qemu-aarch64 it builds
 # each program of tests/cases/libc-imports for aarch64-linux, programs that behave as the ordinary (x86-64) compiler's cross builds of them do. Needs
 # ABLA_STATIC_LLVM_LIB (a directory with the AArch64 libLLVM*.a), ABLA_STATIC_TARGET_LIBS (a directory with libstdc++.a, libz.a and libgcc.a of AArch64) and
-# qemu-aarch64; without them it says so and passes (docs/toolchain.md: pkgsCross.aarch64-multiplatform's llvmPackages_23.libllvm.lib, zlib.static, the cross gcc).
+# qemu-aarch64; without them it says so and passes (nix/aarch64-static-native-deps.nix: nixpkgs' native aarch64-linux llvmPackages_23.libllvm.lib, zlib.static, the native gcc).
 # Usage: tools/test-static-compiler-aarch64.sh [compiler]
 set -euo pipefail
 export LC_ALL=C
