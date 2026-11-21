@@ -2,6 +2,7 @@
 
 ```abla
 import "abla/sql"
+val id = "00000000-0000-0000-0000-000000000001"
 val statement = $sql("SELECT id FROM users WHERE id=${id}::uuid AND active=${true}::boolean")
 ```
 
