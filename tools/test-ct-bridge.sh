@@ -22,13 +22,8 @@ mkdir -p "$output_directory"
 cd "$project_root"
 export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-2048}
 export ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-120}
-# tools/test-compile-effects.sh rewrites tests/cases/capabilities/input.txt and its abla.toml while it runs, and the
-# suite runs it beside this test: one copy, taken once, is what every case's work directory sees as
-# tests/cases/capabilities, so both tiers of a case read the same files.
-capabilities_snapshot="$output_directory/capabilities"
-cp -R tests/cases/capabilities "$capabilities_snapshot"
-# Each tier's work directory: links to the project's top-level directories (tests/cases/capabilities to the snapshot),
-# made once and copied.
+# Each tier's work directory: links to the project's top-level directories, made once and copied (tools/test-compile-effects.sh works on a copy
+# of tests/cases/capabilities, so the tracked case is the same for both tiers of every case).
 work_template="$output_directory/work-template"
 mkdir -p "$work_template/tests/cases"
 for top in "$project_root"/*; do
@@ -38,8 +33,7 @@ for top in "$project_root"/tests/*; do
     [[ ${top##*/} == cases ]] || ln -s "$top" "$work_template/tests/${top##*/}"
 done
 for top in "$project_root"/tests/cases/*; do
-    if [[ ${top##*/} == capabilities ]]; then ln -s "$capabilities_snapshot" "$work_template/tests/cases/capabilities"
-    else ln -s "$top" "$work_template/tests/cases/${top##*/}"; fi
+    ln -s "$top" "$work_template/tests/cases/${top##*/}"
 done
 
 compare_case() {

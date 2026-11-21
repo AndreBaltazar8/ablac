@@ -4,24 +4,37 @@ set -euo pipefail
 unset ABLA_CACHE_DIR
 
 compiler=${1:-build/ablac.bin}
+[[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 project_root=$(cd "$(dirname "$0")/.." && pwd)
 output_directory="$project_root/build/compile-effects-test"
 mkdir -p "$output_directory"
-input="$project_root/tests/cases/capabilities/input.txt"
-manifest="$project_root/tests/cases/capabilities/abla.toml"
-input_original=$(<"$input")
-manifest_original=$(<"$manifest")
+# This test rewrites the capabilities case's input.txt and abla.toml as it goes, so it works on a copy: a project directory of its own whose top-level
+# directories link to the project's (tests/cases/capabilities is the exception: a copy), and it runs there (the compile-time code reads
+# tests/cases/capabilities/input.txt relative to the working directory, and the default cache is build/.abla-cache under it). The tracked case is never
+# touched, so an interrupted run leaves the tree as it was and tests that run beside this one (test-ct-bridge.sh) see the original.
+work="$output_directory/work"
+rm -rf -- "$work"
+mkdir -p "$work/tests/cases" "$work/build"
+for top in "$project_root"/*; do
+    [[ ${top##*/} == build || ${top##*/} == tests ]] || ln -s "$top" "$work/${top##*/}"
+done
+for top in "$project_root"/tests/*; do
+    [[ ${top##*/} == cases ]] || ln -s "$top" "$work/tests/${top##*/}"
+done
+for top in "$project_root"/tests/cases/*; do
+    [[ ${top##*/} == capabilities ]] || ln -s "$top" "$work/tests/cases/${top##*/}"
+done
+cp -R "$project_root/tests/cases/capabilities" "$work/tests/cases/capabilities"
+capabilities="$work/tests/cases/capabilities"
+input="$capabilities/input.txt"
+manifest="$capabilities/abla.toml"
+cd "$work"
 network_server_pid=''
-restore_inputs() {
-    printf '%s\n' "$input_original" > "$input"
-    printf '%s\n' "$manifest_original" > "$manifest"
-}
 cleanup() {
     if [[ -n $network_server_pid ]]; then
         kill "$network_server_pid" 2>/dev/null || true
         wait "$network_server_pid" 2>/dev/null || true
     fi
-    restore_inputs
 }
 trap cleanup EXIT
 
@@ -113,7 +126,7 @@ grep -q 'compile.capability-not-authorized:filesystem.read' \
 set +e
 ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
-    "$project_root/tests/cases/capabilities/subparser-input-denied.ab" \
+    "$capabilities/subparser-input-denied.ab" \
     > "$output_directory/subparser-denied.ll" \
     2> "$output_directory/subparser-denied.err"
 subparser_denied_status=$?
@@ -127,7 +140,7 @@ grep -Eq '(LLVM compilation|compile-time evaluation) failed:' \
 # Historical compiler identities may each have a record for this fixture.
 # Remove only those recoverable input sidecars so the corruption assertion
 # below targets the record published by this exact compiler invocation.
-cache_directory="$project_root/build/.abla-cache"
+cache_directory="$work/build/.abla-cache"
 if [[ -d $cache_directory ]]; then
     while IFS= read -r -d '' input_record; do
         if grep -q 'tests/cases/capabilities/input.txt' "$input_record"; then
@@ -137,11 +150,11 @@ if [[ -d $cache_directory ]]; then
 fi
 
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/entry.ab" \
+    "$capabilities/entry.ab" \
     -o "$output_directory/granted" --fast
 printf '%s\n' 'compile-input-cache-hit' > "$output_directory/granted.ll"
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/entry.ab" \
+    "$capabilities/entry.ab" \
     -o "$output_directory/granted" --fast
 grep -q '^compile-input-cache-hit$' "$output_directory/granted.ll"
 set +e
@@ -157,12 +170,12 @@ while IFS= read -r -d '' input_record; do
         input_cache=$input_record
         break
     fi
-done < <(find "$project_root/build/.abla-cache" -type f \
+done < <(find "$work/build/.abla-cache" -type f \
     -name '*.inputs' -print0)
 [[ -n $input_cache ]] || exit 1
 printf '%s\n' 'corrupt-input-record' > "$input_cache"
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/entry.ab" \
+    "$capabilities/entry.ab" \
     -o "$output_directory/granted" --fast
 if grep -q '^compile-input-cache-hit$' "$output_directory/granted.ll"; then
     echo 'corrupt compile-input record was reused' >&2
@@ -172,7 +185,7 @@ fi
 printf '%s\n' 'compile-input-cache-hit' > "$output_directory/granted.ll"
 printf '%s\n' second > "$input"
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/entry.ab" \
+    "$capabilities/entry.ab" \
     -o "$output_directory/granted" --fast
 if grep -q '^compile-input-cache-hit$' "$output_directory/granted.ll"; then
     echo 'compile input content change reused a stale object' >&2
@@ -189,18 +202,18 @@ set -e
 # journal is still part of the final artifact identity.
 printf '%s\n' first > "$input"
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/subparser-input.ab" \
+    "$capabilities/subparser-input.ab" \
     -o "$output_directory/subparser-input" --fast
 printf '%s\n' 'subparser-input-cache-hit' > \
     "$output_directory/subparser-input.ll"
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/subparser-input.ab" \
+    "$capabilities/subparser-input.ab" \
     -o "$output_directory/subparser-input" --fast
 grep -q '^subparser-input-cache-hit$' \
     "$output_directory/subparser-input.ll"
 printf '%s\n' second > "$input"
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/subparser-input.ab" \
+    "$capabilities/subparser-input.ab" \
     -o "$output_directory/subparser-input" --fast
 if grep -q '^subparser-input-cache-hit$' \
     "$output_directory/subparser-input.ll"; then
@@ -217,17 +230,17 @@ set -e
 # The environment provider is deterministic: its named observation is
 # journaled, cacheable while unchanged, and invalidates on value changes.
 ABLA_COMPILE_TEST_INPUT=first "$compiler" build \
-    "$project_root/tests/cases/capabilities/environment.ab" \
+    "$capabilities/environment.ab" \
     -o "$output_directory/environment" --fast
 printf '%s\n' 'environment-input-cache-hit' > \
     "$output_directory/environment.ll"
 ABLA_COMPILE_TEST_INPUT=first "$compiler" build \
-    "$project_root/tests/cases/capabilities/environment.ab" \
+    "$capabilities/environment.ab" \
     -o "$output_directory/environment" --fast
 grep -q '^environment-input-cache-hit$' \
     "$output_directory/environment.ll"
 ABLA_COMPILE_TEST_INPUT=second "$compiler" build \
-    "$project_root/tests/cases/capabilities/environment.ab" \
+    "$capabilities/environment.ab" \
     -o "$output_directory/environment" --fast
 if grep -q '^environment-input-cache-hit$' \
     "$output_directory/environment.ll"; then
@@ -245,11 +258,11 @@ set -e
 # Process, clock, and randomness are deliberately ambient. Even when granted,
 # their presence disables native-object reuse/publication.
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/ambient.ab" \
+    "$capabilities/ambient.ab" \
     -o "$output_directory/ambient"
 printf '%s\n' 'ambient-cache-must-not-hit' > "$output_directory/ambient.ll"
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/ambient.ab" \
+    "$capabilities/ambient.ab" \
     -o "$output_directory/ambient"
 if grep -q '^ambient-cache-must-not-hit$' "$output_directory/ambient.ll"; then
     echo 'ambient compile-time effects reused a native object' >&2
@@ -264,11 +277,13 @@ set -e
 
 # File outputs stay in memory until the complete compiler/toolchain succeeds.
 # A failed compilation must therefore leave no externally visible output.
-transaction_output="$output_directory/transaction-output.txt"
+# (the cases write build/compile-effects-test/transaction-output.txt relative to the project, which is the work directory)
+transaction_output="$work/build/compile-effects-test/transaction-output.txt"
+mkdir -p "$(dirname "$transaction_output")"
 rm -f -- "$transaction_output"
 set +e
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/write-output-failure.ab" \
+    "$capabilities/write-output-failure.ab" \
     -o "$output_directory/write-output-failure" \
     > "$output_directory/write-output-failure.out" \
     2> "$output_directory/write-output-failure.err"
@@ -278,12 +293,12 @@ set -e
 [[ ! -e $transaction_output ]] || exit 1
 
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/write-output.ab" \
+    "$capabilities/write-output.ab" \
     -o "$output_directory/write-output"
 grep -q '^published-after-success$' "$transaction_output"
 
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/write-output-invalid-path.ab" \
+    "$capabilities/write-output-invalid-path.ab" \
     -o "$output_directory/write-output-invalid-path"
 set +e
 "$project_root/tools/run-limited.sh" \
@@ -291,15 +306,15 @@ set +e
 invalid_path_status=$?
 set -e
 [[ $invalid_path_status -eq 42 ]] || exit 1
-[[ ! -e "$project_root/../outside-project.txt" ]] || exit 1
+[[ ! -e "$work/../outside-project.txt" ]] || exit 1
 
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/network-bounded.ab" \
+    "$capabilities/network-bounded.ab" \
     -o "$output_directory/network-bounded"
 printf '%s\n' 'network-cache-must-not-hit' > \
     "$output_directory/network-bounded.ll"
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/network-bounded.ab" \
+    "$capabilities/network-bounded.ab" \
     -o "$output_directory/network-bounded"
 if grep -q '^network-cache-must-not-hit$' \
     "$output_directory/network-bounded.ll"; then
@@ -316,7 +331,7 @@ rm -rf -- "$network_ready" "$network_case"
 mkdir -p "$network_case"
 # The peer is an Abla program over a raw socket with literal PING/PONG bytes; the build
 # below is the client (a compile-time TCP exchange), so the two share no protocol code.
-"$compiler" build "$project_root/tests/cases/capabilities/network-peer.ab" -o "$output_directory/network-peer" --fast
+"$compiler" build "$capabilities/network-peer.ab" -o "$output_directory/network-peer" --fast
 cp "$manifest" "$network_case/abla.toml"
 # run_network_case [wrong]: serve one exchange (under a hard timeout), build the case
 # against the port the peer published, and set network_live_status to the program's status.
@@ -330,7 +345,7 @@ run_network_case() {
     done
     [[ -e $network_ready ]] || exit 1
     sed "s/39091/$(<"$network_ready")/" \
-        "$project_root/tests/cases/capabilities/network-live.ab" \
+        "$capabilities/network-live.ab" \
         > "$network_case/network-live.ab"
     "$compiler" build \
         "$network_case/network-live.ab" \
@@ -351,7 +366,7 @@ run_network_case
 printf '%s\n' 'compileCapabilities = []' > "$manifest"
 set +e
 "$compiler" build \
-    "$project_root/tests/cases/capabilities/entry.ab" \
+    "$capabilities/entry.ab" \
     -o "$output_directory/granted" --fast \
     > "$output_directory/manifest-denied.out" \
     2> "$output_directory/manifest-denied.err"
