@@ -142,11 +142,11 @@ if script --version 2>/dev/null | grep util-linux >/dev/null; then
     # process group (run-limited.sh's timeout --foreground), where the editor is on; timeout bounds script from
     # outside. A bare compiler needs the standard library named.
     TERM=xterm ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root} timeout 300 \
-        script -qfec "'$compiler' repl" "$base.editor.out" < "$base.editor.in" > /dev/null 2>&1 &
+        script -qfec "stty cols 20 rows 24; exec '$compiler' repl" "$base.editor.out" < "$base.editor.in" > /dev/null 2>&1 &
     editor_pid=$!
     exec 3> "$base.editor.in"
-    # A fresh prompt; a redraw prints it again after a carriage return.
-    prompts() { echo $(($(grep -o 'abla> ' "$base.editor.out" 2>/dev/null | wc -l) - $(grep -o $'\rabla> ' "$base.editor.out" 2>/dev/null | wc -l))); }
+    # A fresh prompt; a redraw prints it again after clearing its row (ESC [K).
+    prompts() { echo $(($(grep -o 'abla> ' "$base.editor.out" 2>/dev/null | wc -l) - $(grep -o $'\x1b\\[Kabla> ' "$base.editor.out" 2>/dev/null | wc -l))); }
     keys() { # prompts-to-wait-for keys
         local waited=0
         until [[ $(prompts) -ge $1 ]]; do
@@ -161,12 +161,13 @@ if script --version 2>/dev/null | grep util-linux >/dev/null; then
     keys 3 '\033[A\033[A\r'
     keys 4 '999\003'
     keys 5 '1\1777\r'
-    keys 6 '\004'
+    keys 6 '1 + 2 + 3 + 4 + 5 + 6 + 7\001100 + \r'
+    keys 7 '\004'
     exec 3>&-
     wait "$editor_pid" || { echo 'repl (editor): the session did not end on Ctrl-D' >&2; cat -v "$base.editor.out" >&2; exit 1; }
     # Each redraw starts with a carriage return: as line breaks, the values are lines of their own.
-    values=$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$base.editor.out" | tr '\r' '\n' | grep -vx '' | grep -v '^abla> \|^Script ')
-    [[ $values == $'42\n24\n42\n7' ]] && grep -q '\^C' "$base.editor.out" ||
+    values=$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$base.editor.out" | tr '\r' '\n' | grep -vx '' | grep -vxF '^C' | grep -v '^abla> \|^Script ')
+    [[ $values == $'42\n24\n42\n7\n128' ]] && grep -q '\^C' "$base.editor.out" && grep -q $'\x1b\[1A' "$base.editor.out" ||
         { echo "repl (editor): the keys did not edit the lines (values: $values)" >&2; cat -v "$base.editor.out" >&2; exit 1; }
     editor=checked
 fi

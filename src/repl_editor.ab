@@ -5,7 +5,7 @@
 //
 // Keys: left and right, Home and End (and Ctrl-A, Ctrl-E), Backspace, Delete, up and down through the session's
 // earlier lines, Ctrl-K (to the end) and Ctrl-U (to the start) cut, Ctrl-C drops the entry, Ctrl-D on an empty line
-// ends the input. A line longer than the terminal's width is redrawn on its last row only.
+// ends the input. A line longer than the terminal is wide is drawn over as many rows as it takes.
 import "abla/bytes"
 import "abla/text"
 import "abla/sys/linux"
@@ -106,10 +106,51 @@ fun bootstrapReplEditorRight(text: string, cursor: int): int {
 }
 
 // The line drawn again: the prompt, the text, the rest of the row cleared, the cursor put back.
+// A line longer than the terminal is wide wraps over rows: each draw clears the rows the last one used (from the
+// last up to the first), prints the prompt and the text, and puts the cursor back on its row and column. The last
+// draw's rows and cursor (in characters from the line's start) are kept here, from the prompt's draw on.
+var bootstrapReplEditorRows = 1
+var bootstrapReplEditorShown = 0
+var bootstrapReplEditorColumns = 80
+
 fun bootstrapReplEditorDraw(prompt: string, text: string, cursor: int): void {
-    val back = bootstrapReplEditorWidth(text, cursor, text.size)
-    linuxPrintStandardOutput(if (back > 0) "\r$prompt$text\x1b[K\x1b[${back}D" else "\r$prompt$text\x1b[K")
+    val columns = bootstrapReplEditorColumns
+    val start = bootstrapReplEditorWidth(prompt, 0, prompt.size)
+    val length = bootstrapReplEditorWidth(text, 0, text.size)
+    val position = bootstrapReplEditorWidth(text, 0, cursor)
+    var out = ""
+    // Down to the last row of the last draw, then each row cleared on the way up to its first.
+    val shownRow = (start + bootstrapReplEditorShown) / columns
+    val below = bootstrapReplEditorRows - 1 - shownRow
+    if (below > 0) out = "$out\x1b[${below}B"
+    for (row in 0 until bootstrapReplEditorRows - 1) out = "$out\r\x1b[K\x1b[1A"
+    out = "$out\r\x1b[K$prompt$text"
+    var rows = (start + length + columns - 1) / columns
+    if (rows < 1) rows = 1
+    // A line that ends at a row's last column leaves the terminal's cursor there, waiting to wrap: a line break
+    // takes it to the next row's start, where a cursor at the end belongs.
+    if (position == length && length > 0 && (start + length) % columns == 0) {
+        out = "$out\n\r"
+        rows = rows + 1
+    }
+    val cursorRow = (start + position) / columns
+    val up = rows - 1 - cursorRow
+    if (up > 0) out = "$out\x1b[${up}A"
+    val column = (start + position) % columns
+    out = if (column > 0) "$out\r\x1b[${column}C" else "$out\r"
+    linuxPrintStandardOutput(out)
+    bootstrapReplEditorRows = rows
+    bootstrapReplEditorShown = position
     return
+}
+
+// The terminal's width (TIOCGWINSZ: 21523 on Linux, 0x40087468 on macOS; columns are the second 16-bit word), or 80.
+trusted fun bootstrapReplEditorWidthOfTerminal(var scratch: NativeByteBuffer): int {
+    scratch.storeI64(0, 0)
+    val request = if (ablaHostIsMacOS()) 1074295912 else 21523
+    if (linuxSyscall3(16, 1, request, nativePointerAddress(scratch.address)) != 0) return 80
+    val columns = scratch.load(2) | (scratch.load(3) << 8)
+    if (columns > 0) columns else 80
 }
 
 // One line, read after `prompt` (printed here) with the keys of the file's header.
@@ -129,6 +170,9 @@ trusted fun bootstrapReplEditorRead(prompt: string): BootstrapReplEditorLine {
         raw.store(23, 1)
     }
     bootstrapReplEditorSet(raw)
+    bootstrapReplEditorColumns = bootstrapReplEditorWidthOfTerminal(raw)
+    bootstrapReplEditorRows = 1
+    bootstrapReplEditorShown = 0
     linuxPrintStandardOutput(prompt)
     var text = ""
     var cursor = 0
@@ -197,6 +241,8 @@ trusted fun bootstrapReplEditorRead(prompt: string): BootstrapReplEditorLine {
         }
         if (kind < 0) bootstrapReplEditorDraw(prompt, text, cursor)
     }
+    // The cursor to the line's end first: on a line over several rows the break goes after its last.
+    if (bootstrapReplEditorRows > 1 && cursor < text.size) bootstrapReplEditorDraw(prompt, text, text.size)
     linuxPrintStandardOutput(if (kind == 2) "^C\n" else "\n")
     bootstrapReplEditorSet(saved)
     saved.close()
