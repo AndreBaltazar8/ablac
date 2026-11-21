@@ -2,7 +2,7 @@
 
 Internal only. Regenerate with `tools/readiness.sh`; this is an evidence inventory, not a production approval or stability policy.
 
-Source revision: `e7090763dfc23b74bb2a2602686da4aa14425411`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.
+Source revision: `e0bd778e98e95b4d7f5145dfc02ee3ea77fc39d0`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.
 
 ## Stability
 
@@ -74,9 +74,9 @@ Counts are top-level migration bullets, a proxy for breaking changes. A present 
 
 ## Correctness
 
-Suite inventory: **545 recipe commands**, **399 case directories**. These are source inventory counts, not passing checks.
+Suite inventory: **546 recipe commands**, **400 case directories**. These are source inventory counts, not passing checks.
 
-Evidence: `build/gate/gate.log`; SHA-256 `5eeb669b54022816344fe408e8f024cc9739f7ebfea51c735db632c084df8a9f`.
+Evidence: `build/gate/gate.log`; SHA-256 `6a04e57333d1545eca5a5a61ab5e3d280f34423466e2bc389488066b582af7a3`.
 
     Fixed point: Missing
     Suite: Missing
