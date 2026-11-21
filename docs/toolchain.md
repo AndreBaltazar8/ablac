@@ -441,7 +441,9 @@ which does not interpolate, as `<array of size N>`), or a statement (`total += 5
 stderr and leaves the session as it was; a change the running code cannot take is refused (`E_LIVE_SIGNATURE`,
 ...) with the old definition kept; a line that does not compile prints its diagnostics. `:reset` starts a new
 program with nothing defined. Elsewhere `repl` compiles each line on its own in a child compiler, so only
-declarations persist.
+declarations persist. In both, an entry whose bracket (`(`, `[`, `{`), string or `/*` comment is still open
+continues on the next line (`....> `), so a function or class body can span lines; an empty line ends an
+entry still open.
 
 The interpreter is not a second language implementation. Compile-time `#`
 evaluation, `run`, tests, the REPL, and macro/subparser handlers share the same

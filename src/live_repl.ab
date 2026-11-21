@@ -12,6 +12,8 @@
 //   in it is contained: the reload fails (E_LIVE_PANIC), its message goes to standard error and the session's state
 //   is as it was.
 // - `:reset` ends the program and starts a new one with nothing defined; `:quit` (or the end of the input) ends it.
+// - A "line" is an entry (bootstrapReplReadEntry): it continues on the next lines while a bracket is open, in this
+//   REPL and in the one of a run without live mode (orc_main.ab).
 import "abla/fs"
 import "abla/text"
 import "abla/unsafe/memory"
@@ -21,6 +23,7 @@ import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/process/exit"
 import "live_reload.ab"
+import "lexer.ab"
 
 class BootstrapReplDeclaration(val key: string, val line: string)
 
@@ -50,12 +53,52 @@ fun bootstrapReplKey(line: string): string {
     var end = 0
     while (end < rest.size) {
         val byte = rest[end]
-        // ( < : = { space
-        if (byte == 40 || byte == 60 || byte == 58 || byte == 61 || byte == 123 || byte == 32) break
+        // ( < : = { space, line break
+        if (byte == 40 || byte == 60 || byte == 58 || byte == 61 || byte == 123 || byte == 32 || byte == 10) break
         end = end + 1
     }
     val family = if (kind == "val " || kind == "var ") "variable" else if (kind == "fun ") "function" else "type"
     "$family ${rest.slice(0, end)}"
+}
+
+// Whether `text` is an entry still open: a bracket ( [ { not closed, a string, or a `/*` comment or `"""` string not
+// ended. The compiler's lexer counts, so a bracket inside a string, a comment or an interpolation is not one.
+fun bootstrapReplOpen(text: string): bool {
+    var depth = 0
+    var strings = 0
+    for (token in bootstrapLex(text)) {
+        val kind = token.kind
+        if (kind == BOOTSTRAP_TOKEN_LPAREN || kind == BOOTSTRAP_TOKEN_LBRACKET || kind == BOOTSTRAP_TOKEN_LBRACE) {
+            depth = depth + 1
+        } else if (kind == BOOTSTRAP_TOKEN_RPAREN || kind == BOOTSTRAP_TOKEN_RBRACKET ||
+            kind == BOOTSTRAP_TOKEN_RBRACE) {
+            depth = depth - 1
+        } else if (kind == BOOTSTRAP_TOKEN_STRING_START) {
+            strings = strings + 1
+        } else if (kind == BOOTSTRAP_TOKEN_STRING_END) {
+            strings = strings - 1
+        } else if (kind == BOOTSTRAP_TOKEN_INVALID && token.end == text.size) {
+            val opening = text.slice(token.begin, text.size)
+            if (opening.startsWith("/*") || opening.startsWith("\"\"\"")) return true
+        }
+    }
+    depth > 0 || strings > 0
+}
+
+// One entry: a line, and while it is open (bootstrapReplOpen) the lines after it, each read after a "....> " prompt,
+// so a declaration or expression can span lines. An empty line ends an entry still open (the compiler then says what
+// is missing), as does the end of the input. Not available at the end of the input.
+fun bootstrapReplReadEntry(var input: LinuxInput): LinuxInputLine {
+    val first = input.readLine()
+    if (!first.available) return first
+    var text = first.text
+    while (bootstrapReplOpen(text)) {
+        linuxPrintStandardOutput("....> ")
+        val next = input.readLine()
+        if (!next.available || next.text.trim() == "") break
+        text = "$text\n${next.text}"
+    }
+    LinuxInputLine(text, true)
 }
 
 // The session's program: its imports, the REPL's helpers, the declarations, the current line, and main, which waits. The
@@ -160,7 +203,7 @@ fun bootstrapReplStep(): void {
         return
     }
     linuxPrintStandardOutput("abla> ")
-    val input = bootstrapReplInput.readLine()
+    val input = bootstrapReplReadEntry(bootstrapReplInput)
     if (!input.available || input.text == ":quit") {
         bootstrapReplQuit = true
         bootstrapReplEnd()

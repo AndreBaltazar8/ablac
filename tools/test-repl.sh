@@ -31,6 +31,11 @@ recovery=$!
 printf 'fun add(value: int): int = value + 1\nadd(41)\nval base: int = 40\nbase + 2\n:reset\nbase\n:quit\n' |
     session definitions 120 &
 definitions=$!
+# An entry continues while a bracket is open ("....> "): a function over four lines, an expression over two; an empty
+# line ends one still open (its error is shown, and the session goes on).
+printf 'fun add(value: int): int {\n    val one = 1\n    return value + one\n}\nadd(41)\n(1 +\n2)\n(1 +\n\n20 + 22\n:quit\n' |
+    session multiline 120 &
+multiline=$!
 # Each line compiles in a child compiler (about half a second, most of it
 # the runtime, on an idle machine), so 32 generations stay within the memory
 # limit in time.
@@ -45,7 +50,7 @@ generations=$!
 # prints, a line that panics leaves the session and its state as they were, and a redefinition the running code
 # cannot take is refused with the old one kept.
 if ((live)); then
-    printf 'var total = 0\ntotal += 5\ntotal\n"ab" + "c"\n1.5 * 3.0\n[1, 2, 3]\n:quit\n' | session state 300 &
+    printf 'var total = 0\ntotal += 5\ntotal\n"a{" + "c"\n1.5 * 3.0\n[1, 2, 3]\n:quit\n' | session state 300 &
     state=$!
     printf 'val xs = [1, 2]\nxs[5]\nxs.size\n:quit\n' | session panic 300 &
     panicking=$!
@@ -54,12 +59,13 @@ if ((live)); then
 fi
 wait "$recovery"
 wait "$definitions"
+wait "$multiline"
 wait "$generations"
 if ((live)); then
     wait "$state"
     wait "$panicking"
     wait "$refused"
-    [[ $(< "$base.state.out") == $'abla> defined\nabla> 5\nabla> 5\nabla> abc\nabla> 4.5\nabla> <array of size 3>\nabla> ' ]] ||
+    [[ $(< "$base.state.out") == $'abla> defined\nabla> 5\nabla> 5\nabla> a{c\nabla> 4.5\nabla> <array of size 3>\nabla> ' ]] ||
         { echo 'repl (state): a variable did not keep its value, or a value did not print' >&2; cat "$base.state.out" "$base.state.err" >&2; exit 1; }
     [[ $(< "$base.panic.out") == $'abla> defined\nabla> abla> 2\nabla> ' ]] && grep -q 'E_LIVE_PANIC' "$base.panic.err" ||
         { echo 'repl (panic): a line that panics did not leave the session and its state as they were' >&2; cat "$base.panic.out" "$base.panic.err" >&2; exit 1; }
@@ -71,6 +77,8 @@ fi
 grep -q 'identifier:missingName' "$base.recovery.err"
 [[ $(< "$base.definitions.out") == $'abla> defined\nabla> 42\nabla> defined\nabla> 42\nabla> reset\nabla> abla> ' ]] || exit 1
 grep -q 'identifier:base' "$base.definitions.err"
+[[ $(< "$base.multiline.out") == $'abla> ....> ....> ....> defined\nabla> 42\nabla> ....> 3\nabla> ....> abla> 42\nabla> ' ]] ||
+    { echo 'repl (multiline): an entry over several lines was not read as one' >&2; cat "$base.multiline.out" "$base.multiline.err" >&2; exit 1; }
 [[ $(grep -o '42' "$base.generations.out" | wc -l) -eq 32 ]] || exit 1
 
-printf '%s\n' 'persistent REPL: retained definitions + recovery + reclaimed JIT generations; live: state across lines, a contained panic, a refused redefinition'
+printf '%s\n' 'persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines; live: state across lines, a contained panic, a refused redefinition'
