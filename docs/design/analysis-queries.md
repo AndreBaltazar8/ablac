@@ -32,7 +32,7 @@ as graph-v1 apply: a known target can be queried while `complete` is false.
 `stale_revision` rejects a supplied revision after source or configuration changes;
 `document_not_analyzed` rejects a file outside the selected program graph.
 Offsets outside the file and invalid URI/number forms use `invalid_params`.
-Legacy mode continues to reject these methods with `method_not_found`.
+Legacy mode rejected these methods with `method_not_found` (history: it was removed in #832).
 
 ## Indexing and invalidation
 

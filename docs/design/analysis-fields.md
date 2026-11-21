@@ -19,7 +19,7 @@ must not mistake absent occurrences for evidence that a declaration has no
 references. Request a full view when a feature requires all occurrences, or use
 `query/definition`, `query/hover`, and `query/references`.
 
-Omitting `fields` preserves the existing analyze response bytes exactly. Legacy
+Omitting `fields` preserves the existing analyze response bytes exactly. Legacy (removed in #832)
 mode does not advertise this capability and retains its existing behavior.
 Older clients/compilers need no changes. Only explicitly opted-in graph clients
 should send the selection.

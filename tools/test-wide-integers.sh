@@ -200,9 +200,9 @@ echo "ok   refusals: $(ls "$cases"/invalid-*.ab | wc -l)"
 
 # The analysis service takes it as it takes the other widths.
 analysis=$(printf '%s\n' \
-    '{"schema":1,"id":1,"method":"initialize","params":{"workspaceRoots":[],"clientName":"wide-test","clientVersion":"1"}}' \
+    '{"schema":1,"id":1,"method":"initialize","params":{"workspaceRoots":[],"clientName":"wide-test","clientVersion":"1","analysisMode":"graph-v1"}}' \
     '{"schema":1,"id":2,"method":"document/open","params":{"uri":"file:///tmp/abla-wide-analysis.ab","version":1,"text":"import \"abla/'"$type"'\"\nfun twice(value: '"$type"'): '"$type"' = value + value\nfun wrong(value: '"$type"'): bool = value == 1\n"}}' \
-    '{"schema":1,"id":3,"method":"analyze","params":{}}' \
+    '{"schema":1,"id":3,"method":"analyze","params":{"roots":["/tmp/abla-wide-analysis.ab"]}}' \
     '{"schema":1,"id":4,"method":"shutdown","params":{}}' | "$compiler" analyze --stdio)
 grep -q '"name":"twice"' <<<"$analysis" || { echo "analysis has no \`twice\`: $analysis" >&2; exit 1; }
 grep -q 'comparison.type' <<<"$analysis" || { echo "analysis missed a mixed comparison: $analysis" >&2; exit 1; }

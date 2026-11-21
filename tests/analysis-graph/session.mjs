@@ -16,11 +16,11 @@ const uri = (file) => pathToFileURL(file).href;
 const bytes = (text) => Buffer.byteLength(text);
 
 class Session {
-    constructor(project, { graph = true, mode = 'graph-v1' } = {}) {
+    constructor(project, { mode = 'graph-v1', initialize = true } = {}) {
         this.id = 0;
         this.project = project;
-        this.graph = graph;
         this.mode = mode;
+        this.initialize = initialize;
     }
     async start() {
         const stderr = fs.openSync(path.join(this.project, 'service.stderr'), 'w');
@@ -28,12 +28,12 @@ class Session {
         fs.closeSync(stderr);
         this.exit = new Promise((resolve) => this.process.on('close', resolve));
         this.lines = readline.createInterface({ input: this.process.stdout })[Symbol.asyncIterator]();
-        const params = { workspaceRoots: [this.project], clientName: 'graph-fixture', clientVersion: '1' };
-        if (this.graph) params.analysisMode = this.mode;
+        if (!this.initialize) return this;
+        const params = { workspaceRoots: [this.project], clientName: 'graph-fixture', clientVersion: '1', analysisMode: this.mode };
         const init = (await this.rpc('initialize', params)).result;
         assert.equal(init.protocolVersion, 1);
-        assert.equal(init.capabilities.includes('module-graph-analysis-v1'), this.graph);
-        assert.equal(init.capabilities.includes('stable-declaration-ids-v1'), this.graph && this.mode === 'graph-v2');
+        assert.ok(init.capabilities.includes('module-graph-analysis-v1'));
+        assert.equal(init.capabilities.includes('stable-declaration-ids-v1'), this.mode === 'graph-v2');
         return this;
     }
     async rpc(method, params) {
@@ -49,7 +49,7 @@ class Session {
     async analyze() {
         const result = (await this.rpc('analyze', {})).result;
         assert.equal(typeof result.revision, 'string');
-        if (this.graph) assert.equal(result.analysisMode, this.mode);
+        assert.equal(result.analysisMode, this.mode);
         for (const document of result.documents) {
             for (const key of ['uri', 'version', 'text', 'symbols', 'occurrences', 'diagnostics']) assert.ok(key in document, key);
             for (const symbol of document.symbols) {
@@ -188,10 +188,18 @@ async function negativeProtocol() {
     const p = fixture('bad-protocol', { 'main.ab': 'fun main: int = 0\n' });
     const s = await start(p);
     assert.equal(code(await s.rpc('document/open', { uri: 'https://invalid/main.ab', version: 1, text: 'fun main: int = 1\n' })), 'invalid_params');
-    assert.equal(code(await s.rpc('initialize', {})), 'already_initialized');
+    assert.equal(code(await s.rpc('initialize', { analysisMode: 'graph-v1' })), 'already_initialized');
     const r = (await s.rpc('analyze', { roots: [path.join(p, 'main.ab'), path.join(p, 'other.ab')] })).result;
     assert.ok(!r.complete && r.issues.length > 0);
     await s.close();
+    // The legacy mode (an initialize without analysisMode) is gone (#832): refused, and so is anything before an
+    // accepted initialize.
+    const bare = await start(p, { initialize: false });
+    const params = { workspaceRoots: [p], clientName: 'graph-fixture', clientVersion: '1' };
+    assert.equal(code(await bare.rpc('initialize', params)), 'unsupported_analysis_mode');
+    assert.equal(code(await bare.rpc('analyze', {})), 'not_initialized');
+    assert.ok((await bare.rpc('initialize', { ...params, analysisMode: 'graph-v1' })).result.capabilities.includes('module-graph-analysis-v1'));
+    await bare.close();
 }
 
 async function packages() {
@@ -282,9 +290,6 @@ async function queries() {
     assert.equal(changed.value.type, 'string');
     assert.notEqual(changed.revision, restored.revision);
     await s.close();
-    const legacy = await start(p, { graph: false });
-    assert.equal(code(await legacy.rpc('query/hover', params)), 'method_not_found');
-    await legacy.close();
 }
 
 // A type is written as text (`s: Square`, `Square(2)`, `: Shape`) and a module imported under an alias is written as a qualifier (`geo.area`):

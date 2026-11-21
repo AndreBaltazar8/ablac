@@ -1,5 +1,9 @@
 # Opt-in module-graph analysis
 
+History: graph mode is the only analysis since #832 (2026-11-21). The legacy mode (an `initialize` without
+`analysisMode`) was removed, and such an `initialize` is refused with `unsupported_analysis_mode`. The
+legacy comparisons below record the migration.
+
 The subsequent [indexed-query extension](analysis-queries.md) adds warm snapshot
 reuse and positional requests. Measurements below describe the initial graph step.
 

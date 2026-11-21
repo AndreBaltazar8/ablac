@@ -37,7 +37,6 @@ class BootstrapAnalysisService(
     var revision: int,
     var initialized: bool,
     var running: bool,
-    var graphMode: bool = false,
     // graph-v2: the symbols' ids are stable (module, container path, name, overload signature) instead of offset-based.
     var graphStableIds: bool = false,
     // initialize `unusedImports`: W_UNUSED_IMPORT warnings in the analysis (graph modes; see graphUnusedImports).
@@ -58,12 +57,6 @@ class BootstrapAnalysisService(
     var graphReferencesRevision: int = -1,
     // Each module's parse and symbols as of the source they were made from (see graphSnapshot); dropped when the entry changes.
     var graphParsed: Map<string, BootstrapAnalysisGraphParsed> = Map()
-)
-
-class BootstrapAnalysisSemanticGroup(
-    val declarations: array<BootstrapDeclaration>,
-    val semantic: BootstrapSemanticResult,
-    val occurrenceIndex: BootstrapAnalysisOccurrenceIndex
 )
 
 fun bootstrapAnalysisHexDigit(value: int): int {
@@ -213,71 +206,6 @@ fun BootstrapAnalysisService.documents(): array<BootstrapAnalysisDocument> {
         root = root + 1
     }
     documents
-}
-
-fun bootstrapAnalysisDocumentPathIndex(
-    documents: array<BootstrapAnalysisDocument>,
-    requested: string
-): int {
-    val normalized = bootstrapNormalizeModulePath(requested)
-    var result = -1
-    var index = 0
-    while (result < 0 && index < documents.size) {
-        if (bootstrapNormalizeModulePath(documents[index].path) == normalized) {
-            result = index
-        }
-        index = index + 1
-    }
-    result
-}
-
-// A workspace may contain independent projects, examples, fixtures, and test
-// cases with intentionally repeated declaration names. Only modules connected
-// by a real import edge share a semantic universe. Keeping those components
-// separate prevents an unrelated `main`, helper, or fixture from making an
-// otherwise valid open document ambiguous.
-fun bootstrapAnalysisComponentIds(
-    documents: array<BootstrapAnalysisDocument>
-): array<int> {
-    val components: array<int> = []
-    var document = 0
-    while (document < documents.size) {
-        components.append(document)
-        document = document + 1
-    }
-    document = 0
-    while (document < documents.size) {
-        val scan = bootstrapScanImports(documents[document].text)
-        var edge = 0
-        while (edge < scan.edges.size) {
-            if (!scan.edges[edge].provider) {
-                val resolved = bootstrapImportAliasExposedTarget(
-                    bootstrapResolveImport(
-                        documents[document].path,
-                        scan.edges[edge].source
-                    )
-                )
-                val imported = bootstrapAnalysisDocumentPathIndex(
-                    documents, resolved
-                )
-                if (imported >= 0 &&
-                    components[document] != components[imported]) {
-                    val replaced = components[imported]
-                    val retained = components[document]
-                    var index = 0
-                    while (index < components.size) {
-                        if (components[index] == replaced) {
-                            components[index] = retained
-                        }
-                        index = index + 1
-                    }
-                }
-            }
-            edge = edge + 1
-        }
-        document = document + 1
-    }
-    components
 }
 
 fun bootstrapAnalysisSymbolKind(kind: string): string {
@@ -1192,31 +1120,6 @@ fun bootstrapAnalysisOccurrenceSet(
     BootstrapAnalysisOccurrenceSet(begins, ends, ids, types)
 }
 
-/** The exported occurrences (a name, its range, and its declarationId and type when it has them) as a tree. */
-fun bootstrapAnalysisOccurrenceSetJson(source: string, set: BootstrapAnalysisOccurrenceSet): Json {
-    val values: array<Json> = []
-    for (item in 0 until set.begins.size) {
-        val keys = ["name", "range"]
-        val occurrenceValues = [
-            jsonString(source.slice(set.begins[item], set.ends[item])),
-            jsonObject(
-                ["start", "end"],
-                [jsonInteger(set.begins[item]), jsonInteger(set.ends[item])]
-            )
-        ]
-        if (set.ids[item] != "") {
-            keys.append("declarationId")
-            occurrenceValues.append(jsonString(set.ids[item]))
-        }
-        if (set.types[item] != "") {
-            keys.append("type")
-            occurrenceValues.append(jsonString(set.types[item]))
-        }
-        values.append(jsonObject(keys, occurrenceValues))
-    }
-    jsonArray(values)
-}
-
 /** The same list as jsonStringify writes it, without the tree: one string per document, kept as a raw node in the answer. */
 fun bootstrapAnalysisOccurrenceSetText(source: string, set: BootstrapAnalysisOccurrenceSet): string {
     val out = byteBuffer()
@@ -1243,19 +1146,6 @@ fun bootstrapAnalysisOccurrenceSetText(source: string, set: BootstrapAnalysisOcc
     out.appendText("]")
     out.toText()
 }
-
-fun bootstrapAnalysisOccurrencesJson(
-    source: string,
-    sourceIdentity: string,
-    parsed: BootstrapParseResult,
-    declarations: array<BootstrapDeclaration>,
-    semantic: BootstrapSemanticResult,
-    aliases: Map<string, string> = Map(),
-    requireKnownIdentity: bool = false,
-    occurrenceIndex: BootstrapAnalysisOccurrenceIndex? = null
-): Json = bootstrapAnalysisOccurrenceSetJson(source, bootstrapAnalysisOccurrenceSet(source,
-    sourceIdentity, parsed, declarations, semantic, aliases, requireKnownIdentity,
-    occurrenceIndex))
 
 fun bootstrapAnalysisCollectTypedRequests(
     expression: BootstrapExpression,
@@ -1317,190 +1207,8 @@ fun bootstrapAnalysisCollectDeclarationRequests(
     }
 }
 
-fun bootstrapAnalysisDiagnosticCode(diagnostics: string): string =
-    bootstrapFrontendDiagnosticCode(diagnostics)
-
-fun bootstrapAnalysisAppendLocatedDiagnostics(
-    diagnostics: string,
-    prefix: string,
-    text: string,
-    var values: array<Json>
-): void {
-    val located: array<BootstrapFrontendDiagnostic> = []
-    bootstrapFrontendAppendLocatedDiagnostics(diagnostics, prefix, "", text, located)
-    for (diagnostic in located) values.append(bootstrapFrontendDiagnosticJson(diagnostic))
-    return
-}
-
-fun bootstrapAnalysisDiagnosticsJson(
-    text: string,
-    parsed: BootstrapParseResult,
-    semantic: BootstrapSemanticResult,
-    sourceIdentity: string
-): Json {
-    val values: array<Json> = []
-    bootstrapAnalysisAppendLocatedDiagnostics(
-        parsed.diagnostics,
-        "source[parser]:$sourceIdentity:",
-        text,
-        values
-    )
-    // Extension diagnostics do not all carry a normalized source identity yet.
-    // Preserve a visible fallback until every generated/subparser producer does.
-    if (values.size == 0 && (parsed.errors > 0 ||
-        parsed.extensionErrors > 0 || parsed.diagnostics != "")) {
-        values.append(jsonObject(
-            ["code", "message", "range"],
-            [
-                jsonString(bootstrapAnalysisDiagnosticCode(
-                    parsed.diagnostics
-                )),
-                jsonString(parsed.diagnostics),
-                jsonObject(
-                    ["start", "end"],
-                    [jsonInteger(0), jsonInteger(if (text.size > 0) 1 else 0)]
-                )
-            ]
-        ))
-    }
-    bootstrapAnalysisAppendLocatedDiagnostics(
-        semantic.diagnostics,
-        "source[semantic]:$sourceIdentity:",
-        text,
-        values
-    )
-    jsonArray(values)
-}
-
-fun bootstrapAnalysisDocumentJson(
-    document: BootstrapAnalysisDocument,
-    parsed: BootstrapParseResult,
-    declarations: array<BootstrapDeclaration>,
-    semantic: BootstrapSemanticResult,
-    occurrenceIndex: BootstrapAnalysisOccurrenceIndex
-): Json {
-    jsonObject(
-        [
-            "uri", "version", "text", "symbols", "occurrences",
-            "diagnostics"
-        ],
-        [
-            jsonString(document.uri),
-            jsonInteger(document.version),
-            jsonString(document.text),
-            bootstrapAnalysisSymbolsJson(document.text, document.uri, parsed),
-            bootstrapAnalysisOccurrencesJson(
-                document.text, document.path, parsed, declarations, semantic, Map(), false,
-                occurrenceIndex
-            ),
-            bootstrapAnalysisDiagnosticsJson(
-                document.text, parsed, semantic, document.path
-            )
-        ]
-    )
-}
-
-fun bootstrapAnalysisSemanticGroup(
-    documents: array<BootstrapAnalysisDocument>,
-    parsedDocuments: array<BootstrapParseResult>,
-    components: array<int>,
-    requestedComponent: int
-): BootstrapAnalysisSemanticGroup {
-    val declarations: array<BootstrapDeclaration> = []
-    val actions: array<BootstrapExpression> = []
-    val compileInputPaths: array<string> = []
-    val compileInputContents: array<string> = []
-    var errors = 0
-    var extensionErrors = 0
-    var diagnostics = ""
-    val typedBegins: array<int> = []
-    val typedEnds: array<int> = []
-    val typedKinds: array<string> = []
-    val typedSources: array<string> = []
-    var document = 0
-    while (document < documents.size) {
-        if (components[document] == requestedComponent) {
-            val parsed = parsedDocuments[document]
-            errors = errors + parsed.errors
-            extensionErrors = extensionErrors + parsed.extensionErrors
-            diagnostics = "$diagnostics${parsed.diagnostics}"
-            var declaration = 0
-            while (declaration < parsed.declarations.size) {
-                declarations.append(parsed.declarations[declaration])
-                bootstrapAnalysisCollectDeclarationRequests(
-                    parsed.declarations[declaration],
-                    typedBegins, typedEnds, typedKinds, typedSources
-                )
-                declaration = declaration + 1
-            }
-            var action = 0
-            while (action < parsed.actions.size) {
-                actions.append(parsed.actions[action])
-                bootstrapAnalysisCollectTypedRequests(
-                    parsed.actions[action], documents[document].path,
-                    typedBegins, typedEnds, typedKinds, typedSources
-                )
-                action = action + 1
-            }
-        }
-        document = document + 1
-    }
-    val merged = BootstrapParseResult(
-        declarations, actions, errors, extensionErrors,
-        compileInputPaths, compileInputContents, diagnostics
-    )
-    val semantic = bootstrapFrontendAnalyzeRequested(
-        merged, typedBegins, typedEnds, typedKinds, typedSources
-    )
-    BootstrapAnalysisSemanticGroup(declarations, semantic,
-        bootstrapAnalysisOccurrenceIndex(declarations, semantic))
-}
-
-fun BootstrapAnalysisService.legacySnapshot(): Json {
-    val documents = this.documents()
-    val parsedDocuments: array<BootstrapParseResult> = []
-    var documentIndex = 0
-    while (documentIndex < documents.size) {
-        val parsed = bootstrapParseWithIdentity(
-            documents[documentIndex].text,
-            documents[documentIndex].path
-        )
-        parsedDocuments.append(parsed)
-        documentIndex = documentIndex + 1
-    }
-    val components = bootstrapAnalysisComponentIds(documents)
-    val groupIds: array<int> = []
-    val groups: array<BootstrapAnalysisSemanticGroup> = []
-    val values: array<Json> = []
-    var index = 0
-    while (index < documents.size) {
-        var group = -1
-        var candidate = 0
-        while (group < 0 && candidate < groupIds.size) {
-            if (groupIds[candidate] == components[index]) group = candidate
-            candidate = candidate + 1
-        }
-        if (group < 0) {
-            groupIds.append(components[index])
-            groups.append(bootstrapAnalysisSemanticGroup(
-                documents, parsedDocuments, components, components[index]
-            ))
-            group = groups.size - 1
-        }
-        values.append(bootstrapAnalysisDocumentJson(
-            documents[index], parsedDocuments[index],
-            groups[group].declarations, groups[group].semantic, groups[group].occurrenceIndex
-        ))
-        index = index + 1
-    }
-    jsonObject(
-        ["revision", "documents"],
-        [jsonString("${this.revision}"), jsonArray(values)]
-    )
-}
-
 fun BootstrapAnalysisService.snapshot(): Json =
-    if (this.graphMode) this.graphSnapshot() else this.legacySnapshot()
+    this.graphSnapshot()
 
 fun bootstrapAnalysisSnapshotDiagnosticCount(
     snapshot: Json,
@@ -1607,11 +1315,10 @@ fun bootstrapAnalysisSnapshotPreservesUneditedSymbols(
 fun bootstrapAnalysisOwnedString(value: string): string = "$value"
 
 fun BootstrapAnalysisService.validateEdit(params: Json): Json {
-    val graphBaseline = if (this.graphMode) this.graphSnapshot() else jsonNull()
+    val graphBaseline = this.graphSnapshot()
     var valid = params.getString("baseRevision") == "${this.revision}"
     var reason = if (valid) "" else "analysis revision is stale"
     val candidate = BootstrapAnalysisService([], [], this.revision, true, true)
-    candidate.graphMode = this.graphMode
     candidate.graphStableIds = this.graphStableIds
     for (entry in this.graphEntries) candidate.graphEntries.append(entry)
     var root = 0
@@ -1728,17 +1435,15 @@ fun BootstrapAnalysisService.validateEdit(params: Json): Json {
         edit = edit + 1
     }
 
-    val baseline = if (this.graphMode) graphBaseline else this.snapshot()
-    if (this.graphMode && !baseline.get("complete").asBoolean()) {
+    val baseline = graphBaseline
+    if (!baseline.get("complete").asBoolean()) {
         return jsonObject(["valid", "reason"], [jsonBoolean(false),
             jsonString("graph analysis is incomplete; compile-time evaluation was not performed")])
     }
-    if (this.graphMode) {
-        candidate.graphEntries.truncate(0)
-        candidate.graphEntries.append(baseline.getString("entry"))
-    }
+    candidate.graphEntries.truncate(0)
+    candidate.graphEntries.append(baseline.getString("entry"))
     val prospective = if (valid) candidate.snapshot() else jsonNull()
-    if (valid && this.graphMode && !prospective.get("complete").asBoolean()) {
+    if (valid && !prospective.get("complete").asBoolean()) {
         valid = false
         reason =
             "prospective graph analysis is incomplete; compile-time evaluation was not performed"
@@ -1793,16 +1498,14 @@ fun BootstrapAnalysisService.initialize(params: Json): Json {
             index = index + 1
         }
     }
-    this.graphMode = params.getString("analysisMode") == "graph-v1" ||
-        params.getString("analysisMode") == "graph-v2"
     this.graphStableIds = params.getString("analysisMode") == "graph-v2"
-    this.graphUnusedImports = this.graphMode && params.get("unusedImports").asBoolean()
+    this.graphUnusedImports = params.get("unusedImports").asBoolean()
     if (this.graphUnusedImports) bootstrapUnusedImportsRequested = true
-    this.graphUnusedLocals = this.graphMode && params.get("unusedLocals").asBoolean()
+    this.graphUnusedLocals = params.get("unusedLocals").asBoolean()
     if (this.graphUnusedLocals) bootstrapUnusedLocalsRequested = true
-    this.graphUnusedParameters = this.graphMode && params.get("unusedParameters").asBoolean()
+    this.graphUnusedParameters = params.get("unusedParameters").asBoolean()
     if (this.graphUnusedParameters) bootstrapUnusedParametersRequested = true
-    this.graphUnusedDeclarations = this.graphMode && params.get("unusedDeclarations").asBoolean()
+    this.graphUnusedDeclarations = params.get("unusedDeclarations").asBoolean()
     if (this.graphUnusedDeclarations) bootstrapUnusedDeclarationsRequested = true
     val entries = params.get("entryPoints")
     var entryIndex = 0
@@ -1813,19 +1516,16 @@ fun BootstrapAnalysisService.initialize(params: Json): Json {
     }
     val capabilities = [jsonString("document-overlays"), jsonString("parser-diagnostics"),
         jsonString("declarations"), jsonString("semantic-call-references"),
-        jsonString("semantic-name-references")]
-    if (this.graphMode) {
-        capabilities.append(jsonString("module-graph-analysis-v1"))
-        if (this.graphStableIds) {
-            capabilities.append(jsonString("stable-declaration-ids-v1"))
-            capabilities.append(jsonString("analysis-since-v1"))
-        }
-        capabilities.append(jsonString("no-eval-ct"))
-        capabilities.append(jsonString("pre-ct-types"))
-        capabilities.append(jsonString("analysis-queries-v1"))
-        capabilities.append(jsonString("analysis-fields-v1"))
-        capabilities.append(jsonString("refactor-validation-complete-only"))
+        jsonString("semantic-name-references"), jsonString("module-graph-analysis-v1")]
+    if (this.graphStableIds) {
+        capabilities.append(jsonString("stable-declaration-ids-v1"))
+        capabilities.append(jsonString("analysis-since-v1"))
     }
+    capabilities.append(jsonString("no-eval-ct"))
+    capabilities.append(jsonString("pre-ct-types"))
+    capabilities.append(jsonString("analysis-queries-v1"))
+    capabilities.append(jsonString("analysis-fields-v1"))
+    capabilities.append(jsonString("refactor-validation-complete-only"))
     this.initialized = true
     jsonObject(
         ["compilerVersion", "protocolVersion", "capabilities"],
@@ -1849,11 +1549,11 @@ fun BootstrapAnalysisService.handle(request: Json): string {
         )
     } else if (method == "initialize") {
         val mode = params.getString("analysisMode")
-        if (mode != "" && mode != "graph-v1" && mode != "graph-v2") response = bootstrapAnalysisError(id,
-            "unsupported_analysis_mode", "unsupported analysisMode")
-        else if (this.initialized && (this.graphMode || mode == "graph-v1" || mode == "graph-v2")) response =
-            bootstrapAnalysisError(id, "already_initialized",
-                "initialize may only run once in graph mode")
+        // The legacy mode, an initialize without analysisMode, was removed (#832).
+        if (mode != "graph-v1" && mode != "graph-v2") response = bootstrapAnalysisError(id,
+            "unsupported_analysis_mode", "analysisMode must be graph-v1 or graph-v2")
+        else if (this.initialized) response =
+            bootstrapAnalysisError(id, "already_initialized", "initialize may only run once")
         else response = bootstrapAnalysisResponse(id, this.initialize(params))
     } else if (!this.initialized) {
         response = bootstrapAnalysisError(
@@ -1861,15 +1561,13 @@ fun BootstrapAnalysisService.handle(request: Json): string {
         )
     } else if (method == "document/open" || method == "document/change") {
         val uri = params.getString("uri")
-        if (this.graphMode && !bootstrapAnalysisGraphUriValid(uri)) return bootstrapAnalysisError(
+        if (!bootstrapAnalysisGraphUriValid(uri)) return bootstrapAnalysisError(
             id, "invalid_params", "graph documents require a local absolute file URI")
-        if (this.graphMode) {
-            for (overlay in this.overlays) {
-                if (overlay.active && overlay.uri != uri &&
-                    bootstrapAnalysisGraphPath(overlay.path) == bootstrapAnalysisGraphPath(uri)) {
-                    return bootstrapAnalysisError(id, "duplicate_document_path",
-                        "the same lexical path is already open under another URI")
-                }
+        for (overlay in this.overlays) {
+            if (overlay.active && overlay.uri != uri &&
+                bootstrapAnalysisGraphPath(overlay.path) == bootstrapAnalysisGraphPath(uri)) {
+                return bootstrapAnalysisError(id, "duplicate_document_path",
+                    "the same lexical path is already open under another URI")
             }
         }
         val accepted = this.storeOverlay(
@@ -1886,12 +1584,12 @@ fun BootstrapAnalysisService.handle(request: Json): string {
         this.closeOverlay(params.getString("uri"))
         response = bootstrapAnalysisResponse(id, jsonNull())
     } else if (method == "analyze") {
-        if (this.graphMode && params.has("fields") &&
+        if (params.has("fields") &&
             !bootstrapAnalysisGraphFieldsValid(params.get("fields"))) {
             return bootstrapAnalysisError(id, "invalid_params",
                 "fields must be an array of distinct diagnostics, symbols or occurrences")
         }
-        if (this.graphMode && params.get("roots").isArray()) {
+        if (params.get("roots").isArray()) {
             this.graphEntries.truncate(0)
             for (root in params.get("roots").values) {
                 if (root.isString()) this.graphEntries.append(root.asString())
@@ -1905,10 +1603,10 @@ fun BootstrapAnalysisService.handle(request: Json): string {
         val answer = this.graphMaterialize(if (params.has("since")) this.graphSince(snapshot, params.getString("since"))
             else snapshot)
         response = bootstrapAnalysisResponse(id,
-            if (this.graphMode && params.has("fields")) bootstrapAnalysisGraphProjection(answer,
+            if (params.has("fields")) bootstrapAnalysisGraphProjection(answer,
                 params.get("fields"))
             else answer)
-    } else if (this.graphMode && (method == "query/definition" || method == "query/hover" ||
+    } else if ((method == "query/definition" || method == "query/hover" ||
         method == "query/references")) {
         response = this.graphQuery(id, method, params)
     } else if (method == "refactor/validate") {
