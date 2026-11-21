@@ -25,10 +25,12 @@ fun main {
 ## Types
 
 `i8x16 i16x8 i32x4 i64x2 u8x16 u16x8 u32x4 u64x2 f32x4 f64x2` (128 bits) and
-`i8x32 i16x16 i32x8 i64x4 u8x32 u16x16 u32x8 u64x4 f32x8 f64x4` (256 bits). They work in
-locals, fields, arrays, maps, closures, generics, as parameters and results. Not across
-`@export`, and not at compile time (`#`). A local is a register; a field, an array element or
-a capture is a heap copy of its bytes, made each time it is stored.
+`i8x32 i16x16 i32x8 i64x4 u8x32 u16x16 u32x8 u64x4 f32x8 f64x4` (256 bits) and
+`i8x64 i16x32 i32x16 i64x8 u8x64 u16x32 u32x16 u64x8 f32x16 f64x8` (512 bits).
+Vectors work in locals, fields, arrays, maps, closures, generics, parameters, results,
+and compile-time expressions (`#`). The C ABI boundary (`@export`) accepts scalar
+arguments and results. A local is a register. A field, array element or capture
+holds a copy of its bytes.
 
 ## Operations
 
@@ -63,7 +65,7 @@ a capture is a heap copy of its bytes, made each time it is stored.
 | `.interleaveLow(o)`, `.interleaveHigh(o)`, `.reverse()` | common shuffles |
 | `.asU8x16()` and so on | the same bits as another type of the same width |
 | `.toF32x4()`, `.toI32x4()`, ... | numeric conversion; 32- and 64-bit lanes only. To integers it saturates, and NaN gives 0 |
-| `v.low()`, `v.high()`, `TConcat(low, high)` | 256-bit vectors in halves. `u32x8Concat(a, b)` |
+| `v.low()`, `v.high()`, `TConcat(low, high)` | 256- or 512-bit vectors in halves. `u32x8Concat(a, b)` and `u32x16Concat(a, b)` |
 
 For cross-width conversion, `i32x4.toF64x2Low()` and `i32x4.toF64x2High()`
 select a half. `f64x2.toI32x4(other)` converts this vector followed by `other`.
@@ -75,7 +77,7 @@ conversions truncate and saturate, with NaN giving zero.
 | | |
 |---|---|
 | `targetHas(feature)` | every CPU of the build's target has it; constant in the code: `sse2` on x86-64, `neon` on AArch64, `simd128` on Wasm |
-| `cpuHas(feature)` | this CPU has it: `aes`, `clmul`, `avx2`, `sse41`, `ssse3`, or what `targetHas` answers for |
+| `cpuHas(feature)` | this CPU has it: `aes`, `clmul`, `avx2`, `sse41`, `ssse3`, `avx512f`, `avx512bw`, or what `targetHas` answers for |
 | `simdTargetArch()` | `SIMD_ARCH_X86_64`, `SIMD_ARCH_AARCH64`, `SIMD_ARCH_WASM`, `SIMD_ARCH_XTENSA` or `SIMD_ARCH_OTHER`; constant in the code |
 
 A feature's name that neither function knows panics.
@@ -106,7 +108,10 @@ fun oneBlock(state: u8x16, key: u8x16): u8x16 =
 ```
 
 `@target` takes a comma-separated list and also allows AVX2 (`@target("avx2")`): 256-bit
-operations in such a function are one instruction. It can't be combined with `@inline`.
+operations in such a function can use YMM registers. Use `@target("avx512f")` or
+`@target("avx512bw")` to enable the 512-bit x86 instructions, and check the matching
+feature with `cpuHas` before the call. Other targets legalize the wider vector
+into smaller vectors or scalar lanes. `@target` cannot be combined with `@inline`.
 
 ## Timing
 

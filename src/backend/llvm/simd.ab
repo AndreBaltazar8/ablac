@@ -2,7 +2,7 @@
 // closed grammar: `ablaSimd_<operation>_<type>`, a conversion's being
 // `ablaSimd_<operation>_<from>_<to>`, plus `<type>Shuffle` and the target-specific
 // operations (aesEncRound and its family, clmul). A vector is an LLVM vector in the
-// scalar plan, 16 or 32 bytes of string data when boxed, and an integer of its width
+// scalar plan, 16, 32 or 64 bytes of string data when boxed, and an integer of its width
 // across a direct call (bootstrapLlvmDirectType).
 
 import "../../simd_types.ab"
@@ -39,6 +39,8 @@ fun bootstrapLlvmSimdTargetFeatures(triple: string, features: string): string {
             if (feature == "aes") "+aes"
             else if (feature == "clmul") "+pclmul"
             else if (feature == "avx2") "+avx2"
+            else if (feature == "avx512f") "+avx512f"
+            else if (feature == "avx512bw") "+avx512f,+avx512bw"
             else if (feature == "sse41") "+sse4.1"
             else if (feature == "ssse3") "+ssse3"
             else ""
@@ -506,10 +508,19 @@ private fun bootstrapLlvmSimdSwizzleByteChunk(
 ): i64* {
     val bytes = backend.type("u8x16")
     if (arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
-        val args: array<i64*> = []
-        for (table in tables) args.append(table)
-        args.append(indices)
-        return bootstrapLlvmSimdCall(backend, "llvm.aarch64.neon.tbl${tables.size}.v16i8", bytes, args)
+        if (tables.size <= 4) {
+            val args: array<i64*> = []
+            for (table in tables) args.append(table)
+            args.append(indices)
+            return bootstrapLlvmSimdCall(backend, "llvm.aarch64.neon.tbl${tables.size}.v16i8", bytes, args)
+        }
+        val offset = bootstrapLlvmSimdSplat(backend, LLVMConstInt(backend.i8Type, 64, 0), bytes, 16)
+        val upperIndices = LLVMBuildSub(backend.builder, indices, offset, "swizzle.upper.indices")
+        val lower = bootstrapLlvmSimdCall(backend, "llvm.aarch64.neon.tbl4.v16i8", bytes,
+            [tables[0], tables[1], tables[2], tables[3], indices])
+        val upper = bootstrapLlvmSimdCall(backend, "llvm.aarch64.neon.tbl4.v16i8", bytes,
+            [tables[4], tables[5], tables[6], tables[7], upperIndices])
+        return LLVMBuildOr(backend.builder, lower, upper, "swizzle.tables")
     }
     val builder = backend.builder
     var result = LLVMConstNull(bytes)
@@ -557,21 +568,30 @@ private fun bootstrapLlvmSimdSwizzle(
     val source = [left, right]
     for (at in 0 until (if (two) 2 else 1)) {
         val table = LLVMBuildBitCast(builder, source[at], bytes, "swizzle.table")
-        if (byteCount == 16) tables.append(table)
-        else {
-            tables.append(bootstrapLlvmSimdSlice(backend, table, 0, 16))
-            tables.append(bootstrapLlvmSimdSlice(backend, table, 16, 16))
+        for (part in 0 until byteCount / 16) {
+            tables.append(if (byteCount == 16) table
+                else bootstrapLlvmSimdSlice(backend, table, part * 16, 16))
         }
     }
     val byteIndices = bootstrapLlvmSimdSwizzleByteIndices(backend, indices, laneType, count,
         tableCount, bytesPerLane)
-    val selected = if (byteCount == 16) bootstrapLlvmSimdSwizzleByteChunk(backend, arch, tables, byteIndices)
-        else bootstrapLlvmSimdJoin(backend,
-            bootstrapLlvmSimdSwizzleByteChunk(backend, arch, tables,
-                bootstrapLlvmSimdSlice(backend, byteIndices, 0, 16)),
-            bootstrapLlvmSimdSwizzleByteChunk(backend, arch, tables,
-                bootstrapLlvmSimdSlice(backend, byteIndices, 16, 16)), 16)
-    LLVMBuildBitCast(builder, selected, vector, "swizzle.vector")
+    var chunks: array<i64*> = []
+    for (part in 0 until byteCount / 16) {
+        val selection = if (byteCount == 16) byteIndices
+            else bootstrapLlvmSimdSlice(backend, byteIndices, part * 16, 16)
+        chunks.append(bootstrapLlvmSimdSwizzleByteChunk(backend, arch, tables, selection))
+    }
+    var chunkBytes = 16
+    while (chunks.size > 1) {
+        var pairs: array<i64*> = []
+        for (part in 0 until chunks.size / 2) {
+            pairs.append(bootstrapLlvmSimdJoin(backend, chunks[part * 2], chunks[part * 2 + 1],
+                chunkBytes))
+        }
+        chunks = pairs
+        chunkBytes = chunkBytes * 2
+    }
+    LLVMBuildBitCast(builder, chunks[0], vector, "swizzle.vector")
 }
 
 private fun bootstrapLlvmSimdConvert(
@@ -717,16 +737,10 @@ fun bootstrapLlvmEmitSimdIntrinsic(
         )
         return true
     }
-    if (!name.startsWith("ablaSimd_")) return false
-    var split = 9
-    while (split < name.size && int(name[split]) != 95) split = split + 1
-    if (split >= name.size) return false
-    val operation = name.slice(9, split)
-    var typeEnd = split + 1
-    while (typeEnd < name.size && int(name[typeEnd]) != 95) typeEnd = typeEnd + 1
-    val type = name.slice(split + 1, typeEnd)
-    val target = if (typeEnd < name.size) name.slice(typeEnd + 1, name.size) else ""
-    if (!bootstrapIsVectorType(type)) return false
+    val parsed = bootstrapSimdOperation(name) ?? return false
+    val operation = parsed.operation
+    val type = parsed.type
+    val target = parsed.target
     val lane = bootstrapVectorLaneType(type)
     val laneCount = bootstrapVectorLaneCount(type)
     val floating = lane.startsWith("f")
@@ -756,6 +770,9 @@ fun bootstrapLlvmEmitSimdIntrinsic(
         LLVMSetAlignment(stored, 1)
         bootstrapLlvmTagAccess(backend, stored, false)
         return true
+    } else if (operation == "fromBytes") {
+        if (operands.size != 1) return false
+        result = bootstrapLlvmUnboxVector(backend, storage.values[operands[0]], type, "simd.from.bytes")
     } else if (operation == "bytes") {
         if (operands.size != 1) return false
         bootstrapLlvmBoxVector(
@@ -863,14 +880,10 @@ fun bootstrapLlvmEmitSimdIntrinsic(
             LLVMBuildBitCast(builder, value, bitsType, "simd.bitmask.bits"),
             LLVMConstNull(bitsType), "simd.bitmask.test"
         )
-        result = LLVMBuildZExt(
-            builder,
-            LLVMBuildBitCast(
-                builder, negative, LLVMIntTypeInContext(backend.context, i32(laneCount)),
-                "simd.bitmask.pack"
-            ),
-            backend.i64Type, "simd.bitmask"
-        )
+        val packed = LLVMBuildBitCast(builder, negative,
+            LLVMIntTypeInContext(backend.context, i32(laneCount)), "simd.bitmask.pack")
+        result = if (laneCount == 64) packed
+            else LLVMBuildZExt(builder, packed, backend.i64Type, "simd.bitmask")
     } else if (operation == "sum") {
         if (operands.size != 1) return false
         val value = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)

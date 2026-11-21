@@ -13,15 +13,15 @@ and why; [stdlib/simd.md](stdlib/simd.md) is the reference for using them.
   portable and target-specific, `@target` with `cpuHas`, and the boundary rule.
 - **Zig `@Vector`** gives any length as a primitive type and lanewise builtins (`==` on
   vectors gives a vector of bools). LLVM splits or scalarizes what the CPU lacks. Abla takes
-  primitive types and leaning on LLVM's legalization, but only two widths.
+  primitive types and leaning on LLVM's legalization, at three fixed widths.
 - **C++ `std::simd`** ties width to the target by default (`native_simd`), which makes the size
   of a type depend on the build. Abla's types mean the same on every target.
 
 ## Decisions
 
-**Types.** A lane type (`i8`...`u64`, `f32`, `f64`) and a count making 128 or 256 bits. They
+**Types.** A lane type (`i8`...`u64`, `f32`, `f64`) and a count making 128, 256, or 512 bits. They
 are primitive names, known to the compiler (`src/simd_types.ab`), and no other width exists:
-what a program does with them doesn't depend on the target, only how fast it is.
+what a program does with them doesn't depend on the target, only how fast it is. At 512 bits, LLVM splits the value on targets without a 512-bit vector instruction. With AVX2 it can use two 256-bit halves.
 
 **Masks are ordinary unsigned vectors.** A comparison gives `u32x4` with all-ones or
 all-zeros lanes, and `select` is bitwise: any bit pattern means something, there's one fewer
@@ -33,7 +33,7 @@ says which.
 
 **Representation.** In a function, a vector is an LLVM vector in the scalar plan, like any
 scalar (`docs/llvm-backend.md`). Where a value goes boxed (a field, an array element, a capture,
-a generic), it is a `string` of its 16 or 32 bytes: every boxed path already carries a string,
+a generic), it is a `string` of its 16, 32, or 64 bytes: every boxed path already carries a string,
 the collector knows it, and a program can't see it (`.bytes()` is how it gets those bytes).
 Boxing allocates; arithmetic in locals and direct calls doesn't.
 
@@ -87,12 +87,14 @@ lane in order using ordinary array indexing.
 - `targetHas(feature)`: every CPU of this build's target has it, and the answer is a constant in
   the code: `sse2` on x86-64, `neon` on AArch64, `simd128` on Wasm. Nothing more, since the
   compiler always targets the baseline CPU.
-- `cpuHas(feature)`: this CPU, now. CPUID (and XGETBV for AVX2) on x86-64, `ID_AA64ISAR0_EL1` on
+- `cpuHas(feature)`: this CPU, now. CPUID and XGETBV for AVX2 and AVX-512 on x86-64, `ID_AA64ISAR0_EL1` on
   AArch64 (Linux emulates the read; on Apple's chips it's a constant, since all have them and the
   system forbids the read). Cached after the first call. False on Wasm and Xtensa.
 
 **`@target("aes,clmul")`** lets LLVM use those instructions in one function, through its
-`target-features` attribute, and LLVM won't inline it into a plain function. A target-specific
+`target-features` attribute, and LLVM won't inline it into a plain function. 512-bit operations can use ZMM registers under `@target("avx512f")` or
+`@target("avx512bw")`, guarded by the matching `cpuHas` check. `cpuHas` also requires
+OS support for saving XMM/YMM, opmask and ZMM state. A target-specific
 operation outside one is `simd.target-required`, instead of LLVM's "Cannot select". What stays
 the programmer's job is to check `cpuHas` before calling it: the check can't be proved here,
 and running AES-NI on a CPU without it is an illegal instruction, not a wrong answer. Features a
@@ -113,8 +115,16 @@ PCLMULQDQ's. Key expansion has no operation: `AESKEYGENASSIST` has no ARM counte
 | ESP32-S3 (Xtensa) | **Scalar code.** LLVM legalizes vectors into lanes. The S3's PIE vector instructions aren't reachable: upstream LLVM has no intrinsics for them, and only Espressif's fork does | **Compiled only** to an object. Nothing here runs Xtensa, and no board is attached. Sound but slower than it looks: an `f64` lane is software float there, and 64-bit lanes are pairs |
 | Others | Whatever LLVM legalizes to | Nothing |
 
-## Not yet
+The x86 suite checks for ZMM additions in the AVX-512F and AVX-512BW paths
+and runs those paths when the CPU advertises both features. On a host without
+AVX-512 it runs the portable implementation. Set `ABLA_SIMD_SDE` to an installed
+Intel SDE executable to require and run both AVX-512 paths under emulation.
 
-512-bit vectors and vectors at compile time (`#` is refused, by `compile.` errors:
-the evaluator has no vectors).
-`targetHas` doesn't know about a build that raises the CPU, since no build can yet.
+## Compile time
+
+Vectors can be constructed, operated on, and returned under `#`. The interpreter
+stores the lane bits as little-endian bytes and uses the scalar rules for each lane.
+A native compile-time result reuses the boxed runtime bytes and recovers its vector
+shape from the static type. Checked array gathers and string loads can run at compile time.
+Raw-address loads and stores and hardware-only crypto operations retain their native
+effect requirements.

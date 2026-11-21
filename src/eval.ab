@@ -12,6 +12,7 @@ import "ct_native.ab"
 import "eval_scalar.ab"
 import "simd_types.ab"
 import "eval_uint256.ab"
+import "eval_simd.ab"
 import "eval_checks.ab"
 import "module_paths.ab"
 import "abla/sys/linux/io"
@@ -1958,7 +1959,7 @@ fun bootstrapEvalElementType(value: BootstrapEvalValue): string = when (value.ki
     "f32" -> "f32"
     "object" -> value.owner
     "integer" -> if (value.text != "") value.text else if (value.owner != "") value.owner else "i64"
-    else -> ""
+    else -> if (bootstrapIsVectorType(value.kind)) value.kind else ""
 }
 
 /** The type of an array or map receiver for extension `name` (`array:i64`,
@@ -2149,7 +2150,7 @@ fun bootstrapEvalEqual(
     if (left.kind == "boolean") {
         equal = equal && left.boolean == right.boolean
     }
-    if (left.kind == "string" || bootstrapIsWideIntType(left.kind)) equal = equal && left.text ==
+    if (left.kind == "string" || bootstrapIsWideValueType(left.kind)) equal = equal && left.text ==
         right.text
     if (left.kind == "shared" || left.kind == "weak") {
         equal = equal && left.elements[0] == right.elements[0]
@@ -5540,7 +5541,7 @@ class BootstrapEvaluator(
         val lookupOwner = if (defaultOwner != "") defaultOwner else receiver.owner
         var receiverType = if (interfaceExtension != "") interfaceExtension else receiver.owner
         if (receiver.kind == "string") receiverType = "string"
-        if (bootstrapIsWideIntType(receiver.kind)) receiverType = receiver.kind
+        if (bootstrapIsWideValueType(receiver.kind)) receiverType = receiver.kind
         if (receiver.kind == "integer") {
             receiverType = bootstrapEvalIntegerReceiverType(this, receiver, expression.text)
         }
@@ -6251,6 +6252,7 @@ val BOOTSTRAP_EVAL_ROUTE_CONVERSION = 2048
 val BOOTSTRAP_EVAL_ROUTE_INTRINSIC = 4096
 val BOOTSTRAP_EVAL_ROUTE_PROVIDER = 8192
 val BOOTSTRAP_EVAL_ROUTE_PATH = 16384
+val BOOTSTRAP_EVAL_ROUTE_SIMD = 32768
 val bootstrapEvalIntrinsicRoutes: Map<string, int> = Map()
 
 fun bootstrapEvalIntrinsicRoute(name: string): int {
@@ -6258,6 +6260,7 @@ fun bootstrapEvalIntrinsicRoute(name: string): int {
     if (known != null) return known
     var route = 0
     if (bootstrapWideIntrinsicType(name) != "") route = route | BOOTSTRAP_EVAL_ROUTE_WIDE
+    if (bootstrapSimdPureIntrinsic(name)) route = route | BOOTSTRAP_EVAL_ROUTE_SIMD
     if (name.startsWith("__abla") || name.startsWith("git") || name.startsWith("import") ||
         name.startsWith("resolved")) route = route | BOOTSTRAP_EVAL_ROUTE_IMPORTS
     if (name.startsWith("compiler") || name.startsWith("typed")) route = route | BOOTSTRAP_EVAL_ROUTE_REFLECTION
@@ -6292,6 +6295,9 @@ fun bootstrapEvaluateIntrinsicCall(
 ): BootstrapEvalValue {
     var result = initial
     val route = bootstrapEvalIntrinsicRoute(targetName)
+    if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_SIMD)) {
+        return bootstrapEvaluateSimdIntrinsic(evaluator, expression, targetName)
+    }
     if (bootstrapEvalRoutes(route, BOOTSTRAP_EVAL_ROUTE_WIDE)) {
         return bootstrapEvaluateU256Intrinsic(evaluator, expression, targetName)
     }
@@ -8105,6 +8111,7 @@ fun bootstrapEvaluateComplement(
     var result = bootstrapEvalInvalid()
     val value = evaluator.evaluate(expression.children[0])
     if (bootstrapEvalLeaves(value)) return value
+    if (bootstrapIsVectorType(value.kind)) return bootstrapEvalSimdOperator("not", value, bootstrapEvalInteger(0))
     result = bootstrapEvalScalar(bitNot(value.integer), value.owner, value.text)
     result
 }
@@ -9173,7 +9180,7 @@ fun bootstrapEvaluateMemberCall(
                receiver.kind == "string" ||
                receiver.kind == "integer" ||
                receiver.kind == "boolean" ||
-               bootstrapIsWideIntType(receiver.kind) ||
+               bootstrapIsWideValueType(receiver.kind) ||
                // An extension of `array<T>` or `Map<K, V>`.
                receiver.kind == "array" ||
                receiver.kind == "map") {
@@ -9404,6 +9411,7 @@ fun bootstrapEvaluateNegate(
     var result = bootstrapEvalInvalid()
     val value = evaluator.evaluate(expression.children[0])
     if (bootstrapEvalLeaves(value)) return value
+    if (bootstrapIsVectorType(value.kind)) return bootstrapEvalSimdOperator("neg", value, bootstrapEvalInteger(0))
     var integer = value.integer
     if (expression.kind == "unary-") integer = -integer
     result = if (value.kind == "f64") {
@@ -9440,6 +9448,11 @@ fun bootstrapEvaluateArithmetic(
     }
     if (bootstrapEvalLeaves(leftValue)) return leftValue
     if (bootstrapEvalLeaves(rightValue)) return rightValue
+    if (leftValue.kind == rightValue.kind && bootstrapIsVectorType(leftValue.kind)) {
+        val op = if (expression.kind == "+") "add" else if (expression.kind == "-") "sub"
+            else if (expression.kind == "*") "mul" else "div"
+        return bootstrapEvalSimdOperator(op, leftValue, rightValue)
+    }
     result = if (expression.kind == "+" && leftValue.kind == "string" &&
         rightValue.kind == "string") {
         bootstrapEvalString("${leftValue.text}${rightValue.text}")
@@ -9482,6 +9495,13 @@ fun bootstrapEvaluateBitwise(
     var result = bootstrapEvalInvalid()
     val left = evaluator.evaluate(expression.children[0])
     val right = evaluator.evaluate(expression.children[1])
+    if (bootstrapEvalLeaves(left)) return left
+    if (bootstrapEvalLeaves(right)) return right
+    if (bootstrapIsVectorType(left.kind)) {
+        val op = if (expression.kind == "&") "and" else if (expression.kind == "|") "or"
+            else if (expression.kind == "^") "xor" else if (expression.kind == "<<") "shl" else "shr"
+        return bootstrapEvalSimdOperator(op, left, right)
+    }
     // A shift has its left operand's type.
     val shift = expression.kind == "<<" || expression.kind == ">>" ||
         expression.kind == ">>>"

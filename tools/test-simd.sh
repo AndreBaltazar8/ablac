@@ -17,15 +17,23 @@ rm -rf "$out"
 mkdir -p "$out"
 
 for mode in "" --fast; do
-    "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache $mode
+    ABLA_TEST_FAST_BUILDS=0 "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache $mode
     "$out/native" || { echo "simd native ${mode:-release}: check $? failed" >&2; exit 1; }
+    if [[ -z $mode ]]; then cp "$out/native" "$out/native-release"; fi
 done
 echo "ok   x86-64: release and --fast, cpu has aes/clmul/avx2 where /proc/cpuinfo says"
 llvm-objdump -d "$out/native" > "$out/native.s"
+llvm-objdump -d "$out/native-release" > "$out/native-release.s"
 grep -q aesenc "$out/native.s" || { echo "no aesenc in the program" >&2; exit 1; }
 grep -q 'pshufb' "$out/native.s" || { echo "no SSSE3 byte shuffle in the program" >&2; exit 1; }
 grep -qE 'roundps|roundpd' "$out/native.s" || { echo "no SSE4.1 lane rounding in the program" >&2; exit 1; }
 grep -q 'vpgatherqq' "$out/native.s" || { echo "no AVX2 array gather in the program" >&2; exit 1; }
+grep -qE 'vpaddd.*%zmm' "$out/native-release.s" || { echo "no AVX-512F word addition" >&2; exit 1; }
+grep -qE 'vpaddb.*%zmm' "$out/native-release.s" || { echo "no AVX-512BW byte addition" >&2; exit 1; }
+if [[ -n ${ABLA_SIMD_SDE:-} ]]; then
+    "$ABLA_SIMD_SDE" -skx -- "$out/native-release" --require-avx512
+    echo "ok   AVX-512F/BW under Intel SDE"
+fi
 "$compiler" build "$cases/gather-bounds.ab" -o "$out/gather-bounds" --no-cache
 check_gather_bounds() {
     for index in 2 -1; do
@@ -99,6 +107,19 @@ if "$compiler" --emit-llvm "$cases/if-join.ab" |
     echo "a vector's if join boxes its branches" >&2
     exit 1
 fi
+
+for tier in interp jit auto; do
+    ABLA_COMPILE_EVAL="$tier" ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build "$cases/compile-time.ab" \
+        -o "$out/compile-time-$tier" --no-cache --fast > "$out/compile-time-$tier.log" 2>&1 || {
+        cat "$out/compile-time-$tier.log" >&2
+        exit 1
+    }
+    "$out/compile-time-$tier" || { echo "simd compile-time $tier: check $? failed" >&2; exit 1; }
+done
+native_sites=$(awk '/^note\[ct-jit\]: native at .*compile-time\.ab:/ { count++ } END { print count+0 }' \
+    "$out/compile-time-jit.log")
+[[ $native_sites == 4 ]] || { cat "$out/compile-time-jit.log" >&2; exit 1; }
+echo "ok   compile-time vectors: interp, jit and auto"
 
 for invalid in "$cases"/invalid-*.ab; do
     expected=$(sed -n '1s|^// *||p' "$invalid")

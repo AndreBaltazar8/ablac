@@ -14,6 +14,7 @@ import "abla/sys/linux/process"
 import "abla/text"
 import "parser.ab"
 import "eval.ab"
+import "eval_simd.ab"
 import "sema.ab"
 import "simd_types.ab"
 
@@ -216,7 +217,7 @@ fun bootstrapLiftWideKind(tag: int): string =
 
 fun bootstrapLiftIsScalar(kind: string): bool =
     kind == "integer" || kind == "f64" || kind == "f32" ||
-    kind == "boolean" || kind == "string" || bootstrapIsWideIntType(kind)
+    kind == "boolean" || kind == "string" || bootstrapIsWideValueType(kind)
 
 fun bootstrapLiftEmit(
     var lowerer: BootstrapLowerer,
@@ -235,8 +236,8 @@ fun bootstrapLiftEmit(
             "const.bool", -1, -1, if (value.boolean) "true" else "false"
         )
     }
-    // A boxed `uint256` is a string of its bytes.
-    if (kind == "string" || bootstrapIsWideIntType(kind)) return lowerer.emit("const.string", -1,
+    // Boxed wide integers and SIMD vectors are strings of their bytes.
+    if (kind == "string" || bootstrapIsWideValueType(kind)) return lowerer.emit("const.string", -1,
         -1,
         value.text)
     if (kind == "f64") return lowerer.lowerEraseFloat(
@@ -1250,6 +1251,8 @@ fun bootstrapLiftEncodeValue(
     else if (kind == "f32") encoder.parts.append("f${value.integer};")
     else if (kind == "boolean") encoder.parts.append(if (value.boolean) "b1" else "b0")
     else if (kind == "string") encoder.parts.append("s${bootstrapLiftToken(value.text)}")
+    else if (bootstrapIsVectorType(kind)) encoder.parts.append(
+        "Y${bootstrapLiftToken(kind)}${bootstrapLiftToken(value.text)}")
     else if (bootstrapIsWideIntType(kind)) encoder.parts.append(
         "${bootstrapLiftWideTag(kind)}${bootstrapLiftToken(value.text)}")
     else if (kind == "null") encoder.parts.append("n")
@@ -1428,6 +1431,13 @@ fun bootstrapLiftDecodeValue(var decoder: BootstrapLiftDecoder): BootstrapEvalVa
             else decoder.fail("expected 0 or 1")
     }
     if (tag == 115) return bootstrapEvalString(decoder.token())
+    if (tag == 89) {
+        val type = decoder.token()
+        val data = decoder.token()
+        if (!bootstrapIsVectorType(type) || data.size != bootstrapVectorBits(type) / 8)
+            return decoder.fail("invalid SIMD vector type or byte count")
+        return bootstrapEvalSimdValue(type, data)
+    }
     val wideKind = bootstrapLiftWideKind(tag)
     if (wideKind != "") {
         return BootstrapEvalValue(wideKind, 0, false, decoder.token(), BOOTSTRAP_EVAL_NO_ELEMENTS,
@@ -2121,6 +2131,14 @@ fun bootstrapLiftRetype(
 ): BootstrapEvalValue {
     val type = bootstrapLiftRetypeType(retyper, staticType)
     val kind = raw.kind
+    if (kind == "string") {
+        val shape = if (bootstrapIsNullableType(type)) bootstrapNullableElementType(type) else type
+        if (bootstrapIsVectorType(shape)) {
+            if (raw.text.size != bootstrapVectorBits(shape) / 8)
+                return bootstrapLiftRetypeFail(retyper, "incorrect byte count for SIMD vector $shape")
+            return bootstrapEvalSimdValue(shape, raw.text)
+        }
+    }
     if (kind.size < 4 || kind.slice(0, 4) != "raw.") {
         // Already typed (null, booleans, strings, void, invalid).
         return raw

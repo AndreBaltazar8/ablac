@@ -1,0 +1,276 @@
+// A compile-time SIMD value carries its type and the same little-endian bytes
+// as a boxed runtime vector. Lane calculations use the scalar language rules.
+import "eval.ab"
+import "eval_scalar.ab"
+import "parser.ab"
+import "simd_types.ab"
+import "abla/bytes"
+import "abla/float"
+import "abla/math"
+import "abla/text"
+
+fun bootstrapEvalSimdValue(type: string, bytes: string): BootstrapEvalValue =
+    BootstrapEvalValue(type, 0, false, bytes, BOOTSTRAP_EVAL_NO_ELEMENTS, "",
+        BOOTSTRAP_EVAL_NO_FIELDS)
+
+private fun simdEvalRead(value: BootstrapEvalValue, index: int, bytes: int): int {
+    var word = 0
+    val offset = index * bytes
+    for (byte in 0 until bytes) word = word | (int(value.text[offset + byte]) << (byte * 8))
+    word
+}
+
+private fun simdEvalAppend(var output: ByteBuffer, value: int, width: int): void {
+    for (byte in 0 until width) output.appendByteValue((value >> (byte * 8)) & 255)
+    return
+}
+
+private fun simdEvalLane(raw: int, lane: string): BootstrapEvalValue =
+    if (lane == "f32") bootstrapEvalF32(f32FromBits(u32(raw)))
+    else if (lane == "f64") bootstrapEvalF64(f64FromBits(raw))
+    else bootstrapEvalScalar(raw, bootstrapEvalIntegerWidth(lane), "")
+
+private fun simdEvalIntegerSaturate(op: string, a: int, b: int, width: string): int {
+    val bits = bootstrapEvalWidthBits(width)
+    val unsigned = !bootstrapEvalWidthSigned(width)
+    val subtract = op == "subSat"
+    val result = if (subtract) a - b else a + b
+    if (bits == 64) {
+        if (unsigned) {
+            if (subtract && bootstrapEvalUnsignedLess(a, b)) return 0
+            if (!subtract && bootstrapEvalUnsignedLess(result, a)) return -1
+        } else {
+            val overflow = if (subtract) ((a ^ b) & (a ^ result)) < 0
+                else ((a ^ result) & (b ^ result)) < 0
+            if (overflow) return if (a < 0) -9223372036854775807 - 1 else 9223372036854775807
+        }
+        return result
+    }
+    val upper = (1 << (if (unsigned) bits else bits - 1)) - 1
+    val lower = if (unsigned) 0 else -upper - 1
+    if (result < lower) lower else if (result > upper) upper else result
+}
+
+private fun simdEvalIntOperation(op: string, a: int, b: int, lane: string): int {
+    val width = bootstrapEvalIntegerWidth(lane)
+    val x = bootstrapEvalWrap(a, width)
+    val y = bootstrapEvalWrap(b, width)
+    if (op == "add") return x + y
+    if (op == "sub") return x - y
+    if (op == "mul") return x * y
+    if (op == "and") return x & y
+    if (op == "or") return x | y
+    if (op == "xor") return x ^ y
+    if (op == "neg") return -x
+    if (op == "not") return ~x
+    if (op == "abs") return if (x < 0) -x else x
+    if (op == "addSat" || op == "subSat") return simdEvalIntegerSaturate(op, x, y, width)
+    val bits = bootstrapEvalWidthBits(width)
+    if (op == "shl" || op == "shr") {
+        if (b < 0 || b >= bits) return 0
+        return if (op == "shl") x << b else if (width == "u64") int(u64(x) >> b) else x >> b
+    }
+    if (op == "rotl" || op == "rotr") {
+        val count = (if (op == "rotr") -b else b) & (bits - 1)
+        val pattern = if (bits == 64) x else x & ((1 << bits) - 1)
+        return (pattern << count) | int(u64(pattern) >> (bits - count))
+    }
+    val less = if (width == "u64") bootstrapEvalUnsignedLess(x, y) else x < y
+    if (op == "min") return if (less) x else y
+    if (op == "max") return if (less) y else x
+    val same = x == y
+    val comparison = if (op == "eq") same else if (op == "ne") !same
+        else if (op == "lt") less else if (op == "le") less || same
+        else if (op == "gt") !less && !same else !less
+    if (comparison) -1 else 0
+}
+
+private fun simdEvalReal(op: string, a: f64, b: f64): f64 =
+    if (op == "add") a + b else if (op == "sub") a - b
+    else if (op == "mul") a * b else if (op == "div") a / b
+    else if (op == "neg") -a else if (op == "abs") fabs(a)
+    else if (op == "min") fmin(a, b) else if (op == "max") fmax(a, b)
+    else if (op == "sqrt") sqrt(a) else if (op == "floor") floor(a)
+    else if (op == "ceil") ceil(a) else if (op == "trunc") trunc(a)
+    else roundEven(a)
+
+private fun simdEvalFloatValue(word: int, lane: string): f64 =
+    if (lane == "f32") f32ToF64(f32FromBits(u32(word))) else f64FromBits(word)
+
+private fun simdEvalFloatOperation(op: string, a: int, b: int, lane: string): int {
+    val x = simdEvalFloatValue(a, lane)
+    val y = simdEvalFloatValue(b, lane)
+    if (op == "eq" || op == "ne" || op == "lt" || op == "le" || op == "gt" || op == "ge") {
+        val compared = if (op == "eq") x == y else if (op == "ne") x != y
+            else if (op == "lt") x < y else if (op == "le") x <= y
+            else if (op == "gt") x > y else x >= y
+        return if (compared) -1 else 0
+    }
+    if (lane == "f64") return f64ToBits(simdEvalReal(op, x, y))
+    // Do f32 arithmetic at its own width, especially division.
+    val first = f32FromBits(u32(a))
+    val second = f32FromBits(u32(b))
+    val value = if (op == "add") first + second else if (op == "sub") first - second
+        else if (op == "mul") first * second else if (op == "div") first / second
+        else f64ToF32(simdEvalReal(op, x, y))
+    int(f32ToBits(value))
+}
+
+private fun simdEvalLaneConvert(word: int, source: string, target: string, saturate: bool): int {
+    val bits = bootstrapLaneBits(target)
+    val unsigned = target.startsWith("u")
+    val floatSource = source.startsWith("f")
+    if (target.startsWith("f")) {
+        if (floatSource) {
+            val value = simdEvalFloatValue(word, source)
+            return if (target == "f32") int(f32ToBits(f64ToF32(value))) else f64ToBits(value)
+        }
+        val value = bootstrapEvalWrap(word, bootstrapEvalIntegerWidth(source))
+        val high = source == "u64" && value < 0
+        val reduced = if (high) int(u64(value) >> 1) | (value & 1) else value
+        if (target == "f32") {
+            val converted = f32FromInt(reduced)
+            return int(f32ToBits(if (high) converted * f32(2.0) else converted))
+        }
+        return f64ToBits(f64FromInt(reduced) * (if (high) 2.0 else 1.0))
+    }
+    if (floatSource && target == "u64") {
+        val value = simdEvalFloatValue(word, source)
+        if (value != value || value <= 0.0) return 0
+        if (value >= 18446744073709551616.0) return -1
+        if (value < 9223372036854775808.0) return f64ToInt(value)
+        return f64ToInt(value - 9223372036854775808.0) | (-9223372036854775807 - 1)
+    }
+    if (floatSource || saturate) {
+        val upper = if (bits == 64) 9223372036854775807
+            else (1 << (if (unsigned) bits else bits - 1)) - 1
+        val lower = if (unsigned) 0 else -upper - 1
+        if (floatSource) return bootstrapEvalSaturatingTruncate(
+            simdEvalFloatValue(word, source), lower, upper)
+        val value = bootstrapEvalWrap(word, bootstrapEvalIntegerWidth(source))
+        if (unsigned && (value < 0 || value > upper)) return upper
+        return if (value < lower) lower else if (value > upper) upper else value
+    }
+    bootstrapEvalWrap(word, bootstrapEvalIntegerWidth(source))
+}
+
+fun bootstrapEvalSimdOperator(op: string, left: BootstrapEvalValue,
+    right: BootstrapEvalValue): BootstrapEvalValue {
+    val type = left.kind
+    val lane = bootstrapVectorLaneType(type)
+    val count = bootstrapVectorLaneCount(type)
+    val bits = bootstrapLaneBits(lane)
+    val bytes = bits / 8
+    val comparison = op == "eq" || op == "ne" || op == "lt" || op == "le" ||
+        op == "gt" || op == "ge"
+    val outputType = if (comparison) "u${bits}x$count" else type
+    var output = byteBuffer()
+    for (index in 0 until count) {
+        val a = simdEvalRead(left, index, bytes)
+        val b = if (right.kind == type) simdEvalRead(right, index, bytes) else right.integer
+        val value = if (lane.startsWith("f")) simdEvalFloatOperation(op, a, b, lane)
+            else simdEvalIntOperation(op, a, b, lane)
+        simdEvalAppend(output, value, bytes)
+    }
+    bootstrapEvalSimdValue(outputType, output.toText())
+}
+
+private fun simdEvalTransform(
+    op: string, from: string, to: string, values: array<BootstrapEvalValue>
+): BootstrapEvalValue {
+    val lane = bootstrapVectorLaneType(from)
+    val targetLane = bootstrapVectorLaneType(to)
+    val bytes = bootstrapLaneBits(lane) / 8
+    val targetBytes = bootstrapLaneBits(targetLane) / 8
+    val count = bootstrapVectorLaneCount(from)
+    val outputCount = bootstrapVectorLaneCount(to)
+    val start = if (op.endsWith("High")) count / 2 else 0
+    val left = values[0]
+    var output = byteBuffer()
+    for (index in 0 until outputCount) {
+        val offset = index + start
+        val word = if (offset < count) simdEvalRead(left, offset, bytes)
+            else simdEvalRead(values[1], offset - count, bytes)
+        simdEvalAppend(output, simdEvalLaneConvert(word, lane, targetLane, op == "narrowSat"),
+            targetBytes)
+    }
+    bootstrapEvalSimdValue(to, output.toText())
+}
+
+fun bootstrapEvaluateSimdIntrinsic(
+    var evaluator: BootstrapEvaluator, expression: BootstrapExpression, name: string
+): BootstrapEvalValue {
+    val literal = bootstrapSimdShuffleType(name)
+    val parsed = if (literal != "") BootstrapSimdOperation("shuffle", literal, "")
+        else bootstrapSimdOperation(name) ?? return bootstrapEvalInvalid()
+    val op = parsed.operation
+    val type = parsed.type
+    val target = parsed.target
+    val values: array<BootstrapEvalValue> = []
+    for (child in expression.children) {
+        val value = bootstrapEvalUnwrapBorrow(evaluator.evaluate(child))
+        if (bootstrapEvalLeaves(value) || value.kind == "invalid") return value
+        values.append(value)
+    }
+    val lane = bootstrapVectorLaneType(type)
+    val count = bootstrapVectorLaneCount(type)
+    val bytes = bootstrapLaneBits(lane) / 8
+    val a = values[0]
+    if (op == "bytes") return bootstrapEvalString(a.text)
+    if (op == "fromBytes") {
+        if (a.text.size != count * bytes) return bootstrapEvalInvalid()
+        return bootstrapEvalSimdValue(type, a.text)
+    }
+    if (op == "bits") return bootstrapEvalSimdValue(target, a.text)
+    if (op == "low" || op == "high" || op == "concat") {
+        val resultCount = if (op == "concat") count * 2 else count / 2
+        val result = "$lane" + "x$resultCount"
+        val half = count * bytes / 2
+        val data = if (op == "concat") a.text + values[1].text
+            else if (op == "low") a.text.slice(0, half) else a.text.slice(half, a.text.size)
+        return bootstrapEvalSimdValue(result, data)
+    }
+    if (op == "get" || op == "with") {
+        val index = values[1].integer
+        if (index < 0 || index >= count) return bootstrapEvalRuntimePanic(
+            evaluator, "E_EVAL_OUT_OF_BOUNDS", "$type: no lane $index", expression)
+        if (op == "get") return simdEvalLane(simdEvalRead(a, index, bytes), lane)
+    }
+    if (op == "sum" || op == "bitmask") {
+        var value = 0
+        for (index in 0 until count) {
+            val word = simdEvalRead(a, index, bytes)
+            if (op == "bitmask") value = value | (((word >> (bytes * 8 - 1)) & 1) << index)
+            else if (lane.startsWith("f")) value = simdEvalFloatOperation("add", value, word, lane)
+            else value += word
+        }
+        return if (op == "bitmask") bootstrapEvalInteger(value) else simdEvalLane(value, lane)
+    }
+    if (target != "") return simdEvalTransform(op, type, target, values)
+    if (op == "splat" || op == "make" || op == "with" || op == "swizzle" ||
+        op == "swizzle2" || op == "shuffle" || op == "select") {
+        var output = byteBuffer()
+        for (index in 0 until count) {
+            var word = 0
+            if (op == "splat") word = a.integer
+            else if (op == "make") word = values[index].integer
+            else if (op == "with") word = if (index == values[1].integer) values[2].integer
+                else simdEvalRead(a, index, bytes)
+            else if (op == "select") {
+                val mask = simdEvalRead(a, index, bytes)
+                word = (mask & simdEvalRead(values[1], index, bytes)) |
+                    (~mask & simdEvalRead(values[2], index, bytes))
+            } else {
+                val two = op != "swizzle"
+                val selected = if (op == "shuffle") values[index + 2].integer
+                    else simdEvalRead(values[if (two) 2 else 1], index, bytes)
+                if (selected >= 0 && selected < count) word = simdEvalRead(a, selected, bytes)
+                else if (two && selected >= count && selected < count * 2)
+                    word = simdEvalRead(values[1], selected - count, bytes)
+            }
+            simdEvalAppend(output, word, bytes)
+        }
+        return bootstrapEvalSimdValue(type, output.toText())
+    }
+    bootstrapEvalSimdOperator(op, a, if (values.size == 2) values[1] else bootstrapEvalInteger(0))
+}
