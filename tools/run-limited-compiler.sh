@@ -44,9 +44,6 @@ default_stack_kb=131072
 default_memory_mb=4096
 if [[ $OSTYPE == darwin* ]]; then
     if [[ -n ${ABLA_LLVM:-} ]]; then
-        # Scope the loader override inside this script: launching Apple's
-        # protected shell can discard a DYLD_* inherited from the job.
-        export DYLD_LIBRARY_PATH="$ABLA_LLVM/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
         export PATH="$ABLA_LLVM/bin:${ABLA_LLD:-$ABLA_LLVM}/bin:$PATH"
     fi
     hard_stack_kb=$(ulimit -H -s)
@@ -150,4 +147,11 @@ if [[ ${1:-} == repl && -t 0 ]]; then
     export ABLA_RUN_LIMITED_FOREGROUND=1
 fi
 
+if [[ $OSTYPE == darwin* && -n ${ABLA_LLVM:-} ]]; then
+    # Apple's protected shells can clear DYLD_* at each supervisor hop.
+    # Carry the assignment as argv until env execs the compiler itself.
+    exec "$script_directory/run-limited.sh" /usr/bin/env \
+        "DYLD_LIBRARY_PATH=$ABLA_LLVM/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+        "$compiler" "$@"
+fi
 exec "$script_directory/run-limited.sh" "$compiler" "$@"
