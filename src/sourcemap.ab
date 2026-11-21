@@ -18,6 +18,8 @@ import "abla/json"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
 import "abla/sys/linux/io"
+import "abla/text"
+import "module_paths.ab"
 
 class BootstrapSourceMapRows(
     val addresses: array<int>,
@@ -347,6 +349,20 @@ fun bootstrapSourceMapJson(
         )
         index = index + 1
     }
+    // The standard library's sources are on the ignore list (the source map's `ignoreList`, and Chromium's older
+    // `x_google_ignoreList`): developer tools step over their code, which is inlined into the program's, and leave
+    // their frames out of the call stack by default.
+    val root = bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
+    val prefix = if (root.endsWith("/")) root else "$root/"
+    var ignored = ""
+    index = 0
+    while (index < rows.paths.size) {
+        if (bootstrapNormalizeModulePath(rows.paths[index]).startsWith(prefix)) {
+            ignored = if (ignored == "") "$index" else "$ignored,$index"
+        }
+        index = index + 1
+    }
+    json.appendText("],\"ignoreList\":[$ignored],\"x_google_ignoreList\":[$ignored")
     json.appendText("],\"names\":[],\"mappings\":\"")
     json.appendBuffer(mappings)
     json.appendText("\"}\n")
@@ -405,16 +421,114 @@ class BootstrapSourceMapModule(val bytes: string, val codeOffset: int)
 // module name (engines prefix every frame's function name with it), with
 // the sourceMappingURL and external_debug_info sections added; and where its
 // code section's contents begin (-1 when the bytes are no module).
+// Each function's name in the debug information, by the code offset its body starts at (its subprogram's
+// DW_AT_low_pc, from llvm-dwarfdump --debug-info): a dispatch wrapper's is readable where its symbol is not
+// (debug.ab, bootstrapLlvmDebugFinish). A line-tables-only unit has no linkage names to match by.
+fun bootstrapSourceMapFunctionNames(info: string): Map<int, string> {
+    val names: Map<int, string> = Map()
+    var name = ""
+    var low = -1
+    var concrete = false
+    for (line in info.split("\n")) {
+        val text = line.trim()
+        if (text.endsWith("DW_TAG_subprogram") || text.endsWith("DW_TAG_inlined_subroutine") || text == "NULL") {
+            if (concrete && low >= 0 && name != "") names.set(low, name)
+            name = ""
+            low = -1
+            concrete = text.endsWith("DW_TAG_subprogram")
+        } else if (text.startsWith("DW_AT_low_pc")) {
+            val open = text.indexOf("(0x")
+            if (open >= 0) low = bootstrapSourceMapParseHex(text, open + 3, text.indexOf(")", open))
+        } else if (text.startsWith("DW_AT_name")) {
+            val open = text.indexOf("(\"")
+            if (open >= 0) name = text.slice(open + 2, text.lastIndexOf("\")"))
+        }
+    }
+    if (concrete && low >= 0 && name != "") names.set(low, name)
+    names
+}
+
+// The code offset each function's body starts at (after its size, from the code section's contents: the debug
+// information's addresses), by the function's index (after the imported functions).
+fun bootstrapSourceMapBodyOffsets(module: string, codeBegin: int, imported: int): Map<int, int> {
+    val offsets: Map<int, int> = Map()
+    val count = bootstrapSourceMapReadLeb(module, codeBegin)
+    var cursor = count.end
+    for (body in 0 until count.value) {
+        val size = bootstrapSourceMapReadLeb(module, cursor)
+        offsets.set(imported + body, size.end - codeBegin)
+        cursor = size.end + size.value
+    }
+    offsets
+}
+
+// How many functions the import section (at `begin`, its contents) imports: entries of kind 0. The others are
+// skipped by their shape (a table, a memory, a global, a tag).
+fun bootstrapSourceMapImportedFunctions(module: string, begin: int): int {
+    val count = bootstrapSourceMapReadLeb(module, begin)
+    var cursor = count.end
+    var functions = 0
+    for (entry in 0 until count.value) {
+        val moduleName = bootstrapSourceMapReadLeb(module, cursor)
+        val fieldName = bootstrapSourceMapReadLeb(module, moduleName.end + moduleName.value)
+        cursor = fieldName.end + fieldName.value
+        val kind = module[cursor]
+        cursor = cursor + 1
+        if (kind == 0) {
+            functions = functions + 1
+            cursor = bootstrapSourceMapReadLeb(module, cursor).end
+        } else if (kind == 1 || kind == 2) {
+            // A table's element type first; then limits: a flag, the minimum, a maximum when the flag says so.
+            if (kind == 1) cursor = cursor + 1
+            val flags = module[cursor]
+            cursor = bootstrapSourceMapReadLeb(module, cursor + 1).end
+            if ((flags & 1) != 0) cursor = bootstrapSourceMapReadLeb(module, cursor).end
+        } else if (kind == 3) {
+            cursor = cursor + 2
+        } else {
+            cursor = bootstrapSourceMapReadLeb(module, cursor + 1).end
+        }
+    }
+    functions
+}
+
+// A name section's function names (subsection 1: a count, then each function's index and name), a hashed
+// symbol's (`abla_fn_...`) replaced by the debug information's name for its body (`named`, by body offset).
+fun bootstrapSourceMapRenameFunctions(module: string, begin: int, end: int, offsets: Map<int, int>,
+    named: Map<int, string>): ByteBuffer {
+    var names = byteBuffer()
+    val count = bootstrapSourceMapReadLeb(module, begin)
+    bootstrapSourceMapAppendLeb(names, count.value)
+    var cursor = count.end
+    for (entry in 0 until count.value) {
+        if (cursor >= end) break
+        val index = bootstrapSourceMapReadLeb(module, cursor)
+        val length = bootstrapSourceMapReadLeb(module, index.end)
+        val name = module.slice(length.end, length.end + length.value)
+        val offset = offsets.get(index.value)
+        val readable = if (offset != null) named.get(offset) else null
+        val shown = if (readable != null && name.startsWith("abla_fn_")) readable else name
+        bootstrapSourceMapAppendLeb(names, index.value)
+        bootstrapSourceMapAppendLeb(names, shown.size)
+        names.appendText(shown)
+        cursor = length.end + length.value
+    }
+    names
+}
+
 fun bootstrapSourceMapRewriteModule(
     module: string,
     mapUrl: string,
-    debugUrl: string
+    debugUrl: string,
+    named: Map<int, string> = Map()
 ): BootstrapSourceMapModule {
     var output = byteBuffer()
     var valid = module.size >= 8 && module[0] == 0 && module[1] == 97 &&
         module[2] == 115 && module[3] == 109
     if (valid) output.appendText(module.slice(0, 8))
     var codeOffset = -1
+    var imported = 0
+    var offsets: Map<int, int> = Map()
     var cursor = 8
     while (valid && cursor < module.size) {
         val id = module[cursor]
@@ -439,7 +553,14 @@ fun bootstrapSourceMapRewriteModule(
                     )
                     val subsectionEnd =
                         subsectionSize.end + subsectionSize.value
-                    if (module[subsection] != 0) {
+                    if (module[subsection] == 1 && named.keys().size > 0) {
+                        // The function names, as the debug information names them.
+                        var names = bootstrapSourceMapRenameFunctions(module, subsectionSize.end, subsectionEnd,
+                            offsets, named)
+                        kept.appendByteValue(1)
+                        bootstrapSourceMapAppendLeb(kept, names.size())
+                        kept.appendBuffer(names)
+                    } else if (module[subsection] != 0) {
                         kept.appendText(module.slice(subsection, subsectionEnd))
                     }
                     subsection = subsectionEnd
@@ -453,7 +574,11 @@ fun bootstrapSourceMapRewriteModule(
         } else {
             // Sections are copied with their headers as they are, so the
             // code's offset is its header's end in the output.
-            if (id == 10) codeOffset = output.size() + (size.end - cursor)
+            if (id == 2) imported = bootstrapSourceMapImportedFunctions(module, size.end)
+            if (id == 10) {
+                codeOffset = output.size() + (size.end - cursor)
+                offsets = bootstrapSourceMapBodyOffsets(module, size.end, imported)
+            }
             output.appendText(module.slice(cursor, payloadEnd))
         }
         cursor = payloadEnd
@@ -489,13 +614,6 @@ fun bootstrapWasmDebugArtifacts(modulePath: string, outputPath: string): int {
     val infoPath = "$modulePath.debug-info"
     val module = Path(modulePath).readText()
     var status = if (Path(debugPath).writeTextAtomic(module)) 0 else 1
-    val rewritten = bootstrapSourceMapRewriteModule(
-        module, "$name.map", "$name.debug.wasm"
-    )
-    if (status == 0 && rewritten.codeOffset < 0) status = 1
-    if (status == 0 && !Path(modulePath).writeTextAtomic(rewritten.bytes)) {
-        status = 1
-    }
     if (status == 0) {
         // The two dumps read the same file and write their own: both run at once.
         val dump = linuxCommand("llvm-dwarfdump")
@@ -514,12 +632,22 @@ fun bootstrapWasmDebugArtifacts(modulePath: string, outputPath: string): int {
         val informed = if (informing > 0) linuxWaitProcess(informing).status else 127
         status = if (dumped != 0) dumped else informed
     }
+    // The module itself, its functions named as the debug information names them (the code before them unchanged,
+    // so the map's offsets are the rewritten module's too).
+    val info = if (status == 0) Path(infoPath).readText() else ""
+    val rewritten = bootstrapSourceMapRewriteModule(
+        module, "$name.map", "$name.debug.wasm", bootstrapSourceMapFunctionNames(info)
+    )
+    if (status == 0 && rewritten.codeOffset < 0) status = 1
+    if (status == 0 && !Path(modulePath).writeTextAtomic(rewritten.bytes)) {
+        status = 1
+    }
     if (status == 0) {
         var rows = bootstrapSourceMapReadLineTables(Path(dumpPath).readText())
         bootstrapSourceMapApplyCalls(
             rows,
             bootstrapSourceMapReadInlineCalls(
-                Path(infoPath).readText(), rows.paths
+                info, rows.paths
             )
         )
         if (!Path(mapPath).writeTextAtomic(

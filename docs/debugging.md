@@ -117,8 +117,9 @@ ratio = 3.75
 A field that refers to another instance is an untyped pointer (the layout does
 not say which class). `--fast` still optimizes a little (O1), so a local can
 read `<optimized out>` after its last use. The calls through the dispatch
-table appear between frames as `abla_fn_<n>_<n>` without a line, and
-`step`/`next` pass through them. A release build with `-g` has no variables.
+table appear between frames as `<function>.boxed` (`probe.main.lambda.boxed`,
+the entry the table calls) without a line, and `step`/`next` pass through
+them. A release build with `-g` has no variables.
 
 The stack a debug build prints on its own resolves with `atos` (macOS) or
 `addr2line` (Linux):
@@ -142,7 +143,9 @@ two files beside it:
   call in that function, so each frame of a stack reads at its own line.
 
 The module itself keeps its `name` section (functions are named as above, so
-stack traces read `at renderer.Renderer.draw (…wasm-function[812]:0x1a2b)`),
+stack traces read `at renderer.Renderer.draw (…wasm-function[812]:0x1a2b)`; a
+function's dispatch-table entry, often where its body was inlined, is
+`<name>.boxed`: `probe.main.lambda.boxed`),
 drops its DWARF, and names both files in custom sections — `sourceMappingURL`
 and `external_debug_info` — as URLs relative to its own. Serve the two files
 next to the module; a hosting page that fails to serve them only loses the
@@ -153,6 +156,10 @@ Developer tools in Chromium-based browsers:
 - **Without extensions**, the source map works: the Sources panel lists the
   Abla files (under `file://`), and breakpoints and stepping work by line in
   them. The call stack shows the readable names.
+  The map puts the standard library's sources on its ignore list (`ignoreList`,
+  and `x_google_ignoreList` for older Chromium), so stepping over a line does
+  not stop in the runtime code inlined into it, and those frames are hidden by
+  default.
 - **With the "C/C++ DevTools Support (DWARF)" extension** (Chrome Web Store),
   developer tools read `<module>.debug.wasm` instead: Abla sources, line
   breakpoints and stepping that follows inlined calls. Enable *Settings →
