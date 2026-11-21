@@ -24,15 +24,15 @@ reject() {
     if "$compiler" build "tests/cases/text-blocks/$name.ab" -o "$out/invalid" --no-cache --fast > "$out/$name.log" 2>&1; then
         echo "text blocks: $name unexpectedly compiled" >&2; exit 1
     fi
-    grep -qF "E_PARSE_$code" "$out/$name.log" || { cat "$out/$name.log" >&2; exit 1; }
+    grep -qF "error[$code]:" "$out/$name.log" || { cat "$out/$name.log" >&2; exit 1; }
     grep -qF "$name.ab:$line:$column" "$out/$name.log" || { cat "$out/$name.log" >&2; exit 1; }
 }
-reject invalid-open RAW_OPEN_LINE 2 19
-reject invalid-indent RAW_INDENT 4 1
-reject invalid-import-indent RAW_INDENT 3 1
-reject invalid-close RAW_CLOSE_LINE 4 7
-reject invalid-close-suffix RAW_CLOSE_LINE 4 13
-reject invalid-unclosed RAW_UNTERMINATED 2 16
+reject invalid-open E_PARSE_RAW_OPEN_LINE 2 19
+reject invalid-indent E_PARSE_RAW_INDENT 4 1
+reject invalid-import-indent E_PARSE_RAW_INDENT 3 1
+reject invalid-close E_PARSE_RAW_CLOSE_LINE 4 7
+reject invalid-close-suffix E_PARSE_RAW_CLOSE_LINE 4 13
+reject invalid-unclosed E_PARSE_RAW_UNTERMINATED 2 16
 "$compiler" build "$root/tests/cases/text-blocks/extern.ab" -o "$out/extern" --fast --no-cache
 status=0
 "$out/extern" || status=$?

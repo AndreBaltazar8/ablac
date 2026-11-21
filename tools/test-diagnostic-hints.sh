@@ -38,6 +38,9 @@ check invalid-statement-separator 1 "E_PARSE_STATEMENT_SEPARATOR" "help: put the
 check invalid-top-level-statement 1 "E_PARSE_TOP_LEVEL_DECLARATION" "help: put executable statements inside"
 # A `{ ... }` statement whose value is dropped never runs (#824): one error each, with the fix named.
 check invalid-discarded-lambda 6 "E_PARSE_DISCARDED_LAMBDA" 'help: to run the statements here, write `if (true) { ... }`'
+check invalid-cast-type 1 "E_PARSE_CAST_TYPE"
+check invalid-loop-label 1 "E_PARSE_LOOP_LABEL"
+check invalid-private-target 1 "E_PARSE_PRIVATE_TARGET"
 
 "$compiler" build "$cases/defer-assignment-tail.ab" -o "$output_directory/defer-assignment-tail" >/dev/null
 actual=$("$output_directory/defer-assignment-tail")

@@ -54,6 +54,11 @@ only its parse errors.
 | `E_PARSE_UNCLOSED_DELIMITER` | an unclosed `(`, `[` or `{` |
 | `E_PARSE_UNTERMINATED_COMMENT` | a block comment reaches the end of the file with no matching `*/` |
 | `E_PARSE_STRING_PART` | a malformed string or template |
+| `E_PARSE_INVALID_UTF8` | a quoted string contains a byte sequence that isn't UTF-8 |
+| `E_PARSE_RAW_OPEN_LINE` | the opening `"""` of a multiline raw string is followed by text on the same line |
+| `E_PARSE_RAW_CLOSE_LINE` | the closing `"""` of a multiline raw string doesn't stand on its own line |
+| `E_PARSE_RAW_INDENT` | a nonblank content line is indented less than the closing delimiter |
+| `E_PARSE_RAW_UNTERMINATED` | a raw string is missing the closing `"""` |
 | `E_PARSE_EXTENSION_RECEIVER` | an extension's receiver type isn't followed by `.name` (e.g. an unclosed `array<int`) |
 | `E_PARSE_ELVIS` | Kotlin's `?:`: Abla writes it `??` ([null-safe operators](language.md#null-safe-operators)) |
 | `E_PARSE_INVALID_ESCAPE` | an unknown backslash escape in a string, a `\x` without 2 hex digits, or a `\u` that isn't a Unicode code point ([language.md](language.md#lexical-structure)) |
@@ -63,6 +68,10 @@ only its parse errors.
 | `E_PARSE_ASSIGNMENT_TARGET` | the left side of `=` can't be assigned (a `?.` chain is not a place) |
 | `E_PARSE_COMPOUND_ASSIGNMENT_TARGET` | the left side of `+=` etc. contains a call ([language.md](language.md#expressions-and-operators)) |
 | `E_PARSE_TRAILING_LAMBDA_TARGET` | a trailing lambda after something that can't be called |
+| `E_PARSE_DISCARDED_LAMBDA` | a bare lambda is used as a statement and its value is discarded. Call it, assign it, or use a control-flow block for statements intended to run immediately. |
+| `E_PARSE_CAST_TYPE` | `as?` isn't followed by a class name |
+| `E_PARSE_LOOP_LABEL` | `break@` or `continue@` isn't followed immediately by a label |
+| `E_PARSE_PRIVATE_TARGET` | `private` modifies a declaration. It can't modify an import, compile-time action or `extend` block. |
 | `E_PARSE_CLASS_MEMBER` | a class body contains something other than a method |
 | `E_PARSE_DELEGATED_PARAMETER` | `by` on a function's parameter, or on a constructor parameter that isn't `val`/`var`: only a class property is delegated ([delegated properties](language.md#delegated-class-properties)) |
 | `E_PARSE_RESOURCE_DECLARATION` | `resource` before something other than `class` |
@@ -113,6 +122,86 @@ Close a block comment with `*/`, or use `//` for a single line.
 /* comment
 // error: E_PARSE_UNTERMINATED_COMMENT
 // error: help: close the comment with
+```
+
+In a [multiline raw string](language.md#lexical-structure), put the opening
+and closing delimiters on their own lines. Here, `text` must move to the
+next line.
+
+```abla error
+val message = """text
+    """
+// error: E_PARSE_RAW_OPEN_LINE
+```
+
+The closing delimiter can't follow text on a content line.
+
+```abla error
+val message = """
+    text"""
+// error: E_PARSE_RAW_CLOSE_LINE
+```
+
+Indent content at least as far as the closing delimiter. In this example,
+add another space before `text` or move the closing delimiter to the left.
+
+```abla error
+val message = """
+   text
+    """
+// error: E_PARSE_RAW_INDENT
+```
+
+Add a closing delimiter to finish a raw string.
+
+```abla error
+val message = """text
+// error: E_PARSE_RAW_UNTERMINATED
+```
+
+For a byte that isn't text, write a byte escape such as `\xFF` in an
+ordinary string. For example, this command puts a literal invalid UTF-8 byte
+inside the quotes, so building `invalid.ab` reports
+`E_PARSE_INVALID_UTF8`.
+
+```sh
+printf 'fun main { val text = "\377" }\n' > invalid.ab
+```
+
+A bare lambda won't run by itself. Use an `if` or loop block for statements
+that should run immediately, or call the lambda as `{ 42 }()`.
+
+```abla error
+fun main: int {
+    { 42 }
+    0
+}
+// error: E_PARSE_DISCARDED_LAMBDA
+```
+
+Give a conditional cast a class name after `as?`.
+
+```abla error
+fun main: int = 1 as? 2
+// error: E_PARSE_CAST_TYPE
+```
+
+For an unlabeled break, write `break`. A labeled break must name an
+enclosing loop, as in `break@outer`.
+
+```abla error
+fun main {
+    while (true) { break@ }
+}
+// error: E_PARSE_LOOP_LABEL
+```
+
+Remove `private` from an import. Use it on the declaration you want to hide.
+
+```abla error
+private import "abla/io"
+fun main {}
+// error: E_PARSE_PRIVATE_TARGET
 ```
 
 ## Names, calls and types
