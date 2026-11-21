@@ -2214,7 +2214,31 @@ fun bootstrapRunningImageSuffix(backend: string, tail: int, count: int): string 
     bytes.toText()
 }
 
+// A file's bytes copied in this process (copy_file_range between the two descriptors), so that publishing an object needs no `cp` on the PATH; false when it cannot
+// (the kernel lacks the call, or the descriptors are on different file systems of an old one), and the caller runs `cp`.
+fun bootstrapCopyFileInProcess(source: string, destination: string): bool {
+    val input = linuxOpen(source, 0)
+    if (input.descriptor < 0) return false
+    // (O_WRONLY | O_CREAT | O_TRUNC, mode 0644: the mode cp gives an object.)
+    val output = linuxOpen(destination, 577, 420)
+    if (output.descriptor < 0) {
+        linuxSyscall1(3, input.descriptor)
+        return false
+    }
+    var copied = true
+    var finished = false
+    while (copied && !finished) {
+        val count = linuxSyscall6(326, input.descriptor, 0, output.descriptor, 0, 1073741824, 0)
+        if (count < 0) copied = false
+        else if (count == 0) finished = true
+    }
+    linuxSyscall1(3, input.descriptor)
+    linuxSyscall1(3, output.descriptor)
+    copied
+}
+
 fun bootstrapCopyNativeObject(source: string, destination: string): int {
+    if (bootstrapCopyFileInProcess(source, destination)) return 0
     val copy = linuxCommand("cp")
     copy.argument("--")
     copy.argument(source)
@@ -2951,14 +2975,6 @@ fun bootstrapEmitReleaseParts(optimizedPath: string, parts: int, objectPath: str
     var status = 0
     val running: array<int> = []
     var next = 0
-    if (!compilerParts && bootstrapInProcessEmitterOn()) {
-        // In this process, a part after another: no llc to start (one hold of the cores less, a little longer for the largest programs).
-        while (status == 0 && next <= parts) {
-            status = bootstrapEmitWholeProgramObject("$optimizedPath.$next", "$objectPath.$next")
-            next = next + 1
-        }
-        next = parts + 1
-    }
     var active = 0
     while (next <= parts || active > 0) {
         while (status == 0 && next <= parts && active < jobs) {
@@ -3100,8 +3116,16 @@ fun bootstrapStartCompilerPart(inputPath: string, outputPath: string, index: int
     child.start().process
 }
 
-// Starts bootstrapEmitWholeProgramObject's llc on one part: its process, or 0.
+// Starts bootstrapEmitWholeProgramObject's llc on one part: its process, or 0. A compiler that makes the object itself starts a child of its own
+// (`--emit-object`), so the parts run side by side as llc's processes did.
 fun bootstrapStartPartObject(partPath: string, objectPath: string): int {
+    if (bootstrapInProcessEmitterOn()) {
+        val child = linuxCommand("/proc/self/exe")
+        child.argument("--emit-object")
+        child.argument(partPath)
+        child.argument(objectPath)
+        return child.start().process
+    }
     val emitObject = bootstrapWholeProgramObjectCommand(partPath, objectPath)
     emitObject.start().process
 }

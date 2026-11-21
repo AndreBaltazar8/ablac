@@ -34,19 +34,21 @@ for program in "${programs[@]}"; do
     cmp -s "$out/$name.in" "$out/$name.ex" || fail "$name: the in-process code generation differs from llc's"
     count=$((count + 1))
 done
-# No llc on the PATH or in ABLA_LLVM_TOOLS (the nix shell sets it); the coreutils the compiler runs, ld.lld not even: it links in process too.
+# An EMPTY PATH and no ABLA_LLVM_TOOLS (the nix shell sets it): no llc, no ld.lld (it links in process), not even cp or env.
 bin=$out/bin
 mkdir -p "$bin"
-for tool in env cp nproc rm mktemp cat uname dirname readlink; do
-    path=$(command -v "$tool" 2> /dev/null || true)
-    [[ -z $path ]] || ln -sf "$path" "$bin/$tool"
-done
 builtins=$(clang --rtlib=compiler-rt -print-libgcc-file-name)
 [[ -f $builtins ]] || fail "no compiler-rt builtins archive to name"
 PATH=$PWD/$bin ABLA_LLVM_TOOLS= ABLA_COMPILER_RT_BUILTINS=$builtins ABLA_CACHE_DIR=$PWD/$out/nollc.cache "$compiler" build tests/cases/libc-imports/hello.ab -o "$out/nollc" --no-cache > "$out/nollc.log" 2>&1 ||
     { tail -5 "$out/nollc.log" >&2; fail "a release build of hello failed with no llc on the PATH"; }
 cmp -s "$out/nollc" "$out/hello.ex" || fail "hello built with no llc differs from the one built with it"
 [[ $("$out/nollc") == hello ]] || fail "the release hello did not print hello"
+# An object artifact is published without `cp` too (an Xtensa build ends the same way): built on the empty PATH, the same bytes as with the whole one.
+PATH=$PWD/$bin ABLA_LLVM_TOOLS= ABLA_COMPILER_RT_BUILTINS=$builtins ABLA_CACHE_DIR=$PWD/$out/obj-empty.cache "$compiler" build tests/cases/libc-imports/hello.ab --emit object -o "$out/obj-empty.o" \
+    --no-cache > "$out/obj-empty.log" 2>&1 || { tail -5 "$out/obj-empty.log" >&2; fail "an object build of hello failed on an empty PATH"; }
+ABLA_CACHE_DIR=$PWD/$out/obj-full.cache "$compiler" build tests/cases/libc-imports/hello.ab --emit object -o "$out/obj-full.o" --no-cache > "$out/obj-full.log" 2>&1 ||
+    { tail -5 "$out/obj-full.log" >&2; fail "an object build of hello failed"; }
+cmp -s "$out/obj-empty.o" "$out/obj-full.o" || fail "the object built on an empty PATH differs"
 if PATH=$PWD/$bin ABLA_LLVM_TOOLS= ABLA_CODEGEN_INPROCESS=0 ABLA_COMPILER_RT_BUILTINS=$builtins ABLA_CACHE_DIR=$PWD/$out/nollc-off.cache "$compiler" build tests/cases/libc-imports/hello.ab -o "$out/nollc-off" \
     --no-cache > "$out/nollc-off.log" 2>&1; then
     fail "hello built with ABLA_CODEGEN_INPROCESS=0 and no llc: the test does not tell the in-process code generation from llc"
