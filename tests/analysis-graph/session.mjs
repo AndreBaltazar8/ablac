@@ -576,6 +576,16 @@ async function documentation(mode) {
         '@noinline',
         'fun annotated(): int = 1',
         '',
+        '/** Parameter example. */',
+        'fun withDocs(',
+        '    /** The first operand. */',
+        '    left: int,',
+        '    // The second operand.',
+        '    right: int = 2',
+        '): int = left + right',
+        '',
+        'fun <T> mapArgs(items: Map<string, array<T>>, transform: (T) -> T): int = 0',
+        '',
         'fun main: int = inc(1) + dec(2) + plain() + annotated() + Box(1, 2).twice()',
         '',
     ].join('\n');
@@ -595,6 +605,30 @@ async function documentation(mode) {
     assert.equal(docOf('same'), undefined);
     assert.equal(docOf('annotated'), 'Annotated.');
     assert.equal(docOf('main'), undefined);
+    const symbolOf = (name) => d.symbols.find((x) => x.name === name);
+    assert.equal(symbolOf('inc').signature, 'fun inc(n: int): int');
+    assert.equal(symbolOf('twice').signature, 'fun twice(): int');
+    assert.equal(symbolOf('annotated').signature, '@noinline\nfun annotated(): int');
+    assert.equal(symbolOf('withDocs').signature, [
+        'fun withDocs(',
+        '    /** The first operand. */',
+        '    left: int,',
+        '    // The second operand.',
+        '    right: int = 2',
+        '): int',
+    ].join('\n'));
+    assert.deepEqual(symbolOf('withDocs').parameters, [
+        { name: 'left', label: 'left: int', documentation: 'The first operand.' },
+        { name: 'right', label: 'right: int = 2', documentation: 'The second operand.' },
+    ]);
+    assert.equal(docOf('left'), 'The first operand.');
+    assert.equal(docOf('right'), 'The second operand.');
+    assert.equal(symbolOf('Box').parameters[0].label, 'val value: int');
+    assert.equal(symbolOf('Box').parameters[0].documentation, 'The held value.');
+    assert.deepEqual(symbolOf('mapArgs').parameters, [
+        { name: 'items', label: 'items: Map<string, array<T>>' },
+        { name: 'transform', label: 'transform: (T) -> T' },
+    ]);
     // the standard library's and the built-ins' comments come with their declarations
     const stub = a.documents.find((x) => x.uri.endsWith('/stdlib/abla/builtins/declarations.ab'));
     assert.equal(stub.symbols.find((x) => x.name === 'append').documentation, 'Adds `value` at the end.');
@@ -603,6 +637,8 @@ async function documentation(mode) {
     const call = d.occurrences.find((o) => o.name === 'inc' && o.declarationId);
     const hover = (await s.rpc('query/hover', { uri: d.uri, offset: call.range.start })).result.value;
     assert.equal(hover.symbol.documentation, 'Adds one.\nMore text.');
+    assert.equal(hover.symbol.signature, 'fun inc(n: int): int');
+    assert.deepEqual(hover.symbol.parameters, [{ name: 'n', label: 'n: int' }]);
     await s.close();
 }
 

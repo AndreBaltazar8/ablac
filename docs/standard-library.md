@@ -27,6 +27,13 @@ Coverage schema version 1 contains `modules` (each with `module`, `documented`,
 `/** ... */` or run of `//` comments counts as documentation, matching editor hover
 documentation. Modules and declarations appear in deterministic source order.
 
+The same extraction is exposed by `ablac analyze --stdio` graph symbols and
+hover results: `signature` is the exact source header, `documentation` is the
+adjacent comment, and optional `parameters` contains `{name, label,
+documentation?}` entries. Parameter labels preserve their source spelling,
+including defaults and ownership modifiers. Parameter documentation comes from
+adjacent comments, not `@param` tags in a function's comment.
+
 ## By task
 
 | Page | Modules |

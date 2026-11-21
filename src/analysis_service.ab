@@ -373,6 +373,78 @@ fun bootstrapAnalysisDocumentation(source: string, offset: int, limit: int = 409
     if (limit > 0 && text.size > limit) text.slice(0, limit) else text
 }
 
+/** The beginning of the source header (the parser's sealed interface range starts at `interface`). */
+fun bootstrapAnalysisDeclarationBegin(source: string, tokens: array<BootstrapToken>,
+    declaration: BootstrapDeclaration): int {
+    val index = bootstrapAnalysisFirstTokenAt(tokens, declaration.begin)
+    if (declaration.isSealed && index > 0 && bootstrapTokenText(source,
+        tokens[index - 1]) == "sealed") return tokens[index - 1].begin
+    declaration.begin
+}
+
+/** A declaration's exact source header, without its body/initializer. Token nesting protects defaults and annotations. */
+fun bootstrapAnalysisSignature(source: string, tokens: array<BootstrapToken>,
+    declaration: BootstrapDeclaration): string {
+    val begin = bootstrapAnalysisDeclarationBegin(source, tokens, declaration)
+    var end = begin
+    var depth = 0
+    var index = bootstrapAnalysisFirstTokenAt(tokens, begin)
+    while (index < tokens.size && tokens[index].begin < declaration.end) {
+        val token = tokens[index]
+        if (depth == 0 && (token.kind == BOOTSTRAP_TOKEN_LBRACE ||
+            (token.kind == BOOTSTRAP_TOKEN_EQUAL && declaration.kind != "type") ||
+            (declaration.expression.kind == "delegate.initializer" && token.begin ==
+                declaration.expression.begin) ||
+            token.kind == BOOTSTRAP_TOKEN_SEMICOLON)) break
+        if (token.kind == BOOTSTRAP_TOKEN_LPAREN || token.kind == BOOTSTRAP_TOKEN_LBRACKET) depth = depth + 1
+        if (token.kind == BOOTSTRAP_TOKEN_RPAREN || token.kind == BOOTSTRAP_TOKEN_RBRACKET) depth = depth - 1
+        if (token.kind != BOOTSTRAP_TOKEN_NEWLINE) end = token.end
+        index = index + 1
+    }
+    source.slice(begin, end)
+}
+
+/** Parameter labels and comments for the source reference, completion and signature help. */
+fun bootstrapAnalysisParameters(source: string, tokens: array<BootstrapToken>,
+    declaration: BootstrapDeclaration): array<Json> {
+    val parameters: array<Json> = []
+    for (parameter in 0 until declaration.parameters.size) {
+        val selection = bootstrapAnalysisParameterRange(tokens, source, declaration, parameter)
+        var begin = selection[0]
+        var end = selection[1]
+        var index = bootstrapAnalysisFirstTokenAt(tokens, begin)
+        if (index > 0) {
+            val modifier = bootstrapTokenText(source, tokens[index - 1])
+            if (modifier == "val" || modifier == "var" || modifier == "own" || modifier == "borrow") begin = tokens[index - 1].begin
+        }
+        val fallback = if (parameter < declaration.parameterDefaults.size) declaration.parameterDefaults[parameter] else BootstrapExpression("missing", "", end, end, [])
+        if (fallback.kind != "missing") end = fallback.end
+        else {
+            var depth = 0
+            var angles = 0
+            while (index < tokens.size && tokens[index].begin < declaration.end) {
+                val token = tokens[index]
+                if (depth == 0 && angles == 0 && (token.kind == BOOTSTRAP_TOKEN_COMMA || token.kind == BOOTSTRAP_TOKEN_RPAREN)) break
+                if (token.kind == BOOTSTRAP_TOKEN_LPAREN || token.kind == BOOTSTRAP_TOKEN_LBRACKET) depth = depth + 1
+                if (token.kind == BOOTSTRAP_TOKEN_RPAREN || token.kind == BOOTSTRAP_TOKEN_RBRACKET) depth = depth - 1
+                if (token.kind == BOOTSTRAP_TOKEN_LESS) angles = angles + 1
+                angles = angles - bootstrapTypeCloseCount(token.kind)
+                if (token.kind != BOOTSTRAP_TOKEN_NEWLINE) end = token.end
+                index = index + 1
+            }
+        }
+        val keys = ["name", "label"]
+        val values = [jsonString(declaration.parameters[parameter]), jsonString(source.slice(begin, end))]
+        val documentation = bootstrapAnalysisDocumentation(source, selection[0])
+        if (documentation != "") {
+            keys.append("documentation")
+            values.append(jsonString(documentation))
+        }
+        parameters.append(jsonObject(keys, values))
+    }
+    parameters
+}
+
 fun bootstrapAnalysisSymbolJson(
     tokens: array<BootstrapToken>,
     source: string,
@@ -394,7 +466,9 @@ fun bootstrapAnalysisSymbolJson(
         "${declaration.kind} ${declaration.resultType}",
         topLevel,
         containerId,
-        bootstrapAnalysisDocumentation(source, declaration.begin)
+        bootstrapAnalysisDocumentation(source, bootstrapAnalysisDeclarationBegin(source, tokens, declaration)),
+        bootstrapAnalysisSignature(source, tokens, declaration),
+        bootstrapAnalysisParameters(source, tokens, declaration)
     )
 }
 
@@ -410,7 +484,9 @@ fun bootstrapAnalysisNamedSymbolJson(
     detail: string,
     topLevel: bool,
     containerId: string,
-    documentation: string = ""
+    documentation: string = "",
+    signature: string = "",
+    parameters: array<Json> = []
 ): Json {
     val keys = [
         "id", "name", "kind", "uri", "range", "selectionRange",
@@ -440,6 +516,14 @@ fun bootstrapAnalysisNamedSymbolJson(
     if (documentation != "") {
         keys.append("documentation")
         values.append(jsonString(documentation))
+    }
+    if (signature != "") {
+        keys.append("signature")
+        values.append(jsonString(signature))
+    }
+    if (parameters.size > 0) {
+        keys.append("parameters")
+        values.append(jsonArray(parameters))
     }
     jsonObject(keys, values)
 }
@@ -485,7 +569,9 @@ fun bootstrapAnalysisParameterRange(
     if (index < 1) index = 1
     while (!found && index < tokens.size && tokens[index].begin <= headerEnd) {
         val token = tokens[index]
-        val previous = tokens[index - 1]
+        var previousIndex = index - 1
+        while (previousIndex > 0 && tokens[previousIndex].kind == BOOTSTRAP_TOKEN_NEWLINE) previousIndex = previousIndex - 1
+        val previous = tokens[previousIndex]
         val introducer = previous.kind == BOOTSTRAP_TOKEN_LPAREN || previous.kind ==
             BOOTSTRAP_TOKEN_COMMA ||
             (previous.kind == BOOTSTRAP_TOKEN_IDENTIFIER &&
@@ -591,7 +677,7 @@ fun bootstrapAnalysisCollectDeclarationSymbols(
                 declaration.parameterTypes[parameter] else "unknown",
             false,
             containerId,
-            if (kind == "property") bootstrapAnalysisDocumentation(source, selection[0]) else ""
+            bootstrapAnalysisDocumentation(source, selection[0])
         ))
         parameter = parameter + 1
     }
