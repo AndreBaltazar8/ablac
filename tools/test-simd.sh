@@ -23,8 +23,27 @@ done
 echo "ok   x86-64: release and --fast, cpu has aes/clmul/avx2 where /proc/cpuinfo says"
 llvm-objdump -d "$out/native" > "$out/native.s"
 grep -q aesenc "$out/native.s" || { echo "no aesenc in the program" >&2; exit 1; }
+grep -q 'pshufb' "$out/native.s" || { echo "no SSSE3 byte shuffle in the program" >&2; exit 1; }
+grep -qE 'roundps|roundpd' "$out/native.s" || { echo "no SSE4.1 lane rounding in the program" >&2; exit 1; }
+grep -q 'vpgatherqq' "$out/native.s" || { echo "no AVX2 array gather in the program" >&2; exit 1; }
+"$compiler" build "$cases/gather-bounds.ab" -o "$out/gather-bounds" --no-cache
+check_gather_bounds() {
+    for index in 2 -1; do
+        local args=("$@") status=0
+        [[ $index == 2 ]] || args+=(negative)
+        "${args[@]}" > "$out/gather-bounds.out" 2> "$out/gather-bounds.err" || status=$?
+        if [[ $status != 101 ]] ||
+            ! grep -qFx "panic: index $index out of bounds for array of size 2" "$out/gather-bounds.err"; then
+            cat "$out/gather-bounds.err" >&2
+            printf 'SIMD gather: wrong out-of-bounds result for %s (status %s)\n' "$index" "$status" >&2
+            return 1
+        fi
+    done
+}
+check_gather_bounds "$out/gather-bounds"
 if command -v qemu-x86_64 >/dev/null; then
     qemu-x86_64 -cpu qemu64 "$out/native" || { echo "simd under qemu64 (no AES): check $? failed" >&2; exit 1; }
+    check_gather_bounds qemu-x86_64 -cpu qemu64 "$out/gather-bounds"
     echo "ok   x86-64 under qemu64: no AES, CLMUL or AVX2, the paths behind cpuHas not taken"
 fi
 "$compiler" build "$cases/positive-language.ab" -o "$out/language" --no-cache
@@ -39,6 +58,8 @@ echo "ok   language: fields, arrays, maps, nullable, defaults, globals, closures
 node "$cases/run.mjs" "$out/simd.wasm"
 wasm-dis "$out/simd.wasm" > "$out/simd.wat" 2>/dev/null
 grep -q 'i32x4\.add' "$out/simd.wat" || { echo "no SIMD128 instructions in the module" >&2; exit 1; }
+grep -q 'i8x16\.swizzle' "$out/simd.wat" || { echo "no Wasm SIMD swizzle in the module" >&2; exit 1; }
+grep -q 'f32x4\.nearest' "$out/simd.wat" || { echo "no Wasm SIMD rounding in the module" >&2; exit 1; }
 echo "ok   wasm under node $(node --version): SIMD128 instructions, no AES"
 
 # AArch64: no executable target exists, so an object, a start of its own, and qemu.
@@ -49,6 +70,8 @@ if command -v qemu-aarch64 >/dev/null; then
     llvm-objdump -d "$out/aarch64" > "$out/aarch64.s"
     grep -q 'aese' "$out/aarch64.s" || { echo "no AESE in the AArch64 program" >&2; exit 1; }
     grep -q 'pmull' "$out/aarch64.s" || { echo "no PMULL in the AArch64 program" >&2; exit 1; }
+    grep -qE '[[:space:]]tbl[[:space:]]' "$out/aarch64.s" || { echo "no NEON table lookup in the program" >&2; exit 1; }
+    grep -q 'frintn' "$out/aarch64.s" || { echo "no NEON ties-to-even rounding in the program" >&2; exit 1; }
     for cpu in max cortex-a57; do
         qemu-aarch64 -cpu "$cpu" "$out/aarch64" || { echo "simd aarch64 $cpu: check $? failed" >&2; exit 1; }
     done

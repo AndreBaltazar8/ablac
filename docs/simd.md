@@ -51,17 +51,36 @@ Vectors can't cross an `@export` (`simd.export`): there is no C ABI to keep to h
 needs a `Splat`.
 
 **Shuffles take literal indices** (`simd.shuffle-index`), since LLVM's `shufflevector` needs a
-constant and a wrapper function would hide it, so each `<type>Shuffle` is an intrinsic. A
-variable-index shuffle (`pshufb`, `tbl`, `i8x16.swizzle`) isn't provided: it isn't portable
-below SSSE3, and it would be the one operation here whose time on some targets depends on data.
+constant and a wrapper function would hide it, so each `<type>Shuffle` is an intrinsic.
+For indices computed at run time, `.swizzle(indices)` selects from one vector and
+`.swizzle2(other, indices)` selects from this vector followed by `other`. The index
+vector has unsigned lanes of the same width and count. A lane outside the table gives
+zero, including for float results. AArch64 uses `tbl` and Wasm uses `i8x16.swizzle`.
+On x86-64, an SSSE3 path uses `pshufb` with an explicit range check, with a checked
+scalar lane lookup on SSE2. These are general-purpose operations with no constant-time guarantee.
 
 **Shift counts** out of range give zero, as scalars' do; LLVM would call them poison, so a
 variable count costs a compare and a select, which folds for a constant. Rotations take the
 count modulo the width.
 
 **Float lanes.** `min` and `max` are IEEE 754-2019 `minimum`/`maximum`: NaN if either is, and
-`-0 < +0`. Conversions to integers saturate and NaN gives 0, as `f32ToI32` does. Rounding lanes
-isn't provided yet: baseline x86-64 would call the C library (see `bootstrapLlvmTargetHasRoundingInstructions`).
+`-0 < +0`. `.floor()`, `.ceil()`, `.trunc()`, and `.roundEven()` round each lane,
+preserving signed zero and infinities and returning NaN for NaN input. AArch64 uses `frint*` and Wasm uses its lane
+rounding instructions. x86-64 dispatches to a function marked `@target("sse41")`
+when supported. Baseline SSE2 uses arithmetic instead of requiring a C math library.
+
+**Conversions.** Integer `.widenLow()` and `.widenHigh()` sign- or zero-extend the chosen
+half. `.narrowSaturating(other)` clamps this vector's lanes and then `other`'s
+lanes to the narrower type. Cross-width `.to…Low()` and `.to…High()` select a half,
+and paired `.to…(other)` conversions fill a result from two inputs. Equal-lane-count
+cross-width conversions use ordinary `.to…()`. Float-to-int truncates toward zero,
+saturates overflow, and maps NaN to 0. Int-to-float and float narrowing round to nearest,
+ties to even.
+
+**Gathers.** `TGather(values, indices)` gathers from an array, with the same bounds
+checks as scalar indexing. On x86-64 with AVX2, it can gather 32- and 64-bit lanes from
+dense arrays under `@target("avx2")` after checking all indices. Other cases read each
+lane in order using ordinary array indexing.
 
 **Asking what the target has.** Two questions, because they have different answers:
 
@@ -96,6 +115,6 @@ PCLMULQDQ's. Key expansion has no operation: `AESKEYGENASSIST` has no ARM counte
 
 ## Not yet
 
-Variable shuffles, lane rounding, widening and narrowing conversions, gathers, 512-bit vectors,
-vectors at compile time (`#` is refused, by `compile.` errors: the evaluator has no vectors).
+512-bit vectors and vectors at compile time (`#` is refused, by `compile.` errors:
+the evaluator has no vectors).
 `targetHas` doesn't know about a build that raises the CPU, since no build can yet.

@@ -430,10 +430,236 @@ fun bootstrapLlvmSimdShift(
     LLVMBuildSelect(backend.builder, inRange, shifted, LLVMConstNull(vector), "simd.shift")
 }
 
+// A contiguous slice of lanes, also used to split byte tables at 128 bits.
+private fun bootstrapLlvmSimdSlice(
+    backend: BootstrapLlvmBackend, value: i64*, begin: int, count: int
+): i64* {
+    val mask: array<i64*> = []
+    for (at in 0 until count) mask.append(LLVMConstInt(backend.i32Type, begin + at, 0))
+    LLVMBuildShuffleVector(backend.builder, value, LLVMGetUndef(LLVMTypeOf(value)),
+        bootstrapLlvmConstVector(mask), "simd.slice")
+}
+
+private fun bootstrapLlvmSimdJoin(
+    backend: BootstrapLlvmBackend, left: i64*, right: i64*, count: int
+): i64* {
+    val mask: array<i64*> = []
+    for (at in 0 until count * 2) mask.append(LLVMConstInt(backend.i32Type, at, 0))
+    LLVMBuildShuffleVector(backend.builder, left, right, bootstrapLlvmConstVector(mask), "simd.join")
+}
+
+// SSE2 and other targets without byte-table instructions. Mask before the
+// extract: an out-of-range extract produces poison even on targets that wrap.
+private fun bootstrapLlvmSimdSwizzleScalar(
+    backend: BootstrapLlvmBackend, table: i64*, indices: i64*, laneType: i64*,
+    count: int, tableCount: int, resultType: i64*
+): i64* {
+    val builder = backend.builder
+    val limit = LLVMConstInt(laneType, tableCount, 0)
+    val mask = LLVMConstInt(laneType, tableCount - 1, 0)
+    var result = LLVMGetUndef(resultType)
+    for (at in 0 until count) {
+        val lane = LLVMConstInt(backend.i32Type, at, 0)
+        val index = LLVMBuildExtractElement(builder, indices, lane, "swizzle.index")
+        val safe = LLVMBuildAnd(builder, index, mask, "swizzle.safe")
+        val selected = LLVMBuildExtractElement(builder, table, safe, "swizzle.lane")
+        val valid = LLVMBuildICmp(builder, llvmIntUnsignedLessThan(), index, limit, "swizzle.valid")
+        val value = LLVMBuildSelect(builder, valid, selected,
+            LLVMConstNull(LLVMTypeOf(selected)), "swizzle.value")
+        result = LLVMBuildInsertElement(builder, result, value, lane, "swizzle.result")
+    }
+    result
+}
+
+// Convert a lane index into one byte index per byte it selects. Reject
+// oversized lane indices before truncating, so e.g. 256 cannot wrap to 0.
+private fun bootstrapLlvmSimdSwizzleByteIndices(
+    backend: BootstrapLlvmBackend, indices: i64*, laneType: i64*, count: int,
+    tableCount: int, bytesPerLane: int
+): i64* {
+    if (bytesPerLane == 1) return indices
+    val builder = backend.builder
+    val vector = LLVMTypeOf(indices)
+    val byteCount = count * bytesPerLane
+    val byteType = backend.type("u8x$byteCount")
+    val limit = bootstrapLlvmSimdSplat(backend, LLVMConstInt(laneType, tableCount, 0), vector, count)
+    val valid = LLVMBuildICmp(builder, llvmIntUnsignedLessThan(), indices, limit, "swizzle.valid")
+    val scale = bootstrapLlvmSimdSplat(backend, LLVMConstInt(laneType, bytesPerLane, 0),
+        vector, count)
+    val invalid = bootstrapLlvmSimdSplat(backend, LLVMConstInt(laneType, 128, 0), vector, count)
+    val first = LLVMBuildSelect(builder, valid, LLVMBuildMul(builder, indices, scale, "swizzle.scale"),
+        invalid, "swizzle.byte.first")
+    val bytes = LLVMBuildBitCast(builder, first, byteType, "swizzle.byte.indices")
+    val mask: array<i64*> = []
+    val offsets: array<i64*> = []
+    for (at in 0 until byteCount) {
+        mask.append(LLVMConstInt(backend.i32Type, at - at % bytesPerLane, 0))
+        offsets.append(LLVMConstInt(backend.i8Type, at % bytesPerLane, 0))
+    }
+    val expanded = LLVMBuildShuffleVector(builder, bytes, LLVMGetUndef(byteType),
+        bootstrapLlvmConstVector(mask), "swizzle.byte.repeat")
+    LLVMBuildAdd(builder, expanded, bootstrapLlvmConstVector(offsets), "swizzle.byte.offset")
+}
+
+private fun bootstrapLlvmSimdSwizzleByteChunk(
+    backend: BootstrapLlvmBackend, arch: int, tables: array<i64*>, indices: i64*
+): i64* {
+    val bytes = backend.type("u8x16")
+    if (arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
+        val args: array<i64*> = []
+        for (table in tables) args.append(table)
+        args.append(indices)
+        return bootstrapLlvmSimdCall(backend, "llvm.aarch64.neon.tbl${tables.size}.v16i8", bytes, args)
+    }
+    val builder = backend.builder
+    var result = LLVMConstNull(bytes)
+    val limit = bootstrapLlvmSimdSplat(backend, LLVMConstInt(backend.i8Type, 16, 0), bytes, 16)
+    for (at in 0 until tables.size) {
+        val offset = bootstrapLlvmSimdSplat(backend, LLVMConstInt(backend.i8Type, at * 16, 0), bytes, 16)
+        var index = LLVMBuildSub(builder, indices, offset, "swizzle.table.index")
+        var intrinsic = "llvm.wasm.swizzle"
+        if (arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
+            intrinsic = "llvm.x86.ssse3.pshuf.b.128"
+            val valid = LLVMBuildICmp(builder, llvmIntUnsignedLessThan(), index, limit, "swizzle.table.valid")
+            val off = bootstrapLlvmSimdSplat(backend, LLVMConstInt(backend.i8Type, 128, 0), bytes, 16)
+            index = LLVMBuildSelect(builder, valid, index, off, "swizzle.pshuf.index")
+        }
+        val chunk = bootstrapLlvmSimdCall(backend, intrinsic, bytes, [tables[at], index])
+        result = LLVMBuildOr(builder, result, chunk, "swizzle.tables")
+    }
+    result
+}
+
+private fun bootstrapLlvmSimdSwizzle(
+    backend: BootstrapLlvmBackend, type: string, left: i64*, right: i64*, indices: i64*,
+    two: bool, features: string
+): i64* {
+    val arch = bootstrapLlvmSimdArch(backend.targetTriple)
+    val count = bootstrapVectorLaneCount(type)
+    val bits = bootstrapLaneBits(bootstrapVectorLaneType(type))
+    val bytesPerLane = bits / 8
+    val byteCount = count * bytesPerLane
+    val laneType = LLVMIntTypeInContext(backend.context, i32(bits))
+    val vector = LLVMTypeOf(left)
+    val tableCount = if (two) count * 2 else count
+    val native = arch == BOOTSTRAP_SIMD_ARCH_AARCH64 || arch == BOOTSTRAP_SIMD_ARCH_WASM ||
+        (arch == BOOTSTRAP_SIMD_ARCH_X86_64 &&
+            (bootstrapSimdFeatureListHas(features, "ssse3") ||
+             bootstrapSimdFeatureListHas(features, "sse41") ||
+             bootstrapSimdFeatureListHas(features, "avx2")))
+    if (!native) {
+        val source = if (two) bootstrapLlvmSimdJoin(backend, left, right, count) else left
+        return bootstrapLlvmSimdSwizzleScalar(backend, source, indices, laneType, count, tableCount, vector)
+    }
+    val bytes = backend.type("u8x$byteCount")
+    val builder = backend.builder
+    val tables: array<i64*> = []
+    val source = [left, right]
+    for (at in 0 until (if (two) 2 else 1)) {
+        val table = LLVMBuildBitCast(builder, source[at], bytes, "swizzle.table")
+        if (byteCount == 16) tables.append(table)
+        else {
+            tables.append(bootstrapLlvmSimdSlice(backend, table, 0, 16))
+            tables.append(bootstrapLlvmSimdSlice(backend, table, 16, 16))
+        }
+    }
+    val byteIndices = bootstrapLlvmSimdSwizzleByteIndices(backend, indices, laneType, count,
+        tableCount, bytesPerLane)
+    val selected = if (byteCount == 16) bootstrapLlvmSimdSwizzleByteChunk(backend, arch, tables, byteIndices)
+        else bootstrapLlvmSimdJoin(backend,
+            bootstrapLlvmSimdSwizzleByteChunk(backend, arch, tables,
+                bootstrapLlvmSimdSlice(backend, byteIndices, 0, 16)),
+            bootstrapLlvmSimdSwizzleByteChunk(backend, arch, tables,
+                bootstrapLlvmSimdSlice(backend, byteIndices, 16, 16)), 16)
+    LLVMBuildBitCast(builder, selected, vector, "swizzle.vector")
+}
+
+private fun bootstrapLlvmSimdConvert(
+    backend: BootstrapLlvmBackend, value: i64*, from: string, to: string
+): i64* {
+    val sourceLane = bootstrapVectorLaneType(from)
+    val targetLane = bootstrapVectorLaneType(to)
+    val result = backend.type(to)
+    val sourceFloat = sourceLane.startsWith("f")
+    val targetFloat = targetLane.startsWith("f")
+    val builder = backend.builder
+    if (sourceFloat && !targetFloat) {
+        val sign = if (targetLane.startsWith("u")) "fptoui" else "fptosi"
+        val sourceSuffix = "v${bootstrapVectorLaneCount(to)}f${bootstrapLaneBits(sourceLane)}"
+        return bootstrapLlvmSimdCall(backend,
+            "llvm.$sign.sat.${bootstrapLlvmSimdSuffix(to)}.$sourceSuffix", result, [value])
+    }
+    if (!sourceFloat && targetFloat) {
+        return if (sourceLane.startsWith("u")) LLVMBuildUIToFP(builder, value, result, "simd.convert")
+            else LLVMBuildSIToFP(builder, value, result, "simd.convert")
+    }
+    if (sourceFloat) {
+        return if (bootstrapLaneBits(sourceLane) < bootstrapLaneBits(targetLane))
+            LLVMBuildFPExt(builder, value, result, "simd.extend.float")
+        else LLVMBuildFPTrunc(builder, value, result, "simd.truncate.float")
+    }
+    if (sourceLane.startsWith("u")) LLVMBuildZExt(builder, value, result, "simd.extend.unsigned")
+    else LLVMBuildSExt(builder, value, result, "simd.extend.signed")
+}
+
+private fun bootstrapLlvmSimdNarrowSaturating(
+    backend: BootstrapLlvmBackend, value: i64*, from: string, to: string
+): i64* {
+    val sourceLane = bootstrapVectorLaneType(from)
+    val unsigned = sourceLane.startsWith("u")
+    val bits = bootstrapLaneBits(bootstrapVectorLaneType(to))
+    val upper = (1 << (bits - (if (unsigned) 0 else 1))) - 1
+    val laneType = backend.type(sourceLane)
+    val vectorType = LLVMTypeOf(value)
+    val count = bootstrapVectorLaneCount(to)
+    val suffix = "v${count}i${bootstrapLaneBits(sourceLane)}"
+    val high = bootstrapLlvmSimdSplat(backend, LLVMConstInt(laneType, upper, 0), vectorType, count)
+    var clamped = bootstrapLlvmSimdCall(backend, "llvm.${if (unsigned) "u" else "s"}min.$suffix",
+        vectorType, [value, high])
+    if (!unsigned) {
+        val low = bootstrapLlvmSimdSplat(backend, LLVMConstInt(laneType, -upper - 1, 1), vectorType, count)
+        clamped = bootstrapLlvmSimdCall(backend, "llvm.smax.$suffix", vectorType, [clamped, low])
+    }
+    LLVMBuildTrunc(backend.builder, clamped, backend.type(to), "simd.narrow.saturating")
+}
+
+private fun bootstrapLlvmSimdGatherQwords(
+    backend: BootstrapLlvmBackend, base: i64*, indices: i64*, count: int
+): i64* {
+    val type = backend.type("u64x$count")
+    val zero = LLVMConstNull(type)
+    val mask = bootstrapLlvmSimdSplat(backend, LLVMConstInt(backend.i64Type, -1, 1), type, count)
+    val name = if (count == 4) "llvm.x86.avx2.gather.q.q.256" else "llvm.x86.avx2.gather.q.q"
+    bootstrapLlvmSimdCall(backend, name, type, [zero, base, indices, mask,
+        LLVMConstInt(backend.i8Type, 8, 0)])
+}
+
+private fun bootstrapLlvmSimdGatherWords(
+    backend: BootstrapLlvmBackend, address: i64*, indices: i64*, type: string
+): i64* {
+    val builder = backend.builder
+    val base = LLVMBuildIntToPtr(builder, address, backend.pointerType, "gather.base")
+    val count = bootstrapVectorLaneCount(type)
+    if (type.startsWith("u64")) return bootstrapLlvmSimdGatherQwords(backend, base, indices, count)
+    val chunk = backend.type("u64x4")
+    val first = if (count == 4) indices else bootstrapLlvmSimdSlice(backend, indices, 0, 4)
+    val firstWords = bootstrapLlvmSimdGatherQwords(backend, base,
+        LLVMBuildZExt(builder, first, chunk, "gather.index"), 4)
+    if (count == 4) return LLVMBuildTrunc(builder, firstWords, backend.type(type), "gather.narrow")
+    val second = bootstrapLlvmSimdSlice(backend, indices, 4, 4)
+    val secondWords = bootstrapLlvmSimdGatherQwords(backend, base,
+        LLVMBuildZExt(builder, second, chunk, "gather.index"), 4)
+    val half = backend.type("u32x4")
+    bootstrapLlvmSimdJoin(backend,
+        LLVMBuildTrunc(builder, firstWords, half, "gather.narrow"),
+        LLVMBuildTrunc(builder, secondWords, half, "gather.narrow"), 4)
+}
+
 fun bootstrapLlvmEmitSimdIntrinsic(
     backend: BootstrapLlvmBackend,
     var storage: BootstrapLlvmFunctionStorage,
-    instruction: BootstrapInstruction
+    instruction: BootstrapInstruction,
+    features: string
 ): bool {
     val name = instruction.text
     val operands = instruction.operands
@@ -571,23 +797,41 @@ fun bootstrapLlvmEmitSimdIntrinsic(
             builder, bootstrapLlvmScalarOperand(backend, storage, operands[0], type),
             backend.type(target), "simd.bits"
         )
-    } else if (operation == "convert") {
-        if (operands.size != 1) return false
-        val value = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
-        val targetType = backend.type(target)
-        val targetLane = bootstrapVectorLaneType(target)
-        if (floating && !targetLane.startsWith("f")) {
-            // Saturating, NaN gives 0, as f32ToI32 does.
-            val sign = if (targetLane.startsWith("u")) "fptoui" else "fptosi"
-            result = bootstrapLlvmSimdCall(
-                backend,
-                "llvm.$sign.sat.${bootstrapLlvmSimdSuffix(target)}.${bootstrapLlvmSimdSuffix(type)}",
-                targetType, [value]
-            )
-        } else if (!floating && targetLane.startsWith("f")) {
-            result = if (unsigned) LLVMBuildUIToFP(builder, value, targetType, "simd.convert")
-                else LLVMBuildSIToFP(builder, value, targetType, "simd.convert")
-        } else return false
+    } else if (operation == "gatherWords") {
+        if (operands.size != 2) return false
+        if (bootstrapLlvmSimdArch(backend.targetTriple) != BOOTSTRAP_SIMD_ARCH_X86_64 ||
+            !bootstrapSimdFeatureListHas(features, "avx2")) {
+            bootstrapLlvmEmitSimdTrap(backend, storage, instruction, vector)
+            return true
+        }
+        result = bootstrapLlvmSimdGatherWords(backend,
+            bootstrapLlvmCoreIntrinsicInteger(backend, storage, operands[0]),
+            bootstrapLlvmScalarOperand(backend, storage, operands[1], type), type)
+    } else if (operation == "swizzle" || operation == "swizzle2") {
+        val two = operation == "swizzle2"
+        if (operands.size != (if (two) 3 else 2)) return false
+        val left = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
+        val right = if (two) bootstrapLlvmScalarOperand(backend, storage, operands[1], type) else left
+        val indexType = "u${bootstrapLaneBits(lane)}x$laneCount"
+        val indices = bootstrapLlvmScalarOperand(backend, storage, operands[operands.size - 1], indexType)
+        result = bootstrapLlvmSimdSwizzle(backend, type, left, right, indices, two, features)
+    } else if (operation == "convert" || operation == "convertLow" || operation == "convertHigh" ||
+               operation == "convertPair" || operation == "widenLow" || operation == "widenHigh" ||
+               operation == "narrowSat") {
+        if (!bootstrapIsVectorType(target)) return false
+        val pair = operation == "convertPair" || operation == "narrowSat"
+        if (operands.size != (if (pair) 2 else 1)) return false
+        var value = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
+        if (pair) {
+            val right = bootstrapLlvmScalarOperand(backend, storage, operands[1], type)
+            value = bootstrapLlvmSimdJoin(backend, value, right, laneCount)
+        } else if (operation.endsWith("Low") || operation.endsWith("High")) {
+            val half = laneCount / 2
+            val begin = if (operation.endsWith("High")) half else 0
+            value = bootstrapLlvmSimdSlice(backend, value, begin, half)
+        }
+        result = if (operation == "narrowSat") bootstrapLlvmSimdNarrowSaturating(backend, value, type, target)
+            else bootstrapLlvmSimdConvert(backend, value, type, target)
     } else if (operation == "low" || operation == "high") {
         if (operands.size != 1) return false
         val half = laneCount / 2
@@ -688,6 +932,16 @@ fun bootstrapLlvmEmitSimdIntrinsic(
             )
         } else if (operation == "sqrt" && floating) {
             result = bootstrapLlvmSimdCall(backend, "llvm.sqrt.$suffix", vector, [value])
+        } else if (floating && (operation == "floor" || operation == "ceil" ||
+                                operation == "trunc" || operation == "roundEven")) {
+            val arch = bootstrapLlvmSimdArch(backend.targetTriple)
+            val native = arch == BOOTSTRAP_SIMD_ARCH_AARCH64 || arch == BOOTSTRAP_SIMD_ARCH_WASM ||
+                (arch == BOOTSTRAP_SIMD_ARCH_X86_64 &&
+                    (bootstrapSimdFeatureListHas(features, "sse41") ||
+                     bootstrapSimdFeatureListHas(features, "avx2")))
+            val rounding = if (operation == "roundEven") "roundeven" else operation
+            result = if (native) bootstrapLlvmSimdCall(backend, "llvm.$rounding.$suffix", vector, [value])
+                else bootstrapLlvmRoundByArithmetic(backend, rounding, value, lane, laneCount)
         } else return false
     } else if (operands.size == 2) {
         val left = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)

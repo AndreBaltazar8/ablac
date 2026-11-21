@@ -1,0 +1,142 @@
+import "abla/simd"
+import "abla/float"
+import "abla/runtime/scalar"
+
+private @noinline fun checkByteTables(left: u8x32, right: u8x32, indices: u8x32): bool {
+    val single = left.swizzle(indices)
+    val pair = left.swizzle2(right, indices)
+    for (lane in 0 until 32) {
+        val index = int(indices.get(lane))
+        val first = if (index < 32) left.get(index) else u8(0)
+        val second = if (index < 32) first else if (index < 64) right.get(index - 32) else u8(0)
+        if (single.get(lane) != first || pair.get(lane) != second) return false
+    }
+    true
+}
+
+private fun checkSwizzles(): bool {
+    var left = u8x32Splat(0)
+    var right = u8x32Splat(0)
+    for (lane in 0 until 32) {
+        left = left.with(lane, u8(lane + 1))
+        right = right.with(lane, u8(lane + 101))
+    }
+    // Cover every unsigned byte index, permuted across the two output halves.
+    for (group in 0 until 8) {
+        var indices = u8x32Splat(0)
+        for (lane in 0 until 32) {
+            indices = indices.with(lane, u8(group * 32 + ((lane * 5) & 31)))
+        }
+        if (!checkByteTables(left, right, indices)) return false
+    }
+    val floats = u32x4(1065353216, 2147483648, 2143289345, 1073741824).asF32x4()
+    val sel = u32x4(2, 1, 256, 4294967295)
+    val selected = floats.swizzle(sel).asU32x4()
+    if (selected.bytes() != u32x4(2143289345, 2147483648, 0, 0).bytes()) return false
+    val other = u64x2(u64(50), u64(60))
+    val both = u64x2(u64(10), u64(20)).swizzle2(other, u64x2(u64(3), u64(4294967296)))
+    both.bytes() == u64x2(u64(60), u64(0)).bytes()
+}
+
+private @noinline fun checkF32Round(value: f32x4): bool {
+    value.floor().bytes() == u32x4(1073741824, 1082130432, 3212836864, 3221225472).bytes() &&
+    value.ceil().bytes() == u32x4(1077936128, 1084227584, 2147483648, 3212836864).bytes() &&
+    value.trunc().bytes() == u32x4(1073741824, 1082130432, 2147483648, 3212836864).bytes() &&
+    value.roundEven().bytes() == u32x4(1073741824, 1082130432, 2147483648, 3221225472).bytes()
+}
+
+private @noinline fun checkF64Round(value: f64x4): bool {
+    val nanFloor = value.floor()
+    val even = value.roundEven()
+    nanFloor.get(0) != nanFloor.get(0) &&
+    f64ToBits(nanFloor.get(1)) == f64ToBits(-0.0) &&
+    f64ToBits(even.get(1)) == f64ToBits(-0.0) &&
+    value.ceil().get(2) == 4503599627370496.0 &&
+    value.trunc().get(2) == 4503599627370495.0 &&
+    even.get(2) == 4503599627370496.0 &&
+    even.get(3) == value.get(3)
+}
+
+private fun checkRounding(): bool {
+    val nan = f64FromBits(9221120237041090561)
+    val infinity = f64FromBits(9218868437227405312)
+    checkF32Round(f32x4(2.5, 4.5, -0.5, -1.5)) &&
+    checkF64Round(f64x4(nan, -0.0, 4503599627370495.5, infinity)) &&
+    f32x8Splat(-2.5).roundEven().bytes() == f32x8Splat(-2.0).bytes() &&
+    f64x2(1.25, -1.25).floor().bytes() == f64x2(1.0, -2.0).bytes() &&
+    f32ToBits(f32x4Splat(f32FromBits(1)).floor().get(0)) == u32(0) &&
+    f32ToBits(f32x4Splat(f32FromBits(2147483649)).ceil().get(0)) == u32(2147483648)
+}
+
+private fun checkConversions(): bool {
+    val signed = i16x8(-32768, -129, -128, 127, 128, 255, 256, 32767)
+    val low = signed.widenLow()
+    val high = signed.widenHigh()
+    if (low.bytes() != i32x4(-32768, -129, -128, 127).bytes() ||
+        high.bytes() != i32x4(128, 255, 256, 32767).bytes()) return false
+    val saturated = signed.narrowSaturating(-signed)
+    if (saturated.get(0) != i8(-128) || saturated.get(3) != i8(127) ||
+        saturated.get(7) != i8(127) || saturated.get(9) != i8(127) ||
+        saturated.get(12) != i8(-128)) return false
+    val unsigned = u32x8(0, 65535, 65536, 4294967295, 1, 2, 3, 4)
+    val narrow = unsigned.narrowSaturating(u32x8Splat(65535))
+    if (narrow.get(0) != u16(0) || narrow.get(1) != u16(65535) ||
+        narrow.get(2) != u16(65535) || narrow.get(3) != u16(65535) ||
+        narrow.get(7) != u16(4) || narrow.get(15) != u16(65535)) return false
+    if (unsigned.widenLow().bytes() != u64x4(u64(0), u64(65535), u64(65536), u64(4294967295)).bytes() ||
+        unsigned.widenHigh().bytes() != u64x4(u64(1), u64(2), u64(3), u64(4)).bytes()) return false
+    val f = i32x4(-2147483648, 16777217, 9, 2147483647).toF64x4()
+    if (f.bytes() != f64x4(-2147483648.0, 16777217.0, 9.0, 2147483647.0).bytes()) return false
+    val a = f64x2(1.25, 1.0e20)
+    val b = f64x2(-1.0e20, f64FromBits(9221120237041090560))
+    if (a.toI32x4(b).bytes() != i32x4(1, 2147483647, -2147483648, 0).bytes()) return false
+    if (a.toU32x4(b).bytes() != u32x4(1, 4294967295, 0, 0).bytes()) return false
+    val f32 = f32x4(-5.75, 7.75, 1.0e30, -1.0e30)
+    val rounded = u64x2(u64(16777217), u64(3)).toF32x4(u64x2(u64(16777219), u64(4)))
+    f32.toI64x2Low().bytes() == i64x2(-5, 7).bytes() &&
+    f32.toI64x2High().bytes() == i64x2(9223372036854775807, -9223372036854775807 - 1).bytes() &&
+    f32.toU64x4().bytes() == u64x4(u64(0), u64(7), u64(-1), u64(0)).bytes() &&
+    f32.toF64x4().toF32x4().bytes() == f32.bytes() &&
+    rounded.bytes() == f32x4(16777216.0, 3.0, 16777220.0, 4.0).bytes()
+}
+
+private @noinline fun checkGather32(values: array<i32>, indices: u32x8, expected: i32x8): bool =
+    i32x8Gather(values, indices).bytes() == expected.bytes()
+
+// Keep the typed array view and deliberately force its boxed-storage fallback.
+private trusted fun forceBoxedGatherArray(values: any): void {
+    __ablaRuntimeArraySet(values, __ablaRuntimeI64(0), __ablaRuntimeNull())
+    return
+}
+
+private fun checkGathers(): bool {
+    val data: array<i32> = [i32(-9), i32(900), i32(-123456789), i32(0), i32(2147483647)]
+    val first = u32x8(4, 2, 3, 0, 1, 4, 4, 2)
+    val second = u32x8(1, 4, 3, 3, 1, 2, 0, 0)
+    if (!checkGather32(data, first, i32x8(2147483647, -123456789, 0, -9, 900, 2147483647, 2147483647, -123456789)) ||
+        !checkGather32(data, second, i32x8(900, 2147483647, 0, 0, 900, -123456789, -9, -9))) return false
+    forceBoxedGatherArray(data)
+    data[0] = i32(-9)
+    if (!checkGather32(data, first, i32x8(2147483647, -123456789, 0, -9, 900, 2147483647, 2147483647, -123456789))) return false
+    val doubleWords: array<f64> = [1.25, -0.0, 3.0, f64FromBits(9221120237041090561)]
+    val gathered = f64x4Gather(doubleWords, u64x4(u64(3), u64(0), u64(1), u64(1))).asU64x4()
+    if (gathered.bytes() != u64x4(u64(9221120237041090561), u64(4608308318706860032),
+        u64(-9223372036854775807 - 1), u64(-9223372036854775807 - 1)).bytes()) return false
+    val small: array<u16> = [u16(7), u16(65535), u16(32768)]
+    val gatheredSmall = u16x8Gather(small, u16x8(1, 0, 2, 1, 1, 2, 2, 0))
+    gatheredSmall.bytes() == u16x8(65535, 7, 32768, 65535, 65535, 32768, 32768, 7).bytes()
+}
+
+fun simdOperationChecks(): int {
+    if (!checkSwizzles()) return 201
+    if (!checkRounding()) return 202
+    if (!checkConversions()) return 203
+    if (!checkGathers()) return 204
+    0
+}
+
+// Keep nonconstant inputs in the binary so disassembly checks the instruction,
+// even when the optimizer evaluates the fixed reference cases at build time.
+@export("simd_round_probe")
+fun simdRoundProbe(a: f32, b: f32, c: f32, d: f32): f32 =
+    f32x4(a, b, c, d).roundEven().sum()

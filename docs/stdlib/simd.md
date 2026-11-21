@@ -55,10 +55,20 @@ a capture is a heap copy of its bytes, made each time it is stored.
 | `m.any()`, `m.all()` | on unsigned vectors: any or all lanes' top bits are set |
 | `.sum()` | the sum of the lanes; integers wrap |
 | `TShuffle(a, b, i0, ...)` | a lane by literal index, `0...n-1` from `a` and `n...2n-1` from `b` |
+| `.swizzle(indices)`, `.swizzle2(o, indices)` | select lanes at run time from this vector or from this vector followed by `o`. Indices have type `M`. Out-of-range indices give zero |
+| `TGather(values: array<L>, indices: M)` | load one value per index into a lane. An out-of-range index panics |
+| `.floor()`, `.ceil()`, `.trunc()`, `.roundEven()` | round each float lane toward negative infinity, positive infinity, zero, or nearest with ties to even |
+| `.widenLow()`, `.widenHigh()` | extend the chosen half of an integer vector to lanes twice as wide, preserving signedness |
+| `.narrowSaturating(o)` | pack this integer vector followed by `o` into lanes half as wide, clamping to the result lane's range |
 | `.interleaveLow(o)`, `.interleaveHigh(o)`, `.reverse()` | common shuffles |
 | `.asU8x16()` and so on | the same bits as another type of the same width |
 | `.toF32x4()`, `.toI32x4()`, ... | numeric conversion; 32- and 64-bit lanes only. To integers it saturates, and NaN gives 0 |
 | `v.low()`, `v.high()`, `TConcat(low, high)` | 256-bit vectors in halves. `u32x8Concat(a, b)` |
+
+For cross-width conversion, `i32x4.toF64x2Low()` and `i32x4.toF64x2High()`
+select a half. `f64x2.toI32x4(other)` converts this vector followed by `other`.
+When the lane counts match, `i32x4.toF64x4()` converts all lanes. Float-to-integer
+conversions truncate and saturate, with NaN giving zero.
 
 ## What the target has
 
@@ -100,7 +110,6 @@ operations in such a function are one instruction. It can't be combined with `@i
 
 ## Timing
 
-None of this is a constant-time promise. A vector's operations have no branch of their own (but
-`.get` and `.with` check their index, and `.text`), and on the targets above add, xor, select and
-the like don't vary with data, but LLVM may rewrite a `select` into anything it likes, and a float
-can take longer on a subnormal. See `abla/ct` for what has that promise.
+Lane indexing, gathers and runtime table lookups may branch or perform indexed
+loads. LLVM may rewrite operations such as `select`, and floating-point operations
+can take longer on subnormals. See `abla/ct` for constant-time operations.

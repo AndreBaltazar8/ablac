@@ -3641,7 +3641,7 @@ fun bootstrapLlvmEmitCoreIntrinsic(
 
     val name = instruction.text
     if (bootstrapSimdIntrinsic(name)) {
-        return bootstrapLlvmEmitSimdIntrinsic(backend, storage, instruction)
+        return bootstrapLlvmEmitSimdIntrinsic(backend, storage, instruction, irFunction.targetFeatures)
     }
     if (name == "nativeInitializeGlobals") {
         if (instruction.operands.size != 0) supported = false
@@ -9283,45 +9283,44 @@ fun bootstrapLlvmSoftwareRounding(
     name: string,
     value: i64*
 ): i64* {
-    val f64 = backend.f64Type
-    val fabs = bootstrapLlvmDeclare(backend, "llvm.fabs.f64", f64, [f64], false, [false])
-    val copysign = bootstrapLlvmDeclare(
-        backend, "llvm.copysign.f64", f64, [f64, f64], false, [false, false]
-    )
-    val big = LLVMConstRealOfStringAndSize(f64, "4503599627370496", i32(16))
-    val one = LLVMConstRealOfStringAndSize(f64, "1", i32(1))
-    // the argument floor works on: -x for ceil, |x| for trunc
-    var x = value
-    if (name == "ablaF64Ceil") x = LLVMBuildFNeg(backend.builder, value, "round.negate")
-    if (name == "ablaF64Trunc") x = bootstrapLlvmCall(backend, fabs, [value], "round.abs", false,
-        [false])
-    val magnitude = bootstrapLlvmCall(backend, fabs, [x], "round.magnitude", false, [false])
-    val shifted = LLVMBuildFSub(
-        backend.builder,
-        LLVMBuildFAdd(backend.builder, magnitude, big, "round.add"),
-        big, "round.subtract"
-    )
-    val signed = bootstrapLlvmCall(
-        backend, copysign, [shifted, x], "round.sign", false, [false, false]
-    )
-    val small = LLVMBuildFCmp(
-        backend.builder, llvmRealUnorderedLessThan(), magnitude, big, "round.small"
-    )
-    val even = LLVMBuildSelect(backend.builder, small, signed, x, "round.even")
-    if (name == "ablaF64RoundEven") return even
-    val up = LLVMBuildFCmp(
-        backend.builder, llvmRealOrderedGreaterThan(), even, x, "round.up"
-    )
-    val floor = LLVMBuildSelect(
-        backend.builder, up, LLVMBuildFSub(backend.builder, even, one, "round.down"),
-        even, "round.floor"
-    )
-    if (name == "ablaF64Ceil") return LLVMBuildFNeg(backend.builder, floor, "round.ceil")
-    if (name == "ablaF64Trunc") {
-        return bootstrapLlvmCall(
-            backend, copysign, [floor, value], "round.trunc", false, [false, false]
-        )
+    val operation = if (name == "ablaF64Ceil") "ceil"
+        else if (name == "ablaF64Trunc") "trunc"
+        else if (name == "ablaF64RoundEven") "roundeven"
+        else "floor"
+    bootstrapLlvmRoundByArithmetic(backend, operation, value, "f64", 1)
+}
+
+fun bootstrapLlvmRoundByArithmetic(
+    backend: BootstrapLlvmBackend, operation: string, value: i64*, lane: string, count: int
+): i64* {
+    val builder = backend.builder
+    val type = LLVMTypeOf(value)
+    val laneType = backend.type(lane)
+    val suffix = if (count == 1) lane else "v${count}$lane"
+    val boundary = if (lane == "f32") "8388608" else "4503599627370496"
+    var big = LLVMConstRealOfStringAndSize(laneType, boundary, i32(boundary.size))
+    var one = LLVMConstRealOfStringAndSize(laneType, "1", i32(1))
+    if (count != 1) {
+        big = bootstrapLlvmSimdSplat(backend, big, type, count)
+        one = bootstrapLlvmSimdSplat(backend, one, type, count)
     }
+    val fabs = "llvm.fabs.$suffix"
+    val copysign = "llvm.copysign.$suffix"
+    val x = if (operation == "ceil") LLVMBuildFNeg(builder, value, "round.negate")
+        else if (operation == "trunc") bootstrapLlvmSimdCall(backend, fabs, type, [value])
+        else value
+    val magnitude = bootstrapLlvmSimdCall(backend, fabs, type, [x])
+    val shifted = LLVMBuildFSub(builder, LLVMBuildFAdd(builder, magnitude, big, "round.add"),
+        big, "round.subtract")
+    val signed = bootstrapLlvmSimdCall(backend, copysign, type, [shifted, x])
+    val small = LLVMBuildFCmp(builder, llvmRealUnorderedLessThan(), magnitude, big, "round.small")
+    val even = LLVMBuildSelect(builder, small, signed, x, "round.even")
+    if (operation == "roundeven") return even
+    val up = LLVMBuildFCmp(builder, llvmRealOrderedGreaterThan(), even, x, "round.up")
+    val floor = LLVMBuildSelect(builder, up, LLVMBuildFSub(builder, even, one, "round.down"),
+        even, "round.floor")
+    if (operation == "ceil") return LLVMBuildFNeg(builder, floor, "round.ceil")
+    if (operation == "trunc") return bootstrapLlvmSimdCall(backend, copysign, type, [floor, value])
     floor
 }
 
