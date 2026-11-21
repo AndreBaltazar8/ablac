@@ -16,6 +16,14 @@ set -e
 [[ $status -eq 42 ]] || exit 1
 echo "dense arrays: numbers and bools in 8-byte words, boxed on demand"
 
+# A class field store preserves the array’s shape. Replacing an element and
+# growing the same array through a mutable borrow must invalidate that lookup.
+"$compiler" build "$project_root/tests/cases/arrays-dense/class-fields.ab" \
+    --no-cache -o "$output_directory/class-fields"
+status=0
+"$output_directory/class-fields" || status=$?
+[[ $status == 42 ]] || exit 1
+
 # Native scalar stores and boxed-storage fallback preserve every payload bit.
 for profile in release fast o1; do
     flags=()
