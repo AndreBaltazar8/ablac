@@ -15,6 +15,8 @@
 #   static      (when the run built ablac-static-x86_64-linux, #806 step C; `static-aarch64` for ablac-static-aarch64-linux, run natively or under
 #               qemu-aarch64, SKIP on a host with neither, never with the fixpoint) it has no PT_INTERP or DT_NEEDED, prints the version, builds and
 #               runs a smoke program and, with ABLA_STATIC_LLVM_LIB set, reaches the fixpoint (tools/test-static-artifact.sh)
+#   toolchain   (when the run ships abla-toolchain-dynamic-x86_64-linux.tar.gz beside the default) abla-toolchain-x86_64-linux.tar.gz is the static package: no
+#               PT_INTERP or DT_NEEDED, no shared library or external LLVM tool, at most 60 MB (150 MB unpacked), its launcher runs with an empty PATH
 #   siblings    (with --siblings) the downstream repositories build and pass their tests with the candidate
 #               (tools/test-siblings.sh over tools/siblings.txt)
 #
@@ -161,7 +163,9 @@ trap 'rm -f -- "$expected" "$actual"; [[ -z ${source_dir:-} || -n $artifacts ]] 
 switched=0
 ! grep -qxF ablac-dynamic-x86_64-linux "$actual" || switched=1
 static_names=$(grep -E "^ablac-static-(x86_64|aarch64)-linux(\.sha256)?\$" "$actual" || true)
-grep -vE "^ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux(\.sha256)?\$" "$actual" > "$actual.filtered" || true
+toolchain_switched=0
+! grep -qxF abla-toolchain-dynamic-x86_64-linux.tar.gz "$actual" || toolchain_switched=1
+grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz)(\.sha256)?\$" "$actual" > "$actual.filtered" || true
 mv -f "$actual.filtered" "$actual"
 if [[ -n $assets_from ]]; then
     sort "$assets_from" >"$expected"
@@ -181,7 +185,7 @@ else
         basis="(no previous release found)"
     fi
 fi
-grep -vE "^ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux(\.sha256)?\$" "$expected" > "$expected.filtered" || true
+grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz)(\.sha256)?\$" "$expected" > "$expected.filtered" || true
 mv -f "$expected.filtered" "$expected"
 if ((count == 0)); then
     report FAIL assets "no files in the artifacts"
@@ -327,6 +331,49 @@ for static_arch in x86_64 aarch64; do
         fi
     fi
 done
+
+# 8. toolchain: when the release ships the dynamic toolchain archive beside the default (abla-toolchain-dynamic-x86_64-linux.tar.gz, one release, like
+# decision #90 A), `abla-toolchain-x86_64-linux.tar.gz` is the static package (tools/package-linux-static-toolchain.sh): no PT_INTERP and no
+# DT_NEEDED in libexec/ablac.bin and libexec/abla-install-xtensa-native, no shared library, libLLVM, libclang-cpp, clang, ld.lld, opt or llc in
+# it, at most 60 MB as an archive and 150 MB unpacked, and its launcher prints the version with an empty PATH.
+if ((toolchain_switched)); then
+    tarball=$out/abla-toolchain-x86_64-linux.tar.gz
+    if [[ ! -f $tarball ]]; then
+        report FAIL toolchain "no abla-toolchain-x86_64-linux.tar.gz beside the dynamic one"
+    else
+        unpack=$(mktemp -d)
+        mkdir -p "$unpack/empty"
+        bad=
+        if ! tar -xzf "$tarball" -C "$unpack" --strip-components=1; then
+            bad="the archive does not unpack;"
+        else
+            size=$(stat -c %s "$tarball")
+            ((size <= 60 * 1048576)) || bad="$bad the archive is $((size / 1048576)) MB (cap 60);"
+            unpacked=$(du -sb "$unpack" | cut -f1)
+            ((unpacked <= 150 * 1048576)) || bad="$bad unpacked it is $((unpacked / 1048576)) MB (cap 150);"
+            for executable in libexec/ablac.bin libexec/abla-install-xtensa-native; do
+                if [[ ! -f $unpack/$executable ]]; then
+                    bad="$bad no $executable;"
+                elif ! readelf -h "$unpack/$executable" > /dev/null 2>&1; then
+                    bad="$bad $executable is not an ELF file;"
+                elif segments=$(readelf -lW "$unpack/$executable") && grep -q 'INTERP\|Shared library' <<< "$segments"; then
+                    bad="$bad $executable is not static;"
+                fi
+            done
+            found=$(cd "$unpack" && find . -type f \( -name '*.so' -o -name '*.so.*' -o -name 'libLLVM*' -o -name 'libclang-cpp*' -o -name clang -o -name ld.lld -o -name opt -o -name llc \) -print)
+            [[ -z $found ]] || found=$(sed -n 1,5p <<< "$found" | tr '\n' ' ')
+            [[ -z $found ]] || bad="$bad it holds ${found% };"
+            reported=$(env -i PATH="$unpack/empty" HOME="$unpack" "$unpack/bin/ablac" --version 2>&1 || true)
+            [[ $reported == "ablac $version" ]] || bad="$bad its launcher printed '$reported' with an empty PATH;"
+        fi
+        if [[ -z $bad ]]; then
+            report PASS toolchain "the static package: no PT_INTERP, no DT_NEEDED, no shared library or external LLVM tool, $((size / 1048576)) MB, version $version with an empty PATH"
+        else
+            report FAIL toolchain "${bad# }"
+        fi
+        rm -rf -- "$unpack"
+    fi
+fi
 
 printf 'release-check %s  run %s  %s\n' "$tag" "$run_id" "$out"
 printf '%s\n' "${results[@]}"

@@ -73,4 +73,25 @@ printf '#!/bin/sh\necho other\n' > artifacts/ablac-dynamic-x86_64-linux
 (cd artifacts && sha256sum ablac-dynamic-x86_64-linux > ablac-dynamic-x86_64-linux.sha256)
 other=$(run expected-without out7)
 [[ $(line stage2 "$other") == FAIL* ]] || { echo "a dynamic asset that is not stage 2 passed check 4: $(line stage2 "$other")" >&2; exit 1; }
-echo "release-check static: the optional assets (x86-64 and AArch64) are judged by their own checks"
+# The portable toolchain (the static package is abla-toolchain-x86_64-linux.tar.gz, the dynamic one abla-toolchain-dynamic-x86_64-linux.tar.gz for one
+# release): the dynamic archive is no extra name, and check 8 judges the default archive. Here it holds scripts, a shared library and a dynamic
+# executable, which each fail; without the default archive the check fails too. (The passing case is the real package's, in the release job.)
+mkdir -p pkg/abla-toolchain-x86_64-linux/bin pkg/abla-toolchain-x86_64-linux/libexec pkg/abla-toolchain-x86_64-linux/lib
+printf '#!/bin/sh\necho "ablac 9.9.9"\n' > pkg/abla-toolchain-x86_64-linux/bin/ablac
+chmod +x pkg/abla-toolchain-x86_64-linux/bin/ablac
+cp "$(command -v readelf)" pkg/abla-toolchain-x86_64-linux/libexec/ablac.bin
+cp "$(command -v readelf)" pkg/abla-toolchain-x86_64-linux/libexec/abla-install-xtensa-native
+printf 'x' > pkg/abla-toolchain-x86_64-linux/lib/libLLVM.so.23.1
+tar -czf artifacts/abla-toolchain-x86_64-linux.tar.gz -C pkg abla-toolchain-x86_64-linux
+cp artifacts/abla-toolchain-x86_64-linux.tar.gz artifacts/abla-toolchain-dynamic-x86_64-linux.tar.gz
+for name in abla-toolchain-x86_64-linux.tar.gz abla-toolchain-dynamic-x86_64-linux.tar.gz; do (cd artifacts && sha256sum "$name" > "$name.sha256"); done
+tc=$(run expected-without out8)
+[[ $(line assets "$tc") == PASS* ]] || { echo "assets, dynamic toolchain archive: $(line assets "$tc")" >&2; exit 1; }
+[[ $(line toolchain "$tc") == FAIL* ]] || { echo "a bad static package passed check 8: $(line toolchain "$tc")" >&2; exit 1; }
+for want in "libLLVM" "is not static"; do
+    [[ $(line toolchain "$tc") == *"$want"* ]] || { echo "check 8 did not say '$want': $(line toolchain "$tc")" >&2; exit 1; }
+done
+rm -f artifacts/abla-toolchain-x86_64-linux.tar.gz artifacts/abla-toolchain-x86_64-linux.tar.gz.sha256
+notc=$(run expected-without out9)
+[[ $(line toolchain "$notc") == FAIL* ]] || { echo "no default toolchain archive passed check 8: $(line toolchain "$notc")" >&2; exit 1; }
+echo "release-check static: the optional assets (x86-64 and AArch64) and the static toolchain package are judged by their own checks"
