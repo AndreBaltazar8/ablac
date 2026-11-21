@@ -78,6 +78,55 @@ AB
 "$compiler" build "$out/math-fold.ab" -o "$out/math-fold.dynamic" --no-cache > "$out/math-fold.dynamic.log" 2>&1 ||
     { echo 'static compiler: the ordinary compiler failed to build the math program' >&2; exit 1; }
 cmp -s "$out/math-fold.static" "$out/math-fold.dynamic" || { echo 'static compiler: the math program differs from the ordinary compiler'"'"'s' >&2; exit 1; }
+# JIT'd code reaches C through the library's symbol table only: the libm functions the optimiser rewrites into (pow(2, x) becomes exp2), compile-time
+# `extern:"c"` calls (strtol, fmod, cbrt, toupper, strstr ...) and `ablac run` must work in the static compiler as in the dynamic one, whose
+# glibc has them all. The same program is run through `ablac run`, built with the jit tier and built with the interpreter-free default, and each
+# must print what the dynamic compiler's builds print.
+mkdir -p "$out/jit-libcalls"
+printf 'compileCapabilities = ["trusted.native"]\n' > "$out/jit-libcalls/abla.toml"
+cat > "$out/jit-libcalls/main.ab" <<'AB'
+import "abla/io"
+import "abla/math"
+import "abla/float/text"
+import "abla/compiler"
+#compilerGrant("trusted.native")
+import "abla/unsafe/native"
+import "abla/unsafe/memory/raw"
+trusted noescape extern:"c" fun exp2(x: f64): f64
+trusted noescape extern:"c" fun cbrt(x: f64): f64
+trusted noescape extern:"c" fun fmod(x: f64, y: f64): f64
+trusted noescape extern:"c" fun trunc(x: f64): f64
+trusted noescape extern:"c" fun rint(x: f64): f64
+trusted noescape extern:"c" fun fmaxf(x: f32, y: f32): f32
+trusted noescape extern:"c" fun expm1(x: f64): f64
+trusted noescape extern:"c" fun strtol(text: cstring, end: i64*, base: i32): i64
+trusted noescape extern:"c" fun toupper(c: i32): i32
+trusted noescape extern:"c" fun atof(text: cstring): f64
+
+trusted fun viaC(x: f64): string =
+    "${f64Text(exp2(x))} ${f64Text(cbrt(x))} ${f64Text(fmod(x, 3.0))} ${f64Text(trunc(x))} ${f64Text(rint(x))} " +
+    "${f64Text(expm1(x / 1000.0))} ${strtol("-0x2a", nativeNullPointer(), 0)} ${toupper(97)} ${f64Text(atof("2.5e3"))}"
+
+// Abla's own pow with a power-of-two base: LLVM turns it into exp2 once the exponent is not constant.
+fun powers(n: int): string = "${f64Text(pow(2.0, f64FromInt(n)))} ${f64Text(pow(10.0, f64FromInt(n)))} ${f64Text(pow(f64FromInt(n), 0.5))}"
+
+val folded = #viaC(10.0)
+
+fun main: int {
+    println(folded)
+    println(viaC(10.0))
+    println(powers(7))
+    return 0
+}
+AB
+expected=$("$compiler" run "$out/jit-libcalls/main.ab" 2>&1) || { echo "static compiler: the ordinary compiler could not run the libcalls program: $expected" >&2; exit 1; }
+actual=$("$out/ablac-static" run "$out/jit-libcalls/main.ab" 2>&1) || { echo "static compiler: ablac run of the libcalls program failed: $actual" >&2; exit 1; }
+[[ $actual == "$expected" ]] || { echo "static compiler: ablac run of the libcalls program printed [$actual], the ordinary compiler [$expected]" >&2; exit 1; }
+for tier in jit auto; do
+    ABLA_COMPILE_EVAL=$tier "$out/ablac-static" build "$out/jit-libcalls/main.ab" -o "$out/jit-libcalls/static-$tier" --no-cache > "$out/jit-libcalls/static-$tier.log" 2>&1 ||
+        { echo "static compiler: the $tier tier failed on the libcalls program" >&2; tail -5 "$out/jit-libcalls/static-$tier.log" >&2; exit 1; }
+    [[ $("$out/jit-libcalls/static-$tier") == "$expected" ]] || { echo "static compiler: the $tier tier's libcalls program printed other than the ordinary compiler's" >&2; exit 1; }
+done
 # LLVM prints floating-point constants through snprintf (%e and friends): the IR text of a float-heavy module is the same from both compilers.
 cat > "$out/float-text.ab" <<'AB'
 import "abla/io"
