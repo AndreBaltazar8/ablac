@@ -36,6 +36,13 @@ check_failure() {
 }
 check_failure malformed 'error[E_SUBPARSER_FAILURE]: invalid raw test literal'
 check_failure unterminated 'error[E_SUBPARSER_FAILURE]: unterminated raw test literal'
+sema_arity=$'\nerror[E_SEMANTIC]: function.arity:parserExpect'
+for tier in interp bridge; do
+    ABLA_COMPILE_EVAL=$tier check_failure arity-missing \
+        'error[E_EVAL_INTRINSIC_ARITY]: parserExpect expects 2 arguments, got 1'"$sema_arity"
+    ABLA_COMPILE_EVAL=$tier check_failure arity-extra \
+        'error[E_EVAL_INTRINSIC_ARITY]: parserExpect expects 2 arguments, got 3'"$sema_arity"
+done
 echo 'raw isolation: opaque text, local and transitive discovery, nested holes, and bounded recovery'
 
 stdlib="$out/stdlib"
@@ -93,4 +100,10 @@ const denied = document(7).diagnostics;
 assert.equal(denied.length, 1, JSON.stringify(denied));
 assert.equal(denied[0].code, 'W_SUBPARSER_NOT_EXPANDED');
 JS
+for tier in interp bridge; do
+    ABLA_COMPILE_EVAL=$tier check_failure arity-missing \
+        'error[E_EVAL_INTRINSIC_ARITY]: parserExpect expects 2 arguments, got 1'"$sema_arity"
+    ABLA_COMPILE_EVAL=$tier check_failure arity-extra \
+        'error[E_EVAL_INTRINSIC_ARITY]: parserExpect expects 2 arguments, got 3'"$sema_arity"
+done
 echo 'raw isolation: trusted editor expansion, overlay edit, and opaque local provider'
