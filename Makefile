@@ -104,6 +104,7 @@ test-serial: ablac
 	LIBC_FREE_TARGETS=x86 tools/test-libc-free-programs.sh $(COMPILER)
 	tools/test-compiler-libc-needs.sh $(COMPILER)
 	tools/test-libc-functions.sh $(COMPILER)
+	tools/test-alias-sweep.sh $(COMPILER)
 	tools/test-static-compiler.sh $(COMPILER)
 	tools/test-export-reflection.sh $(COMPILER)
 	tools/test-libc-float-format.sh $(COMPILER)
