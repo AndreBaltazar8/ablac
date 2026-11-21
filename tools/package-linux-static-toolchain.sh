@@ -32,7 +32,7 @@ for directory in "$abla_root/runtime" "$abla_root/stdlib"; do
     [[ -d $directory ]] || { printf 'missing Abla sysroot directory: %s\n' "$directory" >&2; exit 1; }
 done
 # A dynamic or interpreted executable here would be today's package under another name.
-if readelf -lW "$compiler_binary" 2> /dev/null | grep -q 'INTERP\|Shared library'; then
+if readelf -lW "$compiler_binary" 2> /dev/null | grep 'INTERP\|Shared library' > /dev/null; then
     printf '%s is not statically linked (it names a loader or a shared library)\n' "$compiler_binary" >&2
     exit 1
 fi
