@@ -1,0 +1,111 @@
+// XML writer calls resolve in the invoking module. abla-xml supplies them.
+import "abla/compiler"
+import "abla/compiler/parser"
+import "../literal.ab"
+
+compile class XmlLiteralWritePlan(
+    val name: string, val statements: array<SyntaxExpression>, var indices: int
+)
+
+compile fun ablaXmlWriteStablePlace(place: SyntaxExpression): bool {
+    val kind = syntaxKind(place)
+    if (kind == "identifier") return true
+    if (kind == "member" || kind == "index") return ablaXmlWriteStablePlace(syntaxChild(place, 0))
+    false
+}
+
+compile fun ablaXmlWritePlace(var plan: XmlLiteralWritePlan, place: SyntaxExpression): SyntaxExpression {
+    val kind = syntaxKind(place)
+    if (kind == "member") {
+        return syntaxMember(ablaXmlWritePlace(plan, syntaxChild(place, 0)), syntaxText(place))
+    }
+    if (kind == "index") {
+        val receiver = ablaXmlWritePlace(plan, syntaxChild(place, 0))
+        val index = "${plan.name}_index${plan.indices}"
+        plan.indices += 1
+        plan.statements.append(syntaxLocal(index, compilerFindType("int"), syntaxChild(place, 1)))
+        return syntaxIndex(receiver, syntaxIdentifier(index))
+    }
+    place
+}
+
+compile fun ablaXmlWritePlaceCopy(place: SyntaxExpression): SyntaxExpression {
+    val kind = syntaxKind(place)
+    if (kind == "member") {
+        return syntaxMember(ablaXmlWritePlaceCopy(syntaxChild(place, 0)), syntaxText(place))
+    }
+    if (kind == "index") {
+        return syntaxIndex(ablaXmlWritePlaceCopy(syntaxChild(place, 0)),
+            syntaxIdentifier(syntaxText(syntaxChild(place, 1))))
+    }
+    syntaxIdentifier(syntaxText(place))
+}
+
+compile fun ablaXmlWriteLiteralCall(place: SyntaxExpression, method: string,
+    values: array<SyntaxExpression>): SyntaxExpression {
+    val args: array<SyntaxExpression> = [ablaXmlWritePlaceCopy(place)]
+    for (value in values) args.append(value)
+    syntaxCall(method, args)
+}
+
+compile fun ablaXmlLowerWriterNode(place: SyntaxExpression, node: XmlLiteralNode,
+    var plan: XmlLiteralWritePlan): void {
+    if (node.kind == "element") {
+        plan.statements.append(ablaXmlWriteLiteralCall(place, "ablaXmlWriteLiteralStart", [syntaxString(node.name)]))
+        for (attribute in node.attributes) {
+            val operation = if (attribute.declaration) "ablaXmlWriteLiteralNamespace" else "ablaXmlWriteLiteralAttribute"
+            val name = if (attribute.declaration) attribute.declaredPrefix else attribute.name
+            plan.statements.append(ablaXmlWriteLiteralCall(place, operation, [syntaxString(name), attribute.value]))
+        }
+        plan.statements.append(ablaXmlWriteLiteralCall(place, "ablaXmlWriteLiteralBinding",
+            [syntaxString(node.prefix), syntaxString(node.uri)]))
+        for (child in node.children) ablaXmlLowerWriterNode(place, child, plan)
+        plan.statements.append(ablaXmlWriteLiteralCall(place, "ablaXmlWriteLiteralEnd", []))
+    } else if (node.kind == "instruction") {
+        plan.statements.append(ablaXmlWriteLiteralCall(place, "ablaXmlWriteLiteralInstruction",
+            [syntaxString(node.name), node.value]))
+    } else {
+        val operation = when (node.kind) {
+            "node" -> "ablaXmlWriteLiteralNode"
+            "nodes" -> "ablaXmlWriteLiteralNodes"
+            "comment" -> "ablaXmlWriteLiteralComment"
+            "cdata" -> "ablaXmlWriteLiteralCdata"
+            else -> "ablaXmlWriteLiteralText"
+        }
+        plan.statements.append(ablaXmlWriteLiteralCall(place, operation, [node.value]))
+    }
+    return
+}
+
+compile fun ablaXmlParseWriteLiteral(cursor: ParserCursor): SyntaxExpression {
+    parserExpect(cursor, "(")
+    val writer = parserParseAblaExpression(cursor)
+    parserExpect(cursor, ")")
+    parserRawSkipWhitespace(cursor)
+    var parser = ablaXmlLiteralRead(cursor)
+    val node = ablaXmlLiteral_element(parser, 1)
+    if (parser.failed) return syntaxNull()
+    val name = "ablaXmlWriter_${parserSiteKey(cursor)}"
+    var plan = XmlLiteralWritePlan(name, [], 0)
+    val kind = syntaxKind(writer)
+    var place = syntaxIdentifier(name)
+    if (kind == "identifier" || kind == "member" || kind == "index") {
+        if (!ablaXmlWriteStablePlace(writer)) {
+            parserFail(cursor, "a \$xmlw writer must be a stable place or a fresh expression")
+            return syntaxNull()
+        }
+        place = ablaXmlWritePlace(plan, writer)
+    } else {
+        val type = compilerFindType("XmlWriter")
+        if (type < 0) {
+            parserFail(cursor, "import abla-xml to use \$xmlw")
+            return syntaxNull()
+        }
+        plan.statements.append(syntaxLocal(name, type, writer))
+    }
+    ablaXmlLowerWriterNode(place, node, plan)
+    plan.statements.append(ablaXmlWritePlaceCopy(place))
+    syntaxBlock(plan.statements)
+}
+
+#compilerRegisterSubparser("xmlw", ablaXmlParseWriteLiteral)

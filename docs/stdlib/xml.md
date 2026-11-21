@@ -30,3 +30,22 @@ same value types.
 
 The grammar follows [XML 1.0](https://www.w3.org/TR/xml/) and
 [Namespaces in XML 1.0](https://www.w3.org/TR/REC-xml-names/).
+
+With abla-xml, use `$xmlw(writer)` to write one balanced XML element into a
+buffered or streaming `XmlWriter`. This is also usable inside an element
+already opened on the writer.
+
+```abla
+import github("AndreBaltazar8/abla-xml")
+
+fun writeRow(var writer: XmlWriter, id: int, title: string): void {
+    $xmlw(writer) <row id={id}>{title}</row>
+    return
+}
+```
+
+The literal returns the writer after writing its element. The caller controls
+the declaration and calls `finish()` to check its result. Holes are evaluated
+once in source order. Attributes and text go through the writer's normal
+escaping and character checks. As with calls made directly on a streaming
+writer, the sink may already hold part of a document if writing fails.
