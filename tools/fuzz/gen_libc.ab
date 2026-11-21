@@ -1,33 +1,129 @@
 // libc_check (#648, #806): C library functions through `extern:"c"`, called two ways that must agree: at run time in a native build (glibc,
 // the oracle), and at compile time by the native tier (the compiler's own C library when the compiler is the static one: Abla's libc over
-// the JIT symbol table, src/static_libc). The functions are the non-variadic ones a program can declare: strtod, strtof, strtol and the
-// libm functions the static libc provides. A value prints as its bits (nan as "nan"), so a last-bit difference is a disagreement.
-// tools/fuzz/run --libc [--seeds ...] draws only these checks and has no interpreter mode (the interpreter cannot call C).
+// the JIT symbol table, src/static_libc). The functions are the non-variadic ones a program can declare: strtod, strtof and the strtol
+// family, atoi/atof, the libm functions in double and float forms, ctype, string and rand/srand. A value prints as its bits (nan as "nan"),
+// so a last-bit difference is a disagreement. tools/fuzz/run --libc [--seeds ...] draws only these checks and has no interpreter mode (the
+// interpreter cannot call C).
 import "abla/text"
 import "./prng.ab"
 import "./gen.ab"
 import "./oracle.ab"
 
 val FUZZ_LIBC_UNARY: array<string> = ["sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "exp", "log", "log2", "log10", "log1p",
-    "sqrt", "floor", "ceil", "round", "fabs", "erf"]
+    "sqrt", "floor", "ceil", "round", "fabs", "erf", "cbrt", "exp2", "exp10", "expm1", "trunc", "rint", "nearbyint", "roundeven"]
+val FUZZ_LIBC_BINARY: array<string> = ["pow", "atan2", "fmod", "fmin", "fmax", "copysign", "hypot"]
+val FUZZ_LIBC_UNARY_F: array<string> = ["sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "sinhf", "coshf", "tanhf", "expf", "exp2f", "expm1f",
+    "logf", "log2f", "log10f", "log1pf", "sqrtf", "cbrtf", "floorf", "ceilf", "truncf", "roundf", "rintf", "nearbyintf", "fabsf", "erff"]
+val FUZZ_LIBC_BINARY_F: array<string> = ["powf", "atan2f", "fmodf", "fminf", "fmaxf", "copysignf", "hypotf"]
+val FUZZ_LIBC_CTYPE: array<string> = ["isalnum", "isalpha", "isblank", "iscntrl", "isdigit", "isgraph", "islower", "isprint", "ispunct", "isspace",
+    "isupper", "isxdigit", "isascii"]
+val FUZZ_LIBC_ROUND_INT: array<string> = ["lround", "llround", "lrint", "llrint"]
 
 /** The program's prelude: the externs, a trusted wrapper for each (a check is untrusted code), and the printing of a value. */
 fun fuzzLibcPrelude(): string {
     val lines: array<string> = ["import \"abla/io\"", "import \"abla/float\"", "import \"abla/compiler\"",
-        "#compilerGrant(\"trusted.native\")", "import \"abla/unsafe/native\"", "import \"abla/unsafe/memory/raw\"",
+        "#compilerGrant(\"trusted.native\")", "import \"abla/unsafe/native\"", "import \"abla/unsafe/memory\"", "import \"abla/unsafe/memory/raw\"",
         "trusted noescape extern:\"c\" fun strtod(text: cstring, end: i64*): f64",
         "trusted noescape extern:\"c\" fun strtof(text: cstring, end: i64*): f32",
         "trusted noescape extern:\"c\" fun strtol(text: cstring, end: i64*, base: i32): i64",
-        "trusted noescape extern:\"c\" fun pow(x: f64, y: f64): f64",
-        "trusted noescape extern:\"c\" fun atan2(y: f64, x: f64): f64"]
+        "trusted noescape extern:\"c\" fun strtoll(text: cstring, end: i64*, base: i32): i64",
+        "trusted noescape extern:\"c\" fun strtoul(text: cstring, end: i64*, base: i32): i64",
+        "trusted noescape extern:\"c\" fun strtoull(text: cstring, end: i64*, base: i32): i64",
+        "trusted noescape extern:\"c\" fun atoi(text: cstring): i32",
+        "trusted noescape extern:\"c\" fun atol(text: cstring): i64",
+        "trusted noescape extern:\"c\" fun atof(text: cstring): f64",
+        "trusted noescape extern:\"c\" fun fma(x: f64, y: f64, z: f64): f64",
+        "trusted noescape extern:\"c\" fun fmaf(x: f32, y: f32, z: f32): f32",
+        "trusted noescape extern:\"c\" fun ldexp(x: f64, n: i32): f64",
+        "trusted noescape extern:\"c\" fun ldexpf(x: f32, n: i32): f32",
+        "trusted noescape extern:\"c\" fun frexp(x: f64, e: i64*): f64",
+        "trusted noescape extern:\"c\" fun modf(x: f64, whole: i64*): f64",
+        "trusted noescape extern:\"c\" fun sincos(x: f64, s: i64*, c: i64*): void",
+        "trusted noescape extern:\"c\" fun srand(seed: i32): void",
+        "trusted noescape extern:\"c\" fun rand(): i32",
+        "trusted noescape extern:\"c\" fun strstr(text: cstring, needle: cstring): i64*",
+        "trusted noescape extern:\"c\" fun strrchr(text: cstring, c: i32): i64*",
+        "trusted noescape extern:\"c\" fun strchr(text: cstring, c: i32): i64*",
+        "trusted noescape extern:\"c\" fun strpbrk(text: cstring, set: cstring): i64*",
+        "trusted noescape extern:\"c\" fun strspn(text: cstring, set: cstring): i64",
+        "trusted noescape extern:\"c\" fun strcspn(text: cstring, set: cstring): i64",
+        "trusted noescape extern:\"c\" fun strnlen(text: cstring, limit: i64): i64",
+        "trusted noescape extern:\"c\" fun strcmp(left: cstring, right: cstring): i32",
+        "trusted noescape extern:\"c\" fun strncmp(left: cstring, right: cstring, count: i64): i32",
+        "trusted noescape extern:\"c\" fun strcasecmp(left: cstring, right: cstring): i32",
+        "trusted noescape extern:\"c\" fun strncasecmp(left: cstring, right: cstring, count: i64): i32",
+        "trusted noescape extern:\"c\" fun toupper(c: i32): i32",
+        "trusted noescape extern:\"c\" fun tolower(c: i32): i32",
+        "trusted noescape extern:\"c\" fun lround(x: f64): i64",
+        "trusted noescape extern:\"c\" fun llround(x: f64): i64",
+        "trusted noescape extern:\"c\" fun lrint(x: f64): i64",
+        "trusted noescape extern:\"c\" fun llrint(x: f64): i64"]
     for (name in FUZZ_LIBC_UNARY) lines.append("trusted noescape extern:\"c\" fun $name(x: f64): f64")
+    for (name in FUZZ_LIBC_BINARY) lines.append("trusted noescape extern:\"c\" fun $name(x: f64, y: f64): f64")
+    for (name in FUZZ_LIBC_UNARY_F) lines.append("trusted noescape extern:\"c\" fun $name(x: f32): f32")
+    for (name in FUZZ_LIBC_BINARY_F) lines.append("trusted noescape extern:\"c\" fun $name(x: f32, y: f32): f32")
+    for (name in FUZZ_LIBC_CTYPE) lines.append("trusted noescape extern:\"c\" fun $name(c: i32): i32")
     lines.append("fun libcBits(value: f64): string = if (value != value) \"nan\" else \"\${f64ToBits(value)}\"")
     lines.append("fun libcBitsF(value: f32): string = if (value != value) \"nan\" else \"\${f32ToBits(value)}\"")
     lines.append("trusted fun libcStrtod(text: string): string = libcBits(strtod(text, nativeNullPointer()))")
+    lines.append("trusted fun libcAtof(text: string): string = libcBits(atof(text))")
     lines.append("trusted fun libcStrtof(text: string): string = libcBitsF(strtof(text, nativeNullPointer()))")
-    lines.append("trusted fun libcStrtol(text: string, base: i32): string = \"\${strtol(text, nativeNullPointer(), base)}\"")
+    for (name in ["strtol", "strtoll", "strtoul", "strtoull"]) {
+        lines.append("trusted fun libc_$name(text: string, base: i32): string = \"\${$name(text, nativeNullPointer(), base)}\"")
+    }
+    // the part of the text strtol stopped at, as an offset: the end pointer minus the start (text + "" is the start)
+    lines.append("trusted fun libcStrtolEnd(text: string, base: i32): string {")
+    lines.append("    val cell = nativeByteBuffer(16)")
+    lines.append("    val value = strtol(text, cell.address, base)")
+    lines.append("    \"\${value} \${cell.loadI64(0) - ablaRuntimePointerAddress(strstr(text, \"\"))}\"")
+    lines.append("}")
+    lines.append("trusted fun libc_atoi(text: string): string = \"\${atoi(text)}\"")
+    lines.append("trusted fun libc_atol(text: string): string = \"\${atol(text)}\"")
     for (name in FUZZ_LIBC_UNARY) lines.append("trusted fun libc_$name(x: f64): string = libcBits($name(x))")
-    for (name in ["pow", "atan2"]) lines.append("trusted fun libc_$name(x: f64, y: f64): string = libcBits($name(x, y))")
+    for (name in FUZZ_LIBC_BINARY) lines.append("trusted fun libc_$name(x: f64, y: f64): string = libcBits($name(x, y))")
+    for (name in FUZZ_LIBC_UNARY_F) lines.append("trusted fun libc_$name(x: f32): string = libcBitsF($name(x))")
+    for (name in FUZZ_LIBC_BINARY_F) lines.append("trusted fun libc_$name(x: f32, y: f32): string = libcBitsF($name(x, y))")
+    for (name in FUZZ_LIBC_CTYPE) lines.append("trusted fun libc_$name(c: i32): string = if ($name(c) != 0) \"1\" else \"0\"")
+    for (name in FUZZ_LIBC_ROUND_INT) lines.append("trusted fun libc_$name(x: f64): string = \"\${$name(x)}\"")
+    lines.append("trusted fun libc_fma(x: f64, y: f64, z: f64): string = libcBits(fma(x, y, z))")
+    lines.append("trusted fun libc_fmaf(x: f32, y: f32, z: f32): string = libcBitsF(fmaf(x, y, z))")
+    lines.append("trusted fun libc_ldexp(x: f64, n: i32): string = libcBits(ldexp(x, n))")
+    lines.append("trusted fun libc_ldexpf(x: f32, n: i32): string = libcBitsF(ldexpf(x, n))")
+    lines.append("trusted fun libc_frexp(x: f64): string {")
+    lines.append("    val cell = nativeByteBuffer(16)")
+    lines.append("    val mantissa = frexp(x, cell.address)")
+    lines.append("    var exponent = cell.loadI64(0) & 4294967295")
+    lines.append("    if (exponent >= 2147483648) exponent = exponent - 4294967296")
+    lines.append("    \"\${libcBits(mantissa)} \${exponent}\"")
+    lines.append("}")
+    lines.append("trusted fun libc_modf(x: f64): string {")
+    lines.append("    val cell = nativeByteBuffer(16)")
+    lines.append("    val fraction = modf(x, cell.address)")
+    lines.append("    \"\${libcBits(fraction)} \${libcBits(f64FromBits(cell.loadI64(0)))}\"")
+    lines.append("}")
+    lines.append("trusted fun libc_sincos(x: f64): string {")
+    lines.append("    val cells = nativeByteBuffer(16)")
+    lines.append("    sincos(x, cells.address, cells.pointerAt(8))")
+    lines.append("    \"\${libcBits(f64FromBits(cells.loadI64(0)))} \${libcBits(f64FromBits(cells.loadI64(8)))}\"")
+    lines.append("}")
+    lines.append("trusted fun libc_case(c: i32): string = \"\${toupper(c)} \${tolower(c)}\"")
+    lines.append("trusted fun libc_rand(seed: i32, count: int): string {")
+    lines.append("    srand(seed)")
+    lines.append("    var text = \"\"")
+    lines.append("    for (i in 0 until count) text = text + \"\${rand()} \"")
+    lines.append("    text")
+    lines.append("}")
+    // the offset of a returned pointer in the text (-1 for null): strstr(text, "") is the text itself
+    lines.append("trusted fun libcOffset(text: string, found: i64*): int = if (ablaRuntimePointerAddress(found) == 0) -1 else ablaRuntimePointerAddress(found) - ablaRuntimePointerAddress(strstr(text, \"\"))")
+    lines.append("trusted fun libc_strstr(text: string, needle: string): string = \"\${libcOffset(text, strstr(text, needle))}\"")
+    lines.append("trusted fun libc_strrchr(text: string, c: i32): string = \"\${libcOffset(text, strrchr(text, c))}\"")
+    lines.append("trusted fun libc_strchr(text: string, c: i32): string = \"\${libcOffset(text, strchr(text, c))}\"")
+    lines.append("trusted fun libc_strpbrk(text: string, set: string): string = \"\${libcOffset(text, strpbrk(text, set))}\"")
+    lines.append("trusted fun libc_strspn(text: string, set: string): string = \"\${strspn(text, set)} \${strcspn(text, set)}\"")
+    lines.append("trusted fun libc_strnlen(text: string, limit: int): string = \"\${strnlen(text, limit)}\"")
+    // a comparison's sign, not its value (glibc returns byte differences or 1/-1 as it likes)
+    lines.append("fun libcSign(value: int): int = if (value < 0) -1 else if (value > 0) 1 else 0")
+    lines.append("trusted fun libc_compare(a: string, b: string, count: int): string = \"\${libcSign(strcmp(a, b))} \${libcSign(strncmp(a, b, count))} \${libcSign(strcasecmp(a, b))} \${libcSign(strncasecmp(a, b, count))}\"")
     textJoin(lines, "\n") + "\n"
 }
 
@@ -74,20 +170,50 @@ fun FuzzGen.libcArgument(): string {
     else if (kind == 4) bits = this.libcBitsIn(1018, 1023)
     else if (kind == 5) bits = (this.r.below(2) << 63) | (this.r.range(1023, 1033) << 52) | (this.r.range(0, 7) << 49)
     else if (kind == 6) bits = this.r.pickInt([0, -9223372036854775808, 4607182418800017408, -4616189618054758400, 9218868437227405312,
-        -4503599627370496, 4611686018427387904, 4602678819172646912, 4614256656552045848])
+        -4503599627370496, 4611686018427387904, 4602678819172646912, 4614256656552045848, 4609434218613702656, 4620693217682128896])
     else bits = this.libcBitsIn(1000, 1040)
     "f64FromBits($bits)"
 }
 
+/** A float argument: the same kinds in the 8-bit exponent (127 is 1.0; 1 to 254 are the normal ones). */
+fun FuzzGen.libcArgumentF(): string {
+    val kind = this.r.below(8)
+    val sign = this.r.below(2)
+    val mantissa = this.r.range(0, 8388607)
+    var exponent = 127
+    if (kind == 0) exponent = this.r.range(120, 135)
+    else if (kind == 1) exponent = this.r.range(100, 150)
+    else if (kind == 2) exponent = this.r.range(1, 254)
+    else if (kind == 3) exponent = this.r.range(0, 3)
+    else if (kind == 4) exponent = this.r.range(124, 127)
+    else if (kind == 5) exponent = this.r.range(127, 133)
+    else if (kind == 6) {
+        val special = this.r.pickInt([0, -2147483648, 1065353216, -1082130432, 2139095040, -8388608, 1073741824, 1056964608])
+        return "f32FromBits(u32(${special & 4294967295}))"
+    }
+    val bits = (sign << 31) | (exponent << 23) | mantissa
+    "f32FromBits(u32($bits))"
+}
+
+fun FuzzGen.libcWord(): string {
+    val alphabet = ["a", "b", "A", "B", "ab", "Ab", " ", "x", "ba", "-", "7", "é", "aa"]
+    var text = ""
+    val count = this.r.range(0, 8)
+    for (i in 0 until count) text = text + this.r.pick(alphabet)
+    text
+}
+
 fun FuzzGen.libcCheck(index: int): FuzzCheck {
-    val kind = this.r.below(10)
+    val kind = this.r.below(20)
     val lines: array<string> = ["fun c$index(): string {"]
-    if (kind <= 2) {
+    if (kind <= 1) {
         lines.append("    libcStrtod(${fuzzLiteral(this.libcDecimal())})")
+    } else if (kind == 2) {
+        lines.append("    libcAtof(${fuzzLiteral(this.libcDecimal())})")
     } else if (kind == 3) {
         lines.append("    libcStrtof(${fuzzLiteral(this.libcDecimal())})")
     } else if (kind == 4) {
-        val bases = [0, 2, 8, 10, 16, 36, 7]
+        val bases = [0, 2, 8, 10, 16, 36, 7, 10, 10, 16]
         val base = bases[this.r.below(bases.size)]
         var text = ""
         if (this.r.chance(0.4)) text = this.r.pick(["-", "+", " ", "\t"])
@@ -95,13 +221,51 @@ fun FuzzGen.libcCheck(index: int): FuzzCheck {
         else if (this.r.chance(0.15) && (base == 0 || base == 2)) text = text + "0b"
         val count = this.r.range(1, 22)
         for (i in 0 until count) text = text + this.r.pick(["0", "1", "7", "9", "a", "F", "z", "Z", "5"])
-        lines.append("    libcStrtol(${fuzzLiteral(text)}, $base)")
+        if (this.r.chance(0.2)) text = text + this.r.pick([" ", "x", "g", "."])
+        val name = this.r.pick(["strtol", "strtoll", "strtoul", "strtoull"])
+        if (this.r.chance(0.25)) lines.append("    libcStrtolEnd(${fuzzLiteral(text)}, $base)")
+        else lines.append("    libc_$name(${fuzzLiteral(text)}, $base)")
+    } else if (kind == 5) {
+        var text = this.r.pick(["", " ", "-", "+"]) + "${this.r.range(0, 99999)}${this.r.pick(["", "x", " 7", "e3", ".5"])}"
+        if (this.r.chance(0.2)) text = text + "${this.r.range(0, 99999)}${this.r.range(0, 99999)}${this.r.range(0, 99999)}"
+        lines.append("    libc_${this.r.pick(["atoi", "atol"])}(${fuzzLiteral(text)})")
     } else if (kind <= 8) {
-        val name = this.r.pick(FUZZ_LIBC_UNARY)
-        lines.append("    libc_$name(${this.libcArgument()})")
+        lines.append("    libc_${this.r.pick(FUZZ_LIBC_UNARY)}(${this.libcArgument()})")
+    } else if (kind == 9) {
+        lines.append("    libc_${this.r.pick(FUZZ_LIBC_BINARY)}(${this.libcArgument()}, ${this.libcArgument()})")
+    } else if (kind == 10) {
+        lines.append("    libc_${this.r.pick(FUZZ_LIBC_UNARY_F)}(${this.libcArgumentF()})")
+    } else if (kind == 11) {
+        lines.append("    libc_${this.r.pick(FUZZ_LIBC_BINARY_F)}(${this.libcArgumentF()}, ${this.libcArgumentF()})")
+    } else if (kind == 12) {
+        val choice = this.r.below(6)
+        if (choice == 0) lines.append("    libc_fma(${this.libcArgument()}, ${this.libcArgument()}, ${this.libcArgument()})")
+        else if (choice == 1) lines.append("    libc_fmaf(${this.libcArgumentF()}, ${this.libcArgumentF()}, ${this.libcArgumentF()})")
+        else if (choice == 2) lines.append("    libc_ldexp(${this.libcArgument()}, ${this.r.range(-1200, 1200)})")
+        else if (choice == 3) lines.append("    libc_ldexpf(${this.libcArgumentF()}, ${this.r.range(-200, 200)})")
+        else if (choice == 4) lines.append("    libc_frexp(${this.libcArgument()})")
+        else lines.append("    libc_${this.r.pick(["modf", "sincos"])}(${this.libcArgument()})")
+    } else if (kind == 13) {
+        lines.append("    libc_${this.r.pick(FUZZ_LIBC_ROUND_INT)}(${this.libcArgument()})")
+    } else if (kind == 14) {
+        val c = this.r.range(-1, 255)
+        if (this.r.chance(0.3)) lines.append("    libc_case($c)")
+        else lines.append("    libc_${this.r.pick(FUZZ_LIBC_CTYPE)}($c)")
+    } else if (kind == 15) {
+        lines.append("    libc_rand(${this.r.range(0, 1000000)}, ${this.r.range(1, 40)})")
+    } else if (kind == 16) {
+        val text = this.libcWord()
+        val choice = this.r.below(4)
+        if (choice == 0) lines.append("    libc_strstr(${fuzzLiteral(text)}, ${fuzzLiteral(this.libcWord())})")
+        else if (choice == 1) lines.append("    libc_${this.r.pick(["strrchr", "strchr"])}(${fuzzLiteral(text)}, ${this.r.pick(["97", "98", "65", "32", "0", "233", "195"])})")
+        else if (choice == 2) lines.append("    libc_strpbrk(${fuzzLiteral(text)}, ${fuzzLiteral(this.libcWord())})")
+        else lines.append("    libc_strspn(${fuzzLiteral(text)}, ${fuzzLiteral(this.libcWord())})")
+    } else if (kind == 17) {
+        lines.append("    libc_strnlen(${fuzzLiteral(this.libcWord())}, ${this.r.range(0, 12)})")
+    } else if (kind == 18) {
+        lines.append("    libc_compare(${fuzzLiteral(this.libcWord())}, ${fuzzLiteral(this.libcWord())}, ${this.r.range(0, 8)})")
     } else {
-        val name = this.r.pick(["pow", "atan2"])
-        lines.append("    libc_$name(${this.libcArgument()}, ${this.libcArgument()})")
+        lines.append("    libc_${this.r.pick(FUZZ_LIBC_UNARY)}(${this.libcArgument()})")
     }
     lines.append("}")
     FuzzCheck(lines, "c$index()", "str", index)
