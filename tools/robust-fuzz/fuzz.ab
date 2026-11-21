@@ -1,0 +1,526 @@
+// Robustness fuzzing of the standard library's parsers that take outside input, deterministic from a seed (tools/test-robust-fuzz.sh drives it; the crypto, X.509,
+// PEM and TLS parsers are tools/parse-fuzz, HPACK and HTTP/2 tools/http2-fuzz). Usage: robust-fuzz <target> <first seed> <count> [seed file...] [--verbose]
+// Targets (a target that takes seed files mutates their bytes, one that needs none builds its own valid inputs):
+//   json     jsonParse on mutated documents and random text; a parsed value must stringify to text that parses again and stringifies to the same text
+//   yaml     yamlParse on mutated documents; a parsed value must emit, and the emitted text must parse again
+//   http     httpParseRequest, httpHeaderEnd and httpParseResponseBounded on mutated requests and responses (built ones with chunked and length framings, folded and
+//            repeated headers, huge numbers)
+//   chunked  httpCoreDecodeChunked on mutated chunked bodies (sizes, extensions, trailers) with small and large body limits
+//   inflate  gzipDecompress on mutated gzip members (seeds: .gz files; the compressed form of the other seeds is built here), with a small output limit; an
+//            accepted member must be what the output limit allows
+//   regex    regexCompile on mutated and generated patterns; a compiled one is run on mutated texts with matches, find, findAll and replace
+//   date     httpDateParse on mutated dates (each of the three formats), and the round trip of utcDate / httpDate / iso8601
+//   uuid     uuidParse on mutated texts and the round trip of uuidText
+// A finding is a violated rule, an input that takes over two seconds (quadratic cost), or a crash (a panic ends the program: the seed is printed before each run
+// with --verbose, and `robust-fuzz <target> <seed> 1 <seed files>` repeats it; --dump FILE writes the seed's input). Run it under tools/run-limited.sh for the memory
+// and time limit (memory growth shows there as the limit being hit).
+// Coverage: every distinct outcome (an accepted input kind, an error text) is counted and listed at the end.
+import "abla/io"
+import "abla/crypto"
+import "abla/json"
+import "abla/yaml"
+import "abla/http"
+import "abla/compression/gzip"
+import "abla/regex"
+import "abla/date"
+import "abla/uuid"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+import "abla/memory"
+import "abla/integer"
+import "abla/fs"
+
+var choiceState = 1
+var failures = 0
+val coverageLabels: array<string> = []
+val coverageCounts: array<int> = []
+var dumpPath = ""
+var peakKilobytes = 0
+
+fun nextChoice(): int {
+    choiceState = (choiceState * 6364136223846793005 + 1442695040888963407)
+    (choiceState >> 33) & 2147483647
+}
+
+fun below(limit: int): int = if (limit <= 0) 0 else nextChoice() % limit
+
+fun finding(seed: int, what: string): void {
+    failures = failures + 1
+    if (failures < 25) println("FINDING seed $seed: $what")
+    return
+}
+
+fun cover(label: string): void {
+    for (i in 0 until coverageLabels.size) {
+        if (coverageLabels[i] == label) {
+            coverageCounts[i] = coverageCounts[i] + 1
+            return
+        }
+    }
+    coverageLabels.append(label)
+    coverageCounts.append(1)
+    return
+}
+
+fun bytes(values: array<int>): string = cryptoByteString(values)
+
+fun randomBytes(maximum: int): string {
+    val count = below(maximum + 1)
+    val values: array<int> = []
+    for (i in 0 until count) values.append(below(256))
+    bytes(values)
+}
+
+fun pickFrom(list: array<string>): string = list[below(list.size)]
+
+/** One structural change: a byte flipped, set, inserted, removed, a run repeated or cut, a byte copied, or a boundary value (digits, separators, 0xff) put in. */
+fun mutate(input: string): string {
+    if (input.size == 0) return randomBytes(8)
+    val at = below(input.size)
+    val kind = below(13)
+    if (kind == 0) return input.slice(0, at) + bytes([below(256)]) + input.slice(at + 1, input.size)
+    if (kind == 1) return input.slice(0, at) + bytes([input[at] ^ (1 << below(8))]) + input.slice(at + 1, input.size)
+    if (kind == 2) return input.slice(0, at) + bytes([below(256)]) + input.slice(at, input.size)
+    if (kind == 3) return input.slice(0, at) + input.slice(at + 1, input.size)
+    if (kind == 4) return input.slice(0, at)
+    if (kind == 5) {
+        val end = at + below(input.size - at) + 1
+        return input.slice(0, end) + input.slice(at, end) + input.slice(end, input.size)
+    }
+    if (kind == 6) {
+        val other = below(input.size)
+        return input.slice(0, at) + bytes([input[other]]) + input.slice(at + 1, input.size)
+    }
+    if (kind == 7) return input.slice(0, at) + bytes([255, 255, 255, 255, 127]) + input.slice(at, input.size)
+    if (kind == 8) {
+        val pieces = ["9999999999999999999", "-1", "0", "4294967296", "18446744073709551616", "\r\n", "\n", ",", ":", "\"", "\\", "[", "{", "]", "}", "\\u", "%", "0x", "e999", "..", "--", "\t", " "]
+        return input.slice(0, at) + pickFrom(pieces) + input.slice(at, input.size)
+    }
+    if (kind == 9) {
+        val width = 1 + below(8)
+        val end = if (at + width > input.size) input.size else at + width
+        var repeated = ""
+        for (i in 0 until 1 + below(60)) repeated = repeated + input.slice(at, end)
+        return input.slice(0, at) + repeated + input.slice(end, input.size)
+    }
+    if (kind == 10) {
+        val other = below(input.size)
+        val low = if (at < other) at else other
+        val high = if (at < other) other else at
+        return input.slice(0, low) + input.slice(high, input.size) + input.slice(low, high)
+    }
+    if (kind == 11) return input.slice(0, at) + bytes([[0, 128, 192, 239, 255][below(5)]]) + input.slice(at + 1, input.size)
+    input.slice(at, input.size) + input.slice(0, at)
+}
+
+fun mutateMany(input: string): string {
+    var out = mutate(input)
+    var rounds = below(3)
+    while (rounds > 0) {
+        out = mutate(out)
+        rounds = rounds - 1
+    }
+    out
+}
+
+/** The input unchanged (a control: it must parse), or several structural changes. */
+fun variant(input: string): string = if (below(5) == 0) input else mutateMany(input)
+
+fun timed(seed: int, what: string, started: int): void {
+    val spent = linuxMonotonicMilliseconds() - started
+    if (spent > 2000) finding(seed, "$what took $spent ms")
+    return
+}
+
+fun dump(input: string): void {
+    if (dumpPath != "") Path(dumpPath).writeText(input)
+    return
+}
+
+/** `unit` repeated between 200 and 60000 times, between `head` and `tail`: the shapes that make a parser quadratic or deep. */
+fun scaled(head: string, unit: string, tail: string): string = scaledUpTo(60000, head, unit, tail)
+
+fun scaledUpTo(cap: int, head: string, unit: string, tail: string): string {
+    val counts = [200, 1000, 5000, 20000, 60000]
+    var count = counts[below(counts.size)]
+    if (count > cap) count = cap / (1 + below(4))
+    var out = head
+    var piece = unit
+    var have = 1
+    // doubling, so the text is built in few concatenations
+    while (have * 2 <= count) {
+        piece = piece + piece
+        have = have * 2
+    }
+    out = out + piece
+    for (i in have until count) out = out + unit
+    out + tail
+}
+
+// ---- seeds ----
+val fileSeeds: array<string> = []
+val gzipSeeds: array<string> = []
+
+fun loadSeeds(paths: array<string>): void {
+    for (path in paths) {
+        val data = linuxReadFile(path, 4194304)
+        if (data.size == 0) continue
+        fileSeeds.append(data)
+        if (data.size > 2 && data[0] == 31 && data[1] == 139) gzipSeeds.append(data)
+    }
+    return
+}
+
+fun seedOr(fallback: array<string>): string = if (fileSeeds.size > 0 && below(3) > 0) pickFrom(fileSeeds) else pickFrom(fallback)
+
+// ---- json ----
+val jsonBuiltIn: array<string> = [
+    "{\"a\":[1,2.5,-3e10,true,false,null,\"s\\u00e9\\n\"],\"b\":{\"c\":\"\\ud83d\\ude00\"}}",
+    "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+    "  [1, 2 , 3 ] ", "\"\\\\\\\"\\/\\b\\f\\n\\r\\t\"", "-0.0e-0", "123456789012345678901234567890", "{\"\":{\"\":{\"\":[]}}}", "[]", "{}", "null"]
+
+fun jsonShape(): string {
+    val kind = below(8)
+    if (kind == 0) return scaled("", "[", "")
+    if (kind == 1) return scaled("", "[", "]")
+    if (kind == 2) return scaled("", "{\"a\":", "1")
+    if (kind == 3) return scaled("[", "\"x\",", "1]")
+    if (kind == 4) return scaled("{", "\"k\":1,", "\"z\":2}")
+    if (kind == 5) return scaled("\"", "\\u00e9", "\"")
+    if (kind == 6) return scaled("[", "1e999,-0.0000000000000000000001,", "0]")
+    scaled("", "\"", "")
+}
+
+fun targetJson(seed: int): void {
+    val input = if (below(8) == 0) randomBytes(40) else if (below(6) == 0) jsonShape() else variant(seedOr(jsonBuiltIn))
+    dump(input)
+    val started = linuxMonotonicMilliseconds()
+    val parsed = jsonParse(input)
+    if (parsed.succeeded) {
+        cover("json: parsed")
+        val text = jsonStringify(parsed.value)
+        val again = jsonParse(text)
+        if (!again.succeeded) finding(seed, "json: the stringified text of a parsed value does not parse: ${again.error.code}")
+        else if (jsonStringify(again.value) != text) finding(seed, "json: stringify is not stable over a parse")
+    } else cover("json: refused ${parsed.error.code}")
+    timed(seed, "json (${input.size} bytes)", started)
+    return
+}
+
+// ---- yaml ----
+val yamlBuiltIn: array<string> = [
+    "a: 1\nb:\n  - x\n  - y: z\n  - [1, 2, {k: v}]\nc: \"quoted \\n\"\nd: 'it''s'\n",
+    "- a\n- - b\n  - c\n- ? k\n  : v\n", "key: |\n  literal\n  text\nother: >\n  folded\n  text\n",
+    "&anchor [1, 2]\n", "a: &x 1\nb: *x\n", "---\nx: 1\n...\n---\ny: 2\n", "{a: [1, 2], b: {c: d}}", "? [complex]\n: value\n",
+    "a: !!str 1\nb: !!int \"2\"\n", "- 0x1F\n- 0o17\n- 1e3\n- .inf\n- ~\n"]
+
+fun yamlShape(): string {
+    val kind = below(8)
+    if (kind == 0) return scaled("", "- ", "x\n")
+    if (kind == 1) return scaled("", "[", "]")
+    if (kind == 2) return scaled("a: &a 1\n", "b: *a\n", "")
+    if (kind == 3) {
+        // an alias bomb: each level holds the previous one several times
+        var text = "l0: &l0 [x, x, x, x, x, x, x, x, x]\n"
+        for (i in 1 until 3 + below(14)) text = text + "l$i: &l$i [*l${i - 1}, *l${i - 1}, *l${i - 1}, *l${i - 1}, *l${i - 1}, *l${i - 1}, *l${i - 1}, *l${i - 1}, *l${i - 1}]\n"
+        return text
+    }
+    if (kind == 4) return scaled("", "  - a\n", "")
+    if (kind == 5) return scaled("k: \"", "\\x41", "\"\n")
+    if (kind == 6) return scaled("", "? ", "x\n")
+    scaled("k: |\n", "  line\n", "")
+}
+
+fun targetYaml(seed: int): void {
+    val input = if (below(8) == 0) randomBytes(40) else if (below(6) == 0) yamlShape() else variant(seedOr(yamlBuiltIn))
+    dump(input)
+    val started = linuxMonotonicMilliseconds()
+    val parsed = yamlParse(input)
+    if (parsed.succeeded) {
+        cover("yaml: parsed")
+        val emitted = yamlEmit(parsed.value)
+        if (!emitted.succeeded) cover("yaml: emit refused ${emitted.error.code}")
+        else {
+            val again = yamlParse(emitted.text)
+            if (!again.succeeded) finding(seed, "yaml: emitted text of a parsed value does not parse: ${again.error.code}")
+            else cover("yaml: round trip")
+        }
+    } else cover("yaml: refused ${parsed.error.code}")
+    timed(seed, "yaml (${input.size} bytes)", started)
+    return
+}
+
+// ---- http ----
+val httpRequests: array<string> = [
+    "GET /a/b?x=1&y=%41 HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n",
+    "POST /submit HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello",
+    "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nTrailer: X\r\n\r\n3;ext=1\r\nabc\r\n0\r\nX: y\r\n\r\n",
+    "GET / HTTP/1.0\r\nX-A: 1\r\nX-A: 2\r\n  folded\r\n\r\n",
+    "PUT /p%20q HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+    "GET http://h/abs HTTP/1.1\r\nHost: h\r\nConnection: keep-alive, upgrade\r\nUpgrade: websocket\r\n\r\n"]
+val httpResponses: array<string> = [
+    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n",
+    "HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\nbody until close",
+    "HTTP/1.1 301 Moved\r\nLocation: /x\r\nSet-Cookie: a=b\r\nSet-Cookie: c=d\r\nContent-Length: 0\r\n\r\n"]
+
+fun httpShape(response: bool): string {
+    val head = if (response) "HTTP/1.1 200 OK\r\n" else "POST /x HTTP/1.1\r\nHost: h\r\n"
+    val kind = below(7)
+    if (kind == 0) return scaled(head, "X-A: b\r\n", "\r\n")
+    if (kind == 1) return scaled(head + "X-A: ", "b", "\r\n\r\n")
+    if (kind == 2) return scaled(head, "X-A: 1\r\n  fold\r\n", "\r\n")
+    if (kind == 3) return scaled(head + "Transfer-Encoding: chunked\r\n\r\n", "1\r\na\r\n", "0\r\n\r\n")
+    if (kind == 4) return scaled(head + "Transfer-Encoding: chunked\r\n\r\n1", ";e=1", "\r\na\r\n0\r\n\r\n")
+    if (kind == 5) return scaled(head + "Content-Length: 99999999999999999999\r\n\r\n", "ab", "")
+    scaled(head, "Set-Cookie: a=b\r\n", "Content-Length: 0\r\n\r\n")
+}
+
+fun targetHttp(seed: int): void {
+    val which = below(3)
+    val started = linuxMonotonicMilliseconds()
+    if (which == 0) {
+        val input = if (below(8) == 0) randomBytes(80) else if (below(6) == 0) httpShape(false) else variant(pickFrom(httpRequests))
+        dump(input)
+        val end = httpHeaderEnd(input)
+        cover(if (end >= 0) "http: header end found" else "http: no header end")
+        val request = httpParseRequest(input)
+        cover(if (request.method == "") "http: request refused" else "http: request ${request.method.size > 0}")
+        if (request.headers.size > input.size) finding(seed, "http: more headers than input bytes")
+    } else {
+        val input = if (below(8) == 0) randomBytes(80) else if (below(6) == 0) httpShape(true) else variant(pickFrom(httpResponses))
+        dump(input)
+        val bounded = 64 + below(2000)
+        val result = httpParseResponseBounded(input, bounded, below(4) == 0, below(2) == 0)
+        cover(if (result.succeeded) "http: response parsed" else "http: response refused")
+        // (An incomplete response carries what was read: the bound is the rule of a complete one.)
+        if (result.complete && result.response.body.size > bounded) finding(seed, "http: a complete body over the bound ${result.response.body.size} > $bounded")
+    }
+    timed(seed, "http", started)
+    return
+}
+
+// ---- chunked ----
+val chunkedBuiltIn: array<string> = [
+    "5\r\nhello\r\n0\r\n\r\n", "3;a=b;c=\"d\"\r\nabc\r\n0;x\r\nT: v\r\n\r\n", "ff\r\n" + "x".repeat(255) + "\r\n0\r\n\r\n",
+    "1\r\na\r\n1\r\nb\r\n1\r\nc\r\n0\r\n\r\n", "0\r\n\r\n", "A\r\n0123456789\r\n0\r\n\r\n"]
+
+fun targetChunked(seed: int): void {
+    val kind = below(6)
+    val input = if (below(8) == 0) randomBytes(60) else if (kind == 0) scaled("", "1\r\na\r\n", "0\r\n\r\n") else if (kind == 1) scaled("1", ";e=1", "\r\na\r\n0\r\n\r\n") else if (kind == 2) scaled("0\r\n", "T: v\r\n", "\r\n") else variant(pickFrom(chunkedBuiltIn))
+    dump(input)
+    val limit = [16, 64, 1048576][below(3)]
+    val started = linuxMonotonicMilliseconds()
+    val result = httpCoreDecodeChunked(input, limit)
+    cover(if (!result.valid) "chunked: invalid" else if (result.complete) "chunked: complete" else "chunked: incomplete")
+    if (result.body.size > limit) finding(seed, "chunked: body ${result.body.size} over the limit $limit")
+    if (result.consumed > input.size) finding(seed, "chunked: consumed ${result.consumed} of ${input.size} bytes")
+    timed(seed, "chunked (${input.size} bytes)", started)
+    return
+}
+
+// ---- inflate ----
+fun inflateBase(): string {
+    if (gzipSeeds.size > 0 && below(2) == 0) return pickFrom(gzipSeeds)
+    var text = ""
+    for (i in 0 until 1 + below(40)) text = text + pickFrom(["hello ", "abc", "\n", "0123456789", "repeat repeat repeat ", "\u00e9"])
+    gzipCompress(text, 1 + below(256))
+}
+
+fun targetInflate(seed: int): void {
+    val member = inflateBase()
+    val input = if (below(8) == 0) randomBytes(60) else variant(member)
+    dump(input)
+    val limit = [64, 1024, 65536][below(3)]
+    val started = linuxMonotonicMilliseconds()
+    val result = gzipDecompress(input, limit)
+    if (result.error == "") {
+        cover("inflate: accepted")
+        if (result.data.size > limit) finding(seed, "inflate: output ${result.data.size} over the limit $limit")
+        if (input == member) {
+            // an unchanged member made here (not a seed file) must give the text it was made from: only its size is known, so the rule is the limit
+            cover("inflate: control accepted")
+        }
+    } else cover("inflate: refused ${result.error}")
+    timed(seed, "inflate (${input.size} bytes)", started)
+    return
+}
+
+// ---- regex ----
+val regexBuiltIn: array<string> = [
+    "a+b*c?", "(a|b)*abb", "[a-z]+@[a-z]+\\.com", "^\\d{3}-\\d{4}$", "(\\w+)\\s+\\1", "(?i)abc", "a{2,5}", "(a+)+b", "(a*)*b", "(.*)(.*)(.*)x",
+    "[^abc\\]]*", "\\bword\\b", "(?:ab|a)(?:bc|b)?", "x*", "(a|aa)+$", "\\p{L}+", "[\\u00e0-\\u00ff]+", "(?<n>a)(?=b)", ".{0,100}z", "(((a*)*)*)*c"]
+val regexTexts: array<string> = [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "abababababababababababababababab", "user@host.com and other@place.com", "123-4567",
+    "hello hello world", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "caf\u00e9 \u00e9\u00e0", "", "a\nb\r\nc",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"]
+
+fun targetRegex(seed: int): void {
+    val kind = below(8)
+    val pattern = if (below(6) == 0) randomBytes(14) else if (kind == 0) scaledUpTo(200, "", "a?", "a") else if (kind == 1) scaledUpTo(200, "", "(", "a" + ")") else if (kind == 2) scaledUpTo(300, "", "a|", "b")
+        else if (kind == 3) scaledUpTo(200, "(", "a*", ")*b") else if (kind == 4) scaledUpTo(300, "", "[a-z]", "") else if (kind == 5) scaledUpTo(200, "", "(?:", "x)") else variant(pickFrom(regexBuiltIn))
+    dump(pattern)
+    val started = linuxMonotonicMilliseconds()
+    val compiled = regexCompile(pattern)
+    if (!compiled.succeeded) {
+        cover("regex: refused ${compiled.error.message}")
+        timed(seed, "regex compile of ${pattern.size} bytes", started)
+        return
+    }
+    cover("regex: compiled")
+    val regex = compiled.regex
+    // The cost of a match is linear in pattern x text (a Pike machine): about 1.5 us a step in a --fast build; the allowance is 10 us a step on top of two seconds.
+    var allowance = 2000
+    for (round in 0 until 3) {
+        val text = if (below(4) == 0) randomBytes(60) else if (below(5) == 0) scaledUpTo(4000, "", pickFrom(["a", "ab", "x", " ", "aab"]), pickFrom(["", "c", "!"])) else variant(pickFrom(regexTexts))
+        allowance = allowance + pattern.size * text.size / 25
+        val whole = regex.matches(text)
+        val found = regex.find(text, 0)
+        val all = regex.findAll(text)
+        val replaced = regex.replace(text, pickFrom(["", "<$0>", "$1$1", "x"]))
+        cover(if (found == null) "regex: no match" else "regex: match")
+        if (whole && found == null) finding(seed, "regex: matches() is true but find() found nothing for /$pattern/")
+        if (all.size > 2 * (text.size + 1)) finding(seed, "regex: ${all.size} matches in ${text.size} bytes for /$pattern/")
+        if (replaced.size > 100000000) finding(seed, "regex: replace grew to ${replaced.size} bytes for /$pattern/")
+    }
+    val spent = linuxMonotonicMilliseconds() - started
+    if (spent > allowance) finding(seed, "regex /$pattern/ took $spent ms (allowed $allowance)")
+    return
+}
+
+// ---- date ----
+val dateBuiltIn: array<string> = [
+    "Sun, 06 Nov 1994 08:49:37 GMT", "Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994", "Thu, 01 Jan 1970 00:00:00 GMT",
+    "Tue, 29 Feb 2000 23:59:59 GMT", "Fri, 31 Dec 9999 23:59:59 GMT"]
+
+fun targetDate(seed: int): void {
+    val started = linuxMonotonicMilliseconds()
+    if (below(3) > 0) {
+        val input = if (below(8) == 0) randomBytes(40) else variant(pickFrom(dateBuiltIn))
+        dump(input)
+        val parsed = httpDateParse(input)
+        cover(if (parsed == null) "date: refused" else "date: parsed")
+    } else {
+        val limit = [1000000000000, 253402300799000, 4000000000000][below(3)]
+        val milliseconds = (below(2000000000) * 997 + below(1000)) % limit
+        val date = utcDate(milliseconds)
+        if (date.milliseconds() != milliseconds) finding(seed, "date: utcDate/milliseconds round trip of $milliseconds gave ${date.milliseconds()}")
+        val back = httpDateParse(date.httpDate())
+        if (back == null) finding(seed, "date: httpDate of $milliseconds does not parse: ${date.httpDate()}")
+        else if (back != milliseconds - milliseconds % 1000) finding(seed, "date: httpDate round trip of $milliseconds gave $back (${date.httpDate()})")
+        cover("date: round trip")
+    }
+    timed(seed, "date", started)
+    return
+}
+
+// ---- uuid ----
+fun targetUuid(seed: int): void {
+    val started = linuxMonotonicMilliseconds()
+    if (below(2) == 0) {
+        val built = uuidFromBytes(randomFixed(16))
+        if (built == null) finding(seed, "uuid: 16 bytes refused")
+        else {
+            val text = uuidText(built)
+            val parsed = uuidParse(text)
+            if (parsed == null) finding(seed, "uuid: its own text does not parse: $text")
+            else if (uuidText(parsed) != text) finding(seed, "uuid: round trip of $text gave ${uuidText(parsed)}")
+            cover("uuid: round trip")
+        }
+    } else {
+        val base = pickFrom(["123e4567-e89b-12d3-a456-426614174000", "00000000-0000-0000-0000-000000000000", "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF", "{123e4567-e89b-12d3-a456-426614174000}",
+            "urn:uuid:123e4567-e89b-12d3-a456-426614174000", "123e4567e89b12d3a456426614174000"])
+        val input = if (below(8) == 0) randomBytes(40) else variant(base)
+        dump(input)
+        val parsed = uuidParse(input)
+        cover(if (parsed == null) "uuid: refused" else "uuid: parsed")
+        if (parsed != null) {
+            val again = uuidParse(uuidText(parsed))
+            if (again == null || uuidText(again) != uuidText(parsed)) finding(seed, "uuid: text of a parsed value is not stable for [$input]")
+        }
+    }
+    timed(seed, "uuid", started)
+    return
+}
+
+fun randomFixed(count: int): string {
+    val values: array<int> = []
+    for (i in 0 until count) values.append(below(256))
+    bytes(values)
+}
+
+fun main: int {
+    if (processArgumentCount() < 3) {
+        println("usage: robust-fuzz <target> <first seed> <count> [seed file...] [--verbose] [--dump FILE]")
+        return 2
+    }
+    val target = processArgument(0)
+    val firstArg = processArgument(1).parseInt()
+    val countArg = processArgument(2).parseInt()
+    if (firstArg == null || countArg == null) return 2
+    val first: int = firstArg
+    val count: int = countArg
+    val paths: array<string> = []
+    var verbose = false
+    var memoryTrace = false
+    var index = 3
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument == "--verbose") verbose = true
+        else if (argument == "--memory") memoryTrace = true
+        else if (argument == "--dump" && index + 1 < processArgumentCount()) {
+            dumpPath = processArgument(index + 1)
+            index = index + 1
+        } else paths.append(argument)
+        index = index + 1
+    }
+    loadSeeds(paths)
+    for (seed in first until first + count) {
+        choiceState = seed * 2654435761 + 12345
+        if (verbose) println("seed $seed")
+        if (memoryTrace && seed % 250 == 0) {
+            val before = memoryLiveBytes()
+            memoryCollect()
+            println("live seed $seed: ${before / 1048576} MB before a collection, ${memoryLiveBytes() / 1048576} MB after; statm ${linuxReadFile("/proc/self/statm", 200).trim()}")
+        }
+        if (memoryTrace && seed > first) {
+            // the peak resident size so far (VmHWM) of the process: a seed whose run raised it by over 100 MB is named (the previous seed: this runs at the next one's start)
+            val status = linuxReadFile("/proc/self/status", 4000)
+            val at = status.indexOf("VmHWM:")
+            if (at >= 0) {
+                var digits = ""
+                var cursor = at + 6
+                while (cursor < status.size && (status[cursor] == 32 || status[cursor] == 9)) cursor = cursor + 1
+                while (cursor < status.size && status[cursor] >= 48 && status[cursor] <= 57) {
+                    digits = digits + status.slice(cursor, cursor + 1)
+                    cursor = cursor + 1
+                }
+                val kilobytes = digits.parseInt() ?? 0
+                if (kilobytes > peakKilobytes + 40000) {
+                    println("peak seed ${seed - 1}: ${kilobytes / 1024} MB (was ${peakKilobytes / 1024} MB)")
+                    peakKilobytes = kilobytes
+                }
+            }
+        }
+        if (target == "json") targetJson(seed)
+        else if (target == "yaml") targetYaml(seed)
+        else if (target == "http") targetHttp(seed)
+        else if (target == "chunked") targetChunked(seed)
+        else if (target == "inflate") targetInflate(seed)
+        else if (target == "regex") targetRegex(seed)
+        else if (target == "date") targetDate(seed)
+        else if (target == "uuid") targetUuid(seed)
+        else {
+            println("unknown target $target")
+            return 2
+        }
+    }
+    println("coverage: ${coverageLabels.size} outcomes")
+    for (i in 0 until coverageLabels.size) println("  ${coverageCounts[i]} ${coverageLabels[i]}")
+    if (failures == 0) println("robust-fuzz $target ok: seeds $first..${first + count - 1}")
+    failures
+}
