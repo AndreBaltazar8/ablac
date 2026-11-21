@@ -3181,14 +3181,36 @@ trusted fun __ablaRuntimeHostMarkPointer(candidate: int): bool {
     val layout = ablaRuntimeLoadI64(header + 24)
     if (u64(candidate) < u64(payload) || u64(candidate - payload) >= u64(size) ||
         layout < 0 || layout >= 16) return false
+    __ablaRuntimeHostClaimSerial(header, layout)
+    true
+}
+
+@inline
+trusted fun __ablaRuntimeHostClaimSerial(header: int, layout: int): void {
     ablaRuntimeStoreI64(header + 24, layout + 16)
     val work = __ablaRuntimeHostCollectionWorklistCount
     if (work >= __ablaRuntimeHostCollectionCount) ablaRuntimeTrap()
-    ablaRuntimeStoreI64(
-        __ablaRuntimeHostCollectionWorklist + work * 8, header
-    )
+    ablaRuntimeStoreI64(__ablaRuntimeHostCollectionWorklist + work * 8, header)
     __ablaRuntimeHostCollectionWorklistCount = work + 1
-    true
+}
+
+// Kinds 4 and 5 hold runtime-created one-word references to payload starts.
+// Objects, arrays and maps have an allocation header, except in the frozen
+// window. A region header carries its owner's address in place of a layout.
+@inline
+trusted fun __ablaRuntimeHostMarkExactReference(candidate: int): void {
+    if (candidate == 0) return
+    if (__ablaRuntimeHostFrozenBase != 0 && __ablaRuntimeHostFrozenIn(candidate)) {
+        __ablaRuntimeHostFrozenMark(candidate)
+        return
+    }
+    val header = candidate - 32
+    val layout = ablaRuntimeLoadI64(header + 24)
+    if (u64(layout) >= 16) return
+    if (__ablaRuntimeHostGcStress && __ablaRuntimeHostCollectionLocate(candidate) != header) {
+        ablaRuntimeTrap()
+    }
+    __ablaRuntimeHostClaimSerial(header, layout)
 }
 
 // The root and layout walkers share this tag dispatch instead of duplicating it.
@@ -3317,8 +3339,12 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
                 val field = payload + ablaRuntimeLoadI32(entries + index * 8)
                 val kind = ablaRuntimeLoadI32(entries + index * 8 + 4)
                 if (kind == 0) __ablaRuntimeHostMarkValue(field)
-                if (kind != 0) __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(field))
-                if (kind == 3) __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(field + 8))
+                else if (kind == 4 || kind == 5) {
+                    __ablaRuntimeHostMarkExactReference(ablaRuntimeLoadI64(field))
+                } else {
+                    __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(field))
+                    if (kind == 3) __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(field + 8))
+                }
                 index = index + 1
             }
             __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(payload + 8))

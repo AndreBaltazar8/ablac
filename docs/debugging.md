@@ -196,3 +196,12 @@ and a line for each stop that parked threads (`gc: stopped <n> thread(s)`) or wa
 collection are what the next one marks again, so for a long-running server they are its long-lived state: the framework's
 own event server (tests/cases/http-peer/server.ab shape, 300,000 requests) keeps 22 KB and collects in 2 ms, so only an
 application's caches could make a copy into read-only memory (`docs/design/frozen-heap.md`) worth having.
+
+A foreground collection also prints `gc: directory reason <n>`. The reason is
+0 when the registry sufficed, 1 under GC stress, 2 when the directory was forced,
+3 after a recent fallback, 4 when the mapping snapshot was unavailable, 5 when
+the registry was outside the snapshot, 6 on a pointer lookup miss, or 7 when
+scanning raw words. Reason 6 has a matching `gc: directory miss source <n> result <n>`
+line. Source 1 is a root and 2 is a value reached during marking. Result 0
+means no tracked allocation contains the pointer, 1 is a payload start, and 2
+is an interior pointer.
