@@ -2,7 +2,7 @@
 
 Internal only. Regenerate with `tools/readiness.sh`; this is an evidence inventory, not a production approval or stability policy.
 
-Source revision: `6a2c17ee409eda406a0feba69403d8b5c7606165`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.
+Source revision: `e7090763dfc23b74bb2a2602686da4aa14425411`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.
 
 ## Stability
 
@@ -76,7 +76,7 @@ Counts are top-level migration bullets, a proxy for breaking changes. A present 
 
 Suite inventory: **545 recipe commands**, **399 case directories**. These are source inventory counts, not passing checks.
 
-Evidence: `build/gate/gate.log`; SHA-256 `6d9ea253dd609ef18f968faad4558e8d83103335649196057b83ce2a6065a0c2`.
+Evidence: `build/gate/gate.log`; SHA-256 `5eeb669b54022816344fe408e8f024cc9739f7ebfea51c735db632c084df8a9f`.
 
     Fixed point: Missing
     Suite: Missing
@@ -172,6 +172,21 @@ Missing: independent audit, vulnerability inventory and security fuzz campaign e
 Awaiting `tools/bench-languages` measurements. Archive its report as `benchmarks.md` with revision, toolchains and host metadata.
 
 ## Platforms
+
+Coverage tiers from [the platform support matrix](platforms.md), based on required checks rather than a current green-run claim:
+
+| Platform | Tier | Compiler host evidence | Program target evidence | Published v0.2.64 assets |
+|---|---|---|---|---|
+| Linux x86-64 | T1 | Native suite, dynamic self-build and static compiler fixpoint | Native executables; default libc-free link with explicit dependency exceptions | `ablac-x86_64-linux`, `ablac-static-x86_64-linux`, `abla-toolchain-x86_64-linux.tar.gz` |
+| Linux AArch64 | T2 | Cross-built static compiler executed under qemu; no native host full-suite gate | Static programs cross-built and selected programs executed under qemu | None; AArch64 static compiler not a v0.2.64 asset |
+| macOS arm64 | T2 | Native compiler, selected host checks and self-rebuild | Native Mach-O; selected runtime paths, iOS Simulator integration | `ablac-arm64-macos`, `abla-toolchain-arm64-macos.tar.gz` |
+| macOS Intel | T2 | Native compiler and selected host checks; release self-rebuild | Native Mach-O; selected runtime paths | `ablac-x86_64-macos`, `abla-toolchain-x86_64-macos.tar.gz` |
+| Android arm64 | T2 | No Android-hosted compiler gate | Shared libraries checked against NDK; exports executed by bionic under qemu | None for Android |
+| iOS arm64 and Simulator | T2 Simulator / T3 device | No iOS-hosted compiler gate | Device archive/XCFramework checks; selected exported calls run on arm64 Simulator | None for iOS |
+| WebAssembly hosted | T2 | No Wasm-hosted compiler gate | Release/development modules execute with the `abla_host` ABI under Node | No standalone Wasm compiler asset; build support in host toolchains |
+| WebAssembly hostless | T2 | No Wasm-hosted compiler gate | Import-free runtime fixtures and differential programs execute under Node | No standalone Wasm compiler asset; build support in host toolchains |
+| Xtensa / ESP32 | T3 | No compiler hosted on the microcontroller | Object/assembly checks and optional companion integration; no required board run | No ablac ESP32 binary; separately versioned LLVM companion |
+| Windows | Planned | No Windows host compiler gate | Generic COFF emission is not Windows program/runtime support | None for Windows |
 
 Declared workflow jobs and matrices, extracted from `.github/workflows`. This configuration does not establish passing CI or hardware coverage; conditional/manual jobs remain conditional/manual.
 

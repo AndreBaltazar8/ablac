@@ -14,6 +14,9 @@ has 'Missing: structured campaign totals'
 has '| Runtime / RSS / compile time / size | Missing |'
 has '### `.github/workflows/ci.yml`'
 has 'runner: macos-15-intel'
+has '| Linux x86-64 | T1 |'
+has '| Linux AArch64 | T2 |'
+has '| Windows | Planned |'
 [[ $(grep -c '^## ' "$work/report.md") == 8 ]]
 cat > "$work/data/releases.json" <<'JSON'
 [

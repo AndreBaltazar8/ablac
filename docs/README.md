@@ -35,6 +35,7 @@ in seven short sections of runnable programs.
 
 | Document | What it covers |
 |---|---|
+| [platforms.md](platforms.md) | Coverage tiers, compiler hosts, runtime targets, release assets and remaining platform gaps |
 | [targets.md](targets.md) | Target selection, release platforms and evidence for cross-target coverage |
 | [stdlib/ios-build.md](stdlib/ios-build.md) | iOS SDK selection, static libraries, exported C ABI and XCFramework packaging |
 | [toolchain.md](toolchain.md) | `ablac build`, `run`, `repl`, `serve`, `package`; targets and Wasm |

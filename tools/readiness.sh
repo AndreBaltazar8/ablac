@@ -119,6 +119,11 @@ json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence
         printf 'Awaiting `tools/bench-languages` measurements. Archive its report as `benchmarks.md` with revision, toolchains and host metadata.\n\n'
     fi
     printf '## Platforms\n\n'
+    if [[ -s docs/platforms.md ]]; then
+        printf 'Coverage tiers from [the platform support matrix](platforms.md), based on required checks rather than a current green-run claim:\n\n'
+        awk '/^<!-- readiness-platforms:start -->$/ {inside=1; next} /^<!-- readiness-platforms:end -->$/ {inside=0} inside {print}' docs/platforms.md
+        printf '\n'
+    else missing 'platform coverage tiers (docs/platforms.md)'; fi
     printf 'Declared workflow jobs and matrices, extracted from `.github/workflows`. This configuration does not establish passing CI or hardware coverage; conditional/manual jobs remain conditional/manual.\n\n'
     for workflow in .github/workflows/*.yml .github/workflows/*.yaml; do
         [[ -f $workflow ]] || continue
