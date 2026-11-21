@@ -85,7 +85,7 @@ rec {
     let stock = pkgs.llvmPackages_23.clang-unwrapped; in
     pkgs.runCommand "clang-23.1.3-fdiv"
       {
-        outputs = [ "out" "lib" "dev" "python" ];
+        outputs = stock.outputs;
         nativeBuildInputs = [ pkgs.patchelf ];
         inherit (stock) version meta pname;
         passthru = stock.passthru;
@@ -118,7 +118,7 @@ rec {
           chmod u+w "$f"
           patchelf --set-rpath "$lib/lib:${llvm.lib}/lib:$rest" "$f"
         done
-        ln -s ${stock.dev} $dev
-        ln -s ${stock.python} $python
+        # Every other output of nixpkgs' clang (headers, scripts) as it is.
+        ${pkgs.lib.concatMapStrings (o: "ln -s ${stock.${o}} \$${o}\n") (pkgs.lib.subtractLists [ "out" "lib" ] stock.outputs)}
       '';
 }
