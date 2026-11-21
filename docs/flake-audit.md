@@ -80,8 +80,9 @@ remain infrastructure failures. Some cancelled-job downloads are partial; raw
 logs and metadata are retained rather than counting unavailable logs as passes.
 
 One pre-EF quiet sweep completed on compiler core `c2e0a4b2` with tooling at
-`716402c8`: **546 unique commands, 546 passed, 0 failed**, all release builds
-(`RUN_TESTS_FULL=1`). The partial second sweep was retired at the EF rebase and
+`716402c8`: **546 unique commands, 546 passed, 0 failed**, with
+`RUN_TESTS_FULL=1`. Individual checks retain any explicit `--fast` smoke builds.
+The partial second sweep was retired at the EF rebase and
 is not a completed sweep. Its evidence is archived under
 `~/archive/ablac-cx6-flakes/retired-716402c8/`.
 
