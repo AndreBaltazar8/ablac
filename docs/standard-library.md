@@ -5,6 +5,28 @@ The standard library is a set of ordinary Abla modules, imported by path:
 needs, so a program that never touches JSON, TLS or the compiler doesn't
 carry them.
 
+Generate the source reference with `build/ablac doc`. The output is
+`build/docs/index.md`, a Markdown page per source module under `build/docs/abla/`,
+and `build/docs/coverage.json` for tools such as the readiness scorecard. These
+are build products; do not check them in. `--stdlib <root>` selects a different
+stdlib directory (containing `abla/`); `--output <directory>` selects the destination.
+The default stdlib follows the compiler's `ABLA_STDLIB` / `ABLA_SYSROOT` settings.
+
+The generator uses the compiler's unevaluated analysis graph and parser. It lists
+public source declarations, including methods, extensions, aliases, values and
+registered sub-languages, with signatures sliced from the original source and
+adjacent doc comments. Re-exports link the API to its declaring module; coverage
+counts declarations at their source, once, rather than at every re-export.
+Constructor parameters are part of the type signature, not separate coverage
+entries. Compile-time generated declarations are not executed or counted.
+Entry modules show their public import path; auxiliary source modules have their
+own pages, reached through the entry module's re-export links.
+
+Coverage schema version 1 contains `modules` (each with `module`, `documented`,
+`undocumented`, `total`) and `totals` (the same counts without `module`). An adjacent
+`/** ... */` or run of `//` comments counts as documentation, matching editor hover
+documentation. Modules and declarations appear in deterministic source order.
+
 ## By task
 
 | Page | Modules |

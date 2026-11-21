@@ -349,6 +349,7 @@ test-serial: ablac
 	tools/test-overload-probe-filter.sh $(COMPILER)
 	tools/test-doc-examples.sh $(COMPILER)
 	tools/test-tour.sh $(COMPILER)
+	tools/test-stdlib-doc.sh $(COMPILER)
 	tools/test-doc-examples-tiers.sh $(COMPILER)
 	tools/test-runtime-memory.sh $(COMPILER)
 	tools/test-native-object-cache.sh $(COMPILER)

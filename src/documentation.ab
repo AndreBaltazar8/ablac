@@ -1,0 +1,219 @@
+import "analysis_graph.ab"
+import "analysis_service.ab"
+import "parser.ab"
+import "lexer.ab"
+import "module_paths.ab"
+import "module.ab"
+import "abla/json"
+import "abla/bytes"
+import "abla/text"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+
+// This is the analysis service's unevaluated module surface. It never loads or
+// executes compile-time code, including subparser handlers.
+class BootstrapDocumentationModule(val name: string, val files: array<string>)
+
+fun bootstrapDocumentationCollect(path: Path, root: string,
+    var modules: array<BootstrapDocumentationModule>): bool {
+    if (path.isSymbolicLink()) return true
+    if (path.info().isDirectory()) {
+        val names: array<string> = []
+        for (entry in path.entries()) if (!entry.name().startsWith(".")) names.append(entry.name())
+        for (name in sortedStrings(names)) {
+            if (!bootstrapDocumentationCollect(path.child(name), root, modules)) return false
+        }
+    } else if (path.info().isFile() && path.extension() == "ab") {
+        var name = path.text.slice(root.size + 1, path.text.size - 3)
+        if (name.endsWith("/entry")) name = name.slice(0, name.size - 6)
+        var found = false
+        for (module in modules) if (module.name == name) {
+            module.files.append(path.text)
+            found = true
+        }
+        if (!found) modules.append(BootstrapDocumentationModule(name, [path.text]))
+    } else if (!path.info().isFile()) return false
+    true
+}
+
+// Locate the header's last token in the compiler's token stream. Nested
+// defaults, annotations and strings may contain `=` or `{`; they are not the
+// declaration's body. Whitespace *within* the resulting source slice survives.
+fun bootstrapDocumentationBegin(source: string, tokens: array<BootstrapToken>,
+    declaration: BootstrapDeclaration): int {
+    val index = bootstrapAnalysisFirstTokenAt(tokens, declaration.begin)
+    if (declaration.isSealed && index > 0 && bootstrapTokenText(source,
+        tokens[index - 1]) == "sealed") return tokens[index - 1].begin
+    declaration.begin
+}
+
+fun bootstrapDocumentationSignature(source: string, tokens: array<BootstrapToken>,
+    declaration: BootstrapDeclaration): string {
+    val begin = bootstrapDocumentationBegin(source, tokens, declaration)
+    var end = begin
+    var depth = 0
+    var index = bootstrapAnalysisFirstTokenAt(tokens, begin)
+    while (index < tokens.size && tokens[index].begin < declaration.end) {
+        val token = tokens[index]
+        if (depth == 0 && (token.kind == BOOTSTRAP_TOKEN_LBRACE ||
+            (token.kind == BOOTSTRAP_TOKEN_EQUAL && declaration.kind != "type") ||
+            (declaration.expression.kind == "delegate.initializer" && token.begin ==
+                declaration.expression.begin) ||
+            token.kind == BOOTSTRAP_TOKEN_SEMICOLON)) break
+        if (token.kind == BOOTSTRAP_TOKEN_LPAREN || token.kind == BOOTSTRAP_TOKEN_LBRACKET) depth =
+            depth + 1
+        if (token.kind == BOOTSTRAP_TOKEN_RPAREN || token.kind == BOOTSTRAP_TOKEN_RBRACKET) depth =
+            depth - 1
+        if (token.kind != BOOTSTRAP_TOKEN_NEWLINE) end = token.end
+        index = index + 1
+    }
+    source.slice(begin, end)
+}
+
+fun bootstrapDocumentationFence(text: string): string {
+    var fence = "```"
+    while (text.indexOf(fence) >= 0) fence = "$fence`"
+    fence
+}
+
+fun bootstrapDocumentationEntry(var page: ByteBuffer, name: string, kind: string,
+    signature: string, documentation: string): void {
+    val fence = bootstrapDocumentationFence(signature)
+    page.appendText("\n## `$name` ($kind)\n\n${fence}abla\n$signature\n$fence\n")
+    if (documentation != "") page.appendText("\n$documentation\n")
+}
+
+fun bootstrapDocumentationDeclaration(var page: ByteBuffer, source: string,
+    tokens: array<BootstrapToken>, declaration: BootstrapDeclaration, owner: string,
+    var counts: array<int>): void {
+    if (declaration.isPrivate || declaration.name.startsWith("__abla_default_")) return
+    val signature = bootstrapDocumentationSignature(source, tokens, declaration)
+    val offset = bootstrapDocumentationBegin(source, tokens, declaration)
+    val documentation = bootstrapAnalysisDocumentation(source, offset, 0)
+    val prefix = if (owner != "") "$owner." else if (declaration.extensionOwner !=
+        "") "${declaration.extensionOwner}." else ""
+    val kind = if (owner != "") "method" else if (declaration.extensionOwner !=
+        "") "extension ${declaration.kind}" else declaration.kind
+    bootstrapDocumentationEntry(page, "$prefix${declaration.name}", kind, signature, documentation)
+    val bucket = if (documentation != "") 0 else 1
+    counts[bucket] = counts[bucket] + 1
+    for (method in declaration.methods) bootstrapDocumentationDeclaration(page, source, tokens,
+        method,
+        "$prefix${declaration.name}", counts)
+}
+
+fun bootstrapDocumentationCoverage(name: string, counts: array<int>): Json = jsonObject(
+    ["module", "documented", "undocumented", "total"],
+    [jsonString(name), jsonInteger(counts[0]), jsonInteger(counts[1]),
+        jsonInteger(counts[0] + counts[1])])
+
+fun bootstrapDocumentationGenerate(root: string, output: string): int {
+    val modules: array<BootstrapDocumentationModule> = []
+    if (!bootstrapDocumentationCollect(Path(root).child("abla"), root, modules)) {
+        linuxPrintStandardError("error[E_DOC]: cannot read $root/abla\n")
+        return 1
+    }
+    val coverage: array<Json> = []
+    val totals = [0, 0]
+    val index = byteBuffer()
+    index
+        .appendText("# Standard library reference\n\nGenerated from source by `ablac doc`. Signatures retain source spelling.\n\n| Module | With docs | Without docs |\n|---|---:|---:|\n")
+    for (module in modules) {
+        val page = byteBuffer()
+        page.appendText("# `${module.name}`\n\nGenerated from source.\n")
+        var importable = false
+        for (file in module.files) if (file.endsWith("/entry.ab")) importable = true
+        if (importable) page.appendText("\nImport with `import \"${module.name}\"`.\n")
+        else page.appendText("\nSource module; follow its importing module's re-export links.\n")
+        val counts = [0, 0]
+        for (file in module.files) {
+            val source = Path(file).readText()
+            val graph = bootstrapAnalysisGraphParse(source, "file://$file", true, file, false)
+            if (graph.parsed.errors != 0) {
+                linuxPrintStandardError("error[E_DOC]: cannot parse $file\n${graph.parsed.diagnostics}")
+                return 1
+            }
+            page.appendText("\nSource: `${file.slice(root.size + 1, file.size)}`\n")
+            for (edge in bootstrapScanImportsWithIdentity(source, file).edges) {
+                if (edge.exported && !edge.provider) {
+                    var target = edge.source
+                    if (target.startsWith(".")) {
+                        val relativeSource = file.slice(root.size + 1, file.size)
+                        target =
+                            bootstrapNormalizeModulePath(Path(relativeSource).parent().child(target)
+                                    .text)
+                    }
+                    if (target.endsWith(".ab")) target = target.slice(0, target.size - 3)
+                    if (target.endsWith("/entry")) target = target.slice(0, target.size - 6)
+                    var shown = "`${edge.source}`"
+                    for (candidate in modules) if (candidate.name == target) {
+                        var relative = ""
+                        for (part in 1 until module.name.split("/").size) relative = "$relative../"
+                        shown = "[`${edge.source}`]($relative$target.md)"
+                    }
+                    page
+                        .appendText("\nRe-exports $shown${if (edge.alias != "") " as `${edge.alias}`" else ""}.\n")
+                }
+            }
+            val tokens = bootstrapLexShared(source)
+            for (declaration in graph.parsed.declarations) bootstrapDocumentationDeclaration(page,
+                source, tokens, declaration, "", counts)
+            // Registrations are compiler-parsed actions, never text matches or
+            // executed handlers. The call itself is the language's signature.
+            for (action in graph.parsed.actions) {
+                val expression = if (action.kind == "compile" && action.children.size ==
+                    1) action.children[0] else action
+                if (expression.kind == "call" && expression.text == "compilerRegisterSubparser" &&
+                    expression.children.size == 2 && expression.children[0].kind == "string") {
+                    val documentation = bootstrapAnalysisDocumentation(source, action.begin, 0)
+                    bootstrapDocumentationEntry(page, "$${expression.children[0].text}",
+                        "sub-language",
+                        source.slice(action.begin, action.end), documentation)
+                    val bucket = if (documentation != "") 0 else 1
+                    counts[bucket] = counts[bucket] + 1
+                }
+            }
+        }
+        val destination = Path(output).child("${module.name}.md")
+        if (!destination.createParentDirectories() || !destination.writeText(page.toText())) {
+            linuxPrintStandardError("error[E_DOC]: cannot write ${destination.text}\n")
+            return 1
+        }
+        index
+            .appendText("| [`${module.name}`](${module.name}.md) | ${counts[0]} | ${counts[1]} |\n")
+        coverage.append(bootstrapDocumentationCoverage(module.name, counts))
+        totals[0] = totals[0] + counts[0]
+        totals[1] = totals[1] + counts[1]
+        linuxPrintStandardOutput("${module.name}: ${counts[0]} documented, ${counts[1]} undocumented\n")
+    }
+    val report = jsonObject(["schemaVersion", "modules", "totals"], [jsonInteger(1),
+        jsonArray(coverage),
+        jsonObject(["documented", "undocumented", "total"], [jsonInteger(totals[0]),
+            jsonInteger(totals[1]), jsonInteger(totals[0] + totals[1])])])
+    if (!Path(output).child("index.md").writeText(index.toText()) ||
+        !Path(output).child("coverage.json").writeText("${jsonStringify(report)}\n")) return 1
+    linuxPrintStandardOutput("total: ${totals[0]} documented, ${totals[1]} undocumented\n")
+    0
+}
+
+fun bootstrapDocumentationCommand(): int {
+    var root = bootstrapStandardLibraryRoot()
+    var output = "build/docs"
+    var index = 1
+    while (index < linuxArgumentCount()) {
+        val argument = linuxArgument(index)
+        if ((argument == "--stdlib" || argument == "--output") && index + 1 <
+            linuxArgumentCount()) {
+            if (argument == "--stdlib") root = linuxArgument(index + 1) else output =
+                linuxArgument(index + 1)
+            index = index + 2
+        } else {
+            linuxPrintStandardError("usage: ablac doc [--stdlib <stdlib-root>] [--output <directory>]\n")
+            return 2
+        }
+    }
+    // Remove trailing separators so module identities do not depend on them.
+    while (root.endsWith("/") && root.size > 1) root = root.slice(0, root.size - 1)
+    bootstrapDocumentationGenerate(root, output)
+}
