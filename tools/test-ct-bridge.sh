@@ -64,6 +64,9 @@ compare_case() {
     # Every other case keeps the default: a heavy one ran past a short limit in one tier only under a loaded suite.
     local limit=${ABLA_COMPILE_EVAL_TIME_LIMIT:-}
     [[ $source != tests/cases/ct-time-limit/* ]] || limit=10
+    # The diagnostic fixture is designed for a one-second deadline, as in
+    # test-ct-site-errors.sh; without it, it blocks for a minute and succeeds.
+    [[ $source != tests/cases/ct-site-errors/late.ab ]] || limit=1
     # A case long by nature (tests/cases/ct-bridge/long-loopback.txt) gets three times the wall limit in each tier.
     local seconds=$ABLA_MAX_SECONDS
     [[ $long_cases != *" $source "* ]] || seconds=$((ABLA_MAX_SECONDS * 3))
@@ -97,6 +100,15 @@ compare_case() {
         printf 'loopback timeout: %s: stopped by the %s s limit:%s; not compared (a case long by nature belongs in tests/cases/ct-bridge/long-loopback.txt)\n' \
             "$source" "$seconds" "$stopped" >&2
         return 1
+    fi
+    if [[ $source == tests/cases/ct-site-errors/late.ab ]]; then
+        for tier in interp bridge; do
+            local status_of=${tier}_status
+            if [[ ${!status_of} -ne 1 ]] || ! grep -q '^error\[E_CT_TIME_LIMIT\]' "$base.$tier.err"; then
+                echo "loopback deadline: $source ($tier) did not stop at its site deadline" >&2
+                return 1
+            fi
+        done
     fi
     for tier in interp bridge; do comparable_err < "$base.$tier.err" > "$base.$tier.cmp"; done
     if [[ $interp_status -ne $bridge_status ]] ||

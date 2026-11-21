@@ -105,3 +105,18 @@ does not establish a cause or justify retrying failed connections. The fixture
 now reports the failed connection descriptor and captures the server log and
 socket state on an unexpected positive-case failure. Full sweep rates must come
 from completed campaign unions, separately from these diagnostic reproductions.
+
+The first loaded sweep on `9b47085b` also failed `test-ct-bridge.sh` for
+`ct-site-errors/late.ab`. This fixture polled the clock for a minute; its own
+diagnostic harness supplied a one-second deadline, but the bridge loopback did
+not. The slower bridge tier completed the minute, while the interpreter later
+spent its 50-million-step budget in 33.3 seconds. The resulting success/error
+mismatch depended on execution speed. Raw outputs are retained in the campaign's
+`loaded-1/part-4/` logs and diagnostic archive.
+
+The fixture now blocks in `sleep`, and the bridge harness supplies and asserts
+its intended one-second deadline in both tiers. The diagnostic harness lowers
+this case's step budget to 100,000 and requires `E_CT_TIME_LIMIT`, so a clock loop
+cannot silently replace the wait. `ct-time-limit/clock.ab` separately retains
+the regression for an interrupt inside a clock-provider call. No evaluator
+budget is increased.

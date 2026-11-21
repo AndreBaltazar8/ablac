@@ -15,16 +15,23 @@ cd "$project_root/tests/cases/ct-site-errors"
 fail() { echo "ct site errors: $1" >&2; [[ -z ${2:-} ]] || cat "$2" >&2; exit 1; }
 # The report without the tier's place: record lines and `-->` lines out, the trace's notes out.
 common() { grep -v '^source\[\|^  --> \|^note\[' "$1"; }
-declare -A expected_path=([bounds]="pick table" [division]="ratio table" [panic]=check [exit]=leave [deep]=down [late]=spin)
+declare -A expected_path=([bounds]="pick table" [division]="ratio table" [panic]=check [exit]=leave [deep]=down [late]=waitPastDeadline)
 for case in bounds division panic exit deep late denied; do
+    # This case must end at its deadline even with few interpreter steps left;
+    # a clock-polling loop would hit E_EVAL_STEP_LIMIT first on a fast tier.
+    extra_env=()
+    [[ $case != late ]] || extra_env+=(ABLA_EVAL_STEP_LIMIT=100000)
     for mode in interp jit; do
         log=$out/$case-$mode.log
         status=0
-        ABLA_COMPILE_EVAL=$mode ABLA_COMPILE_EVAL_TIME_LIMIT=1 timeout 120 "$compiler" build $case.ab \
+        env "${extra_env[@]}" ABLA_COMPILE_EVAL=$mode ABLA_COMPILE_EVAL_TIME_LIMIT=1 timeout 120 "$compiler" build $case.ab \
             -o "$out/$case-$mode" --fast --no-cache > "$log" 2>&1 || status=$?
         [[ $status == 1 ]] || fail "$case $mode: the compiler exited $status, not 1" "$log"
         [[ $(grep -c '^error\[' "$log") == 1 ]] || fail "$case $mode: not one error" "$log"
         grep -q '^  --> ' "$log" || fail "$case $mode: no place" "$log"
+        if [[ $case == late ]]; then
+            grep -q '^error\[E_CT_TIME_LIMIT\]' "$log" || fail "$case $mode: not its deadline" "$log"
+        fi
     done
     interp=$out/$case-interp.log jit=$out/$case-jit.log
     diff <(common "$interp") <(common "$jit") > "$out/$case.diff" ||
