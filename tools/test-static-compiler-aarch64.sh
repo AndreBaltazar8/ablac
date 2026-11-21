@@ -21,6 +21,9 @@ if [[ -z ${ABLA_STATIC_LLVM_LIB:-} || ! -f ${ABLA_STATIC_LLVM_LIB}/libLLVMSuppor
 fi
 export ABLA_STATIC_LLVM_LIB ABLA_STATIC_TARGET_LIBS
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$root}
+# The launcher's default cap is 2048 MB; the frontend on the compiler's own source needs about 1.8 GB resident and the static link more (CI run 44878467709 died with
+# "out of memory"; tools/build-static-compiler.sh has the same default). The compilers run under qemu below read it too.
+export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-8192}
 out=build/static-compiler-aarch64
 rm -rf "$out"
 mkdir -p "$out"
