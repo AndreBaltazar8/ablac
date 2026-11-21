@@ -2,7 +2,7 @@
 # The downstream check: the sibling repositories (tools/siblings.txt) against a candidate compiler, in two layers.
 #
 #   tools/test-siblings.sh <candidate-tree> [--baseline <compiler>] [--only a,b,...] [--programs-only | --tests-only]
-#                          [--jobs N] [--out DIR] [--keep] [--list FILE] [--projects DIR]
+#                          [--jobs N] [--out DIR] [--keep] [--list FILE] [--projects DIR] [--expected-fail FILE]
 #
 # (--list and --projects, for tools/test-siblings-tool.sh: another list than tools/siblings.txt, and another
 # directory of repositories than the one beside ablac.)
@@ -19,6 +19,9 @@
 # Programs: every file with a `fun main` in a listed repository (not under build/, vendor/, .abla/ or .claude/),
 # built with the candidate and, with --baseline, with that compiler (--fast --no-cache, `jobs` at a time). A program
 # the baseline builds and the candidate does not is a regression; its first errors are kept.
+# A repository with a shell.nix of its own builds its programs inside it (its system libraries, e.g. abla-graphics' vulkan-loader and libX11).
+# tools/siblings-expected-fail.txt names, by hand, the programs a repository's tests expect NOT to build: they are no regression, show in the
+# summary's xfail column (failed as expected / listed), and one that builds is an unexpected pass that fails the run.
 # Tests: the repository's command from siblings.txt, run in its worktree (each in turn), its exit status kept.
 #
 # Unused imports: the candidate's W_UNUSED_IMPORT warnings from both layers (a test file is a root of its own, which
@@ -45,6 +48,7 @@ out=
 keep=0
 list=
 projects_override=
+expected_fail_file=
 while [[ $# -gt 0 ]]; do
     case $1 in
         --baseline) baseline=$2; shift ;;
@@ -56,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --keep) keep=1 ;;
         --list) list=$2; shift ;;
         --projects) projects_override=$2; shift ;;
+        --expected-fail) expected_fail_file=$2; shift ;;
         *) usage ;;
     esac
     shift
@@ -66,6 +71,10 @@ projects=$(cd -- "$project_root/.." && pwd)
 [[ -d $projects/abla-xml || ! -d $project_root/../../../../abla-xml ]] || projects=$(cd -- "$project_root/../../../.." && pwd)
 [[ -z $projects_override ]] || projects=$(cd -- "$projects_override" && pwd)
 list=${list:-$project_root/tools/siblings.txt}
+expected_fail_file=${expected_fail_file:-$project_root/tools/siblings-expected-fail.txt}
+# The programs a repository's own tests expect NOT to build (negative tests), one `<repository><TAB><file>` a line: named by hand, never inferred.
+expected_fail=
+[[ ! -f $expected_fail_file ]] || expected_fail=$(grep -vE '^[[:space:]]*(#|$)' "$expected_fail_file" | tr '\t' ' ' || true)
 out=${out:-$project_root/build/siblings}
 [[ -x $candidate/build/ablac ]] || { echo "test-siblings: $candidate/build/ablac is not built" >&2; exit 2; }
 case $out in /*) ;; *) out=$PWD/$out ;; esac
@@ -134,29 +143,39 @@ if ((programs)); then
         (cd "$layout/$name" && grep -rlE --include='*.ab' '^((trusted|inline) )*fun main\b' . 2>/dev/null |
             grep -vE '/(build|vendor|\.abla|\.claude|node_modules)/' | sed "s#^\./#$name #") >> "$programs_file" || true
     done
-    build_one() { # name file -> "<name> <file> base=<rc|-> cand=<rc>"
-        local name=$1 file=$2 work
+    # A repository with a shell.nix of its own (its system libraries: vulkan-loader, libX11, ...) builds inside it; the compilers' paths are absolute.
+    in_repo_shell() { # name command... : run it in the repository's directory, inside its shell.nix when it has one
+        local repo=$1; shift
+        if [[ -f $layout/$repo/shell.nix ]] && command -v nix-shell >/dev/null 2>&1; then
+            (cd "$layout/$repo" && nix-shell shell.nix --run "$(printf '%q ' "$@")")
+        else
+            (cd "$layout/$repo" && "$@")
+        fi
+    }
+    build_one() { # name file -> "<name> <file> base=<rc|-> cand=<rc> expect=<pass|fail>"
+        local name=$1 file=$2 work expect=pass
+        grep -qxF "$name $file" <<< "$expected_fail" && expect=fail
         work=$(mktemp -d "$out/program.XXXXXX")
         local base=-
         if [[ -n $baseline ]]; then
-            (cd "$layout/$name" && ABLA_MAX_MEMORY_MB=$memory timeout 600 "$baseline" build "$file" -o "$work/base" --fast --no-cache) > "$work/base.log" 2>&1 && base=0 || base=$?
+            in_repo_shell "$name" env ABLA_MAX_MEMORY_MB=$memory timeout 600 "$baseline" build "$file" -o "$work/base" --fast --no-cache > "$work/base.log" 2>&1 && base=0 || base=$?
         fi
         local cand=0
-        (cd "$layout/$name" && ABLA_MAX_MEMORY_MB=$memory ABLA_SYSROOT=$candidate timeout 600 "$candidate/build/ablac" build "$file" -o "$work/cand" --fast --no-cache) > "$work/cand.log" 2>&1 || cand=$?
-        echo "$name $file base=$base cand=$cand"
+        in_repo_shell "$name" env ABLA_MAX_MEMORY_MB=$memory ABLA_SYSROOT=$candidate timeout 600 "$candidate/build/ablac" build "$file" -o "$work/cand" --fast --no-cache > "$work/cand.log" 2>&1 || cand=$?
+        echo "$name $file base=$base cand=$cand expect=$expect"
         grep -a 'W_UNUSED_IMPORT' "$work/cand.log" | sed "s#^#$name #" >> "$out/unused-raw.txt" || true
-        if [[ $cand != 0 && ( $base == 0 || $base == - ) ]]; then
+        if [[ $expect == pass && $cand != 0 && ( $base == 0 || $base == - ) ]]; then
             { echo "### $name $file (base=$base cand=$cand)"; grep -a -m3 -E 'error\[|error:' "$work/cand.log" | cut -c1-240; } > "$work/regression"
             cat "$work/regression" >> "$out/regressions.txt"
         fi
         rm -rf -- "$work"
     }
-    export -f build_one
+    export -f in_repo_shell build_one
     # One memory cap for both compilers, above what any sibling program needs: abla-graphics' generated
     # tests/raw_registry.ab needs more than 4096 MB of address space with v0.2.63 and master alike (at 2048 or 4096
     # both run out of memory alone, about 965 MB resident; at 6144 it builds), so a lower cap flips it by chance.
     memory=${ABLA_MAX_MEMORY_MB:-8192}
-    export out layout baseline candidate memory
+    export out layout baseline candidate memory expected_fail
     : > "$out/regressions.txt"
     # `jobs` at a time; each line's output is whole (one echo). (Paths with spaces aren't sibling sources.)
     xargs -P "$jobs" -L 1 bash -c 'build_one "$0" "$1"' < "$programs_file" > "$out/programs-result.txt" 2>&1 || true
@@ -185,24 +204,30 @@ while read -r name warning; do
     echo "$name $warning"
 done < "$out/unused-raw.txt" | sort -u > "$out/unused.txt"
 
-# The summary.
+# The summary. Programs: built / listed, not counting the expected-fail ones (tools/siblings-expected-fail.txt: negative tests that must NOT build);
+# those are a column of their own, "failed as expected / listed", and one that builds is an unexpected pass (it fails the run, so a newly passing one shows).
 failed=0
+: > "$out/unexpected-pass.txt"
 {
-    printf '%-18s %-14s %-11s %-7s %s\n' repository programs regressions unused tests
+    printf '%-18s %-14s %-11s %-7s %-9s %s\n' repository programs regressions unused xfail tests
     for name in "${repos[@]}"; do
-        total=$(grep -c "^$name " "$out/programs-result.txt" 2>/dev/null || true)
-        built=$(grep "^$name " "$out/programs-result.txt" 2>/dev/null | grep -c ' cand=0$' || true)
+        total=$(grep -c "^$name .* expect=pass$" "$out/programs-result.txt" 2>/dev/null || true)
+        built=$(grep "^$name " "$out/programs-result.txt" 2>/dev/null | grep -c ' cand=0 expect=pass$' || true)
+        listed=$(grep -c "^$name .* expect=fail$" "$out/programs-result.txt" 2>/dev/null || true)
+        xfailed=$(( ${listed:-0} - $(grep "^$name " "$out/programs-result.txt" 2>/dev/null | grep -c ' cand=0 expect=fail$' || true) ))
+        grep "^$name .* cand=0 expect=fail$" "$out/programs-result.txt" 2>/dev/null >> "$out/unexpected-pass.txt" || true
         regressed=$(grep -c "^### $name " "$out/regressions.txt" 2>/dev/null || true)
         status=$(awk -v n="$name" '$1 == n {print $2}' "$out/tests.txt")
         test_text=${status:--}
         [[ $test_text == 0 ]] && test_text="pass"
         [[ $test_text != pass && $test_text != - ]] && test_text="FAIL ($status, test-$name.log)"
-        [[ ${regressed:-0} != 0 || $test_text == FAIL* ]] && failed=1
+        [[ ${regressed:-0} != 0 || $test_text == FAIL* || $xfailed != "${listed:-0}" ]] && failed=1
         unused=$(grep -c "^$name " "$out/unused.txt" || true)
-        printf '%-18s %-14s %-11s %-7s %s\n' "$name" "${built:-0}/${total:-0}" "${regressed:-0}" "${unused:-0}" "$test_text"
+        printf '%-18s %-14s %-11s %-7s %-9s %s\n' "$name" "${built:-0}/${total:-0}" "${regressed:-0}" "${unused:-0}" "${xfailed}/${listed:-0}" "$test_text"
     done
 } > "$out/summary.txt"
 cat "$out/summary.txt"
 [[ -s $out/regressions.txt ]] && { echo; cat "$out/regressions.txt"; }
+[[ -s $out/unexpected-pass.txt ]] && { echo; echo "unexpected pass (listed in $(basename "$expected_fail_file") as must-fail, but it builds):"; cat "$out/unexpected-pass.txt"; }
 ((keep)) || { remove_layout; rm -rf -- "$layout"; }
 exit $failed
