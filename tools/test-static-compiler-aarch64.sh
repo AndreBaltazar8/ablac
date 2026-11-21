@@ -56,5 +56,26 @@ for source in tests/cases/libc-imports/hello.ab tests/cases/libc-imports/strings
         diff "$out/$name.static.out" "$out/$name.cross.out" | head -5 >&2; exit 1; }
     count=$((count + 1))
 done
+# The JIT: `ablac run` and the compile-time jit tier find the process's symbols through the library's dlsym table (src/static_libc/dl.ab), here with
+# LLVM's AArch64 JIT running under qemu-aarch64; and the three compile-time evaluation tiers agree.
+run=$(qemu-aarch64 "$out/ablac-static" run tests/cases/libc-imports/hello.ab 2>&1) || { echo "static compiler aarch64: ablac run failed: $run" >&2; exit 1; }
+[[ $run == hello ]] || { echo "static compiler aarch64: ablac run printed [$run]" >&2; exit 1; }
+cat > "$out/compile-time.ab" <<'AB'
+import "abla/io"
+
+fun fib(n: int): int = if (n < 2) n else fib(n - 1) + fib(n - 2)
+
+val answer = #fib(20)
+
+fun main: int {
+    println("answer $answer")
+    return 0
+}
+AB
+for tier in interp jit auto; do
+    ABLA_COMPILE_EVAL=$tier qemu-aarch64 "$out/ablac-static" build "$out/compile-time.ab" -o "$out/compile-time-$tier" --no-cache > "$out/compile-time-$tier.log" 2>&1 ||
+        { echo "static compiler aarch64: the $tier tier failed" >&2; grep -v 'warning' "$out/compile-time-$tier.log" | tail -5 >&2; exit 1; }
+    [[ $(qemu-aarch64 "$out/compile-time-$tier") == 'answer 6765' ]] || { echo "static compiler aarch64: the $tier tier answered wrong" >&2; exit 1; }
+done
 [[ $(head -n 1 "$out/hello.static.out") == hello ]] || { echo 'static compiler aarch64: the hello it built did not print hello' >&2; exit 1; }
-echo "static compiler aarch64: static-pie, no needed library, the default target is AArch64, $count programs it builds behave as the ordinary compiler's cross builds under qemu, hello runs"
+echo "static compiler aarch64: static-pie, no needed library, the default target is AArch64, $count programs it builds behave as the ordinary compiler's cross builds under qemu, ablac run and the three compile-time tiers work, hello runs"
