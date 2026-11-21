@@ -17,6 +17,7 @@ import "debug.ab"
 import "coverage.ab"
 import "abla/unsafe/memory/raw"
 import "../../ir.ab"
+import "../../runtime_prune.ab"
 import "analysis.ab"
 import "functions.ab"
 import "runtime.ab"
@@ -1042,7 +1043,18 @@ fun bootstrapCompileLlvmParsedCached(
     // properties' accesses become plain calls of their delegates
     // (delegated_properties.ab); results that return a view of a parameter
     // get its borrow contract.
-    val parsed = bootstrapPreSemanticPipeline(written)
+    // What the compiler takes by name from the runtime for features the program asks for stays (backend.ab: bootstrapBackgroundFreeParse, the WebAssembly
+    // unwinding pairs): no lowering demands those as functions, so the hint cannot name them.
+    val hookNames: array<string> = []
+    if (bootstrapProgramWantsBackgroundFree(written)) hookNames.append("__ablaRuntimeHostBackgroundMemoryCollect")
+    if (bootstrapTextContains(targetTriple, "wasm")) {
+        for (name in BOOTSTRAP_WASM_UNWINDING) hookNames.append(name)
+    }
+    val prunedWritten = bootstrapPruneRuntime(written, hookNames)
+    // (Locals: a compile-time site can build another program from inside the lowering, which prunes and records on its own.)
+    val prunedHere = bootstrapRuntimePruned
+    val hintHere = bootstrapRuntimeHint
+    val parsed = bootstrapPreSemanticPipeline(prunedWritten)
     bootstrapLlvmTraceMemory("frontend.annotations.begin")
     val annotationErrors = bootstrapStageAnnotatedExports(parsed)
     bootstrapLlvmTraceMemory("frontend.annotations.end")
@@ -1083,6 +1095,22 @@ fun bootstrapCompileLlvmParsedCached(
         bootstrapTextContains(targetTriple, "wasm")
     bootstrapSemanticWasmUnwinds = false
     bootstrapLlvmTraceMemory("frontend.semantic.end")
+    if (prunedHere && analyzed.errors > 0) {
+        // The pruned program did not analyse (a declaration it dropped was needed after all): built again without the prune, and what this attempt
+        // staged and reported goes with it (runtime_prune.ab).
+        val _prunedExports = bootstrapTakeExportRequests()
+        val _prunedDiagnosed = bootstrapTakeDiagnosedLoweringErrors()
+        val _prunedDiagnostics = bootstrapTakeDriverDiagnostics()
+        val _prunedNamed = bootstrapTakeNamedArgumentErrors()
+        bootstrapCtFinishPass()
+        if (bootstrapPruneRuntimeTrace()) linuxWriteStandardError("abla-prune-runtime fallback: built again without the prune\n")
+        bootstrapRuntimePruneOff = true
+        bootstrapFloatBridgeProbe = bridgeProbe
+        bootstrapFloatOriginProbe = originProbe
+        return bootstrapCompileLlvmParsedCached(
+            written, cache, targetTriple, pruneUnused, requireMain, round, committed, globalsBefore, holdLlvmClient
+        )
+    }
     val actionInputPaths: array<string> = []
     val actionInputContents: array<string> = []
     var actionErrors = 0
@@ -1148,6 +1176,25 @@ fun bootstrapCompileLlvmParsedCached(
     bootstrapCompileEditRound = -1
     bootstrapCompileRoundRaw = []
     bootstrapStagedEvaluationBlocked = false
+    bootstrapRuntimePruned = prunedHere
+    bootstrapRuntimeHint = hintHere
+    if (prunedHere && actionErrors == 0 && (program.errors > 0 || !bootstrapRuntimeDemandMatchesHint(hintHere))) {
+        // The lowering demanded other runtime declarations than the build the hint came from (or failed): this result is not trusted. Built again without
+        // the prune; its demand is the next hint.
+        val _prunedExports = bootstrapTakeExportRequests()
+        val _prunedDiagnosed = bootstrapTakeDiagnosedLoweringErrors()
+        val _prunedDiagnostics = bootstrapTakeDriverDiagnostics()
+        val _prunedNamed = bootstrapTakeNamedArgumentErrors()
+        bootstrapCtFinishPass()
+        bootstrapRestoreCompileGlobals(globals)
+        if (bootstrapPruneRuntimeTrace()) linuxWriteStandardError("abla-prune-runtime fallback: built again without the prune\n")
+        bootstrapRuntimePruneOff = true
+        bootstrapFloatBridgeProbe = bridgeProbe
+        bootstrapFloatOriginProbe = originProbe
+        return bootstrapCompileLlvmParsedCached(
+            written, cache, targetTriple, pruneUnused, requireMain, round, committed, globalsBefore, holdLlvmClient
+        )
+    }
     val roundEdits = bootstrapNewCompileEdits(bootstrapTakeCompileRoundEdits(), committed)
     if (roundEdits.size > 0 && analyzed.errors == 0 && actionErrors == 0 &&
         program.errors == 0) {

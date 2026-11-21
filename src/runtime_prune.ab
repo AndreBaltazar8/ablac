@@ -1,0 +1,222 @@
+// Pruning the runtime modules' functions nothing demands, before the pre-semantic passes and sema (#806 step C, the runtime front-end item). The runtime
+// modules (abla/runtime/platform/host.ab, abla/runtime/self/entry.ab, platform/wasm.ab, platform/darwin) are about 9600 lines of which a hello world demands
+// under half; analysing and rewriting the rest is a fifth of a cold build. The lowering is demand-driven, so a declaration that is never demanded changes
+// nothing in the output; but WHICH declarations are demanded is only known after lowering (the backend inserts calls by opcode, and a few features swap runtime
+// bodies in by name, backend.ab). So the prune is driven by what an earlier build of the same program demanded (a hint kept in the build cache) and checked
+// by the build it prunes: the lowering must demand exactly the hinted declarations, or its result is discarded and the program is built again without the
+// prune (backend.ab), whose demand becomes the new hint.
+//
+// What is kept: the hinted names, closed over the names that the declarations that stay refer to: everything that is not a plain function of a runtime
+// module (types, globals with their initializers, externs, extension functions, the program's own code), every kept function's body, parameter defaults and
+// annotation arguments. The test is on names, so overloads stay together; a function with an annotation (export, naked, ...) always stays.
+//
+// The hint is a file: the first line `abla-runtime-demand-1`, then one demanded name a line, sorted. It is read and written only under the build cache
+// policy (--no-cache builds do not prune); ABLA_PRUNE_RUNTIME_HINT=<file> names one to read instead, which tests use to prune with a hint they made, whatever
+// the cache policy (nothing is written then).
+import "parser.ab"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/sys/linux/fs"
+import "abla/text"
+
+// Set by the build driver (toolchain.ab) before it compiles: the file this build's hint is read from and written to, "" when the cache is off.
+var bootstrapRuntimeDemandPath: string = ""
+// A hinted compile whose lowering demanded something else is built again without the prune: this stays set for the rest of that build.
+var bootstrapRuntimePruneOff: bool = false
+// What the current compile was pruned by (empty when it was not) and the sorted names its lowering demanded.
+var bootstrapRuntimeHint: array<string> = []
+var bootstrapRuntimePruned: bool = false
+var bootstrapRuntimeDemanded: array<string> = []
+
+val BOOTSTRAP_RUNTIME_DEMAND_HEADER = "abla-runtime-demand-1"
+
+fun bootstrapRuntimeModuleIdentity(identity: string): bool =
+    identity.endsWith("abla/runtime/platform/host.ab") || identity.endsWith("abla/runtime/self/entry.ab") ||
+    identity.endsWith("abla/runtime/platform/wasm.ab") || identity.endsWith("abla/runtime/platform/darwin/entry.ab")
+
+// A function the pruning may drop: plain, of a runtime module, with no annotation.
+fun bootstrapRuntimeFunctionPrunable(declaration: BootstrapDeclaration): bool =
+    declaration.kind == "fun" && declaration.extensionOwner == "" && declaration.annotations.size == 0 &&
+    bootstrapRuntimeModuleIdentity(declaration.sourceIdentity)
+
+// Every `text` of the expression tree (names of calls, identifiers, members): a superset of what it refers to.
+fun bootstrapRuntimeCollectNames(
+    expression: BootstrapExpression,
+    var referenced: Map<string, bool>,
+    var pending: array<string>
+): void {
+    if (expression.text != "" && !referenced.has(expression.text)) {
+        referenced.set(expression.text, true)
+        pending.append(expression.text)
+    }
+    for (child in expression.children) bootstrapRuntimeCollectNames(child, referenced, pending)
+    return
+}
+
+fun bootstrapRuntimeCollectDeclaration(
+    declaration: BootstrapDeclaration,
+    var referenced: Map<string, bool>,
+    var pending: array<string>
+): void {
+    bootstrapRuntimeCollectNames(declaration.expression, referenced, pending)
+    for (default in declaration.parameterDefaults) bootstrapRuntimeCollectNames(default, referenced, pending)
+    for (argument in declaration.annotationArguments) bootstrapRuntimeCollectNames(argument, referenced, pending)
+    for (method in declaration.methods) bootstrapRuntimeCollectDeclaration(method, referenced, pending)
+    return
+}
+
+fun bootstrapPruneRuntimeWithHint(
+    written: BootstrapParseResult,
+    hintNames: array<string>,
+    // The declarations the compiler takes bodies from by name when the program asks for a feature (backend.ab), which no lowering demands as functions.
+    hookNames: array<string> = []
+): BootstrapParseResult {
+    val declarations = written.declarations
+    // The prunable functions by name (overloads share one): the first with a name, and a chain through the others.
+    val prunable: Map<string, int> = Map()
+    val sameName: array<int> = []
+    for (index in 0 until declarations.size) {
+        sameName.append(-1)
+        val declaration = declarations[index]
+        if (!bootstrapRuntimeFunctionPrunable(declaration)) continue
+        val head = prunable.get(declaration.name)
+        if (head != null) sameName[index] = head
+        prunable.set(declaration.name, index)
+    }
+    val referenced: Map<string, bool> = Map()
+    val pending: array<string> = []
+    val kept: Map<string, bool> = Map()
+    // What stays regardless: every declaration that is not prunable, and the actions.
+    for (declaration in declarations) {
+        if (!bootstrapRuntimeFunctionPrunable(declaration)) bootstrapRuntimeCollectDeclaration(declaration, referenced, pending)
+    }
+    for (action in written.actions) bootstrapRuntimeCollectNames(action, referenced, pending)
+    for (name in hookNames) {
+        if (prunable.has(name) && !kept.has(name)) {
+            kept.set(name, true)
+            referenced.set(name, true)
+            pending.append(name)
+        }
+    }
+    for (name in hintNames) {
+        if (prunable.has(name) && !kept.has(name)) {
+            kept.set(name, true)
+            referenced.set(name, true)
+            pending.append(name)
+        }
+    }
+    var cursor = 0
+    while (cursor < pending.size) {
+        val name = pending[cursor]
+        cursor = cursor + 1
+        var index = prunable.get(name) ?? -1
+        if (index < 0) continue
+        if (!kept.has(name)) kept.set(name, true)
+        // A prunable function reached by a name: its body's names are reached too (once: the map of referenced names only grows).
+        while (index >= 0) {
+            bootstrapRuntimeCollectDeclaration(declarations[index], referenced, pending)
+            index = sameName[index]
+        }
+    }
+    val remaining: array<BootstrapDeclaration> = []
+    var dropped = 0
+    for (declaration in declarations) {
+        if (bootstrapRuntimeFunctionPrunable(declaration) && !kept.has(declaration.name)) dropped = dropped + 1
+        else remaining.append(declaration)
+    }
+    if (dropped == 0) return written
+    BootstrapParseResult(
+        remaining, written.actions, written.errors, written.extensionErrors, written.compileInputPaths,
+        written.compileInputContents, written.diagnostics, written.declarationEdits, written.stackDepthStoppedSources,
+        written.subparserSpans, written.subparserUses
+    )
+}
+
+// The names of a hint file; none when it is not there or not one (another version, a cut file).
+fun bootstrapRuntimeDemandRead(path: string): array<string> {
+    val names: array<string> = []
+    if (path == "") return names
+    val text = Path(path).readText()
+    if (!text.startsWith("$BOOTSTRAP_RUNTIME_DEMAND_HEADER\n") || !text.endsWith("\n")) return names
+    var first = true
+    for (line in text.split("\n")) {
+        if (first) {
+            first = false
+            continue
+        }
+        if (line.size > 0) names.append(line)
+    }
+    names
+}
+
+fun bootstrapRuntimeDemandText(names: array<string>): string {
+    var text = "$BOOTSTRAP_RUNTIME_DEMAND_HEADER\n"
+    for (name in names) text = "$text$name\n"
+    text
+}
+
+// The hint this build prunes by: the explicit file, else the build's own under the cache policy.
+fun bootstrapRuntimeHintPath(): string {
+    val configured = linuxEnvironment("ABLA_PRUNE_RUNTIME_HINT")
+    if (configured.found && configured.value != "") return configured.value
+    bootstrapRuntimeDemandPath
+}
+
+// Before the pre-semantic passes: `written` without the runtime functions the hint does not keep, noting what it pruned by.
+fun bootstrapPruneRuntime(written: BootstrapParseResult, hookNames: array<string>): BootstrapParseResult {
+    bootstrapRuntimePruned = false
+    bootstrapRuntimeHint = []
+    if (bootstrapRuntimePruneOff) return written
+    val names = bootstrapRuntimeDemandRead(bootstrapRuntimeHintPath())
+    if (names.size == 0) return written
+    val pruned = bootstrapPruneRuntimeWithHint(written, names, hookNames)
+    if (pruned.declarations.size == written.declarations.size) return written
+    bootstrapRuntimePruned = true
+    bootstrapRuntimeHint = names
+    if (bootstrapPruneRuntimeTrace()) {
+        linuxWriteStandardError("abla-prune-runtime ${written.declarations.size - pruned.declarations.size} of ${written.declarations.size} declarations dropped\n")
+    }
+    pruned
+}
+
+fun bootstrapPruneRuntimeTrace(): bool {
+    val configured = linuxEnvironment("ABLA_COMPILER_DEMAND_TRACE")
+    configured.found && configured.value != ""
+}
+
+// After the lowering: the sorted runtime functions it demanded.
+fun bootstrapRuntimeRecordDemanded(declarations: array<BootstrapDeclaration>, demanded: array<int>): void {
+    val seen: Map<string, bool> = Map()
+    val names: array<string> = []
+    for (index in demanded) {
+        val declaration = declarations[index]
+        if (declaration.kind != "fun" || !bootstrapRuntimeModuleIdentity(declaration.sourceIdentity)) continue
+        if (declaration.extensionOwner != "" || seen.has(declaration.name)) continue
+        seen.set(declaration.name, true)
+        names.append(declaration.name)
+    }
+    bootstrapRuntimeDemanded = sortedStrings(names)
+    return
+}
+
+// Whether the lowering of a pruned compile demanded exactly what the hint says: nothing more (a feature the hint's build did not use) and nothing
+// less (a by-name hook that did not find its declaration, a branch folded differently).
+fun bootstrapRuntimeDemandMatchesHint(hint: array<string>): bool {
+    val demanded = bootstrapRuntimeDemanded
+    // The hint holds every demanded name, prunable or not (the same filter), sorted: equal as lists.
+    if (hint.size != demanded.size) return false
+    for (index in 0 until hint.size) {
+        if (hint[index] != demanded[index]) return false
+    }
+    true
+}
+
+// After a successful build: this build's demand becomes the hint when it is not the one it was pruned by. Only under the cache policy.
+fun bootstrapRuntimeDemandRemember(path: string): void {
+    if (path == "" || bootstrapRuntimePruned || bootstrapRuntimeDemanded.size == 0) return
+    val text = bootstrapRuntimeDemandText(bootstrapRuntimeDemanded)
+    val file = Path(path)
+    if (file.readText() == text) return
+    if (file.parent().createDirectories()) file.writeTextAtomic(text)
+    return
+}
