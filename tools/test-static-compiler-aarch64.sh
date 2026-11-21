@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # #806 step C, the second target: the statically linked compiler for AArch64 Linux (src/orc_main_static.ab cross-built with --target aarch64-linux on the
 # AArch64 LLVM archives and the target's libstdc++.a/libz.a/libgcc.a) is a static-pie image with no needed library, and run under qemu-aarch64 it builds
-# each program of tests/cases/libc-imports for aarch64-linux byte for byte as the ordinary (x86-64) compiler's cross build does. Needs
+# each program of tests/cases/libc-imports for aarch64-linux, programs that behave as the ordinary (x86-64) compiler's cross builds of them do. Needs
 # ABLA_STATIC_LLVM_LIB (a directory with the AArch64 libLLVM*.a), ABLA_STATIC_TARGET_LIBS (a directory with libstdc++.a, libz.a and libgcc.a of AArch64) and
 # qemu-aarch64; without them it says so and passes (docs/toolchain.md: pkgsCross.aarch64-multiplatform's llvmPackages_23.libllvm.lib, zlib.static, the cross gcc).
 # Usage: tools/test-static-compiler-aarch64.sh [compiler]
@@ -31,17 +31,30 @@ needed=$(readelf -d "$out/ablac-static" | grep -c '(NEEDED)' || true)
 [[ $needed == 0 ]] || { echo "static compiler aarch64: $needed needed libraries" >&2; exit 1; }
 export ABLA_NATIVE_JOBS=1 ABLA_CODEGEN_JOBS=1
 count=0
+# Run natively (here under qemu) the compiler builds for the machine it runs on: no --target is the same as --target aarch64-linux (#806 step C). That
+# is its in-process code generation, not the external opt/llc the x86-64 compiler's cross build uses, so the executables are not byte-identical to the
+# cross build's; what must agree is what the programs do, run under qemu-aarch64 in a directory of their own: output and exit status.
+run_program() { # executable directory output
+    mkdir -p "$2"
+    (cd "$2" && qemu-aarch64 "$OLDPWD/$1" > "$OLDPWD/$3" 2>&1 < /dev/null; echo "exit $?" >> "$OLDPWD/$3") || true
+}
 for source in tests/cases/libc-imports/hello.ab tests/cases/libc-imports/strings-arrays.ab tests/cases/libc-imports/files.ab \
     tests/cases/libc-imports/float-remainder.ab tests/cases/libc-imports/tasks.ab tests/cases/libc-imports/threads.ab \
     tests/cases/libc-imports/jwt-verify.ab; do
     name=$(basename -- "$source" .ab)
-    qemu-aarch64 "$out/ablac-static" build "$source" --target aarch64-linux -o "$out/$name.static" --no-cache > "$out/$name.static.log" 2>&1 ||
+    qemu-aarch64 "$out/ablac-static" build "$source" -o "$out/$name.static" --no-cache > "$out/$name.static.log" 2>&1 ||
         { echo "static compiler aarch64: it failed to build $name" >&2; grep -v 'warning' "$out/$name.static.log" | tail -5 >&2; exit 1; }
+    qemu-aarch64 "$out/ablac-static" build "$source" --target aarch64-linux -o "$out/$name.explicit" --no-cache > "$out/$name.explicit.log" 2>&1 ||
+        { echo "static compiler aarch64: it failed to build $name with --target aarch64-linux" >&2; exit 1; }
+    cmp -s "$out/$name.static" "$out/$name.explicit" || { echo "static compiler aarch64: $name without --target is not the AArch64 build" >&2; exit 1; }
     "$compiler" build "$source" --target aarch64-linux -o "$out/$name.cross" --no-cache > "$out/$name.cross.log" 2>&1 ||
         { echo "static compiler aarch64: the ordinary compiler failed to build $name" >&2; exit 1; }
-    cmp -s "$out/$name.static" "$out/$name.cross" || { echo "static compiler aarch64: $name differs from the ordinary compiler's cross build" >&2; exit 1; }
+    run_program "$out/$name.static" "$out/run-static-$name" "$out/$name.static.out"
+    run_program "$out/$name.cross" "$out/run-cross-$name" "$out/$name.cross.out"
+    cmp -s "$out/$name.static.out" "$out/$name.cross.out" || {
+        echo "static compiler aarch64: $name built by it behaves differently from the ordinary compiler's cross build" >&2
+        diff "$out/$name.static.out" "$out/$name.cross.out" | head -5 >&2; exit 1; }
     count=$((count + 1))
 done
-# The first milestone's program runs: hello world, built by the AArch64 compiler under qemu, prints under qemu.
-[[ $(qemu-aarch64 "$out/hello.static") == hello ]] || { echo 'static compiler aarch64: the hello it built did not print hello' >&2; exit 1; }
-echo "static compiler aarch64: static-pie, no needed library, $count programs byte-identical to the ordinary compiler's cross builds, hello runs"
+[[ $(head -n 1 "$out/hello.static.out") == hello ]] || { echo 'static compiler aarch64: the hello it built did not print hello' >&2; exit 1; }
+echo "static compiler aarch64: static-pie, no needed library, the default target is AArch64, $count programs it builds behave as the ordinary compiler's cross builds under qemu, hello runs"
