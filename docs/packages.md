@@ -31,6 +31,23 @@ The alias affects source lookup only. Lock identity, vendoring, offline cache
 keys, and canonical declarations continue to use the resolved package and
 module identity.
 
+## Inspecting a package
+Run `ablac package search <term>` to find public repositories by name,
+description, or keyword. Search fetches the simple catalog from
+`https://abla.dev/packages.toml` using curl. It can run outside a project.
+
+
+Run `ablac package info owner/repo` to read the root `abla.toml` at the
+GitHub repository’s default-branch commit and list its Git tags. The command
+shows the manifest version separately from the tags. It does not read each
+tag’s manifest or test the package against a compiler.
+
+The optional top-level metadata keys are `description`, `license` (an SPDX
+expression), and `compiler` (a maintainer-declared range such as
+`">=0.2.60, <0.3.0"`). Use single-line quoted strings. Omitted fields are shown
+as not declared. The command works outside an Abla project and needs Git and
+network access. It leaves project files and the package cache untouched.
+
 ## The source protocol
 
 The provider-facing structures are:

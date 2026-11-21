@@ -1,0 +1,111 @@
+// The small TOML catalog served by abla.dev for the package search CLI.
+import "abla/json"
+import "abla/text"
+
+private fun packageCatalogComponent(value: string, owner: bool): bool {
+    if (value == "" || value == "." || value == ".." || value.size > 100) return false
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        val alphanumeric = (byte >= 48 && byte <= 57) ||
+            (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        if (!alphanumeric && byte != 45 && (owner || (byte != 46 && byte != 95))) {
+            return false
+        }
+        index = index + 1
+    }
+    !owner || (value[0] != 45 && value[value.size - 1] != 45)
+}
+
+fun packageCatalogRepositoryValid(value: string): bool {
+    val parts = value.split("/")
+    parts.size == 2 && packageCatalogComponent(parts[0], true) &&
+        packageCatalogComponent(parts[1], false) && !parts[1].endsWith(".git")
+}
+
+class PackageCatalogEntry(
+    val repository: string,
+    val description: string,
+    val keywords: array<string>
+)
+
+class PackageCatalog(
+    val entries: array<PackageCatalogEntry>,
+    val error: string = ""
+)
+
+private fun packageCatalogTextValid(value: string): bool {
+    if (value == "") return false
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        if (byte < 32 || byte == 127) return false
+        index = index + 1
+    }
+    true
+}
+
+// The catalog uses one [[package]] table per repo and JSON-compatible quoted
+// strings and string arrays on single lines. Whole-line comments are allowed.
+fun packageCatalogParse(source: string): PackageCatalog {
+    if (source.size > 262144) return PackageCatalog([], "catalog exceeds 256 KiB")
+    var entries: array<PackageCatalogEntry> = []
+    var repository = ""
+    var description = ""
+    var keywords: array<string> = []
+    var started = false
+    var hasKeywords = false
+    var lineNumber = 0
+    // Closing sentinel publishes the final table through the same path.
+    for (line in ("$source\n[[package]]").split("\n")) {
+        lineNumber = lineNumber + 1
+        val trimmed = line.trim()
+        if (trimmed == "" || trimmed.startsWith("#")) continue
+        if (trimmed == "[[package]]") {
+            if (started) {
+                if (!packageCatalogRepositoryValid(repository) ||
+                    !packageCatalogTextValid(description) || !hasKeywords) {
+                    return PackageCatalog([], "invalid or incomplete package before line $lineNumber")
+                }
+                for (entry in entries) {
+                    if (entry.repository.lowercase() == repository.lowercase()) {
+                        return PackageCatalog([], "duplicate repository $repository")
+                    }
+                }
+                entries.append(PackageCatalogEntry(repository, description, keywords))
+                repository = ""
+                description = ""
+                keywords = []
+                hasKeywords = false
+            }
+            started = true
+            continue
+        }
+        val equals = trimmed.indexOf("=")
+        if (!started || equals < 1) return PackageCatalog([], "invalid catalog line $lineNumber")
+        val field = trimmed.slice(0, equals).trim()
+        val parsed = jsonParse(trimmed.slice(equals + 1, trimmed.size))
+        if (!parsed.succeeded) return PackageCatalog([], "invalid catalog value on line $lineNumber")
+        val value = parsed.value
+        if (field == "repository" && repository == "" && value.isString()) {
+            repository = value.asString()
+            if (packageCatalogRepositoryValid(repository)) continue
+        } else if (field == "description" && description == "" && value.isString()) {
+            description = value.asString()
+            if (packageCatalogTextValid(description)) continue
+        } else if (field == "keywords" && !hasKeywords && value.isArray()) {
+            hasKeywords = true
+            for (item in value.values) {
+                val keyword = item.asString()
+                if (!item.isString() || !packageCatalogTextValid(keyword)) {
+                    return PackageCatalog([], "invalid keyword on line $lineNumber")
+                }
+                keywords.append(keyword)
+            }
+            continue
+        }
+        return PackageCatalog([], "invalid or duplicate catalog field on line $lineNumber")
+    }
+    if (entries.size == 0) return PackageCatalog([], "catalog contains no packages")
+    PackageCatalog(entries)
+}

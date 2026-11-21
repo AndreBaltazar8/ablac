@@ -1,0 +1,155 @@
+import "package.ab"
+import "abla/json"
+import "package_catalog.ab"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/text"
+
+private fun bootstrapPackageInfoString(line: string, key: string): string {
+    val equals = line.indexOf("=")
+    if (equals < 0 || bootstrapPackageTrim(line.slice(0, equals)) != key) return ""
+    val value = bootstrapPackageTrim(line.slice(equals + 1, line.size))
+    if (value.size < 2 || value.startsWith("\"\"\"") || value.startsWith("'''")) return ""
+    val quote = value[0]
+    if (quote != 34 && quote != 39) return ""
+    var end = 1
+    while (end < value.size && value[end] != quote) {
+        if (quote == 34 && value[end] == 92) end = end + 1
+        end = end + 1
+    }
+    if (end >= value.size) return ""
+    val suffix = bootstrapPackageTrim(value.slice(end + 1, value.size))
+    if (suffix != "" && !suffix.startsWith("#")) return ""
+    if (quote == 39) return value.slice(1, end)
+    val decoded = jsonParse(value.slice(0, end + 1))
+    if (!decoded.succeeded || !decoded.value.isString()) return ""
+    decoded.value.asString()
+}
+
+private fun bootstrapPackageInfoField(manifest: string, key: string): string {
+    for (line in manifest.split("\n")) {
+        val trimmed = bootstrapPackageTrim(line)
+        if (trimmed.startsWith("[")) return ""
+        val field = bootstrapPackageInfoString(trimmed, key)
+        if (field != "") return field
+    }
+    ""
+}
+
+// Preserve Unicode and keep control characters from remote metadata out of the CLI.
+private fun bootstrapPackageInfoDisplay(value: string, missing: string): string {
+    if (value == "") return missing
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        if (byte < 32 || byte == 127) return missing
+        index = index + 1
+    }
+    value
+}
+
+private fun bootstrapPackageInfoGit(directory: string): LinuxCommand {
+    val command = linuxCommand("git")
+    command.workingDirectory = directory
+    // A caller such as a Git hook can export these for a different checkout.
+    for (name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"]) {
+        command.removeEnvironment(name)
+    }
+    command.environment("GIT_TERMINAL_PROMPT", "0")
+    command.argument("-c")
+    command.argument("credential.interactive=false")
+    command
+}
+
+private fun bootstrapPackageInfoError(message: string): int {
+    linuxPrintStandardError("error[E_PACKAGE_INFO]: $message\n")
+    1
+}
+
+private fun bootstrapPackageInfoRead(repository: string, directory: string): int {
+    val url = "https://github.com/$repository.git"
+    val clone = bootstrapPackageInfoGit(directory)
+    clone.argument("clone")
+    clone.argument("--quiet")
+    clone.argument("--bare")
+    clone.argument("--depth=1")
+    clone.argument("--no-tags")
+    clone.argument("--filter=blob:none")
+    clone.argument("--")
+    clone.argument(url)
+    clone.argument("package.git")
+    if (clone.run() != 0) return bootstrapPackageInfoError("cannot read $repository from GitHub")
+
+    val repoDir = "$directory/package.git"
+    val head = bootstrapPackageInfoGit(repoDir)
+    head.argument("rev-parse")
+    head.argument("--verify")
+    head.argument("HEAD")
+    val resolved = head.capture()
+    val revision = bootstrapPackageTrim(resolved.output)
+    if (resolved.status != 0 || !bootstrapPackageHexRevision(revision)) return bootstrapPackageInfoError("$repository has no default-branch commit")
+    val manifestFile = Path(directory).child("manifest")
+    val manifestCommand = bootstrapPackageInfoGit(repoDir)
+    manifestCommand.argument("cat-file")
+    manifestCommand.argument("blob")
+    manifestCommand.argument("HEAD:abla.toml")
+    manifestCommand.outputPath = manifestFile.text
+    if (manifestCommand.run() != 0) {
+        return bootstrapPackageInfoError("$repository has no readable abla.toml at its default-branch HEAD")
+    }
+    if (manifestFile.info().size > 65536) return bootstrapPackageInfoError("abla.toml exceeds 64 KiB")
+    val manifest = manifestFile.readText()
+    val name = bootstrapPackageInfoField(manifest, "name")
+    if (!bootstrapPackageNameValid(name)) return bootstrapPackageInfoError("abla.toml has no valid package name")
+
+    val tagsFile = Path(directory).child("tags")
+    val tags = bootstrapPackageInfoGit(directory)
+    tags.argument("ls-remote")
+    tags.argument("--tags")
+    tags.argument("--refs")
+    tags.argument("--sort=-version:refname")
+    tags.argument("--")
+    tags.argument(url)
+    tags.outputPath = tagsFile.text
+    if (tags.run() != 0) return bootstrapPackageInfoError("cannot list Git tags for $repository")
+    if (tagsFile.info().size > 1048576) return bootstrapPackageInfoError("Git tag listing exceeds 1 MiB")
+
+    val description = bootstrapPackageInfoDisplay(bootstrapPackageInfoField(manifest, "description"), "(not declared)")
+    val licence = bootstrapPackageInfoDisplay(bootstrapPackageInfoField(manifest, "license"), "(not declared)")
+    val compiler = bootstrapPackageInfoDisplay(bootstrapPackageInfoField(manifest, "compiler"), "(not declared)")
+    val version = bootstrapPackageInfoDisplay(bootstrapPackageInfoField(manifest, "version"), "(not declared)")
+    linuxPrintStandardOutput("Name: $name\nSource: $url\nMetadata: default branch at $revision\nDescription: $description\nLicence: $licence\nManifest version: $version\nDeclared compiler range: $compiler\nGit tags:\n")
+    var listed = false
+    for (line in tagsFile.readText().split("\n")) {
+        val marker = line.indexOf("\trefs/tags/")
+        if (marker >= 0) {
+            val tag = bootstrapPackageInfoDisplay(line.slice(marker + 11, line.size), "")
+            if (tag != "") {
+                linuxPrintStandardOutput("  $tag\n")
+                listed = true
+            }
+        }
+    }
+    if (!listed) linuxPrintStandardOutput("  (none)\n")
+    0
+}
+
+fun bootstrapPackageInfo(repository: string): int {
+    if (!packageCatalogRepositoryValid(repository)) {
+        linuxPrintStandardError("usage: ablac package info <owner/repo>\n")
+        return 2
+    }
+    val temporary = linuxCommand("mktemp")
+    temporary.argument("-d")
+    val created = temporary.capture()
+    val path = bootstrapPackageTrim(created.output)
+    if (created.status != 0 || path == "") {
+        return bootstrapPackageInfoError("cannot create a temporary directory")
+    }
+    val directory = if (path.startsWith("/")) path else "${currentDirectory().text}/$path"
+    val status = bootstrapPackageInfoRead(repository, directory)
+    bootstrapPackageRemoveTree(directory)
+    status
+}
