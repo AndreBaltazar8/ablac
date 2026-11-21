@@ -444,6 +444,7 @@ fun ablaJsonObject(keys: array<string>, values: array<Json>): Json =
 // other type is a compile error at the value.
 fun ablaJsonValue(value: Json): Json = value
 fun ablaJsonValue(value: string): Json = jsonString(value)
+fun ablaJsonValue(value: string?): Json = if (value == null) jsonNull() else jsonString(value)
 fun ablaJsonValue(value: int): Json = jsonInteger(value)
 fun ablaJsonValue(value: bool): Json = jsonBoolean(value)
 fun ablaJsonValue(value: JsonNumber): Json = jsonNumber(value)
@@ -457,6 +458,11 @@ fun ablaJsonValue(values: array<Json>): Json = jsonArray(values)
 fun ablaJsonValue(values: array<string>): Json {
     val converted: array<Json> = []
     for (value in values) converted.append(jsonString(value))
+    jsonArray(converted)
+}
+fun ablaJsonValue(values: array<string?>): Json {
+    val converted: array<Json> = []
+    for (value in values) converted.append(ablaJsonValue(value))
     jsonArray(converted)
 }
 fun ablaJsonValue(values: array<int>): Json {
@@ -493,6 +499,10 @@ fun ablaJsonWriteValue(var out: ByteBuffer, value: string): void {
     return
 }
 fun ablaJsonWriteValue(var out: ByteBuffer, value: int): void = out.appendInt(value)
+fun ablaJsonWriteValue(var out: ByteBuffer, value: string?): void {
+    if (value == null) out.appendText("null") else ablaJsonWriteValue(out, value)
+    return
+}
 fun ablaJsonWriteValue(var out: ByteBuffer, value: bool): void =
     out.appendText(if (value) "true" else "false")
 fun ablaJsonWriteValue(var out: ByteBuffer, value: f64): void {
@@ -4334,9 +4344,12 @@ compile fun ablaJsonSyntaxCall(
 // (so 9223372036854775808 and 1.5e-2 stay exact), string, Boolean and null
 // literals map directly, and any other expression is converted by its type
 // through ablaJsonValue. Unlike JSON, an object or array may end in a comma.
-compile fun ablaJsonParseValue(cursor: ParserCursor): SyntaxExpression {
-    if (parserAt(cursor, "{")) ablaJsonParseObject(cursor)
-    else if (parserAt(cursor, "[")) ablaJsonParseArray(cursor)
+compile fun ablaJsonParseValue(cursor: ParserCursor): SyntaxExpression =
+    ablaJsonParseForm(cursor, false)
+
+compile fun ablaJsonParseForm(cursor: ParserCursor, streamed: bool): SyntaxExpression {
+    if (parserAt(cursor, "{")) ablaJsonParseObject(cursor, streamed)
+    else if (parserAt(cursor, "[")) ablaJsonParseArray(cursor, streamed)
     else {
         val negative = parserAt(cursor, "-")
         val lexeme = parserTextAhead(cursor, if (negative) 1 else 0)
@@ -4371,7 +4384,7 @@ compile fun ablaJsonExpect(
     if (!parserConsume(cursor, token)) parserFail(cursor, message)
 }
 
-compile fun ablaJsonParseArray(cursor: ParserCursor): SyntaxExpression {
+compile fun ablaJsonParseArray(cursor: ParserCursor, streamed: bool = false): SyntaxExpression {
     parserExpect(cursor, "[")
     val values: array<SyntaxExpression> = []
     var more = !parserAt(cursor, "]")
@@ -4383,7 +4396,7 @@ compile fun ablaJsonParseArray(cursor: ParserCursor): SyntaxExpression {
             parserRawSkipWhitespace(cursor)
             more = !parserAt(cursor, "]")
         } else {
-            values.append(ablaJsonParseValue(cursor))
+            values.append(ablaJsonParseForm(cursor, streamed))
             // A comma may follow the last element.
             more = parserConsume(cursor, ",")
             if (more) parserRawSkipWhitespace(cursor)
@@ -4394,10 +4407,13 @@ compile fun ablaJsonParseArray(cursor: ParserCursor): SyntaxExpression {
     ablaJsonSyntaxCall("ablaJsonArray", syntaxArray(values))
 }
 
-compile fun ablaJsonParseObject(cursor: ParserCursor): SyntaxExpression {
+compile fun ablaJsonParseObject(cursor: ParserCursor, streamed: bool = false): SyntaxExpression {
+    val prefix = "ablaJsonObject_${parserSiteKey(cursor)}"
     parserExpect(cursor, "{")
     val keys: array<SyntaxExpression> = []
     val values: array<SyntaxExpression> = []
+    val guards: array<SyntaxExpression> = []
+    var guarded = false
     // Literal keys seen so far: a repeated one is an error, as jsonParse's default
     // rejects a duplicate key.
     val literalKeys: array<string> = []
@@ -4410,8 +4426,23 @@ compile fun ablaJsonParseObject(cursor: ParserCursor): SyntaxExpression {
             parserRawSkipWhitespace(cursor)
             more = !parserAt(cursor, "}")
         } else {
+            var condition = syntaxNull()
+            val hasCondition = parserConsume(cursor, "if")
+            if (hasCondition) {
+                ablaJsonExpect(cursor, "(", "expected `(` after a \$json member guard")
+                condition = parserParseAblaExpression(cursor)
+                ablaJsonExpect(cursor, ")", "expected `)` after a \$json member condition")
+            }
             // A key that is not a string literal must still be a string.
-            val key = parserParseAblaExpression(cursor)
+            var key = parserParseAblaExpression(cursor)
+            // Preserve an existing computed key of the form `if (...) a else b`.
+            if (hasCondition && parserConsume(cursor, "else")) {
+                key = syntaxIf(condition, key, parserParseAblaExpression(cursor))
+                guards.append(syntaxNull())
+            } else {
+                if (hasCondition) guarded = true
+                guards.append(if (hasCondition) ablaJsonSyntaxCall("ablaJsonGuard", condition) else syntaxNull())
+            }
             if (syntaxKind(key) == "string") {
                 val text = syntaxText(key)
                 for (seen in literalKeys) {
@@ -4422,7 +4453,7 @@ compile fun ablaJsonParseObject(cursor: ParserCursor): SyntaxExpression {
                 keys.append(key)
             } else keys.append(ablaJsonSyntaxCall("ablaJsonKey", key))
             ablaJsonExpect(cursor, ":", "expected `:` after a \$json object key")
-            values.append(ablaJsonParseValue(cursor))
+            values.append(ablaJsonParseForm(cursor, streamed))
             // A comma may follow the last member.
             more = parserConsume(cursor, ",")
             if (more) parserRawSkipWhitespace(cursor)
@@ -4433,7 +4464,9 @@ compile fun ablaJsonParseObject(cursor: ParserCursor): SyntaxExpression {
     val arguments: array<SyntaxExpression> = []
     arguments.append(syntaxArray(keys))
     arguments.append(syntaxArray(values))
-    syntaxCall("ablaJsonObject", arguments)
+    if (guarded) arguments.append(syntaxArray(guards))
+    val object = syntaxCall("ablaJsonObject", arguments)
+    if (guarded && !streamed) ablaJsonGuardedTree(object, prefix) else object
 }
 
 // `$jsons` shares the JSON grammar but produces its deterministic encoded
@@ -4447,6 +4480,81 @@ compile fun ablaJsonParseStringifiedValue(
 
 #compilerRegisterSubparser("json", ablaJsonParseValue)
 #compilerRegisterSubparser("jsons", ablaJsonParseStringifiedValue)
+
+// The tree form allocates this builder only for objects with guarded members.
+// Streaming lowers the same parsed members directly, without this runtime data.
+class JsonLiteralObject(val keys: array<string>, val values: array<Json>)
+fun ablaJsonLiteralObject(): JsonLiteralObject = JsonLiteralObject([], [])
+fun ablaJsonLiteralMember(var object: JsonLiteralObject, key: string, value: Json): void {
+    object.keys.append(key)
+    object.values.append(value)
+    return
+}
+fun ablaJsonLiteralFinish(object: JsonLiteralObject): Json = jsonObject(object.keys, object.values)
+
+compile class JsonObjectSyntaxKeys(
+    val statements: array<SyntaxExpression>,
+    val guards: array<string>,
+    val keys: array<string>,
+    var valid: SyntaxExpression,
+    var nextKey: int
+)
+
+// Evaluate guards and selected computed keys once, before any values. A false
+// guard skips its key and value; an invalid selected key makes the object null.
+compile fun ablaJsonGuardedKeys(expression: SyntaxExpression, prefix: string, first: int): JsonObjectSyntaxKeys {
+    val prepared = JsonObjectSyntaxKeys([], [], [], syntaxBoolean(true), first)
+    val keys = syntaxChild(expression, 0)
+    val guards = syntaxChild(expression, 2)
+    for (index in 0 until syntaxChildCount(keys)) {
+        val condition = syntaxChild(guards, index)
+        var guard = ""
+        if (syntaxKind(condition) != "null") {
+            guard = "${prefix}_guard${prepared.nextKey}"
+            prepared.nextKey = prepared.nextKey + 1
+            prepared.statements.append(syntaxLocal(guard, compilerFindType("bool"), syntaxChild(condition, 0)))
+        }
+        prepared.guards.append(guard)
+        val key = syntaxChild(keys, index)
+        if (syntaxKind(key) == "string") {
+            prepared.keys.append("")
+            if (!syntaxText(key).isValidUtf8()) {
+                val valid = if (guard == "") syntaxBoolean(false)
+                    else syntaxBinary("==", syntaxIdentifier(guard), syntaxBoolean(false))
+                prepared.valid = syntaxBinary("&&", prepared.valid, valid)
+            }
+        } else {
+            val name = "${prefix}_key${prepared.nextKey}"
+            prepared.nextKey = prepared.nextKey + 1
+            prepared.keys.append(name)
+            val selected = if (guard == "") key
+                else syntaxIf(syntaxIdentifier(guard), key, syntaxString(""))
+            prepared.statements.append(syntaxLocal(name, compilerFindType("string"), selected))
+            prepared.valid = syntaxBinary("&&", prepared.valid,
+                syntaxCall("ablaJsonWriteKeyValid", [syntaxIdentifier(name)]))
+        }
+    }
+    prepared
+}
+
+compile fun ablaJsonGuardedTree(expression: SyntaxExpression, prefix: string): SyntaxExpression {
+    val prepared = ablaJsonGuardedKeys(expression, prefix, 0)
+    val keys = syntaxChild(expression, 0)
+    val values = syntaxChild(expression, 1)
+    val name = "${prefix}_builder"
+    val body: array<SyntaxExpression> = [syntaxLocal(name, compilerFindType("JsonLiteralObject"),
+        syntaxCall("ablaJsonLiteralObject", []))]
+    for (index in 0 until syntaxChildCount(keys)) {
+        val key = if (prepared.keys[index] == "") syntaxChild(keys, index)
+            else syntaxIdentifier(prepared.keys[index])
+        val member = syntaxCall("ablaJsonLiteralMember", [syntaxIdentifier(name), key, syntaxChild(values, index)])
+        if (prepared.guards[index] == "") body.append(member)
+        else body.append(syntaxIf(syntaxIdentifier(prepared.guards[index]), member, syntaxBlock([])))
+    }
+    body.append(syntaxCall("ablaJsonLiteralFinish", [syntaxIdentifier(name)]))
+    prepared.statements.append(syntaxIf(prepared.valid, syntaxBlock(body), syntaxCall("ablaJsonNull", [])))
+    syntaxBlock(prepared.statements)
+}
 
 // A compile-time plan, never a runtime writer or Json tree. Parsing is shared
 // with `$json`: only the constructor syntax produced by that parser is lowered.
@@ -4515,6 +4623,10 @@ compile fun ablaJsonWriteObject(
     var plan: JsonWriteSyntaxPlan,
     expression: SyntaxExpression
 ): void {
+    if (syntaxChildCount(expression) > 2) {
+        ablaJsonWriteGuardedObject(plan, expression)
+        return
+    }
     val keys = syntaxChild(expression, 0)
     val values = syntaxChild(expression, 1)
     val count = syntaxChildCount(keys)
@@ -4577,6 +4689,56 @@ compile fun ablaJsonWriteObject(
 
 fun ablaJsonWriteKeyValid(key: string): bool = key.isValidUtf8()
 
+compile fun ablaJsonWriteGuardedObject(var plan: JsonWriteSyntaxPlan, expression: SyntaxExpression): void {
+    ablaJsonWriteFlush(plan)
+    val prepared = ablaJsonGuardedKeys(expression, plan.prefix, plan.nextKey)
+    for (statement in prepared.statements) plan.statements.append(statement)
+    val body = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], "{", prepared.nextKey)
+    val keys = syntaxChild(expression, 0)
+    val values = syntaxChild(expression, 1)
+    val comma = "${plan.prefix}_comma${body.nextKey}"
+    body.nextKey = body.nextKey + 1
+    val needsComma = prepared.guards[0] != "" && syntaxChildCount(keys) > 1
+    if (needsComma) body.statements.append(
+        syntaxVariable(comma, compilerFindType("bool"), syntaxBoolean(false)))
+    var alwaysMember = false
+    var possibleMember = false
+    for (index in 0 until syntaxChildCount(keys)) {
+        val guarded = prepared.guards[index] != ""
+        if (guarded) ablaJsonWriteFlush(body)
+        val member = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], body.pending, body.nextKey)
+        body.pending = ""
+        if (alwaysMember) member.pending = member.pending + ","
+        else if (possibleMember) member.statements.append(syntaxIf(syntaxIdentifier(comma),
+            syntaxCall("ablaJsonWriteText", [ablaJsonWriteSink(plan.sink), syntaxString(",")]), syntaxBlock([])))
+        val key = syntaxChild(keys, index)
+        if (syntaxKind(key) == "string") member.pending = member.pending + jsonQuote(syntaxText(key)) + ":"
+        else {
+            ablaJsonWriteLeaf(member, syntaxIdentifier(prepared.keys[index]))
+            member.pending = member.pending + ":"
+        }
+        ablaJsonWriteLower(member, syntaxChild(values, index))
+        if (guarded) {
+            ablaJsonWriteFlush(member)
+            if (!alwaysMember && needsComma) member.statements.append(syntaxAssign(comma, syntaxBoolean(true)))
+            body.statements.append(syntaxIf(syntaxIdentifier(prepared.guards[index]), syntaxBlock(member.statements), syntaxBlock([])))
+        } else {
+            // Keep the unconditional prefix and adjacent static tokens coalesced.
+            for (statement in member.statements) body.statements.append(statement)
+            body.pending = member.pending
+            alwaysMember = true
+        }
+        possibleMember = true
+        body.nextKey = member.nextKey
+    }
+    body.pending = body.pending + "}"
+    ablaJsonWriteFlush(body)
+    plan.nextKey = body.nextKey
+    plan.statements.append(syntaxIf(prepared.valid, syntaxBlock(body.statements),
+        syntaxCall("ablaJsonWriteText", [ablaJsonWriteSink(plan.sink), syntaxString("null")])))
+    return
+}
+
 // `$jsonw(buffer) value` appends one complete value and returns that buffer.
 // The sink is evaluated once. Static tokens collapse into one append per run;
 // dynamic leaves use ordinary type-checked calls and create no Json nodes.
@@ -4592,7 +4754,7 @@ compile fun ablaJsonParseWrittenValue(cursor: ParserCursor): SyntaxExpression {
         }
         plan.sink = ablaJsonWritePlace(plan, sink)
     } else plan.statements.append(syntaxLocal(name, compilerFindType("ByteBuffer"), sink))
-    ablaJsonWriteLower(plan, ablaJsonParseValue(cursor))
+    ablaJsonWriteLower(plan, ablaJsonParseForm(cursor, true))
     ablaJsonWriteFlush(plan)
     plan.statements.append(ablaJsonWriteSink(plan.sink))
     syntaxBlock(plan.statements)
@@ -4601,6 +4763,18 @@ compile fun ablaJsonParseWrittenValue(cursor: ParserCursor): SyntaxExpression {
 #compilerRegisterSubparser("jsonw", ablaJsonParseWrittenValue)
 
 fun ablaJsonWriteValue(var out: ByteBuffer, values: array<string>): void {
+    out.appendText("[")
+    var index = 0
+    for (value in values) {
+        if (index > 0) out.appendText(",")
+        ablaJsonWriteValue(out, value)
+        index = index + 1
+    }
+    out.appendText("]")
+    return
+}
+
+fun ablaJsonWriteValue(var out: ByteBuffer, values: array<string?>): void {
     out.appendText("[")
     var index = 0
     for (value in values) {

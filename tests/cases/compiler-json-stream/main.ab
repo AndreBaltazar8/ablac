@@ -1,0 +1,64 @@
+// Compiler dogfooding: preserve all optional occurrence-field combinations and
+// exact source-map fields, including absent, empty and invalid-UTF-8 files.
+import "../../../src/analysis_service.ab"
+import "../../../src/module_paths.ab"
+import "../../../src/sourcemap.ab"
+import "abla/bytes"
+import "abla/io"
+import "abla/json"
+import "abla/sys/linux/fs"
+
+fun main: int {
+    var failures = 0
+    val set = BootstrapAnalysisOccurrenceSet(
+        [0, 2, 4, 6], [1, 3, 5, 7], ["", "decl", "", "decl"], ["", "", "i64", "i64"]
+    )
+    val occurrences = bootstrapAnalysisOccurrenceSetText("a b c d", set)
+    val expectedOccurrences = "[{\"name\":\"a\",\"range\":{\"start\":0,\"end\":1}},{\"name\":\"b\",\"range\":{\"start\":2,\"end\":3},\"declarationId\":\"decl\"},{\"name\":\"c\",\"range\":{\"start\":4,\"end\":5},\"type\":\"i64\"},{\"name\":\"d\",\"range\":{\"start\":6,\"end\":7},\"declarationId\":\"decl\",\"type\":\"i64\"}]"
+    if (occurrences != expectedOccurrences) {
+        println("FAIL optional occurrence fields: $occurrences")
+        failures = failures + 1
+    }
+    val root = Path("build/compiler-json-stream/inputs")
+    if (!root.createDirectories()) return 1
+    val good = Path("${root.text}/good.ab")
+    val missing = Path("${root.text}/missing.ab")
+    val invalid = Path("${root.text}/invalid.ab")
+    val empty = Path("${root.text}/empty.ab")
+    val contents = "line\né \"quote\" \\ slash"
+    if (!good.writeText(contents) || !invalid.writeText(byteEncode(255)) || !empty.writeText("")) return 1
+    if (missing.exists()) missing.remove()
+    val rows = BootstrapSourceMapRows(
+        [0, 4, 4, 8], [0, 1, 1, 2], [1, 1, 1, 1], [1, 1, 1, 1],
+        [good.text, missing.text, invalid.text, empty.text]
+    )
+    val actualMap = bootstrapSourceMapJson(rows, 16, "module.wasm")
+    val expectedMap = jsonStringify(jsonObject(
+        ["version", "file", "sources", "sourcesContent", "ignoreList", "x_google_ignoreList", "names", "mappings"],
+        [jsonInteger(3), jsonString("module.wasm"), jsonArray([
+            jsonString("file://${good.text}"), jsonString("file://${missing.text}"),
+            jsonString("file://${invalid.text}"), jsonString("file://${empty.text}")
+        ]), jsonArray([jsonString(contents), jsonNull(), jsonNull(), jsonString("")]),
+            jsonArray([]), jsonArray([]), jsonArray([]), jsonString("gBAAA,ICAA,ICAA")]
+    )) + "\n"
+    if (actualMap != expectedMap) {
+        println("FAIL source map: $actualMap expected $expectedMap")
+        failures = failures + 1
+    }
+    val standardPath = "${bootstrapStandardLibraryRoot()}/abla/json/entry.ab"
+    val standardRows = BootstrapSourceMapRows([], [], [], [], [good.text, standardPath])
+    val standardMap = bootstrapSourceMapJson(standardRows, 0, "standard.wasm")
+    val standardExpected = jsonStringify(jsonObject(
+        ["version", "file", "sources", "sourcesContent", "ignoreList", "x_google_ignoreList", "names", "mappings"],
+        [jsonInteger(3), jsonString("standard.wasm"), jsonArray([
+            jsonString("file://${good.text}"), jsonString("file://$standardPath")
+        ]), jsonArray([jsonString(contents), jsonString(Path(standardPath).readText())]),
+            jsonArray([jsonInteger(1)]), jsonArray([jsonInteger(1)]), jsonArray([]), jsonString("")]
+    )) + "\n"
+    if (standardMap != standardExpected) {
+        println("FAIL source map ignore lists")
+        failures = failures + 1
+    }
+    if (failures == 0) println("compiler-json-stream ok")
+    failures
+}

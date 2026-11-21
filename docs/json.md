@@ -539,6 +539,36 @@ literal written one member per line can add, remove, or reorder lines freely; a
 comma with nothing before it (`[1,, 2]`, `{,}`) is a compile error. `$jsons`
 reads the same grammar.
 
+A member can start with `if (condition)` in `$json`, `$jsons`, or `$jsonw`:
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val name = "symbol"
+    val declarationId = "decl"
+    val typeName = ""
+    val record = $json {
+        "name": name,
+        if (declarationId != "") "declarationId": declarationId,
+        if (typeName != "") "type": typeName,
+    }
+    println(jsonStringify(record))
+}
+// output:
+// {"name":"symbol","declarationId":"decl"}
+```
+
+The condition must be Boolean. A false condition omits the member and skips
+its key and value. An object with no selected members is `{}`; commas are
+handled automatically, including when the first or last member is omitted.
+Guards and selected computed keys are evaluated once, in member order, before
+the object's values. Selected values then run in member order. An invalid
+selected UTF-8 key makes the entire object `null` and skips its values.
+Literal duplicate keys remain errors even when guarded. A conditional computed
+key, `if (condition) "a" else "b": value`, keeps its existing meaning.
+
 A value of another type is rejected with a help line listing the accepted
 types.
 
@@ -596,7 +626,8 @@ or closures for the schema. Adjacent static keys, punctuation and literals
 become one append. Dynamic integers write directly into the buffer; strings
 share the usual quoting and UTF-8 rules; fractional/exponent literals keep
 their exact source spelling. Dynamic arrays of strings, integers, booleans,
-floats or `Json` values stream their elements. An explicit `Json` input is
+floats or `Json` values stream their elements. Nullable strings and arrays of
+nullable strings accept `null`, in both `$json` and `$jsonw`. An explicit `Json` input is
 serialized as given; it does not become another tree.
 
 The sink must be an owned buffer place (a variable, field or indexed element)
@@ -609,7 +640,8 @@ whole containing object and skips its values; invalid string values and
 nonfinite floats write `null`. There is no transaction around the sink: if an
 interpolation fails, earlier bytes remain appended. Use an ordinary Abla loop
 to stream complete elements with `$jsonw`, adding the enclosing brackets and
-commas outside it. Conditional members likewise remain ordinary Abla code.
+commas outside it. Use `if (condition) key: value` inside an object to omit
+optional members without duplicating the surrounding object.
 
 `$jsonw` supports staging as well: a function that writes to a fresh buffer and
 returns its text can run under `#`. `tools/bench-json-stream.sh` is an opt-in

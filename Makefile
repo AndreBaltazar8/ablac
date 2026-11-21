@@ -247,6 +247,7 @@ test-serial: ablac
 	tools/test-deep-json.sh $(COMPILER)
 	tools/test-json-expressions.sh $(COMPILER)
 	tools/test-json-stream.sh $(COMPILER)
+	tools/test-compiler-json-stream.sh $(COMPILER)
 	tools/test-json-literal-diagnostics.sh $(COMPILER)
 	tools/test-xml-literals.sh $(COMPILER)
 	tools/test-sql.sh $(COMPILER)

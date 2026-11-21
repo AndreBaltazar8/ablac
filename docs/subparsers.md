@@ -47,6 +47,10 @@ are combined during compilation; interpolated strings use the usual JSON
 escaping and number literals retain their exact spelling. See [JSON](json.md)
 for streaming examples and evaluation order.
 
+All three JSON forms accept guarded object members, `if (condition) "key": value`.
+A false guard skips that member's key and value; the writer emits the necessary
+commas directly, including for objects whose members are all optional.
+
 ## Writing a subparser
 
 A subparser is a `compile fun` that takes a `ParserCursor` and returns a
