@@ -10,8 +10,10 @@ import "abla/unsafe/memory/raw"
 
 private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
 
+// Stores path spelling `text` as given. Constructing a path does not query the filesystem.
 class Path(val text: string)
 
+// Metadata for `path`. Kind 0 means unavailable, 1 regular file, 2 directory, 3 another kind, and 4 symbolic link. `size` is in bytes and is -1 on failure. `revision` and `changed` are modification and status-change times in nanoseconds since the Unix epoch. Times and `inode` are zero when unavailable.
 class FileInfo(
     val path: Path,
     val kind: int,
@@ -20,10 +22,13 @@ class FileInfo(
     val inode: int = 0,
     val changed: int = 0
 ) {
+    // Returns true when metadata was found.
     fun exists(): bool = this.kind != 0
 
+    // Returns true for a regular file.
     fun isFile(): bool = this.kind == 1
 
+    // Returns true for a directory.
     fun isDirectory(): bool = this.kind == 2
 }
 
@@ -36,6 +41,7 @@ class FileWatch(
     var fingerprints: array<string> = []
 )
 
+// Returns a Path holding `value` without normalization or filesystem access.
 fun path(value: string): Path = Path(value)
 
 private fun linuxLoadU16(buffer: NativeByteBuffer, offset: int): int =
@@ -45,6 +51,7 @@ private fun linuxLoadU32(buffer: NativeByteBuffer, offset: int): int =
     linuxLoadU16(buffer, offset) +
     linuxLoadU16(buffer, offset + 2) * 65536
 
+// Returns metadata for `filePath`, following symbolic links. A failed lookup returns kind 0.
 fun linuxFileInfo(filePath: Path): FileInfo = linuxStatInfo(filePath, 0)
 
 // newfstatat with `flags`: 0 follows a symbolic link, AT_SYMLINK_NOFOLLOW (256)
@@ -80,6 +87,7 @@ private fun linuxStatInfo(filePath: Path, flags: int): FileInfo {
     FileInfo(filePath, kind, size, revision, inode, changed)
 }
 
+// Returns the process working directory, or a path containing `.` when the lookup fails.
 fun currentDirectory(): Path {
     val buffer = nativeByteBuffer(4096)
     val measured = linuxSyscall2(
@@ -146,6 +154,7 @@ fun homePath(): Path? {
     if (home == null) null else Path(home)
 }
 
+// Appends `name` to the path, inserting a slash if needed. Does not normalize or check the result.
 fun Path.child(name: string): Path {
     var separator = "/"
     if (this.text.size > 0 && this.text[this.text.size - 1] == 47) {
@@ -169,8 +178,10 @@ private fun linuxParentPath(text: string): string {
     result
 }
 
+// Returns the lexical parent, ignoring trailing slashes. A single relative component has parent `.`, and the root has parent `/`.
 fun Path.parent(): Path = Path(linuxParentPath(this.text))
 
+// Returns the final path component after ignoring trailing slashes, or an empty string if no component exists.
 fun Path.name(): string {
     var end = this.text.size
     while (end > 1 && this.text[end - 1] == 47) end = end - 1
@@ -183,6 +194,7 @@ fun Path.name(): string {
     this.text.slice(slash + 1, end)
 }
 
+// Returns the final component's suffix after its last dot. Returns an empty string for no suffix, a leading dot alone, or a trailing dot.
 fun Path.extension(): string {
     val name = this.name()
     var dot = -1
@@ -198,12 +210,14 @@ fun Path.extension(): string {
     result
 }
 
+// Returns metadata for the path, following symbolic links. Kind 0 indicates a failed lookup.
 fun Path.info(): FileInfo = linuxFileInfo(this)
 
 /** What the path names itself: a symbolic link is not followed, and is kind 4
  *  with the size of its target's name. */
 fun Path.linkInfo(): FileInfo = linuxStatInfo(this, 256)
 
+// Returns the modification time in nanoseconds since the Unix epoch, or 0 when metadata is unavailable.
 fun Path.revision(): int = this.info().revision
 
 // What a watch compares: modification time, size, inode and change time from
@@ -214,8 +228,10 @@ private fun Path.fingerprint(): string {
     "${info.revision}:${info.size}:${info.inode}:${info.changed}"
 }
 
+// Returns true when the path can be queried. Follows symbolic links, so a dangling link returns false.
 fun Path.exists(): bool = this.info().exists()
 
+// Reads the full contents of a regular file as bytes. Returns an empty string for an empty file, a nonregular file, or a failed lookup, open, or read.
 fun Path.readText(): string {
     val info = this.info()
     var result = ""
@@ -239,6 +255,7 @@ class FileReadResult(
     val errorCode: int
 )
 
+// Opens the path and reads through EOF. Returns the bytes and success flag, or an empty string and a positive system error code. A directory is reported with error 21.
 fun Path.readTextResult(): FileReadResult {
     val descriptor = linuxOpen(this.text)
     if (descriptor.descriptor < 0) {
@@ -324,8 +341,10 @@ private fun linuxCreateDirectories(text: string, mode: int = 0o777): bool {
     success
 }
 
+// Attempts to create every path component with `mode` filtered by the process umask. Returns false on a mkdir error other than already exists. Existing components are accepted without checking their kind.
 fun Path.createDirectories(mode: int = 0o777): bool = linuxCreateDirectories(this.text, mode)
 
+// Creates the parent path with the default directory mode. Returns false on a mkdir error other than already exists.
 fun Path.createParentDirectories(): bool {
     linuxCreateDirectories(linuxParentPath(this.text))
 }
@@ -468,9 +487,11 @@ fun FileLock.hold(): bool {
 fun FileLock.tryHold(): bool =
     this.descriptor >= 0 && linuxSyscall2(73, this.descriptor, 6) == 0
 
+// Unlocks the descriptor without closing it. Returns false for an invalid descriptor or unlock failure.
 fun FileLock.release(): bool =
     this.descriptor >= 0 && linuxSyscall2(73, this.descriptor, 8) == 0
 
+// Creates parents of `destination` and renames this path there. Returns false if parent creation or rename fails, including a cross-filesystem rename.
 fun Path.moveTo(destination: Path): bool {
     var success = linuxCreateDirectories(linuxParentPath(destination.text))
     if (success) {
@@ -506,6 +527,7 @@ private fun linuxLinkKind(filePath: Path): int {
     kind
 }
 
+// Returns true if the path itself is a symbolic link. A failed lookup returns false.
 fun Path.isSymbolicLink(): bool = linuxLinkKind(this) == 4
 
 /** The modification time in milliseconds since the Unix epoch (0 when the
@@ -543,6 +565,7 @@ fun Path.removeTree(): bool {
     linuxLinkKind(this) == 0
 }
 
+// Unlinks a file or symbolic link, or removes an empty directory. Returns false when removal fails, including when the path is already missing.
 fun Path.remove(): bool {
     var status = linuxSyscall1(87, nativeCStringAddress(this.text))
     if (status != 0) status = linuxSyscall1(
@@ -571,6 +594,7 @@ private fun linuxDirectoryEntryName(
     name.adoptString(length)
 }
 
+// Returns immediate child paths in filesystem order, excluding dot and dot-dot. Returns an empty array if the directory cannot be opened and may return a partial list on a read error.
 fun Path.entries(): array<Path> {
     val entries: array<Path> = []
     val descriptor = linuxOpen(this.text, 65536).descriptor
