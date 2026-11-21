@@ -1,0 +1,459 @@
+// The fast path of the correctly rounded libm (crmath.ab, #1045): the same formulas as the arbitrary-precision path, evaluated in double-double
+// arithmetic (a value is an unevaluated sum h + l of two doubles, about 104 bits), with a rounding test (Ziv's strategy). A function here returns the
+// double nearest to the exact value when the error bound shows that value cannot round the other way, and NaN ("not sure") when it cannot tell: the
+// caller then takes the exact path. Correct rounding is therefore still guaranteed; this only makes the typical call cheap.
+// Clean-room, from: Dekker (1971) and Knuth (TAOCP 4.2.2) for the error-free sums and products (here with fma for the product);
+// Hida, Li, Bailey, "Library for double-double and quad-double arithmetic" (2008) for the add/multiply/divide/sqrt on pairs;
+// the algorithms of crmath.ab (Brent and Zimmermann, Modern Computer Arithmetic ch. 4; Muller, Elementary Functions) for the functions.
+// The error bound used is 2^-80 of the result (the operations above are accurate to about 2^-104; the compositions stay below 2^-90), for erfc an
+// absolute 2^-92 (its subtraction cancels).
+import "abla/float"
+import "abla/math" as mth
+
+class DD(var h: f64, var l: f64)
+
+// the exact value of 2^k as a double, for |k| <= 1000
+private fun ddPow2(k: int): f64 = f64FromBits((k + 1023) << 52)
+
+private fun ddAdd(a: DD, b: DD): DD {
+    val ah = a.h
+    val al = a.l
+    val bh = b.h
+    val bl = b.l
+    var s1 = ah + bh
+    var bb = s1 - ah
+    var s2 = (ah - (s1 - bb)) + (bh - bb)
+    val t1 = al + bl
+    bb = t1 - al
+    val t2 = (al - (t1 - bb)) + (bl - bb)
+    s2 = s2 + t1
+    var h = s1 + s2
+    var l = s2 - (h - s1)
+    s1 = h
+    s2 = l + t2
+    h = s1 + s2
+    l = s2 - (h - s1)
+    DD(h, l)
+}
+
+private fun ddNeg(a: DD): DD = DD(0.0 - a.h, 0.0 - a.l)
+
+private fun ddSub(a: DD, b: DD): DD = ddAdd(a, DD(0.0 - b.h, 0.0 - b.l))
+
+private fun ddMul(a: DD, b: DD): DD {
+    val p = a.h * b.h
+    var e = mth.fma(a.h, b.h, 0.0 - p)
+    e = e + (a.h * b.l + a.l * b.h)
+    val h = p + e
+    DD(h, e - (h - p))
+}
+
+private fun ddMulD(a: DD, d: f64): DD {
+    val p = a.h * d
+    val e = mth.fma(a.h, d, 0.0 - p) + a.l * d
+    val h = p + e
+    DD(h, e - (h - p))
+}
+
+private fun ddDiv(a: DD, b: DD): DD {
+    val q1 = a.h / b.h
+    var rem = ddSub(a, ddMulD(b, q1))
+    val q2 = rem.h / b.h
+    rem = ddSub(rem, ddMulD(b, q2))
+    val q3 = rem.h / b.h
+    ddAdd(ddAdd(DD(q1, 0.0), DD(q2, 0.0)), DD(q3, 0.0))
+}
+
+private fun ddDivD(a: DD, d: f64): DD = ddDiv(a, DD(d, 0.0))
+
+private fun ddSqrt(a: DD): DD {
+    if (a.h <= 0.0) return DD(0.0, 0.0)
+    val s = mth.sqrt(a.h)
+    val p = s * s
+    val e = mth.fma(s, s, 0.0 - p)
+    val corr = (((a.h - p) - e) + a.l) / (2.0 * s)
+    val h = s + corr
+    DD(h, corr - (h - s))
+}
+
+// a * 2^k
+private fun ddScale(a: DD, k: int): DD {
+    var h = a.h
+    var l = a.l
+    var rest = k
+    while (rest > 1000) {
+        h = h * ddPow2(1000)
+        l = l * ddPow2(1000)
+        rest = rest - 1000
+    }
+    while (rest < -1000) {
+        h = h * ddPow2(-1000)
+        l = l * ddPow2(-1000)
+        rest = rest + 1000
+    }
+    DD(h * ddPow2(rest), l * ddPow2(rest))
+}
+
+private fun ddLn2(): DD = DD(f64FromBits(4604418534313441775), f64FromBits(4358002977218854975))
+private fun ddLn10(): DD = DD(f64FromBits(4612367379483415830), f64FromBits(-4850578364558302231))
+private fun ddInvLn2(): DD = DD(f64FromBits(4609176140021203710), f64FromBits(4357082904033627428))
+private fun ddInvLn10(): DD = DD(f64FromBits(4601495173785380110), f64FromBits(4353102142499388115))
+private fun ddPi(): DD = DD(f64FromBits(4614256656552045848), f64FromBits(4368955796522032135))
+private fun ddHalfPi(): DD = DD(f64FromBits(4609753056924675352), f64FromBits(4364452196894661639))
+private fun ddTwoOverSqrtPi(): DD = DD(f64FromBits(4607760587169110893), f64FromBits(4355453881213250944))
+
+// the exponent of a nonzero double (its value is in [2^e, 2^(e+1)))
+private fun ddExponent(x: f64): int = ((f64ToBits(x) >> 52) & 2047) - 1023
+
+// The correctly rounded double of the pair h + l when `bound` (absolute) holds on its distance to the true value, else NaN.
+private fun ddRound(h: f64, l: f64, bound: f64): f64 {
+    val a = h + (l - bound)
+    val b = h + (l + bound)
+    if (a == b) return a
+    f64FromBits(9221120237041090560)
+}
+
+private fun ddRoundRel(a: DD): f64 {
+    val h = mth.fabs(a.h)
+    if (!(h > 1.0e-290) || !(h < 1.7e308)) return f64FromBits(9221120237041090560)
+    ddRound(a.h, a.l, h * 8.271806125530277e-25)
+}
+
+// The series loops below keep their pairs in local doubles (no object per operation): a product of two pairs, a division by a small integer
+// and a sum of two same-magnitude-order pairs, each the same arithmetic as ddMul, ddDivD and ddAdd (Hida, Li, Bailey) with the sloppy sum, which
+// is enough where no cancellation happens (every series here has terms far below its sum).
+
+// ---- exp - 1 -------------------------------------------------------------------------------------------------------------------------------
+
+class DDK(val v: DD, val k: int)
+
+// y = exp(r) - 1 for the reduced r = x - k ln 2 (k returned), |r| <= 0.35: r / 2^s, the Taylor series, then s doublings y <- 2y + y^2
+private fun ddExpm1Parts(x: DD): DDK {
+    var k = 0
+    var r = DD(x.h, x.l)
+    if (mth.fabs(x.h) >= 0.34) {
+        k = f64ToInt(mth.roundEven(x.h * 1.4426950408889634))
+        r = ddSub(x, ddMulD(ddLn2(), f64FromInt(k)))
+    }
+    if (r.h == 0.0) return DDK(DD(0.0, 0.0), k)
+    var s = ddExponent(r.h) + 9
+    if (s < 0) s = 0
+    val t = ddScale(r, 0 - s)
+    val th = t.h
+    val tl = t.l
+    var xh = th
+    var xl = tl
+    var sh = th
+    var sl = tl
+    var i = 2
+    while (i < 40) {
+        // term = term * t / i
+        val p = xh * th
+        var e = mth.fma(xh, th, 0.0 - p) + (xh * tl + xl * th)
+        var ph = p + e
+        var pl = e - (ph - p)
+        val d = f64FromInt(i)
+        val q1 = ph / d
+        val rem = mth.fma(0.0 - q1, d, ph) + pl
+        val q2 = rem / d
+        xh = q1 + q2
+        xl = q2 - (xh - q1)
+        // sum += term
+        val a = sh + xh
+        val v = a - sh
+        val b = (sh - (a - v)) + (xh - v) + (sl + xl)
+        sh = a + b
+        sl = b - (sh - a)
+        if (mth.fabs(xh) < mth.fabs(sh) * 2.0e-33) i = 1000
+        i += 1
+    }
+    for (j in 0 until s) {
+        // y <- 2 y + y^2
+        val p = sh * sh
+        val e = mth.fma(sh, sh, 0.0 - p) + 2.0 * sh * sl
+        val a = 2.0 * sh + p
+        val v = a - 2.0 * sh
+        val b = ((2.0 * sh - (a - v)) + (p - v)) + (2.0 * sl + e)
+        sh = a + b
+        sl = b - (sh - a)
+    }
+    DDK(DD(sh, sl), k)
+}
+
+// exp(x) - 1 for a double x in [-40, 710]
+private fun ddExpm1(x: f64): DD {
+    val parts = ddExpm1Parts(DD(x, 0.0))
+    if (parts.k == 0) return DD(parts.v.h, parts.v.l)
+    val one = DD(1.0, 0.0)
+    ddSub(ddScale(ddAdd(parts.v, one), parts.k), one)
+}
+
+fun libcFastExpm1(x: f64): f64 {
+    if (mth.fabs(x) < 1.0e-250) return f64FromBits(9221120237041090560)
+    ddRoundRel(ddExpm1(x))
+}
+
+// ---- log -----------------------------------------------------------------------------------------------------------------------------------
+
+// 2 atanh(z) = 2 sum z^(2j+1) / (2j + 1)
+private fun ddTwoAtanh(z: DD): DD {
+    if (z.h == 0.0) return DD(0.0, 0.0)
+    val z2 = ddMul(z, z)
+    val wh = z2.h
+    val wl = z2.l
+    var ph = z.h
+    var pl = z.l
+    var sh = z.h
+    var sl = z.l
+    var j = 1
+    while (j < 80) {
+        // power = power * z^2
+        val p = ph * wh
+        val e = mth.fma(ph, wh, 0.0 - p) + (ph * wl + pl * wh)
+        ph = p + e
+        pl = e - (ph - p)
+        // term = power / (2j + 1), sum += term
+        val d = f64FromInt(2 * j + 1)
+        val q1 = ph / d
+        val rem = mth.fma(0.0 - q1, d, ph) + pl
+        val q2 = rem / d
+        val th = q1 + q2
+        val tl = q2 - (th - q1)
+        val a = sh + th
+        val v = a - sh
+        val b = (sh - (a - v)) + (th - v) + (sl + tl)
+        sh = a + b
+        sl = b - (sh - a)
+        if (mth.fabs(th) < mth.fabs(sh) * 2.0e-33) j = 1000
+        j += 1
+    }
+    ddScale(DD(sh, sl), 1)
+}
+
+class DDE(val v: DD, val e: int)
+
+// x = m 2^E with m in [1/sqrt 2, sqrt 2): ln(m) and E
+private fun ddLogParts(x: f64): DDE {
+    var e = ddExponent(x)
+    var m = f64FromBits((f64ToBits(x) & 4503599627370495) | 4607182418800017408)
+    if (m > 1.4142135623730951) {
+        m = m * 0.5
+        e += 1
+    }
+    val z = ddDiv(DD(m - 1.0, 0.0), ddAdd(DD(m, 0.0), DD(1.0, 0.0)))
+    DDE(ddTwoAtanh(z), e)
+}
+
+private fun ddSubnormalOrSpecial(x: f64): bool = !(x > 2.3e-308) || !(x < 1.0e308)
+
+fun libcFastLog2(x: f64): f64 {
+    if (ddSubnormalOrSpecial(x)) return f64FromBits(9221120237041090560)
+    val parts = ddLogParts(x)
+    var y = ddMul(parts.v, ddInvLn2())
+    if (parts.e != 0) y = ddAdd(y, DD(f64FromInt(parts.e), 0.0))
+    if (y.h == 0.0) return 0.0
+    ddRoundRel(y)
+}
+
+fun libcFastLog10(x: f64): f64 {
+    if (ddSubnormalOrSpecial(x)) return f64FromBits(9221120237041090560)
+    val parts = ddLogParts(x)
+    var y = DD(parts.v.h, parts.v.l)
+    if (parts.e != 0) y = ddAdd(y, ddMulD(ddLn2(), f64FromInt(parts.e)))
+    if (y.h == 0.0) return 0.0
+    ddRoundRel(ddMul(y, ddInvLn10()))
+}
+
+fun libcFastLog1p(x: f64): f64 {
+    if (mth.fabs(x) < 1.0e-250) return f64FromBits(9221120237041090560)
+    var y = DD(0.0, 0.0)
+    if (x >= -0.29 && x <= 0.41) {
+        // 2 atanh(x / (2 + x)) keeps the relative accuracy for tiny x
+        y = ddTwoAtanh(ddDiv(DD(x, 0.0), ddAdd(DD(2.0, 0.0), DD(x, 0.0))))
+    } else {
+        val sum = ddAdd(DD(1.0, 0.0), DD(x, 0.0))
+        if (sum.h < 2.3e-308 || sum.h > 1.0e307) return f64FromBits(9221120237041090560)
+        val parts = ddLogParts(sum.h)
+        y = ddAdd(parts.v, ddMulD(ddLn2(), f64FromInt(parts.e)))
+        if (sum.l != 0.0) {
+            // log(h + l) = log(h) + log1p(l / h), with c = l / h below 2^-52: c - c^2 / 2
+            val c = ddDiv(DD(sum.l, 0.0), DD(sum.h, 0.0))
+            y = ddAdd(y, ddSub(c, ddScale(ddMul(c, c), -1)))
+        }
+    }
+    ddRoundRel(y)
+}
+
+// ---- atan family ---------------------------------------------------------------------------------------------------------------------
+
+// atan(t) for t >= 0: t <- t / (1 + sqrt(1 + t^2)) until t < 2^-6, the alternating series, times 2^s
+private fun ddAtan(t0: DD): DD {
+    if (t0.h == 0.0) return DD(0.0, 0.0)
+    val one = DD(1.0, 0.0)
+    var t = DD(t0.h, t0.l)
+    var invert = false
+    if (t.h > 1.0) {
+        t = ddDiv(one, t0)
+        invert = true
+    }
+    var s = 0
+    while (t.h > 0.125) {
+        t = ddDiv(t, ddAdd(ddSqrt(ddAdd(ddMul(t, t), one)), one))
+        s += 1
+    }
+    val t2 = ddMul(t, t)
+    val wh = t2.h
+    val wl = t2.l
+    var ph = t.h
+    var pl = t.l
+    var sh = t.h
+    var sl = t.l
+    var k = 1
+    while (k < 60) {
+        val p = ph * wh
+        val e = mth.fma(ph, wh, 0.0 - p) + (ph * wl + pl * wh)
+        ph = p + e
+        pl = e - (ph - p)
+        val d = f64FromInt(2 * k + 1)
+        val q1 = ph / d
+        val rem = mth.fma(0.0 - q1, d, ph) + pl
+        val q2 = rem / d
+        var th = q1 + q2
+        var tl = q2 - (th - q1)
+        if (k % 2 == 1) {
+            th = 0.0 - th
+            tl = 0.0 - tl
+        }
+        val a = sh + th
+        val v = a - sh
+        val b = (sh - (a - v)) + (th - v) + (sl + tl)
+        sh = a + b
+        sl = b - (sh - a)
+        if (mth.fabs(th) < mth.fabs(sh) * 2.0e-33) k = 1000
+        k += 1
+    }
+    var out = ddScale(DD(sh, sl), s)
+    if (invert) out = ddSub(ddHalfPi(), out)
+    DD(out.h, out.l)
+}
+
+fun libcFastAsin(x: f64): f64 {
+    val ax = mth.fabs(x)
+    if (ax < 1.0e-100) return f64FromBits(9221120237041090560)
+    val one = DD(1.0, 0.0)
+    val a = DD(ax, 0.0)
+    val root = ddSqrt(ddMul(ddSub(one, a), ddAdd(one, a)))
+    val t = ddDiv(a, ddAdd(root, one))
+    var y = ddScale(ddAtan(t), 1)
+    if (x < 0.0) y = ddNeg(y)
+    ddRoundRel(y)
+}
+
+fun libcFastAcos(x: f64): f64 {
+    val one = DD(1.0, 0.0)
+    val xd = DD(x, 0.0)
+    val t = ddSqrt(ddDiv(ddSub(one, xd), ddAdd(one, xd)))
+    ddRoundRel(ddScale(ddAtan(t), 1))
+}
+
+// ---- hyperbolic -----------------------------------------------------------------------------------------------------------------------
+
+fun libcFastSinh(x: f64): f64 {
+    val ax = mth.fabs(x)
+    if (ax < 1.0e-100 || ax > 700.0) return f64FromBits(9221120237041090560)
+    val e = ddExpm1(ax)
+    var q = ddScale(ddAdd(ddDiv(e, ddAdd(e, DD(1.0, 0.0))), e), -1)
+    if (x < 0.0) q = ddNeg(q)
+    ddRoundRel(q)
+}
+
+fun libcFastCosh(x: f64): f64 {
+    val ax = mth.fabs(x)
+    if (ax > 700.0) return f64FromBits(9221120237041090560)
+    val big = ddAdd(ddExpm1(ax), DD(1.0, 0.0))
+    ddRoundRel(ddScale(ddAdd(big, ddDiv(DD(1.0, 0.0), big)), -1))
+}
+
+fun libcFastTanh(x: f64): f64 {
+    val ax = mth.fabs(x)
+    if (ax < 1.0e-100 || ax > 20.0) return f64FromBits(9221120237041090560)
+    val e = ddExpm1(2.0 * ax)
+    var q = ddDiv(e, ddAdd(e, DD(2.0, 0.0)))
+    if (x < 0.0) q = ddNeg(q)
+    ddRoundRel(q)
+}
+
+// ---- erf ----------------------------------------------------------------------------------------------------------------------------
+
+// erf(x) for x in (0, 6]: 2/sqrt(pi) e^(-x^2) sum 2^n x^(2n+1) / (2n+1)!!
+private fun ddErf(x: f64): DD {
+    val xd = DD(x, 0.0)
+    val x2 = ddMul(xd, xd)
+    val two = ddScale(x2, 1)
+    val wh = two.h
+    val wl = two.l
+    var xh = x
+    var xl = 0.0
+    var sh = x
+    var sl = 0.0
+    var k = 1
+    while (k < 600) {
+        val p = xh * wh
+        val e = mth.fma(xh, wh, 0.0 - p) + (xh * wl + xl * wh)
+        val ph = p + e
+        val pl = e - (ph - p)
+        val d = f64FromInt(2 * k + 1)
+        val q1 = ph / d
+        val rem = mth.fma(0.0 - q1, d, ph) + pl
+        val q2 = rem / d
+        xh = q1 + q2
+        xl = q2 - (xh - q1)
+        val a = sh + xh
+        val v = a - sh
+        val b = (sh - (a - v)) + (xh - v) + (sl + xl)
+        sh = a + b
+        sl = b - (sh - a)
+        if (mth.fabs(xh) < mth.fabs(sh) * 2.0e-33) k = 10000
+        k += 1
+    }
+    val sum = DD(sh, sl)
+    val parts = ddExpm1Parts(ddNeg(x2))
+    val e = ddScale(ddAdd(parts.v, DD(1.0, 0.0)), parts.k)
+    ddMul(sum, ddMul(e, ddTwoOverSqrtPi()))
+}
+
+fun libcFastErf(x: f64): f64 {
+    val ax = mth.fabs(x)
+    if (ax < 1.0e-100 || ax >= 6.0) return f64FromBits(9221120237041090560)
+    var y = ddErf(ax)
+    if (x < 0.0) y = ddNeg(y)
+    ddRoundRel(y)
+}
+
+// erfc(x) for x in [4.6, 25.5): e^(-x^2) / (sqrt(pi) (x + (1/2)/(x + 1/(x + (3/2)/(x + 2/(x + ...)))))), the continued fraction of Laplace
+// (Abramowitz and Stegun 7.1.14), evaluated backwards from N terms where x sqrt(2N) is about 37 (the truncation error is then below 2^-106)
+private fun ddErfcTail(x: f64): DD {
+    val n = f64ToInt(1300.0 / (x * x)) + 8
+    val xd = DD(x, 0.0)
+    var t = DD(x, 0.0)
+    var k = n
+    while (k >= 1) {
+        t = ddAdd(xd, ddDiv(DD(0.5 * f64FromInt(k), 0.0), t))
+        k -= 1
+    }
+    val parts = ddExpm1Parts(ddNeg(ddMul(xd, xd)))
+    val e = ddScale(ddAdd(parts.v, DD(1.0, 0.0)), parts.k)
+    val sqrtPi = ddDiv(DD(2.0, 0.0), ddTwoOverSqrtPi())
+    ddDiv(e, ddMul(sqrtPi, t))
+}
+
+fun libcFastErfc(x: f64): f64 {
+    if (x >= 25.5 || x <= -6.0) return f64FromBits(9221120237041090560)
+    if (x >= 4.6) return ddRoundRel(ddErfcTail(x))
+    val ax = mth.fabs(x)
+    if (ax < 1.0e-100) return 1.0
+    val y = ddErf(ax)
+    val r = if (x < 0.0) ddAdd(DD(1.0, 0.0), y) else ddSub(DD(1.0, 0.0), y)
+    // absolute error 2^-92: the subtraction cancels
+    ddRound(r.h, r.l, 2.0e-28)
+}
