@@ -39,12 +39,22 @@ retained in the CI evidence and excluded from test-flake counts. A missing
 compiler also explains the `test-ct-stop-threads.sh` failure in run 44244744710;
 it is not evidence that its threading assertion failed.
 
+Focused validation exposed one additional test-isolation defect locally:
+`test-shards.sh` inherited the parent's `RUN_TESTS_FILTER`, exclusions and custom
+recipe, while asserting properties of the complete suite. A private fixture
+passed with the default selection, failed with `RUN_TESTS_FILTER=tools/test-shards\.sh`,
+and passed with that same filter after the helper cleared the three selectors.
+The before/after logs are `build/flake-audit/shard-filter-{before,after}.log`.
+The soak fixture now poisons all three selectors and checks that the actual
+shard helper still verifies the whole recipe. This is a deterministic context
+leak, distinct from a runtime race.
+
 Local full-suite and stress results are recorded separately once completed.
 After the lead's batch ED rebase, local verification uses master `c2e0a4b24fc10c3c9f08204330410ef4383a55c1`
 plus the registered soak-tool fixture. No compiler/runtime changes are made by this branch.
 Earlier queued gates ran no builds or suites and were stopped before rebasing.
 Under the lead's focused-validation rule, the unstarted full self-gate was
-cancelled. `cx6-build-focused-v2.service` runs `make ablac` and the focused tooling
+cancelled. `cx6-build-focused-v3.service` runs `make ablac` and the focused tooling
 checks; its log is `build/flake-audit/build-focused.log`. No claim of local suite
 success follows from a queued job or from the historical CI passes above.
 The repeated campaign uses slot 4, sixteen disjoint shards per full suite, releasing

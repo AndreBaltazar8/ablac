@@ -7,12 +7,16 @@ set -euo pipefail
 compiler=${1:-build/ablac}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+# This check proves the whole recipe's partition, even when a focused suite
+# selected this script. The parent's filter, exclusions or custom recipe must
+# not change the universe that the shard assertions describe.
+unset RUN_TESTS_FILTER RUN_TESTS_EXCLUDE RUN_TESTS_COMMANDS
 mkdir -p build   # run-tests.sh stamps its compiler cache there
 work=$(mktemp -d "${TMPDIR:-/tmp}/test-shards.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 list() { RUN_TESTS_LIST=1 RUN_TESTS_OUTPUT="$work/$1" "$root/tools/run-tests.sh" "$compiler" "${@:2}" | sort -n; }
 export RUN_TESTS_SHARD=
-whole=$(RUN_TESTS_SHARD= list whole)
+whole=$(RUN_TESTS_SHARD='' list whole)
 [[ -n $whole ]] || { echo "test-shards: the suite lists no command" >&2; exit 1; }
 for count in 2 3; do
     : > "$work/union.$count"

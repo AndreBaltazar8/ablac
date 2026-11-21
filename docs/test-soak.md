@@ -50,4 +50,5 @@ before the next iteration if they are needed to diagnose a failure.
 fail once then recover, and always fail. It also checks selection, per-failure
 logs, evidence preservation, invalid inputs, and refusal of missing results. It
 runs the actual suite runner in a private fixture tree, without touching the
-worktree's compiler or build cache.
+worktree's compiler or build cache. It also checks that inherited selection
+variables cannot shrink the whole-recipe assertions in `test-shards.sh`.

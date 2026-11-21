@@ -7,6 +7,7 @@ trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/tools" "$work/build"
 cp "$root/tools/soak-tests.sh" "$root/tools/run-tests.sh" "$work/tools/"
 printf 'fixture compiler\n' >"$work/build/ablac"
+cp "$work/build/ablac" "$work/build/ablac.bin"
 export RUN_TESTS_COMMANDS=$work/commands.txt JOBS=2 RUN_TESTS_MIN_FREE=0
 unset RUN_TESTS_EXCLUDE RUN_TESTS_SHARD RUN_TESTS_LIST RUN_TESTS_HISTORY
 cat >"$RUN_TESTS_COMMANDS" <<'COMMANDS'
@@ -40,6 +41,13 @@ grep -q first-failure "$work/evidence/run-1/2.log"
 expect_status 2 "$work/tools/soak-tests.sh" 1 'no-such-command' build/ablac "$work/empty"
 expect_status 2 "$work/tools/soak-tests.sh" 0 ''
 expect_status 2 "$work/tools/soak-tests.sh" 1 '['
+# A focused parent must not shrink the shard check's whole-recipe universe.
+# Only listing runs here: none of the recipe's commands (or its compiler) execute.
+cp "$root/Makefile" "$work/Makefile"
+cp "$root/tools/test-shards.sh" "$root/tools/test-times.tsv" "$work/tools/"
+mkdir -p "$work/src" "$work/stdlib"
+expect_status 0 env RUN_TESTS_FILTER='no-such-command' RUN_TESTS_EXCLUDE='.*' \
+    RUN_TESTS_COMMANDS="$work/no-such-recipe" "$work/tools/test-shards.sh" build/ablac
 # A runner that drops a result but returns success must not produce a clean rate.
 mv "$work/tools/run-tests.sh" "$work/tools/real-runner"
 cat >"$work/tools/run-tests.sh" <<'RUNNER'
