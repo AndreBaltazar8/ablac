@@ -1886,8 +1886,100 @@ var bootstrapRunningImageFirst: int = 41
 var bootstrapRunningImageSecond: int = 101
 var bootstrapRunningImageTail: int = 0
 
+// A little-endian unsigned field of `width` bytes (2, 4 or 8) at `offset` of the head of an image, 0 past its end.
+fun bootstrapImageField(head: string, offset: int, width: int): int {
+    if (offset < 0 || offset + width > head.size) return 0
+    var value = 0
+    var index = width - 1
+    while (index >= 0) {
+        value = value * 256 + head[offset + index]
+        index = index - 1
+    }
+    value
+}
+
+fun bootstrapImageHex(head: string, offset: int, count: int): string {
+    val digits = "0123456789abcdef"
+    val bytes = byteBuffer()
+    var index = 0
+    while (index < count) {
+        val byte = head[offset + index]
+        bytes.appendByteValue(digits[byte / 16])
+        bytes.appendByteValue(digits[byte % 16])
+        index = index + 1
+    }
+    bytes.toText()
+}
+
+// The identity the linker recorded in the running image: the ELF GNU build-id note (lld --build-id=sha1, a hash of the whole output) or the
+// Mach-O LC_UUID (ld64 derives it from the content). Both change whenever any byte of the image does, so a process need not read and hash the
+// whole image (10 MB for the dynamic compiler, 97 MB for the static one: 30 and 80 ms of every build that touches a cache) to key its caches
+// on it. "" when the image has none (a compiler linked before the flag, a stripped note): the caller then hashes the whole image as before.
+// Only the first 16 KB are read: the headers and notes sit at the front of an ELF, the load commands of a Mach-O.
+fun bootstrapRunningImageLinkerId(): string {
+    val file = linuxOpen("/proc/self/exe")
+    if (file.descriptor < 0) return ""
+    val head = file.read(16384)
+    file.close()
+    if (head.size < 64) return ""
+    // ELF64, little endian: the program headers (e_phoff, e_phentsize, e_phnum), the PT_NOTE ones, the notes of type NT_GNU_BUILD_ID (3) named "GNU".
+    if (head[0] == 127 && head[1] == 69 && head[2] == 76 && head[3] == 70 && head[4] == 2 && head[5] == 1) {
+        val headers = bootstrapImageField(head, 32, 8)
+        val entry = bootstrapImageField(head, 54, 2)
+        val count = bootstrapImageField(head, 56, 2)
+        var index = 0
+        while (index < count && entry >= 56) {
+            val at = headers + index * entry
+            if (at + 56 > head.size) break
+            if (bootstrapImageField(head, at, 4) == 4) {
+                var position = bootstrapImageField(head, at + 8, 8)
+                val end = position + bootstrapImageField(head, at + 32, 8)
+                while (position + 12 <= end && position + 12 <= head.size) {
+                    val nameSize = bootstrapImageField(head, position, 4)
+                    val descriptionSize = bootstrapImageField(head, position + 4, 4)
+                    val kind = bootstrapImageField(head, position + 8, 4)
+                    val name = position + 12
+                    val description = name + (nameSize + 3) / 4 * 4
+                    if (kind == 3 && nameSize == 4 && description + descriptionSize <= head.size && head[name] == 71 && head[name + 1] == 78 &&
+                        head[name + 2] == 85 && descriptionSize >= 8 && descriptionSize <= 64) {
+                        return "elf-" + bootstrapImageHex(head, description, descriptionSize)
+                    }
+                    position = description + (descriptionSize + 3) / 4 * 4
+                }
+            }
+            index = index + 1
+        }
+        return ""
+    }
+    // Mach-O 64 (magic 0xfeedfacf, little endian): the load commands follow the 32-byte header; LC_UUID (0x1b) holds 16 bytes.
+    if (bootstrapImageField(head, 0, 4) == 4277009103) {
+        var commands = bootstrapImageField(head, 16, 4)
+        var position = 32
+        while (commands > 0 && position + 8 <= head.size) {
+            val size = bootstrapImageField(head, position + 4, 4)
+            if (bootstrapImageField(head, position, 4) == 27 && size >= 24 && position + 24 <= head.size) {
+                return "macho-" + bootstrapImageHex(head, position + 8, 16)
+            }
+            if (size < 8) break
+            position = position + size
+            commands = commands - 1
+        }
+    }
+    ""
+}
+
 fun bootstrapReadRunningImageIdentity(): void {
     if (bootstrapRunningImageSize >= 0) return
+    // The linker's own content hash, when the image carries one: no read of the image.
+    val linkerId = bootstrapRunningImageLinkerId()
+    if (linkerId.size > 0) {
+        val text = "image-id:$linkerId"
+        bootstrapRunningImageFirst = bootstrapNativeCacheHash(text, 41, 269, 1000000007)
+        bootstrapRunningImageSecond = bootstrapNativeCacheHash(text, 101, 271, 1000000009)
+        bootstrapRunningImageTail = 0
+        bootstrapRunningImageSize = linkerId.size
+        return
+    }
     val image = Path("/proc/self/exe").readText()
     // A failed read is retried, and still disables this build's object cache.
     if (image.size == 0) return
@@ -4803,6 +4895,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 link.argument("-Wl,--threads=1")
                 link.argument("-Wl,--gc-sections")
                 link.argument("-Wl,--error-limit=0")
+                // A program that links LLVM is a compiler: it keys its caches on its own image, and a content hash the linker records
+                // (a build-id note) names the image without the process reading all of it (bootstrapRunningImageLinkerId).
+                if (linkLlvm) link.argument("-Wl,--build-id=sha1")
             }
             if (linkLlvm && !staticLlvm) {
                 link.argument(if (macTarget)

@@ -104,6 +104,7 @@ test-serial: ablac
 	tools/test-libc-functions.sh $(COMPILER)
 	tools/test-static-compiler.sh $(COMPILER)
 	tools/test-libc-float-format.sh $(COMPILER)
+	tools/test-image-identity.sh $(COMPILER)
 	tools/test-release-check-static.sh
 	tools/test-shards.sh $(COMPILER)
 	tools/test-static-compiler-aarch64.sh $(COMPILER)
