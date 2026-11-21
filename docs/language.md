@@ -2705,7 +2705,8 @@ fun main {
   module doesn't expose the aliases *it* uses. Other alias errors:
   `E_IMPORT_ALIAS_DUPLICATE` (one alias bound twice),
   `E_IMPORT_ALIAS_TARGET_DUPLICATE` (one module imported twice),
-  `E_IMPORT_ALIAS_MEMBER_UNKNOWN`.
+  `E_IMPORT_ALIAS_MEMBER_UNKNOWN`. The compiler also rejects aliases of the implicit runtime module
+  `abla/runtime/self` (`E_IMPORT_RUNTIME_ALIAS`).
 - `private` before a top-level declaration (`fun`, `val`, `var`, `class`,
   `interface`, `type`, an extension function or field) makes it visible only
   in its own module. Two modules may each have a private declaration of one

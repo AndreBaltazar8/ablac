@@ -2,8 +2,7 @@
 # A standard-library module imported under an alias must build like the module imported plainly. tests/cases/alias-stdlib-json runs abla/json
 # under an alias (its method `string` once gave the type `string` the module's prefix: ~1000 errors), and the modules listed below are built
 # plainly and as `import "<module>" as q` (front end and object only). `--all` does it for every stdlib module (about 140, several minutes).
-# Known failing under an alias (todo #1083, each also listed in the waiver below): abla/serial (a name reached through two `export import`
-# levels), abla/runtime/self (the runtime's intrinsics are not meant to be imported by a program).
+# The implicit runtime module rejects aliases. The negative case below checks its diagnostic.
 # Usage: tools/test-alias-sweep.sh [compiler] [--all]
 set -euo pipefail
 export LC_ALL=C
@@ -20,9 +19,25 @@ mkdir -p "$out"
 code=0
 "$out/json" > "$out/json.out" 2>&1 < /dev/null || code=$?
 [[ $code == 42 ]] || { echo "alias sweep: alias-stdlib-json exited $code" >&2; cat "$out/json.out" >&2; exit 1; }
-waived=" abla/serial abla/runtime/self abla/io "
+"$compiler" build tests/cases/alias-stdlib-serial/main.ab -o "$out/serial" --fast --no-cache
+"$out/serial"
+
+cat > "$out/runtime-self.ab" <<'ABLA'
+import "abla/runtime/self" as runtime
+
+fun main: int = 0
+ABLA
+if "$compiler" build "$out/runtime-self.ab" --emit object -o "$out/runtime-self.o" --fast --no-cache > "$out/runtime-self.log" 2>&1; then
+    echo 'alias sweep: abla/runtime/self accepted an alias' >&2
+    exit 1
+fi
+expected='error[E_IMPORT_RUNTIME_ALIAS]: abla/runtime/self is loaded by the compiler and cannot be imported under an alias'
+errors=$(grep -a '^error\[' "$out/runtime-self.log" || true)
+if [[ $errors != "$expected" ]]; then cat "$out/runtime-self.log" >&2; exit 1; fi
+
+waived=" abla/io "
 if [[ $all == --all ]]; then
-    modules=$(cd stdlib && find abla -name entry.ab | sed 's#/entry.ab##' | sort)
+    modules=$(cd stdlib && find abla -name entry.ab ! -path abla/runtime/self/entry.ab | sed 's#/entry.ab##' | sort)
 else
     modules='abla/json abla/http/h2/hpack abla/text abla/bytes abla/math abla/yaml abla/regex'
 fi
@@ -38,4 +53,4 @@ for module in $modules; do
     fi
 done
 [[ $failed == 0 ]] || exit 1
-echo 'alias sweep: abla/json under an alias runs, and the modules listed build under an alias'
+echo 'alias sweep: JSON and serial run under aliases, other listed modules build, and the implicit runtime alias is refused'

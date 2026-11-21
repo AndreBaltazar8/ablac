@@ -1505,17 +1505,21 @@ class BootstrapAliasSummary(
 /** `target` and every module its `export import`s pass on, nearest first. */
 fun bootstrapAliasReachedModules(
     target: string,
-    aliases: array<BootstrapModuleAlias>
+    aliases: array<BootstrapModuleAlias>,
+    summary: BootstrapAliasSummary? = null
 ): array<string> {
     val reached = [target]
     var next = 0
     while (next < reached.size) {
         val from = reached[next]
-        for (edge in aliases) {
+        var edgeIndex = if (summary == null) 0 else summary.firstEdgeOf(from)
+        while (edgeIndex >= 0 && edgeIndex < aliases.size) {
+            val edge = aliases[edgeIndex]
             if (edge.exported && edge.alias == "" && edge.importer == from &&
                 !bootstrapAffineNamesContain(reached, edge.target)) {
                 reached.append(edge.target)
             }
+            edgeIndex = if (summary == null) edgeIndex + 1 else summary.nextEdge[edgeIndex]
         }
         next = next + 1
     }
@@ -1858,6 +1862,9 @@ fun bootstrapModuleShadowIndex(
     }
     result
 }
+
+fun bootstrapRuntimeSelfModulePath(): string =
+    bootstrapNormalizeModulePath(Path(bootstrapStandardLibraryRoot()).child("abla/runtime/self/entry.ab").text)
 
 fun bootstrapRuntimePlatformModule(path: string): bool {
     val platform = Path(bootstrapStandardLibraryRoot()).child(
@@ -2279,10 +2286,16 @@ fun bootstrapRewriteModuleSource(
             }
         }
         if (targetPrefix != "" && target != null) {
-            bootstrapAppendPrefixedNames(
-                snapshots[target].discovery, targetPrefix,
-                names, replacements, false
-            )
+            // A prefixed import exposes its re-exports under each declarer's prefix.
+            for (reached in bootstrapAliasReachedModules(edge.target, aliases, summary)) {
+                val declaring = summary.snapshotIndex.get(reached)
+                if (declaring != null) {
+                    bootstrapAppendPrefixedNames(
+                        snapshots[declaring].discovery, summary.targetPrefix(reached),
+                        names, replacements, false
+                    )
+                }
+            }
         }
         // A plainly imported module's shadowing declarations, unless this
         // module declares the name itself.
@@ -3691,9 +3704,7 @@ fun bootstrapStrictEdgesOf(
     // wasm.ab), which a program has without importing them.
     val transactions = bootstrapImplicitTransactionsPath()
     val standardLibrary = Path(bootstrapStandardLibraryRoot())
-    val runtime = bootstrapNormalizeModulePath(standardLibrary.child(
-        "abla/runtime/self/entry.ab"
-    ).text)
+    val runtime = bootstrapRuntimeSelfModulePath()
     val platform = standardLibrary.child("abla/runtime/platform")
     val hostPlatform = bootstrapNormalizeModulePath(platform.child("host.ab").text)
     val wasmPlatform = bootstrapNormalizeModulePath(platform.child("wasm.ab").text)
@@ -4423,6 +4434,13 @@ class BootstrapModuleGraph(
         edge: BootstrapImportEdge,
         target: string
     ): void {
+        if (edge.alias != "" && (edge.source == "abla/runtime/self" ||
+            target == bootstrapRuntimeSelfModulePath())) {
+            this.errors += 1
+            this.diagnostics =
+                "${this.diagnostics}error[E_IMPORT_RUNTIME_ALIAS]: abla/runtime/self is loaded by the compiler and cannot be imported under an alias\nsource[import]:${importer.path}:${edge.begin}:${edge.end}\n"
+            return
+        }
         val slot = this.importerSlot(importer.path)
         var duplicateAlias = false
         var duplicateTarget = false
