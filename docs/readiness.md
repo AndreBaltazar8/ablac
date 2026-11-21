@@ -2,7 +2,7 @@
 
 Internal only. Regenerate with `tools/readiness.sh`; this is an evidence inventory, not a production approval or stability policy.
 
-Source revision: `8b069114febef2595bdd00647a5169d1f37e57c0`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.
+Source revision: `f32639daa42dbcb77002a7f6dfab6a3b90d4c5df`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.
 
 ## Stability
 
@@ -76,7 +76,13 @@ Counts are top-level migration bullets, a proxy for breaking changes. A present 
 
 Suite inventory: **545 recipe commands**, **399 case directories**. These are source inventory counts, not passing checks.
 
-Missing: completed gate, stage2 == stage3 result and suite pass/fail totals.
+Evidence: `build/gate/gate.log`; SHA-256 `924e28fb53eea28b57f2b6cb4c775debe3eeffdf488d5e17b5c2f8f1bf1ce7e5`.
+
+    Fixed point: Missing
+    Suite: Missing
+    Gate completion: Missing (unfinished)
+
+Gate source revision: see the optional `gate-revision.txt`; absent provenance means the result cannot establish this revision passed.
 
 ### Fuzz campaigns and disagreements
 
@@ -88,11 +94,11 @@ Evidence: `/home/andre/agents-memory/abla/ablac-differential-fuzzer.md`; SHA-256
 
 Historical campaign narrative, final 24 lines (may be stale; no aggregate inferred; consult the full source above):
 
-    
+
     2026-11-12 ablac-c6 took over #648 (from ablac-e2). Standing on 195f43b9 (build/ablac.bin SHA-256 9d9e77fd…a621d53): default 7601–7640, hosted 7701–7710, cross-target 7801–7804, focused ownership_lifetime_check 7901–7920, all agree. Branch fuzz-804-c6 aa2cb156 (on b1d218e5) adds `fresh_select_check` (#804: `??`-selected fresh resource as argument/field owner/receiver/loop source, fresh resource-interface `when` subject via prelude `face(n, other)`, FaceTicket/OtherFace); focused 7961–7980 and default 7981–8000 agree; handed to ablac-d1. Lesson: never edit tools/fuzz-differential in the worktree a running campaign uses (each run re-reads it): develop in a second worktree. Next free seeds: above 8000.
-    
+
     ## 2026-11-14 Abla port (decision #60, ablac-9e for lead ablac-74)
-    
+
     Campaign on master cae5a190 with the Python fuzzer (seeds 8001–8720, all modes and campaigns) found nothing; shared
     globals now pass (#796 fixed). The fuzzer is ported to Abla as tools/fuzz (built and run by tools/fuzz/run, like
     tools/ct-timing): stage 1 + batches A–E2, a stacked chain of local branches on cae5a190 — fuzz-abla-stage1 54bc57ad,
@@ -305,4 +311,3 @@ Missing: stdlib public declaration documentation coverage (tools/stdlib-doc cove
 ## Real-world deployments
 
 Missing: verified, hand-maintained deployments.
-

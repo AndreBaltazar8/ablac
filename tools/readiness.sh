@@ -155,5 +155,7 @@ json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence
         printf '\nHand-maintained reports; inclusion does not establish a support or stability promise.\n'
     else missing 'verified, hand-maintained deployments'; fi
 } > "$tmp"
+clean=$(sed 's/[[:blank:]]*$//' "$tmp")
+printf '%s\n' "$clean" > "$tmp"
 mv -- "$tmp" "$out"
 printf '%s\n' "$out"
