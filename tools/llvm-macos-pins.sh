@@ -1,4 +1,5 @@
-# shellcheck shell=bash disable=SC2034
+#!/usr/bin/env bash
+# shellcheck disable=SC2034
 # Published artifacts of .github/workflows/llvm-macos.yml. Do not merge these
 # consumers until the maintainer publishes and pins both checked archives.
 LLVM_MACOS_VERSION=23.1.3
