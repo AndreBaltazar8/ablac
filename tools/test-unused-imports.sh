@@ -2,7 +2,8 @@
 # W_UNUSED_IMPORT (module.ab: bootstrapUnusedImportWarnings), on by default (off with --no-warn-unused-imports or
 # ABLA_WARN_UNUSED_IMPORTS=0, and a cache hit prints what its entry kept): an import nothing in the importing file uses
 # gets a warning, an import used only through an extension method, a re-exported class or a
-# `$json` subparser (also through a module that passes the registering one on) or an interpolated float doesn't, nor
+# `$json` subparser (also through a module that passes the registering one on), a call a subparser generates, an
+# import line's provider call or an interpolated float doesn't, nor
 # one of a module with an @export function; a package's entry gets the `export import` line instead, and a module that
 # runs compile code or defines syntax (a subparser) keeps its imports. Another project's module, a
 # vendored package and a checkout linked in get none, nor does any module after a front end that stopped at an error.
@@ -196,13 +197,21 @@ grep -qxF 'fix-imports: removed 0 unused import(s) in 0 file(s); 0 restored, 0 l
     fail "the interpolated prune touched abla/float/text" "$work/interpolated-prune.log"
 
 # Syntax: dsl.ab registers `$seven()`, whose generated call needs ./helper.ab, so a module defining syntax keeps its
-# imports; view.ab writes `$seven()` through kit.ab (which passes dsl.ab on), a use of ./kit.ab; main.ab imports kit.ab
-# and never writes it: the one warning.
+# imports; view.ab writes `$seven()` through kit.ab (which passes dsl.ab on), a use of ./kit.ab; view2.ab's ./helper.ab
+# is used only by the call `$seven()` generates there; main.ab imports kit.ab and never writes it: the one warning.
 (cd "$work/syntax" && "$compiler" build main.ab -o program --fast) > "$work/syntax.log" 2>&1 ||
     fail "syntax/main.ab doesn't build" "$work/syntax.log"
 [[ $(grep -c 'W_UNUSED_IMPORT' "$work/syntax.log") == 1 ]] || fail "syntax: not exactly one warning" "$work/syntax.log"
 grep -qxF 'warning[W_UNUSED_IMPORT]: main.ab: nothing `import "./kit.ab"` declares is used here' "$work/syntax.log" ||
     fail "syntax: main.ab's unused kit.ab isn't warned" "$work/syntax.log"
+
+# An import line that calls a provider (`import providedSource()`) uses the module declaring it: ./source.ab gets no
+# warning though no other line names it.
+(cd "$work/provider" && ABLA_PACKAGE_CACHE="$work/provider/cache" "$compiler" package update --project .) \
+    > "$work/provider.log" 2>&1 || fail "provider: package update failed" "$work/provider.log"
+(cd "$work/provider" && ABLA_PACKAGE_CACHE="$work/provider/cache" "$compiler" build main.ab -o program --fast) \
+    >> "$work/provider.log" 2>&1 || fail "provider/main.ab doesn't build" "$work/provider.log"
+! grep -q 'W_UNUSED_IMPORT' "$work/provider.log" || fail "an import a provider call uses is called unused" "$work/provider.log"
 
 # A module with a runtime hook (`fun __abla...`) matters by being loaded.
 (cd "$work/hook" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/hook.log" 2>&1 ||
