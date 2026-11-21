@@ -97,6 +97,7 @@ test-serial: ablac
 	tools/test-repo-shebang-guard.sh
 	tools/test-repo-shebang-guard-selftest.sh
 	tools/test-shell-pipefail-guard.sh
+	tools/test-soak-tests.sh
 	tools/test-shell-wait-guard.sh
 	tools/test-run-limited.sh
 	tools/test-libc-imports.sh $(COMPILER)
