@@ -74,6 +74,14 @@ text_size() { llvm-size -A "$1" | awk '$1 ~ /^\.text/ { total += $2 } END { prin
 local_text=$(text_size "$output_directory/local.o")
 plain_text=$(text_size "$output_directory/local-plain.o")
 (( local_text < plain_text )) || { echo "extern-export: local .text $local_text is not below the plain exports' $plain_text"; exit 1; }
+# A live run (`ablac run`, the default on x86-64 Linux and macOS) binds extern:"c" calls by symbol lookup across the JIT
+# session's modules: local exports are kept and global there, so a program whose local definitions call one another,
+# reached or not, starts (it used to fail with "Symbols not found").
+set +e
+"$compiler" run "$cases/live/main.ab" > "$output_directory/live.out" 2>&1
+live_status=$?
+set -e
+[[ $live_status == 42 ]] || { echo "extern-export: the live run exited $live_status, not 42"; cat "$output_directory/live.out"; exit 1; }
 if "$compiler" build "$cases/local-unbound.ab" -o "$output_directory/local-unbound" --no-cache > "$output_directory/local-unbound.err" 2>&1; then
     echo "extern-export: local-unbound compiled"; exit 1
 fi
