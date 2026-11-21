@@ -2,7 +2,7 @@
 
 Internal only. Regenerate with `tools/readiness.sh`; this is an evidence inventory, not a production approval or stability policy.
 
-Source revision: `f32639daa42dbcb77002a7f6dfab6a3b90d4c5df`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.
+Source revision: `6a2c17ee409eda406a0feba69403d8b5c7606165`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.
 
 ## Stability
 
@@ -76,7 +76,7 @@ Counts are top-level migration bullets, a proxy for breaking changes. A present 
 
 Suite inventory: **545 recipe commands**, **399 case directories**. These are source inventory counts, not passing checks.
 
-Evidence: `build/gate/gate.log`; SHA-256 `924e28fb53eea28b57f2b6cb4c775debe3eeffdf488d5e17b5c2f8f1bf1ce7e5`.
+Evidence: `build/gate/gate.log`; SHA-256 `6d9ea253dd609ef18f968faad4558e8d83103335649196057b83ce2a6065a0c2`.
 
     Fixed point: Missing
     Suite: Missing
@@ -306,7 +306,7 @@ Missing: tools/test-siblings.sh summary.
 
 ## Docs
 
-Missing: stdlib public declaration documentation coverage (tools/stdlib-doc coverage.json).
+Missing: stdlib public declaration documentation coverage (ablac doc coverage.json).
 
 ## Real-world deployments
 

@@ -85,6 +85,7 @@ json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence
     if [[ -s $data/fuzz.json ]]; then
         json_check "$data/fuzz.json" 'type == "array" and all(.[]; (.command | type == "string") and (.revision | type == "string") and (.recordedAt | type == "string") and (.agree | type == "number" and . >= 0 and floor == .) and (.disagree | type == "number" and . >= 0 and floor == .) and (.exitStatus | type == "number" and floor == .))'
         evidence "$data/fuzz.json"
+        if [[ $(jq 'length' "$data/fuzz.json") == 0 ]]; then missing 'recorded fuzz campaigns'; fi
         jq -r '.[] | "Revision: \(.revision)\nRecorded: \(.recordedAt)\nCommand: \(.command)\nAgreeing seeds: \(.agree); disagreeing seeds: \(.disagree); exit status: \(.exitStatus)\n"' "$data/fuzz.json" | sed 's/^/    /'
         printf '\nExit status 124 means timeout; a partial campaign with zero disagreements is not a completed clean campaign.\n\n'
     else
@@ -146,7 +147,7 @@ json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence
         evidence "$coverage"
         jq -r '.totals | "Public declarations documented: **\(.documented)/\(.total)** (\(if .total > 0 then ((.documented * 10000 / .total | floor) / 100 | tostring) + "%" else "Missing: no declarations" end)); undocumented: **\(.undocumented)**."' "$coverage"
         printf '\nCoverage measures declared API documentation, not documentation quality or example execution.\n\n'
-    else missing 'stdlib public declaration documentation coverage (tools/stdlib-doc coverage.json)'; fi
+    else missing 'stdlib public declaration documentation coverage (ablac doc coverage.json)'; fi
     printf '## Real-world deployments\n\n'
     deployments=docs/readiness-data/deployments.tsv
     if [[ -s $deployments ]] && awk '!/^#/ && NF {found=1} END {exit !found}' "$deployments"; then

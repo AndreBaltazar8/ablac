@@ -36,7 +36,7 @@ prints evidence hashes for traceability, not as proof of freshness.
   back to `build/siblings/summary.txt`. `siblings-context.md` records compiler
   revision, invocation, scope and completion. A summary without provenance is
   presented as an unattributed saved result, never as current green.
-- `coverage.json`: `tools/stdlib-doc`'s schemaVersion 1 JSON, falling back to
+- `coverage.json`: `ablac doc`'s schemaVersion 1 JSON, falling back to
   `build/docs/coverage.json`. `totals` has `documented`, `undocumented`, `total`;
   `modules` is an array. Counts refer to public declarations.
 
