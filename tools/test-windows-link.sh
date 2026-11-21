@@ -42,9 +42,9 @@ check_executable() { # $1 = the image, $2 = what it is
     while read -r dll function; do
         [[ -z $dll ]] || grep -qxF "$dll $function" <<< "$allowed" || fail "$2: import not in tools/windows-imports-allowlist.txt: $dll $function"
     done <<< "$imports"
-    if command -v wine > /dev/null; then
-        status=0
-        WINEDEBUG=-all wine "$1" > /dev/null 2>&1 || status=$?
+    status=0
+    tools/windows/wine-run.sh "$1" > /dev/null 2>&1 || status=$?
+    if [[ $status != 125 ]]; then
         [[ $status == 7 ]] || fail "$2: under Wine the program exited with $status, not 7"
         ran='ran under Wine (exit 7)'
     else
