@@ -424,7 +424,12 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_IMPORT_PATH_UNQUOTED` | a file or standard module path needs double quotes; the help line shows the import to write |
 | `E_IMPORT_UNQUALIFIED_AMBIGUOUS` | two unaliased imports expose the same name ([modules](language.md#modules-and-imports)) |
 | `E_NAME_NOT_IMPORTED` | a [strict](language.md#strict-imports) module uses a name of a module it doesn't import; `help:` is the import to add (a warning under `--strict-imports=warn`) |
-| `E_IMPORT_ALIAS_*` | alias errors: duplicate alias, module imported twice, unknown member, alias used as a value |
+| `E_IMPORT_ALIAS_INVALID` | the import has an empty source or a spelling that can't be used as an alias |
+| `E_IMPORT_ALIAS_DUPLICATE` | two imports in the same module use the same alias |
+| `E_IMPORT_ALIAS_DECLARATION_COLLISION` | the alias has the same name as a declaration in the importing module |
+| `E_IMPORT_ALIAS_TARGET_DUPLICATE` | the same resolved module is imported more than once, even if one spelling uses an alias |
+| `E_IMPORT_ALIAS_MEMBER_UNKNOWN` | the module named by the alias exports no declaration of that name |
+| `E_IMPORT_ALIAS_USED_AS_VALUE` | an alias qualifies a declaration at compile time. It isn't a value that can be assigned, passed or returned. |
 | `E_IMPORT_REMAP_MANIFEST` | a line of the root `abla.toml`'s `[imports]` isn't `"<module>" = "<module>"` ([import remaps](packages.md#import-remaps)) |
 | `E_IMPORT_REMAP_INVALID` | a remapped module doesn't exist, maps to itself, is remapped twice, or its target is remapped too |
 | `E_IMPORT_REMAP_MISMATCH` | the target doesn't declare everything the source declares publicly with the same signatures; a `note:` per declaration missing or different |
@@ -459,6 +464,72 @@ defines `private fun answer(): int = 42`, this call reports
 ```abla fragment
 import "helpers.ab" as helpers
 fun main: int = helpers.answer()
+```
+
+The following examples import these two modules:
+
+```abla file=diagnostics-left.ab
+fun value(): int = 42
+```
+
+```abla file=diagnostics-right.ab
+fun value(): int = 0
+```
+
+An alias is an identifier. Use a name such as `left` that does not start
+with a digit and isn't a keyword.
+
+```abla error
+import "diagnostics-left.ab" as 9left
+fun main {}
+// error: E_IMPORT_ALIAS_INVALID
+```
+
+Use different aliases for different modules.
+
+```abla error
+import "diagnostics-left.ab" as dependency
+import "diagnostics-right.ab" as dependency
+fun main {}
+// error: E_IMPORT_ALIAS_DUPLICATE
+```
+
+Choose an alias that isn't already declared locally.
+
+```abla error
+import "diagnostics-left.ab" as dependency
+fun dependency(): int = 0
+fun main: int = dependency()
+// error: E_IMPORT_ALIAS_DECLARATION_COLLISION
+```
+
+Import a module once and use that import's spelling everywhere in the file.
+
+```abla error
+import "diagnostics-left.ab" as left
+import "diagnostics-left.ab"
+fun main: int = left.value()
+// error: E_IMPORT_ALIAS_TARGET_DUPLICATE
+```
+
+Use a declaration the aliased module actually exposes, such as
+`left.value()` here.
+
+```abla error
+import "diagnostics-left.ab" as left
+fun main: int = left.missing()
+// error: E_IMPORT_ALIAS_MEMBER_UNKNOWN
+```
+
+To store a value, call or reference a declaration on the module.
+
+```abla error
+import "diagnostics-left.ab" as left
+fun main: int {
+    val result = left
+    0
+}
+// error: E_IMPORT_ALIAS_USED_AS_VALUE
 ```
 
 ## Unused declarations and imports

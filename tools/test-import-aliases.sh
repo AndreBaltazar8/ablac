@@ -91,6 +91,8 @@ check_invalid() {
 check_invalid invalid-import-alias-value E_IMPORT_ALIAS_USED_AS_VALUE
 check_invalid invalid-import-alias-member E_IMPORT_ALIAS_MEMBER_UNKNOWN
 check_invalid invalid-import-alias-duplicate E_IMPORT_ALIAS_DUPLICATE
+check_invalid invalid-import-alias-invalid E_IMPORT_ALIAS_INVALID
+check_invalid invalid-import-alias-declaration-collision E_IMPORT_ALIAS_DECLARATION_COLLISION
 check_invalid \
     invalid-import-alias-target-duplicate E_IMPORT_ALIAS_TARGET_DUPLICATE
 check_invalid \
