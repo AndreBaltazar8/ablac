@@ -1,0 +1,133 @@
+// loop_field_check (#648, the n-body work): an array of objects with scalar f64 and int fields, updated in loops over several steps: pairwise interactions that
+// read and write two elements, a position advance, loop-carried accumulation into a local and into a field, two references to one element, two slots
+// holding the same object, element swaps, in-place updates that read the previous element after it was written, copies into a fresh array, and
+// conditional stores. A compiler that keeps a field in a register across iterations, hoists a load past a store through an alias, or reorders float operations
+// disagrees with the others in one of the modes. The result is the fields and the accumulated value, printed exactly.
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+import "./oracle.ab"
+
+/** One statement group of a step; `n` is the element count (at least 2), `cls` the class name. (A `val` that names an element cannot change it or be stored
+ *  (docs/ownership.md), so every write goes through `bs[i]`, and aliasing is by index: `i` equal to `j`, two indexes that name one element.) */
+fun FuzzGen.loopStep(cls: string, indent: string): array<string> {
+    val kind = this.r.below(14)
+    val dt = this.r.pick(["0.01", "0.125", "0.5", "1.0", "0.001"])
+    val lines: array<string> = []
+    if (kind <= 2) {
+        // pairwise interaction: two elements read and written; with `from` 0 the pair (i, i) is one element read and written twice
+        val from = this.r.pick(["i + 1", "i + 1", "0", "i"])
+        lines.append("for (i in 0 until n) {")
+        lines.append("    for (j in $from until n) {")
+        lines.append("        val d = bs[i].x - bs[j].x")
+        lines.append("        val w = bs[i].m * bs[j].m / (d * d + 1.0)")
+        lines.append("        bs[i].v = bs[i].v - d * w * $dt")
+        lines.append("        bs[j].v = bs[j].v + d * w * $dt + bs[i].v * 0.0625")
+        lines.append("    }")
+        lines.append("}")
+    } else if (kind == 3) {
+        lines.append("for (i in 0 until n) {")
+        lines.append("    bs[i].x = bs[i].x + $dt * bs[i].v")
+        lines.append("}")
+    } else if (kind == 4) {
+        // accumulation across iterations, into a local and into a field
+        lines.append("var acc = 0.0")
+        lines.append("for (i in 0 until n) {")
+        lines.append("    acc = acc + bs[i].v * bs[i].v * bs[i].m")
+        lines.append("    bs[i].k = bs[i].k + 1")
+        lines.append("}")
+        lines.append("energy = energy + acc * 0.5")
+    } else if (kind == 5) {
+        // two indexes naming one element
+        val index = this.r.range(0, 1)
+        lines.append("val p = $index % n")
+        lines.append("val q = ${this.r.pick(["p", "$index % n", "0"])}")
+        lines.append("bs[p].x = bs[p].x + 1.5")
+        lines.append("bs[q].x = bs[q].x * 2.0")
+        lines.append("bs[p].v = bs[p].v - bs[q].x * $dt")
+    } else if (kind == 6) {
+        // two slots holding the same object
+        val to = this.r.range(1, 3)
+        lines.append("bs[$to % n] = bs[0]")
+        lines.append("bs[0].x = bs[0].x + 0.75")
+        lines.append("bs[$to % n].v = bs[$to % n].v * 0.5")
+    } else if (kind == 7) {
+        // exchange two elements' fields through locals
+        lines.append("val s = ${this.r.range(0, 5)} % n")
+        lines.append("val u = (s + ${this.r.range(0, 3)}) % n")
+        lines.append("val tx = bs[s].x")
+        lines.append("val tv = bs[s].v")
+        lines.append("bs[s].x = bs[u].x")
+        lines.append("bs[s].v = bs[u].v")
+        lines.append("bs[u].x = tx")
+        lines.append("bs[u].v = tv")
+    } else if (kind == 8) {
+        // in place, reading the element that the previous iteration wrote
+        lines.append("for (i in 1 until n) {")
+        lines.append("    bs[i].x = bs[i].x + bs[i - 1].x * 0.5")
+        lines.append("    bs[i].k = bs[i].k + bs[i - 1].k")
+        lines.append("}")
+    } else if (kind == 9) {
+        // into a fresh array of new objects
+        lines.append("val nb: array<$cls> = []")
+        lines.append("for (i in 0 until n) nb.append($cls(bs[i].x + bs[i].v * $dt, bs[i].v, bs[i].m, bs[i].k))")
+        lines.append("bs = nb")
+    } else if (kind == 10) {
+        lines.append("for (i in 0 until n) {")
+        lines.append("    if (bs[i].v > 0.0) bs[i].x = bs[i].x + 1.0 else bs[i].x = bs[i].x - 0.5")
+        lines.append("    if (bs[i].k % 2 == 0) bs[i].v = bs[i].v * 0.9")
+        lines.append("}")
+    } else if (kind == 11) {
+        // a field read before and after the loop-carried store to the next element
+        lines.append("for (i in 0 until n) {")
+        lines.append("    val before = bs[i].x")
+        lines.append("    bs[(i + 1) % n].x = bs[(i + 1) % n].x + before * $dt")
+        lines.append("    energy = energy + (bs[i].x - before) + before * 0.25")
+        lines.append("}")
+    } else if (kind == 12) {
+        // a scalar carried in a field of one object across the whole loop (element 0 is also visited by the loop)
+        lines.append("for (i in 0 until n) {")
+        lines.append("    bs[0].v = bs[0].v + bs[i].x * $dt")
+        lines.append("    bs[i].v = bs[i].v - bs[0].v * 0.125")
+        lines.append("}")
+    } else {
+        // parallel arrays of the fields
+        lines.append("val xs: array<f64> = []")
+        lines.append("val vs: array<f64> = []")
+        lines.append("for (i in 0 until n) {")
+        lines.append("    xs.append(bs[i].x)")
+        lines.append("    vs.append(bs[i].v)")
+        lines.append("}")
+        lines.append("for (i in 0 until n) {")
+        lines.append("    xs[i] = xs[i] + vs[(i + 1) % n] * $dt")
+        lines.append("    bs[i].x = xs[i]")
+        lines.append("}")
+    }
+    // each group in a scope of its own (the same local names recur in a step)
+    val shifted: array<string> = [indent + "for (scope in 0 until 1) {"]
+    for (line in lines) shifted.append(indent + "    " + line)
+    shifted.append(indent + "}")
+    shifted
+}
+
+fun FuzzGen.loopFieldCheck(index: int): FuzzCheck {
+    val cls = "LfBody$index"
+    val lines: array<string> = ["class $cls(var x: f64, var v: f64, val m: f64, var k: int)", "", "fun c$index(): string {"]
+    val n = this.r.range(2, 5)
+    lines.append("    val n = $n")
+    lines.append("    var bs: array<$cls> = []")
+    lines.append("    for (i in 0 until n) bs.append($cls(f64FromInt(i * 3 + 1) * ${this.r.pick(["0.5", "1.0", "0.25"])}, f64FromInt(${this.r.range(-3, 3)} - i) * 0.125, f64FromInt(i + 1), ${this.r.range(0, 4)} + i))")
+    lines.append("    var energy = 0.0")
+    val steps = this.r.range(1, 6)
+    lines.append("    for (step in 0 until $steps) {")
+    val parts = this.r.range(2, 5)
+    for (part in 0 until parts) {
+        for (line in this.loopStep(cls, "        ")) lines.append(line)
+    }
+    lines.append("    }")
+    lines.append("    var out = \"\"")
+    lines.append("    for (b in bs) out = out + f64Text(b.x) + \",\" + f64Text(b.v) + \",\" + \"\${b.k};\"")
+    lines.append("    out + f64Text(energy)")
+    lines.append("}")
+    FuzzCheck(lines, "c$index()", "str", index)
+}
