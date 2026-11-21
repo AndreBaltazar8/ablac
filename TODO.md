@@ -159,9 +159,20 @@ a generated assembly file with the data symbols and the variadic printf entry po
 ordinary compiler does (`tools/test-static-compiler.sh`; it needs the static archives and skips without them). Found on the way: a C comparator returns
 its int in eax with the upper half undefined, so `qsort` must sign-extend the low 32 bits (the first crash was a corrupt sort inside LLVM); the runtime
 declares malloc/calloc/free/realloc itself, so their exports are abla_libc_* and the link binds the C names by --defsym; the compiler's own externs of
-sigaction, sigaltstack, fork, dlopen and dlsym have 32-bit signatures an export cannot match, so those five are assembly jumps; (3) the remaining families; (4) C locale; (5) threads and
-thread-local storage; (6) the dlsym table and ORC; (7) math; (8) the verification campaign (suite and stage 2 == stage 3 built by the static compiler,
-byte-compare module programs, RSS); (9) the switch (the release job packages the static binary; the `compiler` allowlist of test-libc-imports goes empty).
+sigaction, sigaltstack, fork, dlopen and dlsym have 32-bit signatures an export cannot match, so those five are assembly jumps. Done 2026-11-21: (3) the remaining
+families (wide characters, locale objects, collation, strtod through the stdlib's exact parser, UTC localtime/strftime, execve; the last 22 stubs by ablac-60-2),
+(4) the C locale tables, (5) threads (futex mutexes, rwlocks, condition variables, once, per-thread errno, pthread_t = thread id, pthread_kill = tgkill),
+(6) the dlsym table: `src/static_libc_symbols.ab` lists every symbol JIT'd code and compile-time `extern:"c"` calls may find (the library's exports, the compiler's
+abla_ct_bridge_* entry points, the hosted runtime's pthread keys, itimers ...); a name missing there fails with "Symbols not found". The table comes from the
+BUILDING compiler's source, so a table or toolchain change needs builders N, N+1, N+2 (compare N+1 with N+2). A shared object cannot be loaded (decision #88:
+compile-time nativeLibraries and dlopen of a library are unavailable; the missing-symbol message says so), (7) math from the stdlib's own routines, and printf's
+%f %e %g %a exact and correctly rounded (src/static_libc/floatfmt.ab, tools/test-libc-float-format.sh: 23,458 cases identical to glibc's output), (8) the verification
+campaign: the static compiler built by itself is byte-identical; the whole suite with it as the test compiler passes (only test-libc-imports differed, since the
+compiler has no imports: it accepts a compiler with no interpreter and no needed library); all tests/cases/modules programs and --emit-llvm text of float-heavy
+programs are byte-identical from both compilers (same ABLA_SYSROOT and job counts: a bare static binary has no launcher); peak RSS building the compiler 1.67 GB
+against 1.75 GB, hello 164 MB against 242 MB; (9) the switch is André's decision #90 (the release already carries the static compiler as an extra asset; the
+`compiler` allowlist of test-libc-imports goes empty then; the fork's static archives need Xtensa for it). Known gaps: __strtof_l rounds through a double, localtime
+is UTC, a few libm functions are approximations by composition.
 
 Step 5, the heap (ablac-87, branch heap-806-step5): the runtime heap's malloc, calloc, realloc and
 free are Abla code over mmap, munmap, mremap and madvise on x86-64 Linux (`__ablaRuntimeHostHeap*`
