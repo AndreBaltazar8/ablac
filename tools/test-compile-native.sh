@@ -78,6 +78,19 @@ else
     library="$library_directory/libctnative.so"
     clang -shared -fPIC -O1 "$cases/library/ctnative.c" -o "$library"
 fi
+. "$project_root/tools/lib/static-compiler.sh"
+if compiler_is_static "$compiler"; then
+    # The statically linked compiler loads no shared object (decision #88): the library's symbols do not resolve, and the diagnostic says why.
+    set +e
+    (cd "$cases/library" && LIBRARY_PATH="$library_directory" "$compiler" build main.ab -o "$output_directory/library" --no-cache) \
+        > "$output_directory/library-static.log" 2> "$output_directory/library-static.err"
+    static_library=$?
+    set -e
+    [[ $static_library -ne 0 ]] || { echo 'a static compiler loaded a manifest native library' >&2; exit 1; }
+    grep -q 'E_COMPILE_NATIVE_SYMBOL' "$output_directory/library-static.err"
+    grep -q 'statically linked' "$output_directory/library-static.err" ||
+        { cat "$output_directory/library-static.err" >&2; echo 'the missing-symbol diagnostic does not say the compiler is static' >&2; exit 1; }
+else
 LIBRARY_PATH="$library_directory" run_case "$cases/library" \
     "$output_directory/library" build
 expect_42 "$cases/library" "$output_directory/library" \
@@ -91,6 +104,7 @@ expect_42 "$cases/library" "$output_directory/library" \
     { cat "$output_directory/library-jit.trace" >&2; echo "library: not every site ran natively under jit" >&2; exit 1; }
 expect_42 "$cases/library" "$output_directory/library-jit" \
     LD_LIBRARY_PATH="$library_directory" DYLD_LIBRARY_PATH="$library_directory"
+fi
 
 # A library that is not found: the missing symbol names it.
 set +e

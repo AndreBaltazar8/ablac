@@ -109,11 +109,15 @@ for tier in unset jit; do
 done
 # A call through a C function pointer (dlsym, then `ablaUnsafeCallExact_*`) is one the interpreter can't make: under
 # auto such a site runs natively, though it holds no loop, lambda or recursion (native-call/, #1022).
-build native-call-auto "$cases/native-call/main.ab" -u ABLA_COMPILE_EVAL ||
-    { cat "$output/native-call-auto.trace" >&2; fail "native-call under auto did not build"; }
-[[ $(runs native-call-auto) == 42 ]] || fail "native-call under auto gave the wrong value"
-grep -q '^note\[ct-jit\]: native at' "$output/native-call-auto.trace" ||
-    { cat "$output/native-call-auto.trace" >&2; fail "native-call's site was not native under auto"; }
+# (Not with the statically linked compiler, which loads no shared object at compile time: decision #88.)
+. "$(dirname -- "${BASH_SOURCE[0]}")/lib/static-compiler.sh"
+if ! compiler_is_static "$compiler"; then
+    build native-call-auto "$cases/native-call/main.ab" -u ABLA_COMPILE_EVAL ||
+        { cat "$output/native-call-auto.trace" >&2; fail "native-call under auto did not build"; }
+    [[ $(runs native-call-auto) == 42 ]] || fail "native-call under auto gave the wrong value"
+    grep -q '^note\[ct-jit\]: native at' "$output/native-call-auto.trace" ||
+        { cat "$output/native-call-auto.trace" >&2; fail "native-call's site was not native under auto"; }
+fi
 build bounded-jit "$cases/bounded.ab" ABLA_COMPILE_EVAL=jit ||
     { cat "$output/bounded-jit.trace" >&2; fail "bounded.ab under jit did not build"; }
 [[ $(runs bounded-jit) == 42 ]] || fail "bounded.ab under jit gave the wrong values"
