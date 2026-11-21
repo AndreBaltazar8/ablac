@@ -29,7 +29,7 @@ assume the repository root.
 
 For an API, start at the [stdlib module index](../standard-library.md), then
 follow its curated module pages. The generated declaration reference, when
-you build it with `tools/stdlib-doc`, lives in `build/docs/index.md`; it is
+you build it with `build/ablac doc`, lives in `build/docs/index.md`; it is
 separate from these checked-in explanations. The [language reference](../language.md)
 describes the full rules. The existing [compact guide](../guide.md) offers a
 single-page refresher.
