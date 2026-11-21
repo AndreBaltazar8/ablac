@@ -1,0 +1,186 @@
+# Manual toolchain build only. The maintainer checks these artifacts, publishes
+# them under new names on the LLVM fork, then pins their hashes in ablac.
+name: Patched LLVM for macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'Asset revision: llvm-23.1.3-fdiv-<revision>-<architecture>-macos.tar.xz'
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Patched LLVM for ${{ matrix.architecture }}-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: macos-15, architecture: arm64}
+          - {runner: macos-15-intel, architecture: x86_64}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 350
+    env:
+      LLVM_COMMIT: 0d261d1ca552c95a8f007e061c787ac7132fbcbc # llvmorg-23.1.3
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Prepare the pinned source and build tools
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          [[ "$REVISION" =~ ^[1-9][0-9]*$ ]] || { echo 'revision must be a positive integer' >&2; exit 2; }
+          test "$(uname -m)" = '${{ matrix.architecture }}'
+          brew install --force-bottle cmake ninja gnu-tar xz
+          git init "$RUNNER_TEMP/llvm-source"
+          git -C "$RUNNER_TEMP/llvm-source" remote add origin https://github.com/llvm/llvm-project.git
+          git -C "$RUNNER_TEMP/llvm-source" fetch --depth=1 origin "$LLVM_COMMIT"
+          git -C "$RUNNER_TEMP/llvm-source" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/llvm-source" rev-parse HEAD)" = "$LLVM_COMMIT"
+          # Same source-only backport as nix/llvm.nix, relative to llvm/.
+          patch -d "$RUNNER_TEMP/llvm-source/llvm" -p1 -F 0 < nix/llvm-instcombine-fdiv-zero.patch
+      - name: Build libLLVM and its matching tools
+        run: |
+          cmake -G Ninja -S "$RUNNER_TEMP/llvm-source/llvm" -B "$RUNNER_TEMP/llvm-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$(xcrun --find clang)" \
+            -DCMAKE_CXX_COMPILER="$(xcrun --find clang++)" \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_OSX_ARCHITECTURES='${{ matrix.architecture }}' \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/llvm-install" \
+            -DCMAKE_INSTALL_NAME_DIR='@rpath' \
+            -DCMAKE_INSTALL_RPATH='@loader_path/../lib' \
+            -DLLVM_ENABLE_PROJECTS='clang;lld' \
+            -DLLVM_ENABLE_RUNTIMES=compiler-rt \
+            -DLLVM_TARGETS_TO_BUILD='X86;AArch64;WebAssembly' \
+            -DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DLLVM_DYLIB_COMPONENTS=all \
+            -DCLANG_LINK_CLANG_DYLIB=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_LIBEDIT=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_Z3_SOLVER=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCOMPILER_RT_BUILD_BUILTINS=ON \
+            -DCOMPILER_RT_BUILD_SANITIZERS=OFF -DCOMPILER_RT_BUILD_XRAY=OFF \
+            -DCOMPILER_RT_BUILD_LIBFUZZER=OFF -DCOMPILER_RT_BUILD_PROFILE=OFF \
+            -DCOMPILER_RT_BUILD_MEMPROF=OFF -DCOMPILER_RT_BUILD_ORC=OFF \
+            -DCOMPILER_RT_ENABLE_IOS=OFF -DCOMPILER_RT_ENABLE_WATCHOS=OFF \
+            -DCOMPILER_RT_ENABLE_TVOS=OFF -DCOMPILER_RT_ENABLE_XROS=OFF \
+            -DLLVM_PARALLEL_COMPILE_JOBS=2 -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DLLVM_DISTRIBUTION_COMPONENTS='LLVM;LTO;clang;clang-resource-headers;lld;opt;llc;llvm-config;llvm-ar;llvm-ranlib;llvm-as;llvm-dis;llvm-link;llvm-nm;llvm-objcopy;llvm-objdump;llvm-readobj;llvm-readelf;llvm-size;llvm-symbolizer;llvm-strip'
+          cmake --build "$RUNNER_TEMP/llvm-build" --parallel 2 --target install-distribution
+          cmake --build "$RUNNER_TEMP/llvm-build" --parallel 2 --target install-runtimes
+      - name: Check the relocated tools, library and NaN regression
+        run: |
+          # Move the installation before running anything: a build-tree rpath
+          # or install name must not make an otherwise broken archive pass.
+          mv "$RUNNER_TEMP/llvm-install" "$RUNNER_TEMP/llvm-relocated"
+          prefix="$RUNNER_TEMP/llvm-relocated"
+          test "$("$prefix/bin/llvm-config" --version)" = 23.1.3
+          for tool in opt llc clang ld.lld ld64.lld wasm-ld llvm-config llvm-ar llvm-ranlib llvm-as llvm-dis llvm-link llvm-nm llvm-objcopy llvm-objdump llvm-readobj llvm-readelf llvm-size llvm-symbolizer llvm-strip; do
+            test -x "$prefix/bin/$tool"
+          done
+          test -e "$prefix/lib/libLLVM.dylib"
+          test -e "$prefix/lib/libLTO.dylib"
+          # Reject Homebrew and build-directory dylib dependencies. Only
+          # Apple system libraries and libraries shipped here are allowed.
+          find "$prefix/bin" "$prefix/lib" -type f \( -perm -111 -o -name '*.dylib' \) -print > "$RUNNER_TEMP/llvm-files"
+          while IFS= read -r file; do
+            if ! file -b "$file" | grep -q 'Mach-O'; then continue; fi
+            otool -L "$file"
+            otool -L "$file" | sed '1d' | awk '{print $1}' > "$RUNNER_TEMP/llvm-dependencies"
+            while IFS= read -r dependency; do
+              case "$dependency" in
+                /usr/lib/*|/System/Library/*) ;;
+                @rpath/*) test -e "$prefix/lib/${dependency#@rpath/}" ;;
+                @loader_path/../lib/*) test -e "$prefix/lib/${dependency#@loader_path/../lib/}" ;;
+                *) echo "unbundled dependency: $file: $dependency" >&2; exit 1 ;;
+              esac
+            done < "$RUNNER_TEMP/llvm-dependencies"
+          done < "$RUNNER_TEMP/llvm-files"
+          # Same fixture as tests/cases/llvm-miscompiles/fdiv-zero-by-zero-times-value.ll.
+          # Keep a fallback until the standalone regression fixture lands.
+          fixture=tests/cases/llvm-miscompiles/fdiv-zero-by-zero-times-value.ll
+          if [[ ! -f "$fixture" ]]; then
+            fixture="$RUNNER_TEMP/fdiv.ll"
+            cat > "$fixture" <<'LL'
+          define double @f(i64 %n) {
+            %v = sitofp i64 %n to double
+            %m = fmul double 0.000000e+00, %v
+            %d = fdiv double 0.000000e+00, %m
+            %r = fmul double %d, 1.600000e-01
+            ret double %r
+          }
+          LL
+          fi
+          "$prefix/bin/opt" -passes=instcombine -S "$fixture" -o "$RUNNER_TEMP/fdiv-instcombine.ll"
+          sed -n '/^define .*@f(/,/^}/p' "$RUNNER_TEMP/fdiv-instcombine.ll" > "$RUNNER_TEMP/fdiv-body.ll"
+          if grep -q copysign "$RUNNER_TEMP/fdiv-body.ll"; then
+            cat "$RUNNER_TEMP/fdiv-body.ll"; exit 1
+          fi
+          # Check f itself (a constant caller alone can fold before reaching
+          # the faulty transform), then the full pipeline with a caller.
+          grep -Eq 'ret double (\+qnan|0x7FF8[0-9A-Fa-f]+)' "$RUNNER_TEMP/fdiv-body.ll"
+          { cat "$fixture"; printf '\ndefine double @g() {\n  %%r = call double @f(i64 5)\n  ret double %%r\n}\n'; } > "$RUNNER_TEMP/fdiv-call.ll"
+          "$prefix/bin/opt" -passes='default<O2>' -S "$RUNNER_TEMP/fdiv-call.ll" -o "$RUNNER_TEMP/fdiv-o2.ll"
+          sed -n '/^define .*@g(/,/^}/p' "$RUNNER_TEMP/fdiv-o2.ll" > "$RUNNER_TEMP/fdiv-result.ll"
+          cat "$RUNNER_TEMP/fdiv-body.ll" "$RUNNER_TEMP/fdiv-result.ll"
+          grep -Eq 'ret double (\+qnan|0x7FF8[0-9A-Fa-f]+)' "$RUNNER_TEMP/fdiv-result.ll"
+          # Exercise clang's optimizer and link libLLVM's C API, the same
+          # library the Mac compiler holds in process. No Homebrew LLVM.
+          cat > "$RUNNER_TEMP/llvm-smoke.c" <<'C'
+          extern void *LLVMContextCreate(void);
+          extern void LLVMContextDispose(void *);
+          volatile long input = 5;
+          int main(void) {
+            void *context = LLVMContextCreate();
+            LLVMContextDispose(context);
+            double value = 0.0 / (0.0 * (double)input) * 0.16;
+            return value == value;
+          }
+          C
+          "$prefix/bin/clang" -O2 -isysroot "$(xcrun --sdk macosx --show-sdk-path)" \
+            "$RUNNER_TEMP/llvm-smoke.c" -L"$prefix/lib" -lLLVM \
+            -Wl,-rpath,"$prefix/lib" -o "$RUNNER_TEMP/llvm-smoke"
+          "$RUNNER_TEMP/llvm-smoke"
+          "$prefix/bin/llc" -filetype=obj "$fixture" -o "$RUNNER_TEMP/fdiv.o"
+          "$prefix/bin/ld.lld" --version
+          "$prefix/bin/ld64.lld" --version
+          "$prefix/bin/wasm-ld" --version
+      - name: Pack the checked installation
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          name="llvm-23.1.3-fdiv-$REVISION-${{ matrix.architecture }}-macos"
+          mkdir -p pack
+          mv "$RUNNER_TEMP/llvm-relocated" "pack/$name"
+          {
+            echo "$name"
+            echo "LLVM llvmorg-23.1.3 $LLVM_COMMIT"
+            echo "ablac $GITHUB_SHA"
+            shasum -a 256 nix/llvm-instcombine-fdiv-zero.patch
+            xcodebuild -version
+            cmake --version
+          } > "pack/$name/SOURCE"
+          cp "$RUNNER_TEMP/llvm-source/llvm/LICENSE.TXT" "pack/$name/LICENSE.TXT"
+          gtar -C pack --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - "$name" | xz -9 -T2 > "$name.tar.xz"
+          shasum -a 256 "$name.tar.xz" | tee "$name.tar.xz.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llvm-macos-${{ matrix.architecture }}
+          path: |
+            llvm-23.1.3-fdiv-*-macos.tar.xz
+            llvm-23.1.3-fdiv-*-macos.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 14
