@@ -3,6 +3,7 @@
 // 3 boolean, 4 array, 5 object.
 
 import "abla/bytes"
+import "abla/compiler"
 import "abla/compiler/parser"
 import "abla/float/text"
 import "abla/text"
@@ -440,9 +441,9 @@ fun ablaJsonValue(value: JsonNumber): Json = jsonNumber(value)
 // An f64 interpolates as f64Text, the shortest text that reads back as the
 // value, with the same bytes at compile time and at run time; JSON has no NaN
 // or infinities: null.
-fun ablaJsonValue(value: f64): Json =
-    if (value != value || value - value != 0.0) jsonNull()
-    else jsonNumberText("$value")
+private fun jsonFloatValueText(value: f64): string =
+    if (value != value || value - value != 0.0) "null" else "$value"
+fun ablaJsonValue(value: f64): Json = jsonNumberText(jsonFloatValueText(value))
 fun ablaJsonValue(values: array<Json>): Json = jsonArray(values)
 fun ablaJsonValue(values: array<string>): Json {
     val converted: array<Json> = []
@@ -468,6 +469,36 @@ fun ablaJsonValue(values: array<bool>): Json {
 // A `$json` key written as an expression other than a string literal: only a
 // string is accepted.
 fun ablaJsonKey(key: string): string = key
+
+// Runtime leaves of `$jsonw`: typed values go straight to the caller's buffer.
+// Use the tree writer's string encoder, without a quoted intermediate copy.
+fun ablaJsonWriteValue(var out: ByteBuffer, value: string): void {
+    if (ablaCompileTimeNativeHost()) {
+        if (!jsonAppendStringNative(out, value)) out.appendText("null")
+    } else if (ablaAtCompileTime()) {
+        // The portable writer can discover a bad UTF-8 sequence after writing
+        // a prefix, so validate before touching the caller's buffer.
+        if (value.isValidUtf8()) jsonAppendStringPortable(out, value)
+        else out.appendText("null")
+    } else if (!jsonAppendStringNative(out, value)) out.appendText("null")
+    return
+}
+fun ablaJsonWriteValue(var out: ByteBuffer, value: int): void = out.appendInt(value)
+fun ablaJsonWriteValue(var out: ByteBuffer, value: bool): void =
+    out.appendText(if (value) "true" else "false")
+fun ablaJsonWriteValue(var out: ByteBuffer, value: f64): void {
+    out.appendText(jsonFloatValueText(value))
+    return
+}
+fun ablaJsonWriteValue(var out: ByteBuffer, value: JsonNumber): void {
+    out.appendText(if (jsonNumberKind(value.text) >= 0) value.text else "null")
+    return
+}
+// Explicit tree inputs are supported without building another tree.
+fun ablaJsonWriteValue(var out: ByteBuffer, value: Json): void {
+    out.appendText(jsonStringify(value))
+    return
+}
 
 fun Json.isNull(): bool = this.kind == 0
 fun Json.isString(): bool = this.kind == 1
@@ -4351,3 +4382,246 @@ compile fun ablaJsonParseStringifiedValue(
 
 #compilerRegisterSubparser("json", ablaJsonParseValue)
 #compilerRegisterSubparser("jsons", ablaJsonParseStringifiedValue)
+
+// A compile-time plan, never a runtime writer or Json tree. Parsing is shared
+// with `$json`: only the constructor syntax produced by that parser is lowered.
+compile class JsonWriteSyntaxPlan(
+    var sink: SyntaxExpression,
+    val prefix: string,
+    val statements: array<SyntaxExpression>,
+    var pending: string,
+    var nextKey: int
+)
+
+compile fun ablaJsonWriteFlush(var plan: JsonWriteSyntaxPlan): void {
+    if (plan.pending != "") {
+        plan.statements.append(syntaxCall("ablaJsonWriteText", [
+            ablaJsonWriteSink(plan.sink), syntaxString(plan.pending)
+        ]))
+        plan.pending = ""
+    }
+    return
+}
+
+// Public because generated calls resolve in the importing module.
+fun ablaJsonWriteText(var out: ByteBuffer, text: string): void = out.appendText(text)
+
+compile fun ablaJsonWriteLeaf(
+    var plan: JsonWriteSyntaxPlan,
+    value: SyntaxExpression
+): void {
+    ablaJsonWriteFlush(plan)
+    plan.statements.append(syntaxCall("ablaJsonWriteValue", [ablaJsonWriteSink(plan.sink), value]))
+    return
+}
+
+compile fun ablaJsonWriteLower(
+    var plan: JsonWriteSyntaxPlan,
+    expression: SyntaxExpression
+): void {
+    val name = syntaxText(expression)
+    if (name == "ablaJsonNull") plan.pending = plan.pending + "null"
+    else if (name == "ablaJsonNumberText") {
+        // Exact spelling was selected and checked by the shared value parser.
+        plan.pending = plan.pending + syntaxText(syntaxChild(expression, 0))
+    } else if (name == "ablaJsonString") {
+        val value = syntaxChild(expression, 0)
+        if (syntaxKind(value) == "string") {
+            plan.pending = plan.pending + jsonQuote(syntaxText(value))
+        } else ablaJsonWriteLeaf(plan, value)
+    } else if (name == "ablaJsonBoolean") {
+        plan.pending = plan.pending +
+            if (syntaxKind(syntaxChild(expression, 0)) == "true") "true" else "false"
+    } else if (name == "ablaJsonValue") {
+        ablaJsonWriteLeaf(plan, syntaxChild(expression, 0))
+    } else if (name == "ablaJsonArray") {
+        plan.pending = plan.pending + "["
+        val values = syntaxChild(expression, 0)
+        for (index in 0 until syntaxChildCount(values)) {
+            if (index > 0) plan.pending = plan.pending + ","
+            ablaJsonWriteLower(plan, syntaxChild(values, index))
+        }
+        plan.pending = plan.pending + "]"
+    } else if (name == "ablaJsonObject") ablaJsonWriteObject(plan, expression)
+    return
+}
+
+compile fun ablaJsonWriteObject(
+    var plan: JsonWriteSyntaxPlan,
+    expression: SyntaxExpression
+): void {
+    val keys = syntaxChild(expression, 0)
+    val values = syntaxChild(expression, 1)
+    val count = syntaxChildCount(keys)
+    val keyNames: array<string> = []
+    var dynamic = false
+    var invalidLiteral = false
+    for (index in 0 until count) {
+        val key = syntaxChild(keys, index)
+        if (syntaxKind(key) != "string") dynamic = true
+        else if (!syntaxText(key).isValidUtf8()) invalidLiteral = true
+    }
+    if (invalidLiteral) {
+        plan.pending = plan.pending + "null"
+        return
+    }
+    // As in jsonObject, an invalid UTF-8 key makes this whole object null.
+    // Bind computed keys once, before the values, just as `$json` does.
+    var valid = syntaxBoolean(true)
+    if (dynamic) {
+        ablaJsonWriteFlush(plan)
+        for (index in 0 until count) {
+            val key = syntaxChild(keys, index)
+            if (syntaxKind(key) == "string") keyNames.append("")
+            else {
+                val local = "${plan.prefix}_key${plan.nextKey}"
+                plan.nextKey = plan.nextKey + 1
+                keyNames.append(local)
+                plan.statements.append(syntaxLocal(local, compilerFindType("string"), key))
+                valid = syntaxBinary("&&", valid, syntaxCall("ablaJsonWriteKeyValid", [syntaxIdentifier(local)]))
+            }
+        }
+    }
+    val body = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], plan.pending, plan.nextKey)
+    plan.pending = ""
+    body.pending = body.pending + "{"
+    for (index in 0 until count) {
+        if (index > 0) body.pending = body.pending + ","
+        val key = syntaxChild(keys, index)
+        if (syntaxKind(key) == "string") {
+            body.pending = body.pending + jsonQuote(syntaxText(key)) + ":"
+        } else {
+            ablaJsonWriteLeaf(body, syntaxIdentifier(keyNames[index]))
+            body.pending = body.pending + ":"
+        }
+        ablaJsonWriteLower(body, syntaxChild(values, index))
+    }
+    body.pending = body.pending + "}"
+    if (dynamic) {
+        ablaJsonWriteFlush(body)
+        plan.nextKey = body.nextKey
+        plan.statements.append(syntaxIf(valid, syntaxBlock(body.statements),
+            syntaxCall("ablaJsonWriteText", [ablaJsonWriteSink(plan.sink), syntaxString("null")])) )
+    } else {
+        for (statement in body.statements) plan.statements.append(statement)
+        plan.pending = body.pending
+        plan.nextKey = body.nextKey
+    }
+    return
+}
+
+fun ablaJsonWriteKeyValid(key: string): bool = key.isValidUtf8()
+
+// `$jsonw(buffer) value` appends one complete value and returns that buffer.
+// The sink is evaluated once. Static tokens collapse into one append per run;
+// dynamic leaves use ordinary type-checked calls and create no Json nodes.
+compile fun ablaJsonParseWrittenValue(cursor: ParserCursor): SyntaxExpression {
+    parserExpect(cursor, "(")
+    val sink = parserParseAblaExpression(cursor)
+    parserExpect(cursor, ")")
+    val name = "ablaJsonSink_${parserSiteKey(cursor)}"
+    val plan = JsonWriteSyntaxPlan(syntaxIdentifier(name), name, [], "", 0)
+    if (syntaxKind(sink) == "identifier" || syntaxKind(sink) == "member" || syntaxKind(sink) == "index") {
+        if (!ablaJsonWriteStablePlace(sink)) {
+            parserFail(cursor, "a \$jsonw sink must be a stable buffer place or a fresh buffer expression")
+        }
+        plan.sink = ablaJsonWritePlace(plan, sink)
+    } else plan.statements.append(syntaxLocal(name, compilerFindType("ByteBuffer"), sink))
+    ablaJsonWriteLower(plan, ablaJsonParseValue(cursor))
+    ablaJsonWriteFlush(plan)
+    plan.statements.append(ablaJsonWriteSink(plan.sink))
+    syntaxBlock(plan.statements)
+}
+
+#compilerRegisterSubparser("jsonw", ablaJsonParseWrittenValue)
+
+fun ablaJsonWriteValue(var out: ByteBuffer, values: array<string>): void {
+    out.appendText("[")
+    var index = 0
+    for (value in values) {
+        if (index > 0) out.appendText(",")
+        ablaJsonWriteValue(out, value)
+        index = index + 1
+    }
+    out.appendText("]")
+    return
+}
+
+fun ablaJsonWriteValue(var out: ByteBuffer, values: array<int>): void {
+    out.appendText("[")
+    var index = 0
+    for (value in values) {
+        if (index > 0) out.appendText(",")
+        ablaJsonWriteValue(out, value)
+        index = index + 1
+    }
+    out.appendText("]")
+    return
+}
+
+fun ablaJsonWriteValue(var out: ByteBuffer, values: array<bool>): void {
+    out.appendText("[")
+    var index = 0
+    for (value in values) {
+        if (index > 0) out.appendText(",")
+        ablaJsonWriteValue(out, value)
+        index = index + 1
+    }
+    out.appendText("]")
+    return
+}
+
+fun ablaJsonWriteValue(var out: ByteBuffer, values: array<f64>): void {
+    out.appendText("[")
+    var index = 0
+    for (value in values) {
+        if (index > 0) out.appendText(",")
+        ablaJsonWriteValue(out, value)
+        index = index + 1
+    }
+    out.appendText("]")
+    return
+}
+
+fun ablaJsonWriteValue(var out: ByteBuffer, values: array<Json>): void {
+    out.appendText("[")
+    var index = 0
+    for (value in values) {
+        if (index > 0) out.appendText(",")
+        ablaJsonWriteValue(out, value)
+        index = index + 1
+    }
+    out.appendText("]")
+    return
+}
+
+// Rebuild the stable place for each use; no mutable borrow is saved as a val.
+compile fun ablaJsonWriteStablePlace(place: SyntaxExpression): bool {
+    val kind = syntaxKind(place)
+    if (kind == "identifier") true
+    else if (kind == "member" || kind == "index") ablaJsonWriteStablePlace(syntaxChild(place, 0))
+    else false
+}
+
+compile fun ablaJsonWriteSink(place: SyntaxExpression): SyntaxExpression {
+    val kind = syntaxKind(place)
+    if (kind == "member") syntaxMember(ablaJsonWriteSink(syntaxChild(place, 0)), syntaxText(place))
+    else if (kind == "index") syntaxIndex(ablaJsonWriteSink(syntaxChild(place, 0)),
+        syntaxIdentifier(syntaxText(syntaxChild(place, 1))))
+    else syntaxIdentifier(syntaxText(place))
+}
+
+compile fun ablaJsonWritePlace(
+    var plan: JsonWriteSyntaxPlan,
+    place: SyntaxExpression
+): SyntaxExpression {
+    val kind = syntaxKind(place)
+    if (kind == "member") syntaxMember(ablaJsonWritePlace(plan, syntaxChild(place, 0)), syntaxText(place))
+    else if (kind == "index") {
+        val receiver = ablaJsonWritePlace(plan, syntaxChild(place, 0))
+        val index = "${plan.prefix}_index${plan.nextKey}"
+        plan.nextKey = plan.nextKey + 1
+        plan.statements.append(syntaxLocal(index, compilerFindType("int"), syntaxChild(place, 1)))
+        syntaxIndex(receiver, syntaxIdentifier(index))
+    } else place
+}

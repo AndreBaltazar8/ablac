@@ -243,6 +243,7 @@ test-serial: ablac
 	tools/test-tar-stream.sh $(COMPILER)
 	tools/test-deep-json.sh $(COMPILER)
 	tools/test-json-expressions.sh $(COMPILER)
+	tools/test-json-stream.sh $(COMPILER)
 	tools/test-json-literal-diagnostics.sh $(COMPILER)
 	tools/test-generators-tasks.sh $(COMPILER)
 	tools/test-generator-borrowed-container.sh $(COMPILER)

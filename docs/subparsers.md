@@ -40,6 +40,13 @@ companion `$jsons` provider delegates to that grammar and wraps the resulting
 tree in deterministic `jsonStringify`; `#$jsons` therefore leaves a validated
 static string in the runtime program.
 
+`$jsonw(buffer) value` appends directly to a `ByteBuffer`, returning that buffer.
+It uses the same parser and value types as `$json`, but lowers the schema to
+appends instead of constructing a runtime tree. Static punctuation and literals
+are combined during compilation; interpolated strings use the usual JSON
+escaping and number literals retain their exact spelling. See [JSON](json.md)
+for streaming examples and evaluation order.
+
 ## Writing a subparser
 
 A subparser is a `compile fun` that takes a `ParserCursor` and returns a

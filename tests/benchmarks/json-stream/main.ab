@@ -1,0 +1,143 @@
+// Optimized, byte-identical source map envelopes and occurrence records.
+// Inputs are prepared outside the timed region. Every result is consumed.
+import "abla/bytes"
+import "abla/io"
+import "abla/json"
+import "abla/process/time"
+
+fun manualMap(file: string, paths: array<string>, contents: array<string>, mappings: string): string {
+    val out = byteBuffer()
+    out.appendText("{\"version\":3,\"file\":")
+    out.appendText(jsonQuote(file))
+    out.appendText(",\"sources\":[")
+    var i = 0
+    for (path in paths) {
+        if (i > 0) out.appendText(",")
+        out.appendText(jsonQuote(path))
+        i = i + 1
+    }
+    out.appendText("],\"sourcesContent\":[")
+    i = 0
+    for (text in contents) {
+        if (i > 0) out.appendText(",")
+        out.appendText(jsonQuote(text))
+        i = i + 1
+    }
+    // The compiler knows VLQ mappings contain no JSON escapes.
+    out.appendText("],\"names\":[],\"mappings\":\"")
+    out.appendText(mappings)
+    out.appendText("\"}")
+    out.toText()
+}
+
+fun writtenMap(file: string, paths: array<string>, contents: array<string>, mappings: string): string {
+    val out = byteBuffer()
+    $jsonw(out) {
+        "version": 3, "file": file, "sources": paths,
+        "sourcesContent": contents, "names": [], "mappings": mappings
+    }
+    out.toText()
+}
+
+fun manualOccurrences(names: array<string>, starts: array<int>, ends: array<int>): string {
+    val out = byteBuffer()
+    out.appendText("[")
+    for (i in 0 until names.size) {
+        if (i > 0) out.appendText(",")
+        out.appendText("{\"name\":")
+        jsonAppendQuoted(out, names[i])
+        out.appendText(",\"range\":{\"start\":")
+        out.appendInt(starts[i])
+        out.appendText(",\"end\":")
+        out.appendInt(ends[i])
+        out.appendText("}}")
+    }
+    out.appendText("]")
+    out.toText()
+}
+
+fun writtenOccurrences(names: array<string>, starts: array<int>, ends: array<int>): string {
+    val out = byteBuffer()
+    out.appendText("[")
+    for (i in 0 until names.size) {
+        if (i > 0) out.appendText(",")
+        $jsonw(out) {"name": names[i], "range": {"start": starts[i], "end": ends[i]}}
+    }
+    out.appendText("]")
+    out.toText()
+}
+
+fun mapSample(written: bool, paths: array<string>, contents: array<string>, mappings: string): int {
+    val begin = monotonicNanoseconds()
+    var size = 0
+    for (iteration in 0 until 1024) {
+        val text = if (written) writtenMap("compiler.wasm", paths, contents, mappings)
+            else manualMap("compiler.wasm", paths, contents, mappings)
+        size = size + text.size + text[iteration]
+    }
+    val elapsed = monotonicNanoseconds() - begin
+    println("map ${if (written) "jsonw" else "manual"} $elapsed $size")
+    elapsed
+}
+
+fun occurrenceSample(written: bool, names: array<string>, starts: array<int>, ends: array<int>): int {
+    val begin = monotonicNanoseconds()
+    var size = 0
+    for (iteration in 0 until 1024) {
+        val text = if (written) writtenOccurrences(names, starts, ends)
+            else manualOccurrences(names, starts, ends)
+        size = size + text.size + text[iteration]
+    }
+    val elapsed = monotonicNanoseconds() - begin
+    println("occurrences ${if (written) "jsonw" else "manual"} $elapsed $size")
+    elapsed
+}
+
+fun main: int {
+    val paths: array<string> = []
+    val contents: array<string> = []
+    val source = byteBuffer()
+    for (line in 0 until 80) source.appendText("fun item$line(): string = \"line $line: é \\\"\"\n")
+    for (i in 0 until 64) {
+        paths.append("file:///src/module$i.ab")
+        contents.append(source.toText())
+    }
+    val mapping = byteBuffer()
+    for (i in 0 until 16000) mapping.appendText("AAAA,")
+    val mappings = mapping.toText()
+    val names: array<string> = []
+    val starts: array<int> = []
+    val ends: array<int> = []
+    for (i in 0 until 4096) {
+        names.append("identifier$i")
+        starts.append(i * 16)
+        ends.append(i * 16 + 12)
+    }
+    if (manualMap("compiler.wasm", paths, contents, mappings) !=
+        writtenMap("compiler.wasm", paths, contents, mappings) ||
+        manualOccurrences(names, starts, ends) != writtenOccurrences(names, starts, ends)) {
+        println("FAIL bytes differ")
+        return 1
+    }
+    println("bytes map=${writtenMap("compiler.wasm", paths, contents, mappings).size} occurrences=${writtenOccurrences(names, starts, ends).size}")
+    // Warm both paths, then reverse ordering each pair to reduce drift bias.
+    mapSample(false, paths, contents, mappings)
+    mapSample(true, paths, contents, mappings)
+    occurrenceSample(false, names, starts, ends)
+    occurrenceSample(true, names, starts, ends)
+    println("samples")
+    for (sample in 0 until 9) {
+        if (sample % 2 == 0) {
+            mapSample(false, paths, contents, mappings)
+            mapSample(true, paths, contents, mappings)
+            occurrenceSample(false, names, starts, ends)
+            occurrenceSample(true, names, starts, ends)
+        } else {
+            mapSample(true, paths, contents, mappings)
+            mapSample(false, paths, contents, mappings)
+            occurrenceSample(true, names, starts, ends)
+            occurrenceSample(false, names, starts, ends)
+        }
+    }
+    0
+}

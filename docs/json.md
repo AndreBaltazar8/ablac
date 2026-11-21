@@ -574,6 +574,48 @@ fun main {
 // {"event":"ready","attempt":1}
 ```
 
+### Writing directly to a buffer
+
+`$jsonw(buffer) value` uses the same grammar as `$json`, appending one complete
+JSON value directly to a `ByteBuffer`. It returns the buffer, evaluates its
+buffer expression once, and preserves any bytes already there:
+
+```abla
+import "abla/bytes"
+import "abla/json"
+
+fun occurrence(name: string, begin: int, end: int): string {
+    val out = byteBuffer()
+    $jsonw(out) {"name": name, "range": {"start": begin, "end": end}}
+    out.toText()
+}
+```
+
+This form constructs no runtime `Json` nodes, arrays of nodes, encoder state,
+or closures for the schema. Adjacent static keys, punctuation and literals
+become one append. Dynamic integers write directly into the buffer; strings
+share the usual quoting and UTF-8 rules; fractional/exponent literals keep
+their exact source spelling. Dynamic arrays of strings, integers, booleans,
+floats or `Json` values stream their elements. An explicit `Json` input is
+serialized as given; it does not become another tree.
+
+The sink must be an owned buffer place (a variable, field or indexed element)
+or a fresh buffer expression. Indexed places evaluate their indexes once;
+interpolations must keep the selected sink place stable. A saved immutable
+borrow cannot be used as a writer, following ordinary Abla ownership rules.
+Values are evaluated as they are written. Computed keys are evaluated once,
+before the values of their object. An invalid UTF-8 key writes `null` for the
+whole containing object and skips its values; invalid string values and
+nonfinite floats write `null`. There is no transaction around the sink: if an
+interpolation fails, earlier bytes remain appended. Use an ordinary Abla loop
+to stream complete elements with `$jsonw`, adding the enclosing brackets and
+commas outside it. Conditional members likewise remain ordinary Abla code.
+
+`$jsonw` supports staging as well: a function that writes to a fresh buffer and
+returns its text can run under `#`. `tools/bench-json-stream.sh` is an opt-in
+optimized benchmark against hand-written source-map and occurrence writers;
+it checks byte identity before timing prepared inputs in alternating order.
+
 `$json`, `#$json`, `$jsons`, `#$jsons`, `#jsonParse`, and `#jsonStringify` use
 the same phase-safe implementation as runtime code. For the same tree,
 compile-time and native serialization produce identical bytes. Under `#`, the

@@ -1,0 +1,128 @@
+// `$jsonw` and `$json` must produce identical bytes, including malformed UTF-8,
+// all escape classes, exact literals, computed keys and typed interpolation.
+import "abla/bytes"
+import "abla/io"
+import "abla/json"
+
+fun streamed(text: string, n: int): string {
+    val out = byteBuffer()
+    $jsonw(out) {
+        "text": text, "number": n, "bool": n > 0,
+        "nested": [null, true, false, {}, [], {"key": text,},],
+        "literal": "quotes \" slash \\ line\n tab\t é 😀",
+        "exact": [9223372036854775808, -9223372036854775809, 1.50e-2, -0.0],
+        "ints": intValues(n),
+        "strings": stringValues(text),
+        "bools": boolValues(),
+        "floats": floatValues(),
+        "float": 0.1 + 0.2,
+        "nan": 0.0 / 0.0,
+        "inf": 1.0 / 0.0,
+        "numberText": JsonNumber("1e+02", false, 0, false),
+        "tree": jsonObject(["old"], [jsonString(text)]),
+        "trees": jsonValues(text),
+        "template$n": "v=$n",
+    }
+    out.toText()
+}
+
+fun tree(text: string, n: int): string = $jsons {
+    "text": text, "number": n, "bool": n > 0,
+    "nested": [null, true, false, {}, [], {"key": text,},],
+    "literal": "quotes \" slash \\ line\n tab\t é 😀",
+    "exact": [9223372036854775808, -9223372036854775809, 1.50e-2, -0.0],
+    "ints": intValues(n),
+    "strings": stringValues(text),
+    "bools": boolValues(),
+    "floats": floatValues(),
+    "float": 0.1 + 0.2,
+    "nan": 0.0 / 0.0,
+    "inf": 1.0 / 0.0,
+    "numberText": JsonNumber("1e+02", false, 0, false),
+    "tree": jsonObject(["old"], [jsonString(text)]),
+    "trees": jsonValues(text),
+    "template$n": "v=$n",
+}
+
+fun stringValues(text: string): array<string> = ["", text, "end"]
+fun intValues(n: int): array<int> = [n, n + 1]
+fun jsonValues(text: string): array<Json> = [jsonString(text), jsonInteger(1)]
+fun boolValues(): array<bool> = [true, false]
+fun floatValues(): array<f64> = [0.1 + 0.2, 0.0 / 0.0, 1.0 / 0.0, -0.0 * 1.0]
+
+fun keyed(key: string, value: string): string {
+    val out = byteBuffer()
+    $jsonw(out) {"before": 1, key: value, "nested": {key: [value]}}
+    out.toText()
+}
+
+val staged = #streamed("staged\n\"é", 7)
+val stagedTree = #tree("staged\n\"é", 7)
+val stagedInvalid = #streamed(byteEncode(255), 7)
+val stagedInvalidTree = #tree(byteEncode(255), 7)
+var sinkCalls = 0
+var indexCalls = 0
+class SinkBox(val output: ByteBuffer)
+fun sinkIndex(): int {
+    indexCalls = indexCalls + 1
+    0
+}
+fun sink(): ByteBuffer {
+    sinkCalls = sinkCalls + 1
+    byteBuffer()
+}
+
+fun main: int {
+    var failures = 0
+    for (text in ["", "plain", "\"\\\b\x0c\n\r\t", "é € 😀", byteEncode(0), byteEncode(31), byteEncode(255)]) {
+        for (n in [0, -1, 42, -9223372036854775808, 9223372036854775807]) {
+            if (streamed(text, n) != tree(text, n)) {
+                println("FAIL document n=$n")
+                failures = failures + 1
+            }
+        }
+        val expected = $jsons {"before": 1, text: text, "nested": {text: [text]}}
+        if (keyed(text, text) != expected) {
+            println("FAIL key")
+            failures = failures + 1
+        }
+        val out = byteBuffer()
+        $jsonw(out) text
+        if (out.toText() != jsonStringify($json text)) failures = failures + 1
+    }
+    if (staged != stagedTree || staged != streamed("staged\n\"é", 7) ||
+        stagedInvalid != stagedInvalidTree) {
+        println("FAIL staged parity")
+        failures = failures + 1
+    }
+    val out = byteBuffer()
+    out.appendText("prefix:")
+    $jsonw(out) {"v": 1}
+    out.appendText("/suffix")
+    val fresh = $jsonw(sink()) {"fresh": true}
+    if (sinkCalls != 1 || out.toText() != "prefix:{\"v\":1}/suffix" ||
+        fresh.toText() != "{\"fresh\":true}") {
+        println("FAIL sink evaluation and identity")
+        failures = failures + 1
+    }
+    val box = SinkBox(byteBuffer())
+    $jsonw(box.output) [1, 2, 3]
+    val buffers = [byteBuffer()]
+    $jsonw(buffers[sinkIndex()]) {"n": 7}
+    if (indexCalls != 1 || buffers[0].toText() != "{\"n\":7}" ||
+        box.output.toText() != "[1,2,3]") failures = failures + 1
+    for (byte in 0 until 256) {
+        val text = "prefix" + byteEncode(byte) + "suffix"
+        val buffer = byteBuffer()
+        $jsonw(buffer) [text, {"value": text}]
+        if (buffer.toText() != ($jsons [text, {"value": text}])) failures = failures + 1
+    }
+    val literal = byteBuffer()
+    $jsonw(literal) ["before", {"\xff": 1}, "\xff", "after"]
+    if (literal.toText() != ($jsons ["before", {"\xff": 1}, "\xff", "after"])) {
+        println("FAIL invalid UTF-8 literals")
+        failures = failures + 1
+    }
+    if (failures == 0) println("json-stream ok")
+    failures
+}
