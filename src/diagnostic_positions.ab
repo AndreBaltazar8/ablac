@@ -10,6 +10,7 @@
 // can't be read (a generated module) stays as it is.
 import "abla/sys/linux/fs"
 import "abla/sys/linux/io"
+import "abla/sys/linux/process"
 import "generic_types.ab"
 import "abla/text"
 
@@ -95,9 +96,74 @@ fun bootstrapCommandLineDiagnostics(raw: string): string {
     output
 }
 
+// A REPL entry (live_repl.ab): the session's source file, which the user never wrote, and the bytes the entry being
+// compiled takes in it. A place in that file is not shown as the file's: one in the entry is `entry:<line>:<column>`
+// of the entry's text (one after it up to the limit, in the code the REPL wraps it in, is the entry's end), one
+// elsewhere is the other entry it is in, and its record line is left out. The REPL that compiles each line in a child
+// compiler passes it as ABLA_REPL_ENTRY=<begin>:<end>:<limit>:<path>.
+var bootstrapDiagnosticEntryPath = ""
+var bootstrapDiagnosticEntryBegin = 0
+var bootstrapDiagnosticEntryEnd = 0
+var bootstrapDiagnosticEntryLimit = 0
+var bootstrapDiagnosticEntryRead = false
+
+fun bootstrapDiagnosticEntryFromEnvironment(): void {
+    if (bootstrapDiagnosticEntryRead) return
+    bootstrapDiagnosticEntryRead = true
+    val variable = linuxEnvironment("ABLA_REPL_ENTRY")
+    if (!variable.found || bootstrapDiagnosticEntryPath != "") return
+    val text = variable.value
+    val first = text.indexOf(":")
+    val second = if (first < 0) -1 else text.indexOf(":", first + 1)
+    val third = if (second < 0) -1 else text.indexOf(":", second + 1)
+    if (third < 0) return
+    val begin = bootstrapDiagnosticDecimal(text, 0, first)
+    val end = bootstrapDiagnosticDecimal(text, first + 1, second)
+    val limit = bootstrapDiagnosticDecimal(text, second + 1, third)
+    if (begin < 0 || end < begin || limit < end) return
+    bootstrapDiagnosticEntryBegin = begin
+    bootstrapDiagnosticEntryEnd = end
+    bootstrapDiagnosticEntryLimit = limit
+    bootstrapDiagnosticEntryPath = text.slice(third + 1, text.size)
+    return
+}
+
+// Whether the diagnostics are a REPL entry's: then a failed compile prints no summary line ("LLVM compilation failed:
+// ..."), and a message's offset into the session's file (`identifier:name@273`) is left out.
+fun bootstrapDiagnosticInEntry(): bool {
+    bootstrapDiagnosticEntryFromEnvironment()
+    bootstrapDiagnosticEntryPath != ""
+}
+
+// `line` without a trailing `@<offset>` when it is a REPL entry's diagnostic.
+fun bootstrapDiagnosticEntryMessage(line: string): string {
+    if (bootstrapDiagnosticEntryPath == "" || !(line.startsWith("error[") || line.startsWith("warning["))) return line
+    var at = line.size
+    while (at > 0 && line[at - 1] >= 48 && line[at - 1] <= 57) at = at - 1
+    if (at < line.size && at > 0 && line[at - 1] == 64) line.slice(0, at - 1) else line
+}
+
+// The place shown for `offset` in the REPL session's `contents`: in the entry, or in another one (its line).
+fun bootstrapDiagnosticEntryPlace(contents: string, offset: int): string {
+    val begin = bootstrapDiagnosticEntryBegin
+    val end = bootstrapDiagnosticEntryEnd
+    if (begin < end && begin <= offset && offset <= bootstrapDiagnosticEntryLimit && end <= contents.size) {
+        val within = if (offset > end) end - begin else offset - begin
+        return "  --> ${bootstrapDiagnosticLineColumn("entry", contents.slice(begin, end), within)}\n"
+    }
+    var lineBegin = offset
+    while (lineBegin > 0 && contents[lineBegin - 1] != 10) lineBegin = lineBegin - 1
+    var lineEnd = offset
+    while (lineEnd < contents.size && contents[lineEnd] != 10) lineEnd = lineEnd + 1
+    var text = contents.slice(lineBegin, lineEnd).trim()
+    if (text.size > 60) text = "${text.slice(0, 57)}..."
+    "  --> in another entry: `$text`\n"
+}
+
 fun bootstrapDiagnosticPositions(raw: string): string {
     // A place in a generic's instance is its generic's (generic_types.ab).
     val diagnostics = bootstrapGenericDiagnostics(raw)
+    bootstrapDiagnosticEntryFromEnvironment()
     var sources = BootstrapDiagnosticSources([], [], [])
     var output = ""
     var lineBegin = 0
@@ -106,7 +172,8 @@ fun bootstrapDiagnosticPositions(raw: string): string {
         while (lineEnd < diagnostics.size && diagnostics[lineEnd] != 10) {
             lineEnd = lineEnd + 1
         }
-        val line = diagnostics.slice(lineBegin, lineEnd)
+        val line = bootstrapDiagnosticEntryMessage(diagnostics.slice(lineBegin, lineEnd))
+        val before = output
         output = "$output$line"
         if (lineEnd < diagnostics.size) output = "$output\n"
         if (line.size > 7 && line.slice(0, 7) == "source[") {
@@ -122,7 +189,10 @@ fun bootstrapDiagnosticPositions(raw: string): string {
             if (close + 2 < middle && begin >= 0) {
                 val path = line.slice(close + 2, middle)
                 val source = bootstrapDiagnosticSource(sources, path)
-                if (sources.readable[source] &&
+                if (path == bootstrapDiagnosticEntryPath && sources.readable[source] &&
+                    begin <= sources.contents[source].size) {
+                    output = "$before${bootstrapDiagnosticEntryPlace(sources.contents[source], begin)}"
+                } else if (sources.readable[source] &&
                     begin <= sources.contents[source].size) {
                     if (lineEnd >= diagnostics.size) output = "$output\n"
                     val place = bootstrapDiagnosticLineColumn(path, sources.contents[source], begin)

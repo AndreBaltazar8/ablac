@@ -36,6 +36,14 @@ definitions=$!
 printf 'fun add(value: int): int {\n    val one = 1\n    return value + one\n}\nadd(41)\n(1 +\n2)\n(1 +\n\n20 + 22\n:quit\n' |
     session multiline 120 &
 multiline=$!
+# Commands: :help lists them, an unknown one is refused without a compile (no parser error), and a command may have
+# spaces around it (the ":quit " ends the session before the last line).
+printf ':help\n:nope 1\n20 + 22\n  :quit \n20 + 1\n' | session commands 120 &
+commands=$!
+# A diagnostic names its place in the entry (line and column of what was typed), never the session's hidden source
+# file: in a declaration over lines, in an expression, and at the end of one cut short.
+printf 'fun f(): int {\n    return missing\n}\n1 + nope\n(2 *\n\n:quit\n' | session diagnostics 120 &
+diagnostics=$!
 # Each line compiles in a child compiler (about half a second, most of it
 # the runtime, on an idle machine), so 32 generations stay within the memory
 # limit in time.
@@ -60,6 +68,8 @@ fi
 wait "$recovery"
 wait "$definitions"
 wait "$multiline"
+wait "$commands"
+wait "$diagnostics"
 wait "$generations"
 if ((live)); then
     wait "$state"
@@ -79,6 +89,15 @@ grep -q 'identifier:missingName' "$base.recovery.err"
 grep -q 'identifier:base' "$base.definitions.err"
 [[ $(< "$base.multiline.out") == $'abla> ....> ....> ....> defined\nabla> 42\nabla> ....> 3\nabla> ....> abla> 42\nabla> ' ]] ||
     { echo 'repl (multiline): an entry over several lines was not read as one' >&2; cat "$base.multiline.out" "$base.multiline.err" >&2; exit 1; }
+diagnostics_err=$(< "$base.diagnostics.err")
+[[ $diagnostics_err == *$'identifier:missing\n  --> entry:2:12\n'* && $diagnostics_err == *$'identifier:nope\n  --> entry:1:5\n'* &&
+    $(grep -c '^  --> entry:1:5$' <<< "$diagnostics_err") -ge 2 ]] &&
+    ! grep -qE 'abla-repl-source|^source\[|LLVM compilation failed|@[0-9]+$' <<< "$diagnostics_err" ||
+    { echo 'repl (diagnostics): a diagnostic did not name its place in the entry, or showed the session source file' >&2; cat "$base.diagnostics.out" "$base.diagnostics.err" >&2; exit 1; }
+commands_out=$(< "$base.commands.out")
+[[ $commands_out == 'abla> Commands:'* && $commands_out == *$'\n  :reset '* && $commands_out == *$'\nabla> abla> 42\nabla> ' ]] &&
+    [[ $(< "$base.commands.err") == 'unknown command :nope (:help lists them)' ]] ||
+    { echo 'repl (commands): :help, an unknown command or a spaced :quit was not handled as a command' >&2; cat "$base.commands.out" "$base.commands.err" >&2; exit 1; }
 [[ $(grep -o '42' "$base.generations.out" | wc -l) -eq 32 ]] || exit 1
 
-printf '%s\n' 'persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines; live: state across lines, a contained panic, a refused redefinition'
+printf '%s\n' 'persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines + commands + diagnostics placed in the entry; live: state across lines, a contained panic, a refused redefinition'

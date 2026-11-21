@@ -447,7 +447,9 @@ stderr and leaves the session as it was; a change the running code cannot take i
 program with nothing defined. Elsewhere `repl` compiles each line on its own in a child compiler, so only
 declarations persist. In both, an entry whose bracket (`(`, `[`, `{`), string or `/*` comment is still open
 continues on the next line (`....> `), so a function or class body can span lines; an empty line ends an
-entry still open.
+entry still open. `:help` lists the commands, `:quit` (or the end of the input) ends the session, and any other
+entry starting with `:` is an unknown command, refused without a compile. The REPL has no line editor yet: arrow
+keys and history come from a wrapper, `rlwrap ablac repl`.
 
 The interpreter is not a second language implementation. Compile-time `#`
 evaluation, `run`, tests, the REPL, and macro/subparser handlers share the same

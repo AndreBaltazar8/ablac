@@ -12,6 +12,7 @@
 //   in it is contained: the reload fails (E_LIVE_PANIC), its message goes to standard error and the session's state
 //   is as it was.
 // - `:reset` ends the program and starts a new one with nothing defined; `:quit` (or the end of the input) ends it.
+//   `:help` lists the commands; any other `:` entry is an unknown command, refused without a compile.
 // - A "line" is an entry (bootstrapReplReadEntry): it continues on the next lines while a bracket is open, in this
 //   REPL and in the one of a run without live mode (orc_main.ab).
 import "abla/fs"
@@ -24,6 +25,7 @@ import "abla/sys/linux/process"
 import "abla/process/exit"
 import "live_reload.ab"
 import "lexer.ab"
+import "diagnostic_positions.ab"
 
 class BootstrapReplDeclaration(val key: string, val line: string)
 
@@ -101,20 +103,72 @@ fun bootstrapReplReadEntry(var input: LinuxInput): LinuxInputLine {
     LinuxInputLine(text, true)
 }
 
+// A command entry (`:name ...`, no Abla entry starts with a colon): its name, ":help"; "" for an entry.
+fun bootstrapReplCommandName(line: string): string {
+    val text = line.trim()
+    if (!text.startsWith(":")) return ""
+    var end = 1
+    // space, tab, line break
+    while (end < text.size && text[end] != 32 && text[end] != 9 && text[end] != 10) end = end + 1
+    text.slice(0, end)
+}
+
+// The last, empty line gives the text its final line break.
+val BOOTSTRAP_REPL_HELP = """
+    Commands:
+      :help    this list
+      :reset   forget every declaration and start again
+      :quit    end the session (so does the end of the input)
+    Any other entry is Abla. A declaration (fun, val, var, class, interface, resource class, import) is added, or
+    replaces the one of the same name; anything else runs and its value, if it has one, prints. An entry goes on to
+    the next line while a bracket, a string or a comment is open; an empty line ends it.
+
+    """
+
+// A command other than :quit and :reset, which the session's loop handles: :help prints the commands, any other is
+// refused, never compiled.
+fun bootstrapReplOtherCommand(command: string): void {
+    if (command == ":help") {
+        linuxPrintStandardOutput(BOOTSTRAP_REPL_HELP)
+    } else linuxPrintStandardError("unknown command $command (:help lists them)\n")
+    return
+}
+
 // The session's program: its imports, the REPL's helpers, the declarations, the current line, and main, which waits. The
 // frontend lowers only what is referenced: __replKeep names every variable of the session (and the current line's,
 // `currentVariable`), and main refers to it under a condition that never holds, so each stays a variable of the
 // program (its initializer then runs when it is new, live_globals.ab).
+// `entry` is the user's text being tried, a declaration of `declarations` or a part of `current`: where it lies in the
+// source goes to bootstrapDiagnosticEntryBegin and End (diagnostic_positions.ab), so a diagnostic names its place in
+// the entry, not in this file.
 fun bootstrapReplSource(declarations: array<BootstrapReplDeclaration>, current: string,
-    currentVariable: string = ""): string {
+    currentVariable: string = "", entry: string = ""): string {
+    var entryBegin = -1
     var text = "import \"abla/io\"\nimport \"abla/float/text\"\nimport \"abla/sys/linux/process\"\n\n"
     for (declaration in declarations) {
-        if (declaration.line.startsWith("import ")) text = "$text${declaration.line}\n"
+        if (declaration.line.startsWith("import ")) {
+            if (declaration.line == entry) entryBegin = text.size
+            text = "$text${declaration.line}\n"
+        }
     }
     text = "${text}\nvar __replQuit = 0\n\nfun __replPrint(text: string): int {\n    println(text)\n    return 0\n}\n\nfun <T> __replArray(items: array<T>): string = \"<array of size \${items.size}>\"\n\n"
     for (declaration in declarations) {
-        if (!declaration.line.startsWith("import ")) text = "$text${declaration.line}\n"
+        if (!declaration.line.startsWith("import ")) {
+            if (declaration.line == entry) entryBegin = text.size
+            text = "$text${declaration.line}\n"
+        }
     }
+    // An entry in `current` is wrapped (a function's body, an initializer): a place after it up to the end of `current`
+    // (a parse error at the wrapper's `return`) is the entry's end.
+    var entryLimit = entryBegin + entry.size
+    val within = if (entry == "") -1 else current.indexOf(entry)
+    if (within >= 0) {
+        entryBegin = text.size + within
+        entryLimit = text.size + current.size
+    }
+    bootstrapDiagnosticEntryBegin = if (entryBegin < 0) 0 else entryBegin
+    bootstrapDiagnosticEntryEnd = if (entryBegin < 0) 0 else entryBegin + entry.size
+    bootstrapDiagnosticEntryLimit = if (entryBegin < 0) 0 else entryLimit
     var keep = "@noinline\nfun __replKeep(): int {\n"
     var kept = 0
     for (declaration in declarations) {
@@ -132,8 +186,8 @@ fun bootstrapReplSource(declarations: array<BootstrapReplDeclaration>, current: 
 // failed, 3 unavailable), its message in bootstrapReplMessage. `quiet` sends the compiler's diagnostics nowhere (a
 // first try whose failure is not the user's to read).
 trusted fun bootstrapReplReload(declarations: array<BootstrapReplDeclaration>, current: string, quiet: bool,
-    currentVariable: string = ""): int {
-    if (!Path(bootstrapReplSourcePath).writeTextAtomic(bootstrapReplSource(declarations, current, currentVariable))) {
+    currentVariable: string = "", entry: string = ""): int {
+    if (!Path(bootstrapReplSourcePath).writeTextAtomic(bootstrapReplSource(declarations, current, currentVariable, entry))) {
         bootstrapReplMessage = "the session's source could not be written ($bootstrapReplSourcePath)"
         return 2
     }
@@ -204,16 +258,21 @@ fun bootstrapReplStep(): void {
     }
     linuxPrintStandardOutput("abla> ")
     val input = bootstrapReplReadEntry(bootstrapReplInput)
-    if (!input.available || input.text == ":quit") {
+    val command = if (input.available) bootstrapReplCommandName(input.text) else ""
+    if (!input.available || command == ":quit") {
         bootstrapReplQuit = true
         bootstrapReplEnd()
         return
     }
     val line = input.text
-    if (line == ":reset") {
+    if (command == ":reset") {
         bootstrapReplQuit = false
         bootstrapReplEnd()
         linuxPrintStandardOutput("reset\n")
+        return
+    }
+    if (command != "") {
+        bootstrapReplOtherCommand(command)
         return
     }
     if (line.trim() == "") return
@@ -228,7 +287,7 @@ fun bootstrapReplStep(): void {
             } else declarations.append(BootstrapReplDeclaration(declaration.key, declaration.line))
         }
         if (!replaced) declarations.append(BootstrapReplDeclaration(key, line))
-        val status = bootstrapReplReload(declarations, "", false)
+        val status = bootstrapReplReload(declarations, "", false, "", line)
         if (status == 0) {
             bootstrapReplDeclarations = declarations
             linuxPrintStandardOutput("defined\n")
@@ -240,15 +299,15 @@ fun bootstrapReplStep(): void {
     // An expression first, its failure unshown; then an array (which does not interpolate: its size prints, whatever
     // its elements), also unshown; then the line as a statement, whose diagnostics are the user's.
     var status = bootstrapReplReload(bootstrapReplDeclarations,
-        "val __repl_$number: int = __replPrint(\"\${$line}\")", true, "__repl_$number")
+        "val __repl_$number: int = __replPrint(\"\${$line}\")", true, "__repl_$number", line)
     if (status == 2 && bootstrapReplMessage.startsWith("E_LIVE_COMPILE")) {
         status = bootstrapReplReload(bootstrapReplDeclarations,
-            "val __repl_$number: int = __replPrint(__replArray($line))", true, "__repl_$number")
+            "val __repl_$number: int = __replPrint(__replArray($line))", true, "__repl_$number", line)
     }
     if (status == 2 && bootstrapReplMessage.startsWith("E_LIVE_COMPILE")) {
         status = bootstrapReplReload(bootstrapReplDeclarations,
             "fun __repl_run_$number(): int {\n    $line\n    return 0\n}\nval __repl_$number: int = __repl_run_$number()",
-            false, "__repl_$number")
+            false, "__repl_$number", line)
     }
     bootstrapReplReport(status)
     return

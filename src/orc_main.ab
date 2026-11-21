@@ -128,7 +128,7 @@ fun bootstrapOrcEmit(sourcePath: string): int {
         linuxPrintStandardError(
             bootstrapCommandLineDiagnostics(compilation.diagnostics)
         )
-        linuxPrintStandardError(
+        if (!bootstrapDiagnosticInEntry()) linuxPrintStandardError(
             bootstrapCompilationFailedLine(compilation.parserErrors, compilation.extensionErrors, compilation.semanticErrors, compilation.irErrors, compilation.errors)
         )
     }
@@ -1044,10 +1044,13 @@ fun bootstrapOrcBuildModuleState(
 // compiler keeps tables in module values from one compilation to the next, so
 // neither a region nor the collector can give a line's memory back; the
 // child's goes back to the system when it exits.
-fun bootstrapReplCompile(sourcePath: string): LinuxProcessResult {
+// The entry takes bytes `begin` to `end` of the source, and a place after it up to `limit` is its end
+// (diagnostic_positions.ab: the child names places in the entry, not in the file).
+fun bootstrapReplCompile(sourcePath: string, begin: int, end: int, limit: int): LinuxProcessResult {
     val child = linuxCommand("/proc/self/exe")
     child.argument("--emit-llvm")
     child.argument(sourcePath)
+    child.environment("ABLA_REPL_ENTRY", "$begin:$end:$limit:$sourcePath")
     child.capture()
 }
 
@@ -1058,6 +1061,7 @@ fun bootstrapRepl(): int = if (bootstrapLiveRunSupported()) bootstrapReplLive() 
 // status when it failed.
 fun bootstrapReplLive(): int {
     bootstrapReplSourcePath = "build/.abla-repl-source.${linuxProcessId()}.ab"
+    bootstrapDiagnosticEntryPath = bootstrapReplSourcePath
     Path("build").createDirectories()
     var status = 0
     var running = true
@@ -1091,18 +1095,22 @@ fun bootstrapReplChildren(): int {
         linuxPrintStandardOutput("abla> ")
         val inputLine = bootstrapReplReadEntry(standardInput)
         val line = inputLine.text
-        if (!inputLine.available || line == ":quit") {
+        val command = if (inputLine.available) bootstrapReplCommandName(line) else ""
+        if (!inputLine.available || command == ":quit") {
             running = false
-        } else if (line == ":reset") {
+        } else if (command == ":reset") {
             declarations = ""
             linuxPrintStandardOutput("reset\n")
+        } else if (command != "") {
+            bootstrapReplOtherCommand(command)
         } else if (line != "" && bootstrapReplDeclaration(line)) {
             val source = "$declarations$line\nfun main: int = 0\n"
             if (!Path(sourcePath).writeTextAtomic(source)) {
                 status = 141
                 running = false
             } else {
-                if (bootstrapReplCompile(sourcePath).status == 0) {
+                if (bootstrapReplCompile(sourcePath, declarations.size, declarations.size + line.size,
+                    declarations.size + line.size).status == 0) {
                     declarations = "$declarations$line\n"
                     linuxPrintStandardOutput("defined\n")
                 }
@@ -1113,7 +1121,9 @@ fun bootstrapReplChildren(): int {
                 status = 141
                 running = false
             } else {
-                val compilation = bootstrapReplCompile(sourcePath)
+                // "\nfun main: int = " is 17 bytes.
+                val begin = declarations.size + 17
+                val compilation = bootstrapReplCompile(sourcePath, begin, begin + line.size, source.size)
                 if (compilation.status == 0) {
                     val llvmPath = "build/.abla-repl.${linuxProcessId()}.ll"
                     if (!Path(llvmPath).writeTextAtomic(
