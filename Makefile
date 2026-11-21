@@ -105,6 +105,7 @@ test-serial: ablac
 	tools/test-compiler-libc-needs.sh $(COMPILER)
 	tools/test-libc-functions.sh $(COMPILER)
 	tools/test-static-compiler.sh $(COMPILER)
+	tools/test-export-reflection.sh $(COMPILER)
 	tools/test-libc-float-format.sh $(COMPILER)
 	tools/test-image-identity.sh $(COMPILER)
 	tools/test-libcall-coverage.sh

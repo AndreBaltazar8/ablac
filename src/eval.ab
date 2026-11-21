@@ -5551,6 +5551,9 @@ class BootstrapEvaluator(
             if (expression.text == "functions") {
                 target = "compilerFunctions"
             }
+            if (expression.text == "exportedNames") {
+                target = "compilerExportedNames"
+            }
             if (expression.text == "functionsAnnotated") {
                 target = "compilerFunctionsAnnotated"
             }
@@ -10261,6 +10264,63 @@ fun bootstrapEvaluateCallReflection(
     initial: BootstrapEvalValue
 ): BootstrapEvalValue {
     var result = initial
+    if (targetName == "compilerExportedNames") {
+        val modules = bootstrapEvalJournalArg(evaluator, expression, 0)
+        if (bootstrapEvalLeaves(modules)) return modules
+        var valid = modules.kind == "array"
+        for (module in modules.elements) {
+            if (module.kind != "string") valid = false
+        }
+        if (valid) {
+            val requested: Map<string, int> = Map()
+            val sources: Map<string, int> = Map()
+            for (module in modules.elements) requested.set(module.text, 1)
+            if (modules.elements.size > 0) {
+                // A module can contain both ordinary names and prefixed private
+                // or shadowed names. Resolve either spelling to its parser
+                // origin so one selected identity covers the entire module.
+                for (declaration in evaluator.declarations) {
+                    val canonical = bootstrapCanonicalDeclarationModuleIdentity(declaration.name)
+                    if (declaration.sourceIdentity != "" &&
+                        (requested.has(declaration.sourceIdentity) ||
+                         canonical != "" && requested.has(canonical))) {
+                        sources.set(declaration.sourceIdentity, 1)
+                    }
+                }
+            }
+            val names: array<string> = []
+            for (declaration in evaluator.declarations) {
+                val canonical = bootstrapCanonicalDeclarationModuleIdentity(declaration.name)
+                val selected = modules.elements.size == 0 ||
+                    sources.has(declaration.sourceIdentity) ||
+                    canonical != "" && requested.has(canonical)
+                if (selected && declaration.kind == "fun" && declaration.extensionOwner == "") {
+                    var index = 0
+                    while (index < declaration.annotations.size && index < declaration.annotationArguments.size) {
+                        val annotation = declaration.annotations[index]
+                        if (annotation == "export" || annotation == "exportChecked" || annotation == "exportLocal") {
+                            val argument = declaration.annotationArguments[index]
+                            if (argument.kind == "string") names.append(argument.text)
+                            else if (argument.kind == "array") {
+                                for (name in argument.children) {
+                                    if (name.kind == "string") names.append(name.text)
+                                }
+                            }
+                        }
+                        index = index + 1
+                    }
+                }
+            }
+            val sorted = sortedStrings(names)
+            val values: array<BootstrapEvalValue> = []
+            var previous = ""
+            for (name in sorted) {
+                if (name != previous) values.append(bootstrapEvalString(name))
+                previous = name
+            }
+            result = bootstrapEvalArray(values)
+        } else evaluator.errors = evaluator.errors + 1
+    }
     // Compiler reflection handles are declaration indexes. They are
     // stable for one compilation and need no host state, so reflection
     // works identically in the self-hosted compile-time evaluator.
@@ -11241,11 +11301,11 @@ fun bootstrapEvaluateCallCompiler(
                 if (owner >= 0) {
                     canonicalName = evaluator.declarations[owner].name
                 }
-                result = bootstrapEvalString(
-                    bootstrapCanonicalDeclarationModuleIdentity(
-                        canonicalName
-                    )
-                )
+                val canonical = bootstrapCanonicalDeclarationModuleIdentity(canonicalName)
+                // Unaliased, unambiguous names need no module prefix. Their
+                // parser origin still identifies the actual declaring module.
+                result = bootstrapEvalString(if (canonical != "") canonical
+                    else evaluator.declarations[declarationIndex].sourceIdentity)
             }
             if (targetName == "compilerFunctionOwner") {
                 var ownerName = declaration.extensionOwner

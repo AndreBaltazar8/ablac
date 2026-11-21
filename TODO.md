@@ -18,6 +18,16 @@
 - Keep the measurements on performance items, and what was tried and dropped, so nobody
   repeats the work. Date them: they go stale.
 
+## Suite runner bare-compiler fingerprint (cx6)
+
+`tools/run-tests.sh` assumes a custom compiler has a `.bin` companion when
+fingerprinting it: `readlink -f` succeeds for a nonexistent leaf, then line 78
+reports "No such file or directory" and the empty stamp clears the cache every
+run. Reproduce by copying `build/ablac.bin` to `/tmp/ablac-direct` and running
+`RUN_TESTS_FILTER=test-libcall-coverage.sh tools/run-tests.sh /tmp/ablac-direct`.
+Check that the companion exists before choosing it (or use `readlink -e`).
+Owner: ablac-0c (cx6), handling it on the runner track.
+
 ## Remove Python from the suite (#807): done
 
 No tracked file is a Python script or calls the interpreter, and `tools/test-repo-language-guard.sh`

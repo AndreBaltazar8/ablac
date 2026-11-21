@@ -24,7 +24,7 @@ awk '/^fun bootstrapStaticLibcSymbolNames/ { inside = 1 } inside { print } insid
     grep -o '"[A-Za-z_0-9.]*"' | tr -d '"' | sort -u > "$out/table.txt"
 [[ $(wc -l < "$out/table.txt") -gt 200 ]] || { echo 'libcall coverage: the symbol table could not be read' >&2; exit 1; }
 # The names an AArch64 static link cannot define (bootstrapStaticLibcSymbolsNotOnAarch64): left out of that target's table.
-awk '/^fun bootstrapStaticLibcSymbolsNotOnAarch64/' src/static_libc_symbols.ab | grep -o '"[A-Za-z_0-9.]*"' | tr -d '"' | sort -u > "$out/not-aarch64.txt"
+awk '/^fun bootstrapStaticLibcSymbolsNotOnAarch64/ { inside = 1 } inside { print } inside && /^\]/ { exit }' src/static_libc_symbols.ab | grep -o '"[A-Za-z_0-9.]*"' | tr -d '"' | sort -u > "$out/not-aarch64.txt"
 [[ -s $out/not-aarch64.txt ]] || { echo 'libcall coverage: the list of names missing on AArch64 could not be read' >&2; exit 1; }
 comm -23 "$out/table.txt" "$out/not-aarch64.txt" > "$out/table.aarch64-unknown-linux-gnu.txt"
 cp "$out/table.txt" "$out/table.x86_64-unknown-linux-gnu.txt"
@@ -55,11 +55,11 @@ if [[ -n $libgcc ]]; then
     absent=$(comm -23 "$out/runtime-names.aarch64.txt" "$out/libgcc-aarch64.txt" | tr '\n' ' ')
     if [[ -n $absent ]]; then
         echo "libcall coverage: the AArch64 table names these compiler-rt routines and $libgcc does not define them (the AArch64 static link would fail with an undefined symbol): $absent" >&2
-        echo 'libcall coverage: list them in bootstrapStaticLibcSymbolsNotOnAarch64 (src/static_libc_symbols.ab), or define them in src/static_libc' >&2
+        echo 'libcall coverage: list them in bootstrapStaticLibcExtraSymbolsNotOnAarch64 (src/static_libc_symbol_extras.ab), or define them in src/static_libc; then run tools/gen-static-libc-symbols.sh' >&2
         status=1
     fi
 else
     echo 'libcall coverage: no AArch64 libgcc.a found (ABLA_AARCH64_LIBGCC or ABLA_STATIC_TARGET_LIBS): the static link check is skipped' >&2
 fi
-[[ $status == 0 ]] || { echo 'libcall coverage: add each missing name to src/static_libc_symbols.ab and define it in src/static_libc' >&2; exit 1; }
+[[ $status == 0 ]] || { echo 'libcall coverage: define each missing name in src/static_libc (or document its non-Abla definition in src/static_libc_symbol_extras.ab), then run tools/gen-static-libc-symbols.sh' >&2; exit 1; }
 echo "libcall coverage: every library call LLVM introduces for x86-64 and AArch64 ($(cat "$out"/undefined.*.txt | sort -u | wc -l) names) is in the JIT symbol table"

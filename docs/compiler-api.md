@@ -143,6 +143,7 @@ The low-level reflection ABI includes:
 
 ```abla
 compile extern:"compiler" fun compilerFunctions(): array<int>
+compile extern:"compiler" fun compilerExportedNames(modules: array<string>): array<string>
 compile extern:"compiler" fun compilerFindFunction(name: string): int
 compile extern:"compiler" fun compilerFunctionName(handle: int): string
 compile extern:"compiler" fun compilerFunctionCanonicalIdentity(handle: int): string
@@ -168,6 +169,34 @@ canonical compiler spelling (`int` currently reports as `i64`).
 names. Canonical identity and the explicit module-origin queries distinguish
 same-named declarations imported under aliases; neither result depends on the
 consumer's alias spelling.
+For a function whose name needs no canonical prefix, its module identity is
+the parser's source identity rather than an empty string.
+
+`#compiler.exportedNames(modules)` returns sorted, unique C names from
+`@export`, `@exportChecked`, and `@exportLocal` on top-level functions in the
+loaded graph. Both a string argument and an array of strings on an annotation
+are included. Pass exact identities from `compiler.functionModuleIdentity`;
+repeated identities have no effect, unknown identities match nothing, and an
+empty array selects every loaded module. The query reads declarations before
+reachability pruning, so an unused function remains discoverable. The selection
+includes every declaration of that origin even when private or shadowed names
+in the same module carry a canonical prefix. Results contain annotation names,
+including local exports; the query does not promise that the linker
+will expose them publicly. Assembly labels, data objects, linker aliases and
+exports staged by `compiler.exportFunction` are outside this query.
+
+The static compiler's JIT table in `src/static_libc_symbols.ab` is a checked-in
+reflection snapshot so bootstrap seeds need no new reflection ABI. Regenerate
+it with `tools/gen-static-libc-symbols.sh build/ablac`; the suite checks it with
+`tools/test-export-reflection.sh`. After changing the snapshot, rebuild the
+compiler passed to `tools/build-static-compiler.sh`: its compiled toolchain code
+emits the table. The generator loads the actual static entry,
+reflects its libc and compiler bridge modules, normalises private
+`abla_libc_*` implementation names to their public C aliases, and adds the
+documented assembly/data/compiler-rt names from
+`src/static_libc_symbol_extras.ab`. The unwinder's aborting `_Unwind_*` stubs
+remain excluded. Four repeated names from the original table are retained to
+preserve its assembly bytes. AArch64's half-float exclusions stay explicit.
 
 The VM reads owned IR metadata for handles and never exposes AST, semantic, C++,
 or backend pointers. Marker annotations are retained with source spans, included
