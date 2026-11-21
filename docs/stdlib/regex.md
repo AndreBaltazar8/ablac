@@ -28,6 +28,32 @@ fun main {
 
 ## API
 
+For a fixed pattern, `$regex("pattern")` checks the pattern during compilation
+and embeds a constant `Regex`, including its compiled VM program. Importing
+`abla/regex` registers the syntax; no extra `#` is required:
+
+```abla
+val pages = $regex("(\\d+)-(\\d+)")
+val match = pages.find("pages 12-48")
+if (match != null) println(match.group(1) ?? "")
+val matched = $regex("[a-z]+").matches("hello")
+println("$matched")
+```
+
+The argument must be a plain Abla string literal; it uses Abla string escaping,
+so write `\\d` for the regex escape `\d`. Interpolation, variables and other
+expressions are rejected. Invalid patterns produce `E_SUBPARSER_FAILURE` at
+the literal site, for example `invalid $regex at pattern byte 0: missing ]`.
+The byte offset refers to the decoded pattern, starting at zero. Pattern
+syntax, size limits and numbered captures are identical to `regexCompile`;
+named captures are not supported. Use `regexCompile` for patterns known only
+at run time. Matching has the same cost for a literal and a previously compiled
+runtime pattern; the literal saves the pattern compilation and its allocations.
+
+The manual `tools/bench-regex-literals.sh` compares repeated compile-and-match,
+literal reuse and reuse of a runtime-compiled matcher, checking identical match
+counts before reporting timings. It is a measurement, not a timing test.
+
 | Call | Result |
 |---|---|
 | `regexCompile(pattern)` | `RegexCompileResult`: `succeeded`, `regex`, and on failure `error` (`message`, byte `offset` into the pattern) |

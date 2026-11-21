@@ -136,6 +136,19 @@ is consumed when it is put into another node. A name given to
 the module that invokes the subparser, its `private` declarations included,
 not in the module that declares the handler.
 
+`syntaxCompile(expression, origin = expression)` builds the same expression as `#expression`.
+The ordinary compile evaluator evaluates its child and freezes the result into
+the program, with the same limits, granted effects and restrictions on values
+escaping compile time as a written `#` site. Pass a parsed `origin` when the child
+was synthesized without source spans, for example
+`syntaxCompile(syntaxCall("buildTable", []), parsedArgument)`. It locates
+diagnostics and keeps each frozen site's identity distinct; a child with zero
+source spans and no origin is rejected with `E_SYNTAX_COMPILE_ORIGIN`.
+The compile-only table builder runs once and its result is embedded in the
+program. Unlike returning `syntaxCall` alone, this requires no `#` at the
+invocation site. See the independent
+`tests/cases/syntax-compile/main.ab` example and the stdlib `$regex` handler.
+
 A call can name its arguments: `syntaxNamedArgument(name, value)` builds what
 `name = value` parses to in a call's argument list, and is valid only as an
 element of the argument array of `syntaxCall`, `syntaxCallTarget` or
