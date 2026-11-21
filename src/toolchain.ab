@@ -270,6 +270,19 @@ fun bootstrapBuiltinLinkArguments(arguments: array<string>, outputPath: string):
     command
 }
 
+// The release path's code generation in this process (#101, runtime/abla_lld_shim.cpp): `llc`'s work on a module's bitcode, with the options the C API cannot set. The
+// function takes the bitcode path, the object path, whether to verify, and returns 0, or -1 when this compiler has no code generation of its own (the external llc runs).
+// ABLA_CODEGEN_INPROCESS=0 always runs llc.
+fun bootstrapNoInProcessEmitter(bitcode: string, object: string, verify: bool): int = -1
+var bootstrapInProcessEmitter: (string, string, bool) -> int = bootstrapNoInProcessEmitter
+var bootstrapInProcessEmitterInstalled: bool = false
+
+fun bootstrapInProcessEmitterOn(): bool {
+    if (!bootstrapInProcessEmitterInstalled) return false
+    val configured = linuxEnvironment("ABLA_CODEGEN_INPROCESS")
+    !(configured.found && configured.value == "0")
+}
+
 // A Linux link runs the `ld.lld` that clang would run, without clang. Through a Nix shell's
 // clang, a small program's link was 60 ms of 330: the wrapper's shell script and clang's own
 // start, ahead of 13 ms of linking. The first link asks clang (`-###`) for the command it
@@ -2743,9 +2756,15 @@ fun bootstrapOptimizeWholeProgram(
 }
 
 // The optimized whole program's object, by llc: its loop alignment and sections are code
-// generation flags that the C API can't set, so this one stays a tool.
-fun bootstrapEmitWholeProgramObject(optimizedPath: string, objectPath: string): int =
+// generation flags that the C API can't set. The static compiler makes the object in its own process
+// (the same bytes: tools/test-codegen-inprocess.sh); any other runs llc.
+fun bootstrapEmitWholeProgramObject(optimizedPath: string, objectPath: string): int {
+    if (bootstrapInProcessEmitterOn()) {
+        val inProcess = bootstrapInProcessEmitter(optimizedPath, objectPath, bootstrapLlvmToolsVerify())
+        if (inProcess >= 0) return inProcess
+    }
     bootstrapWholeProgramObjectCommand(optimizedPath, objectPath).run()
+}
 
 fun bootstrapWholeProgramObjectCommand(optimizedPath: string, objectPath: string): LinuxCommand {
     val emitObject = linuxCommand(bootstrapHostLlvmTool("llc"))
@@ -2932,6 +2951,14 @@ fun bootstrapEmitReleaseParts(optimizedPath: string, parts: int, objectPath: str
     var status = 0
     val running: array<int> = []
     var next = 0
+    if (!compilerParts && bootstrapInProcessEmitterOn()) {
+        // In this process, a part after another: no llc to start (one hold of the cores less, a little longer for the largest programs).
+        while (status == 0 && next <= parts) {
+            status = bootstrapEmitWholeProgramObject("$optimizedPath.$next", "$objectPath.$next")
+            next = next + 1
+        }
+        next = parts + 1
+    }
     var active = 0
     while (next <= parts || active > 0) {
         while (status == 0 && next <= parts && active < jobs) {
@@ -5151,8 +5178,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 // shim, a stub abla_lld_main that returns -1 (the compiler then runs the external linker).
                 val lldObject = linuxEnvironment("ABLA_STATIC_LLD_OBJECT").value
                 // (the stubs: abla_lld_main and abla_archive_gnu both return -1)
-                val lldStub = if (lldObject != "") "" else if (aarch64Linux) ".text\n.globl abla_lld_main\n.type abla_lld_main,%function\nabla_lld_main:\nmov x0, #-1\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,%function\nabla_archive_gnu:\nmov x0, #-1\nret\n"
-                    else ".text\n.globl abla_lld_main\n.type abla_lld_main,@function\nabla_lld_main:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,@function\nabla_archive_gnu:\nxorq %rax, %rax\ndecq %rax\nret\n"
+                val lldStub = if (lldObject != "") "" else if (aarch64Linux) ".text\n.globl abla_lld_main\n.type abla_lld_main,%function\nabla_lld_main:\nmov x0, #-1\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,%function\nabla_archive_gnu:\nmov x0, #-1\nret\n.globl abla_emit_object\n.type abla_emit_object,%function\nabla_emit_object:\nmov x0, #-1\nret\n"
+                    else ".text\n.globl abla_lld_main\n.type abla_lld_main,@function\nabla_lld_main:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,@function\nabla_archive_gnu:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_emit_object\n.type abla_emit_object,@function\nabla_emit_object:\nxorq %rax, %rax\ndecq %rax\nret\n"
                 Path(dataPath).writeText((if (aarch64Linux) bootstrapStaticLibcDataAarch64() else bootstrapStaticLibcData()) + lldStub)
                 if (lldObject != "") link.argument(lldObject)
                 link.argument(dataPath)

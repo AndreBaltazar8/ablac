@@ -12,6 +12,8 @@ compiler=${1:?usage: tools/test-static-lld.sh <static compiler>}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 [[ $(uname -s) == Linux ]] || { echo 'static lld: Linux only'; exit 0; }
+# (the static archives are for building the static compiler: a program that links LLVM must not be linked on them here)
+unset ABLA_STATIC_LLVM_LIB ABLA_STATIC_ZLIB ABLA_STATIC_LLD_LIB ABLA_STATIC_LLD_INCLUDE ABLA_STATIC_LLVM_INCLUDE ABLA_STATIC_LLD_OBJECT
 unset ABLA_DEBUG ABLA_TEST_FAST_BUILDS ABLA_LINK_DIRECT ABLA_LINK_BUILTIN ABLA_LINK_INPROCESS ABLA_COMPILER_RT_BUILTINS
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$root}
 out=build/static-lld

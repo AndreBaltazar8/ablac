@@ -13,7 +13,18 @@
 #include "lld/Common/Driver.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/CodeGen/CommandFlags.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/ArchiveWriter.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FileSystem.h"
@@ -111,5 +122,94 @@ extern "C" int abla_archive_gnu(const char *arguments) {
         llvm::errs() << paths[0] << ": " << llvm::toString(std::move(failure)) << "\n";
         return 1;
     }
+    return 0;
+}
+
+// Object emission in this process, as `llc` does it (#101): the release path's code generation flags (--function-sections, --data-sections, --align-loops) are options of
+// the C++ API's TargetMachine and of the code generation passes, which the C API does not reach, so the compiler could not emit its release objects itself and ran llc.
+// This builds the TargetMachine from llvm/CodeGen/CommandFlags.h's defaults, as llc does, and runs the same code generation pipeline over the same bitcode:
+//
+//   llc -filetype=obj -relocation-model=pic -O2 [--function-sections --data-sections] [--align-loops=N] [--disable-verify] BITCODE -o OBJECT
+//
+//   int abla_emit_object(const char *bitcode, const char *object, int verify, int sections, int alignLoops)
+//
+// Returns 0, or non-zero with the reason on standard error. (The compiler's targets only: X86, AArch64, WebAssembly.) The objects are byte for byte llc's
+// (tools/test-codegen-inprocess.sh).
+extern "C" {
+void LLVMInitializeX86TargetInfo();
+void LLVMInitializeX86Target();
+void LLVMInitializeX86TargetMC();
+void LLVMInitializeX86AsmPrinter();
+void LLVMInitializeX86AsmParser();
+void LLVMInitializeAArch64TargetInfo();
+void LLVMInitializeAArch64Target();
+void LLVMInitializeAArch64TargetMC();
+void LLVMInitializeAArch64AsmPrinter();
+void LLVMInitializeAArch64AsmParser();
+void LLVMInitializeWebAssemblyTargetInfo();
+void LLVMInitializeWebAssemblyTarget();
+void LLVMInitializeWebAssemblyTargetMC();
+void LLVMInitializeWebAssemblyAsmPrinter();
+void LLVMInitializeWebAssemblyAsmParser();
+}
+
+static llvm::codegen::RegisterCodeGenFlags abla_codegen_flags;
+
+extern "C" int abla_emit_object(const char *bitcode, const char *object, int verify, int sections, int alignLoops) {
+    static bool initialized = false;
+    static int aligned = -1;
+    if (!initialized) {
+        LLVMInitializeX86TargetInfo(); LLVMInitializeX86Target(); LLVMInitializeX86TargetMC(); LLVMInitializeX86AsmPrinter(); LLVMInitializeX86AsmParser();
+        LLVMInitializeAArch64TargetInfo(); LLVMInitializeAArch64Target(); LLVMInitializeAArch64TargetMC(); LLVMInitializeAArch64AsmPrinter(); LLVMInitializeAArch64AsmParser();
+        LLVMInitializeWebAssemblyTargetInfo(); LLVMInitializeWebAssemblyTarget(); LLVMInitializeWebAssemblyTargetMC(); LLVMInitializeWebAssemblyAsmPrinter(); LLVMInitializeWebAssemblyAsmParser();
+        initialized = true;
+    }
+    if (aligned != alignLoops) {
+        // llc's --align-loops is an option of the process.
+        const std::string argument = "--align-loops=" + std::to_string(alignLoops);
+        const char *arguments[] = {"abla", argument.c_str()};
+        llvm::cl::ResetAllOptionOccurrences();
+        llvm::cl::ParseCommandLineOptions(2, arguments, "", &llvm::errs());
+        aligned = alignLoops;
+    }
+    llvm::LLVMContext context;
+    llvm::SMDiagnostic diagnostic;
+    std::unique_ptr<llvm::Module> module = llvm::parseIRFile(bitcode, diagnostic, context);
+    if (!module) {
+        diagnostic.print("abla", llvm::errs());
+        return 1;
+    }
+    llvm::Triple triple(module->getTargetTriple());
+    llvm::TargetOptions options = llvm::codegen::InitTargetOptionsFromCodeGenFlags(triple);
+    if (sections) {
+        options.FunctionSections = true;
+        options.DataSections = true;
+    }
+    std::string error;
+    const llvm::Target *target = llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target) {
+        llvm::errs() << "abla: " << error << "\n";
+        return 1;
+    }
+    std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(triple, llvm::codegen::getCPUStr(), llvm::codegen::getFeaturesStr(), options, llvm::Reloc::PIC_,
+                                                                             llvm::codegen::getExplicitCodeModel(), llvm::CodeGenOptLevel::Default));
+    if (!machine) {
+        llvm::errs() << "abla: could not create a target machine\n";
+        return 1;
+    }
+    module->setDataLayout(machine->createDataLayout());
+    std::error_code failure;
+    llvm::ToolOutputFile out(object, failure, llvm::sys::fs::OF_None);
+    if (failure) {
+        llvm::errs() << "abla: " << object << ": " << failure.message() << "\n";
+        return 1;
+    }
+    llvm::legacy::PassManager passes;
+    if (machine->addPassesToEmitFile(passes, out.os(), nullptr, llvm::CodeGenFileType::ObjectFile, /*DisableVerify=*/!verify)) {
+        llvm::errs() << "abla: the target cannot emit an object file\n";
+        return 1;
+    }
+    passes.run(*module);
+    out.keep();
     return 0;
 }

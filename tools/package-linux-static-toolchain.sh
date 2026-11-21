@@ -56,7 +56,8 @@ cleanup() {
     return "$status"
 }
 trap cleanup EXIT
-name=abla-toolchain-static-x86_64-linux
+# The directory inside the archive: ABLA_PACKAGE_NAME (the default name of the static package; the release that makes it the default asset sets abla-toolchain-x86_64-linux).
+name=${ABLA_PACKAGE_NAME:-abla-toolchain-static-x86_64-linux}
 bundle="$working/$name"
 mkdir -p "$bundle/bin" "$bundle/libexec" "$bundle/share/abla" "$bundle/share/licenses" "$bundle/lib/clang/23/lib/linux"
 
@@ -106,10 +107,10 @@ libexec/ablac.bin is one statically linked executable. Besides Abla's own code (
 Abla's own C library (src/static_libc) replaces the system's: nothing of glibc or musl is in it.
 EOF
 
-# The Xtensa installer is built by the packaged compiler itself, on an empty PATH (a libc-free static program: no shared library). --fast: a release build (-O2) still runs the
-# external opt and llc, which this package does not carry (step 4 of the static toolchain work: code generation in process for every build).
+# The Xtensa installer is built by the packaged compiler itself, on an empty PATH (a libc-free static program: no shared library), as a release build (-O2): its
+# code generation runs in the compiler's process (abla_emit_object), so there is no opt or llc to carry.
 mkdir -p "$working/native-build"
-env -i PATH="$working/native-build" ABLA_CACHE_DIR="$working/cache" HOME="$working" "$bundle/bin/ablac" build "$abla_root/tools/xtensa-native/main.ab" --no-cache --fast \
+env -i PATH="$working/native-build" ABLA_CACHE_DIR="$working/cache" HOME="$working" "$bundle/bin/ablac" build "$abla_root/tools/xtensa-native/main.ab" --no-cache \
     -o "$working/native-build/installer"
 cp "$working/native-build/installer" "$bundle/libexec/abla-install-xtensa-native"
 chmod 0755 "$bundle/libexec/abla-install-xtensa-native"
