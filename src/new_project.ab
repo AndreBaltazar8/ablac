@@ -1,0 +1,101 @@
+import "package.ab"
+import "abla/fs/secure"
+import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/text"
+
+private fun bootstrapNewUsage(): int {
+    linuxPrintStandardError("usage: ablac new <name> [--lib] [--github]\n")
+    2
+}
+
+private fun bootstrapNewError(message: string): int {
+    linuxPrintStandardError("error[E_NEW_PROJECT]: $message\n")
+    1
+}
+
+private fun bootstrapNewFiles(root: Path, name: string, library: bool, github: bool, compilerVersion: string): bool {
+    val entry = if (library) "src/lib.ab" else "src/main.ab"
+    val greeting = if (library) "lib.ab" else "greeting.ab"
+    val mainPath = if (library) "examples/hello.ab" else entry
+    val greetingImport = if (library) "../src/$greeting" else greeting
+    val build = if (library) "ablac build --project . --emit object -o build/lib.o"
+        else "ablac build --project ."
+    val run = if (library) "ablac run examples/hello.ab" else "ablac run --project ."
+    val test = "ablac test tests/greeting.ab"
+    val kind = if (library) "library" else "application"
+
+    if (!root.child("abla.toml").writeText(
+        "name = \"$name\"\nversion = \"0.1.0\"\nentry = \"$entry\"\n"
+    )) return false
+    if (!root.child("src").child(greeting).writeText(
+        "fun greeting(): string = \"Hello, Abla!\"\n"
+    )) return false
+    if (!root.child(mainPath).writeText(
+        "import \"abla/io\"\nimport \"$greetingImport\"\n\nfun main {\n    println(greeting())\n}\n"
+    )) return false
+    if (!root.child("tests/greeting.ab").writeText(
+        "import \"abla/test\"\nimport \"../src/$greeting\"\n\nfun main: int {\n    expectEqual(greeting(), \"Hello, Abla!\", \"greeting\")\n    testsPassed()\n}\n"
+    )) return false
+    if (!root.child(".gitignore").writeText("/build/\n/.abla/\n")) return false
+    if (!root.child("README.md").writeText(
+        "# $name\n\nAn Abla $kind. Run these commands from the project directory.\n\n~~~sh\n$build\n$run\n$test\n~~~\n"
+    )) return false
+    if (github && !root.child(".github/workflows/ci.yml").writeText(
+        "name: Abla CI\non: [push, pull_request]\npermissions:\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v6\n      - uses: AndreBaltazar8/setup-abla@v1\n        with:\n          version: '$compilerVersion'\n      - run: $build\n      - run: $test\n"
+    )) return false
+    true
+}
+
+private fun bootstrapNewProject(name: string, library: bool, github: bool, compilerVersion: string): int {
+    if (Path(name).linkInfo().exists()) return bootstrapNewError("'$name' already exists")
+    val parent = secureDirectory(".")
+    val prefix = ".ablac-new-${linuxProcessId()}"
+    var stage = prefix
+    var attempt = 0
+    var created = parent.createDirectoryStatus(stage, 0o777)
+    while (created == -17 && attempt < 8) {
+        attempt = attempt + 1
+        stage = "$prefix-$attempt"
+        created = parent.createDirectoryStatus(stage, 0o777)
+    }
+    if (created != 0) {
+        return bootstrapNewError("could not create a temporary directory here (error ${0 - created})")
+    }
+    val root = Path(stage)
+    if (!bootstrapNewFiles(root, name, library, github, compilerVersion)) {
+        if (!root.removeTree()) return bootstrapNewError("could not write starter files or remove '$stage'")
+        return bootstrapNewError("could not write starter files for '$name'")
+    }
+    val published = parent.renameNoReplace(stage, parent, name)
+    if (published != 0) {
+        if (!root.removeTree()) return bootstrapNewError("could not publish '$name' or remove '$stage'")
+        if (published == -17) return bootstrapNewError("'$name' already exists")
+        return bootstrapNewError("could not publish '$name' (error ${0 - published})")
+    }
+    linuxPrintStandardOutput("Created $name. See $name/README.md to build, run and test it.\n")
+    0
+}
+
+fun bootstrapNewCommand(compilerVersion: string): int {
+    val count = linuxArgumentCount()
+    if (count < 2) return bootstrapNewUsage()
+    val name = linuxArgument(1)
+    if (!bootstrapPackageNameValid(name) || name.startsWith("-")) {
+        linuxPrintStandardError("error[E_NEW_PROJECT_NAME]: start with a letter, digit or underscore. Use at most 128 letters, digits, underscores or hyphens\n")
+        return 2
+    }
+    var library = false
+    var github = false
+    var index = 2
+    while (index < count) {
+        val argument = linuxArgument(index)
+        if (argument == "--lib" && !library) library = true
+        else if (argument == "--github" && !github) github = true
+        else return bootstrapNewUsage()
+        index = index + 1
+    }
+    bootstrapNewProject(name, library, github, compilerVersion)
+}

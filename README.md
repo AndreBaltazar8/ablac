@@ -202,6 +202,11 @@ compiler for the host from `v0.2.65`, then immediately recompiles the current
 No C++ compiler implementation or generated-C bootstrap is involved.
 
 ## Using the compiler
+Start a project with `ablac new hello`, then open `hello/README.md` for
+the build, run and test commands. Use `--lib` for a library with a runnable
+example and `--github` to include a GitHub Actions workflow. The command
+creates a new directory in the current working directory.
+
 
 `make ablac` produces the single compiler interface:
 
