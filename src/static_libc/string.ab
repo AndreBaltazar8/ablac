@@ -122,13 +122,21 @@ fun libcTolower(c: int): int {
     if (x >= 65 && x <= 90) x + 32 else x
 }
 
-// qsort: heapsort over the elements, in place, the comparison called through the C function pointer. A swap goes byte by byte.
+// qsort: an introsort (below), the comparison called through the C function pointer. A swap goes 8 bytes a step.
 trusted fun libcSwap(base: int, size: int, a: int, b: int): void {
+    val left = base + a * size
+    val right = base + b * size
     var at = 0
+    while (at + 8 <= size) {
+        val x = ablaRuntimeLoadI64(left + at)
+        ablaRuntimeStoreI64(left + at, ablaRuntimeLoadI64(right + at))
+        ablaRuntimeStoreI64(right + at, x)
+        at = at + 8
+    }
     while (at < size) {
-        val x = ablaRuntimeLoadU8(base + a * size + at)
-        ablaRuntimeStoreU8(base + a * size + at, ablaRuntimeLoadU8(base + b * size + at))
-        ablaRuntimeStoreU8(base + b * size + at, x)
+        val x = ablaRuntimeLoadU8(left + at)
+        ablaRuntimeStoreU8(left + at, ablaRuntimeLoadU8(right + at))
+        ablaRuntimeStoreU8(right + at, x)
         at = at + 1
     }
     return
@@ -151,8 +159,8 @@ trusted fun libcSiftDown(base: int, size: int, compare: int, start: int, end: in
     return
 }
 
-@export("qsort")
-trusted fun libcQsort(base: int, count: int, size: int, compare: int): void {
+// qsort: heapsort over `count` elements from `base`, in place (the introsort's fallback when its partitions go bad).
+trusted fun libcHeapsort(base: int, count: int, size: int, compare: int): void {
     if (count < 2) return
     var start = (count - 2) / 2
     while (start >= 0) {
@@ -165,6 +173,81 @@ trusted fun libcQsort(base: int, count: int, size: int, compare: int): void {
         end = end - 1
         libcSiftDown(base, size, compare, 0, end)
     }
+    return
+}
+
+trusted fun libcCompareAt(base: int, size: int, compare: int, a: int, b: int): int =
+    libcInt(ablaUnsafeCallAddressPointerPointer(compare, ablaRuntimePointerFromAddress(base + a * size),
+        ablaRuntimePointerFromAddress(base + b * size)))
+
+// Insertion sort of the elements lo to hi (inclusive).
+trusted fun libcInsertionSort(base: int, size: int, compare: int, lo: int, hi: int): void {
+    var i = lo + 1
+    while (i <= hi) {
+        var j = i
+        while (j > lo && libcCompareAt(base, size, compare, j - 1, j) > 0) {
+            libcSwap(base, size, j - 1, j)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return
+}
+
+// Quicksort of the elements lo to hi (inclusive): the median of three as the pivot, the smaller side by recursion and the larger by the loop, insertion sort for 16 or
+// fewer, heapsort once `depth` partitions have gone by (so no input takes more than n log n).
+trusted fun libcQuicksort(base: int, size: int, compare: int, lo: int, hi: int, depth: int): void {
+    var low = lo
+    var high = hi
+    var budget = depth
+    while (high - low > 16) {
+        if (budget == 0) {
+            libcHeapsort(base + low * size, high - low + 1, size, compare)
+            return
+        }
+        budget = budget - 1
+        val middle = low + (high - low) / 2
+        if (libcCompareAt(base, size, compare, low, middle) > 0) libcSwap(base, size, low, middle)
+        if (libcCompareAt(base, size, compare, middle, high) > 0) {
+            libcSwap(base, size, middle, high)
+            if (libcCompareAt(base, size, compare, low, middle) > 0) libcSwap(base, size, low, middle)
+        }
+        // The pivot goes next to the end; the elements at low and high bound the scans.
+        libcSwap(base, size, middle, high - 1)
+        val pivot = high - 1
+        var i = low
+        var j = high - 1
+        var scanning = true
+        while (scanning) {
+            i = i + 1
+            while (libcCompareAt(base, size, compare, i, pivot) < 0) i = i + 1
+            j = j - 1
+            while (libcCompareAt(base, size, compare, j, pivot) > 0) j = j - 1
+            if (i >= j) scanning = false else libcSwap(base, size, i, j)
+        }
+        libcSwap(base, size, i, pivot)
+        if (i - low < high - i) {
+            libcQuicksort(base, size, compare, low, i - 1, budget)
+            low = i + 1
+        } else {
+            libcQuicksort(base, size, compare, i + 1, high, budget)
+            high = i - 1
+        }
+    }
+    libcInsertionSort(base, size, compare, low, high)
+    return
+}
+
+@export("qsort")
+trusted fun libcQsort(base: int, count: int, size: int, compare: int): void {
+    if (count < 2) return
+    var depth = 0
+    var span = count
+    while (span > 1) {
+        depth = depth + 2
+        span = span / 2
+    }
+    libcQuicksort(base, size, compare, 0, count - 1, depth)
     return
 }
 
