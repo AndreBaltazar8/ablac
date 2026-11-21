@@ -7668,6 +7668,76 @@ fun bootstrapLlvmInitializerChunkFor(
 // costs bytes there (frame addresses recomputed per block instead of kept in a local).
 val BOOTSTRAP_LLVM_INITIALIZER_CHUNKED_FROM = 10000
 
+// A name a debugger shows: one the source wrote, not one lowering made up (`__`, `$`, `#` or `.` in it).
+fun bootstrapLlvmDebugShownName(name: string): bool =
+    name != "" && !name.startsWith("__") && !bootstrapTextContains(name, "$") &&
+        !bootstrapTextContains(name, "#") && !bootstrapTextContains(name, ".")
+
+// A local's name as the source wrote it: lowering stores one as `local_<n>_<name>` (ir.ab); "" for any other
+// (a join's result, a temporary), which a debugger does not show.
+fun bootstrapLlvmDebugLocalName(storage: string): string {
+    if (!storage.startsWith("local_")) return ""
+    var at = 6
+    while (at < storage.size && storage[at] >= 48 && storage[at] <= 57) at = at + 1
+    if (at == 6 || at >= storage.size || storage[at] != 95) return ""
+    val name = storage.slice(at + 1, storage.size)
+    if (bootstrapLlvmDebugShownName(name)) name else ""
+}
+
+// A development build's parameters and locals (debug.ab, bootstrapLlvmDebugDeclareVariable), declared at the end
+// of the entry block once their storage is made. A parameter passed as a universal value is at the pointer it
+// arrives as (or its slot when it has a default); one passed as a native scalar is that value. A local is at its
+// native scalar's alloca or its universal value's.
+fun bootstrapLlvmDebugDeclareFunctionVariables(
+    var debug: BootstrapLlvmDebug,
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    function: BootstrapIrFunction,
+    functionId: int,
+    llvmFunction: i64*,
+    storage: BootstrapLlvmFunctionStorage
+): void {
+    val block = LLVMGetInsertBlock(backend.builder)
+    val direct = bootstrapLlvmDirectParameterCount(function)
+    val begin = (if (bootstrapLlvmDirectResultUsesOutput(function)) 1 else 0) +
+        (if (bootstrapLlvmDirectNeedsArgumentCount(function)) 1 else 0)
+    for (index in 0 until function.parameters.size) {
+        val name = function.parameters[index]
+        if (bootstrapLlvmDebugShownName(name)) {
+            val type = if (index < function.parameterTypes.size) function.parameterTypes[index] else ""
+            val scalar = if (index < direct) bootstrapLlvmDirectParameterScalarType(function, index) else ""
+            val slot = if (index < storage.parameters.size) storage.parameters[index] else nativeNullPointer()
+            if (scalar != "" && pointerIsNull(slot) && index < direct) {
+                bootstrapLlvmDebugDeclareVariable(debug, backend, program, functionId, name, type, scalar,
+                    LLVMGetParam(llvmFunction, i32(index + begin)), true, index + 1, -1, block)
+            } else {
+                bootstrapLlvmDebugDeclareVariable(debug, backend, program, functionId, name, type, "", slot, false,
+                    index + 1, -1, block)
+            }
+        }
+    }
+    for (index in 0 until function.locals.size) {
+        val local = function.locals[index]
+        val declaration = local.declaration
+        val name = bootstrapLlvmDebugLocalName(local.name)
+        if (name != "" && declaration >= 0 && declaration < storage.locals.size) {
+            val type = if (index < function.localTypes.size) function.localTypes[index] else ""
+            val native = storage.nativeLocals[declaration]
+            val scalar = if (declaration < storage.localTypes.size) storage.localTypes[declaration] else ""
+            val position = if (declaration < function.instructions.size)
+                function.instructions[declaration].position else -1
+            if (!pointerIsNull(native) && scalar != "") {
+                bootstrapLlvmDebugDeclareVariable(debug, backend, program, functionId, name, type, scalar,
+                    native, false, 0, position, block)
+            } else {
+                bootstrapLlvmDebugDeclareVariable(debug, backend, program, functionId, name, type, "",
+                    storage.locals[declaration], false, 0, position, block)
+            }
+        }
+    }
+    return
+}
+
 fun bootstrapLlvmEmitFunction(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -7835,6 +7905,10 @@ fun bootstrapLlvmEmitFunction(
     bootstrapLlvmInitializeParameters(
         backend, function, llvmFunction, storage
     )
+    if (debug.variables) {
+        bootstrapLlvmDebugDeclareFunctionVariables(debug, backend, program, function, functionId, llvmFunction,
+            storage)
+    }
     // The frame is pushed lazily, at the start of the first block that needs
     // it, unless the first block does or the safe point cannot move from entry
     // (and not in the global initializer, which runs once).

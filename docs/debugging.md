@@ -24,9 +24,13 @@ kind of object.
 
 What a debug build contains:
 
-- **Line tables** (DWARF 5, line tables only: no types or variables). Each
-  instruction's location is the Abla expression it was lowered from; an
-  implicit return belongs to the body's last line.
+- **Line tables** (DWARF 5). Each instruction's location is the Abla
+  expression it was lowered from; an implicit return belongs to the body's
+  last line. An optimized build (`-g` on a release build) has line tables only:
+  its optimizations would leave variables wrong.
+- **Variables and their types** in a native development build (`--fast`):
+  every function's parameters and locals, by the names the source gave them
+  ([Variables](#variables)).
 - **Source paths as the build names them.** A native object's compilation
   directory is `.` (like clang's `-fdebug-compilation-dir=.`): a source the
   build reached by a relative path keeps that path, and the standard library's
@@ -77,7 +81,44 @@ lldb build/app -o 'breakpoint set -n _exit' -o run -k bt   # stops at a panic
 
 Breakpoints take Abla files and lines (`breakpoint set -f app.ab -l 10`) or
 the readable names as a pattern (`breakpoint set -r 'app\.middle$'`; lldb reads
-a plain dotted name as a C++ scope). There is no variable information yet.
+a plain dotted name as a C++ scope). gdb takes them as they are
+(`break app.middle`, `break app.ab:10`).
+
+### Variables
+
+A development build (`--fast`) describes every function's parameters and
+locals, by the names the source gave them, with types that read their values
+as Abla wrote them (tools/test-debug-variables.sh):
+
+| Abla | Shown as |
+| --- | --- |
+| `int`, `float`, `bool` (and the sized integers) | the number or bool |
+| `string` | `{data = "pt=5", length = 4}` (a rope's `data` is null) |
+| an instance of a class | its fields: `{class = …, extension = 0, x = 2, y = 3}` (the first two are its header) |
+| a nullable instance | a pointer to it: `print *maybe` |
+| `array<int>`, `array<float>` | a pointer to `{length, capacity, data}`: `print *items.data@items.length` (gdb), `parray 3 items->data` (lldb) |
+| any other value | the universal value: `{tag, flags, word0, word1}` |
+
+```text
+(gdb) break probe.ab:14
+(gdb) run
+Breakpoint 1, probe.describe (p=..., label=...) at probe.ab:14
+(gdb) info args
+p = {class = 4611826755781206992, extension = 0, x = 2, y = 3}
+label = {data = 0x7ffff7fb2744 "pt", length = 2}
+(gdb) info locals
+items = 0x7ffff7ea8080
+maybe = 0x7ffff7ea8030
+text = {data = 0x7ffff7ea80e0 "pt=5", length = 4}
+total = 5
+ratio = 3.75
+```
+
+A field that refers to another instance is an untyped pointer (the layout does
+not say which class). `--fast` still optimizes a little (O1), so a local can
+read `<optimized out>` after its last use. The calls through the dispatch
+table appear between frames as `abla_fn_<n>_<n>` without a line, and
+`step`/`next` pass through them. A release build with `-g` has no variables.
 
 The stack a debug build prints on its own resolves with `atos` (macOS) or
 `addr2line` (Linux):
@@ -187,7 +228,10 @@ a large browser program (about 6,900 functions) it adds roughly 100 KB to the
 served module (the name section), a source map of a few MB and a debug module
 of a few tens of MB that only developer tools load, and some seconds of
 build time (code generation with line tables, and the map). `--no-debug`
-skips all of it.
+skips all of it. A native development build's variables and types add about
+40% to its executable (168 KB to 240 KB for tests/cases/debug-variables, 154
+KB to 220 KB for tests/cases/action-journal/queries.ab) and 2% to 11% to its
+build time.
 
 ## Collector trace: `ABLA_GC_TRACE=1`
 
