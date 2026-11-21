@@ -92,3 +92,15 @@ and requeued between shards. Loaded passes add eight busy loops on the same
 eight CPUs (24–31) as the eight suite jobs; quiet means no intentional extra
 load, while other work on the machine still runs. Keep results from different
 compiler snapshots separate; a queued or partial run is never a full-suite pass.
+
+The first `9b47085b` quiet sweep exposed a `test-tls-session.sh` failure at
+its first IPv6 TLS 1.3 connection: `result failed connect`, while the server
+log reported `ACCEPT [::]:44289`. That is OpenSSL's startup marker, not proof
+of a completed client handshake. The failed command and server log are retained
+in `~/archive/ablac-cx6-flakes/tls-9b-first-failure/`. Fifty fresh-server sessions
+using the same binary passed under syscall tracing. With additional failure
+diagnostics, five quiet and five loaded full test executions also passed. This
+does not establish a cause or justify retrying failed connections. The fixture
+now reports the failed connection descriptor and captures the server log and
+socket state on an unexpected positive-case failure. Full sweep rates must come
+from completed campaign unions, separately from these diagnostic reproductions.

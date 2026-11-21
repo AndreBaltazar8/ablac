@@ -42,7 +42,12 @@ run() {   # mode host ca family action [pid]
 }
 expect_ok() {
     local what=$1 result=$2
-    [[ $result == 'result ok '* ]] || { echo "tls-session ($what): [$result]" >&2; exit 1; }
+    [[ $result == 'result ok '* ]] || {
+        echo "tls-session ($what): [$result]" >&2
+        head -12 "$out/server.log" >&2
+        openssl_server_show "$port"
+        exit 1
+    }
 }
 expect_failed() {
     local what=$1 result=$2
