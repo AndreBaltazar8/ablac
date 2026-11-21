@@ -13,6 +13,9 @@
 # failure fails it too.
 # LIBC_FREE_TARGETS="x86" builds the x86-64 half only (the suite does), "a64" the AArch64 half only (CI does: the whole is 22
 # CPU-minutes, 4 minutes on 8 cores, and took 25 on a CI runner); the default is "x86 a64".
+# LIBC_FREE_RUNNER="qemu-aarch64" runs the compiler under that command, for the statically linked AArch64 compiler (#806 step C): with
+# LIBC_FREE_TARGETS=a64 the AArch64 half then has an AArch64 builder end to end, no x86-64 compiler involved (it needs ABLA_SYSROOT for the
+# stdlib, and ABLA_STATIC_LLVM_LIB unset, so the programs that import LLVM stay the exceptions the list names).
 # Usage: tools/test-libc-free-programs.sh [compiler]
 set -euo pipefail
 export LC_ALL=C
@@ -23,6 +26,8 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 [[ $(uname -s) == Linux ]] || { echo 'libc free programs: Linux only'; exit 0; }
 targets=${LIBC_FREE_TARGETS:-x86 a64}
+runner=${LIBC_FREE_RUNNER:-}
+[[ -z $runner || $targets == a64 ]] || { echo "libc free programs: LIBC_FREE_RUNNER needs LIBC_FREE_TARGETS=a64" >&2; exit 2; }
 [[ $targets == x86 || $targets == a64 || $targets == 'x86 a64' ]] ||
     { echo "libc free programs: LIBC_FREE_TARGETS must be x86, a64 or 'x86 a64'" >&2; exit 2; }
 allow=tools/libc-free-programs-allowlist.txt
@@ -39,7 +44,7 @@ build_one() { # source target -> a line in $out/<name>.<target>.result
     local source=$1 target=$2 name options=() status needed
     name=$(basename -- "$source" .ab)
     [[ $target == a64 ]] && options=(--target aarch64-linux)
-    if "$compiler" build "$source" -o "$out/$name.$target" --fast --no-cache "${options[@]}" > "$out/$name.$target.log" 2>&1; then
+    if $runner "$compiler" build "$source" -o "$out/$name.$target" --fast --no-cache "${options[@]}" > "$out/$name.$target.log" 2>&1; then
         needed=$(readelf -d "$out/$name.$target" 2> /dev/null | grep -c '(NEEDED)' || true)
         if ((needed == 0)); then status=static; else status=libc; fi
     else
@@ -48,7 +53,7 @@ build_one() { # source target -> a line in $out/<name>.<target>.result
     echo "$name $target $status" > "$out/$name.$target.result"
 }
 export -f build_one
-export compiler out
+export compiler out runner
 # The programs known not to build for x86-64 (the negative cases and the ones needing a manifest) fail for AArch64 too: the AArch64
 # half alone does not build them again (a third of the programs, and the slowest to fail).
 printf '%s\n' tests/cases/modules/*.ab > "$out/programs.txt"
@@ -78,6 +83,25 @@ grep -v '^nobuild-a64 ' "$out/actual.txt" > "$out/actual-x86.txt" || true
     grep -qx "$name" "$out/x86-failed.txt" || echo "nobuild-a64 $name"
 done | sort > "$out/actual-a64.txt"
 cat "$out/actual-x86.txt" "$out/actual-a64.txt" | sort -u > "$out/actual.txt"
+# With LIBC_FREE_RUNNER the builder is the AArch64 compiler under an emulator, which differs from the x86-64 cross compiler in two named ways
+# (tools/libc-free-programs-qemu.txt, may only shrink): `exec NAME`: a program big enough to be built in parts, each by the compiler re-executing
+# /proc/self/exe, which qemu-user cannot do without binfmt_misc (execve fails with ENOEXEC; on an AArch64 machine it works), so it must still fail
+# to build here; `differs NAME`: the AArch64 compiler builds it where the x86-64 cross compiler cannot, so its nobuild-a64 line does not apply.
+runner_failed=0
+if [[ -n $runner ]]; then
+    qemu_list=tools/libc-free-programs-qemu.txt
+    sort -cu "$qemu_list" || { echo "libc free programs: $qemu_list must be sorted and unique" >&2; exit 1; }
+    for kind in exec differs; do sed -n "s/^$kind \\(.*\\)\$/\\1/p" "$qemu_list" | sort > "$out/qemu-$kind.txt"; done
+    for name in $(cat "$out/qemu-exec.txt"); do
+        if grep -qx "$name a64 static" "$out/results.txt"; then
+            echo "libc free programs: $name builds under the emulator now (remove its exec line from $qemu_list)" >&2
+            runner_failed=1
+        fi
+    done
+    # Their failures are the expected ones: not new.
+    { grep -vxF -f <(sed 's/^/nobuild-a64 /' "$out/qemu-exec.txt") "$out/actual.txt" || true; } > "$out/actual.filtered"
+    mv "$out/actual.filtered" "$out/actual.txt"
+fi
 # The allowlist lines of the targets built.
 expected=$out/expected.txt
 case $targets in
@@ -85,9 +109,13 @@ case $targets in
     a64) { grep '^nobuild-a64 ' "$allow" || true; } > "$expected" ;;
     *) cp "$allow" "$expected" ;;
 esac
+if [[ -n $runner ]]; then
+    { grep -vxF -f <(sed 's/^/nobuild-a64 /' "$out/qemu-differs.txt") "$expected" || true; } > "$out/expected.filtered"
+    mv "$out/expected.filtered" "$expected"
+fi
 new=$(comm -13 "$expected" "$out/actual.txt" || true)
 gone=$(comm -23 "$expected" "$out/actual.txt" || true)
 if [[ -n $new ]]; then echo "libc free programs: not on $allow, but linking libc or not building:" >&2; echo "$new" >&2; fi
 if [[ -n $gone ]]; then echo "libc free programs: on $allow, but static and building now (remove the line):" >&2; echo "$gone" >&2; fi
-[[ -z $new && -z $gone ]] || exit 1
+[[ -z $new && -z $gone && $runner_failed == 0 ]] || exit 1
 echo "libc free programs ($targets): $(grep -c ' static$' "$out/results.txt") static builds of $(wc -l < "$out/results.txt"), $(wc -l < "$expected") allowed exceptions"
