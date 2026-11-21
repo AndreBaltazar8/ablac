@@ -12,6 +12,11 @@ if [[ $(uname -s) != Darwin && -z ${IN_NIX_SHELL:-} ]]; then
     printf -v self_command '%q ' "$project_root/tools/build-self-hosted-current.sh" "$@"
     exec nix-shell "$project_root/shell.nix" --run "$self_command"
 fi
+if [[ $(uname -s) == Darwin && -n ${ABLA_LLVM:-} ]]; then
+    # Released seeds name Homebrew's libLLVM. Give the seed the patched
+    # library too; its child build launcher sets this again before exec.
+    export DYLD_LIBRARY_PATH="$ABLA_LLVM/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+fi
 
 compiler=$1
 if [[ $compiler != /* ]]; then compiler=$project_root/$compiler; fi
