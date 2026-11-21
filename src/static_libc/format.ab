@@ -1,8 +1,7 @@
 // printf for the statically linked compiler's C library (#806 step C, the printf family): vsnprintf over the System V x86-64 va_list, and the
 // variadic entry points (snprintf, sprintf, __printf_chk, __snprintf_chk) as assembly that builds the va_list and calls it (src/toolchain.ab,
 // bootstrapStaticLibcData). Conversions: %d %i %u %x %X %o %c %s %p %% with flags - + space # 0, a width and a precision (also *), the
-// length modifiers hh h l ll z j t. Floating-point conversions (%f %e %g) print the shortest decimal that reads back (abla/float/text), cut to
-// the precision for %f and %g; they match C for the values LLVM prints (small decimals) and not digit for digit in general.
+// length modifiers hh h l ll z j t. Floating-point conversions (%f %F %e %E %g %G %a %A) are exact and correctly rounded as glibc's (floatfmt.ab).
 import "abla/runtime/scalar"
 import "abla/float"
 import "abla/bytes"
@@ -11,6 +10,7 @@ import "abla/float/text"
 import "abla/simd/target"
 import "./string.ab"
 import "./stdio.ab"
+import "./floatfmt.ab"
 
 // The va_list: System V x86-64's gp_offset (4 bytes), fp_offset (4), overflow_arg_area (8), reg_save_area (8); on AArch64 (AAPCS64) the
 // stack pointer (8), the end of the general register save area (8), the end of the vector one (8), and the two offsets from those ends as
@@ -241,14 +241,20 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
                 body = copy
             }
             precision = -1
-        } else if (conversion == 102 || conversion == 70 || conversion == 101 || conversion == 69 || conversion == 103 || conversion == 71) {
+        } else if (conversion == 102 || conversion == 70 || conversion == 101 || conversion == 69 || conversion == 103 || conversion == 71 ||
+            conversion == 97 || conversion == 65) {
             val value = libcVaDouble(list)
             body = libcFloat(value, conversion, precision, alternate)
             if (body.size > 0 && body[0] == 45) {
                 sign = "-"
                 body = body.slice(1, body.size)
             } else sign = if (plus) "+" else if (space) " " else ""
-            numeric = true
+            // inf and nan are padded with spaces, never zeros; a %a keeps its 0x before the zeros of a zero-padded field.
+            numeric = value - value == 0.0
+            if (numeric && (conversion == 97 || conversion == 65)) {
+                sign = sign + body.slice(0, 2)
+                body = body.slice(2, body.size)
+            }
         } else {
             // An unknown conversion is written as it came.
             out.put(37)
@@ -283,68 +289,6 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
 
 // One byte as a one-byte string (the C strings here are bytes, not UTF-8 text).
 fun utf8ByteText(byte: int): string = byteEncode(byte)
-
-// The shortest-decimal digits of `value`, laid out as the conversion asks; a cut to the precision rounds half up on the shortest digits.
-fun libcFloat(value: f64, conversion: int, precision: int, alternate: bool): string {
-    val text = f64Text(value)
-    // f64Text gives forms like "1.5", "-0.25", "1e21", "NaN", "Infinity"; nothing else is expected from LLVM's callers.
-    var shown = text
-    if (conversion == 102 || conversion == 70) {
-        val dot = shown.indexOf(".")
-        val wanted = if (precision < 0) 6 else precision
-        if (dot < 0) {
-            var whole = shown
-            if (wanted > 0) {
-                whole = whole + "."
-                var i = 0
-                while (i < wanted) {
-                    whole = whole + "0"
-                    i = i + 1
-                }
-            }
-            return whole
-        }
-        val fraction = shown.slice(dot + 1, shown.size)
-        if (fraction.size <= wanted) {
-            var padded = fraction
-            while (padded.size < wanted) padded = padded + "0"
-            return shown.slice(0, dot) + (if (wanted > 0) "." + padded else "")
-        }
-        // Cut and round half up on the digit after the last kept one.
-        var kept = shown.slice(0, dot) + fraction.slice(0, wanted)
-        val next = fraction[wanted]
-        var digits = kept
-        if (next >= 53) digits = libcIncrementDigits(kept)
-        val negative = digits.size > 0 && digits[0] == 45
-        val integerSize = digits.size - wanted
-        return digits.slice(0, integerSize) + (if (wanted > 0) "." + digits.slice(integerSize, digits.size) else "")
-    }
-    shown
-}
-
-// "-12" -> "-13", "199" -> "200", "-0" -> "-1" as digit strings (the sign kept).
-fun libcIncrementDigits(digits: string): string {
-    var negative = false
-    var body = digits
-    if (body.size > 0 && body[0] == 45) {
-        negative = true
-        body = body.slice(1, body.size)
-    }
-    var out = ""
-    var carry = 1
-    var i = body.size - 1
-    while (i >= 0) {
-        var d = body[i] - 48 + carry
-        if (d == 10) {
-            d = 0
-            carry = 1
-        } else carry = 0
-        out = byteEncode(48 + d) + out
-        i = i - 1
-    }
-    if (carry == 1) out = "1" + out
-    if (negative) "-" + out else out
-}
 
 @export("vsnprintf")
 trusted fun libcVsnprintf(buffer: int, size: int, format: int, list: int): int {

@@ -1,0 +1,265 @@
+// printf's floating-point conversions for the statically linked compiler's C library (#806 step C): %f %F %e %E %g %G %a %A of a double in the C
+// locale, digit for digit what glibc prints: the exact binary value is expanded in decimal (a big integer in base 10^9 limbs: the mantissa times
+// 2^e, or times 5^-e with the decimal point moved) and rounded to the precision to nearest, ties to even, as the default rounding mode does.
+import "abla/float"
+import "abla/bytes"
+import "abla/array"
+
+// |value| = 0.DIGITS x 10^point, the digits most significant first with no leading or trailing zero; zero has no digits.
+class LibcDecimal(val digits: array<int>, val point: int)
+
+private fun libcMultiply(var limbs: array<int>, factor: int): void {
+    var carry = 0
+    for (i in 0 until limbs.size) {
+        val product = limbs[i] * factor + carry
+        limbs[i] = product % 1000000000
+        carry = product / 1000000000
+    }
+    while (carry > 0) {
+        limbs.append(carry % 1000000000)
+        carry = carry / 1000000000
+    }
+}
+
+// The exact decimal expansion of |value| (finite).
+fun libcExact(value: f64): LibcDecimal {
+    val bits = f64ToBits(value)
+    val exponent = (bits >>> 52) & 2047
+    val fraction = bits & 4503599627370495
+    var mantissa = fraction
+    var scale = -1074
+    if (exponent != 0) {
+        mantissa = fraction | 4503599627370496
+        scale = exponent - 1075
+    }
+    val none: array<int> = []
+    if (mantissa == 0) return LibcDecimal(none, 0)
+    val limbs: array<int> = [mantissa % 1000000000, (mantissa / 1000000000) % 1000000000, mantissa / 1000000000000000000]
+    while (limbs.size > 1 && limbs[limbs.size - 1] == 0) limbs.removeLast()
+    var pointShift = 0
+    if (scale >= 0) {
+        var left = scale
+        while (left > 0) {
+            val step = if (left > 29) 29 else left
+            libcMultiply(limbs, 1 << step)
+            left = left - step
+        }
+    } else {
+        var left = 0 - scale
+        pointShift = left
+        while (left > 0) {
+            val step = if (left > 13) 13 else left
+            var factor = 1
+            for (i in 0 until step) factor = factor * 5
+            libcMultiply(limbs, factor)
+            left = left - step
+        }
+    }
+    // The limbs, most significant first, nine digits each (the top one without its leading zeros).
+    val digits: array<int> = []
+    var index = limbs.size - 1
+    var top = true
+    while (index >= 0) {
+        var limb = limbs[index]
+        val group: array<int> = []
+        for (i in 0 until 9) {
+            group.append(limb % 10)
+            limb = limb / 10
+        }
+        var at = 8
+        if (top) {
+            while (at > 0 && group[at] == 0) at = at - 1
+            top = false
+        }
+        while (at >= 0) {
+            digits.append(group[at])
+            at = at - 1
+        }
+        index = index - 1
+    }
+    val point = digits.size - pointShift
+    while (digits.size > 0 && digits[digits.size - 1] == 0) digits.removeLast()
+    LibcDecimal(digits, point)
+}
+
+// The decimal rounded to its first `keep` digits (keep may be zero or negative): to nearest, a tie to the even digit. The result's digits are
+// exactly `keep` of them (zeros appended) unless the value rounds to zero (no digits); a carry out of the first digit moves the point.
+private fun libcRoundTo(d: LibcDecimal, keep: int): LibcDecimal {
+    val none: array<int> = []
+    val n = d.digits.size
+    if (n == 0) return LibcDecimal(none, 0)
+    if (keep >= n) {
+        val padded: array<int> = []
+        for (digit in d.digits) padded.append(digit)
+        for (i in n until keep) padded.append(0)
+        return LibcDecimal(padded, d.point)
+    }
+    if (keep < 0) return LibcDecimal(none, 0)
+    var up = false
+    val first = d.digits[keep]
+    if (first > 5) up = true
+    else if (first == 5) {
+        var rest = false
+        for (i in (keep + 1) until n) if (d.digits[i] != 0) rest = true
+        if (rest) up = true
+        else if (keep > 0 && d.digits[keep - 1] % 2 == 1) up = true
+    }
+    if (!up) {
+        if (keep == 0) return LibcDecimal(none, 0)
+        val kept: array<int> = []
+        for (i in 0 until keep) kept.append(d.digits[i])
+        return LibcDecimal(kept, d.point)
+    }
+    if (keep == 0) return LibcDecimal([1], d.point + 1)
+    val kept: array<int> = []
+    for (i in 0 until keep) kept.append(d.digits[i])
+    var at = keep - 1
+    while (at >= 0) {
+        if (kept[at] == 9) {
+            kept[at] = 0
+            at = at - 1
+        } else {
+            kept[at] = kept[at] + 1
+            return LibcDecimal(kept, d.point)
+        }
+    }
+    // 99..9 became 100..0.
+    kept[0] = 1
+    LibcDecimal(kept, d.point + 1)
+}
+
+private fun libcDigit(d: LibcDecimal, index: int): int = if (index >= 0 && index < d.digits.size) d.digits[index] else 0
+
+private fun libcDigitText(digit: int): string = byteEncode(48 + digit)
+
+private fun libcByteText(byte: int): string = byteEncode(byte)
+
+// %f: the digits of d to `precision` places after the point.
+fun libcFixed(d: LibcDecimal, precision: int, alternate: bool): string {
+    val r = libcRoundTo(d, d.point + precision)
+    val point = if (r.digits.size == 0) 0 else r.point
+    var text = ""
+    if (point <= 0) text = "0"
+    else for (i in 0 until point) text = text + libcDigitText(libcDigit(r, i))
+    if (precision > 0 || alternate) text = text + "."
+    for (j in 1 until precision + 1) text = text + libcDigitText(libcDigit(r, point + j - 1))
+    text
+}
+
+// %e: d.ddde+XX with `precision` digits after the point.
+fun libcScientific(d: LibcDecimal, precision: int, alternate: bool, upper: bool): string {
+    val r = libcRoundTo(d, precision + 1)
+    var exponent = 0
+    if (r.digits.size > 0) exponent = r.point - 1
+    var text = libcDigitText(libcDigit(r, 0))
+    if (precision > 0 || alternate) text = text + "."
+    for (j in 1 until precision + 1) text = text + libcDigitText(libcDigit(r, j))
+    text = text + (if (upper) "E" else "e")
+    var magnitude = exponent
+    if (exponent < 0) {
+        text = text + "-"
+        magnitude = 0 - exponent
+    } else text = text + "+"
+    if (magnitude < 10) text = text + "0"
+    text + "${magnitude}"
+}
+
+// Drops the trailing zeros of a fraction (and the point), before an exponent when there is one.
+private fun libcStripZeros(text: string): string {
+    var end = text.size
+    var exponentAt = -1
+    for (i in 0 until text.size) if (text[i] == 101 || text[i] == 69) exponentAt = i
+    val suffix = if (exponentAt >= 0) text.slice(exponentAt, text.size) else ""
+    if (exponentAt >= 0) end = exponentAt
+    var hasPoint = false
+    for (i in 0 until end) if (text[i] == 46) hasPoint = true
+    if (!hasPoint) return text
+    while (end > 0 && text[end - 1] == 48) end = end - 1
+    if (end > 0 && text[end - 1] == 46) end = end - 1
+    text.slice(0, end) + suffix
+}
+
+fun libcGeneral(d: LibcDecimal, precision: int, alternate: bool, upper: bool): string {
+    val significant = if (precision < 0) 6 else if (precision == 0) 1 else precision
+    val r = libcRoundTo(d, significant)
+    var exponent = 0
+    if (r.digits.size > 0) exponent = r.point - 1
+    val text = if (exponent < -4 || exponent >= significant) libcScientific(d, significant - 1, alternate, upper)
+        else libcFixed(d, significant - 1 - exponent, alternate)
+    if (alternate) text else libcStripZeros(text)
+}
+
+// %a: hexadecimal digits of the binary value (a normal number is 1.xxxx x 2^e, a subnormal 0.xxxx x 2^-1022), rounded to the precision to
+// nearest even, a carry into the leading digit left there (0x2p+0), as glibc does.
+fun libcHexFloat(value: f64, precision: int, alternate: bool, upper: bool): string {
+    val bits = f64ToBits(value)
+    val exponent = (bits >>> 52) & 2047
+    var fraction = bits & 4503599627370495
+    var lead = 1
+    var power = exponent - 1023
+    if (exponent == 0) {
+        lead = 0
+        power = if (fraction == 0) 0 else -1022
+    }
+    var digitCount = 13
+    if (precision >= 0 && precision < 13) {
+        val dropBits = (13 - precision) * 4
+        val unit = 1 << dropBits
+        val remainder = fraction & (unit - 1)
+        var kept = fraction >>> dropBits
+        val half = unit >> 1
+        var up = false
+        // A tie goes to the even last digit; with no fraction digit kept the last digit is the leading one.
+        if (remainder > half) up = true
+        else if (remainder == half) up = if (precision == 0) (lead & 1) == 1 else (kept & 1) == 1
+        if (up) kept = kept + 1
+        if (precision == 0) {
+            lead = lead + kept
+            kept = 0
+        } else if (kept >= (1 << (precision * 4))) {
+            kept = kept - (1 << (precision * 4))
+            lead = lead + 1
+        }
+        fraction = kept
+        digitCount = precision
+    }
+    val alphabet = if (upper) "0123456789ABCDEF" else "0123456789abcdef"
+    var digits = ""
+    for (i in 0 until digitCount) {
+        val shift = (digitCount - 1 - i) * 4
+        digits = digits + libcByteText(alphabet[(fraction >>> shift) & 15])
+    }
+    // A precision past the thirteen digits there are is padded with zeros.
+    if (precision > 13) for (i in 13 until precision) digits = digits + "0"
+    if (precision < 0) {
+        var end = digits.size
+        while (end > 0 && digits[end - 1] == 48) end = end - 1
+        digits = digits.slice(0, end)
+    }
+    var text = (if (upper) "0X" else "0x") + libcByteText(alphabet[lead])
+    if (digits.size > 0 || alternate) text = text + "."
+    text = text + digits + (if (upper) "P" else "p")
+    if (power < 0) text = text + "-${0 - power}" else text = text + "+${power}"
+    text
+}
+
+// One conversion of `value`: a leading "-" for a negative one (the sign bit: -0.0 and -nan too); inf and nan as glibc names them.
+fun libcFloat(value: f64, conversion: int, precision: int, alternate: bool): string {
+    val bits = f64ToBits(value)
+    val negative = bits < 0
+    val upper = conversion == 70 || conversion == 69 || conversion == 71 || conversion == 65
+    var body = ""
+    if (((bits >>> 52) & 2047) == 2047) {
+        val nan = (bits & 4503599627370495) != 0
+        body = if (nan) (if (upper) "NAN" else "nan") else (if (upper) "INF" else "inf")
+    } else if (conversion == 97 || conversion == 65) {
+        body = libcHexFloat(value, precision, alternate, upper)
+    } else {
+        val d = libcExact(value)
+        val wanted = if (precision < 0) 6 else precision
+        body = if (conversion == 102 || conversion == 70) libcFixed(d, wanted, alternate)
+            else if (conversion == 101 || conversion == 69) libcScientific(d, wanted, alternate, upper)
+            else libcGeneral(d, precision, alternate, upper)
+    }
+    if (negative) "-" + body else body
+}

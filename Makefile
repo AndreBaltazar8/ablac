@@ -103,6 +103,7 @@ test-serial: ablac
 	tools/test-compiler-libc-needs.sh $(COMPILER)
 	tools/test-libc-functions.sh $(COMPILER)
 	tools/test-static-compiler.sh $(COMPILER)
+	tools/test-libc-float-format.sh $(COMPILER)
 	tools/test-release-check-static.sh
 	tools/test-static-compiler-aarch64.sh $(COMPILER)
 	tools/test-libsystem-imports.sh $(COMPILER)

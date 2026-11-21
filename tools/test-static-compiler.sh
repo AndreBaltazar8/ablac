@@ -78,6 +78,31 @@ AB
 "$compiler" build "$out/math-fold.ab" -o "$out/math-fold.dynamic" --no-cache > "$out/math-fold.dynamic.log" 2>&1 ||
     { echo 'static compiler: the ordinary compiler failed to build the math program' >&2; exit 1; }
 cmp -s "$out/math-fold.static" "$out/math-fold.dynamic" || { echo 'static compiler: the math program differs from the ordinary compiler'"'"'s' >&2; exit 1; }
+# LLVM prints floating-point constants through snprintf (%e and friends): the IR text of a float-heavy module is the same from both compilers.
+cat > "$out/float-text.ab" <<'AB'
+import "abla/io"
+import "abla/float/text"
+
+fun main: int {
+    val a = 0.1 + 0.2
+    val b = 1.0e-7 * 3.0
+    val c = 123456789.125
+    val d = 5.0e-324 + 1.7976931348623157e308
+    val e = 2.0 / 3.0
+    val f = 1.0e22 + 1.0e23
+    val g = 0.000123456789
+    println("${f64Text(a)} ${f64Text(b)} ${f64Text(c)} ${f64Text(d)} ${f64Text(e)} ${f64Text(f)} ${f64Text(g)}")
+    return 0
+}
+AB
+for program in "$out/float-text.ab" "$out/math-fold.ab" tests/cases/libc-imports/float-remainder.ab; do
+    name=$(basename -- "$program" .ab)
+    ABLA_SYSROOT="$root" "$out/ablac-static" --emit-llvm "$program" > "$out/$name.static.ll" 2> "$out/$name.static.ll.err" ||
+        { echo "static compiler: --emit-llvm failed on $name" >&2; tail -3 "$out/$name.static.ll.err" >&2; exit 1; }
+    "$compiler" --emit-llvm "$program" > "$out/$name.dynamic.ll" 2> "$out/$name.dynamic.ll.err" ||
+        { echo "static compiler: the ordinary compiler's --emit-llvm failed on $name" >&2; exit 1; }
+    cmp -s "$out/$name.static.ll" "$out/$name.dynamic.ll" || { echo "static compiler: the LLVM text of $name differs from the ordinary compiler's" >&2; exit 1; }
+done
 # The table covers every symbol the guard lists.
 for symbol in $(cat tools/compiler-libc-needs.txt); do
     grep -q "\"$symbol\"" src/static_libc_symbols.ab || { echo "static compiler: $symbol is not in src/static_libc_symbols.ab" >&2; exit 1; }

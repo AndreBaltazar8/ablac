@@ -131,9 +131,13 @@ sort -u -o "$actual" "$actual"
 # above, has none to report.)
 for subject in $(for program in tests/cases/libc-imports/*.ab; do
     name=$(basename "$program" .ab); echo "$name.release $name.fast"; done) compiler; do
-    if [[ $subject != compiler ]] && ! readelf -lW "$out/$subject" | grep INTERP >/dev/null &&
-        ! readelf -dW "$out/$subject" 2>/dev/null | grep NEEDED >/dev/null &&
-        [[ -z $("$nm" --undefined-only "$out/$subject" 2>/dev/null) ]]; then
+    # The statically linked compiler (#806 step C) is such a program too: no interpreter and nothing needed (nm still lists weak references of
+    # libstdc++ and the thread-local access the static link resolves, so it does not decide there).
+    file=$out/$subject
+    [[ $subject != compiler ]] || file=$binary
+    if ! readelf -lW "$file" | grep INTERP >/dev/null &&
+        ! readelf -dW "$file" 2>/dev/null | grep NEEDED >/dev/null &&
+        { [[ $subject == compiler ]] || [[ -z $("$nm" --undefined-only "$file" 2>/dev/null) ]]; }; then
         continue
     fi
     if ! grep -q "^$subject needed:" "$actual"; then

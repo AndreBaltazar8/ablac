@@ -1,0 +1,76 @@
+// The host C library's side of tools/test-libc-float-format.sh: `format.c gen` writes the cases ("conversion precision alternate bits"), and
+// `format.c` with no argument reads them from stdin and prints each as printf formats it.
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static uint64_t state = 0x9e3779b97f4a7c15ull;
+static uint64_t next(void) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+}
+
+static uint64_t bits_of(double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, 8);
+    return bits;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "gen") == 0) {
+        double tricky[] = {0.0, -0.0, 1.0, -1.0, 0.5, 1.5, 2.5, 0.125, 0.375, 1e21, 1e22, 1e23, 123456789.0, 0.1, 0.2, 0.3, 1.0 / 3, 2.0 / 3, 9.5, 99.5, 999.5,
+            9.9999, 9.99995, 99999.5, 0.00009999, 0.0001, 0.00001, 1e-5, 123456.5, 1234567.5, 4503599627370496.5, 5e-324, 2.2250738585072014e-308,
+            2.225073858507201e-308, 1.7976931348623157e308, 4.9406564584124654e-324, 1e100, 1e-100, 1e300, 1e-300, 8.5, 0.05, 0.15, 0.25, 0.35, 5e-5,
+            0.9999999, 9.999999e5, 999999.5, 100.0, 1000000.0, 12345.678, 3.141592653589793, 2.718281828459045, 1.0000000000000002, 0.30000000000000004,
+            (double)INFINITY, (double)-INFINITY, (double)NAN};
+        size_t count = sizeof tricky / sizeof tricky[0];
+        const char conversions[] = "feEgGaAF";
+        for (size_t i = 0; i < count; i++)
+            for (size_t c = 0; conversions[c]; c++) {
+                int precisions[] = {-1, 0, 1, 2, 3, 5, 6, 10, 15, 16, 17, 20};
+                for (size_t p = 0; p < sizeof precisions / sizeof precisions[0]; p++)
+                    for (int alt = 0; alt < 2; alt++)
+                        printf("%c %d %d %lld\n", conversions[c], precisions[p], alt, (long long)bits_of(tricky[i]));
+            }
+        // Random bit patterns (every exponent, subnormals included) with random precisions.
+        for (int i = 0; i < 4000; i++) {
+            uint64_t bits = next();
+            if ((bits & 0x7ff0000000000000ull) == 0x7ff0000000000000ull) bits &= ~0x0010000000000000ull;
+            printf("%c %d 0 %lld\n", conversions[next() % 7], (int)(next() % 19) - 1, (long long)bits);
+        }
+        // Halfway cases: x.5, x.25, x.125 ... at precisions that land on the tie.
+        for (int i = 0; i < 400; i++) {
+            double value = (double)(next() % 100000) + (double)(1 << (next() % 6)) / (double)(1 << (next() % 6 + 1)) * 0.5;
+            printf("f %d 0 %lld\n", (int)(next() % 6), (long long)bits_of(value));
+            printf("e %d 0 %lld\n", (int)(next() % 8), (long long)bits_of(value));
+            printf("g %d 0 %lld\n", (int)(next() % 8), (long long)bits_of(value));
+        }
+        return 0;
+    }
+    char conversion;
+    int precision, alternate;
+    long long bits;
+    while (scanf(" %c %d %d %lld", &conversion, &precision, &alternate, &bits) == 4) {
+        double value;
+        uint64_t raw = (uint64_t)bits;
+        memcpy(&value, &raw, 8);
+        char format[16];
+        char *at = format;
+        *at++ = '%';
+        if (alternate) *at++ = '#';
+        if (precision >= 0) {
+            *at++ = '.';
+            *at++ = '*';
+        }
+        *at++ = conversion;
+        *at = 0;
+        if (precision >= 0) printf(format, precision, value);
+        else printf(format, value);
+        printf("\n");
+    }
+    return 0;
+}
