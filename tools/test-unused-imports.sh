@@ -215,6 +215,13 @@ grep -qxF 'warning[W_UNUSED_IMPORT]: main.ab: nothing `import "./kit.ab"` declar
 [[ $(grep -c 'W_UNUSED_IMPORT' "$work/provider.log") == 1 ]] || fail "provider: not exactly one warning" "$work/provider.log"
 grep -qxF 'warning[W_UNUSED_IMPORT]: idle.ab: nothing `import providedSource()` declares is used here' "$work/provider.log" ||
     fail "provider: idle.ab's unused provider import isn't named as written" "$work/provider.log"
+# The prune finds the import by that text: it removes idle.ab's provider import (and nothing of main.ab's).
+(cd "$work/provider" && ABLA_PACKAGE_CACHE="$work/provider/cache" "$compiler" fix-imports main.ab --prune) \
+    > "$work/provider-prune.log" 2>&1 || fail "the provider prune failed" "$work/provider-prune.log"
+grep -qxF 'fix-imports: removed 1 unused import(s) in 1 file(s); 0 restored, 0 left' "$work/provider-prune.log" ||
+    fail "the provider prune didn't remove idle.ab's import" "$work/provider-prune.log"
+! grep -qxF 'import providedSource()' "$work/provider/idle.ab" || fail "idle.ab still imports providedSource()" "$work/provider/idle.ab"
+grep -qxF 'import providedSource()' "$work/provider/main.ab" || fail "the prune removed main.ab's provider import" "$work/provider/main.ab"
 
 # A module with a runtime hook (`fun __abla...`) matters by being loaded.
 (cd "$work/hook" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/hook.log" 2>&1 ||
