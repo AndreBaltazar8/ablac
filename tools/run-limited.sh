@@ -78,7 +78,13 @@ else
     # Leave one CPU second between SIGXCPU and the hard SIGKILL fallback so
     # the normal exit status identifies the CPU limit (152).
     set +e
-    limited=(timeout \
+    # An interactive REPL (run-limited-compiler.sh: `repl` on a terminal) stays in the terminal's foreground
+    # process group, where its line editor may set the terminal (src/repl_editor.ab); --foreground leaves its
+    # children untimed, and it starts none. Anything else gets a process group of its own, as before.
+    foreground=()
+    [[ ${ABLA_RUN_LIMITED_FOREGROUND:-} == 1 ]] && foreground=(--foreground)
+    unset ABLA_RUN_LIMITED_FOREGROUND
+    limited=(timeout "${foreground[@]}" \
         --signal=TERM \
         --kill-after="${kill_grace_seconds}s" \
         "${wall_seconds}s" \

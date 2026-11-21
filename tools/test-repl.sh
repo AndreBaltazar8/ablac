@@ -125,13 +125,11 @@ editor=skipped
 if script --version 2>/dev/null | grep util-linux >/dev/null; then
     rm -f "$base.editor.in" "$base.editor.out"
     mkfifo "$base.editor.in"
-    # Not through run-limited.sh (or build/ablac, the launcher around it): its timeout puts the REPL in a process group
-    # of its own, a background one on the terminal, where the editor stays off. The launcher's payload runs instead,
-    # with the standard library the launcher would name; timeout bounds script from outside.
-    payload=$compiler
-    [[ -L $compiler && -x $compiler.bin ]] && payload=$compiler.bin
+    # The compiler as given: build/ablac, the launcher, keeps a REPL on a terminal in the terminal's foreground
+    # process group (run-limited.sh's timeout --foreground), where the editor is on; timeout bounds script from
+    # outside. A bare compiler needs the standard library named.
     TERM=xterm ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root} timeout 300 \
-        script -qfec "'$payload' repl" "$base.editor.out" < "$base.editor.in" > /dev/null 2>&1 &
+        script -qfec "'$compiler' repl" "$base.editor.out" < "$base.editor.in" > /dev/null 2>&1 &
     editor_pid=$!
     exec 3> "$base.editor.in"
     # A fresh prompt; a redraw prints it again after a carriage return.

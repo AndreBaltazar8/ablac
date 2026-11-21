@@ -138,4 +138,10 @@ if [[ ! -x $compiler ]]; then
     exit 127
 fi
 
+# An interactive REPL keeps the terminal's foreground process group (run-limited.sh, Linux), so its line editor can
+# set the terminal; on macOS the supervisor's payload group is its own, and the REPL reads lines as they come.
+if [[ ${1:-} == repl && -t 0 ]]; then
+    export ABLA_RUN_LIMITED_FOREGROUND=1
+fi
+
 exec "$script_directory/run-limited.sh" "$compiler" "$@"
