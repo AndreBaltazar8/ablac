@@ -1,0 +1,161 @@
+// Read-only source inventory for #1047. These are AST candidates, NOT typed
+// compiler warnings or promised fix-its. No imports, CT code or subparsers run.
+import "../src/parser.ab"
+import "abla/fs"
+import "abla/io"
+import "abla/text"
+import "abla/json"
+import "abla/bytes"
+import "abla/process/arguments"
+
+var inventoryFiles = 0
+var inventoryErrors = 0
+var inventorySites = 0
+var inventoryExcluded = 0
+var inventorySkipped = 0
+
+fun inventoryWhite(b: int): bool = b == 32 || b == 9 || b == 10 || b == 13
+
+// JSON key syntax following an opening object or comma, not a quoted source
+// pattern. Inputs here have already been decoded by Abla's real parser.
+fun inventoryKey(text: string): bool {
+    var at = 0
+    while (at < text.size) {
+        if (text[at] == 123 || text[at] == 44) {
+            var next = at + 1
+            while (next < text.size && inventoryWhite(text[next])) next = next + 1
+            if (next < text.size && text[next] == 34) {
+                next = next + 1
+                while (next < text.size && text[next] != 34) {
+                    if (text[next] == 92) next = next + 1
+                    next = next + 1
+                }
+                if (next < text.size) next = next + 1
+                while (next < text.size && inventoryWhite(text[next])) next = next + 1
+                if (next < text.size && text[next] == 58) return true
+            }
+        }
+        at = at + 1
+    }
+    false
+}
+
+fun inventoryPieces(expression: BootstrapExpression): string {
+    if (expression.kind == "string") return expression.text
+    if (expression.kind != "string.template" && expression.kind != "+") return "\u{1f}"
+    val output = byteBuffer()
+    for (child in expression.children) output.appendText(inventoryPieces(child))
+    output.toText()
+}
+
+fun inventoryJson(text: string): bool {
+    if (inventoryKey(text)) return true
+    val trimmed = text.trim()
+    if (!trimmed.startsWith("[")) return false
+    jsonParse(trimmed.replace("\u{1f}", "0")).succeeded
+}
+
+fun inventoryLine(source: string, begin: int): int {
+    var line = 1
+    for (at in 0 until begin) if (source[at] == 10) line = line + 1
+    line
+}
+
+fun inventoryRecord(file: string, source: string, owner: string, expression: BootstrapExpression,
+    category: string, excluded: bool): void {
+    if (excluded) inventoryExcluded = inventoryExcluded + 1
+    else inventorySites = inventorySites + 1
+    println("${if (excluded) "EXCLUDED" else "CANDIDATE"}\t$file\t${inventoryLine(source, expression.begin)}\t${expression.begin}\t${expression.end}\t$category\t$owner")
+}
+
+fun inventoryExcludedUse(expression: BootstrapExpression): bool {
+    if (expression.kind == "==" || expression.kind == "!=") return true
+    if (expression.kind != "call" && expression.kind != "member.call") return false
+    val name = expression.text
+    if (name.startsWith("expect") || name.startsWith("assert")) return true
+    for (ignored in ["jsonParse", "jsonParseWithLimits", "indexOf", "lastIndexOf", "contains", "startsWith", "endsWith", "split", "replace", "matches", "find"]) {
+        if (name == ignored) return true
+    }
+    false
+}
+
+fun inventoryVisit(file: string, source: string, owner: string, expression: BootstrapExpression,
+    excluded: bool = false, inString: bool = false, inAppend: bool = false): void {
+    if (expression.kind == "subparser.placeholder") return
+    val omit = excluded || inventoryExcludedUse(expression)
+    val string = expression.kind == "string" || expression.kind == "string.template" || expression.kind == "+"
+    if (string && !inString && !inAppend && inventoryJson(inventoryPieces(expression))) {
+        inventoryRecord(file, source, owner, expression, expression.kind,
+            omit || expression.kind == "string")
+    }
+    val append = expression.kind == "member.call" &&
+        (expression.text == "appendText" || expression.text == "appendInt") && expression.children.size == 2
+    if (expression.kind == "block") {
+        var at = 0
+        while (at < expression.children.size) {
+            val first = expression.children[at]
+            if (first.kind == "member.call" && (first.text == "appendText" || first.text == "appendInt") && first.children.size == 2) {
+                val sink = first.children[0]
+                val pieces = byteBuffer()
+                var end = at
+                while (end < expression.children.size) {
+                    val call = expression.children[end]
+                    if (call.kind != "member.call" || (call.text != "appendText" && call.text != "appendInt") || call.children.size != 2) break
+                    val receiver = call.children[0]
+                    if (receiver.kind != sink.kind || receiver.text != sink.text) break
+                    pieces.appendText(if (call.text == "appendText") inventoryPieces(call.children[1]) else "\u{1f}")
+                    end = end + 1
+                }
+                if (inventoryJson(pieces.toText())) inventoryRecord(file, source, owner,
+                    BootstrapExpression("append-run", "", first.begin, expression.children[end - 1].end, []),
+                    "append-run-untyped:${sink.kind}:${sink.text}", omit)
+                for (item in at until end) inventoryVisit(file, source, owner, expression.children[item], omit, false, true)
+                at = end
+            } else {
+                inventoryVisit(file, source, owner, first, omit)
+                at = at + 1
+            }
+        }
+        return
+    }
+    for (child in expression.children) inventoryVisit(file, source, owner, child, omit, inString || string, inAppend || append)
+}
+
+fun inventoryDeclaration(file: string, source: string, declaration: BootstrapDeclaration): void {
+    inventoryVisit(file, source, declaration.name, declaration.expression)
+    for (value in declaration.parameterDefaults) inventoryVisit(file, source, declaration.name, value)
+    for (method in declaration.methods) inventoryDeclaration(file, source, method)
+}
+
+fun inventoryWalk(path: Path): void {
+    if (path.isSymbolicLink()) return
+    val name = path.name()
+    if (path.info().isDirectory()) {
+        if (name.startsWith(".")) return
+        for (ignored in ["build", "vendor", "node_modules", "dist", "test", "tests", "fixtures"]) if (name == ignored) return
+        val names: array<string> = []
+        for (entry in path.entries()) names.append(entry.name())
+        for (item in sortedStrings(names)) inventoryWalk(path.child(item))
+    } else if (path.info().isFile() && path.extension() == "ab") {
+        if (name == "test.ab" || name.endsWith("_test.ab") || name.endsWith("_tests.ab") || path.text.endsWith("/stdlib/abla/json/entry.ab")) {
+            inventorySkipped = inventorySkipped + 1
+            return
+        }
+        inventoryFiles = inventoryFiles + 1
+        val source = path.readText()
+        val parsed = bootstrapParse(source)
+        if (parsed.errors != 0) {
+            inventoryErrors = inventoryErrors + 1
+            println("PARSE_ERROR\t${path.text}\t${parsed.errors}")
+            return
+        }
+        for (declaration in parsed.declarations) inventoryDeclaration(path.text, source, declaration)
+        for (action in parsed.actions) inventoryVisit(path.text, source, "<action>", action)
+    }
+}
+
+fun main: int {
+    for (index in 0 until processArgumentCount()) inventoryWalk(Path(processArgument(index)))
+    println("SUMMARY\t$inventoryFiles\t$inventoryErrors\t$inventorySites\t$inventoryExcluded\t$inventorySkipped")
+    0
+}
