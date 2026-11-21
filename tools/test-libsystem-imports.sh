@@ -51,17 +51,26 @@ if [[ -n $new ]]; then
     echo "$new" >&2
     exit 1
 fi
+# Intel is strict: every line of the list is imported there (Intel CI run 43611303835), so a line it does not import
+# goes. Apple Silicon only reports: a line it does not import may be Intel's, and stays listed for it.
+arch=$(uname -m)
 unsure_stale=$(comm -23 "$allow" "$actual" | comm -12 - build/libsystem-imports-unsure.txt)
 if [[ -n $unsure_stale ]]; then
-    echo 'libsystem imports: lines marked " ?" no longer imported here, remove them from the list:' >&2
+    if [[ $arch == x86_64 ]]; then
+        echo 'libsystem imports: lines marked " ?" no longer imported here, remove them from the list:' >&2
+    else
+        echo "libsystem imports: lines marked \" ?\" not imported on $arch; they stay listed until Intel (x86_64, the strict host) reports them too:" >&2
+    fi
     echo "$unsure_stale" >&2
 fi
 stale=$(comm -23 "$allow" "$actual" | comm -23 - build/libsystem-imports-unsure.txt)
 if [[ -n $stale ]]; then
-    echo 'libsystem imports: no longer imported here, remove from tools/libsystem-imports-allowlist.txt:' >&2
+    if [[ $arch == x86_64 ]]; then
+        echo 'libsystem imports: no longer imported here, remove from tools/libsystem-imports-allowlist.txt:' >&2
+        echo "$stale" >&2
+        exit 1
+    fi
+    echo "libsystem imports: not imported on $arch; they stay listed for Intel (x86_64, the strict host):" >&2
     echo "$stale" >&2
-    # Intel is strict: every line of the list is imported there (Intel CI run 43611303835).
-    # Apple Silicon only reports.
-    if [[ $(uname -m) == x86_64 ]]; then exit 1; fi
 fi
 echo "libsystem imports: $(wc -l < "$actual" | tr -d ' ') imports, all within the allowed list"
