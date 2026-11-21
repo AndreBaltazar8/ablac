@@ -8,6 +8,9 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 out=$root/build/test-watch
+# The run is in $out: a bare compiler (CI's build/ci/ablac-stage2, not the launcher) finds the standard library from
+# ABLA_SYSROOT, else the current directory.
+export ABLA_SYSROOT=${ABLA_SYSROOT:-$root}
 rm -rf "$out"
 mkdir -p "$out/case"
 cp "$root"/tests/cases/test-watch/*.ab "$out/case/"
