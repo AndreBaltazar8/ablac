@@ -2158,75 +2158,80 @@ trusted fun __ablaRuntimeCopyString(
     destination: int,
     offset: int
 ): int {
-    var written: int = offset
-    var capacity: int = 16
-    var stack = __ablaRuntimeAllocateOutOfLine(capacity * 16, 0)
-    var count: int = 1
-    ablaRuntimeStoreI64(stack, __ablaRuntimeWord0(value))
-    ablaRuntimeStoreI64(stack + 8, __ablaRuntimeWord1(value))
-    while (count > 0) {
-        count = count - 1
-        var data = ablaRuntimeLoadI64(stack + count * 16)
-        var storage = ablaRuntimeLoadI64(stack + count * 16 + 8)
-        // A rope node that has its flat copy (+40) is read through the copy:
-        // flattening drops the node's children. Load +40 before them.
+    var begin = offset
+    var data = __ablaRuntimeWord0(value)
+    var storage = __ablaRuntimeWord1(value)
+    var capacity: int = 0
+    var pending: int = 0
+    var count: int = 0
+    while (true) {
         if (data == 0 && storage != 0) {
-            val flat = __ablaRuntimeRopeFlat(storage)
-            if (flat != 0) {
-                data = flat
-                storage = ablaRuntimeLoadI64(storage)
-            }
-        }
-        if (data != 0) {
-            // Callers allocate the destination before walking the rope. Its
-            // bytes are disjoint from every immutable leaf, including slices
-            // or repeated leaves that overlap one another.
-            if (storage > 0) {
-                ablaUnsafeCopyMemory(destination + written, data, storage)
-                written = written + storage
-            }
-        } else if (storage != 0) {
-            if (count + 2 > capacity) {
-                val nextCapacity = capacity * 2
-                val replacement = __ablaRuntimeAllocateOutOfLine(
-                    nextCapacity * 16, 0
-                )
-                var index: int = 0
-                while (index < count * 16) {
-                    ablaRuntimeStoreU8(
-                        replacement + index,
-                        ablaRuntimeLoadU8(stack + index)
-                    )
-                    index = index + 1
+            var flat = __ablaRuntimeRopeFlat(storage)
+            if (flat == 0) {
+                val leftData = ablaRuntimeLoadI64(storage + 8)
+                val leftStorage = ablaRuntimeLoadI64(storage + 16)
+                val rightData = ablaRuntimeLoadI64(storage + 24)
+                val rightStorage = ablaRuntimeLoadI64(storage + 32)
+                flat = __ablaRuntimeRopeChildrenCleared(storage)
+                if (flat == 0) {
+                    // Write each flat child directly at its final offset. A
+                    // chain of appends or prepends never needs a pending stack.
+                    if (leftData != 0) {
+                        ablaUnsafeCopyMemory(destination + begin, leftData, leftStorage)
+                        begin = begin + leftStorage
+                        data = rightData
+                        storage = rightStorage
+                    } else if (rightData != 0) {
+                        val rightBegin = begin + ablaRuntimeLoadI64(leftStorage)
+                        ablaUnsafeCopyMemory(destination + rightBegin, rightData, rightStorage)
+                        storage = leftStorage
+                    } else {
+                        // Both children are ropes. Descend into the smaller
+                        // one first, so each pending entry halves the active
+                        // span and a skewed tree cannot grow a deep stack.
+                        val leftLength = ablaRuntimeLoadI64(leftStorage)
+                        val rightBegin = begin + leftLength
+                        if (count == capacity) {
+                            val nextCapacity = if (capacity == 0) 16 else capacity * 2
+                            val replacement = __ablaRuntimeAllocateOutOfLine(nextCapacity * 16, 0)
+                            if (count != 0) {
+                                ablaUnsafeCopyMemory(replacement, pending, count * 16)
+                                __ablaRuntimeFree(pending)
+                            }
+                            pending = replacement
+                            capacity = nextCapacity
+                        }
+                        val slot = pending + count * 16
+                        if (leftLength <= ablaRuntimeLoadI64(rightStorage)) {
+                            ablaRuntimeStoreI64(slot, rightStorage)
+                            ablaRuntimeStoreI64(slot + 8, rightBegin)
+                            storage = leftStorage
+                        } else {
+                            ablaRuntimeStoreI64(slot, leftStorage)
+                            ablaRuntimeStoreI64(slot + 8, begin)
+                            storage = rightStorage
+                            begin = rightBegin
+                        }
+                        count = count + 1
+                    }
+                    continue
                 }
-                __ablaRuntimeFree(stack)
-                stack = replacement
-                capacity = nextCapacity
             }
-            val leftData = ablaRuntimeLoadI64(storage + 8)
-            val leftStorage = ablaRuntimeLoadI64(storage + 16)
-            val rightData = ablaRuntimeLoadI64(storage + 24)
-            val rightStorage = ablaRuntimeLoadI64(storage + 32)
-            val flat = __ablaRuntimeRopeChildrenCleared(storage)
-            if (flat != 0) {
-                ablaRuntimeStoreI64(stack + count * 16, flat)
-                ablaRuntimeStoreI64(
-                    stack + count * 16 + 8, ablaRuntimeLoadI64(storage)
-                )
-                count = count + 1
-            } else {
-                // LIFO: push right first so left is flattened first.
-                ablaRuntimeStoreI64(stack + count * 16, rightData)
-                ablaRuntimeStoreI64(stack + count * 16 + 8, rightStorage)
-                count = count + 1
-                ablaRuntimeStoreI64(stack + count * 16, leftData)
-                ablaRuntimeStoreI64(stack + count * 16 + 8, leftStorage)
-                count = count + 1
-            }
+            data = flat
+            storage = ablaRuntimeLoadI64(storage)
         }
+        // Destination belongs to the caller and cannot alias a leaf.
+        if (data != 0 && storage > 0) {
+            ablaUnsafeCopyMemory(destination + begin, data, storage)
+        }
+        if (count == 0) break
+        count = count - 1
+        data = 0
+        storage = ablaRuntimeLoadI64(pending + count * 16)
+        begin = ablaRuntimeLoadI64(pending + count * 16 + 8)
     }
-    __ablaRuntimeFree(stack)
-    written
+    if (pending != 0) __ablaRuntimeFree(pending)
+    offset + __ablaRuntimeStringLengthValue(value)
 }
 
 // A rope node's flat copy (+40), or 0. Once threads run, another thread may
