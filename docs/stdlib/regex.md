@@ -47,12 +47,15 @@ the literal site, for example `invalid $regex at pattern byte 0: missing ]`.
 The byte offset refers to the decoded pattern, starting at zero. Pattern
 syntax, size limits and numbered captures are identical to `regexCompile`;
 named captures are not supported. Use `regexCompile` for patterns known only
-at run time. Matching has the same cost for a literal and a previously compiled
-runtime pattern; the literal saves the pattern compilation and its allocations.
+at run time. Matching uses the same Pike VM as a previously compiled runtime
+pattern; the literal saves pattern compilation and its allocations. Literal
+compilation also follows the compiler's normal compile-time evaluation limits.
 
 The manual `tools/bench-regex-literals.sh` compares repeated compile-and-match,
 literal reuse and reuse of a runtime-compiled matcher, checking identical match
 counts before reporting timings. It is a measurement, not a timing test.
+The [recorded local comparison](regex-literals-benchmark.md) includes the inputs,
+compiler identity and individual timings.
 
 | Call | Result |
 |---|---|
