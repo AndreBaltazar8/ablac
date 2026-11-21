@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# (The whole-image hash, forced with ABLA_IMAGE_IDENTITY=full: a compiler with a linker id keys on that instead, tools/test-image-identity.sh.)
 # The cached executable prefix and a changing backend suffix must hash exactly
 # as the full image did, including executable files with trailing bytes.
 set -euo pipefail
@@ -18,7 +19,7 @@ for tail in 0 1 2 3; do
     esac
     [[ $(wc -c < "$out/tail-$tail") -eq $(($(wc -c < "$program") + tail)) ]] || { echo "running image identity: tail $tail has the wrong length" >&2; exit 1; }
     set +e
-    ABLA_COMPILER_API_CASE=running-image-identity ABLA_MAX_MEMORY_MB=4096 "$root/tools/run-limited.sh" "$out/tail-$tail"
+    ABLA_IMAGE_IDENTITY=full ABLA_COMPILER_API_CASE=running-image-identity ABLA_MAX_MEMORY_MB=4096 "$root/tools/run-limited.sh" "$out/tail-$tail"
     status=$?
     set -e
     [[ $status -eq 42 ]] || { echo "running image identity: tail $tail returned $status" >&2; exit 1; }
