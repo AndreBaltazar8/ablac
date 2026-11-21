@@ -45,7 +45,7 @@ done
 # is one must be defined there. (A link that cannot find one fails only in CI's AArch64 static build, run under qemu.) The libgcc.a is
 # ABLA_STATIC_TARGET_LIBS/libgcc.a (the CI's native one), else ABLA_AARCH64_LIBGCC, else an AArch64 cross libgcc.a of the nix store.
 libgcc=""
-for candidate in "${ABLA_AARCH64_LIBGCC:-}" "${ABLA_STATIC_TARGET_LIBS:-/nonexistent}/libgcc.a" $(find /nix/store -maxdepth 4 -name libgcc.a -path '*aarch64*' 2> /dev/null | head -n 4); do
+for candidate in "${ABLA_AARCH64_LIBGCC:-}" "${ABLA_STATIC_TARGET_LIBS:-/nonexistent}/libgcc.a" $(find /nix/store -maxdepth 4 -name libgcc.a -path '*aarch64*' -print -quit 2> /dev/null); do
     [[ -n $candidate && -f $candidate ]] && { libgcc=$candidate; break; }
 done
 if [[ -n $libgcc ]]; then
