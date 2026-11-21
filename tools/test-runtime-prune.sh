@@ -74,6 +74,15 @@ for case in "missing:$small:tests/cases/modules/http-event.ab" "extra:$out/hint-
     cmp -s "$out/wrong-$kind.plain" "$out/wrong-$kind.bin" || fail "$kind hint: the fallback build differs from the unpruned one"
     wrong=$((wrong + 1))
 done
+# A hint need not be sorted or free of repeats (a hand-written one, or one sorted by another locale's collation): it prunes as the sorted one does, with no fallback.
+{ echo abla-runtime-demand-1; tail -n +2 "$small" | sort -r; sed -n 2p "$small"; } > "$out/hint-unsorted.txt"
+"$compiler" build tests/cases/libc-imports/hello.ab -o "$out/unsorted.plain" --no-cache --fast > /dev/null 2>&1 || fail "hello did not build"
+ABLA_PRUNE_RUNTIME_HINT=$PWD/$out/hint-unsorted.txt ABLA_COMPILER_DEMAND_TRACE=1 "$compiler" build tests/cases/libc-imports/hello.ab -o "$out/unsorted.bin" --no-cache --fast \
+    > /dev/null 2> "$out/unsorted.trace" || fail "the build with an unsorted hint failed"
+grep -q '^abla-prune-runtime [0-9]* of' "$out/unsorted.trace" || fail "an unsorted hint did not prune"
+fell=$(grep '^abla-prune-runtime fallback' "$out/unsorted.trace" || true)
+[[ -z $fell ]] || fail "an unsorted hint fell back: the hint is sorted when it is read"
+cmp -s "$out/unsorted.plain" "$out/unsorted.bin" || fail "the build with an unsorted hint differs from the unpruned one"
 # A program that runs code at compile time is never pruned (a fallback would run its compile-time code twice, and a target it defines or a program it builds
 # twice is an error): with a hint in hand, its build prunes nothing and runs.
 printf 'import "abla/io"\nfun fib(n: int): int = if (n < 2) n else fib(n - 1) + fib(n - 2)\nval answer = #fib(10)\nfun main: int {\n    println("answer $answer")\n    return 0\n}\n' > "$out/compile-time.ab"
@@ -90,4 +99,4 @@ ABLA_PRUNE_RUNTIME=1 ABLA_CACHE_DIR=$PWD/$out/nocache.cache ABLA_COMPILER_DEMAND
 printf 'not a hint\n' > "$out/garbage.txt"
 ABLA_PRUNE_RUNTIME_HINT=$PWD/$out/garbage.txt ABLA_COMPILER_DEMAND_TRACE=1 "$compiler" build tests/cases/libc-imports/hello.ab -o "$out/garbage.bin" --no-cache --fast > /dev/null 2> "$out/garbage.trace" || fail "hello did not build with a garbage hint"
 ! grep -q '^abla-prune-runtime' "$out/garbage.trace" || fail "a file that is not a hint pruned"
-echo "runtime prune: $count builds (${#programs[@]} programs x ${#variants[@]} ways) pruned by the cache's hint, byte for byte the unpruned ones; $wrong wrong hints (missing, extra, background freeing) found and rebuilt with the same bytes; --no-cache, a garbage hint and a program with compile-time code prune nothing"
+echo "runtime prune: $count builds (${#programs[@]} programs x ${#variants[@]} ways) pruned by the cache's hint, byte for byte the unpruned ones; $wrong wrong hints (missing, extra, background freeing) found and rebuilt with the same bytes; an unsorted hint prunes as a sorted one does; --no-cache, a garbage hint and a program with compile-time code prune nothing"
