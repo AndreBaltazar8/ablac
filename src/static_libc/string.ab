@@ -4,6 +4,7 @@ import "abla/runtime/scalar"
 import "abla/unsafe/native"
 import "./memory.ab"
 import "./fs.ab"
+import "./errno.ab"
 import "abla/unsafe/memory/raw"
 
 @export("strlen")
@@ -181,8 +182,9 @@ trusted fun libcMemsetChk(destination: int, byte: int, count: int, objectSize: i
 }
 
 // strtol and its relatives in the C locale (the __isoc23_ names are glibc's C23 binary-prefix variants: 0b is accepted the same way here
-// as glibc does). Returns the value; *end is set when it is not NULL. Overflow clamps (ERANGE is not reported).
-trusted fun libcStrto(text: int, end: int, base: int, signed: bool): int {
+// as glibc does; the plain names are the pre-C23 ones, with no 0b). Returns the value; *end is set when it is not NULL. Out of range the result is the type's limit (LONG_MAX, LONG_MIN, ULONG_MAX);
+// ERANGE is not reported.
+trusted fun libcStrto(text: int, end: int, base: int, signed: bool, binary: bool): int {
     var at = 0
     while (libcIsspace(ablaRuntimeLoadU8(text + at)) != 0) at = at + 1
     var negative = false
@@ -192,41 +194,83 @@ trusted fun libcStrto(text: int, end: int, base: int, signed: bool): int {
         at = at + 1
     }
     var radix = base & 4294967295
-    if ((radix == 0 || radix == 16) && ablaRuntimeLoadU8(text + at) == 48 && (ablaRuntimeLoadU8(text + at + 1) | 32) == 120) {
+    if (radix == 1 || radix > 36) {
+        libcSetErrno(22)
+        return 0
+    }
+    val start = at
+    if ((radix == 0 || radix == 16) && ablaRuntimeLoadU8(text + at) == 48 && (ablaRuntimeLoadU8(text + at + 1) | 32) == 120 &&
+        libcDigitValue(ablaRuntimeLoadU8(text + at + 2)) < 16) {
         at = at + 2
         radix = 16
-    } else if ((radix == 0 || radix == 2) && ablaRuntimeLoadU8(text + at) == 48 && (ablaRuntimeLoadU8(text + at + 1) | 32) == 98) {
+    } else if (binary && (radix == 0 || radix == 2) && ablaRuntimeLoadU8(text + at) == 48 && (ablaRuntimeLoadU8(text + at + 1) | 32) == 98 &&
+        libcDigitValue(ablaRuntimeLoadU8(text + at + 2)) < 2) {
         at = at + 2
         radix = 2
     } else if (radix == 0) radix = if (ablaRuntimeLoadU8(text + at) == 48) 8 else 10
-    var value = 0
+    // The magnitude in an unsigned 64-bit word, with the overflow noted.
+    var value = u64(0)
     var digits = 0
+    var overflow = false
+    val unit = u64(radix)
+    val ceiling = u64(18446744073709551615)
     while (true) {
-        val c = ablaRuntimeLoadU8(text + at)
-        var digit = 99
-        if (c >= 48 && c <= 57) digit = c - 48
-        else if (c >= 97 && c <= 122) digit = c - 87
-        else if (c >= 65 && c <= 90) digit = c - 55
+        val digit = libcDigitValue(ablaRuntimeLoadU8(text + at))
         if (digit >= radix) break
-        value = value * radix + digit
+        if (value > (ceiling - u64(digit)) / unit) overflow = true
+        else value = value * unit + u64(digit)
         digits = digits + 1
         at = at + 1
     }
     if (end != 0) ablaRuntimeStoreI64(end, if (digits == 0) text else text + at)
-    if (negative) 0 - value else value
+    if (digits == 0) return 0
+    if (signed) {
+        // LONG_MAX is 2^63 - 1 and LONG_MIN's magnitude 2^63.
+        val limit = if (negative) u64(9223372036854775808) else u64(9223372036854775807)
+        if (overflow || value > limit) {
+            libcSetErrno(34)
+            return if (negative) -9223372036854775808 else 9223372036854775807
+        }
+        return if (negative) 0 - int(value) else int(value)
+    }
+    if (overflow) {
+        libcSetErrno(34)
+        return -1
+    }
+    if (negative) 0 - int(value) else int(value)
 }
 
+// The value of a digit character in any base up to 36, 99 for a character that is none.
+fun libcDigitValue(c: int): int {
+    if (c >= 48 && c <= 57) return c - 48
+    if (c >= 97 && c <= 122) return c - 87
+    if (c >= 65 && c <= 90) return c - 55
+    99
+}
+
+@export("strtol")
+trusted fun libcStrtolPlain(text: int, end: int, base: int): int = libcStrto(text, end, base, true, false)
+
+@export("strtoll")
+trusted fun libcStrtollPlain(text: int, end: int, base: int): int = libcStrto(text, end, base, true, false)
+
+@export("strtoul")
+trusted fun libcStrtoulPlain(text: int, end: int, base: int): int = libcStrto(text, end, base, false, false)
+
+@export("strtoull")
+trusted fun libcStrtoullPlain(text: int, end: int, base: int): int = libcStrto(text, end, base, false, false)
+
 @export("__isoc23_strtol")
-trusted fun libcStrtol(text: int, end: int, base: int): int = libcStrto(text, end, base, true)
+trusted fun libcStrtol(text: int, end: int, base: int): int = libcStrto(text, end, base, true, true)
 
 @export("__isoc23_strtoll")
-trusted fun libcStrtoll(text: int, end: int, base: int): int = libcStrto(text, end, base, true)
+trusted fun libcStrtoll(text: int, end: int, base: int): int = libcStrto(text, end, base, true, true)
 
 @export("__isoc23_strtoul")
-trusted fun libcStrtoul(text: int, end: int, base: int): int = libcStrto(text, end, base, false)
+trusted fun libcStrtoul(text: int, end: int, base: int): int = libcStrto(text, end, base, false, true)
 
 @export("__isoc23_strtoull")
-trusted fun libcStrtoull(text: int, end: int, base: int): int = libcStrto(text, end, base, false)
+trusted fun libcStrtoull(text: int, end: int, base: int): int = libcStrto(text, end, base, false, true)
 
 // strerror_r (the XSI form the GNU one reduces to here): "Error N", which is all a diagnostic needs.
 @export("strerror_r")

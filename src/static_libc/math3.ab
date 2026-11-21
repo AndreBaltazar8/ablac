@@ -1,0 +1,464 @@
+// The remaining <math.h> functions an optimiser or a program names (#806 step C, #648): the libcalls LLVM introduces (pow(2, x) becomes exp2,
+// the roundings and min/max lower to calls without SSE4.1, fma, fmod, the float forms of everything) and the C99 set the other files left out.
+// Double functions are exact (the roundings, fmod, ldexp, frexp, modf, copysign, fmin/fmax, fma, the conversions to integers) or built from the
+// standard library's correctly rounded exp, log, pow, sqrt and the functions of math.ab / math2.ab (exp2, exp10, cbrt, expm1, hypot); the float
+// forms compute the double result and round it to a float once. No errno or exception flag is set, as in math.ab.
+import "abla/math" as m
+import "abla/float"
+import "abla/runtime/scalar"
+import "./math.ab"
+import "./math2.ab"
+import "./fs.ab"
+
+val libcSignMask = -9223372036854775808
+val libcExponentMask = 9218868437227405312
+val libcMantissaMask = 4503599627370495
+
+fun libcNaN(): f64 = f64FromBits(9221120237041090560)
+
+@export("copysign")
+fun libcCopysign(x: f64, y: f64): f64 = f64FromBits((f64ToBits(x) & 9223372036854775807) | (f64ToBits(y) & libcSignMask))
+
+@export("trunc")
+fun libcTrunc(x: f64): f64 = m.trunc(x)
+
+@export("rint")
+fun libcRint(x: f64): f64 = m.roundEven(x)
+
+@export("nearbyint")
+fun libcNearbyint(x: f64): f64 = m.roundEven(x)
+
+@export("roundeven")
+fun libcRoundeven(x: f64): f64 = m.roundEven(x)
+
+// fmin and fmax as glibc has them: the other operand when one is a NaN, else the comparison (equal operands: the second).
+@export("fmin")
+fun libcFmin(x: f64, y: f64): f64 = if (x < y || y != y) x else y
+
+@export("fmax")
+fun libcFmax(x: f64, y: f64): f64 = if (x > y || y != y) x else y
+
+@export("fma")
+fun libcFma(x: f64, y: f64, z: f64): f64 = m.fma(x, y, z)
+
+@export("hypot")
+fun libcHypot(x: f64, y: f64): f64 = m.hypot(x, y)
+
+@export("exp2")
+fun libcExp2(x: f64): f64 = m.pow(2.0, x)
+
+@export("exp10")
+fun libcExp10(x: f64): f64 = m.pow(10.0, x)
+
+@export("expm1")
+fun libcExpm1Export(x: f64): f64 {
+    if (x != x) return x
+    if (x > 709.78) return 1.0 / 0.0
+    if (x < -40.0) return -1.0
+    libcExpm1(x)
+}
+
+// cbrt: FreeBSD's (a polynomial estimate, one Newton step: below 0.667 ulp).
+@export("cbrt")
+fun libcCbrt(x: f64): f64 {
+    val bits = f64ToBits(x)
+    val sign = bits & libcSignMask
+    val high = (bits >>> 32) & 2147483647
+    if (high >= 2146435072) return x + x
+    if (high < 1048576) {
+        // zero or subnormal: scale by 2^54, which the result undoes by 2^-18
+        if ((bits & 9223372036854775807) == 0) return x
+        val magnitude = m.fabs(x) * 18014398509481984.0
+        val scaledHigh = (f64ToBits(magnitude) >>> 32) & 2147483647
+        return libcCbrtStep(magnitude, f64FromBits((scaledHigh / 3 + 696219795) << 32), sign, true)
+    }
+    libcCbrtStep(m.fabs(x), f64FromBits((high / 3 + 715094163) << 32), sign, false)
+}
+
+// The estimate refined to 23 bits by the polynomial, rounded away from zero, then one Newton step.
+fun libcCbrtStep(target: f64, estimate: f64, sign: int, scaled: bool): f64 {
+    val r = (estimate * estimate) * (estimate / target)
+    var t = estimate * ((1.87595182427177009643 + r * (-1.88497979543377169875 + r * 1.621429720105354466140)) +
+        ((r * r) * r) * (-0.758397934778766047437 + r * 0.145996192886612446982))
+    t = f64FromBits((f64ToBits(t) + 2147483648) & -1073741824)
+    val s = t * t
+    val q = target / s
+    val w = t + t
+    t = t + t * ((q - t) / (w + q))
+    if (scaled) t = t / 262144.0
+    f64FromBits(f64ToBits(t) | sign)
+}
+
+// fmod: exact, by binary long division of the significands (musl's algorithm).
+@export("fmod")
+fun libcFmod(x: f64, y: f64): f64 {
+    val xb = f64ToBits(x)
+    val yb = f64ToBits(y)
+    var ex = (xb >>> 52) & 2047
+    var ey = (yb >>> 52) & 2047
+    val sx = xb >>> 63
+    if ((yb << 1) == 0 || y != y || ex == 2047) return (x * y) / (x * y)
+    val ax = xb & 9223372036854775807
+    val ay = yb & 9223372036854775807
+    if (ax <= ay) {
+        if (ax == ay) return 0.0 * x
+        return x
+    }
+    var mx = 0
+    var my = 0
+    if (ex == 0) {
+        // subnormal x: shift the significand up until bit 52 is set, lowering the exponent accordingly.
+        mx = ax
+        ex = 1
+        while (mx < 4503599627370496) {
+            mx = mx << 1
+            ex = ex - 1
+        }
+    } else mx = (ax & libcMantissaMask) | 4503599627370496
+    if (ey == 0) {
+        my = ay
+        ey = 1
+        while (my < 4503599627370496) {
+            my = my << 1
+            ey = ey - 1
+        }
+    } else my = (ay & libcMantissaMask) | 4503599627370496
+    while (ex > ey) {
+        val d = mx - my
+        if (d >= 0) {
+            if (d == 0) return 0.0 * x
+            mx = d
+        }
+        mx = mx << 1
+        ex = ex - 1
+    }
+    val last = mx - my
+    if (last >= 0) {
+        if (last == 0) return 0.0 * x
+        mx = last
+    }
+    while (mx < 4503599627370496) {
+        mx = mx << 1
+        ex = ex - 1
+    }
+    var out = 0
+    if (ex > 0) out = (mx - 4503599627370496) | (ex << 52) else out = mx >>> (1 - ex)
+    f64FromBits(out | (sx << 63))
+}
+
+// ldexp: musl's scalbn, the scale applied in at most three exact or single-rounding steps.
+@export("ldexp")
+fun libcLdexp(x: f64, count: int): f64 {
+    var n = libcInt(count)
+    var y = x
+    if (n > 1023) {
+        y = y * 8.98846567431158e307
+        n = n - 1023
+        if (n > 1023) {
+            y = y * 8.98846567431158e307
+            n = n - 1023
+            if (n > 1023) n = 1023
+        }
+    } else if (n < -1022) {
+        y = y * 2.2250738585072014e-308 * 9007199254740992.0
+        n = n + 1022 - 53
+        if (n < -1022) {
+            y = y * 2.2250738585072014e-308 * 9007199254740992.0
+            n = n + 1022 - 53
+            if (n < -1022) n = -1022
+        }
+    }
+    y * f64FromBits((1023 + n) << 52)
+}
+
+@export("frexp")
+trusted fun libcFrexp(x: f64, exponent: int): f64 {
+    ablaRuntimeStoreI32(exponent, 0)
+    var bits = f64ToBits(x)
+    var e = (bits >>> 52) & 2047
+    if (x != x || e == 2047 || (bits & 9223372036854775807) == 0) return x
+    var adjust = 0
+    if (e == 0) {
+        bits = f64ToBits(x * 18014398509481984.0)
+        e = (bits >>> 52) & 2047
+        adjust = -54
+    }
+    ablaRuntimeStoreI32(exponent, e - 1022 + adjust)
+    f64FromBits((bits & -9218868437227405313) | 4602678819172646912)
+}
+
+@export("modf")
+trusted fun libcModf(x: f64, whole: int): f64 {
+    if (x != x) {
+        ablaRuntimeStoreI64(whole, f64ToBits(x))
+        return x
+    }
+    if (m.fabs(x) == 1.0 / 0.0) {
+        ablaRuntimeStoreI64(whole, f64ToBits(x))
+        return libcCopysign(0.0, x)
+    }
+    val t = m.trunc(x)
+    ablaRuntimeStoreI64(whole, f64ToBits(t))
+    libcCopysign(x - t, x)
+}
+
+@export("sincos")
+trusted fun libcSincos(x: f64, sine: int, cosine: int): void {
+    ablaRuntimeStoreI64(sine, f64ToBits(m.sin(x)))
+    ablaRuntimeStoreI64(cosine, f64ToBits(m.cos(x)))
+    return
+}
+
+// The conversions to integers: out of range (or NaN) is the integer minimum, as the x86-64 instruction gives it.
+@export("lround")
+fun libcLround(x: f64): int = libcToInteger(libcRound(x))
+
+@export("llround")
+fun libcLlround(x: f64): int = libcToInteger(libcRound(x))
+
+@export("lrint")
+fun libcLrint(x: f64): int = libcToInteger(m.roundEven(x))
+
+@export("llrint")
+fun libcLlrint(x: f64): int = libcToInteger(m.roundEven(x))
+
+fun libcToInteger(x: f64): int {
+    if (x != x || x >= 9223372036854775808.0 || x < -9223372036854775808.0) return -9223372036854775808
+    f64ToInt(x)
+}
+
+// ---- the float forms
+@export("sinf")
+fun libcSinf(x: f32): f32 = f64ToF32(m.sin(f32ToF64(x)))
+
+@export("cosf")
+fun libcCosf(x: f32): f32 = f64ToF32(m.cos(f32ToF64(x)))
+
+@export("tanf")
+fun libcTanf(x: f32): f32 = f64ToF32(m.tan(f32ToF64(x)))
+
+@export("asinf")
+fun libcAsinf(x: f32): f32 = f64ToF32(libcAsin(f32ToF64(x)))
+
+@export("acosf")
+fun libcAcosf(x: f32): f32 = f64ToF32(libcAcos(f32ToF64(x)))
+
+@export("atanf")
+fun libcAtanf(x: f32): f32 = f64ToF32(m.atan(f32ToF64(x)))
+
+@export("atan2f")
+fun libcAtan2f(y: f32, x: f32): f32 = f64ToF32(m.atan2(f32ToF64(y), f32ToF64(x)))
+
+@export("sinhf")
+fun libcSinhf(x: f32): f32 = f64ToF32(libcSinh(f32ToF64(x)))
+
+@export("coshf")
+fun libcCoshf(x: f32): f32 = f64ToF32(libcCosh(f32ToF64(x)))
+
+@export("tanhf")
+fun libcTanhf(x: f32): f32 = f64ToF32(libcTanh(f32ToF64(x)))
+
+@export("erff")
+fun libcErff(x: f32): f32 = f64ToF32(libcErf(f32ToF64(x)))
+
+@export("expf")
+fun libcExpf(x: f32): f32 = f64ToF32(m.exp(f32ToF64(x)))
+
+@export("exp2f")
+fun libcExp2f(x: f32): f32 = f64ToF32(m.pow(2.0, f32ToF64(x)))
+
+@export("expm1f")
+fun libcExpm1f(x: f32): f32 = f64ToF32(libcExpm1Export(f32ToF64(x)))
+
+@export("logf")
+fun libcLogf(x: f32): f32 = f64ToF32(m.log(f32ToF64(x)))
+
+@export("log10f")
+fun libcLog10f(x: f32): f32 = f64ToF32(libcLog10(f32ToF64(x)))
+
+@export("log1pf")
+fun libcLog1pf(x: f32): f32 = f64ToF32(libcLog1p(f32ToF64(x)))
+
+@export("powf")
+fun libcPowf(x: f32, y: f32): f32 = f64ToF32(m.pow(f32ToF64(x), f32ToF64(y)))
+
+@export("sqrtf")
+fun libcSqrtf(x: f32): f32 = f64ToF32(m.sqrt(f32ToF64(x)))
+
+@export("cbrtf")
+fun libcCbrtf(x: f32): f32 = f64ToF32(libcCbrt(f32ToF64(x)))
+
+@export("hypotf")
+fun libcHypotf(x: f32, y: f32): f32 = f64ToF32(m.hypot(f32ToF64(x), f32ToF64(y)))
+
+@export("floorf")
+fun libcFloorf(x: f32): f32 = f64ToF32(m.floor(f32ToF64(x)))
+
+@export("ceilf")
+fun libcCeilf(x: f32): f32 = f64ToF32(m.ceil(f32ToF64(x)))
+
+@export("truncf")
+fun libcTruncf(x: f32): f32 = f64ToF32(m.trunc(f32ToF64(x)))
+
+@export("roundf")
+fun libcRoundf(x: f32): f32 = f64ToF32(libcRound(f32ToF64(x)))
+
+@export("rintf")
+fun libcRintf(x: f32): f32 = f64ToF32(m.roundEven(f32ToF64(x)))
+
+@export("nearbyintf")
+fun libcNearbyintf(x: f32): f32 = f64ToF32(m.roundEven(f32ToF64(x)))
+
+@export("fabsf")
+fun libcFabsf(x: f32): f32 = f64ToF32(m.fabs(f32ToF64(x)))
+
+@export("fmodf")
+fun libcFmodf(x: f32, y: f32): f32 = f64ToF32(libcFmod(f32ToF64(x), f32ToF64(y)))
+
+@export("fmaf")
+fun libcFmaf(x: f32, y: f32, z: f32): f32 = m.fma(x, y, z)
+
+@export("fminf")
+fun libcFminf(x: f32, y: f32): f32 = if (x < y || y != y) x else y
+
+@export("fmaxf")
+fun libcFmaxf(x: f32, y: f32): f32 = if (x > y || y != y) x else y
+
+@export("copysignf")
+fun libcCopysignf(x: f32, y: f32): f32 =
+    f32FromBits(u32((int(f32ToBits(x)) & 2147483647) | (int(f32ToBits(y)) & 2147483648)))
+
+@export("ldexpf")
+fun libcLdexpf(x: f32, count: int): f32 = f64ToF32(libcLdexp(f32ToF64(x), count))
+
+@export("lroundf")
+fun libcLroundf(x: f32): int = libcToInteger(libcRound(f32ToF64(x)))
+
+@export("llroundf")
+fun libcLlroundf(x: f32): int = libcToInteger(libcRound(f32ToF64(x)))
+
+@export("lrintf")
+fun libcLrintf(x: f32): int = libcToInteger(m.roundEven(f32ToF64(x)))
+
+@export("llrintf")
+fun libcLlrintf(x: f32): int = libcToInteger(m.roundEven(f32ToF64(x)))
+
+// ---- the C99 functions of the inverse hyperbolic, complementary error, IEEE remainder and positive difference families
+@export("asinh")
+fun libcAsinh(x: f64): f64 {
+    val a = m.fabs(x)
+    if (x != x || a == 0.0 || a == 1.0 / 0.0) return x
+    var r = 0.0
+    if (a < 0.000000003725290298461914) return x
+    if (a > 268435456.0) r = m.log(a) + 0.6931471805599453
+    else r = libcLog1p(a + a * a / (1.0 + m.sqrt(1.0 + a * a)))
+    libcCopysign(r, x)
+}
+
+@export("acosh")
+fun libcAcosh(x: f64): f64 {
+    if (x != x || x < 1.0) return libcNaN()
+    if (x == 1.0) return 0.0
+    if (x > 268435456.0) return m.log(x) + 0.6931471805599453
+    val t = x - 1.0
+    libcLog1p(t + m.sqrt(2.0 * t + t * t))
+}
+
+@export("atanh")
+fun libcAtanh(x: f64): f64 {
+    val a = m.fabs(x)
+    if (x != x || a > 1.0) return libcNaN()
+    if (a == 1.0) return libcCopysign(1.0 / 0.0, x)
+    if (a < 0.000000003725290298461914) return x
+    val r = if (a < 0.5) 0.5 * libcLog1p(2.0 * a + 2.0 * a * a / (1.0 - a)) else 0.5 * libcLog1p(2.0 * a / (1.0 - a))
+    libcCopysign(r, x)
+}
+
+// erfc: 1 - erf up to 2.5 (the loss of digits there is tolerable: erfc(2.5) is 4e-4), then e^(-x^2) over the continued fraction as erf does.
+@export("erfc")
+fun libcErfc(x: f64): f64 {
+    if (x != x) return x
+    if (x < 2.5) return 1.0 - libcErf(x)
+    if (x > 27.3) return 0.0
+    val x2 = x * x
+    val low = m.fma(x, x, 0.0 - x2)
+    val gauss = m.exp(0.0 - x2) * (1.0 - low)
+    var t = x
+    var k = 120
+    while (k >= 1) {
+        t = x + f64FromInt(k) / 2.0 / t
+        k -= 1
+    }
+    gauss / (1.7724538509055159 * t)
+}
+
+@export("fdim")
+fun libcFdim(x: f64, y: f64): f64 {
+    if (x != x) return x
+    if (y != y) return y
+    if (x > y) x - y else 0.0
+}
+
+// remainder: x - n y with n the integer nearest x / y (a tie to the even one), exact, from fmod by 2|y|.
+@export("remainder")
+fun libcRemainder(x: f64, y: f64): f64 {
+    if (x != x || y != y || m.fabs(x) == 1.0 / 0.0 || y == 0.0) return libcNaN()
+    if (m.fabs(y) == 1.0 / 0.0) return x
+    val ax = m.fabs(x)
+    val ay = m.fabs(y)
+    val twice = ay * 2.0
+    val r = if (twice == 1.0 / 0.0 || ax < twice) ax else libcFmod(ax, twice)
+    val half = ay / 2.0
+    var result = r
+    if (r > half) {
+        // q = r / ay is in (0.5, 2): nearest is 1 below 1.5 (r - ay, exact), else 2 (a tie at 1.5 goes to the even 2).
+        val d = r - ay
+        result = if (d < half) d else r - twice
+    }
+    if (result == 0.0) return libcCopysign(0.0, x)
+    libcCopysign(result, x)
+}
+
+@export("exp10f")
+fun libcExp10f(x: f32): f32 = f64ToF32(m.pow(10.0, f32ToF64(x)))
+
+@export("logbf")
+fun libcLogbf(x: f32): f32 = f64ToF32(libcLogb(f32ToF64(x)))
+
+@export("roundevenf")
+fun libcRoundevenf(x: f32): f32 = f64ToF32(m.roundEven(f32ToF64(x)))
+
+@export("asinhf")
+fun libcAsinhf(x: f32): f32 = f64ToF32(libcAsinh(f32ToF64(x)))
+
+@export("acoshf")
+fun libcAcoshf(x: f32): f32 = f64ToF32(libcAcosh(f32ToF64(x)))
+
+@export("atanhf")
+fun libcAtanhf(x: f32): f32 = f64ToF32(libcAtanh(f32ToF64(x)))
+
+@export("erfcf")
+fun libcErfcf(x: f32): f32 = f64ToF32(libcErfc(f32ToF64(x)))
+
+@export("fdimf")
+fun libcFdimf(x: f32, y: f32): f32 = f64ToF32(libcFdim(f32ToF64(x), f32ToF64(y)))
+
+@export("remainderf")
+fun libcRemainderf(x: f32, y: f32): f32 = f64ToF32(libcRemainder(f32ToF64(x), f32ToF64(y)))
+
+@export("frexpf")
+trusted fun libcFrexpf(x: f32, exponent: int): f32 = f64ToF32(libcFrexp(f32ToF64(x), exponent))
+
+@export("modff")
+trusted fun libcModff(x: f32, whole: int): f32 {
+    val t = m.trunc(f32ToF64(x))
+    ablaRuntimeStoreI32(whole, int(f32ToBits(f64ToF32(t))))
+    f64ToF32(libcCopysign(f32ToF64(x) - t, f32ToF64(x)))
+}
+
+@export("sincosf")
+trusted fun libcSincosf(x: f32, sine: int, cosine: int): void {
+    ablaRuntimeStoreI32(sine, int(f32ToBits(f64ToF32(m.sin(f32ToF64(x))))))
+    ablaRuntimeStoreI32(cosine, int(f32ToBits(f64ToF32(m.cos(f32ToF64(x))))))
+    return
+}
