@@ -108,7 +108,7 @@ PCLMULQDQ's. Key expansion has no operation: `AESKEYGENASSIST` has no ARM counte
 | Target | Lowered to | Tested here |
 |---|---|---|
 | x86-64 | SSE2 at baseline; AVX2 and others under `@target`. A 256-bit vector without AVX2 is two 128-bit ones, by LLVM | **Run**: all checks, release and `--fast`, on this machine (an i9-13900K: AES, CLMUL, AVX2), and under `qemu-x86_64 -cpu qemu64`, which has none of them |
-| AArch64 | NEON; 256-bit is two 128-bit | **Run under qemu only**, `-cpu max` and `cortex-a57`, from an object linked with a start of its own (no AArch64 executable target exists). Not run on real hardware. A CPU without AES couldn't be tested: `cpuHas` false is read but untried there |
+| AArch64 | NEON; 256-bit is two 128-bit | **Run under qemu only**, `-cpu max` and `cortex-a57`, as static `aarch64-linux` executables. Not run on real hardware. A CPU without AES couldn't be tested: `cpuHas` false is read but untried there |
 | Wasm | SIMD128 when the program uses a vector: the module then needs an engine with it (all current ones) | **Run** under Node. A program with no vector gets no SIMD128 |
 | ESP32-S3 (Xtensa) | **Scalar code.** LLVM legalizes vectors into lanes. The S3's PIE vector instructions aren't reachable: upstream LLVM has no intrinsics for them, and only Espressif's fork does | **Compiled only** to an object. Nothing here runs Xtensa, and no board is attached. Sound but slower than it looks: an `f64` lane is software float there, and 64-bit lanes are pairs |
 | Others | Whatever LLVM legalizes to | Nothing |

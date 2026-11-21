@@ -62,11 +62,10 @@ grep -q 'i8x16\.swizzle' "$out/simd.wat" || { echo "no Wasm SIMD swizzle in the 
 grep -q 'f32x4\.nearest' "$out/simd.wat" || { echo "no Wasm SIMD rounding in the module" >&2; exit 1; }
 echo "ok   wasm under node $(node --version): SIMD128 instructions, no AES"
 
-# AArch64: no executable target exists, so an object, a start of its own, and qemu.
+# AArch64: build the same program as an ordinary static Linux executable.
 if command -v qemu-aarch64 >/dev/null; then
-    "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache
-    llvm-mc -triple aarch64-linux-gnu -filetype=obj "$cases/aarch64-start.s" -o "$out/aarch64-start.o"
-    ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
+    "$compiler" build "$cases/native.ab" --target aarch64-linux -o "$out/aarch64" --no-cache
+    "$compiler" build "$cases/gather-bounds.ab" --target aarch64-linux -o "$out/aarch64-gather-bounds" --no-cache
     llvm-objdump -d "$out/aarch64" > "$out/aarch64.s"
     grep -q 'aese' "$out/aarch64.s" || { echo "no AESE in the AArch64 program" >&2; exit 1; }
     grep -q 'pmull' "$out/aarch64.s" || { echo "no PMULL in the AArch64 program" >&2; exit 1; }
@@ -74,8 +73,9 @@ if command -v qemu-aarch64 >/dev/null; then
     grep -q 'frintn' "$out/aarch64.s" || { echo "no NEON ties-to-even rounding in the program" >&2; exit 1; }
     for cpu in max cortex-a57; do
         qemu-aarch64 -cpu "$cpu" "$out/aarch64" || { echo "simd aarch64 $cpu: check $? failed" >&2; exit 1; }
+        check_gather_bounds qemu-aarch64 -cpu "$cpu" "$out/aarch64-gather-bounds"
     done
-    echo "ok   aarch64 under qemu (max, cortex-a57), with AES and PMULL taken"
+    echo "ok   aarch64-linux under qemu (max, cortex-a57), with AES and PMULL taken"
 else
     echo "skip aarch64: no qemu-aarch64"
 fi
