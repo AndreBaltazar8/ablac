@@ -8790,6 +8790,11 @@ class BootstrapLowerer(
         if ((kindHead == 115 && kind == "string.template") && !staticTemplate) {
             result = bootstrapLowerStringTemplate(this, expression, result)
         }
+        if (kindHead == 115 && kind == "string.build.append") {
+            val cell = this.emit("local.load", -1, -1, expression.text)
+            val piece = this.lowerExpression(expression.children[0])
+            result = this.emitMany("call", [cell, piece], "__ablaRuntimeStringBuildAppend")
+        }
         if ((kindHead == 97 && kind == "array")) {
             result = bootstrapLowerArray(this, expression, result)
         }
@@ -12629,12 +12634,129 @@ fun bootstrapLeaveLoopTarget(var lowerer: BootstrapLowerer, entered: bool): void
 }
 
 @noinline
+fun bootstrapStringBuildSafe(node: BootstrapExpression, name: string): bool {
+    // Keep only expressions whose operands are explicit. A call, capture,
+    // early exit or nested loop stays on the ordinary concatenation path.
+    if (node.text == name) return false
+    val kind = node.kind
+    if (kind != "block" && kind != "if" && kind != "missing" &&
+        kind != "assign" && kind != "local.val" && kind != "local.var" &&
+        kind != "identifier" && kind != "type" &&
+        kind != "integer" && kind != "string" && kind != "string.template" &&
+        kind != "true" && kind != "false" && kind != "range.until" && kind != "range.closed" &&
+        kind != "+" && kind != "-" && kind != "*" && kind != "%" &&
+        kind != "<" && kind != "<=" && kind != ">" && kind != ">=" &&
+        kind != "==" && kind != "!=") return false
+    for (child in node.children) {
+        if (!bootstrapStringBuildSafe(child, name)) return false
+    }
+    true
+}
+
+fun bootstrapStringBuildPrefix(value: BootstrapExpression, name: string): bool {
+    value.children.size >= 2 &&
+        (value.kind == "string.template" || (value.kind == "+" && value.children.size == 2)) &&
+        value.children[0].kind == "identifier" && value.children[0].text == name
+}
+
+class BootstrapLoopStringBuild(
+    val body: BootstrapExpression, val builder: string, val accumulator: string
+)
+
+@noinline
+fun bootstrapPrepareLoopStringBuild(
+    var lowerer: BootstrapLowerer, loop: BootstrapExpression
+): BootstrapLoopStringBuild? {
+    val originalBody = loop.children[1]
+    if (bootstrapLoopLabel(loop) != "" || lowerer.validationOnly) return null
+    if (originalBody.end - originalBody.begin > 4096) return null
+    if (originalBody.kind != "block" && originalBody.kind != "assign") return null
+    if (originalBody.kind == "assign" && (originalBody.children.size != 1 ||
+        !bootstrapStringBuildPrefix(originalBody.children[0], originalBody.text))) return null
+    val body = if (originalBody.kind == "block") originalBody else
+        BootstrapExpression("block", "", originalBody.begin, originalBody.end, [originalBody])
+    var index = 0
+    while (index < body.children.size) {
+        val statement = body.children[index]
+        val append = index
+        index = index + 1
+        if (statement.kind != "assign" || statement.children.size != 1) continue
+        val value = statement.children[0]
+        val name = statement.text
+        if (!bootstrapStringBuildPrefix(value, name)) continue
+        val local = lowerer.visibleLocal(name, false)
+        if (local < 0 || lowerer.localTypes[local] != "string") continue
+        // A captured destination has a cell type. For a plain string, reject
+        // all other reads or writes and any path that can leave the loop early.
+        if (!bootstrapStringBuildSafe(loop.children[0], name)) continue
+        var safe = true
+        var other = 0
+        for (part in body.children) {
+            if (other != append && !bootstrapStringBuildSafe(part, name)) safe = false
+            other = other + 1
+        }
+        var part = 1
+        while (part < value.children.size && safe) {
+            if (!bootstrapStringBuildSafe(value.children[part], name)) safe = false
+            part = part + 1
+        }
+        if (!safe) continue
+        var piece = value.children[1]
+        if (value.kind == "string.template") {
+            val suffix: array<BootstrapExpression> = []
+            for (child in 1 until value.children.size) suffix.append(value.children[child])
+            piece = BootstrapExpression("string.template", "", value.begin, value.end, suffix)
+        } else {
+            // Check the right operand in the scope it will have at the append.
+            val prefix: array<BootstrapExpression> = []
+            for (previous in 0 until append) prefix.append(body.children[previous])
+            prefix.append(piece)
+            val typed = BootstrapExpression("block", "", body.begin, piece.end, prefix)
+            if (bootstrapBorrowElementType(lowerer.lowerExpressionType(typed)) != "string") {
+                continue
+            }
+        }
+        val accumulator = lowerer.localStorage[local]
+        val original = lowerer.emit("local.load", -1, -1, accumulator)
+        val cell = lowerer.emitMany("cell.create", [original], "")
+        val builder = "string_builder_${lowerer.nextValue}"
+        lowerer.emit("local.declare", cell, -1, builder)
+        val statements: array<BootstrapExpression> = []
+        var at = 0
+        for (step in body.children) {
+            if (at == append) statements.append(BootstrapExpression(
+                "string.build.append", builder, step.begin, step.end, [piece]
+            ))
+            else statements.append(step)
+            at = at + 1
+        }
+        return BootstrapLoopStringBuild(
+            BootstrapExpression(body.kind, body.text, body.begin, body.end, statements),
+            builder, accumulator
+        )
+    }
+    null
+}
+
+fun bootstrapFinishLoopStringBuild(
+    var lowerer: BootstrapLowerer, build: BootstrapLoopStringBuild?
+): void {
+    if (build != null) {
+        val cell = lowerer.emit("local.load", -1, -1, build.builder)
+        val value = lowerer.emitMany("call", [cell], "__ablaRuntimeStringBuildFinish")
+        lowerer.emit("local.assign", value, -1, build.accumulator)
+    }
+}
+
+@noinline
 fun bootstrapLowerWhile(
     var lowerer: BootstrapLowerer,
     expression: BootstrapExpression,
     initial: int
 ): int {
     var result = initial
+    val build = bootstrapPrepareLoopStringBuild(lowerer, expression)
+    val body = if (build == null) expression.children[1] else build.body
     val conditionLabel = lowerer.allocateLabel()
     val bodyLabel = lowerer.allocateLabel()
     val mergeLabel = lowerer.allocateLabel()
@@ -12658,7 +12780,7 @@ fun bootstrapLowerWhile(
     )
     val bodyMark = lowerer.locals.size
     lowerer.dropDiscarded(
-        lowerer.lowerExpression(expression.children[1], false), expression.children[1]
+        lowerer.lowerExpression(body, false), body
     )
     lowerer.dropTemporaries(bodyMark)
     bootstrapLeaveLoopTarget(lowerer, labeled)
@@ -12668,6 +12790,7 @@ fun bootstrapLowerWhile(
     lowerer.breakScope = previousBreakScope
     lowerer.continueScope = previousContinueScope
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    bootstrapFinishLoopStringBuild(lowerer, build)
     result = lowerer.emit("const.void", -1, -1, "")
     result
 }
@@ -12929,6 +13052,8 @@ fun bootstrapLowerFor(
         lowerer.containerIteratorStorages.append(iteratorStorage)
         lowerer.containerIteratorFlags.append(arrayFlag)
     }
+    val build = if (range) bootstrapPrepareLoopStringBuild(lowerer, expression) else null
+    val body = if (build == null) expression.children[1] else build.body
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, conditionLabel, -1, "")
     var index = -1
@@ -12984,7 +13109,7 @@ fun bootstrapLowerFor(
     )
     val bodyMark = lowerer.locals.size
     lowerer.dropDiscarded(
-        lowerer.lowerExpression(expression.children[1], false), expression.children[1]
+        lowerer.lowerExpression(body, false), body
     )
     lowerer.dropTemporaries(bodyMark)
     if (affineArray && !iteratorCaptured)
@@ -13012,6 +13137,7 @@ fun bootstrapLowerFor(
     }
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    bootstrapFinishLoopStringBuild(lowerer, build)
     if (sourceScope >= 0) {
         lowerer.emitScopeDrops(lowerer.currentScope)
         lowerer.leaveLocalScope(sourceScope)
