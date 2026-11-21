@@ -387,6 +387,7 @@ test-serial: ablac
 	tools/test-integer-narrowing.sh $(COMPILER)
 	tools/test-integer-narrowing-stores.sh $(COMPILER)
 	tools/test-array-remove-last.sh $(COMPILER)
+	tools/test-path-syntax.sh $(COMPILER)
 	tools/test-path-home.sh $(COMPILER)
 	tools/test-path-directory-mode.sh $(COMPILER)
 	tools/test-path-file-mode.sh $(COMPILER)

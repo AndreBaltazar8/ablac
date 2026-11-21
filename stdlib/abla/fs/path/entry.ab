@@ -1,0 +1,205 @@
+// Lexical path syntax, apart from any operating system: where a path's root ends, its parent, last name, extension, join,
+// normalization and components, for the two syntaxes Abla programs meet, POSIX (`windows = false`) and Windows (`windows = true`).
+import "abla/text"
+import "abla/array"
+
+// Nothing here reads the file system or the host: the functions take the syntax as an argument, so both are testable on every
+// host, and `abla/fs` (abla/sys/linux/fs) calls them with the host's syntax (`pathHostIsWindows`).
+//
+// POSIX: the separator is `/`; a path is absolute when it starts with one; the root is that one byte.
+// Windows: the separators are `\` and `/` (both accepted, `\` produced by join and normalize); a path is one of
+//   - `C:\dir`, `C:/dir`  absolute: a drive and a separator (root `C:\`, 3 bytes);
+//   - `C:dir`, `C:`       relative to the drive's current directory (root `C:`, 2 bytes; not absolute);
+//   - `\dir`, `/dir`      rooted on the current drive (root 1 byte; not absolute);
+//   - `\\server\share\dir` absolute UNC (root `\\server\share\`, the trailing separator included when present);
+//   - `\\?\C:\dir`, `\\?\UNC\server\share\dir`, `\\.\pipe\name`  verbatim and device paths (root up to the same points as the
+//     forms they wrap; the text after the prefix is not normalized by the system, and `normalize` keeps it as written).
+// Names are compared as bytes by every function here (Windows file names are case-insensitive, the file system decides);
+// the bytes are UTF-8 (or WTF-8, which only means that no byte value is special here but the separators and `:`, `.`, `?`).
+// The canonical form that Abla's own tools use inside caches and build files is `/`-separated: `pathToCanonical` turns a
+// Windows path into it and `pathToNative` back, and those two are the only places the separator changes.
+
+fun pathHostIsWindows(): bool = false
+
+private fun pathIsSeparator(windows: bool, byte: int): bool =
+    byte == 47 || (windows && byte == 92)
+
+private fun pathIsLetter(byte: int): bool =
+    (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+
+// The length of the root's text (0 when the path has none): the bytes that no `parent` removes and `name` never includes.
+fun pathRootLength(text: string, windows: bool): int {
+    if (!windows) return if (text.size > 0 && text[0] == 47) 1 else 0
+    if (text.size >= 2 && pathIsSeparator(true, text[0]) && pathIsSeparator(true, text[1])) {
+        var start = 2
+        var wanted = 2
+        // `\\?\` and `\\.\`: the root is the prefix with what follows as a drive or as UNC, else the prefix and one component.
+        if (text.size >= 4 && (text[2] == 63 || text[2] == 46) && pathIsSeparator(true, text[3])) {
+            start = 4
+            wanted = 1
+            if (text.size >= start + 2 && pathIsLetter(text[start]) && text[start + 1] == 58) {
+                var length = start + 2
+                if (text.size > length && pathIsSeparator(true, text[length])) length = length + 1
+                return length
+            }
+            if (text.size >= start + 4 && pathIsSeparator(true, text[start + 3]) &&
+                (text[start] == 85 || text[start] == 117) && (text[start + 1] == 78 || text[start + 1] == 110) &&
+                (text[start + 2] == 67 || text[start + 2] == 99)) {
+                start = start + 4
+                wanted = 2
+            }
+        }
+        // `\\server\share\`: two components after the two separators (the share's separator belongs to the root).
+        var index = start
+        var parts = 0
+        while (index < text.size && parts < wanted) {
+            while (index < text.size && !pathIsSeparator(true, text[index])) index = index + 1
+            parts = parts + 1
+            if (index < text.size) index = index + 1
+        }
+        return index
+    }
+    if (text.size >= 2 && pathIsLetter(text[0]) && text[1] == 58) {
+        if (text.size >= 3 && pathIsSeparator(true, text[2])) return 3
+        return 2
+    }
+    if (text.size >= 1 && pathIsSeparator(true, text[0])) return 1
+    0
+}
+
+// Absolute: the root names a place by itself. A POSIX root, a Windows drive with its separator, UNC, verbatim and device
+// roots are; `\dir` (the current drive's) and `C:dir` (the drive's current directory) are not.
+fun pathIsAbsolute(text: string, windows: bool): bool {
+    val root = pathRootLength(text, windows)
+    if (root == 0) return false
+    if (!windows) return true
+    if (root == 1) return false
+    if (root == 2) return !(pathIsLetter(text[0]) && text[1] == 58)
+    true
+}
+
+// The index of the last separator in [from, end), or -1.
+private fun pathLastSeparator(text: string, windows: bool, from: int, end: int): int {
+    var slash = -1
+    var index = from
+    while (index < end) {
+        if (pathIsSeparator(windows, text[index])) slash = index
+        index = index + 1
+    }
+    slash
+}
+
+// What is left when the last name goes: "." for a relative path of one name, the root for a root and a name under it, and the
+// root itself for a root. The bytes before the last separator are kept as written (`a//b` has the parent `a/`).
+fun pathParent(text: string, windows: bool): string {
+    val root = pathRootLength(text, windows)
+    var end = text.size
+    while (end > root && pathIsSeparator(windows, text[end - 1])) end = end - 1
+    val slash = pathLastSeparator(text, windows, root, end)
+    if (slash >= 0) return text.slice(0, slash)
+    if (root > 0) return text.slice(0, root)
+    "."
+}
+
+// The last name, without trailing separators ("" for a root and for ""); `C:` and `C:\` have none.
+fun pathName(text: string, windows: bool): string {
+    val root = pathRootLength(text, windows)
+    var end = text.size
+    while (end > root && pathIsSeparator(windows, text[end - 1])) end = end - 1
+    val slash = pathLastSeparator(text, windows, root, end)
+    var start = root
+    if (slash >= 0) start = slash + 1
+    if (start > end) start = end
+    text.slice(start, end)
+}
+
+// After the last dot of the name when the dot is neither first nor last ("" otherwise).
+fun pathExtension(text: string, windows: bool): string {
+    val name = pathName(text, windows)
+    var dot = -1
+    var index = 0
+    while (index < name.size) {
+        if (name[index] == 46) dot = index
+        index = index + 1
+    }
+    var result = ""
+    if (dot > 0 && dot + 1 < name.size) result = name.slice(dot + 1, name.size)
+    result
+}
+
+// `base` and `name` with one separator between them (`/`, or `\` for the Windows syntax); none when `base` ends with one, and
+// none after a bare drive (`C:` + `x` is `C:x`, the drive-relative path).
+fun pathJoin(base: string, name: string, windows: bool): string {
+    var separator = if (windows) "\\" else "/"
+    if (base.size > 0 && pathIsSeparator(windows, base[base.size - 1])) separator = ""
+    if (windows && base.size == 2 && pathRootLength(base, true) == 2) separator = ""
+    "$base$separator$name"
+}
+
+// The names after the root, in order, without empty ones (repeated separators) and without ".".
+fun pathComponents(text: string, windows: bool): array<string> {
+    val result: array<string> = []
+    var index = pathRootLength(text, windows)
+    while (index < text.size) {
+        while (index < text.size && pathIsSeparator(windows, text[index])) index = index + 1
+        val begin = index
+        while (index < text.size && !pathIsSeparator(windows, text[index])) index = index + 1
+        if (index > begin) {
+            val part = text.slice(begin, index)
+            if (part != ".") result.append(part)
+        }
+    }
+    result
+}
+
+// A root with its separators in the syntax's own form (the Windows prefixes `\\?\` and `\\.\` and UNC separators `\`; the
+// drive letter is kept as written).
+private fun pathNativeRoot(root: string, windows: bool): string {
+    if (!windows) return root
+    root.replace("/", "\\")
+}
+
+// The lexical normal form: the root in the syntax's separator, repeated separators and "." gone, each ".." removing the name
+// before it (kept at the start of a relative path, dropped at a root), "." for an empty result. Verbatim paths (`\\?\`) are
+// returned as written: the system gives them no such meaning. It never looks at the file system (a symbolic link before a
+// ".." is not followed), so it is the identity of a path, not its target.
+fun pathNormalize(text: string, windows: bool): string {
+    if (windows && text.size >= 4 && pathIsSeparator(true, text[0]) && pathIsSeparator(true, text[1]) &&
+        text[2] == 63 && pathIsSeparator(true, text[3])) return text
+    val root = pathRootLength(text, windows)
+    val rooted = root > 0 && (!windows || pathIsAbsolute(text, true) || root == 1)
+    val names: array<string> = []
+    for (part in pathComponents(text, windows)) {
+        if (part == "..") {
+            if (names.size > 0 && names[names.size - 1] != "..") {
+                names.removeLast()
+            } else if (!rooted) {
+                names.append("..")
+            }
+        } else {
+            names.append(part)
+        }
+    }
+    val separator = if (windows) "\\" else "/"
+    var result = pathNativeRoot(text.slice(0, root), windows)
+    var index = 0
+    while (index < names.size) {
+        if (index > 0) result = "$result$separator"
+        result = "$result${names[index]}"
+        index = index + 1
+    }
+    if (result.size == 0) "." else result
+}
+
+// The `/`-separated form Abla's tools key caches and build files by: a Windows path with its `\` turned into `/`. A POSIX path
+// is returned as it is (a `\` is a name byte there).
+fun pathToCanonical(text: string, windows: bool): string {
+    if (!windows) return text
+    text.replace("\\", "/")
+}
+
+// The form the host's calls take: the Windows syntax with `\`, a POSIX path as it is.
+fun pathToNative(text: string, windows: bool): string {
+    if (!windows) return text
+    text.replace("/", "\\")
+}
