@@ -115,6 +115,16 @@ fun fuzzFirstLines(text: string, count: int): array<string> {
 fun fuzzNativeJob(runner: FuzzRunner, source: string, out: string, fast: bool, evaluation: string): FuzzJob =
     fuzzCachedNativeJob(runner, source, out, fast, evaluation, "", false)
 
+/** A native build and run by `compilerPath` with extra environment variables, with no cache: the extra axes below. */
+fun fuzzAxisJob(runner: FuzzRunner, compilerPath: string, source: string, out: string, fast: bool, names: array<string>,
+    values: array<string>): FuzzJob {
+    val arguments: array<string> = [compilerPath, "build", source, "-o", out, "--no-cache"]
+    if (fast) arguments.append("--fast")
+    val build = runner.step(arguments, names, values, "$out.build.out", "$out.build.err", true)
+    val run = runner.step([out], [], [], "$out.stdout", "$out.stderr", true)
+    FuzzJob([build, run], 0, 0, [])
+}
+
 /** A native build and run; with `cacheDir` the build uses that cache (ABLA_CACHE_DIR) instead of --no-cache, and with
  * `trace` the build writes the compiler's memory trace (discovery cache hits among it) to `<out>.build.err`. */
 fun fuzzCachedNativeJob(runner: FuzzRunner, source: string, out: string, fast: bool, evaluation: string, cacheDir: string,
@@ -217,6 +227,25 @@ fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: stri
         jobs.append(fuzzNativeJob(this, ct, "$directory/ctjit", true, "jit"))
     }
     if (includeWasm) jobs.append(fuzzWasmJob(this, plain, directory))
+    // Extra axes (environment, so every campaign takes them): ABLA_FUZZ_OTHER_COMPILER=<path> builds the program with another compiler too
+    // (the static one against the dynamic: its own C library at compile time, its own link), ABLA_FUZZ_PRUNE=1 with the runtime prune on.
+    val axes: array<string> = []
+    val other = linuxEnvironment("ABLA_FUZZ_OTHER_COMPILER")
+    if (other.found && other.value != "") {
+        for (fast in [true, false]) {
+            val name = if (fast) "other-fast" else "other-release"
+            jobs.append(fuzzAxisJob(this, other.value, plain, "$directory/$name", fast, ["ABLA_SYSROOT"], [this.root]))
+            axes.append(name)
+        }
+    }
+    val prune = linuxEnvironment("ABLA_FUZZ_PRUNE")
+    if (prune.found && prune.value == "1") {
+        for (fast in [true, false]) {
+            val name = if (fast) "prune-fast" else "prune-release"
+            jobs.append(fuzzAxisJob(this, this.compiler, plain, "$directory/$name", fast, ["ABLA_PRUNE_RUNTIME"], ["1"]))
+            axes.append(name)
+        }
+    }
     this.runJobs(jobs)
     val results: array<FuzzResult> = [
         fuzzNativeResult("fast", jobs[0], "$directory/fast"),
@@ -227,6 +256,11 @@ fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: stri
         results.append(fuzzNativeResult("ct", jobs[2], "$directory/ct"))
         results.append(fuzzNativeResult("ct-jit", jobs[3], "$directory/ctjit"))
         next = 4
+    }
+    var axis = if (includeWasm) next + 1 else next
+    for (name in axes) {
+        results.append(fuzzNativeResult(name, jobs[axis], "$directory/$name"))
+        axis = axis + 1
     }
     if (includeWasm) fuzzWasmResults(this, jobs[next], directory, results)
     results
