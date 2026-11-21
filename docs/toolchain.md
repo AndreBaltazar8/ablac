@@ -19,10 +19,14 @@ load it. The archive uses the system dynamic loader and bundles LLVM and its oth
 non-glibc dependencies. The release job checks every ELF file of the archive
 (`tools/test-linux-toolchain-portability.sh`) and runs the compiler in Ubuntu 22.04
 and AlmaLinux 9.
-The standalone `ablac-x86_64-linux` release asset is the byte-reproducible bootstrap
-compiler (docs/bootstrap.md), built in the Nix shell: it names a Nix-store dynamic loader
-and finds libLLVM, libssl and libcrypto through Nix-store RUNPATH entries, so it runs only
-where those store paths exist. Use the toolchain archive for an installed toolchain.
+The standalone `ablac-x86_64-linux` release asset is the statically linked compiler
+(src/orc_main_static.ab on LLVM's static archives and Abla's own C library: a static-pie executable with no
+loader and no needed library, checked by tools/test-static-artifact.sh including its fixpoint) and the bootstrap
+compiler (docs/bootstrap.md). It cannot `dlopen`, so compile-time `nativeLibraries` need
+`ablac-dynamic-x86_64-linux`, which ships beside it for one release: that is the compiler built in the Nix shell,
+the byte-reproducible one, and it names a Nix-store dynamic loader and finds libLLVM, libssl and libcrypto through
+Nix-store RUNPATH entries, so it runs only where those store paths exist. Use the toolchain archive (still
+packaged from the dynamic compiler) for an installed toolchain.
 
 ```sh
 ablac build app.ab -o build/app

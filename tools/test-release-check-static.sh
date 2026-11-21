@@ -57,4 +57,20 @@ rm -f artifacts/ablac-static-aarch64-linux artifacts/ablac-static-aarch64-linux.
 rm -f artifacts/ablac-static-x86_64-linux artifacts/ablac-static-x86_64-linux.sha256
 again=$(run expected-with out3)
 [[ $(line assets "$again") == PASS* ]] || { echo "assets, static expected, none built: $(line assets "$again")" >&2; exit 1; }
+# Decision #90 A (the static compiler is ablac-x86_64-linux, the dynamic one ablac-dynamic-x86_64-linux): the dynamic asset is what is compared with
+# stage 2 and is no extra name; check 7 judges ablac-x86_64-linux (here a script, so it fails as a non-static-pie file; without static LLVM archives
+# the default asset fails for want of its fixpoint rather than passing without it).
+printf '#!/bin/sh\necho "ablac 9.9.9"\necho static-not-really\n' > artifacts/ablac-x86_64-linux
+chmod +x artifacts/ablac-x86_64-linux
+cp stage2 artifacts/ablac-dynamic-x86_64-linux
+for name in ablac-x86_64-linux ablac-dynamic-x86_64-linux; do (cd artifacts && sha256sum "$name" > "$name.sha256"); done
+switched=$(run expected-without out6)
+[[ $(line assets "$switched") == PASS* ]] || { echo "assets, switched layout: $(line assets "$switched")" >&2; exit 1; }
+[[ $(line stage2 "$switched") == PASS* ]] || { echo "stage2 vs the dynamic asset, switched layout: $(line stage2 "$switched")" >&2; exit 1; }
+[[ $(line static "$switched") == FAIL* ]] || { echo "a script passed as the static default asset: $(line static "$switched")" >&2; exit 1; }
+# a switched layout whose dynamic asset differs from stage 2 fails check 4
+printf '#!/bin/sh\necho other\n' > artifacts/ablac-dynamic-x86_64-linux
+(cd artifacts && sha256sum ablac-dynamic-x86_64-linux > ablac-dynamic-x86_64-linux.sha256)
+other=$(run expected-without out7)
+[[ $(line stage2 "$other") == FAIL* ]] || { echo "a dynamic asset that is not stage 2 passed check 4: $(line stage2 "$other")" >&2; exit 1; }
 echo "release-check static: the optional assets (x86-64 and AArch64) are judged by their own checks"

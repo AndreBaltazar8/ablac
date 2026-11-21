@@ -155,10 +155,13 @@ actual=$(mktemp)
 # only exists when nothing was given with --artifacts, and also removes the two temporary lists.)
 trap 'rm -f -- "$expected" "$actual"; [[ -z ${source_dir:-} || -n $artifacts ]] || rm -rf -- "$source_dir"' EXIT
 ( cd "$out" && ls ) | sort >"$actual"   # (ls leaves out the .release-check marker)
-# The static compilers (#806 step C, one per architecture: x86_64 and aarch64) are optional extras next to the dynamic one: their names are neither
-# expected nor an extra; check 7 judges each that is present.
+# The static compilers (#806 step C, one per architecture: x86_64 and aarch64) and the dynamic one that ships beside the static default for one release
+# (decision #90 A: `ablac-x86_64-linux` is then the static compiler, `ablac-dynamic-x86_64-linux` the dynamic one) are optional extras: their names are
+# neither expected nor an extra; check 4 judges the dynamic one and check 7 each static one that is present.
+switched=0
+! grep -qxF ablac-dynamic-x86_64-linux "$actual" || switched=1
 static_names=$(grep -E "^ablac-static-(x86_64|aarch64)-linux(\.sha256)?\$" "$actual" || true)
-grep -vE "^ablac-static-(x86_64|aarch64)-linux(\.sha256)?\$" "$actual" > "$actual.filtered" || true
+grep -vE "^ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux(\.sha256)?\$" "$actual" > "$actual.filtered" || true
 mv -f "$actual.filtered" "$actual"
 if [[ -n $assets_from ]]; then
     sort "$assets_from" >"$expected"
@@ -178,7 +181,7 @@ else
         basis="(no previous release found)"
     fi
 fi
-grep -vE "^ablac-static-(x86_64|aarch64)-linux(\.sha256)?\$" "$expected" > "$expected.filtered" || true
+grep -vE "^ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux(\.sha256)?\$" "$expected" > "$expected.filtered" || true
 mv -f "$expected.filtered" "$expected"
 if ((count == 0)); then
     report FAIL assets "no files in the artifacts"
@@ -240,13 +243,16 @@ else
     fi
 fi
 
-# 4. stage2: the Linux binary is the local stage 2.
-if [[ ! -f $linux ]]; then
-    report FAIL stage2 "no ablac-x86_64-linux in $out"
-elif cmp -s "$linux" "$stage2"; then
-    report PASS stage2 "cmp equal to $stage2 ($(sha256 "$stage2" | cut -c1-12))"
+# 4. stage2: the dynamic Linux binary is the local stage 2 (with the static compiler as the ablac-x86_64-linux asset, decision #90 A, that is
+# ablac-dynamic-x86_64-linux; the static one is judged by check 7, with its fixpoint).
+dynamic=$linux
+((switched)) && dynamic=$out/ablac-dynamic-x86_64-linux
+if [[ ! -f $dynamic ]]; then
+    report FAIL stage2 "no $(basename "$dynamic") in $out"
+elif cmp -s "$dynamic" "$stage2"; then
+    report PASS stage2 "$(basename "$dynamic") cmp equal to $stage2 ($(sha256 "$stage2" | cut -c1-12))"
 else
-    report FAIL stage2 "differs from $stage2 ($(sha256 "$linux" | cut -c1-12) against $(sha256 "$stage2" | cut -c1-12))"
+    report FAIL stage2 "$(basename "$dynamic") differs from $stage2 ($(sha256 "$dynamic" | cut -c1-12) against $(sha256 "$stage2" | cut -c1-12))"
 fi
 
 # 5. convergence: the historical-seed bootstrap routes agree on this release's source (required).
@@ -290,8 +296,9 @@ fi
 # Linux AArch64 host, under qemu-aarch64 on a Linux x86-64 one; with neither, or no qemu, the line is SKIP, not a failure of the file). The
 # AArch64 file is never run through the fixpoint here (it is minutes of emulation per build); its release job's own test does the rest.
 for static_arch in x86_64 aarch64; do
-    grep -qE "^ablac-static-$static_arch-linux(\.sha256)?\$" <<< "$static_names" || continue
+    grep -qE "^ablac-static-$static_arch-linux(\.sha256)?\$" <<< "$static_names" || { [[ $static_arch == x86_64 ]] && ((switched)); } || continue
     static=$out/ablac-static-$static_arch-linux
+    if [[ $static_arch == x86_64 ]] && ((switched)); then static=$linux; fi   # decision #90 A: the static compiler is the default asset
     static_label=static
     [[ $static_arch == x86_64 ]] || static_label=static-$static_arch
     host=$(uname -s)/$(uname -m)
@@ -304,7 +311,15 @@ for static_arch in x86_64 aarch64; do
     else
         chmod +x "$static"
         static_args=("$static" "$version")
+        # The default asset (decision #90 A) must reach the fixpoint: its archives come from nix (tools/static-llvm-env.sh) when the caller set none.
+        if ((switched)) && [[ $static_arch == x86_64 && -z ${ABLA_STATIC_LLVM_LIB:-} ]]; then
+            eval "$("$(dirname -- "${BASH_SOURCE[0]}")/static-llvm-env.sh" 2> "$out/static-llvm-env.log")" || true
+        fi
         if [[ $static_arch == aarch64 || -z ${ABLA_STATIC_LLVM_LIB:-} ]]; then static_args+=(--no-fixpoint); fi
+        if ((switched)) && [[ $static_arch == x86_64 && -z ${ABLA_STATIC_LLVM_LIB:-} ]]; then
+            report FAIL "$static_label" "the default asset needs its fixpoint check: no static LLVM archives (ABLA_STATIC_LLVM_LIB, or nix for tools/static-llvm-env.sh: $out/static-llvm-env.log)"
+            continue
+        fi
         if (cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && STATIC_ARTIFACT_OUTPUT="$out/static-check-$static_arch" tools/test-static-artifact.sh "${static_args[@]}") > "$out/static-$static_arch.log" 2>&1; then
             report PASS "$static_label" "no PT_INTERP, no DT_NEEDED, smoke compile$([[ $static_arch == x86_64 && -n ${ABLA_STATIC_LLVM_LIB:-} ]] && echo ', fixpoint' || echo ' (no fixpoint)')"
         else

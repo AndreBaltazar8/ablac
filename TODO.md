@@ -1306,6 +1306,11 @@ mmap form) apply there.
   on `f9c09e2e`. The native
   streaming limits are 512 MiB compressed and 1 GiB unpacked; the explicit
   in-memory archive validation helper retains its smaller 128 MiB / 256 MiB limits.
+- [ ] **v0.2.65 release-note draft: the Linux x86-64 compiler is statically linked (decision #90 A).** Publish this with the release:
+
+  > The Linux x86-64 compiler (`ablac-x86_64-linux`) is statically linked: a static-pie executable with no loader, no libLLVM and no C library (its self-build is a fixpoint, which the release checks). Compile-time `nativeLibraries`/`dlopen` need `ablac-dynamic-x86_64-linux`, which ships beside it for one release; the packaged toolchain archive is still built from the dynamic compiler. `ablac-static-aarch64-linux` is the same compiler for AArch64 Linux.
+
+  Switch work (tools/release-check.sh: the dynamic asset is compared with stage 2 and the default asset reaches its fixpoint; release.yml renames last, after the dynamic binary has been judged and packaged under its old name); the seed (tools/bootstrap-compiler.sh, release-pin.sh) is the static compiler from the release that ships it.
 - [ ] **v0.2.49 release-note draft: Xtensa migration (planned break).** Publish this
   with the release; v0.2.48 does not implement the new routing:
 

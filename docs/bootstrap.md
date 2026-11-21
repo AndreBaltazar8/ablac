@@ -56,7 +56,9 @@ handoff applies to a v0.2.20 compiler only; newer bootstraps build directly.
 The release workflow still rebuilds stage 2 and verifies the fixed point.
 
 A Linux release is reproducible byte for byte. From the tag, in any directory,
-with `gh release download <tag> -p ablac-x86_64-linux` as `published`:
+with `gh release download <tag> -p ablac-dynamic-x86_64-linux` as `published` (from v0.2.65 on the
+`ablac-x86_64-linux` asset is the statically linked compiler, which the release checks by its fixpoint:
+tools/test-static-artifact.sh; it is the bootstrap seed, and the dynamic asset ships beside it for one release):
 
 ```sh
 tools/build-self-hosted-current.sh published build/rebuilt
