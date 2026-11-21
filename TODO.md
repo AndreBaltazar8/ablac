@@ -3302,15 +3302,22 @@ abla/http/async speaks HTTP/2 when `HttpAsyncOptions.http2` is true (abla/http/h
 
 ## Known upstream LLVM miscompiles
 
-- [ ] **instcombine: `0.0 / (0.0 * v)` becomes a signed zero (LLVM 23.1.x; found by the differential fuzzer, seed 100097, 2026-11-21).** `%v = sitofp i64 %n
+- [x] **instcombine: `0.0 / (0.0 * v)` becomes a signed zero (LLVM 23.1.x; found by the differential fuzzer, seed 100097, 2026-11-21).** `%v = sitofp i64 %n
   to double; %m = fmul double 0.0, %v; %d = fdiv double 0.0, %m` is NaN for every finite `v`, and `opt -passes=instcombine` (also `default<O1>` and `<O2>`) of the
   pinned 23.1.3 rewrites it to `copysign(0.0, %v)` (and a following `fmul` gains `nnan ninf`): the program prints 0 in release, the compile-time jit and
   both Wasm modes, `nan` in `--fast` and the interpreter. The IR is plain IEEE: our emitter sets no fast-math flag on that path (the backend never sets one),
   and the pre-optimisation IR of the fuzz program has `fmul double 0.0, %x` / `fdiv double 0.0, %m` with none. Compiler Explorer: clang 22.1.0 and older keep
   the `fdiv` (correct), 23.1.0 has the miscompile, trunk (24.0.0git c80ecb8d) folds it to `ret double +qnan` (correct): fixed after the 23.1 branch by llvm-project PR #202482, commit bcb4e7d061ac (2026-07-18, "[InstCombine] Fix 0.0 / x -> 0 folds when the divisor may be zero", SimplifyDemandedUseFPClass; `CanIgnoreZeroByZeroNan`); 23.1.0 is not an ancestor of it. The
-  4-line case is `tests/cases/llvm-miscompiles/fdiv-zero-by-zero-times-value.ll`; no test runs it (it would fail until LLVM is bumped to a release with the
+  4-line case is `tests/cases/llvm-miscompiles/fdiv-zero-by-zero-times-value.ll`; it is now run (see below; before #93 it would fail until LLVM was bumped to a release with the
   fix). Whether to report it upstream (or ask for a 23.1.x backport) is André's decision; the report text is in ~/agents-memory (llvm-fdiv-zero-report.md).
   Until the bump, a program that computes `0.0 / (0.0 * x)` with a non-literal `x` gets 0 instead of NaN in optimised builds; the fuzzer's seed 100097 shows it.
+  Fixed in our LLVM (decision #93): `nix/llvm-instcombine-fdiv-zero.patch` backports #202482 (the fork build plus the patch, release tag
+  `llvm-23.1.3-xtensa-3`); `tools/test-llvm-miscompiles.sh` runs the case on the shell's `opt`, `tests/cases/fuzz-differential/fdiv-zero-by-zero-times-value.ab` runs it in
+  every mode, and the static compilers link archives of the patched build (tools/static-llvm-env.sh; AArch64: the arm64 workflow's).
+- [ ] **macOS still has the instcombine fdiv miscompile (owner TBD).** The macOS compiler's in-process libLLVM and the clang of its LTO prepare step are Homebrew's
+  stock 23.1.x, so `0.0 / (0.0 * v)` is still 0 in optimised macOS builds (the fuzz case `tests/cases/fuzz-differential/fdiv-zero-by-zero-times-value.ab`
+  shows it; v0.2.65 lists it under known issues). Fix: a patched macOS LLVM, the fork's Mac build as in #579's companion cohort, with
+  `nix/llvm-instcombine-fdiv-zero.patch` applied.
 - [ ] **fdlibm-exact `sinh`, `cosh`, `tanh`, `asin`, `acos`, `erf`, `log1p`, `log2`, `log10`, `expm1` (static libc, src/static_libc/math2.ab and math3.ab).**
   These are built from the standard library's correctly rounded exp, log, atan2 and sqrt and are within an ulp (a few for erf) of glibc's, not bit for bit:
   `tools/fuzz/run --libc` finds a 1-ulp difference in about 6% of calls (200 seeds: 57 of ~1100 calls; every f32 function and every other function agrees

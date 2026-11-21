@@ -35,6 +35,21 @@ for tool in FileCheck llc lli llvm-addr2line llvm-ar llvm-as llvm-bcanalyzer \
     fi
 done
 cp -P "$lib"/lib/libLLVM*.so* "$bundle/lib/lib/"
+# The linkers, built against this LLVM: a Wasm release link is wasm-ld's LTO, which optimizes with the LLVM inside lld, so nixpkgs' lld
+# would keep every bug this LLVM fixes (the InstCombine fdiv fix: tests/cases/fuzz-differential/fdiv-zero-by-zero-times-value.ab, wasm mode).
+lld=$(nix-build --no-out-link -E "(import $project_root/nix/nixpkgs.nix).llvmPackages_23.lld.override { libllvm = ($nix_expression); }")
+cp -L "$lld/bin/lld" "$bundle/out/bin/lld"
+for linker in ld.lld wasm-ld ld64.lld lld-link; do ln -s lld "$bundle/out/bin/$linker"; done
+# The same for clang: `clang -O2 -flto -c` is the pre-link step of a Wasm and of a non-whole-program ELF LTO build (src/toolchain.ab), and
+# it optimizes with the LLVM inside clang. Only the two files that differ from nixpkgs' clang-unwrapped (the driver binary and
+# libclang-cpp, both linked to this libLLVM) are shipped; nix/llvm-prebuilt.nix puts them into a copy of nixpkgs' clang (its headers,
+# resource directory and wrapper support stay as they are).
+clang_expression="(import $project_root/nix/nixpkgs.nix).llvmPackages_23.clang-unwrapped.override { libllvm = ($nix_expression); }"
+clang=$(nix-build --no-out-link -E "$clang_expression")
+clang_lib=$(nix-build --no-out-link -E "($clang_expression).lib")
+mkdir -p "$bundle/clang/bin" "$bundle/clang/lib"
+cp -L "$clang/bin/clang-23" "$bundle/clang/bin/clang-23"
+cp -L "$clang_lib/lib/libclang-cpp.so.23.1" "$bundle/clang/lib/libclang-cpp.so.23.1"
 cp -P "$dev/bin/llvm-config" "$bundle/dev/bin/"
 cp "$(nix-build --no-out-link -E "($nix_expression).src")/llvm/LICENSE.TXT" "$bundle/LICENSE.TXT"
 store_hash() { basename "$1" | cut -d- -f1; }
@@ -50,3 +65,16 @@ mkdir -p "$output"
 tar -C "$working" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
     -cf - "$name" | xz -9e -T0 > "$output/$name.tar.xz"
 (cd "$output" && sha256sum "$name.tar.xz" > "$name.tar.xz.sha256")
+
+# The static archives of the same build (#806 step C: the statically linked compiler links libLLVM*.a, tools/static-llvm-env.sh), as a
+# second asset so a consumer of the dynamic LLVM does not download them. lib/ holds libLLVM*.a.
+static_name=$tag-static-x86_64-linux
+static_bundle=$working/$static_name
+mkdir -p "$static_bundle/lib"
+cp -L "$lib"/lib/libLLVM*.a "$static_bundle/lib/"
+[[ -f $static_bundle/lib/libLLVMSupport.a ]] || { echo "package-llvm: no libLLVMSupport.a in $lib/lib" >&2; exit 1; }
+cp "$bundle/LICENSE.TXT" "$bundle/SOURCE" "$static_bundle/"
+chmod -R u+w "$static_bundle"
+tar -C "$working" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+    -cf - "$static_name" | xz -9e -T0 > "$output/$static_name.tar.xz"
+(cd "$output" && sha256sum "$static_name.tar.xz" > "$static_name.tar.xz.sha256")

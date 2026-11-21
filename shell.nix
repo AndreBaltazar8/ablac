@@ -21,6 +21,8 @@ let
   llvmTools = if !xtensa then llvm.llvm
     else if prebuiltUsable then prebuilt.llvm
     else toolchain.llvm;
+  # The clang of a Wasm or ELF LTO build's pre-link step optimizes with the LLVM inside it: the patched one (the fdiv fix) with the prebuilt LLVM.
+  clang = if xtensa && prebuiltUsable then llvm.clang.override { cc = prebuilt.clangUnwrapped; } else llvm.clang;
   xtensaCohort = import ./nix/xtensa-cohort.nix { inherit pkgs llvmTools; };
 in
 pkgs.mkShell {
@@ -34,7 +36,7 @@ pkgs.mkShell {
     # Listed before clang so its opt/llc win over anything clang brings.
     llvmTools
     llvm.clang-tools
-    llvm.clang
+    clang
     llvm.lld
     binaryen
     nodejs

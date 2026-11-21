@@ -212,17 +212,19 @@ from compilation.
 ## Adding a patch
 
 1. Write it against `llvm/` as `nix/llvm-xtensa-<name>.patch`, add it to
-   `nix/llvm.nix` and to `patchNames` in `nix/llvm-prebuilt.nix`, and develop with
+   `nix/llvm.nix` (and `nix/llvm-fork.nix`) and to `patchFiles` in `nix/llvm-prebuilt.nix`, and develop with
    the local shell, which builds from source once the patches differ.
 2. Commit the same change on the fork's branch: `git apply --directory=llvm <patch>`.
 3. Point `commit` and `sha256` in `nix/llvm-fork.nix` at it
    (`nix-prefetch-url --unpack <archive url>`).
 4. For the Nix artifact, run
    `tools/package-llvm-xtensa.sh llvm-23.1.3-xtensa-<n+1> <directory>`
-   on this kind of machine, not on CI.
+   on this kind of machine, not on CI. It writes two archives: the LLVM (`llvm-23.1.3-xtensa-<n+1>-x86_64-linux`) and the static
+   archives of the same build (`-static-x86_64-linux`: libLLVM*.a for the static compiler, `staticLibs` in `nix/llvm-prebuilt.nix`).
+   Not every patch is Xtensa: `nix/llvm-instcombine-fdiv-zero.patch` is llvm-project #202482, a fix made after 23.1.3.
 5. Compare the new `llc` with the source-built one on Xtensa code, and check the
    archive's contents for local paths and keys.
-6. `gh release create` the archive and its `.sha256` on the fork, tagged
+6. `gh release create` the archives and their `.sha256` files on the fork, tagged
    `llvm-23.1.3-xtensa-<n+1>` at the branch's commit.
 7. Update `tag`, `sha256` and `patchesSha256` in `nix/llvm-prebuilt.nix`. Moving to a
    new LLVM or nixpkgs repeats this with a new branch.

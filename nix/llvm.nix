@@ -22,6 +22,8 @@ let
     # immediates instead of literal loads. A frame past 255 bytes gets the
     # register scavenger's emergency slot (upstream waits for 2 KiB, while
     # byte loads and stores only reach 255).
+    # Not Xtensa: InstCombine folded 0.0 / (0.0 * v) to a signed zero, but it
+    # is NaN (llvm-project #202482, fixed after 23.1.3, backported here).
     patches = (old.patches or [ ]) ++ [
       ./llvm-xtensa-direct-calls.patch
       ./llvm-xtensa-extui.patch
@@ -30,6 +32,7 @@ let
       ./llvm-xtensa-narrow-branches.patch
       ./llvm-xtensa-bit-tests.patch
       ./llvm-xtensa-scavenging-slot.patch
+      ./llvm-instcombine-fdiv-zero.patch
     ];
   });
 in

@@ -19,5 +19,8 @@ in
   devExtraCmakeFlags = [ "-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=Xtensa" ];
 }).overrideAttrs (old: {
   doCheck = false;
+  # The fork's pinned commit carries the Xtensa patches; the InstCombine fdiv fix
+  # (llvm-project #202482) comes on top as the same nix/ patch llvm.nix applies.
+  patches = (old.patches or [ ]) ++ [ ./llvm-instcombine-fdiv-zero.patch ];
   passthru = (old.passthru or { }) // { inherit commit; };
 })
