@@ -96,6 +96,9 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
         sed -n '1,80p' "$output.err" >&2
         exit 1
     fi
+    if [[ $index -eq 0 ]]; then
+        grep -Fq 'help: finish using the borrower before changing its owner' "$output.err"
+    fi
     [[ ! -e $output ]] || exit 1
     index=$((index + 1))
 done

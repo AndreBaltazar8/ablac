@@ -21,6 +21,6 @@ expect() { # file text…
     done
 }
 
-expect invalid-return-type "return.type@" ":i64:string" "invalid-return-type.ab:19:20"
+expect invalid-return-type "return.type@" ":i64:string" "invalid-return-type.ab:19:20" 'help: return a value of type `int`' 'value.parseInt()'
 expect invalid-return-fnmut "return.type@" "help: the returned closure changes what it captured" "FnMut(...) -> T"
 echo "return.type: names expected and found types; FnMut hint for a mutating closure"

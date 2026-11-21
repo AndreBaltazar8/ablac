@@ -40,7 +40,9 @@ check_rejected() {
     fi
 }
 
-check_rejected invalid-definite-assignment assignment.unassigned:answer:
+check_rejected invalid-definite-assignment 'error[E_DEFINITE_ASSIGNMENT]: assignment.unassigned:answer:'
+grep -Fq 'help: a variable declared without a value must be assigned on every path' \
+    "$output_directory/invalid-definite-assignment.err"
 check_rejected invalid-uninitialized-val local.uninitialized-val
 check_rejected invalid-uninitialized-type local.uninitialized-type
 

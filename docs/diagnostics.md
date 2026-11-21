@@ -125,7 +125,7 @@ Close a block comment with `*/`, or use `//` for a single line.
 | `method.unknown:<T>.<m>` | `T` has no method `m` (a help line names the standard module to import when one declares it, e.g. `abla/text` for `string.trim`) |
 | `function.argument:<f>@<offset>:<expected>:<actual>`, `method.argument`, `constructor.argument` | an argument of the wrong type; a help line says when the argument is a closure that changes its captures (`mut:function:...`: declare the parameter `var g: FnMut(...) -> T`) or consumes them (`own g: FnOnce(...) -> T`) |
 | `function.result:<f>:<declared>:<actual>`, `method.result` | the body's value doesn't match the declared result type ([language.md](language.md#void-and-never)) |
-| `return.type@<offset>:<expected>:<found>` | a `return` value doesn't match the result type; a help line says when the value is a closure that changes its captures (declare the result `FnMut(...) -> T`) |
+| `return.type@<offset>:<expected>:<found>` | a `return` value doesn't match the result type. The help names the type to return and may suggest a conversion. A closure that changes its captures needs a `FnMut(...) -> T` result. |
 | `member:<Type>.<name>` | no such property or method; `member:nullable:...` means the receiver may be `null` |
 | `safe-call.non-null:<T>` | `?.` on a value that is never `null`: use `.` ([null-safe operators](language.md#null-safe-operators)) |
 | `null-default.non-null:<T>` | `??` after a value that is never `null`, so the default is never used |
@@ -208,6 +208,16 @@ fun main: int = add(1, "two")
 // error: function.argument:add
 ```
 
+An explicit `return` also has to match the declared type.
+
+```abla error
+fun main: int {
+    return "42"
+}
+// error: return.type@
+// error: help: return a value of type
+```
+
 ## Ownership and borrowing
 
 `ownership.*`, `E_BORROW_CONFLICT`, `resource.*`, `move.*`, `shared.*`,
@@ -215,6 +225,47 @@ fun main: int = add(1, "two")
 in [ownership.md](ownership.md#reading-ownership-diagnostics).
 `E_DELEGATE_*` and `E_NOT_DELEGATED` are in
 [language.md](language.md#diagnostics).
+
+| Code | Meaning |
+|---|---|
+| `E_BORROW_CONFLICT` | a change to an owner would invalidate a borrower that's still used later. Finish using the borrower first. |
+| `E_OWNERSHIP` | a move leaves the value or a part of it unavailable, or a closure that can run only once is called again. The dotted reason identifies which. |
+| `E_DEFINITE_ASSIGNMENT` | a variable may be read along a path that didn't assign it. Initialize it or assign it in every branch. |
+
+```abla error
+class Counter(var value: int)
+
+fun main: int {
+    val counter = Counter(0)
+    val view = counter
+    counter.value = 1
+    view.value
+}
+// error: E_BORROW_CONFLICT
+// error: help: finish using the borrower
+```
+
+```abla error
+resource class Ticket(val seat: int)
+fun consume(own ticket: Ticket): int = ticket.seat
+
+fun main: int {
+    val ticket = Ticket(1)
+    consume(move(ticket))
+    ticket.seat
+}
+// error: E_OWNERSHIP
+// error: ownership.use-after-move
+```
+
+```abla error
+fun main: int {
+    var answer: int
+    answer
+}
+// error: E_DEFINITE_ASSIGNMENT
+// error: assignment.unassigned
+```
 
 ## Transactions
 
