@@ -3,8 +3,9 @@
 Start with the [README](../README.md) for what Abla is and how to build the
 compiler. The documents below are grouped by what you are trying to do.
 
-New to Abla? Read [the tour](guide.md) first: it walks through the language
-in seven short sections of runnable programs.
+New to Abla? Start with [the learning path](tour/README.md): install the
+compiler, then work through short chapters with runnable, output-checked
+examples. The [compact guide](guide.md) is a single-page refresher.
 
 ## Writing Abla
 
