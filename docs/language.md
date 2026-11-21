@@ -3032,6 +3032,13 @@ The program's own calls of such a symbol are direct calls to the exported functi
 symbol), so they are inlined like any internal call; on a microcontroller target the usual "an exported function is
 not inlined" rule leaves them out.
 
+`@exportLocal("name")` (or an array of names) defines such a symbol for the program's own declarations only: the
+function has internal linkage, it is in the output only when one of the program's calls reaches it, and it is never a
+symbol foreign code can call. A hook an interface module declares and a platform module supplies costs nothing in a
+program that never calls it, where an `@export` stays a global symbol the linker keeps. The signature is checked as
+for `@export`; a local export that no `extern:"c"` declaration of the build names is an error
+(`export.local-unbound`). Use `@export` for a symbol something outside the program (ESP-IDF, a host app) calls.
+
 ## Native declarations
 
 Prototype-compatible `extern:"c"` declarations are supported by the C ABI

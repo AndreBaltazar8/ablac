@@ -8206,24 +8206,29 @@ class BootstrapAnalyzer(
                 externs = externs + 1
             }
         }
-        if (externs == 0) return
         val exported: Map<string, int> = Map()
+        // `@exportLocal` names: each must be bound by an extern:"c" declaration of this build (nothing else can call it).
+        val localNames: array<string> = []
+        val localOwners: array<int> = []
         var index = 0
         while (index < parsed.declarations.size) {
             val declaration = parsed.declarations[index]
             if (declaration.kind == "fun" && declaration.extensionOwner == "") {
                 var annotation = 0
                 while (annotation < declaration.annotations.size && annotation < declaration.annotationArguments.size) {
-                    if (declaration.annotations[annotation] == "export") {
+                    val kind = declaration.annotations[annotation]
+                    if (kind == "export" || kind == "exportLocal") {
                         val argument = declaration.annotationArguments[annotation]
-                        if (argument.kind == "string" && exported.get(argument.text) == null) {
-                            exported.set(argument.text, index)
-                        }
+                        val names: array<string> = []
+                        if (argument.kind == "string") names.append(argument.text)
                         if (argument.kind == "array") {
-                            for (child in argument.children) {
-                                if (child.kind == "string" && exported.get(child.text) == null) {
-                                    exported.set(child.text, index)
-                                }
+                            for (child in argument.children) if (child.kind == "string") names.append(child.text)
+                        }
+                        for (name in names) {
+                            if (exported.get(name) == null) exported.set(name, index)
+                            if (kind == "exportLocal") {
+                                localNames.append(name)
+                                localOwners.append(index)
                             }
                         }
                     }
@@ -8232,10 +8237,13 @@ class BootstrapAnalyzer(
             }
             index = index + 1
         }
+        if (externs == 0 && localNames.size == 0) return
+        val bound: Map<string, bool> = Map()
         for (declaration in parsed.declarations) {
             if (declaration.kind != "extern" || declaration.externalLibrary != "c" || declaration.extensionOwner != "" ||
                 bootstrapStandardLibraryModuleSource(bootstrapGenericSourceFile(declaration.sourceIdentity))) continue
             val symbol = bootstrapCanonicalDeclarationSourceName(declaration.name)
+            bound.set(symbol, true)
             val found = exported.get(symbol)
             if (found == null) continue
             val definition = parsed.declarations[found]
@@ -8265,6 +8273,15 @@ class BootstrapAnalyzer(
                     declaration.begin
                 )
             }
+        }
+        var local = 0
+        while (local < localNames.size) {
+            if (bound.get(localNames[local]) == null) {
+                val definition = parsed.declarations[localOwners[local]]
+                this.currentSourceIdentity = definition.sourceIdentity
+                this.failAtOffset("export.local-unbound:${localNames[local]}", definition.begin)
+            }
+            local = local + 1
         }
     }
 
@@ -8857,7 +8874,7 @@ class BootstrapAnalyzer(
         if (!bootstrapUnusedParametersRequested || name.startsWith("_") || this.currentGeneratedNamespace != "") return
         if (declaration.externalLibrary != "" || (!isMethod && declaration.name == "main")) return
         for (annotation in declaration.annotations) {
-            if (annotation == "export" || annotation == "exportChecked" || annotation == "extern" || annotation == "override") return
+            if (annotation == "export" || annotation == "exportChecked" || annotation == "exportLocal" || annotation == "extern" || annotation == "override") return
         }
         if (ownerConforms) return
         bootstrapUnusedParameterDeclared.append(BootstrapUnusedLocal(
@@ -13473,7 +13490,7 @@ class BootstrapAnalyzer(
             // Exporting publishes a function: never a private one.
             if (declaration.isPrivate) {
                 for (annotation in declaration.annotations) {
-                    if (annotation == "export" || annotation == "exportChecked") {
+                    if (annotation == "export" || annotation == "exportChecked" || annotation == "exportLocal") {
                         this.failAtOffset(
                             "private.export:${bootstrapSourceVisibleType(declaration.name)}",
                             declaration.begin
@@ -13669,7 +13686,8 @@ class BootstrapAnalyzer(
             }
             while (annotation < declaration.annotations.size) {
                 if (declaration.annotations[annotation] == "export" ||
-                    declaration.annotations[annotation] == "exportChecked") {
+                    declaration.annotations[annotation] == "exportChecked" ||
+                    declaration.annotations[annotation] == "exportLocal") {
                     var vectorSignature =
                         bootstrapIsMachineValueType(bootstrapNormalizeType(declaration.resultType))
                     for (parameter in declaration.parameterTypes) {
