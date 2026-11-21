@@ -1,0 +1,371 @@
+// Opt-in JSON-construction suggestions. Source/ownership come from the module
+// loader; types and call identities come from sema. Nothing here executes CT.
+import "parser.ab"
+import "source_rewrite.ab"
+import "abla/bytes"
+import "abla/json"
+import "abla/text"
+
+var bootstrapJsonConstructionRequested = false
+var bootstrapJsonConstructionSources: Map<string, string> = Map()
+var bootstrapJsonConstructionOwned: Map<string, bool> = Map()
+var bootstrapJsonConstructionStdlib = ""
+var bootstrapJsonConstructionSubparsers: Map<string, array<int>> = Map()
+
+class BootstrapJsonConstructionFact(
+    var type: string = "unknown", var local: string = "", var target: string = ""
+)
+class BootstrapJsonConstructionSite(
+    val source: string, val expression: BootstrapExpression,
+    val owner: BootstrapDeclaration, val calls: array<BootstrapExpression>,
+    val terminal: bool, val controlled: bool, val generic: bool
+)
+class BootstrapJsonConstructionContext(
+    val sites: array<BootstrapJsonConstructionSite>,
+    val facts: Map<string, BootstrapJsonConstructionFact>
+)
+class BootstrapJsonConstructionFinding(
+    val file: string, val begin: int, val end: int, val buffer: bool,
+    val replacement: string
+)
+var bootstrapJsonConstructionContext = BootstrapJsonConstructionContext([], Map())
+var bootstrapJsonConstructionFindings: array<BootstrapJsonConstructionFinding> = []
+
+fun bootstrapJsonConstructionFile(source: string): string {
+    val mark = source.indexOf("\u{1f}")
+    if (mark < 0) source else source.slice(0, mark)
+}
+fun bootstrapJsonConstructionKey(source: string, expression: BootstrapExpression): string =
+    "$source:${expression.begin}:${expression.end}:${expression.kind}"
+
+fun bootstrapJsonConstructionReset(): void {
+    bootstrapJsonConstructionSources = Map()
+    bootstrapJsonConstructionOwned = Map()
+    bootstrapJsonConstructionSubparsers = Map()
+    bootstrapJsonConstructionFindings = []
+    bootstrapJsonConstructionContext = BootstrapJsonConstructionContext([], Map())
+}
+fun bootstrapJsonConstructionCapture(file: string, text: string, stdlib: string): void {
+    bootstrapJsonConstructionSources.set(file, text)
+    bootstrapJsonConstructionStdlib = stdlib
+}
+fun bootstrapJsonConstructionEligible(source: string): bool {
+    val file = bootstrapJsonConstructionFile(source)
+    if (file.startsWith("<") || file.contains("/tests/") || file.contains("/test/") ||
+        file.contains("/stdlib/abla/json/") || file.startsWith("stdlib/abla/json/") ||
+        file.contains("/fixtures/") || file.startsWith("tests/") || file.startsWith("test/") ||
+        file.endsWith("_test.ab") || file.endsWith("_tests.ab") || file.endsWith("/test.ab")) return false
+    val owned = bootstrapJsonConstructionOwned.get(file)
+    owned != null && owned && bootstrapJsonConstructionSources.has(file)
+}
+fun bootstrapJsonConstructionSpace(byte: int): bool = byte == 32 || byte == 9 || byte == 10 || byte == 13
+
+/** An object-key token after `{` or `,`, not a source-code regex match. */
+fun bootstrapJsonConstructionHasKey(text: string): bool {
+    var at = 0
+    while (at < text.size) {
+        if (text[at] == 123 || text[at] == 44) {
+            var next = at + 1
+            while (next < text.size && bootstrapJsonConstructionSpace(text[next])) next = next + 1
+            if (next < text.size && text[next] == 34) {
+                next = next + 1
+                while (next < text.size && text[next] != 34) {
+                    if (text[next] == 92) next = next + 1
+                    next = next + 1
+                }
+                if (next < text.size) next = next + 1
+                while (next < text.size && bootstrapJsonConstructionSpace(text[next])) next = next + 1
+                if (next < text.size && text[next] == 58) return true
+            }
+        }
+        at = at + 1
+    }
+    false
+}
+fun bootstrapJsonConstructionParts(expression: BootstrapExpression,
+    var parts: array<BootstrapExpression>): void {
+    if (expression.kind == "string.template" || expression.kind == "+") {
+        for (child in expression.children) bootstrapJsonConstructionParts(child, parts)
+    } else parts.append(expression)
+}
+fun bootstrapJsonConstructionText(parts: array<BootstrapExpression>): string {
+    val output = byteBuffer()
+    for (part in parts) output.appendText(if (part.kind == "string") part.text else "\u{1f}")
+    output.toText()
+}
+fun bootstrapJsonConstructionShape(parts: array<BootstrapExpression>, buffer: bool): bool {
+    val text = bootstrapJsonConstructionText(parts).trim()
+    if (!buffer && !text.startsWith("{") && !text.startsWith("[")) return false
+    if (bootstrapJsonConstructionHasKey(text)) return true
+    text.startsWith("[") && jsonParse(text.replace("\u{1f}", "0")).succeeded
+}
+fun bootstrapJsonConstructionExcluded(expression: BootstrapExpression): bool {
+    if (expression.kind == "==" || expression.kind == "!=") return true
+    if (expression.kind != "call" && expression.kind != "member.call") return false
+    val name = expression.text
+    if (name.startsWith("expect") || name.startsWith("assert")) return true
+    for (ignored in ["jsonParse", "jsonParseWithLimits", "indexOf", "lastIndexOf", "contains", "startsWith", "endsWith", "split", "replace", "matches", "find"]) {
+        if (name == ignored || name.endsWith("_$ignored")) return true
+    }
+    false
+}
+fun bootstrapJsonConstructionAppend(expression: BootstrapExpression): bool =
+    expression.kind == "member.call" && expression.children.size == 2 &&
+        (expression.text == "appendText" || expression.text == "appendInt")
+
+fun bootstrapJsonConstructionRequest(source: string, expression: BootstrapExpression,
+    var facts: Map<string, BootstrapJsonConstructionFact>): void {
+    facts.set(bootstrapJsonConstructionKey(source, expression), BootstrapJsonConstructionFact())
+    for (child in expression.children) bootstrapJsonConstructionRequest(source, child, facts)
+}
+fun bootstrapJsonConstructionCollect(owner: BootstrapDeclaration, expression: BootstrapExpression,
+    controlled: bool, generic: bool, var sites: array<BootstrapJsonConstructionSite>): void {
+    if (expression.kind == "subparser.placeholder" || bootstrapJsonConstructionExcluded(expression)) return
+    if ((expression.kind == "local.val" || expression.kind == "local.var") &&
+        expression.text.startsWith("expected")) return
+    val flow = controlled || expression.kind == "if" || expression.kind == "for" ||
+        expression.kind == "while" || expression.kind == "do.while" || expression.kind == "when" || expression.kind == "lambda"
+    if (expression.kind == "string.template" || expression.kind == "+") {
+        val parts: array<BootstrapExpression> = []
+        bootstrapJsonConstructionParts(expression, parts)
+        if (bootstrapJsonConstructionShape(parts, false)) {
+            sites.append(BootstrapJsonConstructionSite(owner.sourceIdentity, expression, owner, [], false, flow, generic))
+            return
+        }
+    }
+    if (expression.kind == "block") {
+        var at = 0
+        while (at < expression.children.size) {
+            val first = expression.children[at]
+            if (bootstrapJsonConstructionAppend(first)) {
+                val calls: array<BootstrapExpression> = []
+                val parts: array<BootstrapExpression> = []
+                val receiver = first.children[0]
+                var end = at
+                while (end < expression.children.size) {
+                    val call = expression.children[end]
+                    if (!bootstrapJsonConstructionAppend(call) || call.children[0].kind != receiver.kind ||
+                        call.children[0].text != receiver.text) break
+                    calls.append(call)
+                    if (call.text == "appendText") bootstrapJsonConstructionParts(call.children[1], parts)
+                    else parts.append(call.children[1])
+                    end = end + 1
+                }
+                if (bootstrapJsonConstructionShape(parts, true)) sites.append(BootstrapJsonConstructionSite(
+                    owner.sourceIdentity, BootstrapExpression("json.append", "", first.begin,
+                        calls[calls.size - 1].end, []), owner, calls,
+                    end == expression.children.size, flow, generic))
+                at = end
+            } else {
+                bootstrapJsonConstructionCollect(owner, first, flow, generic, sites)
+                at = at + 1
+            }
+        }
+        return
+    }
+    for (child in expression.children) bootstrapJsonConstructionCollect(owner, child, flow, generic, sites)
+}
+fun bootstrapJsonConstructionDeclarations(declarations: array<BootstrapDeclaration>, generic: bool,
+    var context: BootstrapJsonConstructionContext): void {
+    for (declaration in declarations) {
+        val dependent = generic || declaration.typeParameters.size > 0 || declaration.sourceIdentity.contains("\u{1f}")
+        if (bootstrapJsonConstructionEligible(declaration.sourceIdentity) && declaration.generatedNamespace == "") {
+            val before = context.sites.size
+            bootstrapJsonConstructionCollect(declaration, declaration.expression, false, dependent, context.sites)
+            for (value in declaration.parameterDefaults) bootstrapJsonConstructionCollect(declaration, value, false, dependent, context.sites)
+            if (context.sites.size > before) {
+                bootstrapJsonConstructionRequest(declaration.sourceIdentity, declaration.expression, context.facts)
+                for (value in declaration.parameterDefaults) bootstrapJsonConstructionRequest(declaration.sourceIdentity, value, context.facts)
+            }
+        }
+        bootstrapJsonConstructionDeclarations(declaration.methods, dependent, context)
+    }
+}
+fun bootstrapJsonConstructionPrepare(parsed: BootstrapParseResult): BootstrapJsonConstructionContext {
+    var context = BootstrapJsonConstructionContext([], Map())
+    bootstrapJsonConstructionDeclarations(parsed.declarations, false, context)
+    context
+}
+fun bootstrapJsonConstructionFact(source: string, expression: BootstrapExpression): BootstrapJsonConstructionFact? {
+    bootstrapJsonConstructionContext.facts.get(bootstrapJsonConstructionKey(source, expression))
+}
+fun bootstrapJsonConstructionType(source: string, expression: BootstrapExpression, type: string, local: string): void {
+    val fact = bootstrapJsonConstructionFact(source, expression)
+    if (fact != null) { fact.type = type; fact.local = local }
+}
+fun bootstrapJsonConstructionCall(source: string, expression: BootstrapExpression, target: string): void {
+    val fact = bootstrapJsonConstructionFact(source, expression)
+    if (fact != null) fact.target = target
+}
+fun bootstrapJsonConstructionStandard(target: string, module: string, name: string): bool {
+    if (!target.startsWith("abla:$bootstrapJsonConstructionStdlib/abla/$module/entry.ab:")) return false
+    val written = target.slice(target.lastIndexOf(":") + 1, target.size)
+    written == name || written.endsWith("_$name")
+}
+fun bootstrapJsonConstructionKnown(source: string, expression: BootstrapExpression, module: string, name: string): bool {
+    val fact = bootstrapJsonConstructionFact(source, expression)
+    fact != null && bootstrapJsonConstructionStandard(fact.target, module, name)
+}
+fun bootstrapJsonConstructionOriginal(site: BootstrapJsonConstructionSite, expression: BootstrapExpression): string {
+    val file = bootstrapJsonConstructionFile(site.source)
+    val source = bootstrapJsonConstructionSources.get(file)
+    if (source == null) return ""
+    val rewrite = bootstrapSourceRewriteOf(file)
+    val begin = rewrite.original(expression.begin)
+    val end = rewrite.originalEnd(expression.end)
+    if (begin < 0 || end < begin || end > source.size) "" else source.slice(begin, end)
+}
+fun bootstrapJsonConstructionScalar(site: BootstrapJsonConstructionSite, expression: BootstrapExpression, type: string): string {
+    val fact = bootstrapJsonConstructionFact(site.source, expression)
+    if (fact == null || fact.type != type) return ""
+    if (expression.kind == "identifier" && (fact.local == "val" || fact.local == "parameter")) return bootstrapJsonConstructionOriginal(site, expression)
+    if ((type == "i64" && expression.kind == "integer") ||
+        (type == "bool" && (expression.kind == "true" || expression.kind == "false")) ||
+        (type == "i64" && expression.kind == "unary-" && expression.children.size == 1 && expression.children[0].kind == "integer")) return bootstrapJsonConstructionOriginal(site, expression)
+    ""
+}
+fun bootstrapJsonConstructionHole(site: BootstrapJsonConstructionSite, expression: BootstrapExpression): string {
+    val integer = bootstrapJsonConstructionScalar(site, expression, "i64")
+    if (integer != "") return integer
+    val boolean = bootstrapJsonConstructionScalar(site, expression, "bool")
+    if (boolean != "") return boolean
+    // Already encoded with the standard string serializer: $json will use
+    // that same escaping/null-on-invalid-UTF8 policy, not raw interpolation.
+    if (expression.kind == "call" && expression.children.size == 1 &&
+        bootstrapJsonConstructionKnown(site.source, expression, "json", "jsonStringify")) {
+        val inner = expression.children[0]
+        if (inner.kind == "call" && inner.children.size == 1 &&
+            bootstrapJsonConstructionKnown(site.source, inner, "json", "jsonString")) {
+            return bootstrapJsonConstructionScalar(site, inner.children[0], "string")
+        }
+    }
+    ""
+}
+fun bootstrapJsonConstructionNames(expression: BootstrapExpression, name: string): bool {
+    if ((expression.kind == "local.val" || expression.kind == "local.var" || expression.kind == "lambda.parameter") && expression.text == name) return true
+    for (child in expression.children) if (bootstrapJsonConstructionNames(child, name)) return true
+    false
+}
+fun bootstrapJsonConstructionBufferSafe(site: BootstrapJsonConstructionSite, expression: BootstrapExpression,
+    name: string, allowed: bool = false): bool {
+    if (expression.kind == "identifier" && expression.text == name) return allowed
+    var index = 0
+    while (index < expression.children.size) {
+        val receiver = index == 0 && expression.kind == "member.call" &&
+            (bootstrapJsonConstructionKnown(site.source, expression, "bytes", "appendText") ||
+             bootstrapJsonConstructionKnown(site.source, expression, "bytes", "appendInt") ||
+             bootstrapJsonConstructionKnown(site.source, expression, "bytes", "toText") ||
+             bootstrapJsonConstructionKnown(site.source, expression, "bytes", "size"))
+        if (!bootstrapJsonConstructionBufferSafe(site, expression.children[index], name, receiver)) return false
+        index = index + 1
+    }
+    true
+}
+fun bootstrapJsonConstructionOwnedBuffer(site: BootstrapJsonConstructionSite, expression: BootstrapExpression, name: string): int {
+    var found = 0
+    if ((expression.kind == "local.val" || expression.kind == "local.var") && expression.text == name) {
+        if (expression.kind != "local.val" || expression.children.size == 0) return 1000
+        val value = expression.children[0]
+        if (!bootstrapJsonConstructionKnown(site.source, value, "bytes", "byteBuffer") &&
+            !bootstrapJsonConstructionKnown(site.source, value, "bytes", "ByteBuffer")) return 1000
+        found = 1
+    }
+    for (child in expression.children) found = found + bootstrapJsonConstructionOwnedBuffer(site, child, name)
+    found
+}
+fun bootstrapJsonConstructionReplacement(site: BootstrapJsonConstructionSite): string {
+    if (site.generic || site.owner.kind != "fun") return ""
+    for (name in site.owner.parameters) if (name == "jsonStringify") return ""
+    if (bootstrapJsonConstructionNames(site.owner.expression, "jsonStringify")) return ""
+    val source = bootstrapJsonConstructionSources.get(bootstrapJsonConstructionFile(site.source))
+    if (source == null || !source.contains("import \"abla/json\"")) return ""
+    val original = bootstrapJsonConstructionOriginal(site, site.expression)
+    if (original.contains("//") || original.contains("/*")) return ""
+    val parts: array<BootstrapExpression> = []
+    if (site.calls.size == 0) bootstrapJsonConstructionParts(site.expression, parts)
+    else {
+        if (site.terminal || site.controlled) return ""
+        val receiver = site.calls[0].children[0]
+        val fact = bootstrapJsonConstructionFact(site.source, receiver)
+        if (receiver.kind != "identifier" || fact == null || fact.local != "val" ||
+            bootstrapJsonConstructionOwnedBuffer(site, site.owner.expression, receiver.text) != 1 ||
+            !bootstrapJsonConstructionBufferSafe(site, site.owner.expression, receiver.text)) return ""
+        val provider = bootstrapJsonConstructionSources.get("$bootstrapJsonConstructionStdlib/abla/json/entry.ab")
+        if (provider == null || !provider.contains("compilerRegisterSubparser(\"jsonw\",")) return ""
+        for (call in site.calls) {
+            if (call.text == "appendText") bootstrapJsonConstructionParts(call.children[1], parts)
+            else parts.append(call.children[1])
+        }
+    }
+    val sample = byteBuffer()
+    val body = byteBuffer()
+    var quoted = false
+    for (part in parts) {
+        if (part.kind == "string") {
+            // Literal JSON escapes and `$` require a source-language quoting
+            // conversion. Leave them to a human rather than guess a rewrite.
+            if (part.text.contains("\\") || part.text.contains("$")) return ""
+            for (byte in part.text) if (byte == 34) quoted = !quoted
+            sample.appendText(part.text)
+            body.appendText(part.text)
+        } else {
+            if (quoted) return ""
+            val hole = bootstrapJsonConstructionHole(site, part)
+            if (hole == "") return ""
+            sample.appendText("0")
+            body.appendText("($hole)")
+        }
+    }
+    val parsed = jsonParse(sample.toText())
+    if (quoted || !parsed.succeeded || jsonStringify(parsed.value) != sample.toText()) return ""
+    if (site.calls.size == 0) "jsonStringify(\$json ${body.toText()})"
+    else "\$jsonw(${bootstrapJsonConstructionOriginal(site, site.calls[0].children[0])}) ${body.toText()}"
+}
+fun bootstrapJsonConstructionFinish(context: BootstrapJsonConstructionContext): void {
+    for (site in context.sites) {
+        var certain = true
+        if (site.calls.size == 0) {
+            val fact = bootstrapJsonConstructionFact(site.source, site.expression)
+            certain = fact != null && fact.type == "string" && fact.target == ""
+        } else for (call in site.calls) {
+            if (!bootstrapJsonConstructionKnown(site.source, call, "bytes", call.text)) certain = false
+        }
+        if (!certain) continue
+        val file = bootstrapJsonConstructionFile(site.source)
+        val source = bootstrapJsonConstructionSources.get(file)
+        if (source == null) continue
+        val rewrite = bootstrapSourceRewriteOf(file)
+        val begin = rewrite.original(site.expression.begin)
+        val end = rewrite.originalEnd(site.expression.end)
+        if (begin < 0 || end <= begin || end > source.size) continue
+        val spans = bootstrapJsonConstructionSubparsers.get(file)
+        var expanded = false
+        if (spans != null) {
+            var at = 0
+            while (at + 1 < spans.size) {
+                if (begin < spans[at + 1] && end > spans[at]) expanded = true
+                at = at + 2
+            }
+        }
+        if (expanded) continue
+        // A generated expansion may point back at its `$name` site. It is not
+        // an ordinary string expression written at that place in the file.
+        if (site.calls.size == 0 && source[begin] != 34) continue
+        val finding = BootstrapJsonConstructionFinding(file, begin, end, site.calls.size > 0,
+            bootstrapJsonConstructionReplacement(site))
+        var duplicate = false
+        for (previous in bootstrapJsonConstructionFindings) if (previous.file == file && previous.begin == begin && previous.end == end) duplicate = true
+        if (!duplicate) bootstrapJsonConstructionFindings.append(finding)
+    }
+}
+fun bootstrapJsonConstructionWarnings(): string {
+    val output = byteBuffer()
+    for (finding in bootstrapJsonConstructionFindings) {
+        output.appendText("warning[W_JSON_CONSTRUCTION]: ${finding.file}: hand-built JSON; consider \$${if (finding.buffer) "jsonw" else "json"} instead\nsource[json-construction]:${finding.file}:${finding.begin}:${finding.end}\n")
+    }
+    output.toText()
+}
+fun bootstrapJsonConstructionFix(file: string, begin: int, end: int): string {
+    for (finding in bootstrapJsonConstructionFindings) if (finding.file == file && finding.begin == begin && finding.end == end) return finding.replacement
+    ""
+}
