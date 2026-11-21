@@ -1,6 +1,7 @@
 // Opt-in JSON-construction suggestions. Source/ownership come from the module
 // loader; types and call identities come from sema. Nothing here executes CT.
 import "parser.ab"
+import "lexer.ab"
 import "source_rewrite.ab"
 import "abla/bytes"
 import "abla/json"
@@ -9,6 +10,7 @@ import "abla/text"
 var bootstrapJsonConstructionRequested = false
 var bootstrapJsonConstructionSources: Map<string, string> = Map()
 var bootstrapJsonConstructionOwned: Map<string, bool> = Map()
+var bootstrapJsonConstructionImports: Map<string, bool> = Map()
 var bootstrapJsonConstructionStdlib = ""
 var bootstrapJsonConstructionSubparsers: Map<string, array<int>> = Map()
 
@@ -42,6 +44,7 @@ fun bootstrapJsonConstructionKey(source: string, expression: BootstrapExpression
 fun bootstrapJsonConstructionReset(): void {
     bootstrapJsonConstructionSources = Map()
     bootstrapJsonConstructionOwned = Map()
+    bootstrapJsonConstructionImports = Map()
     bootstrapJsonConstructionSubparsers = Map()
     bootstrapJsonConstructionFindings = []
     bootstrapJsonConstructionContext = BootstrapJsonConstructionContext([], Map())
@@ -49,13 +52,32 @@ fun bootstrapJsonConstructionReset(): void {
 fun bootstrapJsonConstructionCapture(file: string, text: string, stdlib: string): void {
     bootstrapJsonConstructionSources.set(file, text)
     bootstrapJsonConstructionStdlib = stdlib
+    // A comment or an aliased import cannot establish unqualified bindings
+    // for the serializer inserted by a fix.
+    val tokens = bootstrapLexShared(text)
+    var imported = false
+    var at = 0
+    while (at + 4 < tokens.size) {
+        if (tokens[at].kind == BOOTSTRAP_TOKEN_IMPORT &&
+            tokens[at + 1].kind == BOOTSTRAP_TOKEN_STRING_START &&
+            tokens[at + 2].kind == BOOTSTRAP_TOKEN_STRING_TEXT &&
+            text.slice(tokens[at + 2].begin, tokens[at + 2].end) == "abla/json" &&
+            tokens[at + 3].kind == BOOTSTRAP_TOKEN_STRING_END &&
+            (tokens[at + 4].kind == BOOTSTRAP_TOKEN_NEWLINE ||
+             tokens[at + 4].kind == BOOTSTRAP_TOKEN_SEMICOLON ||
+             tokens[at + 4].kind == BOOTSTRAP_TOKEN_END)) imported = true
+        at = at + 1
+    }
+    bootstrapJsonConstructionImports.set(file, imported)
 }
 fun bootstrapJsonConstructionEligible(source: string): bool {
     val file = bootstrapJsonConstructionFile(source)
     if (file.startsWith("<") || file.contains("/tests/") || file.contains("/test/") ||
         file.contains("/stdlib/abla/json/") || file.startsWith("stdlib/abla/json/") ||
         file.contains("/fixtures/") || file.startsWith("tests/") || file.startsWith("test/") ||
-        file.endsWith("_test.ab") || file.endsWith("_tests.ab") || file.endsWith("/test.ab")) return false
+        file.endsWith("_test.ab") || file.endsWith("_tests.ab") || file.endsWith("/test.ab") ||
+        file == "test.ab" || file == "tests.ab" || file.endsWith("/tests.ab") ||
+        file.endsWith(".test.ab") || file.endsWith(".spec.ab")) return false
     val owned = bootstrapJsonConstructionOwned.get(file)
     owned != null && owned && bootstrapJsonConstructionSources.has(file)
 }
@@ -125,7 +147,9 @@ fun bootstrapJsonConstructionCollect(owner: BootstrapDeclaration, expression: Bo
     if ((expression.kind == "local.val" || expression.kind == "local.var") &&
         expression.text.startsWith("expected")) return
     val flow = controlled || expression.kind == "if" || expression.kind == "for" ||
-        expression.kind == "while" || expression.kind == "do.while" || expression.kind == "when" || expression.kind == "lambda"
+        expression.kind == "while" || expression.kind == "do.while" || expression.kind == "when" ||
+        expression.kind == "lambda" || expression.kind == "local.fun" ||
+        expression.kind == "compile" || expression.kind == "declaration.block"
     if (expression.kind == "string.template" || expression.kind == "+") {
         val parts: array<BootstrapExpression> = []
         bootstrapJsonConstructionParts(expression, parts)
@@ -279,11 +303,11 @@ fun bootstrapJsonConstructionOwnedBuffer(site: BootstrapJsonConstructionSite, ex
     found
 }
 fun bootstrapJsonConstructionReplacement(site: BootstrapJsonConstructionSite): string {
-    if (site.generic || site.owner.kind != "fun" || !bootstrapJsonConstructionContext.serializerClear) return ""
+    if (site.generic || site.controlled || site.owner.kind != "fun" || !bootstrapJsonConstructionContext.serializerClear) return ""
     for (name in site.owner.parameters) if (name == "jsonStringify") return ""
     if (bootstrapJsonConstructionNames(site.owner.expression, "jsonStringify")) return ""
-    val source = bootstrapJsonConstructionSources.get(bootstrapJsonConstructionFile(site.source))
-    if (source == null || !source.contains("import \"abla/json\"")) return ""
+    val imported = bootstrapJsonConstructionImports.get(bootstrapJsonConstructionFile(site.source))
+    if (imported == null || !imported) return ""
     val original = bootstrapJsonConstructionOriginal(site, site.expression)
     if (original.contains("//") || original.contains("/*")) return ""
     val parts: array<BootstrapExpression> = []

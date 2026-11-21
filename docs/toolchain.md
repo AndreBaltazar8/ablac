@@ -427,6 +427,20 @@ unreachable code has been found. Editor clients request these checks through
 the corresponding `unusedLocals`, `unusedParameters` and `unusedDeclarations`
 initialize properties.
 
+`--warn-json-construction` enables `W_JSON_CONSTRUCTION` suggestions for JSON
+assembled with string interpolation/concatenation or standard `ByteBuffer`
+`appendText`/`appendInt` runs. It is off by default. Tests, fixtures, plain data
+strings, parsing/search inputs, comparisons and existing subparser literals are
+excluded. The lint uses compiler types and declaration identities; unrelated
+methods named `appendText` do not qualify.
+
+Editor clients enable it with initialize option `jsonConstruction: true`.
+Diagnostics carry edits only for complete, compact JSON with known scalar
+values and no escaping, alias, effect or result-type ambiguity. String fixes
+use `jsonStringify($json ...)`; safe owned-buffer runs use `$jsonw(buffer) ...`.
+Other recognized constructions receive a suggestion without an edit. Enabling
+the lint bypasses the native build cache so its warnings are computed afresh.
+
 Compile-time build definitions may register additional program nodes through
 the versioned compiler API. After the root succeeds, `build` drains the bounded
 graph in declaration order; a requested program may add further nodes. This

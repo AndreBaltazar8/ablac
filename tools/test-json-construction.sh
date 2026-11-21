@@ -21,9 +21,13 @@ node --input-type=module - "$work" <<'NODE'
 import fs from 'node:fs';
 const root=process.argv[2];
 fs.writeFileSync(root+'/overload.ab','import "abla/json"\nfun jsonStringify(value: int): string = "custom"\nfun payload(n: int): string = "{\\"n\\":${n}}"\nfun main: int = 0\n');
+fs.writeFileSync(root+'/comment.ab','// import "abla/json"\nfun payload(n: int): string = "{\\"n\\":${n}}"\nfun main: int = 0\n');
+fs.writeFileSync(root+'/alias.ab','import "abla/json" as json\nfun payload(n: int): string = "{\\"n\\":${n}}"\nfun main: int = 0\n');
 const lines=[{schema:1,id:1,method:'initialize',params:{workspaceRoots:[root],clientName:'json-construction',clientVersion:'1',analysisMode:'graph-v2',jsonConstruction:true}},
  {schema:1,id:2,method:'analyze',params:{roots:[root+'/main.ab']}},
- {schema:1,id:3,method:'analyze',params:{roots:[root+'/overload.ab']}},{schema:1,id:4,method:'shutdown',params:{}}];
+ {schema:1,id:3,method:'analyze',params:{roots:[root+'/overload.ab']}},
+ {schema:1,id:4,method:'analyze',params:{roots:[root+'/comment.ab']}},
+ {schema:1,id:5,method:'analyze',params:{roots:[root+'/alias.ab']}},{schema:1,id:6,method:'shutdown',params:{}}];
 fs.writeFileSync(root+'/requests.jsonl',lines.map(JSON.stringify).join('\n')+'\n');
 NODE
 "$compiler" analyze --stdio < "$work/requests.jsonl" > "$work/answers.jsonl" 2> "$work/editor.err"
@@ -39,7 +43,7 @@ const bytes=Buffer.from(doc.text);
 const owner=d=>{const prefix=bytes.subarray(0,d.range.start).toString();return [...prefix.matchAll(/\bfun\s+(\w+)/g)].at(-1)?.[1];};
 const warnings=doc.diagnostics.filter(d=>d.code==='W_JSON_CONSTRUCTION');
 const names=warnings.map(owner).sort();
-assert.deepEqual(names,['safe','concatenated','arrayValue','escaped','quoted','pretty','floating','shared','shadow','effect','writer','alias','terminal','branch'].sort(),JSON.stringify(doc.diagnostics));
+assert.deepEqual(names,['safe','concatenated','arrayValue','branchString','escaped','quoted','pretty','floating','shared','shadow','effect','writer','alias','terminal','branch'].sort(),JSON.stringify(doc.diagnostics));
 for(const d of warnings){assert.equal(d.severity,'warning');assert.ok(!d.tags?.includes('unnecessary'));}
 const fixed=warnings.filter(d=>d.fixes?.length);
 assert.ok(fixed.some(d=>owner(d)==='safe'),'simple scalar template needs a fix');
@@ -55,6 +59,14 @@ assert.ok(!overloaded.diagnostics.some(d=>d.severity==='error'),JSON.stringify(o
 const refused=overloaded.diagnostics.filter(d=>d.code==='W_JSON_CONSTRUCTION');
 assert.equal(refused.length,1,JSON.stringify(overloaded.diagnostics));
 assert.ok(!refused[0].fixes?.length,'user serializer overload must suppress the fix');
+const commented=answers.find(a=>a.id===4).result.documents.find(d=>d.uri.endsWith('/comment.ab'));
+const noImport=commented.diagnostics.filter(d=>d.code==='W_JSON_CONSTRUCTION');
+assert.equal(noImport.length,1,JSON.stringify(commented.diagnostics));
+assert.ok(!noImport[0].fixes?.length,'commented import must not enable a fix');
+const alias=answers.find(a=>a.id===5).result.documents.find(d=>d.uri.endsWith('/alias.ab'));
+const noUnqualified=alias.diagnostics.filter(d=>d.code==='W_JSON_CONSTRUCTION');
+assert.equal(noUnqualified.length,1,JSON.stringify(alias.diagnostics));
+assert.ok(!noUnqualified[0].fixes?.length,'aliased import must not enable an unqualified fix');
 console.log('json-construction: '+warnings.length+' warnings; '+fixed.length+' conservative fixes');
 NODE
 (cd "$work" && "$compiler" build fixed.ab -o fixed --fast) > "$work/fixed.log" 2>&1 || fail 'fixed source did not build' "$work/fixed.log"
@@ -71,4 +83,7 @@ mkdir "$work/tests"
 cp "$work/main.ab" "$work/tests/main.ab"
 (cd "$work" && "$compiler" build tests/main.ab -o tests-program --fast --warn-json-construction) > "$work/tests.log" 2>&1 || fail 'test fixture did not build' "$work/tests.log"
 ! grep -q W_JSON_CONSTRUCTION "$work/tests.log" || fail 'warned in a test directory' "$work/tests.log"
+cp "$work/main.ab" "$work/test.ab"
+(cd "$work" && "$compiler" build test.ab -o named-test --fast --warn-json-construction) > "$work/named-test.log" 2>&1 || fail 'named test did not build' "$work/named-test.log"
+! grep -q W_JSON_CONSTRUCTION "$work/named-test.log" || fail 'warned in test.ab' "$work/named-test.log"
 echo 'json-construction: opt-in, identities, exclusions, fixes and byte parity passed'
