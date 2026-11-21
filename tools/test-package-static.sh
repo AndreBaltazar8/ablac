@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# The static toolchain package (tools/package-linux-static-toolchain.sh): built from the static compiler, unpacked in a directory of its own, and used with an EMPTY PATH (no clang, no
+# ld.lld, no coreutils: not even `ls`): hello builds, links in the compiler's process and runs, built a second time it is the same executable, and the package holds no loader,
+# no shared library and no libLLVM. Prints the package's size. Needs the static compiler (tools/build-static-compiler.sh after eval "$(tools/static-llvm-env.sh)").
+# The Xtensa installer is built by the packaged compiler, on the same empty PATH.
+# Usage: tools/test-package-static.sh <static compiler> [dynamic-package.tar.gz to compare sizes with]
+set -euo pipefail
+export LC_ALL=C
+compiler=${1:?usage: tools/test-package-static.sh <static compiler> [dynamic package]}
+[[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
+compare=${2:-}
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+[[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || { echo 'static package: x86-64 Linux only'; exit 0; }
+out=build/package-static
+rm -rf "$out"
+mkdir -p "$out/unpacked" "$out/empty"
+fail() { echo "static package: $*" >&2; exit 1; }
+args=("$compiler" "$root" "$out/package.tar.gz")
+[[ -z $compare ]] || args+=(--compare "$compare")
+report=$(tools/package-linux-static-toolchain.sh "${args[@]}" 2> "$out/package.log") || { tail -5 "$out/package.log" >&2; fail "the package did not build"; }
+tar -C "$out/unpacked" -xzf "$out/package.tar.gz"
+pkg=$out/unpacked/abla-toolchain-static-x86_64-linux
+for part in bin/ablac libexec/ablac.bin libexec/abla-install-xtensa-native share/abla/stdlib share/abla/runtime lib/clang/23/lib/linux/libclang_rt.builtins-x86_64.a share/licenses/abla.txt; do
+    [[ -e $pkg/$part ]] || fail "the package lacks $part"
+done
+# no shared library, no libLLVM, no tool of an LLVM install
+found=$(find "$pkg" -type f \( -name '*.so' -o -name '*.so.*' -o -name 'libLLVM*' -o -name 'libclang-cpp*' -o -name clang -o -name ld.lld -o -name wasm-ld -o -name opt -o -name llc \) -print)
+[[ -z $found ]] || fail "the package holds: $found"
+for executable in "$pkg/libexec/ablac.bin" "$pkg/libexec/abla-install-xtensa-native"; do
+    interpreter=$(readelf -lW "$executable" | grep -c 'INTERP\|Shared library' || true)
+    [[ $interpreter == 0 ]] || fail "$executable is not static"
+done
+# an empty PATH: the launcher and the compiler run on their own
+hello() { # output name, cache name
+    env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/$2" "$PWD/$pkg/bin/ablac" build tests/cases/libc-imports/hello.ab -o "$out/$1" --fast \
+        > "$out/$1.log" 2>&1 || { tail -5 "$out/$1.log" >&2; fail "hello did not build with an empty PATH"; }
+}
+hello hello1 cache1
+[[ $("$out/hello1") == hello ]] || fail "hello did not print hello"
+hello hello2 cache2
+cmp -s "$out/hello1" "$out/hello2" || fail "two builds of hello differ"
+# a program with a compile-time action and a second module build too (the standard library is the package's own)
+env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/cache3" "$PWD/$pkg/bin/ablac" run tests/cases/libc-imports/strings-arrays.ab > "$out/run.log" 2>&1 ||
+    { tail -5 "$out/run.log" >&2; fail "a run with an empty PATH failed"; }
+echo "$report; hello builds, runs and is reproducible with an empty PATH"

@@ -4,7 +4,7 @@
 // What it calls: lld::lldMain with the ELF and WebAssembly drivers (liblldELF.a, liblldWasm.a, liblldCommon.a, the same lld version as
 // the ld.lld and wasm-ld the compiler otherwise runs, so the output is byte for byte the external link's).
 //
-//   int abla_lld_main(const char *arguments, const char *errors)
+//   int abla_lld_main(const char *arguments, const char *errors)   (and abla_archive_gnu, at the end: the archive writer of the code generation units)
 //
 // `arguments` is the command line, one argument per line (a newline is not valid in a path the compiler links), argument 0 the program name
 // ("ld.lld" or "wasm-ld"). Diagnostics go to the file `errors` (standard error when null or empty). Returns lld's exit code, or -1 when lld
@@ -13,6 +13,7 @@
 #include "lld/Common/Driver.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Object/ArchiveWriter.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FileSystem.h"
@@ -78,4 +79,37 @@ extern "C" int abla_lld_main(const char *arguments, const char *errors) {
         } else llvm::errs() << diagnostics;
     }
     return result.canRunAgain || result.retCode == 0 ? result.retCode : -1;
+}
+
+// An archive of object files, as `llvm-ar rcsD --format=gnu OUTPUT MEMBER...` writes it (what the compiler's code generation units are combined into: src/codegen_units.ab):
+// the same library routine with the same options, so the same bytes.
+//
+//   int abla_archive_gnu(const char *arguments)
+//
+// `arguments` is one path per line: the archive, then its members, in order. Returns 0, or 1 with the reason on standard error.
+extern "C" int abla_archive_gnu(const char *arguments) {
+    std::vector<std::string> paths;
+    const std::string text(arguments);
+    for (size_t start = 0; start <= text.size();) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        paths.push_back(text.substr(start, end - start));
+        start = end + 1;
+    }
+    if (paths.size() < 2) return 1;
+    std::vector<llvm::NewArchiveMember> members;
+    for (size_t index = 1; index < paths.size(); index++) {
+        llvm::Expected<llvm::NewArchiveMember> member = llvm::NewArchiveMember::getFile(paths[index], /*Deterministic=*/true);
+        if (!member) {
+            llvm::errs() << paths[index] << ": " << llvm::toString(member.takeError()) << "\n";
+            return 1;
+        }
+        members.push_back(std::move(*member));
+    }
+    llvm::Error failure = llvm::writeArchive(paths[0], members, llvm::SymtabWritingMode::NormalSymtab, llvm::object::Archive::K_GNU, /*Deterministic=*/true, /*Thin=*/false);
+    if (failure) {
+        llvm::errs() << paths[0] << ": " << llvm::toString(std::move(failure)) << "\n";
+        return 1;
+    }
+    return 0;
 }

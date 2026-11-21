@@ -22,12 +22,12 @@ builtins=$(clang --rtlib=compiler-rt -print-libgcc-file-name)
 [[ -f $builtins ]] || fail "no compiler-rt builtins archive to name"
 bin=$out/bin
 mkdir -p "$bin"
-# What the compiler still runs: the coreutils, and for the AArch64 build opt, llc and llvm-extract (the cross code generation is external). No ld.lld, wasm-ld or clang.
-for tool in env cp nproc rm mktemp cat uname dirname readlink opt llc llvm-extract llvm-ar; do
+# What the compiler still runs: the coreutils, and for the AArch64 build opt, llc and llvm-extract (the cross code generation is external). No ld.lld, wasm-ld, llvm-ar or clang.
+for tool in env cp nproc rm mktemp cat uname dirname readlink opt llc llvm-extract; do
     path=$(command -v "$tool" 2> /dev/null || true)
     [[ -z $path ]] || ln -sf "$path" "$bin/$tool"
 done
-for tool in ld.lld wasm-ld clang; do [[ ! -e $bin/$tool ]] || fail "$tool is in the test's PATH"; done
+for tool in ld.lld wasm-ld clang llvm-ar; do [[ ! -e $bin/$tool ]] || fail "$tool is in the test's PATH"; done
 run() { # tag, then the environment words and the build arguments after --
     local tag=$1; shift
     env "$@" > "$out/$tag.log" 2>&1
@@ -51,6 +51,21 @@ for program in "${programs[@]}"; do
         count=$((count + 1))
     done
 done
+# Code generation units (a big program is cut into units, whose objects are combined by an archive): forced on a small one, the archive is written in process (no llvm-ar on the PATH below)
+# and the executable is the external tools' byte for byte.
+units=(ABLA_CODEGEN_UNITS=4 ABLA_CODEGEN_UNITS_MINIMUM=1 ABLA_CODEGEN_JOBS=1)
+for name in hello strings-arrays; do
+    program=tests/cases/libc-imports/$name.ab
+    run "units.$name.inprocess" "${units[@]}" ABLA_CACHE_DIR=$PWD/$out/units.$name.in.cache "$compiler" build "$program" -o "$out/units.$name.in" --fast ||
+        { tail -5 "$out/units.$name.inprocess.log" >&2; fail "$name with units: the in-process build failed"; }
+    run "units.$name.external" "${units[@]}" ABLA_LINK_INPROCESS=0 ABLA_CACHE_DIR=$PWD/$out/units.$name.ex.cache "$compiler" build "$program" -o "$out/units.$name.ex" --fast ||
+        { tail -5 "$out/units.$name.external.log" >&2; fail "$name with units: the external build failed"; }
+    cmp -s "$out/units.$name.in" "$out/units.$name.ex" || fail "$name with units: the in-process executable differs from the external one"
+    count=$((count + 1))
+done
+run "units.nolinker" PATH=$PWD/$bin "${units[@]}" ABLA_COMPILER_RT_BUILTINS=$builtins ABLA_CACHE_DIR=$PWD/$out/units.nolinker.cache "$compiler" build tests/cases/libc-imports/hello.ab -o "$out/units.nolinker" --fast ||
+    { tail -5 "$out/units.nolinker.log" >&2; fail "hello with units did not build with no linker or llvm-ar on the PATH"; }
+cmp -s "$out/units.nolinker" "$out/units.hello.ex" || fail "hello with units, built with no llvm-ar, differs from the external one"
 # No linker on the PATH.
 for variant in "x86:" "aarch64:--target aarch64-linux"; do
     tag=${variant%%:*}
