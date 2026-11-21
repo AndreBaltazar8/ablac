@@ -405,6 +405,18 @@ private fun linuxFork(): int {
     int(fork())
 }
 
+// setpgid(0, group) in a forked child (group 0: one of its own); its parent sets the group too, which closes the
+// fork/exec race. On macOS the two calls can meet and the child's fail with EPERM (arm64 CI run 44865623174) when
+// the group is already the one asked for: that is no failure. So is a session leader's EPERM, its group being its
+// own. 0, or the negative errno. Allocation-free, as a forked child must be.
+fun linuxChildSetProcessGroup(group: int): int {
+    val result = linuxSyscall2(109, 0, group)
+    if (result >= 0) return result
+    // getpid 39, getpgid 121
+    val wanted = if (group == 0) linuxSyscall0(39) else group
+    if (linuxSyscall1(121, 0) == wanted) 0 else result
+}
+
 private fun linuxExecUnblockSignals(): void {
     val state = linuxSignalWatchState()
     if (linuxSignalWatchGet(0) != 0) linuxSyscall4(14, 1, state, 0, 8)
@@ -639,7 +651,7 @@ fun linuxStartConfiguredProcess(
         if (process == 0) {
             // setpgid(0, 0): the whole test process tree can be terminated on
             // timeout without affecting the parent test runner.
-            linuxSyscall2(109, 0, 0)
+            linuxChildSetProcessGroup(0)
             linuxExecUnblockSignals()
             var ready = true
             if (directoryAddress != 0) {
@@ -1075,7 +1087,7 @@ fun linuxPipelineStart(commands: array<LinuxCommand>, grouped: bool, capture: bo
         val process = linuxFork()
         if (process == 0) {
             var ready = true
-            if (grouped) ready = linuxSyscall2(109, 0, if (group < 0) 0 else group) == 0
+            if (grouped) ready = linuxChildSetProcessGroup(if (group < 0) 0 else group) == 0
             if (index > 0 && linuxSyscall2(33, pipes[index - 1].input, 0) < 0) ready = false
             if (index + 1 < commands.size) {
                 if (linuxSyscall2(33, pipes[index].output, 1) < 0) ready = false

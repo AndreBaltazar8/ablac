@@ -32,5 +32,10 @@ if [[ $(uname -s) == Linux ]]; then
     fi
     "$compiler" build tests/cases/process-pipeline/fork-failure.ab -o build/process-pipeline-test/fork-failure --fast --no-cache
     timeout 20 build/process-pipeline-test/fork-failure
+    # A child's setpgid that fails with its group already the one asked for (macOS, when the parent's call meets
+    # it) is no failure: a session leader is in that state for good.
+    "$compiler" build tests/cases/process-pipeline/session-leader.ab -o build/process-pipeline-test/session-leader --fast --no-cache
+    timeout 20 setsid -w build/process-pipeline-test/session-leader ||
+        { echo "process pipeline: a session leader's setpgid to its own group was taken as a failure ($?)" >&2; exit 1; }
 fi
 echo 'process pipeline: captures, status, snapshots, SIGPIPE, failures and group stop'
