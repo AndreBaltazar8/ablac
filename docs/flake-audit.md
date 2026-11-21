@@ -118,5 +118,11 @@ The fixture now blocks in `sleep`, and the bridge harness supplies and asserts
 its intended one-second deadline in both tiers. The diagnostic harness lowers
 this case's step budget to 100,000 and requires `E_CT_TIME_LIMIT`, so a clock loop
 cannot silently replace the wait. `ct-time-limit/clock.ab` separately retains
-the regression for an interrupt inside a clock-provider call. No evaluator
-budget is increased.
+the regression for an interrupt inside a clock-provider call. No step budget
+is increased.
+
+Focused validation also exposed the diagnostic harness's one-second timer
+pre-empting the recursion fixture's stack-depth guard in the interpreter, while
+native code reached the intended guard. The timer now applies only to `late`;
+other fixtures retain their own error guards and the outer 120-second hang
+guard. The recursion case explicitly requires `E_EVAL_STACK_DEPTH` in both tiers.
