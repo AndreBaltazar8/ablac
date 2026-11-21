@@ -21,7 +21,7 @@ val FUZZ_LIBC_ROUND_INT: array<string> = ["lround", "llround", "lrint", "llrint"
 
 /** The program's prelude: the externs, a trusted wrapper for each (a check is untrusted code), and the printing of a value. */
 fun fuzzLibcPrelude(): string {
-    val lines: array<string> = ["import \"abla/io\"", "import \"abla/float\"", "import \"abla/compiler\"",
+    val lines: array<string> = ["import \"abla/io\"", "import \"abla/float\"", "import \"abla/float/text\"", "import \"abla/compiler\"",
         "#compilerGrant(\"trusted.native\")", "import \"abla/unsafe/native\"", "import \"abla/unsafe/memory\"", "import \"abla/unsafe/memory/raw\"",
         "trusted noescape extern:\"c\" fun strtod(text: cstring, end: i64*): f64",
         "trusted noescape extern:\"c\" fun strtof(text: cstring, end: i64*): f32",
@@ -218,7 +218,51 @@ fun FuzzGen.libcWord(): string {
     text
 }
 
+/** A safe integer expression over `a` and `b` (no overflow: small constants, results reduced). */
+fun FuzzGen.exportLocalIntExpr(): string {
+    val terms = ["a", "b", "(a + b)", "(a - b)", "(a * ${this.r.range(2, 9)})", "(b * ${this.r.range(2, 9)})", "(a & ${this.r.range(1, 255)})",
+        "(b | ${this.r.range(1, 255)})", "(a ^ b)", "(a % ${this.r.range(2, 97)})", "(${this.r.range(-50, 50)})"]
+    val glue = [" + ", " - ", " + ", " ^ "]
+    var text = this.r.pick(terms)
+    for (i in 0 until this.r.range(1, 4)) text = text + this.r.pick(glue) + this.r.pick(terms)
+    "($text) % 100003"
+}
+
+/** An `@exportLocal` function and the `extern:"c"` declaration that binds to it (#648, the prune/export work): called directly, in a loop and (in the
+ * compile-time variant) from `#(...)`; the program's calls reach the local definition, which exists only because of them. */
+fun FuzzGen.exportLocalCheck(index: int): FuzzCheck {
+    val name = "fzel$index"
+    val lines: array<string> = []
+    val kind = this.r.below(3)
+    if (kind == 0) {
+        lines.append("extern:\"c\" fun $name(a: int, b: int): int")
+        lines.append("@exportLocal(\"$name\")")
+        lines.append("fun ${name}Impl(a: int, b: int): int = ${this.exportLocalIntExpr()}")
+        lines.append("fun c$index(): string {")
+        lines.append("    var total = 0")
+        lines.append("    for (i in 0 until ${this.r.range(1, 40)}) total = total + $name(i + ${this.r.range(-20, 20)}, i * ${this.r.range(-5, 5)})")
+        lines.append("    \"\$total \${$name(${this.r.range(-500, 500)}, ${this.r.range(-500, 500)})}\"")
+        lines.append("}")
+    } else if (kind == 1) {
+        // two exports, the second calls the first through its own extern declaration (a chain of local definitions)
+        lines.append("extern:\"c\" fun ${name}a(a: int, b: int): int")
+        lines.append("extern:\"c\" fun ${name}b(a: int, b: int): int")
+        lines.append("@exportLocal(\"${name}a\")")
+        lines.append("fun ${name}aImpl(a: int, b: int): int = ${this.exportLocalIntExpr()}")
+        lines.append("@exportLocal(\"${name}b\")")
+        lines.append("fun ${name}bImpl(a: int, b: int): int = (${name}a(b, a) * ${this.r.range(1, 7)} + ${name}a(a, a)) % 100003")
+        lines.append("fun c$index(): string = \"\${${name}b(${this.r.range(-300, 300)}, ${this.r.range(-300, 300)})} \${${name}a(${this.r.range(-300, 300)}, 1)}\"")
+    } else {
+        lines.append("extern:\"c\" fun $name(x: f64, n: int): f64")
+        lines.append("@exportLocal(\"$name\")")
+        lines.append("fun ${name}Impl(x: f64, n: int): f64 = x * ${this.r.pick(["0.5", "2.0", "1.25", "-3.0"])} + f64FromInt(n % 17)")
+        lines.append("fun c$index(): string = \"\${$name(${this.libcArgument()}, ${this.r.range(-40, 40)})}\"")
+    }
+    FuzzCheck(lines, "c$index()", "str", index)
+}
+
 fun FuzzGen.libcCheck(index: int): FuzzCheck {
+    if (this.r.chance(0.12)) return this.exportLocalCheck(index)
     val kind = this.r.below(20)
     val lines: array<string> = ["fun c$index(): string {"]
     if (kind <= 1) {

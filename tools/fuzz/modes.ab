@@ -151,6 +151,40 @@ fun fuzzCachedNativeJob(runner: FuzzRunner, source: string, out: string, fast: b
     FuzzJob([build, run], 0, 0, [])
 }
 
+/** The runtime prune with a real hint: a build with a cache of its own (ABLA_PRUNE_RUNTIME=1) leaves the hint, and a second text of the program (a
+ * comment appended, so the object cache misses and the compile runs) is built with that cache, pruned by the hint; the program of the second build is
+ * the one that runs. Its build log carries the demand trace (abla-prune-runtime N of M, or `fallback`: the hint was found wrong). */
+fun fuzzPruneWarmJob(runner: FuzzRunner, source: string, out: string, fast: bool): FuzzJob {
+    // The hint is the cache's, keyed by the entry's path: both builds are of one file (a copy of the program in a directory of its own, with the
+    // manifest beside it), whose text the step between them changes.
+    val directory = "$out.warm"
+    Path(directory).createDirectories()
+    val entry = "$directory/main.ab"
+    Path(entry).writeText(Path(source).readText())
+    val manifest = "${source.slice(0, source.lastIndexOf("/"))}/abla.toml"
+    if (Path(manifest).exists()) Path("$directory/abla.toml").writeText(Path(manifest).readText())
+    val cache = "$out.cache"
+    val first: array<string> = [runner.compiler, "build", entry, "-o", "$out.first"]
+    val again: array<string> = [runner.compiler, "build", entry, "-o", out]
+    if (fast) {
+        first.append("--fast")
+        again.append("--fast")
+    }
+    val a = runner.step(first, ["ABLA_PRUNE_RUNTIME", "ABLA_CACHE_DIR"], ["1", cache], "$out.first.out", "$out.first.err", true)
+    val edit = runner.step(["/bin/sh", "-c", "printf '\\n// a second text of the same program\\n' >> '$entry'"], [], [], "$out.edit.out", "$out.edit.err", true)
+    val b = runner.step(again, ["ABLA_PRUNE_RUNTIME", "ABLA_CACHE_DIR", "ABLA_COMPILER_DEMAND_TRACE"], ["1", cache, "1"], "$out.build.out", "$out.build.err", true)
+    val run = runner.step([out], [], [], "$out.stdout", "$out.stderr", true)
+    FuzzJob([a, edit, b, run], 0, 0, [])
+}
+
+fun fuzzPruneWarmResult(mode: string, job: FuzzJob, out: string): FuzzResult {
+    if (job.statuses.size < 4 || job.statuses[0] != 0) {
+        return FuzzResult(mode, false, "", 0, fuzzFirstLines(fuzzReadText("$out.first.err"), 6))
+    }
+    if (job.statuses[1] != 0 || job.statuses[2] != 0) return FuzzResult(mode, false, "", 0, fuzzFirstLines(fuzzReadText("$out.build.err"), 6))
+    FuzzResult(mode, true, fuzzReadText("$out.stdout"), job.statuses[3], fuzzFirstLines(fuzzReadText("$out.stderr"), 1))
+}
+
 fun fuzzNativeResult(mode: string, job: FuzzJob, out: string): FuzzResult {
     if (job.statuses.size == 0 || job.statuses[0] != 0) {
         return FuzzResult(mode, false, "", 0, fuzzFirstLines(fuzzReadText("$out.build.err"), 6))
@@ -249,6 +283,11 @@ fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: stri
             jobs.append(fuzzAxisJob(this, this.compiler, plain, "$directory/$name", fast, ["ABLA_PRUNE_RUNTIME"], ["1"]))
             axes.append(name)
         }
+        for (fast in [true, false]) {
+            val name = if (fast) "prune-warm-fast" else "prune-warm-release"
+            jobs.append(fuzzPruneWarmJob(this, plain, "$directory/$name", fast))
+            axes.append(name)
+        }
     }
     this.runJobs(jobs)
     val results: array<FuzzResult> = [
@@ -266,7 +305,7 @@ fun FuzzRunner.modesOf(relative: string, plainRelative: string, ctRelative: stri
     }
     var axis = if (includeWasm) next + 1 else next
     for (name in axes) {
-        results.append(fuzzNativeResult(name, jobs[axis], "$directory/$name"))
+        results.append(if (name.startsWith("prune-warm")) fuzzPruneWarmResult(name, jobs[axis], "$directory/$name") else fuzzNativeResult(name, jobs[axis], "$directory/$name"))
         axis = axis + 1
     }
     if (includeWasm) fuzzWasmResults(this, jobs[next], directory, results)
