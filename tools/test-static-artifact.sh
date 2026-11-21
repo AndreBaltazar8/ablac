@@ -23,6 +23,7 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 [[ $(uname -s) == Linux ]] || { echo 'static artifact: Linux only'; exit 0; }
 [[ -x $artifact ]] || { echo "static artifact: $artifact is not an executable" >&2; exit 1; }
+export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-8192}   # the self-builds of the fixpoint need more than the launcher's 2048 MB default
 out=${STATIC_ARTIFACT_OUTPUT:-build/static-artifact}
 rm -rf "$out"
 mkdir -p "$out"

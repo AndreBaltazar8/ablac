@@ -12,6 +12,8 @@ output=${2:-build/ablac-static}
 [[ -n ${ABLA_STATIC_LLVM_LIB:-} && -f ${ABLA_STATIC_LLVM_LIB}/libLLVMSupport.a ]] ||
     { echo 'static compiler: set ABLA_STATIC_LLVM_LIB to a directory with libLLVM*.a' >&2; exit 2; }
 export ABLA_STATIC_LLVM_LIB
+# The launcher's default cap is 2048 MB; the frontend on the compiler's own source needs about 1.8 GB resident and the static link more (CI's first run died with "out of memory").
+export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-8192}
 "$compiler" build src/orc_main_static.ab -o "$output" --no-cache
 [[ -x $output ]] || { echo "static compiler: no $output" >&2; exit 1; }
 echo "built $output: $(file -b "$output" | cut -c1-100)"
