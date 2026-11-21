@@ -447,11 +447,12 @@ stderr and leaves the session as it was; a change the running code cannot take i
 program with nothing defined. Elsewhere `repl` compiles each line on its own in a child compiler, so only
 declarations persist. In both, an entry whose bracket (`(`, `[`, `{`), string or `/*` comment is still open
 continues on the next line (`....> `), so a function or class body can span lines; an empty line ends an
-entry still open. `:help` lists the commands, `:quit` (or the end of the input) ends the session, and any other
-entry starting with `:` is an unknown command, refused without a compile. On a terminal the REPL edits a line
-itself (`src/repl_editor.ab`, no readline): left and right, Home and End (Ctrl-A, Ctrl-E), Backspace and Delete, up
-and down through the session's earlier lines, Ctrl-K and Ctrl-U cut to the end and to the start, Ctrl-C drops the
-entry, and Ctrl-D on an empty line ends the session. The terminal's own settings are back while an entry runs, so
+entry still open. `:help` lists the commands, `:type <expr>` shows the type of an expression without running it
+(the live REPL; the compiler's own inference, through `#compiler.typeName`), `:quit` (or the end of the input) ends
+the session, and any other entry starting with `:` is an unknown command, refused without a compile. On a
+terminal the REPL edits a line itself (`src/repl_editor.ab`, no readline): left and right, Home and End (Ctrl-A,
+Ctrl-E), Backspace and Delete, up and down through the session's earlier lines, Ctrl-K and Ctrl-U cut to the end
+and to the start, Ctrl-C drops the entry, and Ctrl-D on an empty line ends the session. The terminal's own settings are back while an entry runs, so
 Ctrl-C interrupts it as before. `ABLA_REPL_EDITOR=0` (or `TERM=dumb`, or input that is not a terminal) reads lines as
 they come.
 

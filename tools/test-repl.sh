@@ -64,6 +64,9 @@ if ((live)); then
     panicking=$!
     printf 'fun f(): int = 1\nval g = f\nfun f(): string = "x"\nf()\n:quit\n' | session refused 300 &
     refused=$!
+    # :type names an expression's type without running it (the println does not print).
+    printf 'val xs = [1, 2]\n:type xs\n:type 1.5 * 2.0\n:type println("ran")\n:type\n:type nope\n:quit\n' | session types 300 &
+    types=$!
 fi
 wait "$recovery"
 wait "$definitions"
@@ -81,6 +84,11 @@ if ((live)); then
         { echo 'repl (panic): a line that panics did not leave the session and its state as they were' >&2; cat "$base.panic.out" "$base.panic.err" >&2; exit 1; }
     [[ $(< "$base.refused.out") == $'abla> defined\nabla> defined\nabla> abla> 1\nabla> ' ]] && grep -q 'E_LIVE_SIGNATURE' "$base.refused.err" ||
         { echo 'repl (refused): a refused redefinition did not keep the old one' >&2; cat "$base.refused.out" "$base.refused.err" >&2; exit 1; }
+    wait "$types"
+    [[ $(< "$base.types.out") == $'abla> defined\nabla> array<int>\nabla> float\nabla> void\nabla> abla> abla> ' ]] &&
+        grep -q '^:type needs an expression' "$base.types.err" && grep -q 'identifier:nope' "$base.types.err" &&
+        grep -q '^  --> entry:1:1$' "$base.types.err" && ! grep -q 'generic.cannot-infer' "$base.types.err" ||
+        { echo 'repl (types): :type did not name a type, or ran the expression' >&2; cat "$base.types.out" "$base.types.err" >&2; exit 1; }
 fi
 
 [[ $(< "$base.recovery.out") == $'abla> abla> 41\nabla> 42\nabla> ' ]] || exit 1
@@ -143,4 +151,4 @@ if script --version 2>/dev/null | grep util-linux >/dev/null; then
     editor=checked
 fi
 
-printf '%s\n' "persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines + commands + diagnostics placed in the entry + line editor ($editor); live: state across lines, a contained panic, a refused redefinition"
+printf '%s\n' "persistent REPL: retained definitions + recovery + reclaimed JIT generations + entries over several lines + commands + diagnostics placed in the entry + line editor ($editor); live: state across lines, a contained panic, a refused redefinition, :type"

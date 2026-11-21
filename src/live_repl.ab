@@ -128,6 +128,7 @@ fun bootstrapReplCommandName(line: string): string {
 val BOOTSTRAP_REPL_HELP = """
     Commands:
       :help    this list
+      :type e  the type of the expression e, which does not run
       :reset   forget every declaration and start again
       :quit    end the session (so does the end of the input)
     Any other entry is Abla. A declaration (fun, val, var, class, interface, resource class, import) is added, or
@@ -145,6 +146,27 @@ fun bootstrapReplOtherCommand(command: string): void {
     return
 }
 
+// The helpers of :type, in every session (abla/compiler cannot be imported once the program runs: its classes would be
+// new to the running code). The expression is the body of a lambda that is never called, so it does not run, and its
+// result type is the compiler's own; the names are shown as written in Abla.
+val BOOTSTRAP_REPL_TYPE_HELPERS = """
+    fun <T> __replTypeOf(make: () -> T): string = #compiler.typeName(T)
+
+    fun __replTypeText(name: string): string {
+        if (name == "i64") return "int"
+        if (name == "f64") return "float"
+        if (name.size > 6 && name.slice(0, 6) == "array:") return "array<" + __replTypeText(name.slice(6, name.size)) + ">"
+        return name
+    }
+
+    """
+
+// The command's argument: what follows its name ("" if nothing).
+fun bootstrapReplCommandArgument(line: string, command: string): string {
+    val text = line.trim()
+    text.slice(command.size, text.size).trim()
+}
+
 // The session's program: its imports, the REPL's helpers, the declarations, the current line, and main, which waits. The
 // frontend lowers only what is referenced: __replKeep names every variable of the session (and the current line's,
 // `currentVariable`), and main refers to it under a condition that never holds, so each stays a variable of the
@@ -155,14 +177,14 @@ fun bootstrapReplOtherCommand(command: string): void {
 fun bootstrapReplSource(declarations: array<BootstrapReplDeclaration>, current: string,
     currentVariable: string = "", entry: string = ""): string {
     var entryBegin = -1
-    var text = "import \"abla/io\"\nimport \"abla/float/text\"\nimport \"abla/sys/linux/process\"\n\n"
+    var text = "import \"abla/io\"\nimport \"abla/float/text\"\nimport \"abla/sys/linux/process\"\nimport \"abla/compiler\"\n\n"
     for (declaration in declarations) {
         if (declaration.line.startsWith("import ")) {
             if (declaration.line == entry) entryBegin = text.size
             text = "$text${declaration.line}\n"
         }
     }
-    text = "${text}\nvar __replQuit = 0\n\nfun __replPrint(text: string): int {\n    println(text)\n    return 0\n}\n\nfun <T> __replArray(items: array<T>): string = \"<array of size \${items.size}>\"\n\n"
+    text = "${text}\nvar __replQuit = 0\n\nfun __replPrint(text: string): int {\n    println(text)\n    return 0\n}\n\nfun <T> __replArray(items: array<T>): string = \"<array of size \${items.size}>\"\n\n$BOOTSTRAP_REPL_TYPE_HELPERS"
     for (declaration in declarations) {
         if (!declaration.line.startsWith("import ")) {
             if (declaration.line == entry) entryBegin = text.size
@@ -279,6 +301,27 @@ fun bootstrapReplStep(): void {
         bootstrapReplQuit = false
         bootstrapReplEnd()
         linuxPrintStandardOutput("reset\n")
+        return
+    }
+    if (command == ":type") {
+        val expression = bootstrapReplCommandArgument(line, command)
+        if (expression == "") {
+            linuxPrintStandardError(":type needs an expression (:type 1 + 2)\n")
+            return
+        }
+        bootstrapReplLines = bootstrapReplLines + 1
+        val number = bootstrapReplLines
+        val status = bootstrapReplReload(bootstrapReplDeclarations,
+            "val __repl_$number: int = __replPrint(__replTypeText(__replTypeOf({ $expression })))", true,
+            "__repl_$number", expression)
+        if (status == 2 && bootstrapReplMessage.startsWith("E_LIVE_COMPILE")) {
+            // Its own diagnostics (an unknown name, ...), not the helper's: the expression as the body of a function
+            // nothing calls, so it does not run either.
+            val checked = bootstrapReplReload(bootstrapReplDeclarations,
+                "fun __repl_check_$number(): int {\n    $expression\n    return 0\n}", false, "", expression)
+            if (checked == 0) linuxPrintStandardError(":type: the type of `$expression` could not be inferred\n")
+            else bootstrapReplReport(checked)
+        } else bootstrapReplReport(status)
         return
     }
     if (command != "") {
