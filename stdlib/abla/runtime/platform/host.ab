@@ -330,6 +330,30 @@ trusted fun __ablaRuntimeHostHeapRemapCopy(base: int, before: int, after: int): 
     moved
 }
 
+// A mapping resized to `after` bytes: MREMAP_MAYMOVE where there is mremap; macOS has none (a new mapping, the old bytes
+// copied, the old one unmapped). The new base, or a negative errno.
+trusted fun __ablaRuntimeHostHeapRemap(base: int, before: int, after: int): int =
+    if (ablaHostIsMacOS()) __ablaRuntimeHostHeapRemapCopy(base, before, after)
+    else ablaLinuxSyscall(25, base, before, after, 1, 0, 0)
+
+// The operating system's side of the frozen groups' reserved window (docs/design/frozen-heap.md), named here so that the
+// system calls of the heap and the collector are the functions above and these, and nowhere inline:
+//  - ReserveWindow: `span` bytes of address space, no access, not backed (MAP_NORESERVE), or a negative errno;
+//  - ReserveFixed: the range [address, address + length) made again that reserved, unbacked space (MAP_FIXED over it);
+//  - Protect: pages made read-write (writable) or read-only.
+trusted fun __ablaRuntimeHostHeapReserveWindow(span: int): int =
+    ablaLinuxSyscall(9, 0, span, 0, 16418, -1, 0)
+
+trusted fun __ablaRuntimeHostHeapReserveFixed(address: int, length: int): void {
+    ablaLinuxSyscall(9, address, length, 0, 16418 + 16, -1, 0)
+    return
+}
+
+trusted fun __ablaRuntimeHostHeapProtect(address: int, length: int, writable: bool): void {
+    ablaLinuxSyscall(10, address, length, if (writable) 3 else 1, 0, 0, 0)
+    return
+}
+
 // A cached mapping that holds `mapped` bytes (its base), or 0.
 // The smallest that fits is taken. The lock is held.
 trusted fun __ablaRuntimeHostHeapCacheTake(mapped: int): int {
@@ -884,10 +908,7 @@ trusted fun __ablaRuntimeHostHeapResize(address: int, size: int): int {
         if (size + 8 > __ablaRuntimeHostHeapSmallMaximum) {
             val mapped = (size + 16 + 4095) & -4096
             if (mapped == mappedBefore) return address
-            // MREMAP_MAYMOVE; macOS has no mremap: a new mapping, the old bytes copied, the old one unmapped.
-            val moved = if (ablaHostIsMacOS()) __ablaRuntimeHostHeapRemapCopy(address - 16,
-                mappedBefore, mapped)
-                else ablaLinuxSyscall(25, address - 16, mappedBefore, mapped, 1, 0, 0)
+            val moved = __ablaRuntimeHostHeapRemap(address - 16, mappedBefore, mapped)
             if (moved < 0) return 0
             ablaRuntimeStoreI64(moved + 8, mapped | 2)
             return moved + 16
@@ -4997,7 +5018,7 @@ trusted fun __ablaRuntimeHostFrozenReclaim(): void {
         if (length != 0) {
             if (ablaRuntimeLoadI64(group + 16) == 0) {
                 // Back to reserved, unbacked address space (a fixed anonymous no-access mapping over it).
-                ablaLinuxSyscall(9, ablaRuntimeLoadI64(group), length, 0, 16418 + 16, -1, 0)
+                __ablaRuntimeHostHeapReserveFixed(ablaRuntimeLoadI64(group), length)
                 var chunk = (ablaRuntimeLoadI64(group) - __ablaRuntimeHostFrozenBase) >>> 16
                 val chunkEnd = chunk + (length >>> 16)
                 while (chunk < chunkEnd) {
@@ -5318,7 +5339,7 @@ trusted fun __ablaRuntimeHostFreezeBody(value: any): any {
         var span = 1073741824
         var window = -1
         while (window < 0 && span >= 67108864) {
-            window = ablaLinuxSyscall(9, 0, span, 0, 16418, -1, 0)
+            window = __ablaRuntimeHostHeapReserveWindow(span)
             if (window < 0) span = span >> 1
         }
         if (window < 0) {
@@ -5417,7 +5438,7 @@ trusted fun __ablaRuntimeHostFreezeBody(value: any): any {
         }
     }
     if (ablaRuntimeLoadI64(context + 80) == 0 && count > 0) {
-        ablaLinuxSyscall(10, base, pages, 3, 0, 0, 0)
+        __ablaRuntimeHostHeapProtect(base, pages, true)
         ablaRuntimeStoreI64(context + 88, base)
         var block = 0
         while (block < count) {
@@ -5445,7 +5466,7 @@ trusted fun __ablaRuntimeHostFreezeBody(value: any): any {
             if ((flag & 15) != 2) __ablaRuntimeHostFreezeScan(old, place + 32, flag)
             block = block + 1
         }
-        ablaLinuxSyscall(10, base, pages, 1, 0, 0, 0)
+        __ablaRuntimeHostHeapProtect(base, pages, false)
         // The group's record.
         val group = __ablaRuntimeHostFrozenGroups() + record * 48
         val edgeCount = ablaRuntimeLoadI64(context + 72)
