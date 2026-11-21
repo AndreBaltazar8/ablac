@@ -2,6 +2,7 @@ import "xtensa_tools.ab"
 import "json_construction.ab"
 import "xtensa_assembly.ab"
 import "static_libc_symbols.ab"
+import "coff_import.ab"
 import "apple_build.ab"
 import "backend/llvm/backend.ab"
 import "backend/llvm/coverage.ab"
@@ -326,6 +327,54 @@ fun bootstrapRunLinker(command: LinuxCommand): int {
         }
     }
     command.run()
+}
+
+/** The Windows executable of a freestanding program (the x86_64-windows target): the program's object linked by lld-link with
+ *  the PE entry point the target names, against an import library for each DLL listed in runtime/windows/imports (written
+ *  here, beside the output, from the names in the list: src/coff_import.ab), /brepro so that the same inputs give the same bytes. */
+fun bootstrapLinkWindowsExecutable(target: BootstrapTargetDescriptor, objectPath: string, publishPath: string): int {
+    val architecture = bootstrapTripleArchitecture(target.llvmTriple)
+    val lists: array<string> = []
+    for (entry in Path(bootstrapRuntimeRoot()).child("windows").child("imports").entries()) {
+        val name = entry.name()
+        if (name.endsWith(".txt")) {
+            var position = lists.size
+            lists.append(name)
+            while (position > 0 && lists[position - 1] > name) {
+                lists[position] = lists[position - 1]
+                position = position - 1
+            }
+            lists[position] = name
+        }
+    }
+    val work = "$publishPath.imports"
+    Path(work).createDirectories()
+    val link = linuxCommand("lld-link")
+    link.argument("/nologo")
+    link.argument("/subsystem:console")
+    link.argument("/entry:${target.entrySymbol}")
+    link.argument("/nodefaultlib")
+    link.argument("/machine:${if (architecture == "aarch64") "arm64" else "x64"}")
+    link.argument("/brepro")
+    link.argument("/out:$publishPath")
+    link.argument(objectPath)
+    for (list in lists) {
+        val stem = list.slice(0, list.size - 4)
+        val names: array<string> = []
+        for (line in Path(Path(bootstrapRuntimeRoot()).child("windows").child("imports").child(list).text).readText().split("\n")) {
+            val trimmed = line.trim()
+            if (trimmed.size > 0 && !trimmed.startsWith("#")) names.append(trimmed)
+        }
+        val library = "$work/$stem.lib"
+        if (!Path(library).writeText(bootstrapCoffImportLibrary("$stem.dll", architecture, names))) {
+            linuxPrintStandardError("error[E_BUILD_IO]: cannot write the import library $library\n")
+            return 1
+        }
+        link.argument(library)
+    }
+    val status = bootstrapRunLinker(link)
+    Path(work).removeTree()
+    status
 }
 
 fun bootstrapRunHostLink(link: LinuxCommand, objectPath: string, outputPath: string): int {
@@ -796,6 +845,23 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
             true
         )
     }
+    if (name == "x86_64-windows") {
+        // A freestanding Windows program (W1a, docs/design/windows-target.md): no runtime and no C library, the PE entry point
+        // abla_start (the program's own function), linked by lld-link against import libraries the compiler writes from
+        // runtime/windows/imports/<dll>.txt (src/coff_import.ab). The hosted target, with the Abla runtime over kernel32 and the
+        // standard library, replaces this one when its runtime exists (W1c).
+        result = BootstrapTargetDescriptor(
+            name,
+            "x86_64-pc-windows-msvc",
+            "coff",
+            false,
+            true,
+            "abla_start",
+            "lld-link",
+            "x64",
+            true
+        )
+    }
     if (name == "x86_64-macos" || name == "arm64-macos") {
         result = BootstrapTargetDescriptor(
             name,
@@ -898,7 +964,7 @@ fun bootstrapDefinedTargetDescriptor(
 )
 
 fun bootstrapSupportedTargets(): string =
-    "x86_64-linux, aarch64-linux, x86_64-macos, arm64-macos"
+    "x86_64-linux, aarch64-linux, x86_64-macos, arm64-macos, x86_64-windows"
 
 class BootstrapNativeBuild(
     val status: int,
@@ -5361,6 +5427,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status == 0 && !rawTarget && artifact == "object") {
         status = bootstrapCopyNativeObject(objectPath, publishPath)
         if (status != 0) failureKind = "io"
+    }
+    if (status == 0 && target.linkerFlavor == "lld-link" && artifact == "executable") {
+        status = bootstrapLinkWindowsExecutable(target, objectPath, publishPath)
+        if (status != 0) failureKind = "reported"
     }
     if (status == 0 && !rawTarget && artifact == "static-library") {
         val archive = linuxCommand("llvm-ar")

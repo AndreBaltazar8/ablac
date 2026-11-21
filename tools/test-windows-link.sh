@@ -28,24 +28,36 @@ link() { lld-link /nologo /subsystem:console /entry:abla_start /nodefaultlib /ma
 link "$out/exit7.exe" 2> "$out/link.log" || { cat "$out/link.log" >&2; fail "lld-link failed"; }
 link "$out/exit7-again.exe" 2> "$out/link.log"
 cmp "$out/exit7.exe" "$out/exit7-again.exe" || fail "the executable is not reproducible (/brepro)"
-headers=$(llvm-readobj --file-headers "$out/exit7.exe")
-grep -q 'Format: COFF-x86-64' <<< "$headers" || fail "not a PE x86-64 image"
-grep -q 'Subsystem: IMAGE_SUBSYSTEM_WINDOWS_CUI' <<< "$headers" || fail "not a console image"
-entry=$(awk '/AddressOfEntryPoint/ { print $2 }' <<< "$headers")
-[[ -n $entry && $entry != 0x0 ]] || fail "no entry point"
-imports=$(llvm-readobj --coff-imports "$out/exit7.exe" | awk '/^ *Name:/ { dll = $2 } /^ *Symbol:/ { print dll, $2 }')
-grep -qiE 'msvcrt|ucrtbase|vcruntime|api-ms-win-crt' <<< "$imports" && fail "a C runtime import: $imports"
-allowed=$(grep -v '^#' tools/windows-imports-allowlist.txt | grep -v '^$' || true)
-while read -r dll function; do
-    [[ -z $dll ]] || grep -qxF "$dll $function" <<< "$allowed" || fail "import not in tools/windows-imports-allowlist.txt: $dll $function"
-done <<< "$imports"
-[[ -n $imports ]] || fail "the program imports nothing (ExitProcess expected)"
-if command -v wine > /dev/null; then
-    status=0
-    WINEDEBUG=-all wine "$out/exit7.exe" > /dev/null 2>&1 || status=$?
-    [[ $status == 7 ]] || fail "under Wine the program exited with $status, not 7"
-    ran='ran under Wine (exit 7)'
-else
-    ran='Wine not installed, not run'
-fi
-echo "windows-link: COFF object, import library from names, lld-link (reproducible), PE32+ console, imports within the allowlist and no C runtime; $ran"
+check_executable() { # $1 = the image, $2 = what it is
+    local headers imports allowed dll function entry status
+    headers=$(llvm-readobj --file-headers "$1")
+    grep -q 'Format: COFF-x86-64' <<< "$headers" || fail "$2: not a PE x86-64 image"
+    grep -q 'Subsystem: IMAGE_SUBSYSTEM_WINDOWS_CUI' <<< "$headers" || fail "$2: not a console image"
+    entry=$(awk '/AddressOfEntryPoint/ { print $2 }' <<< "$headers")
+    [[ -n $entry && $entry != 0x0 ]] || fail "$2: no entry point"
+    imports=$(llvm-readobj --coff-imports "$1" | awk '/^ *Name:/ { dll = $2 } /^ *Symbol:/ { print dll, $2 }')
+    ! grep -qiE 'msvcrt|ucrtbase|vcruntime|api-ms-win-crt' <<< "$imports" || fail "$2: a C runtime import: $imports"
+    [[ -n $imports ]] || fail "$2: the program imports nothing (ExitProcess expected)"
+    allowed=$(grep -v '^#' tools/windows-imports-allowlist.txt | grep -v '^$' || true)
+    while read -r dll function; do
+        [[ -z $dll ]] || grep -qxF "$dll $function" <<< "$allowed" || fail "$2: import not in tools/windows-imports-allowlist.txt: $dll $function"
+    done <<< "$imports"
+    if command -v wine > /dev/null; then
+        status=0
+        WINEDEBUG=-all wine "$1" > /dev/null 2>&1 || status=$?
+        [[ $status == 7 ]] || fail "$2: under Wine the program exited with $status, not 7"
+        ran='ran under Wine (exit 7)'
+    else
+        ran='Wine not installed, not run'
+    fi
+}
+ran=
+check_executable "$out/exit7.exe" "the hand-linked image"
+# The compiler's own target: --target x86_64-windows writes the import libraries from runtime/windows/imports and links.
+"$compiler" build tests/cases/windows/exit7.ab --target x86_64-windows -o "$out/product.exe" > "$out/product.log" 2>&1 ||
+    { cat "$out/product.log" >&2; fail "--target x86_64-windows did not build"; }
+"$compiler" build tests/cases/windows/exit7.ab --target x86_64-windows -o "$out/product-again.exe" > "$out/product.log" 2>&1
+cmp "$out/product.exe" "$out/product-again.exe" || fail "the compiler's Windows executable is not reproducible"
+[[ ! -e $out/product.exe.imports ]] || fail "the import libraries were left beside the output"
+check_executable "$out/product.exe" "the compiler's image"
+echo "windows-link: COFF object, import library from names, lld-link (reproducible), PE32+ console, imports within the allowlist and no C runtime, built by --target x86_64-windows too; $ran"
