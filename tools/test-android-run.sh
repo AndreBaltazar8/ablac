@@ -18,21 +18,27 @@ compiler=${1:-build/ablac}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 if [[ $(uname -s) != Linux ]]; then echo 'android run: Linux only'; exit 0; fi
-bionic=${ABLA_BIONIC_ROOT:-}
-if [[ -z $bionic || ! -x $bionic/system/bin/bootstrap/linker64 ]]; then
-    echo 'android run: no bionic sysroot (tools/prepare-bionic-sysroot.sh <dir>, then ABLA_BIONIC_ROOT=<dir>); skipped'
+missing() {
+    if [[ ${ABLA_REQUIRE_ANDROID_TESTS:-0} == 1 ]]; then
+        echo "android run: required dependency missing: $1" >&2
+        exit 1
+    fi
+    echo "android run: $1 missing; skipped"
     exit 0
-fi
-command -v qemu-aarch64 > /dev/null || { echo 'android run: no qemu-aarch64; skipped'; exit 0; }
+}
+bionic=${ABLA_BIONIC_ROOT:-}
+[[ -n $bionic && -x $bionic/system/bin/bootstrap/linker64 ]] ||
+    missing 'bionic sysroot (set ABLA_BIONIC_ROOT)'
+command -v qemu-aarch64 > /dev/null || missing qemu-aarch64
 clang=
 for r in "${ABLA_ANDROID_NDK:-}" "${ANDROID_NDK_ROOT:-}" "${ANDROID_NDK_HOME:-}" "${ANDROID_HOME:-}/ndk" \
     "${ANDROID_SDK_ROOT:-}/ndk" "${ANDROID_HOME:-}/ndk-bundle" "${ANDROID_SDK_ROOT:-}/ndk-bundle"; do
     if [[ -n $r && -d $r ]]; then
-        found=$(find -L "$r" -name aarch64-linux-android24-clang 2> /dev/null | sort -V | tail -n 1 || true)
-        [[ -z $found ]] || clang=$found
+        clang=$(find -L "$r" -name aarch64-linux-android24-clang 2> /dev/null | sort -V | tail -n 1 || true)
+        [[ -z $clang ]] || break
     fi
 done
-[[ -n $clang ]] || { echo 'android run: no Android NDK found (set ABLA_ANDROID_NDK); skipped'; exit 0; }
+[[ -n $clang ]] || missing 'Android NDK (set ABLA_ANDROID_NDK)'
 out=build/android-run
 rm -rf "$out"
 mkdir -p "$out"

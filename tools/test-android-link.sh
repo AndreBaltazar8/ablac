@@ -16,14 +16,21 @@ compiler=${1:-build/ablac}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 find_ndk_lib() { # a file name under the NDK roots
-    local r
+    local r found
     for r in "${ABLA_ANDROID_NDK:-}" "${ANDROID_NDK_ROOT:-}" "${ANDROID_NDK_HOME:-}" "${ANDROID_HOME:-}/ndk" \
         "${ANDROID_SDK_ROOT:-}/ndk" "${ANDROID_HOME:-}/ndk-bundle" "${ANDROID_SDK_ROOT:-}/ndk-bundle"; do
-        if [[ -n $r && -d $r ]]; then find -L "$r" -path "*/aarch64-linux-android/24/$1" 2>/dev/null; fi
-    done | sort -V | tail -n 1 || true
+        if [[ -n $r && -d $r ]]; then
+            found=$(find -L "$r" -path "*/aarch64-linux-android/24/$1" 2>/dev/null | sort -V | tail -n 1 || true)
+            if [[ -n $found ]]; then printf '%s\n' "$found"; return; fi
+        fi
+    done
 }
 libc=$(find_ndk_lib libc.so)
 if [[ -z $libc ]]; then
+    if [[ ${ABLA_REQUIRE_ANDROID_TESTS:-0} == 1 ]]; then
+        echo 'android link: required API 24 Android NDK sysroot missing' >&2
+        exit 1
+    fi
     echo 'android link: no Android NDK found (set ABLA_ANDROID_NDK); skipped'
     exit 0
 fi

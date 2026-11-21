@@ -5,16 +5,17 @@
 # partition's offset is fixed (the image is a GPT disk with one `super` partition whose first logical partition,
 # an ext4 system-as-root file system, starts 1 MiB in).
 set -euo pipefail
-dest=${1:?usage: prepare-bionic-sysroot.sh <directory>}
+dest=${1:?usage: prepare-bionic-sysroot.sh <directory> [system-image.zip]}
 url=https://dl.google.com/android/repository/sys-img/android/arm64-v8a-36_r02.zip
 sha1=62ad6714df790f89c8a8ad32552ffe20bb16fe87
 # partition 2 starts at sector 4096 of the disk, the ext4 file system 1 MiB into it
 offset=$((4096 * 512 + 1048576))
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-curl -sfL -o "$work/image.zip" "$url"
-[[ $(sha1sum "$work/image.zip" | cut -d' ' -f1) == "$sha1" ]] || { echo "prepare-bionic-sysroot: the download does not match its checksum" >&2; exit 1; }
-unzip -q -o "$work/image.zip" 'arm64-v8a/system.img' -d "$work"
+archive=${2:-$work/image.zip}
+if [[ $# -lt 2 ]]; then curl -sfL -o "$archive" "$url"; fi
+[[ $(sha1sum "$archive" | cut -d' ' -f1) == "$sha1" ]] || { echo "prepare-bionic-sysroot: the image does not match its checksum" >&2; exit 1; }
+unzip -q -o "$archive" 'arm64-v8a/system.img' -d "$work"
 mkdir -p "$dest/system/bin/bootstrap" "$dest/system/lib64/bootstrap"
 for file in bin/bootstrap/linker64 lib64/bootstrap/libc.so lib64/bootstrap/libm.so lib64/bootstrap/libdl.so \
     lib64/bootstrap/libdl_android.so lib64/liblog.so; do

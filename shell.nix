@@ -9,7 +9,8 @@
   # Build LLVM from nix/llvm.nix and its patches: ABLA_NIX_LLVM_SOURCE=1 or
   # --arg llvmFromSource true. A change to those patches does this by itself
   # until a new release is pinned, and is an error on CI.
-, llvmFromSource ? builtins.getEnv "ABLA_NIX_LLVM_SOURCE" == "1" }:
+, llvmFromSource ? builtins.getEnv "ABLA_NIX_LLVM_SOURCE" == "1"
+, androidTests ? builtins.getEnv "ABLA_NIX_ANDROID_TESTS" == "1" }:
 
 let
   toolchain = import ./nix/llvm.nix { inherit pkgs; };
@@ -24,6 +25,7 @@ let
   # The clang of a Wasm or ELF LTO build's pre-link step optimizes with the LLVM inside it: the patched one (the fdiv fix) with the prebuilt LLVM.
   clang = if xtensa && prebuiltUsable then llvm.clang.override { cc = prebuilt.clangUnwrapped; } else llvm.clang;
   xtensaCohort = import ./nix/xtensa-cohort.nix { inherit pkgs llvmTools; };
+  androidInputs = import ./nix/android-tests.nix { inherit pkgs; };
 in
 pkgs.mkShell {
   packages = with pkgs; [
@@ -65,6 +67,11 @@ pkgs.mkShell {
 
   shellHook = ''
     export ABLAC_DEV_SHELL=1
+    ${pkgs.lib.optionalString androidTests ''
+      export ABLA_ANDROID_NDK="${androidInputs}/ndk"
+      export ABLA_BIONIC_ROOT="${androidInputs}/bionic"
+      export ABLA_REQUIRE_ANDROID_TESTS=1
+    ''}
     # A host build's opt and llc (src/toolchain.ab), whatever else is first on PATH.
     export ABLA_LLVM_TOOLS="${llvmTools}/bin"
     ${pkgs.lib.optionalString xtensa ''

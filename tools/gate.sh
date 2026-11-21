@@ -20,6 +20,8 @@
 # --release is the release gate (a release's Prepare commit): stage 3 is built whole and compared as an executable too, the suite
 # is the full one (RUN_TESTS_FULL=1), and the reproducible-elsewhere check runs on the finished compiler (tools/gate-release.sh
 # calls it so). --dry-run prints what each chunk would run, writes nothing and runs nothing.
+# Linux x86_64 gates use CI's pinned Android NDK and bionic inputs for the suite.
+# Set ABLA_NIX_ANDROID_TESTS=0 to omit those inputs (about 1.47 GB of source downloads).
 set -u
 dry=0
 release=0
@@ -52,12 +54,23 @@ common=$(git -C "$tree" rev-parse --path-format=absolute --git-common-dir 2> /de
 slot=${FAIR_FLOCK:-$(dirname -- "$(dirname -- "$common")")/novakind/tools/fair-flock}
 [[ -x $slot || $dry == 1 ]] || { echo "gate: no fair-flock at $slot (set FAIR_FLOCK)" >&2; exit 2; }
 log=$tree/build/gate/gate.log
+android_tests=false
+if [[ $(uname -s)/$(uname -m) == Linux/x86_64 && ${ABLA_NIX_ANDROID_TESTS:-1} != 0 &&
+      -f $tree/nix/android-tests.nix ]]; then
+    android_tests=true
+fi
 if ((dry)); then
     log=/dev/null
 else
     mkdir -p "$tree/build/gate"
     [[ -e $tree/build/ablac ]] || ln -s ../tools/run-limited-compiler.sh "$tree/build/ablac"
     echo "queued $(date -u +%FT%TZ) slot $n cpus $cpus jobs $jobs" > "$log"
+    if [[ $android_tests == true ]]; then
+        # Realize the large inputs before taking a shared test/build slot.
+        echo "Preparing pinned Android test inputs" >> "$log"
+        nix-build --no-out-link "$tree/nix/android-tests.nix" >> "$log" 2>&1 ||
+            { echo "gate: Android test inputs failed (see $log)" >&2; echo "exit=1" >> "$log"; exit 1; }
+    fi
     # The seed: what the tree pins, checksum-verified; a seed left by an older pin is replaced.
     seed=$tree/build/gate/seed.bin
     if ! "$tree/tools/bootstrap-compiler.sh" "$seed" >> "$log" 2>&1; then
@@ -68,13 +81,19 @@ fi
 
 # One chunk inside both slots, in the worktree's shell.
 step() { # name commands
+    local android_args=()
+    if [[ $1 == suite && $android_tests == true ]]; then
+        android_args=(--arg androidTests true)
+    fi
     if ((dry)); then
-        printf '== %s (slot %s, cpus %s, jobs %s, fair-flock %s)\n%s\n' "$1" "$n" "$cpus" "$jobs" "$slot" "$2"
+        printf '== %s (slot %s, cpus %s, jobs %s, fair-flock %s)\n' "$1" "$n" "$cpus" "$jobs" "$slot"
+        [[ ${#android_args[@]} == 0 ]] || printf 'nix-shell --arg androidTests true\n'
+        printf '%s\n' "$2"
         return 0
     fi
     "$slot" --close /tmp/novakind-full-test.slot$n \
         "$slot" --close /tmp/novakind-build.slot$n \
-        nix-shell "$tree/shell.nix" --run "
+        nix-shell "$tree/shell.nix" "${android_args[@]}" --run "
         set -e
         echo \"granted \$(date -u +%FT%TZ): $1\"
         cd $tree
