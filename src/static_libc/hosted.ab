@@ -1,0 +1,108 @@
+// What the JIT'd hosted programs and compile-time C calls need from a C library, beyond what LLVM and libstdc++ do (#806 step C, step 8): the
+// hosted runtime Abla emits for `ablac run`, the REPL and the compile-time jit tier uses pthread keys, mutex and condition initialisation, itimers,
+// signal(), utimes, link; and a program's compile-time `extern:"c"` calls reach the ISO C functions they name (abs, labs, waitpid, mmap ...).
+// Every export here is abla_libc_NAME and the link binds NAME to it by --defsym (src/toolchain.ab, bootstrapStaticLibcAliases), because the
+// compiler's own module may declare the same C name as an import. A shared object of the program's own (nativeLibraries) cannot be loaded.
+import "abla/runtime/scalar"
+import "abla/sys/linux"
+import "./errno.ab"
+import "./fs.ab"
+
+// Mutexes and condition variables start zeroed (glibc's static initialiser): the attribute (recursive) is read when it is given.
+@export("abla_libc_pthread_mutex_init")
+trusted fun libcMutexInit(mutex: int, attributes: int): int {
+    var at = 0
+    while (at < 5) {
+        ablaRuntimeStoreI64(mutex + at * 8, 0)
+        at = at + 1
+    }
+    // The attribute's kind is its first int (PTHREAD_MUTEX_RECURSIVE is 1): copied to the mutex's kind word.
+    if (attributes != 0) ablaRuntimeStoreI32(mutex + 16, ablaRuntimeLoadI32(attributes))
+    0
+}
+
+@export("abla_libc_pthread_mutex_destroy")
+fun libcMutexDestroy(mutex: int): int = 0
+
+@export("abla_libc_pthread_cond_init")
+trusted fun libcCondInit(condition: int, attributes: int): int {
+    var at = 0
+    while (at < 6) {
+        ablaRuntimeStoreI64(condition + at * 8, 0)
+        at = at + 1
+    }
+    0
+}
+
+// Thread-specific data: 128 keys, a table of 256 thread slots (the thread id modulo 256, as errno does) made on first use.
+var libcKeyCount: int = 0
+var libcSpecificTable: int = 0
+
+trusted fun libcSpecificSlot(key: int): int {
+    if (libcSpecificTable == 0) libcSpecificTable = __ablaRuntimeHostHeapAllocate(256 * 128 * 8, true)
+    libcSpecificTable + ((linuxSyscall0(186) & 255) * 128 + key) * 8
+}
+
+@export("abla_libc_pthread_key_create")
+trusted fun libcKeyCreate(key: int, destructor: int): int {
+    if (libcKeyCount >= 128) return 11
+    ablaRuntimeStoreI32(key, libcKeyCount)
+    libcKeyCount = libcKeyCount + 1
+    0
+}
+
+@export("abla_libc_pthread_setspecific")
+trusted fun libcSetspecific(key: int, value: int): int {
+    ablaRuntimeStoreI64(libcSpecificSlot(key & 127), value)
+    0
+}
+
+@export("abla_libc_pthread_getspecific")
+trusted fun libcGetspecific(key: int): int = ablaRuntimeLoadI64(libcSpecificSlot(key & 127))
+
+@export("abla_libc_setitimer")
+trusted fun libcSetitimer(which: int, value: int, previous: int): int = libcResult(linuxSyscall3(38, libcInt(which), value, previous))
+
+// signal(): the handler is installed through no sigaction (the compiler keeps its own stack guard): the previous disposition reads as default.
+@export("abla_libc_signal")
+fun libcSignal(signal: int, handler: int): int = 0
+
+@export("abla_libc_utimes")
+trusted fun libcUtimes(path: int, times: int): int = libcResult(linuxSyscall2(235, path, times))
+
+@export("abla_libc_link")
+trusted fun libcLink(from: int, to: int): int = libcResult(linuxSyscall2(86, from, to))
+
+@export("abla_libc_waitpid")
+trusted fun libcWaitpid(process: int, status: int, options: int): int =
+    libcResult(linuxSyscall4(61, libcInt(process), status, libcInt(options), 0))
+
+// The integer helpers of <stdlib.h>.
+@export("abla_libc_abs")
+fun libcAbs(value: int): int {
+    val x = libcInt(value)
+    if (x < 0) 0 - x else x
+}
+
+@export("abla_libc_labs")
+fun libcLabs(value: int): int = if (value < 0) 0 - value else value
+
+@export("abla_libc_llabs")
+fun libcLlabs(value: int): int = if (value < 0) 0 - value else value
+
+@export("abla_libc_atoi")
+trusted fun libcAtoi(text: int): int {
+    var at = 0
+    while (ablaRuntimeLoadU8(text + at) == 32 || (ablaRuntimeLoadU8(text + at) >= 9 && ablaRuntimeLoadU8(text + at) <= 13)) at = at + 1
+    var negative = false
+    if (ablaRuntimeLoadU8(text + at) == 45 || ablaRuntimeLoadU8(text + at) == 43) {
+        negative = ablaRuntimeLoadU8(text + at) == 45
+        at = at + 1
+    }
+    var value = 0
+    while (ablaRuntimeLoadU8(text + at) >= 48 && ablaRuntimeLoadU8(text + at) <= 57) {
+        value = value * 10 + ablaRuntimeLoadU8(text + at) - 48
+        at = at + 1
+    }
+    if (negative) 0 - value else value
+}

@@ -82,4 +82,14 @@ cmp -s "$out/math-fold.static" "$out/math-fold.dynamic" || { echo 'static compil
 for symbol in $(cat tools/compiler-libc-needs.txt); do
     grep -q "\"$symbol\"" src/static_libc_symbols.ab || { echo "static compiler: $symbol is not in src/static_libc_symbols.ab" >&2; exit 1; }
 done
+# Every other symbol the image exports for JIT'd code is in it too: the library's own exports and the compiler's bridge (the dynamic compiler
+# exposes all of them through --export-dynamic; a JIT'd program that needs one the table lacks fails with "Symbols not found").
+for symbol in $(grep -ho '@export("[^"]*")' src/static_libc/*.ab src/ct_*.ab | sed 's/@export("//; s/")//' | grep -Ev '^(abla_libc_|_Unwind_|a$)' | LC_ALL=C sort -u); do
+    grep -q "\"$symbol\"" src/static_libc_symbols.ab || { echo "static compiler: exported $symbol is not in src/static_libc_symbols.ab" >&2; exit 1; }
+done
+# The aliased exports (abla_libc_NAME of src/static_libc/hosted.ab) are bound to NAME by the link and listed in the table.
+for symbol in $(grep -ho '@export("abla_libc_[^"]*")' src/static_libc/hosted.ab | sed 's/@export("abla_libc_//; s/")//' | LC_ALL=C sort -u); do
+    [[ $(grep -c "\"$symbol\"" src/static_libc_symbols.ab) -ge 2 ]] ||
+        { echo "static compiler: $symbol must be in the table and in bootstrapStaticLibcAliases (src/static_libc_symbols.ab)" >&2; exit 1; }
+done
 echo "static compiler: static-pie, no needed library, $count programs byte-identical to the ordinary compiler's, ablac run and the three compile-time tiers work"
