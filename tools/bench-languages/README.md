@@ -98,3 +98,30 @@ The first completed local baseline is archived in
 [the c2e0a4b2 report](../../docs/measurements/languages-c2e0a4b2.md), with all raw
 samples and provenance. It predates batch EF and v0.2.65; its locally rebuilt
 compiler reporting 0.2.64 is identified by source commit and binary hash.
+
+## Additional measurements
+
+Select `--programs string-build` to measure building one 3,200,000-byte string
+from 200,000 alternating 16-byte lines (101 lines in smoke runs). Each program
+grows its output incrementally and writes the finished bytes, which the runner
+compares in full. Abla uses string concatenation. C, Rust, Go and Zig use growing
+buffers. This measures the language-level construction strategies and is outside
+the historical six-task geometric mean. The default ten-workload selection
+remains comparable to the c2e0a4b2 baseline. Regex-heavy coverage is already in
+the default selection as regex-redux.
+
+Compare matched Linux x86-64 static and dynamic compiler artifacts like this:
+
+```sh
+tools/bench-languages/compiler-hello build/compiler-hello /path/to/static/ablac /path/to/dynamic/ablac
+```
+
+Use both artifacts from the same release or source build. The dynamic compiler's
+loader and libraries must already be available. The runner verifies linkage,
+records compiler hashes and uses this checkout as the common sysroot. It warms
+each compiler once, then records 12 counterbalanced pairs of fresh, no-cache
+release builds of the same hello program on one pinned CPU. It verifies the
+result of every build outside the timed interval. Wall time covers process
+launch, compilation and linking with warm OS caches. The compiler comparison
+includes any linker difference between artifacts. The JSON summary reports a
+static/dynamic ratio of median wall times, with raw samples beside it.

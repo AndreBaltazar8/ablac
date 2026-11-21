@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Compare matched static and dynamic compiler artifacts with the same sysroot.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+if [[ ${1:-} == --help || $# != 3 ]]; then
+    echo 'Usage: compiler-hello OUTPUT_DIRECTORY STATIC_COMPILER DYNAMIC_COMPILER'
+    [[ ${1:-} == --help ]]
+    exit
+fi
+if [[ ${BENCH_NIX_PIN:-} != 6510408d147d8c5e6d76043e899e9251756f6a75 ]]; then
+    printf -v invocation '%q ' "$root/tools/bench-languages/compiler-hello" "$@"
+    exec nix-shell "$root/tools/bench-languages/shell.nix" --run "$invocation"
+fi
+output=$(realpath -m "$1")
+static=$(realpath "$2")
+dynamic=$(realpath "$3")
+bench_slot_number=${BENCH_SLOT:-4}
+cpu=${BENCH_CPU:-24}
+common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)
+fair=${FAIR_FLOCK:-$(dirname -- "$(dirname -- "$common")")/novakind/tools/fair-flock}
+[[ -x $static && -x $dynamic && -x $fair && $bench_slot_number =~ ^[2-4]$ && $cpu =~ ^[0-9]+$ ]]
+mkdir -- "$output"
+readelf -lW "$static" > "$output/static-segments.txt"
+readelf -dW "$static" > "$output/static-dependencies.txt"
+readelf -lW "$dynamic" > "$output/dynamic-segments.txt"
+readelf -dW "$dynamic" > "$output/dynamic-dependencies.txt"
+if grep -qw INTERP "$output/static-segments.txt" || grep -qw NEEDED "$output/static-dependencies.txt"; then
+    echo 'Static compiler has an ELF interpreter or shared dependencies' >&2
+    exit 1
+fi
+grep -qw INTERP "$output/dynamic-segments.txt"
+grep -qw NEEDED "$output/dynamic-dependencies.txt"
+# Record the caller-supplied pair, and catch a mismatched version. One version
+# may span distinct source commits, so the caller must match artifact lineage.
+version=$("$static" --version)
+[[ $version == "$("$dynamic" --version)" ]]
+sha256sum -- "$static" "$dynamic" > "$output/compilers.sha256"
+export LC_ALL=C ABLA_SYSROOT=$root ABLA_NATIVE_JOBS=2 ABLA_CODEGEN_JOBS=2
+unset ABLA_TEST_COMPILER ABLA_COMPILE_EVAL ABLA_COMPILER_PAYLOAD ABLA_COMPILER_BITCODE ABLA_COMPILER_BITCODE_ONLY
+export root output static dynamic cpu
+measure_pair() {
+    local source=$root/tests/benchmarks/languages/abla/hello.ab
+    local helper=$output/measure round variant compiler target stem load
+    "$static" build "$root/tools/bench-languages/measure.ab" --no-cache -o "$helper" > "$output/helper.log" 2>&1
+    for round in warmup {0..11}; do
+        local variants=(static dynamic)
+        if [[ $round != warmup ]] && ((round % 2)); then variants=(dynamic static); fi
+        for variant in "${variants[@]}"; do
+            if [[ $variant == static ]]; then compiler=$static; else compiler=$dynamic; fi
+            stem=$output/$variant-$round
+            target=$stem.bin
+            load=$(cat /proc/loadavg)
+            "$helper" 1 "$stem.stdout" "$stem.stderr" "$compiler" build "$source" -o "$target" --no-cache > "$stem.ns"
+            "$target" > "$stem.hello"
+            printf 'hello\n' | cmp - "$stem.hello"
+            if [[ $round != warmup ]]; then
+                jq -nc --arg variant "$variant" --argjson round "$round" --arg load "$load" --argjson ns "$(cat "$stem.ns")" \
+                    '{variant:$variant,round:$round,load:$load,wallSeconds:($ns/1e9)}' >> "$output/samples.jsonl"
+            fi
+        done
+    done
+}
+export -f measure_pair
+"$fair" --max-hold 600 --close "/tmp/novakind-build.slot$bench_slot_number" taskset -c "$cpu" bash -euo pipefail -c measure_pair
+jq -s --arg version "$version" --arg cpu "$cpu" --arg pin "$BENCH_NIX_PIN" \
+    --arg source "$(git -C "$root" rev-parse HEAD)" \
+    'def stats: sort | {median: ((.[5]+.[6])/2), min: .[0], max: .[-1]};
+     . as $samples |
+     (group_by(.variant) | map({key: .[0].variant, value: (map(.wallSeconds)|stats)}) | from_entries) as $summary |
+     {version:$version,cpu:($cpu|tonumber),nixpkgsCommit:$pin,sysrootCommit:$source,
+      samples:$samples,wallSeconds:$summary,staticToDynamic:($summary.static.median/$summary.dynamic.median)}' \
+    "$output/samples.jsonl" > "$output/results.json"
+jq '{wallSeconds,staticToDynamic}' "$output/results.json"
