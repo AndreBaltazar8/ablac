@@ -277,6 +277,42 @@ fun bootstrapBuiltinLinkArguments(arguments: array<string>, outputPath: string):
 // with the object and output as placeholders. A link the kept command fails, or a command
 // clang doesn't print as one `ld.lld` run, goes through clang as before (and, failing,
 // shows clang's errors). ABLA_LINK_DIRECT=0 always links through clang.
+// The linker in the compiler's own process (#92): the statically linked compiler (src/orc_main_static.ab) carries lld (runtime/abla_lld_shim.cpp) and
+// installs it here (src/static_lld.ab), so its links start no ld.lld or wasm-ld. The function takes the command line, one argument per line (the program
+// name first), and the file for the diagnostics ("" for standard error), and returns the exit code, or -1 when lld cannot run in this process (the
+// build has no lld in it, or a link that exits early) and the external linker runs. ABLA_LINK_INPROCESS=0 always runs the external one.
+fun bootstrapNoInProcessLinker(arguments: string, errors: string): int = -1
+var bootstrapInProcessLinker: (string, string) -> int = bootstrapNoInProcessLinker
+var bootstrapInProcessLinkerInstalled: bool = false
+
+fun bootstrapLinkerProgram(command: LinuxCommand): string {
+    if (command.arguments.size == 0) return ""
+    val program = command.arguments[0]
+    if (program == "ld.lld" || program.endsWith("/ld.lld")) "ld.lld"
+    else if (program == "wasm-ld" || program.endsWith("/wasm-ld")) "wasm-ld"
+    else ""
+}
+
+/** Runs a linker command (`ld.lld` or `wasm-ld`): in this process when the compiler carries lld, else as a process. */
+fun bootstrapRunLinker(command: LinuxCommand): int {
+    val program = bootstrapLinkerProgram(command)
+    if (program != "" && bootstrapInProcessLinkerInstalled && command.workingDirectory == "" && command.inputPath == "" &&
+        command.outputPath == "" && command.overrides.size == 0 && command.removed.size == 0) {
+        val configured = linuxEnvironment("ABLA_LINK_INPROCESS")
+        if (!(configured.found && configured.value == "0")) {
+            var text = program
+            var index = 1
+            while (index < command.arguments.size) {
+                text = "$text\n${command.arguments[index]}"
+                index = index + 1
+            }
+            val status = bootstrapInProcessLinker(text, command.errorPath)
+            if (status >= 0) return status
+        }
+    }
+    command.run()
+}
+
 fun bootstrapRunHostLink(link: LinuxCommand, objectPath: string, outputPath: string): int {
     val configured = linuxEnvironment("ABLA_LINK_DIRECT")
     if (configured.found && configured.value == "0") return link.run()
@@ -289,7 +325,7 @@ fun bootstrapRunHostLink(link: LinuxCommand, objectPath: string, outputPath: str
             for (argument in builtin) own.argument(argument)
             val builtinErrors = "$outputPath.link-errors"
             own.errors(builtinErrors)
-            val builtinStatus = own.run()
+            val builtinStatus = bootstrapRunLinker(own)
             Path(builtinErrors).remove()
             if (builtinStatus == 0) return 0
         }
@@ -311,7 +347,7 @@ fun bootstrapRunHostLink(link: LinuxCommand, objectPath: string, outputPath: str
         }
         val errors = "$outputPath.link-errors"
         direct.errors(errors)
-        val status = direct.run()
+        val status = bootstrapRunLinker(direct)
         Path(errors).remove()
         if (status == 0) return 0
         probe.remove()
@@ -409,6 +445,7 @@ fun bootstrapStaticLibcData(): string =
     ".text\n" +
     bootstrapStaticLibcJump("sigaction") + bootstrapStaticLibcJump("sigaltstack") + bootstrapStaticLibcJump("fork") +
     bootstrapStaticLibcJump("dlopen") + bootstrapStaticLibcJump("dlsym") +
+    ".globl __longjmp_chk\n.type __longjmp_chk,@function\n__longjmp_chk:\n\tjmp _longjmp\n.size __longjmp_chk, .-__longjmp_chk\n" +
     // The variadic printf entry points build the System V va_list (the register save area, then the stack arguments) and call the Abla
     // formatter (src/static_libc/format.ab). `named` is the number of fixed integer arguments; the rest are read from the va_list.
     bootstrapStaticLibcVariadic("snprintf", 24, "") +
@@ -437,6 +474,7 @@ fun bootstrapStaticLibcDataAarch64(): string =
     ".text\n.p2align 2\n" +
     bootstrapStaticLibcJumpAarch64("sigaction") + bootstrapStaticLibcJumpAarch64("sigaltstack") + bootstrapStaticLibcJumpAarch64("fork") +
     bootstrapStaticLibcJumpAarch64("dlopen") + bootstrapStaticLibcJumpAarch64("dlsym") +
+    ".globl __longjmp_chk\n.type __longjmp_chk,%function\n__longjmp_chk:\n\tb _longjmp\n.size __longjmp_chk, .-__longjmp_chk\n" +
     // libgcc's outline atomics and libstdc++ ask the C library's hidden alias of getauxval.
     ".globl __getauxval\n.type __getauxval,%function\n__getauxval:\n\tb getauxval\n.size __getauxval, .-__getauxval\n" +
     bootstrapStaticLibcVariadicAarch64("snprintf", 3, "") +
@@ -2930,7 +2968,7 @@ fun bootstrapEmitReleaseParts(optimizedPath: string, parts: int, objectPath: str
         join.argument("-o")
         join.argument(objectPath)
         for (unit in 0 .. parts) join.argument("$objectPath.$unit")
-        status = join.run()
+        status = bootstrapRunLinker(join)
     }
     for (unit in 0 .. parts) {
         Path("$optimizedPath.$unit").remove()
@@ -3576,7 +3614,7 @@ fun bootstrapEmitPartitionedObject(
             }
             combine.argument("-o")
             combine.argument(outputPath)
-            status = combine.run()
+            status = bootstrapRunLinker(combine)
         }
     }
     Path(preparedPath).remove()
@@ -5104,13 +5142,23 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 // object, in one group so they may refer to one another; the data symbols a C library defines (environ, stdin ...) come
                 // from a generated assembly file.
                 val dataPath = "$publishPath.libc-data.s"
-                Path(dataPath).writeText(if (aarch64Linux) bootstrapStaticLibcDataAarch64() else bootstrapStaticLibcData())
+                // lld in the process (#92): the shim's object and lld's archives (ABLA_STATIC_LLD_OBJECT, ABLA_STATIC_LLD_LIB), or, with no
+                // shim, a stub abla_lld_main that returns -1 (the compiler then runs the external linker).
+                val lldObject = linuxEnvironment("ABLA_STATIC_LLD_OBJECT").value
+                val lldStub = if (lldObject != "") "" else if (aarch64Linux) ".text\n.globl abla_lld_main\n.type abla_lld_main,%function\nabla_lld_main:\nmov x0, #-1\nret\n"
+                    else ".text\n.globl abla_lld_main\n.type abla_lld_main,@function\nabla_lld_main:\nxorq %rax, %rax\ndecq %rax\nret\n"
+                Path(dataPath).writeText((if (aarch64Linux) bootstrapStaticLibcDataAarch64() else bootstrapStaticLibcData()) + lldStub)
+                if (lldObject != "") link.argument(lldObject)
                 link.argument(dataPath)
                 link.argument("-Wl,--start-group")
                 for (entry in Path(staticLlvmLibrary).entries()) {
                     val archive = entry.name()
                     if (archive.size > 8 && archive.slice(0, 7) == "libLLVM" && archive.slice(archive.size - 2, archive.size) == ".a" &&
                         !bootstrapStaticLlvmOtherTarget(archive)) link.argument(entry.text)
+                }
+                val lldLibrary = linuxEnvironment("ABLA_STATIC_LLD_LIB").value
+                if (lldObject != "" && lldLibrary != "") {
+                    for (archive in ["liblldELF.a", "liblldWasm.a", "liblldCommon.a"]) link.argument("$lldLibrary/$archive")
                 }
                 link.argument("-Wl,--end-group")
                 if (aarch64Linux) {
@@ -5354,7 +5402,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
         linkShared.argument("-o")
         linkShared.argument(publishPath)
-        status = linkShared.run()
+        status = bootstrapRunLinker(linkShared)
     }
     if (status == 0 && !target.hosted && !rawTarget &&
         artifact == "shared-library") {
@@ -5378,7 +5426,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
         linkShared.argument("-o")
         linkShared.argument(publishPath)
-        status = linkShared.run()
+        status = bootstrapRunLinker(linkShared)
     }
     if (status == 0 && target.objectFormat == "wasm" &&
         artifact == "module") {
@@ -5428,7 +5476,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 else withoutPanicWrite)
             linkModule.argument("-o")
             linkModule.argument(publishPath)
-            status = linkModule.run()
+            status = bootstrapRunLinker(linkModule)
             if (status == 0 && !panicWriteLinked &&
                 bootstrapWasmImportsHostWrite(publishPath)) {
                 panicWriteLinked = true

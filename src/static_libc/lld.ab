@@ -1,0 +1,113 @@
+// What lld, linked into the statically linked compiler (#92, runtime/abla_lld_shim.cpp), and the libstdc++ it brings (std::random_device, std::thread,
+// thread_local destructors) call that the compiler's LLVM alone did not: files (rename, ftruncate, dup), time (nanosleep), process (_Exit), the CPU set
+// (sched_getaffinity, get_nprocs), thread attributes and names (accepted and ignored: the threads are the runtime's clone threads).
+import "abla/runtime/scalar"
+import "abla/sys/linux"
+import "abla/unsafe/native"
+import "abla/sys/linux/process"
+import "./errno.ab"
+import "./fs.ab"
+
+@export("rename")
+trusted fun libcRename(from: int, to: int): int = libcResult(linuxSyscall2(82, from, to))
+
+@export("ftruncate")
+trusted fun libcFtruncate(descriptor: int, length: int): int = libcResult(linuxSyscall2(77, libcInt(descriptor), length))
+
+@export("dup")
+trusted fun libcDup(descriptor: int): int = libcResult(linuxSyscall1(32, libcInt(descriptor)))
+
+@export("nanosleep")
+trusted fun libcNanosleep(request: int, remaining: int): int = libcResult(linuxSyscall2(35, request, remaining))
+
+@export("_Exit")
+trusted fun libcUnderscoreExitIso(status: int): void {
+    linuxSyscall1(231, libcInt(status))
+    return
+}
+
+// glibc's getentropy: up to 256 bytes from the kernel's random source.
+@export("getentropy")
+trusted fun libcGetentropy(buffer: int, length: int): int {
+    if (length > 256) {
+        libcSetErrno(5)
+        return -1
+    }
+    var done = 0
+    while (done < length) {
+        val got = linuxSyscall3(318, buffer + done, length - done, 0)
+        if (got <= 0) {
+            libcSetErrno(5)
+            return -1
+        }
+        done += got
+    }
+    0
+}
+
+// The kernel's answer is the number of bytes of the mask it wrote; C's is 0.
+@export("sched_getaffinity")
+trusted fun libcSchedGetaffinity(process: int, size: int, mask: int): int {
+    val bytes = linuxSyscall3(204, libcInt(process), size, mask)
+    if (bytes < 0) return libcResult(bytes)
+    0
+}
+
+// CPU_COUNT: the set bits of a mask of `size` bytes.
+@export("__sched_cpucount")
+trusted fun libcSchedCpucount(size: int, mask: int): int {
+    var count = 0
+    var at = 0
+    while (at < size) {
+        var bits = ablaRuntimeLoadU8(mask + at)
+        while (bits != 0) {
+            count += bits & 1
+            bits = bits >> 1
+        }
+        at += 1
+    }
+    count
+}
+
+// The processors this process may run on (at least 1).
+@export("get_nprocs")
+trusted fun libcGetNprocs(): int {
+    val mask = __ablaRuntimeHostHeapAllocate(128, true)
+    val bytes = linuxSyscall3(204, 0, 128, mask)
+    val count = if (bytes > 0) libcSchedCpucount(bytes, mask) else 1
+    __ablaRuntimeHostHeapFree(mask)
+    if (count < 1) 1 else count
+}
+
+// A thread_local object's destructor, to run when the thread exits: the compiler's threads do not run them (nothing in the libraries depends on it); success.
+@export("__cxa_thread_atexit_impl")
+trusted fun libcCxaThreadAtexitImpl(destructor: int, object: int, dso: int): int = 0
+
+// Thread attributes are 64 bytes of zeros the caller owns; the stack size (word 0) is read by nothing (the threads are the runtime's).
+@export("pthread_attr_init")
+trusted fun libcPthreadAttrInit(attributes: int): int {
+    var at = 0
+    while (at < 8) {
+        ablaRuntimeStoreI64(attributes + at * 8, 0)
+        at += 1
+    }
+    0
+}
+
+@export("pthread_attr_destroy")
+fun libcPthreadAttrDestroy(attributes: int): int = 0
+
+@export("pthread_attr_setstacksize")
+trusted fun libcPthreadAttrSetstacksize(attributes: int, size: int): int {
+    ablaRuntimeStoreI64(attributes, size)
+    0
+}
+
+@export("pthread_getname_np")
+trusted fun libcPthreadGetnameNp(handle: int, name: int, length: int): int {
+    if (length > 0) ablaRuntimeStoreU8(name, 0)
+    0
+}
+
+@export("pthread_setname_np")
+fun libcPthreadSetnameNp(handle: int, name: int): int = 0
