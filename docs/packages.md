@@ -48,6 +48,14 @@ expression), and `compiler` (a maintainer-declared range such as
 as not declared. The command works outside an Abla project and needs Git and
 network access. It leaves project files and the package cache untouched.
 
+To check a project’s locked dependencies, run `ablac package outdated
+[--project <dir>]`. For Git packages, it shows the locked tag or commit and
+newer tags on descendant commits, in Git version order. When the locked
+commit has a tag, it reports tags that sort above it. Each compiler range
+comes from the manifest at that tag. Non-Git providers are skipped. The
+command reads `abla.lock` and uses temporary Git repositories. It does not
+edit the lock or install packages.
+
 ## The source protocol
 
 The provider-facing structures are:

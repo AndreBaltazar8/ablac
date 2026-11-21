@@ -1,0 +1,114 @@
+import "package.ab"
+import "package_info.ab"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/text"
+
+private class BootstrapOutdatedResult(val newer: bool, val diagnostic: string = "")
+private class BootstrapOutdatedTag(val name: string, val revision: string)
+
+private fun bootstrapOutdatedFetchRevision(repoDir: string, revision: string): bool {
+    val fetch = bootstrapPackageLookupGit(repoDir)
+    fetch.argument("fetch")
+    fetch.argument("--quiet")
+    fetch.argument("--no-tags")
+    fetch.argument("origin")
+    fetch.argument(revision)
+    fetch.run() == 0
+}
+
+private fun bootstrapOutdatedRead(
+    package: BootstrapLockedPackage, projectRoot: string, directory: string
+): BootstrapOutdatedResult {
+    val repoDir = "$directory/package.git"
+    if (!bootstrapPackageLookupClone(projectRoot, package.source, repoDir, true)) {
+        return BootstrapOutdatedResult(false, "could not read the Git repository")
+    }
+    var locked = bootstrapPackageLookupRevision(repoDir, package.revision)
+    // A force push may have removed the lock revision from advertised refs.
+    if (locked == "" && bootstrapOutdatedFetchRevision(repoDir, package.revision)) {
+        locked = bootstrapPackageLookupRevision(repoDir, package.revision)
+    }
+    if (locked == "") return BootstrapOutdatedResult(false, "locked revision is unavailable upstream")
+
+    val tags = bootstrapPackageLookupGit(repoDir)
+    tags.argument("-c")
+    tags.argument("versionsort.suffix=-")
+    tags.argument("for-each-ref")
+    tags.argument("--contains=$locked")
+    tags.argument("--sort=-version:refname")
+    tags.argument("--format=%(refname)")
+    tags.argument("refs/tags/")
+    val refs = bootstrapPackageLookupOutput(tags, Path(directory).child("tags"), 1048576)
+    if (refs.status == -1) return BootstrapOutdatedResult(false, "Git tag listing exceeds 1 MiB")
+    if (refs.status != 0) return BootstrapOutdatedResult(false, "could not compare Git tags")
+
+    var current = locked
+    val newer: array<BootstrapOutdatedTag> = []
+    for (ref in refs.output.split("\n")) {
+        if (!ref.startsWith("refs/tags/")) continue
+        val tag = bootstrapPackageInfoDisplay(ref.slice(10, ref.size), "")
+        if (tag == "") continue
+        val revision = bootstrapPackageLookupRevision(repoDir, ref)
+        if (revision == "") {
+            return BootstrapOutdatedResult(false, "could not read Git tag $tag")
+        }
+        if (revision == locked) {
+            current = tag
+            // The tags are ordered newest first. An older release number
+            // does not represent an upgrade even if its commit is a descendant.
+            break
+        }
+        newer.append(BootstrapOutdatedTag(tag, revision))
+    }
+    if (newer.size == 0) return BootstrapOutdatedResult(false)
+    linuxPrintStandardOutput("${package.name}: $current -> ${newer[0].name}\n")
+    for (tag in newer) {
+        val manifest = bootstrapPackageLookupManifest(repoDir, tag.revision)
+        var compiler = "(manifest unavailable)"
+        if (manifest.status == 0) {
+            compiler = bootstrapPackageInfoDisplay(
+                bootstrapPackageInfoField(manifest.output, "compiler"), "(not declared)"
+            )
+        }
+        linuxPrintStandardOutput("  ${tag.name}  compiler: $compiler\n")
+    }
+    BootstrapOutdatedResult(true)
+}
+
+fun bootstrapPackageOutdated(projectRoot: string): int {
+    val lockPath = Path(projectRoot).child("abla.lock").text
+    val lock = bootstrapPackageReadLock(lockPath)
+    if (!lock.valid) {
+        linuxPrintStandardError(lock.diagnostic)
+        return 1
+    }
+    var newer = false
+    var status = 0
+    for (package in lock.packages) {
+        if (package.provider != "git") {
+            linuxPrintStandardError("${package.name}: skipping non-Git provider\n")
+            continue
+        }
+        if (!bootstrapPackageHexRevision(package.revision)) {
+            linuxPrintStandardError("error[E_PACKAGE_OUTDATED]: ${package.name}: invalid Git lock revision\n")
+            status = 1
+            continue
+        }
+        val directory = bootstrapPackageLookupTemporary()
+        if (directory == "") {
+            linuxPrintStandardError("error[E_PACKAGE_OUTDATED]: cannot create a temporary directory\n")
+            return 1
+        }
+        val compared = bootstrapOutdatedRead(package, projectRoot, directory)
+        bootstrapPackageRemoveTree(directory)
+        if (compared.newer) newer = true
+        if (compared.diagnostic != "") {
+            linuxPrintStandardError("error[E_PACKAGE_OUTDATED]: ${package.name}: ${compared.diagnostic}\n")
+            status = 1
+        }
+    }
+    if (status == 0 && !newer) linuxPrintStandardOutput("No newer Git tags found.\n")
+    status
+}

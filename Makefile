@@ -596,6 +596,7 @@ test-serial: ablac
 	tools/test-package-subpaths.sh $(COMPILER)
 	tools/test-package-install.sh $(COMPILER)
 	tools/test-package-info.sh $(COMPILER)
+	tools/test-package-outdated.sh $(COMPILER)
 	tools/test-package-search.sh $(COMPILER)
 	tools/test-import-source-sites.sh $(COMPILER)
 	tools/test-process-metrics.sh $(COMPILER)

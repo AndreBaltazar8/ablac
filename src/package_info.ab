@@ -27,7 +27,7 @@ private fun bootstrapPackageInfoString(line: string, key: string): string {
     decoded.value.asString()
 }
 
-private fun bootstrapPackageInfoField(manifest: string, key: string): string {
+fun bootstrapPackageInfoField(manifest: string, key: string): string {
     for (line in manifest.split("\n")) {
         val trimmed = bootstrapPackageTrim(line)
         if (trimmed.startsWith("[")) return ""
@@ -38,7 +38,7 @@ private fun bootstrapPackageInfoField(manifest: string, key: string): string {
 }
 
 // Preserve Unicode and keep control characters from remote metadata out of the CLI.
-private fun bootstrapPackageInfoDisplay(value: string, missing: string): string {
+fun bootstrapPackageInfoDisplay(value: string, missing: string): string {
     if (value == "") return missing
     var index = 0
     while (index < value.size) {
@@ -49,7 +49,7 @@ private fun bootstrapPackageInfoDisplay(value: string, missing: string): string 
     value
 }
 
-private fun bootstrapPackageInfoGit(directory: string): LinuxCommand {
+fun bootstrapPackageLookupGit(directory: string): LinuxCommand {
     val command = linuxCommand("git")
     command.workingDirectory = directory
     // A caller such as a Git hook can export these for a different checkout.
@@ -68,53 +68,86 @@ private fun bootstrapPackageInfoError(message: string): int {
     1
 }
 
-private fun bootstrapPackageInfoRead(repository: string, directory: string): int {
-    val url = "https://github.com/$repository.git"
-    val clone = bootstrapPackageInfoGit(directory)
+// Both views use disposable bare repositories. History is only needed to
+// compare a locked revision with the commits behind the tags.
+fun bootstrapPackageLookupClone(
+    projectRoot: string, source: string, repoDir: string, history: bool
+): bool {
+    val clone = bootstrapPackageLookupGit(projectRoot)
     clone.argument("clone")
     clone.argument("--quiet")
     clone.argument("--bare")
-    clone.argument("--depth=1")
-    clone.argument("--no-tags")
+    clone.argument("--no-local")
     clone.argument("--filter=blob:none")
+    if (!history) {
+        clone.argument("--depth=1")
+        clone.argument("--no-tags")
+    }
     clone.argument("--")
-    clone.argument(url)
-    clone.argument("package.git")
-    if (clone.run() != 0) return bootstrapPackageInfoError("cannot read $repository from GitHub")
+    clone.argument(source)
+    clone.argument(repoDir)
+    clone.run() == 0
+}
 
-    val repoDir = "$directory/package.git"
-    val head = bootstrapPackageInfoGit(repoDir)
-    head.argument("rev-parse")
-    head.argument("--verify")
-    head.argument("HEAD")
-    val resolved = head.capture()
+fun bootstrapPackageLookupOutput(
+    var command: LinuxCommand, file: Path, maximum: int
+): LinuxProcessResult {
+    command.outputPath = file.text
+    val status = command.run()
+    if (status != 0) return LinuxProcessResult(status, "")
+    if (file.info().size > maximum) return LinuxProcessResult(-1, "")
+    val read = file.readTextResult()
+    LinuxProcessResult(if (read.succeeded) 0 else 1, read.text)
+}
+
+fun bootstrapPackageLookupManifest(repoDir: string, revision: string): LinuxProcessResult {
+    val command = bootstrapPackageLookupGit(repoDir)
+    command.argument("cat-file")
+    command.argument("blob")
+    command.argument("$revision:abla.toml")
+    command.errorPath = "/dev/null"
+    bootstrapPackageLookupOutput(command, Path(repoDir).child("abla-info-manifest"), 65536)
+}
+
+fun bootstrapPackageLookupRevision(repoDir: string, ref: string): string {
+    val command = bootstrapPackageLookupGit(repoDir)
+    command.argument("rev-parse")
+    command.argument("--verify")
+    command.argument("--quiet")
+    command.argument("$ref^{commit}")
+    val resolved = command.capture()
     val revision = bootstrapPackageTrim(resolved.output)
-    if (resolved.status != 0 || !bootstrapPackageHexRevision(revision)) return bootstrapPackageInfoError("$repository has no default-branch commit")
-    val manifestFile = Path(directory).child("manifest")
-    val manifestCommand = bootstrapPackageInfoGit(repoDir)
-    manifestCommand.argument("cat-file")
-    manifestCommand.argument("blob")
-    manifestCommand.argument("HEAD:abla.toml")
-    manifestCommand.outputPath = manifestFile.text
-    if (manifestCommand.run() != 0) {
+    if (resolved.status == 0 && bootstrapPackageHexRevision(revision)) revision else ""
+}
+
+private fun bootstrapPackageInfoRead(repository: string, directory: string): int {
+    val url = "https://github.com/$repository.git"
+    val repoDir = "$directory/package.git"
+    if (!bootstrapPackageLookupClone(directory, url, repoDir, false)) {
+        return bootstrapPackageInfoError("cannot read $repository from GitHub")
+    }
+    val revision = bootstrapPackageLookupRevision(repoDir, "HEAD")
+    if (revision == "") return bootstrapPackageInfoError("$repository has no default-branch commit")
+    val read = bootstrapPackageLookupManifest(repoDir, revision)
+    if (read.status == -1) return bootstrapPackageInfoError("abla.toml exceeds 64 KiB")
+    if (read.status != 0) {
         return bootstrapPackageInfoError("$repository has no readable abla.toml at its default-branch HEAD")
     }
-    if (manifestFile.info().size > 65536) return bootstrapPackageInfoError("abla.toml exceeds 64 KiB")
-    val manifest = manifestFile.readText()
+    val manifest = read.output
     val name = bootstrapPackageInfoField(manifest, "name")
     if (!bootstrapPackageNameValid(name)) return bootstrapPackageInfoError("abla.toml has no valid package name")
 
     val tagsFile = Path(directory).child("tags")
-    val tags = bootstrapPackageInfoGit(directory)
+    val tags = bootstrapPackageLookupGit(directory)
     tags.argument("ls-remote")
     tags.argument("--tags")
     tags.argument("--refs")
     tags.argument("--sort=-version:refname")
     tags.argument("--")
     tags.argument(url)
-    tags.outputPath = tagsFile.text
-    if (tags.run() != 0) return bootstrapPackageInfoError("cannot list Git tags for $repository")
-    if (tagsFile.info().size > 1048576) return bootstrapPackageInfoError("Git tag listing exceeds 1 MiB")
+    val listedTags = bootstrapPackageLookupOutput(tags, tagsFile, 1048576)
+    if (listedTags.status == -1) return bootstrapPackageInfoError("Git tag listing exceeds 1 MiB")
+    if (listedTags.status != 0) return bootstrapPackageInfoError("cannot list Git tags for $repository")
 
     val description = bootstrapPackageInfoDisplay(bootstrapPackageInfoField(manifest, "description"), "(not declared)")
     val licence = bootstrapPackageInfoDisplay(bootstrapPackageInfoField(manifest, "license"), "(not declared)")
@@ -122,7 +155,7 @@ private fun bootstrapPackageInfoRead(repository: string, directory: string): int
     val version = bootstrapPackageInfoDisplay(bootstrapPackageInfoField(manifest, "version"), "(not declared)")
     linuxPrintStandardOutput("Name: $name\nSource: $url\nMetadata: default branch at $revision\nDescription: $description\nLicence: $licence\nManifest version: $version\nDeclared compiler range: $compiler\nGit tags:\n")
     var listed = false
-    for (line in tagsFile.readText().split("\n")) {
+    for (line in listedTags.output.split("\n")) {
         val marker = line.indexOf("\trefs/tags/")
         if (marker >= 0) {
             val tag = bootstrapPackageInfoDisplay(line.slice(marker + 11, line.size), "")
@@ -141,15 +174,21 @@ fun bootstrapPackageInfo(repository: string): int {
         linuxPrintStandardError("usage: ablac package info <owner/repo>\n")
         return 2
     }
-    val temporary = linuxCommand("mktemp")
-    temporary.argument("-d")
-    val created = temporary.capture()
-    val path = bootstrapPackageTrim(created.output)
-    if (created.status != 0 || path == "") {
-        return bootstrapPackageInfoError("cannot create a temporary directory")
-    }
-    val directory = if (path.startsWith("/")) path else "${currentDirectory().text}/$path"
+    val directory = bootstrapPackageLookupTemporary()
+    if (directory == "") return bootstrapPackageInfoError("cannot create a temporary directory")
     val status = bootstrapPackageInfoRead(repository, directory)
     bootstrapPackageRemoveTree(directory)
     status
+}
+
+fun bootstrapPackageLookupTemporary(): string {
+    val temporary = linuxCommand("mktemp")
+    temporary.argument("-d")
+    val created = temporary.capture()
+    if (created.status != 0) return ""
+    // Drop only mktemp's newline, preserving spaces in the directory name.
+    var path = created.output
+    if (path.endsWith("\n")) path = path.slice(0, path.size - 1)
+    if (path == "" || path.startsWith("/")) return path
+    currentDirectory().text + "/" + path
 }
