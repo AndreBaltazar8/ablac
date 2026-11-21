@@ -1,0 +1,93 @@
+// The relocations of an ELF64 file, read in-process (#806): what the libc-free links check after linking (src/toolchain.ab) instead of running
+// llvm-readelf, and what tools/test-elf-relocations.sh checks against that tool's own report on real files.
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+// The bytes [offset, offset + count) of an open file, or "" when fewer come back.
+fun bootstrapReadFileRange(descriptor: int, offset: int, count: int): string {
+    if (count <= 0) return ""
+    val buffer = nativeByteBuffer(count + 1)
+    var got = 0
+    var reading = true
+    while (reading && got < count) {
+        val amount = linuxSyscall4(17, descriptor, nativePointerAddress(buffer.address) + got, count - got, offset + got)
+        if (amount > 0) got = got + amount
+        else if (amount != -4) reading = false
+    }
+    if (got != count) {
+        buffer.close()
+        return ""
+    }
+    buffer.adoptString(count)
+}
+
+fun bootstrapLittleEndian(bytes: string, at: int, width: int): int {
+    var value = 0
+    var index = width - 1
+    while (index >= 0) {
+        value = value * 256 + int(bytes[at + index])
+        index = index - 1
+    }
+    value
+}
+
+fun bootstrapRelocationTypeName(kind: int): string =
+    if (kind == 1) "R_X86_64_64" else if (kind == 6) "R_X86_64_GLOB_DAT" else if (kind == 7) "R_X86_64_JUMP_SLOT"
+    else if (kind == 37) "R_X86_64_IRELATIVE" else if (kind == 257) "R_AARCH64_ABS64"
+    else if (kind == 1025) "R_AARCH64_GLOB_DAT" else if (kind == 1026) "R_AARCH64_JUMP_SLOT"
+    else if (kind == 1032) "R_AARCH64_IRELATIVE" else "relocation type $kind"
+
+// The first relocation of the ELF64 little-endian file at `path` that is not `relativeType` (R_X86_64_RELATIVE 8, R_AARCH64_RELATIVE 1027: all
+// that abla_start applies), described; "" when there is none; "?" when the section headers cannot be read as expected, which makes the caller ask
+// llvm-readelf as it always did. The section header table is read and then each RELA section in blocks of a megabyte: no spawn, and a static compiler's
+// hundreds of thousands of relocations are not read through a pipe as text.
+fun bootstrapElfOtherRelocation(path: string, relativeType: int): string {
+    val file = linuxOpen(path)
+    if (file.descriptor < 0) return "?"
+    var result = "?"
+    val header = bootstrapReadFileRange(file.descriptor, 0, 64)
+    if (header.size == 64 && header[0] == 127 && header[1] == 69 && header[2] == 76 && header[3] == 70 &&
+        header[4] == 2 && header[5] == 1) {
+        val tableOffset = bootstrapLittleEndian(header, 40, 8)
+        val entrySize = bootstrapLittleEndian(header, 58, 2)
+        val count = bootstrapLittleEndian(header, 60, 2)
+        if (entrySize == 64 && count > 0 && count < 65280) {
+            val table = bootstrapReadFileRange(file.descriptor, tableOffset, count * 64)
+            if (table.size == count * 64) {
+                result = ""
+                var section = 0
+                while (result == "" && section < count) {
+                    val base = section * 64
+                    val kind = bootstrapLittleEndian(table, base + 4, 4)
+                    // SHT_REL (9) has no addend and no use here: unexpected, so leave it to llvm-readelf.
+                    if (kind == 9) result = "?"
+                    if (kind == 4) {
+                        val offset = bootstrapLittleEndian(table, base + 24, 8)
+                        val size = bootstrapLittleEndian(table, base + 32, 8)
+                        var done = 0
+                        while (result == "" && done < size) {
+                            var chunk = size - done
+                            if (chunk > 1048560) chunk = 1048560
+                            val entries = bootstrapReadFileRange(file.descriptor, offset + done, chunk)
+                            if (entries.size != chunk) result = "?"
+                            else {
+                                var at = 0
+                                while (result == "" && at + 24 <= chunk) {
+                                    val type = bootstrapLittleEndian(entries, at + 8, 4)
+                                    if (type != relativeType) result = "${bootstrapRelocationTypeName(type)} at offset ${bootstrapLittleEndian(entries, at, 8)}"
+                                    at = at + 24
+                                }
+                            }
+                            done = done + chunk
+                        }
+                    }
+                    section = section + 1
+                }
+            }
+        }
+    }
+    file.close()
+    result
+}
+

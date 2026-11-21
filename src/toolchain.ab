@@ -10,6 +10,7 @@ import "ct_native.ab"
 import "lexer.ab"
 import "sourcemap.ab"
 import "abla/sys/linux/fs"
+import "elf_relocations.ab"
 import "abla/bytes"
 import "abla/text"
 import "abla/sys/linux/io"
@@ -246,13 +247,41 @@ fun bootstrapRunHostLink(link: LinuxCommand, objectPath: string, outputPath: str
 // archive in the resource directory of the toolchain's clang, or else the system's libgcc,
 // or "" when neither is there (a program that needs a builtin then falls back to the C
 // library's link, which names it). Never libgcc_s or an unwinder: Abla does not unwind.
+// Asking clang costs a process (the Nix wrapper, then the driver: 16-22 ms of a hello world's 270), and the answer is a path that depends on nothing but the
+// toolchain the environment names, so it is kept in the link cache next to the kept linker command, under the same environment key; a kept path that
+// is no longer a file is asked for again.
 fun bootstrapLibcFreeRuntimeLibrary(): string {
+    var key = "abla-runtime-library 1"
+    for (entry in linuxEnvironmentEntries()) {
+        if (bootstrapLinkReadsEnvironment(entry)) key = "$key\n$entry"
+    }
+    val directory = Path(bootstrapCacheDirectory()).child("link")
+    val kept = directory.child("runtime-library-${bootstrapNativeCacheHash(key, 17, 257, 1000000007)}-${bootstrapNativeCacheHash(key, 31, 263, 1000000009)}")
+    val remembered = kept.readText().trim()
+    if (remembered.startsWith("/") && Path(remembered).info().isFile()) return remembered
     for (runtime in ["compiler-rt", "libgcc"]) {
         val query = linuxCommand("clang")
         query.argument("--rtlib=$runtime")
         query.argument("-print-libgcc-file-name")
         val path = query.captureText().trim()
-        if (path.startsWith("/") && Path(path).info().isFile()) return path
+        if (path.startsWith("/") && Path(path).info().isFile()) {
+            if (directory.createDirectories()) kept.writeTextAtomic(path)
+            return path
+        }
+    }
+    ""
+}
+
+// What the link left that abla_start does not apply, as one described relocation ("" for none): the file read in-process, llvm-readelf only when
+// it cannot be (`prefix` is "R_X86_64_" or "R_AARCH64_").
+fun bootstrapOtherRelocation(path: string, prefix: string, relativeType: int): string {
+    val found = bootstrapElfOtherRelocation(path, relativeType)
+    if (found != "?") return found
+    val relocations = linuxCommand("llvm-readelf")
+    relocations.argument("-rW")
+    relocations.argument(path)
+    for (line in relocations.captureText().split("\n")) {
+        if (bootstrapTextContains(line, prefix) && !bootstrapTextContains(line, "${prefix}RELATIVE")) return line.trim()
     }
     ""
 }
@@ -4952,31 +4981,20 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             }
             if (status == 0 && libcFree) {
                 // abla_start applies R_X86_64_RELATIVE relocations only.
-                val relocations = linuxCommand("llvm-readelf")
-                relocations.argument("-rW")
-                relocations.argument(publishPath)
-                for (line in relocations.captureText().split("\n")) {
-                    if (bootstrapTextContains(line, "R_X86_64_") &&
-                        !bootstrapTextContains(line, "R_X86_64_RELATIVE")) {
-                        libcReason =
-                            "its image needs a relocation abla_start does not apply: ${line.trim()}"
-                        status = 1
-                    }
+                val other = bootstrapOtherRelocation(publishPath, "R_X86_64_", 8)
+                if (other != "") {
+                    libcReason = "its image needs a relocation abla_start does not apply: $other"
+                    status = 1
                 }
             }
             if (status == 0 && aarch64Linux) {
                 // abla_start applies R_AARCH64_RELATIVE relocations only.
-                val relocations = linuxCommand("llvm-readelf")
-                relocations.argument("-rW")
-                relocations.argument(publishPath)
-                for (line in relocations.captureText().split("\n")) {
-                    if (bootstrapTextContains(line, "R_AARCH64_") &&
-                        !bootstrapTextContains(line, "R_AARCH64_RELATIVE")) {
-                        linuxPrintStandardError(
-                            "error: the AArch64 image needs a relocation abla_start does not apply: ${line.trim()}\n"
-                        )
-                        status = 1
-                    }
+                val other = bootstrapOtherRelocation(publishPath, "R_AARCH64_", 1027)
+                if (other != "") {
+                    linuxPrintStandardError(
+                        "error: the AArch64 image needs a relocation abla_start does not apply: $other\n"
+                    )
+                    status = 1
                 }
             }
             if (staticLlvm) {
