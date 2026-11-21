@@ -1618,18 +1618,39 @@ fun ctNativeEvaluateHost(
     ctNativeHostCall(evaluator, name, values)
 }
 
+/** A host file operation's path arguments read against the source file (decision #95 A): the first for every file
+ *  operation, the second too for MoveFile (its destination); other operations' arguments as they are. */
+fun ctNativeHostResolvedPaths(var evaluator: BootstrapEvaluator, operation: string,
+    values: array<BootstrapEvalValue>): array<BootstrapEvalValue> {
+    val reading = operation == "ReadFile" || operation == "FileKind" || operation == "FileSize" ||
+        operation == "ListDirectory" || operation == "FileRevision"
+    val writing = operation == "WriteFile" || operation == "WriteFileAtomic" || operation == "CreateParentDirectories" ||
+        operation == "CreateDirectories" || operation == "MoveFile" || operation == "RemoveFile"
+    val resolved: array<BootstrapEvalValue> = []
+    var index = 0
+    while (index < values.size) {
+        val value = values[index]
+        if ((reading || writing) && (index == 0 || (index == 1 && operation == "MoveFile")) && value.kind == "string") {
+            resolved.append(bootstrapEvalString(bootstrapResolveCompilePath(evaluator, value.text, writing)))
+        } else resolved.append(value)
+        index = index + 1
+    }
+    resolved
+}
+
 // Performs host provider `name` on evaluated arguments (for the interpreter
 // and the JIT tier's bridge), after checking its capability.
 fun ctNativeHostCall(
     var evaluator: BootstrapEvaluator,
     name: string,
-    values: array<BootstrapEvalValue>
+    given: array<BootstrapEvalValue>
 ): BootstrapEvalValue {
     val effect = bootstrapCompileHostOperationEffect(name)
     if (!ctNativeAllowed(evaluator, effect)) {
         return ctNativeDenied(evaluator, "call to `$name`", effect)
     }
     val operation = name.slice(8, name.size)
+    val values = ctNativeHostResolvedPaths(evaluator, operation, given)
     var result = bootstrapEvalVoid()
     if (operation == "FileKind" || operation == "FileSize" ||
         operation == "FileRevision") {
@@ -2073,7 +2094,11 @@ fun ctNativeEvaluatePathMethod(
         values.append(evaluator.evaluate(arguments[index]))
         index = index + 1
     }
-    val path = ctNativePathText(receiver)
+    // Read against the source file (decision #95 A): `named` as the program wrote it, `path` where it is.
+    val named = ctNativePathText(receiver)
+    val writing = method == "writeText" || method == "writeTextAtomic" || method == "appendText" ||
+        method == "createDirectories" || method == "createParentDirectories" || method == "remove" || method == "moveTo"
+    val path = bootstrapResolveCompilePath(evaluator, named, writing)
     var result = bootstrapEvalInvalid()
     // Writes are real writes, as at run time (#72): the compiler performs the run-time operation itself, so the
     // site's own system calls and the processes it starts see them at once. A build that fails later keeps what
@@ -2094,7 +2119,8 @@ fun ctNativeEvaluatePathMethod(
     } else if (method == "remove") {
         result = bootstrapEvalBoolean(path != "" && Path(path).remove())
     } else if (method == "moveTo") {
-        val destination = ctNativePathText(if (values.size > 0) values[0] else bootstrapEvalInvalid())
+        val destination = bootstrapResolveCompilePath(evaluator,
+            ctNativePathText(if (values.size > 0) values[0] else bootstrapEvalInvalid()), true)
         result = bootstrapEvalBoolean(path != "" && destination != "" && Path(path).moveTo(Path(destination)))
     } else if (method == "readText") {
         val read = ctNativeViewRead(evaluator, path, true)
@@ -2123,7 +2149,7 @@ fun ctNativeEvaluatePathMethod(
     } else if (method == "entries") {
         val elements: array<BootstrapEvalValue> = []
         for (name in ctNativeViewEntries(evaluator, path)) {
-            elements.append(ctNativePathValue(Path(path).child(name).text))
+            elements.append(ctNativePathValue(Path(named).child(name).text))
         }
         result = bootstrapEvalArray(elements)
     } else {

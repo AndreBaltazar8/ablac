@@ -44,14 +44,21 @@ compare_case() {
     mkdir -p "$output_directory/loopback"
     local interp_status=0 bridge_status=0
     # Compile-time writes are real writes (#72) and --emit-llvm honours a case's compileCapabilities (#886), so a case
-    # writes its relative paths where it runs (build-fs-write/, build-host-compile/, ...), a failed one too. Each tier
-    # runs in the same fresh directory (an output naming the working directory compares equal) that links the
-    # project's top-level directories, so the tree is left as it was and one tier's files never meet the other's.
+    # writes its relative paths beside its source file (build-fs-write/, build-host-compile/, ...), a failed one too. Each
+    # tier runs in the same fresh directory (an output naming the working directory compares equal) that links the
+    # project's top-level directories and copies the case's own, so the tree is left as it was and one tier's files
+    # never meet the other's.
     local work="$output_directory/work/$name"
     fresh_work() {
         rm -rf "$work"
         mkdir -p "$(dirname "$work")"
         cp -a "$work_template" "$work"
+        # Compile-time code reads and writes against its source file (#95), so the case's own directory is a copy:
+        # through the template's link its writes would land in the tracked case.
+        local top=${source#tests/cases/}
+        top=${top%%/*}
+        rm -f "$work/tests/cases/$top"
+        cp -R "$project_root/tests/cases/$top" "$work/tests/cases/$top"
         # A case that names a relative build/ directory of its own gets it here, in the tier's own tree: without it
         # tests/cases/compiler-capture-process/main.ab fails its pid-file check in both tiers (the child cannot write
         # build/compiler-capture-process/*.pid) and the tiers agree on the failure, which a directory appearing in one

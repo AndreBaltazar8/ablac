@@ -163,6 +163,21 @@ var bootstrapCompileRoundEdits: array<BootstrapDeclarationEdit> = []
 // the request is made.
 var bootstrapCompileRoundSite: string = ""
 
+/** The file of the subparser use being expanded ("" outside one): the directory its handler's paths are read
+ *  against (#95). */
+var bootstrapSubparserSourceFile: string = ""
+
+/** The file of a "<file>:<begin>:<end>" site ("" when it does not have that form). */
+fun bootstrapSiteFile(site: string): string {
+    var cut = site.size
+    var colons = 0
+    while (cut > 0 && colons < 2) {
+        cut = cut - 1
+        if (site[cut] == 58) colons = colons + 1
+    }
+    if (colons == 2) site.slice(0, cut) else ""
+}
+
 /** Where a `#` site's edit was asked for: the site being lowered (not the
  *  compiler API code the request goes through), else the request itself (in
  *  its generic's file when it is an instance's code). */
@@ -171,21 +186,15 @@ fun bootstrapCompileEditOrigin(evaluator: BootstrapEvaluator,
     if (bootstrapCompileRoundSite != "") bootstrapCompileRoundSite
     else "${bootstrapGenericSourceFile(evaluator.sourceIdentity)}:${expression.begin}:${expression.end}"
 
-/** The directory of the build file whose `#` site makes a compile-time build call: the site being lowered, else the
- *  code being evaluated when it is the program's own (not the standard library's compiler API code). "" when neither
- *  names a file. */
+/** The directory compile-time paths are read against: the `#` site being lowered, else the file using the subparser
+ *  being expanded, else the file declaring the running transform's handler, else the code being evaluated when it is
+ *  the program's own (not the standard library's compiler API code). "" when none names a file. */
 fun bootstrapBuildCallDirectory(evaluator: BootstrapEvaluator): string {
-    var file = ""
-    if (bootstrapCompileRoundSite != "") {
-        // "<file>:<begin>:<end>"
-        var cut = bootstrapCompileRoundSite.size
-        var colons = 0
-        while (cut > 0 && colons < 2) {
-            cut = cut - 1
-            if (bootstrapCompileRoundSite[cut] == 58) colons = colons + 1
-        }
-        if (colons == 2) file = bootstrapCompileRoundSite.slice(0, cut)
-    }
+    var file = bootstrapSiteFile(bootstrapCompileRoundSite)
+    // A subparser's handler acts for the file that uses it; a transform's for the file that declares its handler
+    // (the `#compiler.transform` action's), not for the library code either one calls.
+    if (file == "" && bootstrapSubparserSourceFile != "") file = bootstrapSubparserSourceFile
+    if (file == "" && bootstrapCompilerTransformActive) file = bootstrapSiteFile(bootstrapCompilerTransformOrigin)
     if (file == "") {
         val own = bootstrapGenericSourceFile(evaluator.sourceIdentity)
         if (own != "" && !bootstrapStandardLibraryModuleSource(own)) file = own
@@ -249,12 +258,13 @@ fun bootstrapBuildCallRoot(directory: string): string {
 
 /** A build call's path read against the build file and held inside its project: the path to use (relative to the
  *  working directory when it is inside it, else absolute), or "" after E_BUILD_PATH_OUTSIDE. */
-fun bootstrapContainBuildCallPath(var evaluator: BootstrapEvaluator, directory: string, path: string): string {
+fun bootstrapContainBuildCallPath(var evaluator: BootstrapEvaluator, directory: string, path: string,
+    subject: string = "the build call's"): string {
     val resolved = bootstrapBuildCallAbsolute(bootstrapBuildCallPath(directory, path))
     val root = bootstrapBuildCallRoot(directory)
     if (resolved != root && !resolved.startsWith("$root/")) {
         bootstrapStageDriverDiagnostic(
-            "error[E_BUILD_PATH_OUTSIDE]: the build call's path \"$path\" is $resolved, outside the build file's project $root (a build file reads and writes only inside its own project)\n"
+            "error[E_BUILD_PATH_OUTSIDE]: $subject path \"$path\" is $resolved, outside its source file's project $root (compile-time code reads and writes only inside its own project)\n"
         )
         evaluator.errors = evaluator.errors + 1
         return ""
@@ -285,17 +295,23 @@ fun bootstrapResolveBuildCallPaths(var evaluator: BootstrapEvaluator, entry: str
 
 /** W_BUILD_PATH_CWD, or with ABLA_BUILD_PATH_CWD=error (the suite's setting, so that none of its own build files
  *  relies on the old reading) E_BUILD_PATH_CWD, which fails the build call. */
-fun bootstrapBuildPathCwdReport(var evaluator: BootstrapEvaluator, what: string, directory: string): void {
+fun bootstrapBuildPathCwdReport(var evaluator: BootstrapEvaluator, what: string, directory: string,
+    subject: string = "the build call's"): void {
     val mode = linuxEnvironment("ABLA_BUILD_PATH_CWD")
     val strict = mode.found && mode.value == "error"
-    val text = "${if (strict) "error[E_BUILD_PATH_CWD]" else "warning[W_BUILD_PATH_CWD]"}: the build call's $what from the working directory, not next to the build file (${if (directory == "") "." else directory}); paths in build calls are read against the build file's directory (as imports are), and the working-directory reading goes after v0.2.65: write it relative to that directory\n"
+    val text = "${if (strict) "error[E_BUILD_PATH_CWD]" else "warning[W_BUILD_PATH_CWD]"}: $subject $what from the working directory, not next to its source file (${if (directory == "") "." else directory}); paths compile-time code names are read against its source file's directory (as imports are), and the working-directory reading goes in a following release: write it relative to that directory\n"
     // An error goes with the build's diagnostics (printed when it fails); a warning to standard error now, as the build
     // goes on and its diagnostics are not printed when it succeeds.
     if (strict) {
         bootstrapStageDriverDiagnostic(text)
         evaluator.errors = evaluator.errors + 1
-    } else linuxPrintStandardError(text)
+    } else if (!bootstrapBuildPathCwdWarned.has(text)) {
+        // Once per path and use: an operation resolves its path more than once (a write's directory, then its file).
+        bootstrapBuildPathCwdWarned.set(text, true)
+        linuxPrintStandardError(text)
+    }
 }
+val bootstrapBuildPathCwdWarned: Map<string, bool> = Map()
 
 /** An output with no entry to decide by (an independent module's emit): read against the build file's directory, or,
  *  for v0.2.65, from the working directory with W_BUILD_PATH_CWD when only there does its first directory exist. */
@@ -310,6 +326,30 @@ fun bootstrapResolveBuildCallOutput(var evaluator: BootstrapEvaluator, output: s
     }
     bootstrapBuildPathCwdReport(evaluator, "output \"$output\" is read", directory)
     if (bootstrapCompileOutputPathValid(output)) output else ""
+}
+
+/** A path compile-time code names for a file operation (decision #95 A: reads, writes, listings, metadata, moves),
+ *  read as a build call's is: against the source file's directory, inside its project (E_BUILD_PATH_OUTSIDE, ""
+ *  then), with the working-directory reading kept for one release when only it finds the file (a read) or the
+ *  directory to write in (a write), with W_BUILD_PATH_CWD. A path with no source file to read it against (the
+ *  compiler's own) is as given. Both tiers come here: a native slice's file
+ *  operations reach the same providers (ct_native.ab) through the bridge. A trusted.native site's own raw system calls
+ *  (linuxOpen and the like) are not seen, as nothing else of its native access is. */
+fun bootstrapResolveCompilePath(var evaluator: BootstrapEvaluator, path: string, write: bool): string {
+    val directory = bootstrapBuildCallDirectory(evaluator)
+    if (directory == "" || path == "") return path
+    if (path.startsWith("/")) return bootstrapContainBuildCallPath(evaluator, directory, path, "compile-time code's")
+    val fileProbe = bootstrapBuildCallPath(directory, path)
+    val probe = if (write) Path(fileProbe).parent().text else fileProbe
+    val cwdProbe = if (write) Path(path).parent().text else path
+    // The old reading took only a path under the working directory (no ".."): one with ".." is the new reading's.
+    if (Path(probe).exists() || !Path(cwdProbe).exists() || cwdProbe == "." || cwdProbe == "" ||
+        !bootstrapCompileOutputPathValid(path)) {
+        return bootstrapContainBuildCallPath(evaluator, directory, path, "compile-time code's")
+    }
+    bootstrapBuildPathCwdReport(evaluator, "\"$path\" is ${if (write) "written" else "read"}", directory,
+        "compile-time code's path")
+    path
 }
 
 fun bootstrapTakeCompileRoundEdits(): array<BootstrapDeclarationEdit> {
@@ -1655,8 +1695,10 @@ fun bootstrapPrepareCompileOutputRoot(): bool {
  * contract stays: a project-relative path without `.` or `..` components, at most 16 MiB a file and 256 MiB a build.
  * Written beside its target and renamed over it; an existing file keeps its mode.
  */
-fun bootstrapCompileWriteFile(path: string, contents: string): bool {
-    if (!bootstrapCompileOutputPathValid(path) || contents.size > 16777216 ||
+/** `contained`: the path was read against the source file and held inside its project (decision #95 A), so it may be
+ *  absolute; otherwise the working-directory reading's rule (relative, no "..") applies. */
+fun bootstrapCompileWriteFile(path: string, contents: string, contained: bool = false): bool {
+    if (path == "" || (!contained && !bootstrapCompileOutputPathValid(path)) || contents.size > 16777216 ||
         bootstrapCompileOutputBytes + contents.size > BOOTSTRAP_COMPILE_OUTPUT_BYTES) return false
     if (!bootstrapWriteBuildFile(Path(path), contents)) return false
     bootstrapCompileOutputBytes = bootstrapCompileOutputBytes + contents.size
@@ -12963,7 +13005,7 @@ fun bootstrapEvaluateCallHost(
             val path = bootstrapEvalJournalArg(evaluator, expression, 0)
             if (bootstrapEvalLeaves(path)) return path
             // The compile-time file view (ct_native.ab): staged files too.
-            val read = ctNativeViewRead(evaluator, path.text, true)
+            val read = ctNativeViewRead(evaluator, bootstrapResolveCompilePath(evaluator, path.text, false), true)
             result = bootstrapEvalString(if (read.succeeded) read.text else "")
         } else {
             // Parser staging precedes full semantic analysis. Reject the
@@ -12979,7 +13021,7 @@ fun bootstrapEvaluateCallHost(
         if (bootstrapCompileEffectHas(evaluator.allowedCompileEffects, 4)) {
             val path = bootstrapEvalJournalArg(evaluator, expression, 0)
             if (bootstrapEvalLeaves(path)) return path
-            val names = bootstrapSortedNames(ctNativeViewEntries(evaluator, path.text))
+            val names = bootstrapSortedNames(ctNativeViewEntries(evaluator, bootstrapResolveCompilePath(evaluator, path.text, false)))
             var listing = ""
             val elements: array<BootstrapEvalValue> = []
             var index = 0
@@ -13005,7 +13047,8 @@ fun bootstrapEvaluateCallHost(
                 evaluator.allowedCompileEffects,
                 8
             )) {
-            result = bootstrapEvalBoolean(bootstrapCompileWriteFile(path.text, contents.text))
+            val written = bootstrapResolveCompilePath(evaluator, path.text, true)
+            result = bootstrapEvalBoolean(bootstrapCompileWriteFile(written, contents.text, written != path.text))
         } else {
             evaluator.errors = evaluator.errors + 1
             result = bootstrapEvalInvalid()
@@ -15021,6 +15064,9 @@ fun bootstrapInvokeSubparserHandlerIn(
         0,
         ""
     )
+    // The paths the handler names are the using file's (#95), not the subparser library's.
+    val outerSubparserFile = bootstrapSubparserSourceFile
+    bootstrapSubparserSourceFile = bootstrapGenericSourceFile(cursor.sourceIdentity)
     val result = evaluator.evaluate(BootstrapExpression(
         "call",
         handler,
@@ -15034,6 +15080,7 @@ fun bootstrapInvokeSubparserHandlerIn(
             []
         )]
     ))
+    bootstrapSubparserSourceFile = outerSubparserFile
     var expression = BootstrapExpression(
         "invalid",
         "subparser-result",

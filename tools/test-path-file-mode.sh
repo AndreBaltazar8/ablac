@@ -55,7 +55,7 @@ import "abla/compiler"
 #compilerGrant("filesystem.read")
 #compilerGrant("filesystem.write")
 compile fun writeFiles(): bool {
-    val root = Path("build/path-file-mode-test/staged")
+    val root = Path("staged")
     val secret = root.child("secret")
     if (!secret.writeText("first", mode = 0o600)) return false
     if (!secret.writeText("secret", mode = 0o666)) return false
@@ -102,7 +102,7 @@ cat > "$out/failed.ab" <<'ABLA'
 import "abla/fs"
 import "abla/compiler"
 #compilerGrant("filesystem.write")
-val staged = #Path("build/path-file-mode-test/not-published").writeText("secret", mode = 0o600)
+val staged = #Path("not-published").writeText("secret", mode = 0o600)
 fun fail(zero: int): int = 10 / zero
 val broken = #fail(0)
 fun main: int = 0

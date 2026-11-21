@@ -10,7 +10,7 @@ output_directory="$project_root/build/compile-effects-test"
 mkdir -p "$output_directory"
 # This test rewrites the capabilities case's input.txt and abla.toml as it goes, so it works on a copy: a project directory of its own whose top-level
 # directories link to the project's (tests/cases/capabilities is the exception: a copy), and it runs there (the compile-time code reads
-# tests/cases/capabilities/input.txt relative to the working directory, and the default cache is build/.abla-cache under it). The tracked case is never
+# input.txt beside its source file, and the default cache is build/.abla-cache under the working directory). The tracked case is never
 # touched, so an interrupted run leaves the tree as it was and tests that run beside this one (test-ct-bridge.sh) see the original.
 work="$output_directory/work"
 rm -rf -- "$work"
@@ -26,6 +26,8 @@ for top in "$project_root"/tests/cases/*; do
 done
 cp -R "$project_root/tests/cases/capabilities" "$work/tests/cases/capabilities"
 capabilities="$work/tests/cases/capabilities"
+# Compile-time paths stay inside the source file's project; without this name the boundary would be whatever checkout holds the build directory.
+printf 'name = "compile-effects-work"\n' > "$work/abla.toml"
 input="$capabilities/input.txt"
 manifest="$capabilities/abla.toml"
 cd "$work"
@@ -297,15 +299,15 @@ set -e
     -o "$output_directory/write-output"
 grep -q '^published-after-success$' "$transaction_output"
 
-"$compiler" build \
+# A write that leaves the work copy's project (its abla.toml names it) is refused: the build fails and nothing is written.
+rm -f -- "$work/../outside-project.txt"
+if "$compiler" build \
     "$capabilities/write-output-invalid-path.ab" \
-    -o "$output_directory/write-output-invalid-path"
-set +e
-"$project_root/tools/run-limited.sh" \
-    "$output_directory/write-output-invalid-path"
-invalid_path_status=$?
-set -e
-[[ $invalid_path_status -eq 42 ]] || exit 1
+    -o "$output_directory/write-output-invalid-path" \
+    > "$output_directory/write-output-invalid-path.log" 2>&1; then
+    exit 1
+fi
+grep -q 'E_BUILD_PATH_OUTSIDE' "$output_directory/write-output-invalid-path.log"
 [[ ! -e "$work/../outside-project.txt" ]] || exit 1
 
 "$compiler" build \

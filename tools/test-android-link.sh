@@ -7,10 +7,6 @@
 # ANDROID_NDK_HOME, then ndk/<newest> or ndk-bundle under ANDROID_HOME and ANDROID_SDK_ROOT. Without one the
 # test says so and skips (exit 0), as the other Android tests do without their tools.
 set -euo pipefail
-# Its build helper (abla/android/build) writes the generated project with compiler.writeFile (read against the working
-# directory) and builds into it with buildProgram (read against the build file, decision #91 A): until decision #95
-# settles the file API, the working-directory reading stays allowed here, with its warning.
-export ABLA_BUILD_PATH_CWD=warn
 export LC_ALL=C
 compiler=${1:-build/ablac}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)

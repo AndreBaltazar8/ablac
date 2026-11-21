@@ -392,6 +392,29 @@ fields or conformances), runs in the interpreter too: a native closure is
 positional and would run the edited body. Use `compile var` for state that
 sites share, and keep it simple enough for the native tier.
 
+## Paths at compile time
+
+A path compile-time code names is read against the directory of its source file, as an import is (decision #95 A):
+`Path("data.txt").readText()` in a `#` site of `tools/gen.ab` reads `tools/data.txt`, whichever directory
+`ablac build` runs from, and `compilerWriteFile("out/x.ab", ...)` writes `tools/out/x.ab`. This holds for every
+`abla/fs` read, write, listing, metadata query, move and removal and for `compilerWriteFile`, in both the interpreter
+and the native tier (whose file operations reach the same providers through the bridge), and for the build calls
+([programmable-builds.md](programmable-builds.md)). The source file that counts is the one the compile-time work
+runs for: a `#` site's own file, the file that uses a `$subparser`, or the file that declares a
+`#compiler.transform`'s handler. A library function any of them calls (a build helper, the subparser's handler)
+reads and writes where that file says, not beside the library.
+
+Paths stay inside the source file's project: the nearest directory above it whose `abla.toml` names a package
+(`name = ...`; a manifest that only grants capabilities bounds nothing), else the repository root (`.git`), else the
+working directory. A path that leaves it, relative or absolute, is `E_BUILD_PATH_OUTSIDE` and the operation fails:
+a library's compile-time code, called for a program, reads and writes only inside that program's project. A `trusted.native`
+site's own raw system calls (`linuxOpen` and the like) are not resolved, as nothing else of its native access is
+checked.
+
+For one release (v0.2.66) a read whose file is missing next to the source file but is there from the working
+directory, or a write whose directory is, keeps the old working-directory reading with `warning[W_BUILD_PATH_CWD]`;
+`ABLA_BUILD_PATH_CWD=error` makes it `E_BUILD_PATH_CWD`.
+
 ## Capabilities: files, environment, processes, network
 
 Compile-time code runs inside the compiler, so anything it can reach is
@@ -465,23 +488,21 @@ sockets, whatever the other grants say. A game client run under `#` reaches
 X11, Vulkan, ALSA and libcurl that way, by opening them with `dlopen`, and
 never asks for `network`.
 
-The `compiler*` providers come from `import "abla/compiler"`. Ordinary filesystem
-operations read relative paths against the compiler's working directory.
-Compile-time build calls are different: `compilerBuildProgram`, `buildProgram`,
-`wasmBuildModule` and independent-module `emit` read entries/outputs against
-the file containing the `#` site and keep them inside that file's project.
-The v0.2.65 working-directory fallback emits `W_BUILD_PATH_CWD`, or fails with
-`E_BUILD_PATH_CWD` under `ABLA_BUILD_PATH_CWD=error`.
-See [build paths](programmable-builds.md) for the fallback and project boundary;
-`compilerWriteFile` retains its own project-relative contract below.
+The `compiler*` providers come from `import "abla/compiler"`. Every relative
+path compile-time code names, for file operations and for build calls
+(`compilerBuildProgram`, `buildProgram`, `wasmBuildModule`, independent-module
+`emit`) alike, is read against its source file and kept inside that file's
+project ([paths at compile time](#paths-at-compile-time); the transition and the
+project boundary are in [build paths](programmable-builds.md)).
 
 Under `#`, the `abla/fs` writes, moves and removals, and `compilerWriteFile`,
 are real writes, as at run time: each one is on disk when the call returns, so
 what the site does next sees it. That holds for its reads, its own system calls
 (`linkTo`, `permissions`, raw `openat`) and the processes it starts
-(`compilerRunProcess`, `compilerCaptureProcess`), in both tiers. Paths may be
-anywhere the compiler may write, `/tmp` included, as at run time
-(`compilerWriteFile` keeps its own contract, below). `removeTree()` asks what
+(`compilerRunProcess`, `compilerCaptureProcess`), in both tiers. The paths it
+names stay inside its source file's project
+([paths at compile time](#paths-at-compile-time)); the processes it starts are
+not held to that. `removeTree()` asks what
 a path is without following links, which is native code (`trusted.native`);
 so are `linkTo`, `linkTarget` and `linkInfo`.
 
@@ -501,8 +522,8 @@ compile-time evaluation is a program the compiler runs with no arguments:
 
 Bounds:
 
-- `compilerWriteFile`: paths are project-relative, without `.` or `..`
-  components. At most 16 MiB per file and 256 MiB per build. Each write goes
+- `compilerWriteFile`: paths are read against the source file and stay inside
+  its project. At most 16 MiB per file and 256 MiB per build. Each write goes
   beside its target and is renamed over it, so a reader sees the old contents
   or the new ones, whole.
 - `compilerRunProcess`: at most 128 arguments of 4096 bytes each. The same
