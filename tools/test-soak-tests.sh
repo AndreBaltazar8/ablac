@@ -48,6 +48,39 @@ cp "$root/tools/test-shards.sh" "$root/tools/test-times.tsv" "$work/tools/"
 mkdir -p "$work/src" "$work/stdlib"
 expect_status 0 env RUN_TESTS_FILTER='no-such-command' RUN_TESTS_EXCLUDE='.*' \
     RUN_TESTS_COMMANDS="$work/no-such-recipe" "$work/tools/test-shards.sh" build/ablac
+# A bare compiler has no .bin companion: keep its cache between identical runs,
+# invalidate it when its bytes change, and prefer the payload for launchers.
+printf 'echo cache-probe\n' >"$work/cache-commands.txt"
+cache_step=0
+cache_run() {
+    cache_step=$((cache_step + 1))
+    RUN_TESTS_FILTER='' RUN_TESTS_COMMANDS="$work/cache-commands.txt" \
+        RUN_TESTS_OUTPUT="$work/cache-$cache_step" "$work/tools/run-tests.sh" "$1" \
+        >"$work/cache-$cache_step.console.log" 2>&1
+    [[ $(wc -l <"$work/cache-$cache_step/results.tsv") == 1 ]]
+}
+sentinel=$work/build/.abla-cache/sentinel
+printf 'direct-v1\n' >"$work/build/direct"
+cache_run "$work/build/direct"
+mkdir -p "$work/build/.abla-cache"
+touch "$sentinel"
+cache_run "$work/build/direct"
+[[ -f $sentinel && -n $(cat "$work/build/.abla-cache.compiler") ]] ||
+    { echo 'runner cache: unchanged bare compiler lost its cache/fingerprint' >&2; exit 1; }
+printf 'direct-v2-changed\n' >"$work/build/direct"
+cache_run "$work/build/direct"
+[[ ! -f $sentinel ]] || { echo 'runner cache: changed bare compiler kept stale cache' >&2; exit 1; }
+printf 'launcher-v1\n' >"$work/build/wrapper"
+printf 'payload-v1\n' >"$work/build/wrapper.bin"
+cache_run "$work/build/wrapper"
+mkdir -p "$work/build/.abla-cache"
+touch "$sentinel"
+printf 'launcher-v2-changed\n' >"$work/build/wrapper"
+cache_run "$work/build/wrapper"
+[[ -f $sentinel ]] || { echo 'runner cache: launcher text invalidated an unchanged payload' >&2; exit 1; }
+printf 'payload-v2-changed\n' >"$work/build/wrapper.bin"
+cache_run "$work/build/wrapper"
+[[ ! -f $sentinel ]] || { echo 'runner cache: changed payload kept stale cache' >&2; exit 1; }
 # A runner that drops a result but returns success must not produce a clean rate.
 mv "$work/tools/run-tests.sh" "$work/tools/real-runner"
 cat >"$work/tools/run-tests.sh" <<'RUNNER'

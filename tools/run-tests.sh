@@ -75,7 +75,11 @@ mkdir -p "$output"
 
 # The suite's builds share the default cache, so a rerun reuses what the same
 # compiler built. Its entries key on the compiler: another one's are only garbage.
-compiler_stamp=$(cksum <"$(readlink -f "$compiler.bin" 2>/dev/null || echo "$compiler")" 2>/dev/null || true)
+# A caller may pass the payload itself. readlink -f also accepts a missing
+# final component, so only select a companion that actually exists.
+compiler_payload=$compiler
+[[ ! -f $compiler.bin ]] || compiler_payload=$compiler.bin
+compiler_stamp=$(cksum <"$compiler_payload" 2>/dev/null || true)
 stamp_file=$project_root/build/.abla-cache.compiler
 if [[ -z $compiler_stamp || ! -f $stamp_file || $(<"$stamp_file") != "$compiler_stamp" ]]; then
     rm -rf "$project_root/build/.abla-cache"

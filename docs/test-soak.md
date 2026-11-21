@@ -8,7 +8,8 @@ and `JOBS`, `RUN_TESTS_COMMANDS`, `RUN_TESTS_EXCLUDE` and `RUN_TESTS_SHARD` reta
 their normal runner meanings.
 
 Run in the worktree's `nix-shell shell.nix`, through a systemd user unit and the
-shared fair-flock slots (full-test first, then build). Pin the command and any
+shared fair-flock worker build slot. If taking both a full-test and build slot,
+take full-test first; avoid spending a hold waiting for another slot. Pin the command and any
 intentional CPU load to the slot's CPUs. Choose a batch that fits the slot hold
 limit and release/requeue between batches; the soak tool does not acquire slots.
 For example, inside an admitted shell:
@@ -51,4 +52,7 @@ fail once then recover, and always fail. It also checks selection, per-failure
 logs, evidence preservation, invalid inputs, and refusal of missing results. It
 runs the actual suite runner in a private fixture tree, without touching the
 worktree's compiler or build cache. It also checks that inherited selection
-variables cannot shrink the whole-recipe assertions in `test-shards.sh`.
+variables cannot shrink the whole-recipe assertions in `test-shards.sh`, and
+that bare compiler binaries retain caches between identical runs while changed
+payloads invalidate them. A launcher's text does not replace its companion
+payload as the fingerprint.
