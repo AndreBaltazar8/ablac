@@ -396,19 +396,6 @@ fun bootstrapMutableReceiverContains(
     found
 }
 
-fun bootstrapMutableReceiverContainsMethod(
-    summary: BootstrapMutableReceiverSummary,
-    method: string
-): bool {
-    var found = false
-    var index = 0
-    while (!found && index < summary.methods.size) {
-        if (summary.methods[index] == method) found = true
-        index = index + 1
-    }
-    found
-}
-
 fun bootstrapFunctionArgumentIsExclusive(
     declarations: array<BootstrapDeclaration>,
     name: string,
@@ -3060,13 +3047,6 @@ fun bootstrapTypeConformsIn(
     false
 }
 
-/** Whether the class `owner` is `type` or conforms to it. */
-fun bootstrapTypeConformsOrIs(
-    declarations: array<BootstrapDeclaration>,
-    owner: string,
-    type: string
-): bool = owner == type || bootstrapTypeConformsIn(declarations, owner, type)
-
 /** Every member of the interface `name`: its own, then those it inherits
  *  that it doesn't declare again. */
 fun bootstrapInterfaceAllMembers(
@@ -3731,36 +3711,6 @@ fun bootstrapSummaryTypeIsAffine(
     names: array<string>
 ): bool = bootstrapSummaryTypeIsAffineAt(type, names, 0)
 
-fun bootstrapSummaryTypeIsManagedReferenceAt(
-    type: string,
-    declarations: array<BootstrapDeclaration>,
-    depth: int
-): bool {
-    val normalized = bootstrapNormalizeType(type)
-    var managed = bootstrapIsArrayType(normalized) ||
-        bootstrapIsCellType(normalized) || bootstrapIsMapType(normalized)
-    var declaration = 0
-    while (!managed && declaration < declarations.size) {
-        val candidate = declarations[declaration]
-        if ((candidate.kind == "class" || candidate.kind == "interface") &&
-            candidate.name == normalized) managed = true
-        declaration = declaration + 1
-    }
-    if (!managed && depth < 32 && bootstrapIsNullableType(normalized)) {
-        managed = bootstrapSummaryTypeIsManagedReferenceAt(
-            bootstrapNullableElementType(normalized),
-            declarations,
-            depth + 1
-        )
-    }
-    managed
-}
-
-fun bootstrapSummaryTypeIsManagedReference(
-    type: string,
-    declarations: array<BootstrapDeclaration>
-): bool = bootstrapSummaryTypeIsManagedReferenceAt(type, declarations, 0)
-
 /** bootstrapSummaryTypeIsManagedReferenceAt over an index of the class and
  *  interface names (bootstrapManagedTypeIndex). */
 fun bootstrapSummaryTypeIsManagedReferenceIn(
@@ -3824,58 +3774,6 @@ fun bootstrapManagedTypeIndex(
     }
     BootstrapFunctionDeclarationIndex(names, declarationIndices, slots)
 }
-
-// A stable alias must become a source-linked read-only view whenever mutation
-// can be observed through nested class fields. `val` remains Kotlin-like (the
-// field binding is fixed, not recursively frozen). Root arrays are tracked by
-// the same query; arrays stored inside val fields need lifetime propagation
-// through stored/returned references before they can safely join this rule.
-// Cell is deliberately not expanded: its mutation is explicit, scalar-only
-// interior mutability and is legal through shared views.
-fun bootstrapSummaryTypeNeedsManagedAliasTrackingAt(
-    type: string,
-    declarations: array<BootstrapDeclaration>,
-    depth: int
-): bool {
-    var normalized = bootstrapNormalizeType(type)
-    var nullableDepth = 0
-    while (nullableDepth < 32 && bootstrapIsNullableType(normalized)) {
-        normalized = bootstrapNullableElementType(normalized)
-        nullableDepth = nullableDepth + 1
-    }
-    var tracked = depth == 0 && bootstrapIsArrayType(normalized)
-    var declaration = 0
-    while (!tracked && depth < 32 && declaration < declarations.size) {
-        val candidate = declarations[declaration]
-        if (candidate.kind == "class" && candidate.name == normalized) {
-            var field = 0
-            while (!tracked && field < candidate.parameterTypes.size) {
-                if (field < candidate.parameterKinds.size &&
-                    candidate.parameterKinds[field] == "var") {
-                    tracked = true
-                } else if (!bootstrapIsArrayType(bootstrapNormalizeType(
-                    candidate.parameterTypes[field]
-                )) && bootstrapSummaryTypeNeedsManagedAliasTrackingAt(
-                        candidate.parameterTypes[field],
-                        declarations,
-                        depth + 1
-                    )) tracked = true
-                field = field + 1
-            }
-        }
-        declaration = declaration + 1
-    }
-    tracked
-}
-
-fun bootstrapSummaryTypeNeedsManagedAliasTracking(
-    type: string,
-    declarations: array<BootstrapDeclaration>
-): bool = bootstrapSummaryTypeNeedsManagedAliasTrackingAt(
-    type,
-    declarations,
-    0
-)
 
 fun bootstrapBuildAffineTypeNames(
     declarations: array<BootstrapDeclaration>
@@ -4293,41 +4191,6 @@ fun bootstrapCompileTimeNativeHostIf(expression: BootstrapExpression): bool =
     expression.kind == "if" && expression.children.size > 2 &&
         expression.children[0].kind == "call" && expression.children[0].text == "ablaCompileTimeNativeHost" &&
         expression.children[0].children.size == 0
-
-fun bootstrapExpressionCompileEffects(
-    expression: BootstrapExpression,
-    summary: BootstrapCompileEffectSummary
-): int {
-    var mask = 0
-    if (expression.kind == "call" && expression.text != "move" &&
-        expression.text != "Shared" && expression.text != "Mutex" &&
-        expression.text != "Cell" && expression.text != "Map") {
-        mask = bootstrapCompileEffectLookup(
-            summary,
-            expression.text,
-            false
-        )
-    }
-    if (expression.kind == "member.call") {
-        mask = bootstrapCompileEffectLookup(
-            summary,
-            expression.text,
-            true
-        )
-    }
-    var child = 0
-    while (child < bootstrapCompileTimeChildEnd(expression)) {
-        if (!bootstrapCompileTimeChildSkipped(expression, child)) mask = bootstrapCompileEffectMerge(
-            mask,
-            bootstrapExpressionCompileEffects(
-                expression.children[child],
-                summary
-            )
-        )
-        child = child + 1
-    }
-    mask
-}
 
 // Syntactic receiver typing for compile-effect summaries. Method effects were
 // merged across every method sharing a name, so ByteBuffer.appendText (used
@@ -7578,14 +7441,6 @@ fun bootstrapInternIdentity(identity: string): string {
 
 /** A short id for a path, in every mode: for keys that only have to tell sources apart within one analysis. */
 var bootstrapPathIds: Map<string, string> = Map()
-
-fun bootstrapPathId(path: string): string {
-    val known = bootstrapPathIds.get(path)
-    if (known != null) return known
-    val id = "p${bootstrapPathIds.size}"
-    bootstrapPathIds.set(path, id)
-    id
-}
 
 fun bootstrapSourceKey(path: string): string {
     if (bootstrapSemanticRecordNames) return path

@@ -94,8 +94,6 @@ fun ctBridgeLeave(serial: int): bool {
     valid
 }
 
-fun ctBridgeActive(): bool = ctBridgeFrames.size > 0
-
 fun ctBridgeTopIndex(): int = ctBridgeFrames.size - 1
 
 // Boxes a compiler-owned value in the active frame. Entry trampolines use it
@@ -139,25 +137,6 @@ fun ctBridgeUnbox(handle: int): BootstrapEvalValue =
         ]
 } else bootstrapEvalInvalid()
 
-// The JIT tier registers the address of every compile-time function it
-// materializes, so a function value passed as an argument (a finalizer, a
-// handler) reaches the interpreter's API as that declaration's name.
-fun ctBridgeRegisterFunction(address: int, name: string): void {
-    var found = false
-    var index = 0
-    while (index < ctBridgeFunctionAddresses.size) {
-        if (ctBridgeFunctionAddresses[index] == address) {
-            ctBridgeFunctionNames[index] = name
-            found = true
-        }
-        index = index + 1
-    }
-    if (!found) {
-        ctBridgeFunctionAddresses.append(address)
-        ctBridgeFunctionNames.append(name)
-    }
-}
-
 fun ctBridgeFunctionName(address: int): string {
     var name = ""
     var index = 0
@@ -168,11 +147,6 @@ fun ctBridgeFunctionName(address: int): string {
         index = index + 1
     }
     name
-}
-
-fun ctBridgeForgetFunctions(): void {
-    ctBridgeFunctionAddresses.truncate(0)
-    ctBridgeFunctionNames.truncate(0)
 }
 
 // Whether a value crosses as a box rather than as a scalar, string or array.
@@ -326,40 +300,6 @@ fun ctBridgeDeclarationBlock(
     } else bootstrapEvalInvalid()
 }
 
-// The native form of a `declaration.block` expression, for the slice:
-// `DeclarationBlock(ablaCtBridgeDeclarationBlock(text, sourceIdentity))`.
-fun ctBridgeDeclarationBlockExpression(
-    expression: BootstrapExpression
-): BootstrapExpression {
-    var sourceIdentity = ""
-    if (expression.children.size == 1 &&
-        expression.children[0].kind == "declaration.block.source") {
-        sourceIdentity = expression.children[0].text
-    }
-    BootstrapExpression(
-        "call",
-        "DeclarationBlock",
-        expression.begin,
-        expression.end,
-        [BootstrapExpression(
-            "call",
-            "ablaCtBridgeDeclarationBlock",
-            expression.begin,
-            expression.end,
-            [
-                BootstrapExpression(
-                    "string", expression.text, expression.begin,
-                    expression.end, []
-                ),
-                BootstrapExpression(
-                    "string", sourceIdentity, expression.begin,
-                    expression.end, []
-                )
-            ]
-        )]
-    )
-}
-
 fun ctBridgeResultElement(index: int): BootstrapEvalValue {
     val result = ctBridgeResult()
     // An array's elements, or an object's fields in declaration order.
@@ -503,35 +443,11 @@ fun ctBridgeResultElementAddress(index: i64): i64 =
 // zero-argument functions the compiler calls inside a frame that holds their
 // arguments; the entry reads them and returns its value through the bridge.
 
-fun ctBridgeEnterEntry(
-    evaluator: BootstrapEvaluator,
-    begin: int,
-    end: int,
-    arguments: array<BootstrapEvalValue>
-): int {
-    val serial = ctBridgeEnter(evaluator, begin, end)
-    val top = ctBridgeTopIndex()
-    var index = 0
-    while (index < arguments.size) {
-        ctBridgeFrames[top].entryArguments.append(arguments[index])
-        index = index + 1
-    }
-    serial
-}
-
 fun ctBridgeEntryArgument(index: int): BootstrapEvalValue {
     val top = ctBridgeTopIndex()
     if (top >= 0 && index >= 0 &&
         index < ctBridgeFrames[top].entryArguments.size) {
         ctBridgeFrames[top].entryArguments[index]
-    } else bootstrapEvalInvalid()
-}
-
-// What the running entry returned; invalid when it returned nothing.
-fun ctBridgeEntryResult(): BootstrapEvalValue {
-    val top = ctBridgeTopIndex()
-    if (top >= 0 && ctBridgeFrames[top].entryResults.size > 0) {
-        ctBridgeFrames[top].entryResults[0]
     } else bootstrapEvalInvalid()
 }
 
@@ -574,24 +490,6 @@ fun ctBridgeReturnString(value: string): i64 =
 
 @export("abla_ct_bridge_return_handle")
 fun ctBridgeReturnHandle(handle: i64): i64 = ctBridgeReturn(ctBridgeUnbox(handle))
-
-// The source of entry `entry` (an exported symbol name) calling `handler`.
-// Kinds: "subparser" (ParserCursor) -> SyntaxExpression, "finalizer"
-// (string, SyntaxExpression) -> string, "generated-finalizer" (string,
-// SyntaxExpression) -> GeneratedModuleBuilder, "transform" () -> void.
-fun ctBridgeEntrySource(entry: string, handler: string, kind: string): string {
-    val call = if (kind == "subparser") {
-        "    ablaCtBridgeReturnHandle($handler(ParserCursor(ablaCtBridgeEntryHandle(0))).ctHandle)\n"
-    } else if (kind == "finalizer") {
-        "    ablaCtBridgeReturnString($handler(ablaCtBridgeEntryString(0), SyntaxExpression(ablaCtBridgeEntryHandle(1))))\n"
-    } else if (kind == "generated-finalizer") {
-        "    ablaCtBridgeReturnHandle($handler(ablaCtBridgeEntryString(0), SyntaxExpression(ablaCtBridgeEntryHandle(1))).ctHandle)\n"
-    } else if (kind == "transform") {
-        "    $handler()\n    ablaCtBridgeReturnVoid()\n"
-    } else ""
-    if (call == "") ""
-    else "@export(\"$entry\")\ntrusted fun __$entry(): int {\n$call    0\n}\n"
-}
 
 // Stub generation: the native replacements of compiler API declarations.
 
@@ -819,29 +717,6 @@ fun bootstrapCtSliceShims(declaration: BootstrapDeclaration): array<BootstrapDec
                 shim.isSealed, shim.isPrivate, shim.typeParameters
             ))
         }
-    }
-    shims
-}
-
-// The JIT tier's entry: the replacement declarations for every declaration
-// of `declarations` that native code reaches through the bridge, in order.
-// Each replacement keeps the replaced declaration's name and source identity.
-fun bootstrapCtBridgeShims(
-    declarations: array<BootstrapDeclaration>
-): array<BootstrapDeclaration> {
-    val shims: array<BootstrapDeclaration> = []
-    var index = 0
-    while (index < declarations.size) {
-        val source = ctBridgeReplacementSource(declarations[index])
-        if (source != "") {
-            val parsed = bootstrapParseWithIdentity(
-                source, declarations[index].sourceIdentity
-            )
-            if (parsed.errors == 0 && parsed.declarations.size == 1) {
-                shims.append(parsed.declarations[0])
-            }
-        }
-        index = index + 1
     }
     shims
 }
