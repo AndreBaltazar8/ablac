@@ -126,6 +126,53 @@ while IFS= read -r command; do
     fi
 done <"$output/commands.txt"
 
+# RUN_TESTS_SHARD=i/n runs shard i of n (1-based): every selected command is in exactly one shard. The commands are dealt out longest
+# first to the shard with the least cost so far (the cost is a command's CPU seconds in the history, else its wall seconds, else 20), so the shards
+# are about as long as each other; test-self-hosted.sh and the commands that wait for it are one unit (they share its build directories).
+# The same history file (tools/test-times.tsv, or the last run's) makes the same split on every machine of a CI matrix: a run's history must not
+# decide it, so a sharded run reads tools/test-times.tsv only. tools/test-shards.sh checks the split.
+shard_index=1
+shard_count=1
+if [[ -n ${RUN_TESTS_SHARD:-} ]]; then
+    [[ $RUN_TESTS_SHARD =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] || { echo "RUN_TESTS_SHARD must look like 1/2, got $RUN_TESTS_SHARD" >&2; exit 2; }
+    shard_index=${BASH_REMATCH[1]}
+    shard_count=${BASH_REMATCH[2]}
+    ((shard_index <= shard_count)) || { echo "RUN_TESTS_SHARD: shard $shard_index of $shard_count" >&2; exit 2; }
+    history=$project_root/tools/test-times.tsv
+fi
+shard_filter() { # "n<TAB>command<TAB>group" lines in, the lines of this shard out
+    if ((shard_count == 1)); then cat; return; fi
+    awk -F'\t' -v history="$project_root/tools/test-times.tsv" -v idx="$shard_index" -v count="$shard_count" '
+        function key(command) { gsub(/[^ ;]*ablac[^ ;]*/, "COMPILER", command); return command }
+        BEGIN {
+            while ((getline line < history) > 0) {
+                split(line, field, "\t")
+                if (field[3] ~ /^[0-9.]+$/) cost[key(field[4])] = (field[5] + 0 > 0 ? field[5] + 0 : field[3] + 0)
+            }
+        }
+        {
+            lines++; number[lines] = $1; text[lines] = $0
+            c = (key($2) in cost ? cost[key($2)] : 20)
+            if ($3 == 1) { unit[lines] = 0; unitcost[0] += c; if (!(0 in first)) first[0] = lines }
+            else { unit[lines] = lines; unitcost[lines] = c; first[lines] = lines }
+        }
+        END {
+            # The units by cost, longest first (ties: the earlier command).
+            for (u in unitcost) order[++units] = u + 0
+            for (i = 1; i <= units; i++) for (j = i + 1; j <= units; j++) {
+                a = order[i]; b = order[j]
+                if (unitcost[b] > unitcost[a] || (unitcost[b] == unitcost[a] && first[b] < first[a])) { order[i] = b; order[j] = a }
+            }
+            for (s = 1; s <= count; s++) load[s] = 0
+            for (i = 1; i <= units; i++) {
+                best = 1
+                for (s = 2; s <= count; s++) if (load[s] < load[best]) best = s
+                shard[order[i]] = best; load[best] += unitcost[order[i]]
+            }
+            for (l = 1; l <= lines; l++) if (shard[unit[l]] == idx) print text[l]
+        }' | cut -f1,2
+}
+
 # "<seconds> <n>" for every selected command, the longest of the last run
 # first (unknown ones keep the recipe's order, after the known ones).
 order() {
@@ -135,8 +182,11 @@ order() {
         [[ -z $command ]] && continue
         [[ -z $filter || $command =~ $filter ]] || continue
         [[ -n $exclude && $command =~ $exclude ]] && continue
-        printf '%s\t%s\n' "$n" "$command"
-    done <"$output/commands.txt" |
+        # The third column is 1 for what must run in the same shard as test-self-hosted.sh (it and the commands that wait for it).
+        group=0
+        [[ $command == *tools/test-self-hosted.sh* || -n $(serial_reason "$command") ]] && group=1
+        printf '%s\t%s\t%s\n' "$n" "$command" "$group"
+    done <"$output/commands.txt" | shard_filter |
         awk -F'\t' -v history="$history" -v compiler="$compiler" '
             function key(command) {
                 # The compiler differs between runs; the command does not.
@@ -166,6 +216,9 @@ while IFS= read -r n; do
         parallel+=("$n")
     fi
 done < <(order)
+
+# RUN_TESTS_LIST=1: print the numbers of the selected commands, one per line (the parallel ones, then the ones waiting for test-self-hosted.sh), and stop.
+if [[ -n ${RUN_TESTS_LIST:-} ]]; then printf '%s\n' ${parallel[@]+"${parallel[@]}"} ${serial[@]+"${serial[@]}"}; exit 0; fi
 
 running_pids=()
 running_ns=()
@@ -284,7 +337,7 @@ run_all "$jobs" ${parallel[@]+"${parallel[@]}"}
 sort -n -o "$output/results.tsv" "$output/results.tsv" 2>/dev/null
 # A whole run only: a filtered run or a command file of its own (make test-quick) would leave the next run its order
 # for the few commands it ran.
-if [[ -z $filter && -z ${RUN_TESTS_COMMANDS:-} && -s $output/results.tsv ]]; then
+if [[ -z $filter && -z ${RUN_TESTS_COMMANDS:-} && -z ${RUN_TESTS_SHARD:-} && -s $output/results.tsv ]]; then
     mkdir -p "$(dirname "$history_file")" && cp "$output/results.tsv" "$history_file"
 fi
 elapsed=$(awk -v b="$started_at" -v e="$(seconds_now)" 'BEGIN { printf "%d", e - b }')
