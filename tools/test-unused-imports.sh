@@ -206,12 +206,15 @@ grep -qxF 'warning[W_UNUSED_IMPORT]: main.ab: nothing `import "./kit.ab"` declar
     fail "syntax: main.ab's unused kit.ab isn't warned" "$work/syntax.log"
 
 # An import line that calls a provider (`import providedSource()`) uses the module declaring it: ./source.ab gets no
-# warning though no other line names it.
+# warning though no other line names it, in main.ab or idle.ab. idle.ab uses nothing the provided package declares: its
+# one warning names the import as written, unquoted.
 (cd "$work/provider" && ABLA_PACKAGE_CACHE="$work/provider/cache" "$compiler" package update --project .) \
     > "$work/provider.log" 2>&1 || fail "provider: package update failed" "$work/provider.log"
 (cd "$work/provider" && ABLA_PACKAGE_CACHE="$work/provider/cache" "$compiler" build main.ab -o program --fast) \
     >> "$work/provider.log" 2>&1 || fail "provider/main.ab doesn't build" "$work/provider.log"
-! grep -q 'W_UNUSED_IMPORT' "$work/provider.log" || fail "an import a provider call uses is called unused" "$work/provider.log"
+[[ $(grep -c 'W_UNUSED_IMPORT' "$work/provider.log") == 1 ]] || fail "provider: not exactly one warning" "$work/provider.log"
+grep -qxF 'warning[W_UNUSED_IMPORT]: idle.ab: nothing `import providedSource()` declares is used here' "$work/provider.log" ||
+    fail "provider: idle.ab's unused provider import isn't named as written" "$work/provider.log"
 
 # A module with a runtime hook (`fun __abla...`) matters by being loaded.
 (cd "$work/hook" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/hook.log" 2>&1 ||
