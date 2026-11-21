@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Manual only. No CI hook. Run --help for the measurement contract.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+if [[ ${1:-} == --help ]]; then
+    cat <<'HELP'
+tools/bench-languages/run --output NEW_DIRECTORY [--compiler ABSOLUTE_PATH]
+  [--programs 'hello binary-trees ...'] [--languages 'c abla rust go zig']
+  [--rounds 5] [--compile-rounds 3] [--smoke]
+Defaults: all ten programs; C is required as the baseline. Re-enters the hash-pinned
+Nix shell. --smoke uses small correctness inputs, 1 compile/run, 10 hello starts,
+100 HTTP requests. Full: one warmup, rotated samples; 100 hello starts per sample;
+10k POSTs, 256-byte echoed body, one connection, no keepalive (pinned oha).
+Each build and sample queues separately on shared build slot BENCH_SLOT (4),
+pinned to BENCH_CPU (24). Queue time is excluded. Never run alongside a gate
+outside this mechanism. This tool does not drop OS caches or change governors.
+Results include load and raw samples; shared-machine timing is descriptive.
+HELP
+    exit 0
+fi
+if [[ ${BENCH_NIX_PIN:-} != 6510408d147d8c5e6d76043e899e9251756f6a75 ]]; then
+    printf -v invocation '%q ' "$root/tools/bench-languages/run" "$@"
+    exec nix-shell "$root/tools/bench-languages/shell.nix" --run "$invocation"
+fi
+output='' compiler=$root/build/ablac.bin
+programs='binary-trees fannkuch n-body spectral-norm mandelbrot fasta json regex-redux http-echo hello'
+languages='c abla rust go zig' rounds=5 compiles=3 smoke=0 startup=100 http_requests=10000
+while (($#)); do
+    case $1 in
+        --output) output=$2; shift 2;;
+        --compiler) compiler=$2; shift 2;;
+        --programs) programs=$2; shift 2;;
+        --languages) languages=$2; shift 2;;
+        --rounds) rounds=$2; shift 2;;
+        --compile-rounds) compiles=$2; shift 2;;
+        --smoke) smoke=1; shift;;
+        *) echo "unknown option: $1" >&2; exit 2;;
+    esac
+done
+[[ -n $output ]] || { echo '--output is required' >&2; exit 2; }
+[[ -n $programs ]] || { echo '--programs must not be empty' >&2; exit 2; }
+[[ $rounds =~ ^[1-9][0-9]*$ && $compiles =~ ^[1-9][0-9]*$ ]] || exit 2
+[[ " $languages " == *' c '* ]] || { echo 'C baseline is required' >&2; exit 2; }
+for lang in $languages; do case $lang in c|abla|rust|go|zig);; *) echo "bad language $lang" >&2;exit 2;; esac; done
+for name in $programs; do case $name in hello|binary-trees|fannkuch|n-body|spectral-norm|mandelbrot|fasta|json|regex-redux|http-echo);; *) echo "bad program $name" >&2;exit 2;; esac; done
+for selection in "$languages" "$programs"; do
+    read -ra selected <<< "$selection"
+    [[ ${#selected[@]} == $(printf '%s\n' "${selected[@]}" | sort -u | wc -l) ]] || { echo 'duplicate language/program' >&2; exit 2; }
+done
+if ((smoke)); then rounds=1; compiles=1; startup=10; http_requests=100; fi
+compiler=$(realpath "$compiler")
+[[ -x $compiler ]] || { echo "no compiler: $compiler" >&2; exit 2; }
+output=$(realpath -m "$output")
+[[ ! -e $output ]] || { echo "output already exists: $output" >&2; exit 2; }
+mkdir -p "$output"/{bins,logs,cache,inputs}
+exec 9>"$output/runner.lock"
+flock -n 9 || exit 2
+slot=${BENCH_SLOT:-4}; cpu=${BENCH_CPU:-24}
+common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)
+fair=${FAIR_FLOCK:-$(dirname -- "$(dirname -- "$common")")/novakind/tools/fair-flock}
+[[ -x $fair && $slot =~ ^[2-4]$ && $cpu =~ ^[0-9]+$ ]] || exit 2
+export LC_ALL=C GOMAXPROCS=1
+# Remove compiler behaviour overrides before they reach measured processes.
+bench_llvm_tools=${ABLA_LLVM_TOOLS:-}
+bench_llvm_lib=${ABLA_LINUX_LLVM_LIB:-}
+bench_ssl_lib=${ABLA_LINUX_OPENSSL_LIB:-}
+while IFS='=' read -r key _; do [[ $key == ABLA_* ]] && unset "$key"; done < <(env)
+# The pinned shell's LLVM locations are restored for all Abla builds.
+export ABLA_SYSROOT=$root ABLA_LLVM_TOOLS=$bench_llvm_tools ABLA_LINUX_LLVM_LIB=$bench_llvm_lib ABLA_LINUX_OPENSSL_LIB=$bench_ssl_lib
+# The compiler is pinned by content hash and the worktree supplies its sysroot.
+helper=$output/bins/measure
+"$fair" --max-hold 600 --close "/tmp/novakind-build.slot$slot" taskset -c "$cpu" env ABLA_NATIVE_JOBS=2 ABLA_CODEGEN_JOBS=2 "$compiler" build "$root/tools/bench-languages/measure.ab" -o "$helper" --no-cache >"$output/logs/helper.log" 2>&1
+cp "$root/tools/bench-languages/build-one.sh" "$output/logs/build-command.sh"
+versions=$(jq -n --arg c "$(gcc --version | head -1)" --arg rust "$(rustc --version)" --arg go "$(go version)" --arg zig "$(zig version)" --arg abla "$("$compiler" --version)" --arg oha "$(oha --version)" '{c:$c,rust:$rust,go:$go,zig:$zig,abla:$abla,oha:$oha}')
+for tool in gcc rustc go zig oha jq strip; do command -v "$tool"; done > "$output/logs/tool-paths.txt"
+(cd "$root" && git status --porcelain) > "$output/logs/source-status.txt"
+(cd "$root" && find tools/bench-languages tests/benchmarks/languages -type f -print0 | sort -z | xargs -0 sha256sum) > "$output/logs/sources.sha256"
+jq -n --arg source "$(git -C "$root" rev-parse HEAD)" --arg compiler "$compiler" --arg hash "$(sha256sum "$compiler" | cut -d' ' -f1)" --arg pin "$BENCH_NIX_PIN" --arg host "$(uname -a)" --arg cpu "$cpu" --arg slot "$slot" --argjson versions "$versions" --argjson smoke "$smoke" --argjson rounds "$rounds" --argjson compileRounds "$compiles" '{schemaVersion:1,metadata:{sourceCommit:$source,compiler:$compiler,compilerSha256:$hash,nixpkgsCommit:$pin,host:$host,cpu:$cpu,slot:$slot,versions:$versions,smoke:($smoke==1),rounds:$rounds,compileRounds:$compileRounds},samples:[]}' > "$output/metadata.json"
+cat /proc/cpuinfo > "$output/logs/cpuinfo.txt"
+: > "$output/samples.jsonl"
+finish() {
+    local rc=$?
+    trap - EXIT
+    [[ -n ${server_pid:-} ]] && kill "$server_pid" 2>/dev/null || true
+    jq --slurpfile samples "$output/samples.jsonl" --argjson rc "$rc" '.samples=$samples|.status=(if $rc==0 then "complete" else "failed" end)' "$output/metadata.json" > "$output/raw.json"
+    if ((rc==0)); then
+        jq -f "$root/tools/bench-languages/summarize.jq" "$output/raw.json" > "$output/results.json"
+        "$root/tools/bench-languages/report.sh" "$output/results.json" > "$output/report.md"
+        echo "Results: $output/report.md"
+    else
+        echo "Benchmark failed; evidence in $output/raw.json and logs/" >&2
+    fi
+    exit "$rc"
+}
+trap finish EXIT
+# Fixtures are generated outside every timed region. Sorted keys make JSON byte
+# equality possible even for Go's map serializer; no floating conversion ambiguity.
+awk 'BEGIN{printf "[";for(i=0;i<2048;i++){if(i)printf ",";printf "{\"active\":true,\"id\":%d,\"name\":\"item\\n\\\"\\\\\",\"values\":[1,2,3,null]}",i};printf "]"}' > "$output/inputs/data.json"
+printf '%0256d' 0 > "$output/inputs/payload"
+# A fixed DNA fixture independent of any measured language implementation.
+awk 'BEGIN{s=42;print ">fixture";for(i=0;i<500000;i++){s=(s*3877+29573)%139968;r=s/139968;printf "%s",r<0.27?"a":r<0.39?"c":r<0.51?"g":r<0.78?"t":substr("BDHKMNRSVWY",int((r-0.78)/0.02)+1,1);if(i%60==59)printf "\n"};printf "\ntHaN aND caN HaD WaS aN aS at BY <foo> |abc|\n"}' > "$output/inputs/dna.fasta"
+if ((smoke)); then head -c 10000 "$output/inputs/dna.fasta" > "$output/inputs/dna.small"; mv "$output/inputs/dna.small" "$output/inputs/dna.fasta"; fi
+input_for() {
+    case $1 in
+        binary-trees) if ((smoke)); then echo 6; else echo 18; fi;;
+        fannkuch) if ((smoke)); then echo 6; else echo 11; fi;;
+        n-body) if ((smoke)); then echo 1000; else echo 5000000; fi;;
+        spectral-norm) if ((smoke)); then echo 30; else echo 1500; fi;;
+        mandelbrot) if ((smoke)); then echo 33; else echo 2000; fi;;
+        fasta) if ((smoke)); then echo 100; else echo 1000000; fi;;
+        json) if ((smoke)); then echo 1; else echo 100; fi;;
+        *) echo 1;;
+    esac
+}
+# Verify complete outputs (binary PBM included), JSON semantic preservation and
+# bounded floating errors, both before timing and on EVERY measured runtime.
+verify() {
+    local name=$1 actual=$2 reference=$3
+    [[ $name == json ]] && reference=$output/inputs/expected.json
+    "$root/tools/bench-languages/verify.sh" "$name" "$actual" "$reference"
+}
+jq -S -c . "$output/inputs/data.json" > "$output/inputs/expected.json"
+read -ra langs <<< "$languages"
+for name in $programs; do
+    echo "PROGRAM $name"
+    arg=$(input_for "$name")
+    args=("$arg")
+    [[ $name == json ]] && args+=("$output/inputs/data.json")
+    [[ $name == regex-redux ]] && args+=("$output/inputs/dna.fasta")
+    [[ $name == hello ]] && args=()
+    for ((round=0;round<compiles;round++)); do
+        for ((li=0;li<${#langs[@]};li++)); do
+            lang=${langs[$(((li+round)%${#langs[@]}))]}
+            target=$output/bins/$lang-$name
+            stem=$output/logs/build-$lang-$name-$round
+            # Fresh output and private language caches, including Go stdlib and
+            # Zig compiler-rt caches; preinstalled toolchain libraries stay warm.
+            rm -f -- "$target"
+            "$fair" --max-hold 600 --close "/tmp/novakind-build.slot$slot" taskset -c "$cpu" "$helper" 1 "$stem.stdout" "$stem.stderr" bash "$root/tools/bench-languages/build-one.sh" "$lang" "$name" "$target" "$compiler" > "$stem.ns"
+            jq -n --arg program "$name" --arg language "$lang" --argjson round "$round" --argjson ns "$(cat "$stem.ns")" '{kind:"compile",program:$program,language:$language,round:$round,wallSeconds:($ns/1e9)}' >> "$output/samples.jsonl"
+            rm -rf -- "$target.go-cache" "$target.zig-cache" "$target.zig-global" "$target.abla-cache"
+        done
+    done
+    for lang in $languages; do
+        target=$output/bins/$lang-$name
+        strip -o "$target.stripped" "$target"
+        jq -n --arg program "$name" --arg language "$lang" --arg sha256 "$(sha256sum "$target" | cut -d' ' -f1)" --argjson rawBytes "$(stat -c %s "$target")" --argjson strippedBytes "$(stat -c %s "$target.stripped")" '{kind:"size",program:$program,language:$language,rawBytes:$rawBytes,strippedBytes:$strippedBytes,sha256:$sha256}' >> "$output/samples.jsonl"
+    done
+    if [[ $name != http-echo ]]; then
+        # C reference; then one untimed warmup per arm, checked before samples.
+        "$fair" --max-hold 600 --close "/tmp/novakind-build.slot$slot" taskset -c "$cpu" "$output/bins/c-$name" "${args[@]}" > "$output/logs/$name.reference"
+        for lang in $languages; do
+            "$fair" --max-hold 600 --close "/tmp/novakind-build.slot$slot" taskset -c "$cpu" "$output/bins/$lang-$name" "${args[@]}" > "$output/logs/$lang-$name.warmup"
+            verify "$name" "$output/logs/$lang-$name.warmup" "$output/logs/$name.reference"
+        done
+    fi
+    for ((round=0;round<rounds;round++)); do
+        for ((li=0;li<${#langs[@]};li++)); do
+            lang=${langs[$(((li+round)%${#langs[@]}))]}
+            target=$output/bins/$lang-$name
+            stem=$output/logs/run-$lang-$name-$round
+            load=$(cat /proc/loadavg)
+            if [[ $name == http-echo ]]; then
+                # Entire server+load sample under one slot. The child runner
+                # records real server VmHWM; no oha/client RSS is mixed in.
+                "$fair" --max-hold 600 --close "/tmp/novakind-build.slot$slot" bash "$root/tools/bench-languages/http-one.sh" "$target" "$stem" "$output/inputs/payload" "$http_requests" "$cpu"
+                jq -n --arg program "$name" --arg language "$lang" --argjson round "$round" --arg load "$load" --slurpfile metrics "$stem.metrics.json" '{kind:"runtime",program:$program,language:$language,round:$round,load:$load}+ $metrics[0]' >> "$output/samples.jsonl"
+            else
+                "$fair" --max-hold 600 --close "/tmp/novakind-build.slot$slot" taskset -c "$cpu" "$helper" 1 "$stem.stdout" "$stem.stderr" "$BENCH_TIME" -o "$stem.rss" -f '%M' "$target" "${args[@]}" > "$stem.ns"
+                verify "$name" "$stem.stdout" "$output/logs/$name.reference"
+                jq -n --arg program "$name" --arg language "$lang" --argjson round "$round" --arg load "$load" --argjson ns "$(cat "$stem.ns")" --argjson rss "$(cat "$stem.rss")" '{kind:"runtime",program:$program,language:$language,round:$round,load:$load,wallSeconds:($ns/1e9),rssBytes:($rss*1024)}' >> "$output/samples.jsonl"
+                if [[ $name == hello ]]; then
+                    "$fair" --max-hold 600 --close "/tmp/novakind-build.slot$slot" taskset -c "$cpu" "$helper" "$startup" /dev/null "$stem.startup.stderr" "$target" > "$stem.startup.ns"
+                    jq -n --arg program "$name" --arg language "$lang" --argjson round "$round" --argjson count "$startup" --argjson ns "$(cat "$stem.startup.ns")" '{kind:"startup",program:$program,language:$language,round:$round,count:$count,wallSeconds:($ns/1e9/$count)}' >> "$output/samples.jsonl"
+                fi
+            fi
+        done
+    done
+done
