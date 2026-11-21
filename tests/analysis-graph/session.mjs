@@ -1028,7 +1028,21 @@ async function sqlSubparsers() {
     await s.close();
 }
 
-const tests = { sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+// refactor/validate answers with the prospective snapshot WITH its occurrences (a client that renames a symbol the edit moved needs them):
+// the snapshot the service holds has them null, an answer carries them made.
+async function validateOccurrences() {
+    const p = fixture('validate-occurrences', { 'main.ab': 'fun helper(x: int): int = x + 1\n\nfun main: int = helper(2)\n' });
+    const s = await start(p, { mode: 'graph-v2' });
+    const a = await s.analyze();
+    const main = doc(a, path.join(p, 'main.ab'));
+    const v = (await s.rpc('refactor/validate', { baseRevision: a.revision, edits: [{ uri: main.uri, start: 0, end: 0, newText: '// note\n' }], invariants: ['no-new-errors'] })).result;
+    assert.equal(v.valid, true, v.reason);
+    const prospective = doc(v.snapshot, path.join(p, 'main.ab'));
+    assert.ok(Array.isArray(prospective.occurrences) && prospective.occurrences.length > 0, 'the prospective document carries its occurrences');
+    await s.close();
+}
+
+const tests = { validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
