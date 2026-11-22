@@ -253,6 +253,7 @@ test-serial: ablac
 	tools/test-xml-literals.sh $(COMPILER)
 	tools/test-sql.sh $(COMPILER)
 	tools/test-generators-tasks.sh $(COMPILER)
+	tools/test-loop-scalar-global.sh $(COMPILER)
 	tools/test-generator-borrowed-container.sh $(COMPILER)
 	tools/test-owned-container-loop.sh $(COMPILER)
 	tools/test-map-temporary-loop.sh $(COMPILER)

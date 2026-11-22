@@ -2764,7 +2764,7 @@ fun bootstrapLlvmEmitNativeCall(
     if (supported) {
         var result: i64* = nativeNullPointer()
         // x86-64 Linux and an aarch64 Android library, release or debug (--fast): the system call, not libc's.
-        val compact = runtime && (instruction.text == "write" || instruction.text == "_exit") &&
+        val compact = runtime && bootstrapLlvmRuntimeKernelIo(instruction.text) &&
             (bootstrapLlvmStackGuardKernel(backend) || bootstrapLlvmAndroidArm64Library(backend))
         if (compact) {
             result = bootstrapLlvmLinuxX64Syscall(
@@ -7865,6 +7865,29 @@ fun bootstrapLlvmDebugDeclareFunctionVariables(
     return
 }
 
+class BootstrapLlvmLoopGlobal(val name: string, val type: i64*, val address: i64*, val slot: i64*)
+
+fun bootstrapLlvmPrepareLoopGlobal(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    name: string
+): BootstrapLlvmLoopGlobal? {
+    if (name == "") return null
+    val address = LLVMGetNamedGlobal(backend.module, bootstrapLlvmGlobalSymbol(name))
+    if (pointerIsNull(address) || LLVMGetLinkage(address) != llvmInternalLinkage()) return null
+    val type = backend.type(bootstrapLlvmGlobalScalarType(program, name))
+    val slot = LLVMBuildAlloca(backend.builder, type, "loop.global.slot")
+    val initial = LLVMBuildLoad2(backend.builder, type, address, "loop.global.initial")
+    LLVMBuildStore(backend.builder, initial, slot)
+    BootstrapLlvmLoopGlobal(name, type, address, slot)
+}
+
+fun bootstrapLlvmCommitLoopGlobal(backend: BootstrapLlvmBackend, state: BootstrapLlvmLoopGlobal): void {
+    val value = LLVMBuildLoad2(backend.builder, state.type, state.slot, "loop.global.final")
+    LLVMBuildStore(backend.builder, value, state.address)
+    return
+}
+
 fun bootstrapLlvmEmitFunction(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -7877,6 +7900,9 @@ fun bootstrapLlvmEmitFunction(
     classIndex: BootstrapLlvmNameIndex,
     fieldIndex: BootstrapLlvmNameIndex,
     mayCollect: array<bool>,
+    nativeFunctionRoots: array<bool>,
+    addressTaken: array<bool>,
+    loopGlobalsClosed: bool,
     assemblyRegionBegin: int,
     assemblyRegionEnd: int,
     assemblyRegionInstructions: array<int>,
@@ -7899,7 +7925,7 @@ fun bootstrapLlvmEmitFunction(
             bootstrapLlvmFloatReflectionFlag(backend), "float.reflection.enabled"))
         return 0
     }
-    if (backend.noPanicRecovery && function.name == "__ablaRuntimeHostRecover") {
+    if (bootstrapLlvmSkipsHostRecovery(function.name, backend.noPanicRecovery)) {
         LLVMBuildRet(backend.builder, LLVMConstInt(backend.i64Type, 0, 0))
         return 0
     }
@@ -7972,11 +7998,13 @@ fun bootstrapLlvmEmitFunction(
     val collecting = functionId < mayCollect.size &&
         mayCollect[functionId] && !runtimeImplementation
     var directlyAllocates = false
+    var writesGlobal = false
     var allocationInstruction = 0
     while (allocationInstruction < function.instructions.size) {
         if (bootstrapLlvmInstructionMayAllocate(
             function.instructions[allocationInstruction]
         )) directlyAllocates = true
+        if (function.instructions[allocationInstruction].opcode == "global.assign") writesGlobal = true
         allocationInstruction = allocationInstruction + 1
     }
     val pressure = backend.pressureSafePoints && collecting &&
@@ -8029,6 +8057,17 @@ fun bootstrapLlvmEmitFunction(
         backend, function, llvmFunction, collecting, rootValues,
         rootLocals, localIndex, scalarPlan, tables
     )
+    // The slot is local to this invocation. Every ordinary exit publishes
+    // the final scalar, and a closed executable has no recoverable panic.
+    val loopGlobal = if (writesGlobal && function.blocks.size > 2 &&
+        loopGlobalsClosed &&
+        !runtimeImplementation && !debug.variables && !addressTaken[functionId] &&
+        !nativeFunctionRoots[functionId]) {
+        val candidate = bootstrapLlvmLoopGlobalCandidate(program, function, functionId, functionIndex, backend.noPanicRecovery)
+        if (candidate != "" && !bootstrapLlvmReachesCall(
+            program, functionIndex, addressTaken, nativeFunctionRoots, [function.name]
+        )) bootstrapLlvmPrepareLoopGlobal(backend, program, candidate) else null
+    } else null
     bootstrapLlvmInitializeParameters(
         backend, function, llvmFunction, storage
     )
@@ -8800,6 +8839,7 @@ fun bootstrapLlvmEmitFunction(
         }
         if (reachable && (opcodeHead == 114 && opcode == "return")) {
             matched = true
+            if (loopGlobal != null) bootstrapLlvmCommitLoopGlobal(backend, loopGlobal)
             bootstrapLlvmEmitFunctionReturn(
                 backend, function, storage, instruction.left, output,
                 if (storage.gcLazy) pushedStates[instructionIndex] else 2
@@ -9287,7 +9327,8 @@ fun bootstrapLlvmEmitFunction(
             val found = globalIndex.find(instruction.text)
             if (found < 0) supported = false
             if (found >= 0) {
-                val global = LLVMGetNamedGlobal(
+                val global = if (loopGlobal != null && loopGlobal.name == instruction.text)
+                    loopGlobal.slot else LLVMGetNamedGlobal(
                     backend.module,
                     bootstrapLlvmGlobalSymbol(instruction.text)
                 )
@@ -9313,7 +9354,8 @@ fun bootstrapLlvmEmitFunction(
             val found = globalIndex.find(instruction.text)
             if (found < 0) supported = false
             if (found >= 0) {
-                val global = LLVMGetNamedGlobal(
+                val global = if (loopGlobal != null && loopGlobal.name == instruction.text)
+                    loopGlobal.slot else LLVMGetNamedGlobal(
                     backend.module,
                     bootstrapLlvmGlobalSymbol(instruction.text)
                 )
@@ -9383,6 +9425,7 @@ fun bootstrapLlvmEmitFunction(
         instructionIndex = instructionIndex + 1
     }
     if (!terminated) {
+        if (loopGlobal != null) bootstrapLlvmCommitLoopGlobal(backend, loopGlobal)
         bootstrapLlvmEmitFunctionReturn(
             backend, function, storage, function.result, output,
             if (storage.gcLazy) pushedStates[function.instructions.size] else 2

@@ -924,6 +924,178 @@ fun bootstrapLlvmHasSpinLoop(function: BootstrapIrFunction): bool {
     false
 }
 
+// For the scalar-global analysis, read and write complete synchronously.
+// A syscall wrapper can also be checked at its direct call sites.
+private fun bootstrapLlvmLoopGlobalSyscallArgument(
+    function: BootstrapIrFunction, value: int
+): int {
+    for (definition in function.instructions) {
+        if (definition.result != value) continue
+        if (definition.opcode == "const.i64" &&
+            (definition.text == "0" || definition.text == "1")) return -1
+        if (definition.opcode == "parameter.load") {
+            val parameter = bootstrapLlvmParameterId(function, definition.text)
+            if (parameter >= 0) return parameter
+        }
+        return -2
+    }
+    -2
+}
+
+fun bootstrapLlvmLoopGlobalsClosed(
+    program: BootstrapIrProgram,
+    reachable: array<bool>,
+    functionIndex: BootstrapLlvmNameIndex,
+    addressTaken: array<bool>,
+    nativeRoots: array<bool>
+): bool {
+    val syscallParameters = filledArray(program.functions.size, -1)
+    var hasSyscallWrapper = false
+    for (id in 0 until program.functions.size) {
+        if (!reachable[id]) continue
+        val function = program.functions[id]
+        if (bootstrapLlvmRuntimeFunction(function)) continue
+        if (nativeRoots[id]) return false
+        for (instruction in function.instructions) {
+            val opcode = instruction.opcode
+            if (opcode == "thread.create" || opcode == "task.create" ||
+                opcode == "extern.c" || opcode == "extern.host" ||
+                opcode == "inline.assembly" || opcode == "native.function.address") return false
+            if (opcode == "call" &&
+                (instruction.text == "__ablaRuntimeThreadCreate" ||
+                 instruction.text == "__ablaRuntimeTaskCreate")) return false
+            if (opcode == "extern.intrinsic") {
+                val intrinsic = instruction.text
+                if (intrinsic == "nativeLinkerSymbolAddress" ||
+                    bootstrapLlvmUnsafeCallIntrinsic(intrinsic) ||
+                    intrinsic.startsWith("ablaRuntimeCall")) return false
+                if (intrinsic == "ablaLinuxSyscall") {
+                    if (instruction.operands.size != 7) return false
+                    val argument = bootstrapLlvmLoopGlobalSyscallArgument(function, instruction.operands[0])
+                    if (argument == -2) return false
+                    if (argument >= 0) {
+                        // Entry points and methods may be invoked without a direct call in the IR.
+                        if (addressTaken[id] || function.name == "main" ||
+                            function.parameters[0] == "this" ||
+                            (syscallParameters[id] >= 0 && syscallParameters[id] != argument)) return false
+                        syscallParameters[id] = argument
+                        hasSyscallWrapper = true
+                    }
+                }
+            }
+        }
+    }
+    if (hasSyscallWrapper) {
+        for (id in 0 until program.functions.size) {
+            if (!reachable[id]) continue
+            val function = program.functions[id]
+            for (instruction in function.instructions) {
+                if (instruction.opcode != "call") continue
+                val target = functionIndex.find(instruction.text)
+                if (target < 0) continue
+                val parameter = syscallParameters[target]
+                if (parameter >= 0 && (instruction.operands.size <= parameter ||
+                    bootstrapLlvmLoopGlobalSyscallArgument(function, instruction.operands[parameter]) != -1)) return false
+            }
+        }
+    }
+    true
+}
+
+// This analysis only runs where these runtime calls lower directly to the kernel.
+fun bootstrapLlvmRuntimeKernelIo(name: string): bool = name == "write" || name == "_exit"
+
+fun bootstrapLlvmSkipsHostRecovery(name: string, noPanicRecovery: bool): bool =
+    noPanicRecovery && name == "__ablaRuntimeHostRecover"
+
+// A scalar global has no source-level address. A direct callee that only reaches
+// similarly checked callees cannot see it unless one of them names it.
+fun bootstrapLlvmLoopGlobalUnobserved(
+    program: BootstrapIrProgram,
+    functionIndex: BootstrapLlvmNameIndex,
+    owner: int,
+    name: string,
+    noPanicRecovery: bool
+): bool {
+    val visited = filledArray(program.functions.size, false)
+    val pending = [owner]
+    visited[owner] = true
+    var at = 0
+    while (at < pending.size) {
+        val id = pending[at]
+        val function = program.functions[id]
+        at += 1
+        // The emitted function returns zero without running its host body.
+        if (bootstrapLlvmSkipsHostRecovery(function.name, noPanicRecovery)) continue
+        for (instruction in function.instructions) {
+            val opcode = instruction.opcode
+            if (id != owner && instruction.text == name &&
+                (opcode == "global.load" || opcode == "global.assign" || opcode == "global.store")) return false
+            val intrinsic = opcode == "extern.intrinsic"
+            val runtimeBridge = intrinsic && !bootstrapLlvmCoreIntrinsic(instruction.text)
+            if (opcode == "call" || opcode == "resource.drop" || runtimeBridge) {
+                var target = instruction.text
+                if (opcode == "resource.drop") target = bootstrapDropFunctionName(target)
+                if (runtimeBridge) {
+                    if (!target.startsWith("abla")) return false
+                    val implementation = "__ablaRuntime${target.slice(4, target.size)}"
+                    if (bootstrapLlvmSelfHostedRuntimeSymbol(implementation) != target) return false
+                    target = implementation
+                }
+                val called = functionIndex.find(target)
+                if (called < 0 || called == owner) return false
+                if (!visited[called]) {
+                    visited[called] = true
+                    pending.append(called)
+                }
+            } else if (opcode == "extern.c") {
+                val native = instruction.text
+                if (!bootstrapLlvmRuntimeFunction(function) ||
+                    (native != "malloc" && native != "calloc" && native != "realloc" && native != "free" &&
+                     native != "pthread_mutex_lock" && native != "pthread_mutex_unlock" &&
+                     !bootstrapLlvmRuntimeKernelIo(native))) return false
+            } else if (intrinsic) {
+                val name = instruction.text
+                if (name == "nativeInitializeGlobals" || name == "nativeLinkerSymbolAddress" ||
+                    bootstrapLlvmUnsafeCallIntrinsic(name) || name.startsWith("ablaRuntimeCall")) return false
+            } else if (opcode == "extern.host" || opcode == "inline.assembly" ||
+                opcode == "closure.drop" || opcode.startsWith("call.indirect") ||
+                opcode.startsWith("interface.") || opcode.startsWith("native.function.") ||
+                opcode.startsWith("thread.") || opcode.startsWith("task.") ||
+                opcode.startsWith("generator.") || opcode.startsWith("stm.")) return false
+        }
+    }
+    true
+}
+
+@noinline
+fun bootstrapLlvmLoopGlobalCandidate(
+    program: BootstrapIrProgram,
+    function: BootstrapIrFunction,
+    functionId: int,
+    functionIndex: BootstrapLlvmNameIndex,
+    noPanicRecovery: bool
+): string {
+    val loops = bootstrapLlvmLoops(function)
+    val considered: Map<string, bool> = Map()
+    var loop = 0
+    while (loop < loops.starts.size) {
+        var at = loops.starts[loop]
+        while (at <= loops.ends[loop]) {
+            val instruction = function.instructions[at]
+            if (instruction.opcode == "global.assign" && !considered.has(instruction.text)) {
+                val name = instruction.text
+                considered.set(name, true)
+                if (bootstrapLlvmGlobalScalarType(program, name) != "" &&
+                    bootstrapLlvmLoopGlobalUnobserved(program, functionIndex, functionId, name, noPanicRecovery)) return name
+            }
+            at += 1
+        }
+        loop += 1
+    }
+    ""
+}
+
 fun bootstrapLlvmLoopSafePoint(loopSafePoints: array<bool>, index: int): bool =
     index < loopSafePoints.size && loopSafePoints[index]
 
