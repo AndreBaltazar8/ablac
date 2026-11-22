@@ -47,9 +47,10 @@ git -C $root cat-file blob 'HEAD:nix/llvm-instcombine-fdiv-zero.patch' > $patch
 $sourceArchive = Join-Path $work 'source.tar.gz'
 $prefix = "llvm-project-$commit"
 Invoke-WebRequest "https://codeload.github.com/AndreBaltazar8/llvm-project/tar.gz/$commit" -OutFile $sourceArchive
+# LLVM uses common utility headers from libc/. The unused MLGO scripts have symlinks.
 & "$env:SystemRoot/System32/tar.exe" -xf $sourceArchive -C $source --strip-components 1 `
     --exclude "$prefix/llvm/utils/mlgo-utils" `
-    "$prefix/cmake" "$prefix/llvm" "$prefix/lld" "$prefix/third-party"
+    "$prefix/cmake" "$prefix/libc" "$prefix/llvm" "$prefix/lld" "$prefix/third-party"
 Remove-Item $sourceArchive
 Push-Location (Join-Path $source 'llvm')
 try {
@@ -67,12 +68,16 @@ $cmakeOptions = @(
     '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
     '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON'
     '-DBUILD_SHARED_LIBS=OFF'
+    '-DLLVM_BUILD_LLVM_C_DYLIB=OFF'
     '-DLLVM_ENABLE_PROJECTS=lld'
     '-DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-pc-windows-msvc'
     '-DLLVM_TARGETS_TO_BUILD=all'
     '-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=Xtensa'
     '-DLLVM_BUILD_TOOLS=OFF'
+    '-DLLVM_TOOL_LTO_BUILD=OFF'
+    '-DLLVM_TOOL_REMARKS_SHLIB_BUILD=OFF'
     '-DLLVM_BUILD_UTILS=OFF'
+    '-DLLVM_INCLUDE_UTILS=OFF'
     '-DLLVM_INCLUDE_TESTS=OFF'
     '-DLLVM_INCLUDE_BENCHMARKS=OFF'
     '-DLLVM_INCLUDE_EXAMPLES=OFF'
@@ -88,15 +93,18 @@ cmake -G Ninja -S (Join-Path $source 'llvm') -B $build @cmakeOptions
 
 # Check the generated compile commands, so a CMake or toolset change cannot
 # silently build part of the archive with the DLL CRT.
-$compileCommands = Get-Content (Join-Path $build 'compile_commands.json') -Raw | ConvertFrom-Json
+# MASM and resource compiler invocations do not select a C runtime.
+$compileCommands = Get-Content (Join-Path $build 'compile_commands.json') -Raw | ConvertFrom-Json | Where-Object {
+    $_.file -notmatch '\.(?:asm|s|rc)$'
+}
 $wrongCrt = @($compileCommands | Where-Object {
     $_.command -notmatch '(?:^|\s)[/-]MT(?:\s|$)' -or $_.command -match '(?:^|\s)[/-]M(?:Dd?|Td)(?:\s|$)'
 })
 if (!$compileCommands -or $wrongCrt.Count) {
     $wrongCrt | Select-Object -First 3 | Format-List
-    throw 'Expected /MT in every LLVM and lld compile command'
+    throw 'Expected /MT in every LLVM and lld C/C++ compile command'
 }
-Write-Host "Verified /MT in $($compileCommands.Count) compile commands"
+Write-Host "Verified /MT in $($compileCommands.Count) C/C++ compile commands"
 
 # Build the default static libraries and just the command-line tools we check/ship.
 cmake --build $build --parallel 4 --target all opt llc llvm-readobj
