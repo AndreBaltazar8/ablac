@@ -233,6 +233,15 @@ grep -qxF 'import providedSource()' "$work/provider/main.ab" || fail "the prune 
     fail "the lookup prune failed" "$work/lookup-prune.log"
 grep -qxF 'import "./answer.ab"' "$work/lookup/main.ab" || fail "the prune removed the import a lookup finds" "$work/lookup/main.ab"
 
+# A library's reflection of its own declarations does not make its unused import used.
+(cd "$work/selflookup" && "$compiler" build main.ab -o program --fast) > "$work/selflookup.log" 2>&1 ||
+    fail "selflookup/main.ab doesn't build" "$work/selflookup.log"
+grep -qxF 'warning[W_UNUSED_IMPORT]: main.ab: nothing `import "./library.ab"` declares is used here' "$work/selflookup.log" ||
+    fail "a library's self lookup hid its unused import" "$work/selflookup.log"
+(cd "$work/selflookup" && "$compiler" fix-imports main.ab --prune) > "$work/selflookup-prune.log" 2>&1 ||
+    fail "the self-lookup prune failed" "$work/selflookup-prune.log"
+! grep -qxF 'import "./library.ab"' "$work/selflookup/main.ab" || fail "the prune kept the self-reflecting library" "$work/selflookup-prune.log"
+
 # A module with a runtime hook (`fun __abla...`) matters by being loaded.
 (cd "$work/hook" && "$compiler" build main.ab -o program --fast --warn-unused-imports) > "$work/hook.log" 2>&1 ||
     fail "hook/main.ab didn't build" "$work/hook.log"
