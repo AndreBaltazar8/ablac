@@ -1189,6 +1189,21 @@ async function incrementalBodyReplay() {
     try {
         assert.equal(await check('initial full check'), 0);
         let count = 0;
+        let seed = 7291;
+        for (let i = 0; i < 8; i++) {
+            seed ^= seed << 13;
+            seed ^= seed >>> 17;
+            seed ^= seed << 5;
+            const result = String((seed >>> 0) % (i % 2 === 0 ? 1e8 : 10));
+            await edit(original.replace('    42\n', '    ' + result + '\n'));
+            assert.equal(await check('changed integer result ' + i), ++count);
+        }
+        await edit(original);
+        assert.equal(await check('restore integer result'), ++count);
+        await edit(original.replace('    42\n', '    42.5\n'));
+        assert.equal(await check('changed result type'), count);
+        await edit(original);
+        assert.equal(await check('restore after changed result type'), count);
         for (let seed of [17, 863]) {
             for (let i = 0; i < 4; i++) {
                 seed ^= seed << 13;

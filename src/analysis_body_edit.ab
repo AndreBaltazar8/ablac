@@ -1,4 +1,4 @@
-// Replay checked results across a change to an unused integer binding.
+// Replay checked results across a narrowly verified, type-inert body edit.
 // Prove that both sources reduce to the same text and check the parsed body.
 // Other edits go through the ordinary checker.
 import "analysis_service.ab"
@@ -19,6 +19,14 @@ class BootstrapAnalysisBodyInsert(
     val previousLine: string = ""
 )
 
+fun bootstrapAnalysisBodyDecimal(text: string): bool {
+    if (text.size == 0 || text.size >= 10) return false
+    for (index in 0 until text.size) {
+        if (text[index] < 48 || text[index] > 57) return false
+    }
+    true
+}
+
 fun bootstrapAnalysisBodyInsertion(before: string, after: string): BootstrapAnalysisBodyInsert? {
     val size = after.size - before.size
     if (size <= 0 || size > 256) return null
@@ -38,13 +46,9 @@ fun bootstrapAnalysisBodyInsertion(before: string, after: string): BootstrapAnal
                 tokens[3].kind == BOOTSTRAP_TOKEN_INTEGER) {
                 val name = bootstrapTokenText(line, tokens[1])
                 val digits = bootstrapTokenText(line, tokens[3])
-                var decimal = digits.size > 0 && digits.size < 10
-                for (index in 0 until digits.size) {
-                    if (digits[index] < 48 || digits[index] > 57) decimal = false
-                }
                 // Require the single new name to be fresh throughout the
                 // source, including quoted text and interpolation.
-                if (decimal && before.indexOf(name) < 0 && !name.startsWith("__abla_") &&
+                if (bootstrapAnalysisBodyDecimal(digits) && before.indexOf(name) < 0 && !name.startsWith("__abla_") &&
                     !line.contains("//") && !line.contains("/*")) {
                     return BootstrapAnalysisBodyInsert(at, size, at + tokens[0].begin, name,
                         at + tokens[1].begin, at + tokens[1].end, line)
@@ -79,13 +83,36 @@ fun bootstrapAnalysisBodyReplacement(before: string, after: string): BootstrapAn
         fresh.nameBegin, fresh.nameEnd, fresh.line, old.size, old.line)
 }
 
+// Only the digits of a standalone decimal literal may change. The parsed
+// body check below establishes that this line is the function's result.
+fun bootstrapAnalysisBodyResult(before: string, after: string): BootstrapAnalysisBodyInsert? {
+    var first = 0
+    while (first < before.size && first < after.size && before[first] == after[first]) first = first + 1
+    val start = bootstrapAnalysisLineStart(before, first)
+    val oldEnd = before.indexOf("\n", first)
+    val newEnd = after.indexOf("\n", first)
+    if (oldEnd < 0 || newEnd < 0 || oldEnd - start >= 256 || newEnd - start >= 256 ||
+        before.slice(oldEnd, before.size) != after.slice(newEnd, after.size)) return null
+    var begin = start
+    while (begin < first && (after[begin] == 32 || after[begin] == 9)) begin = begin + 1
+    if (begin == start) return null
+    val oldDigits = before.slice(begin, oldEnd)
+    val newDigits = after.slice(begin, newEnd)
+    if (!bootstrapAnalysisBodyDecimal(oldDigits) || !bootstrapAnalysisBodyDecimal(newDigits) ||
+        (oldDigits.size > 1 && oldDigits[0] == 48) ||
+        (newDigits.size > 1 && newDigits[0] == 48)) return null
+    BootstrapAnalysisBodyInsert(begin, newDigits.size, begin, "", 0, 0, newDigits, oldDigits.size, oldDigits)
+}
+
 fun bootstrapAnalysisBodyChange(before: string, after: string): BootstrapAnalysisBodyInsert? {
     val insertion = bootstrapAnalysisBodyInsertion(before, after)
     if (insertion != null) return insertion
-    bootstrapAnalysisBodyReplacement(before, after)
+    val replacement = bootstrapAnalysisBodyReplacement(before, after)
+    if (replacement != null) return replacement
+    bootstrapAnalysisBodyResult(before, after)
 }
 
-fun bootstrapAnalysisPlainBodyInsertion(parsed: BootstrapParseResult, change: BootstrapAnalysisBodyInsert): bool {
+fun bootstrapAnalysisPlainBodyChange(parsed: BootstrapParseResult, change: BootstrapAnalysisBodyInsert): bool {
     if (parsed.errors != 0 || parsed.extensionErrors != 0) return false
     for (declaration in parsed.declarations) {
         val body = declaration.expression
@@ -93,7 +120,14 @@ fun bootstrapAnalysisPlainBodyInsertion(parsed: BootstrapParseResult, change: Bo
             declaration.typeParameters.size != 0 || declaration.annotations.size != 0 ||
             declaration.extensionOwner != "" || declaration.generatedNamespace != "" ||
             body.kind != "block" || body.begin >= change.at || body.end <= change.at + change.size ||
-            body.children.size < 2) continue
+            body.children.size == 0) continue
+        if (change.name == "") {
+            val result = body.children[body.children.size - 1]
+            if (declaration.resultType == "int" && result.kind == "integer" &&
+                result.begin == change.at && result.end == change.at + change.size) return true
+            continue
+        }
+        if (body.children.size < 2) continue
         val added = body.children[0]
         if (added.kind == "local.val" && added.text == change.name && added.begin == change.declarationBegin &&
             added.end <= change.at + change.size && added.children.size == 2 &&
@@ -142,7 +176,7 @@ fun bootstrapAnalysisReplayOccurrence(set: BootstrapAnalysisOccurrenceSet,
     val ends: array<int> = []
     val ids: array<string> = []
     val types: array<string> = []
-    var inserted = false
+    var inserted = id == ""
     var replaced = false
     for (i in 0 until set.begins.size) {
         val begin = set.begins[i]
@@ -156,7 +190,7 @@ fun bootstrapAnalysisReplayOccurrence(set: BootstrapAnalysisOccurrenceSet,
             inserted = true
         }
         if (begin >= change.at && begin < change.at + change.removed) {
-            if (replaced || end > change.at + change.removed || set.ids[i] != id || set.types[i] != "") return null
+            if (id == "" || replaced || end > change.at + change.removed || set.ids[i] != id || set.types[i] != "") return null
             replaced = true
             continue
         }
@@ -166,6 +200,6 @@ fun bootstrapAnalysisReplayOccurrence(set: BootstrapAnalysisOccurrenceSet,
         ids.append(set.ids[i])
         types.append(set.types[i])
     }
-    if (!inserted || (change.removed != 0 && !replaced)) return null
+    if (!inserted || (id != "" && change.removed != 0 && !replaced)) return null
     BootstrapAnalysisOccurrenceSet(begins, ends, ids, types)
 }
