@@ -1199,6 +1199,14 @@ async function incrementalBodyReplay() {
                 await edit(candidate);
                 assert.equal(await check('unused binding ' + i), count + 1);
                 count++;
+                const replacement = candidate.replace(' = ' + i + '\n', ' = ' + (100 + i) + '\n');
+                await edit(replacement);
+                assert.equal(await check('longer initializer ' + i), count + 1);
+                count++;
+                const shorter = replacement.replace(' = ' + (100 + i) + '\n', ' = ' + (i + 1) + '\n');
+                await edit(shorter);
+                assert.equal(await check('shorter initializer ' + i), count + 1);
+                count++;
                 await edit(candidate.replace('    42', '    intentionallyMissing()'));
                 assert.equal(await check('changed expression ' + i), count);
                 await edit(original);

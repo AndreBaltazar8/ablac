@@ -1,6 +1,6 @@
-// Replay a checked graph across the insertion of an unreferenced integer
-// binding. The proof operates on whole source lines and the parsed body;
-// other body edits continue through the ordinary checker.
+// Replay checked results across a change to an unused integer binding.
+// Prove that both sources reduce to the same text and check the parsed body.
+// Other edits go through the ordinary checker.
 import "analysis_service.ab"
 import "module.ab"
 import "parser.ab"
@@ -14,7 +14,9 @@ class BootstrapAnalysisBodyInsert(
     val name: string,
     val nameBegin: int,
     val nameEnd: int,
-    val line: string
+    val line: string,
+    val removed: int = 0,
+    val previousLine: string = ""
 )
 
 fun bootstrapAnalysisBodyInsertion(before: string, after: string): BootstrapAnalysisBodyInsert? {
@@ -55,6 +57,32 @@ fun bootstrapAnalysisBodyInsertion(before: string, after: string): BootstrapAnal
         at = end + 1
     }
     null
+}
+
+// Match a replacement by proving that both sides add the same unused
+// binding to one exact base source.
+fun bootstrapAnalysisBodyReplacement(before: string, after: string): BootstrapAnalysisBodyInsert? {
+    var first = 0
+    while (first < before.size && first < after.size && before[first] == after[first]) first = first + 1
+    if (first == before.size || first == after.size) return null
+    val start = bootstrapAnalysisLineStart(before, first)
+    val oldEnd = before.indexOf("\n", first)
+    val newEnd = after.indexOf("\n", first)
+    if (oldEnd < 0 || newEnd < 0 || oldEnd - start >= 256 || newEnd - start >= 256) return null
+    val left = before.slice(0, start)
+    val right = before.slice(oldEnd + 1, before.size)
+    val base = "$left$right"
+    val old = bootstrapAnalysisBodyInsertion(base, before)
+    val fresh = bootstrapAnalysisBodyInsertion(base, after)
+    if (old == null || fresh == null || old.at != fresh.at || old.name != fresh.name) return null
+    BootstrapAnalysisBodyInsert(fresh.at, fresh.size, fresh.declarationBegin, fresh.name,
+        fresh.nameBegin, fresh.nameEnd, fresh.line, old.size, old.line)
+}
+
+fun bootstrapAnalysisBodyChange(before: string, after: string): BootstrapAnalysisBodyInsert? {
+    val insertion = bootstrapAnalysisBodyInsertion(before, after)
+    if (insertion != null) return insertion
+    bootstrapAnalysisBodyReplacement(before, after)
 }
 
 fun bootstrapAnalysisPlainBodyInsertion(parsed: BootstrapParseResult, change: BootstrapAnalysisBodyInsert): bool {
@@ -101,8 +129,8 @@ fun bootstrapAnalysisReplayInputsAgree(before: BootstrapAnalysisReplayInputs,
     for (index in 0 until left.paths.size) {
         if (left.sources[index] == right.sources[index]) continue
         if (changed || left.paths[index] != path || left.hosts[index] != "") return false
-        val prepared = bootstrapAnalysisBodyInsertion(left.sources[index], right.sources[index])
-        if (prepared == null || prepared.line != change.line) return false
+        val prepared = bootstrapAnalysisBodyChange(left.sources[index], right.sources[index])
+        if (prepared == null || prepared.line != change.line || prepared.previousLine != change.previousLine) return false
         changed = true
     }
     changed
@@ -115,6 +143,7 @@ fun bootstrapAnalysisReplayOccurrence(set: BootstrapAnalysisOccurrenceSet,
     val ids: array<string> = []
     val types: array<string> = []
     var inserted = false
+    var replaced = false
     for (i in 0 until set.begins.size) {
         val begin = set.begins[i]
         val end = set.ends[i]
@@ -126,12 +155,17 @@ fun bootstrapAnalysisReplayOccurrence(set: BootstrapAnalysisOccurrenceSet,
             types.append("")
             inserted = true
         }
-        val shift = if (begin < change.at) 0 else change.size
+        if (begin >= change.at && begin < change.at + change.removed) {
+            if (replaced || end > change.at + change.removed || set.ids[i] != id || set.types[i] != "") return null
+            replaced = true
+            continue
+        }
+        val shift = if (begin < change.at) 0 else change.size - change.removed
         begins.append(begin + shift)
         ends.append(end + shift)
         ids.append(set.ids[i])
         types.append(set.types[i])
     }
-    if (!inserted) return null
+    if (!inserted || (change.removed != 0 && !replaced)) return null
     BootstrapAnalysisOccurrenceSet(begins, ends, ids, types)
 }
