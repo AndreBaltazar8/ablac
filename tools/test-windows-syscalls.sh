@@ -44,6 +44,7 @@ expect() { grep -qxE "$1" "$out/self.out" || fail "self.exe printed no line matc
 expect 'remainder 1\.5'
 expect 'trim 0 key 38'
 expect 'fchmod 0:292 0:420'
+expect 'null true 0'
 expect 'stack 8388608 8388608'
 expect 'descriptors 4096'
 expect 'affinity 8 bytes, some CPUs'
