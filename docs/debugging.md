@@ -189,6 +189,11 @@ stack the program printed. Frames outside the program
 (the C library's, in a program that links it) are left unnamed. Without
 `--backtrace` a release build is byte for byte what it was.
 
+On macOS, a `--backtrace` build on a Mac writes `<output>.dSYM` beside the
+program instead (dsymutil's bundle, tied to it by the image's UUID) and strips
+the program's debug map. `ablac symbolize` gives atos the bundle's DWARF, and
+lldb finds the bundle beside the program.
+
 A WebAssembly module's host walks its stack, so there `--backtrace` (on the
 build that runs `wasmBuildModule` or `buildProgram`) keeps the module's name
 section, its functions under their readable names, and a trap's stack in a

@@ -3518,6 +3518,60 @@ fun bootstrapSplitBacktraceDebug(linkedPath: string, outputPath: string, windows
     status
 }
 
+// The targets whose --backtrace executable gets its line tables beside it: an ELF program's (<output>.debug), a hosted
+// Windows one's (DWARF in a PE, the same) and, built on a Mac (dsymutil, strip and codesign are the host's), a macOS
+// one's (<output>.dSYM).
+fun bootstrapBacktraceSplitTarget(target: BootstrapTargetDescriptor): bool =
+    target.objectFormat == "elf" || (target.objectFormat == "coff" && target.hosted) ||
+        (target.objectFormat == "macho" && target.hosted && ablaHostIsMacOS())
+
+// A macOS --backtrace executable's DWARF (bootstrapLlvmBacktraceSplit): the linked program at `linkedPath` names its
+// objects in a debug map (the link-time-optimized one kept at `ltoObjectPath`), which dsymutil reads into
+// `<output>.dSYM` beside the program, its DWARF file named after the program and tied to it by the image's UUID;
+// `strip -S` then drops the debug map, and an image whose signature that broke (arm64's linker signature) is signed
+// again, ad hoc. atos (ablac symbolize) and lldb find the bundle beside the program.
+fun bootstrapSplitMacBacktraceDebug(linkedPath: string, outputPath: string, ltoObjectPath: string): int {
+    val bundle = "$outputPath.dSYM"
+    Path(bundle).removeTree()
+    val dsym = linuxCommand("dsymutil")
+    dsym.argument(linkedPath)
+    dsym.argument("-o")
+    dsym.argument(bundle)
+    var status = dsym.run()
+    if (status == 0) {
+        // dsymutil names the DWARF file after the image it read, here the link's scratch name.
+        val dwarf = "$bundle/Contents/Resources/DWARF"
+        val slash = outputPath.lastIndexOf("/")
+        val programName = if (slash >= 0) outputPath.slice(slash + 1, outputPath.size) else outputPath
+        for (entry in Path(dwarf).entries()) {
+            if (entry.name() != programName && !entry.moveTo(Path("$dwarf/$programName"))) status = 145
+        }
+    }
+    if (status == 0) {
+        val strip = linuxCommand("strip")
+        strip.argument("-S")
+        strip.argument(linkedPath)
+        status = strip.run()
+    }
+    if (status == 0) {
+        val verify = linuxCommand("codesign")
+        verify.argument("--verify")
+        verify.argument(linkedPath)
+        verify.errors("$linkedPath.codesign")
+        if (verify.run() != 0) {
+            val sign = linuxCommand("codesign")
+            sign.argument("--force")
+            sign.argument("--sign")
+            sign.argument("-")
+            sign.argument(linkedPath)
+            status = sign.run()
+        }
+        Path("$linkedPath.codesign").remove()
+    }
+    Path(ltoObjectPath).remove()
+    status
+}
+
 // Balanced function parts of a large release module. What is inlined and placed across a cut
 // changes the code, so this count is part of what the build produces and must not follow the
 // machine: bootstrapNativeParallelism only says how many parts are generated at once. Checked
@@ -5726,6 +5780,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             if (ltoEligible && !linkLlvm && !wholeProgram) {
                 link.argument("-O2")
                 link.argument("-flto")
+                // The object ld64 generates from the bitcode, which the debug map names, kept for dsymutil.
+                if (macTarget && bootstrapLlvmBacktraceSplit) link.argument("-Wl,-object_path_lto,$publishPath.lto.o")
             }
             if (macTarget) {
                 link.argument("--target=${target.llvmTriple}")
@@ -5960,7 +6016,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             linuxPrintStandardError("note: $outputPath links libc: $libcReason\n")
         }
         if (status == 0 && bootstrapLlvmBacktraceSplit) {
-            status = bootstrapSplitBacktraceDebug(publishPath, outputPath, false)
+            status = if (macTarget) bootstrapSplitMacBacktraceDebug(publishPath, outputPath, "$publishPath.lto.o")
+                else bootstrapSplitBacktraceDebug(publishPath, outputPath, false)
             if (status != 0) failureKind = "io"
         }
     }
