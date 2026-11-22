@@ -2057,6 +2057,8 @@ var __ablaRuntimeHostGrowthEstimate: int = 0
 
 // The live bytes the last collection kept (memoryHeapStat(13)); 0 before the first.
 var __ablaRuntimeHostCollectionKept: int = 0
+// Foreground collections finished, serial or parallel (memoryHeapStat(14)).
+var __ablaRuntimeHostCollections: int = 0
 // ABLA_GC_STRESS=1 (read once, at startup): every safe point collects, which
 // makes a missing root fail at once. Set here, it zeroes the threshold; the
 // safe point's check is the same compare either way.
@@ -2732,6 +2734,7 @@ trusted fun __ablaRuntimePlatformMemoryHeapStat(which: int): int =
     else if (which == 11) ablaRuntimeLoadI64(__ablaRuntimeHostFrozenState() + 16)
     else if (which == 12) ablaRuntimeLoadI64(__ablaRuntimeHostFrozenState() + 32)
     else if (which == 13) __ablaRuntimeHostCollectionKept
+    else if (which == 14) __ablaRuntimeHostCollections
     else 0
 
 // The heap census (abla/memory's memoryCensus): what the last
@@ -2851,6 +2854,12 @@ trusted fun __ablaRuntimePlatformMemorySetManualCollection(): void {
 trusted fun __ablaRuntimePlatformMemorySetStress(on: bool): void {
     __ablaRuntimeHostGcStress = on
     if (on) __ablaRuntimeHostCollectionThreshold = 0
+    return
+}
+
+/// Sets how many safe points pass between two stress collections (1 or less: every one).
+trusted fun __ablaRuntimePlatformMemorySetStressStride(stride: int): void {
+    __ablaRuntimeHostGcStressStride = stride
     return
 }
 
@@ -4372,6 +4381,7 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     __ablaRuntimeHostCollectionRanges = 0
     val freed = before - __ablaRuntimeHostLiveBytes
     __ablaRuntimeHostCollectionKept = __ablaRuntimeHostLiveBytes
+    __ablaRuntimeHostCollections = __ablaRuntimeHostCollections + 1
     if (__ablaRuntimeHostCollectionGrowth == 0) {
         __ablaRuntimeHostTrimAfterAdaptiveGc(__ablaRuntimeHostFinishAdaptiveGc(stopped))
     }
@@ -4483,6 +4493,7 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     __ablaRuntimeHostCollectionRanges = 0
     val freed = before - __ablaRuntimeHostLiveBytes
     __ablaRuntimeHostCollectionKept = __ablaRuntimeHostLiveBytes
+    __ablaRuntimeHostCollections = __ablaRuntimeHostCollections + 1
     if (__ablaRuntimeHostCollectionGrowth == 0) {
         val working = __ablaRuntimeHostFinishAdaptiveGc(stopped)
         if (__ablaRuntimeHostHeapNative() && !__ablaRuntimeHostGcStress &&
@@ -5048,8 +5059,20 @@ trusted fun __ablaRuntimeHostPressureCheck(live: int, threshold: int): int {
         )) < u64(target - tracked)) return 0
     }
     if (__ablaRuntimeHostRegionLoad() != 0) return 0
+    // Stress with a stride (memorySetStressStride): only every n-th safe point collects, unless a stop is under way.
+    if (threshold == 0 && __ablaRuntimeHostGcStressStride > 1 && __ablaRuntimeHostGcStress &&
+        (ablaRuntimeAtomicLoadI64(__ablaRuntimeHostStwAddress()) & 1) == 0) {
+        __ablaRuntimeHostGcStressPasses = __ablaRuntimeHostGcStressPasses + 1
+        if (__ablaRuntimeHostGcStressPasses % __ablaRuntimeHostGcStressStride != 0) return 0
+    }
     __ablaRuntimeHostPressureCollect()
 }
+
+/// Under stress, the safe points between two collections (memorySetStressStride; 1: every one).
+var __ablaRuntimeHostGcStressStride: int = 1
+/// Counts the stressed safe points that passed under a stride. Not atomic: threads may share or skip a count, which only
+/// moves where the next collection falls.
+var __ablaRuntimeHostGcStressPasses: int = 0
 
 // A loop's back edge (where it allocates): the same check, except that under
 // ABLA_GC_STRESS=1 only every 1,024th pass collects. A loop building a long list would

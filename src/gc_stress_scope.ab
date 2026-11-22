@@ -1,0 +1,73 @@
+// ABLA_COMPILER_GC_STRESS=<scope>[:<stride>][,...]: the compiler's heap under stress (a collection at a safe point, as
+// ABLA_GC_STRESS=1 does) only while the compiler runs the named part. A test can then stress that part within a lease: the whole
+// compiler under ABLA_GC_STRESS=1 takes longer than 600 s for a hello build or a three-module editor session, because every safe
+// point of its fixed work (the prelude, the standard library) collects a heap of tens of MB. With a stride n only every n-th
+// safe point collects (runtimeMemorySetStressStride); a stop another thread asked for is never skipped. Scopes:
+// - ct: a native compile-time call of a generation that can start threads (ct_eval.ab, bootstrapCtCall). The call's code runs
+//   on its own runtime and heap; only the emulated thread-locals its threads take come from the compiler's heap, so the window
+//   sees few of the compiler's collections, often none (tools/test-ct-threads-heap-stress.sh);
+// - analysis: each request the editor's analysis service handles (analysis_service.ab, bootstrapAnalysisService);
+// - analysis-edit: the same, once the service has finished its first analyze request: the edits and reanalyses of a session
+//   without its cold analysis (tools/test-analysis-gc-stress.sh).
+// When the outermost window ends, standard error gets `abla-gc-stress <label> collections <n> stops <m>`: the compiler's
+// collections in the window (memoryHeapStat 14, serial or parallel) and those that stopped other threads (memoryHeapStat 7), so
+// a test can check that the heap really was collected inside it. Under ambient ABLA_GC_STRESS=1 every safe point collects
+// anyway: no window opens and nothing is reported. Closing a window puts the stride back to 1 and the collection threshold
+// back to the growth rule's at the next collection.
+import "abla/sys/linux/process"
+import "abla/sys/linux"
+import "abla/runtime/memory"
+import "abla/text"
+
+var bootstrapCompilerGcStressDepth: int = 0
+var bootstrapCompilerGcStressCollections: int = 0
+var bootstrapCompilerGcStressStops: int = 0
+
+// The stride ABLA_COMPILER_GC_STRESS gives `scope` (`scope` alone: 1, `scope:n`: n), or 0 when it does not name it or ambient
+// ABLA_GC_STRESS=1 already collects everywhere.
+fun bootstrapCompilerGcStress(scope: string): int {
+    val configured = linuxEnvironment("ABLA_COMPILER_GC_STRESS")
+    if (!configured.found) return 0
+    val ambient = linuxEnvironment("ABLA_GC_STRESS")
+    if (ambient.found && ambient.value == "1") return 0
+    var stride = 0
+    for (entry in configured.value.split(",")) {
+        if (entry == scope) stride = 1
+        else if (entry.startsWith("$scope:")) {
+            var value = 0
+            var index = scope.size + 1
+            while (index < entry.size && entry[index] >= 48 && entry[index] <= 57) {
+                value = value * 10 + entry[index] - 48
+                index = index + 1
+            }
+            stride = if (value > 0) value else 1
+        }
+    }
+    stride
+}
+
+// Opens a window for `scope` when ABLA_COMPILER_GC_STRESS names it; returns whether it did (pass that to the End).
+fun bootstrapCompilerGcStressBegin(scope: string): bool {
+    val stride = bootstrapCompilerGcStress(scope)
+    if (stride == 0) return false
+    if (bootstrapCompilerGcStressDepth == 0) {
+        bootstrapCompilerGcStressCollections = runtimeMemoryHeapStat(14)
+        bootstrapCompilerGcStressStops = runtimeMemoryHeapStat(7)
+        runtimeMemorySetStressStride(stride)
+        runtimeMemorySetStress(true)
+    }
+    bootstrapCompilerGcStressDepth = bootstrapCompilerGcStressDepth + 1
+    true
+}
+
+fun bootstrapCompilerGcStressEnd(scope: string, began: bool): void {
+    if (!began) return
+    bootstrapCompilerGcStressDepth = bootstrapCompilerGcStressDepth - 1
+    if (bootstrapCompilerGcStressDepth > 0) return
+    runtimeMemorySetStress(false)
+    runtimeMemorySetStressStride(1)
+    val collections = runtimeMemoryHeapStat(14) - bootstrapCompilerGcStressCollections
+    val stops = runtimeMemoryHeapStat(7) - bootstrapCompilerGcStressStops
+    linuxWriteStandardError("abla-gc-stress $scope collections $collections stops $stops\n")
+    return
+}

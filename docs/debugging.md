@@ -308,6 +308,26 @@ are the same as without it, unless the program uses freed memory. A program in m
 WebAssembly modules don't read it. Without the variable it costs nothing:
 the safe point's check is the same compare either way.
 
+A program can also stress a part of itself: `memorySetStress(true)` and
+`memorySetStress(false)` from `abla/memory` turn stress on and off, and
+`memorySetStressStride(n)` makes only every `n`-th safe point collect while it
+is on (1, the default: every one). A stride keeps a long run within a time
+budget; a stop another thread asked for is never skipped. `memoryHeapStat(14)`
+counts the collections that finished, so a test can check that its window
+really collected.
+
+The compiler itself is such a program, and under `ABLA_GC_STRESS=1` its fixed
+work (the prelude and the standard library) collects at every safe point: a
+hello build, or a three-module editor session, takes longer than ten minutes.
+`ABLA_COMPILER_GC_STRESS=<scope>[:<stride>][,...]` stresses its heap only while
+it runs one part: `ct` (a native compile-time call of a generation that can start
+threads), `analysis` (each request the analysis service handles) or
+`analysis-edit` (those after the service's first analysis). The compiler then
+writes `abla-gc-stress <label> collections <n> stops <m>` to standard error for
+each window (the label is `ct`, or `analysis` and the request's method): its
+collections of the compiler's heap, and those that stopped other threads. `tools/test-ct-threads-heap-stress.sh` and
+`tools/test-analysis-gc-stress.sh` use it.
+
 ### Poison only: `ABLA_GC_POISON=1`
 
 `ABLA_GC_POISON=1` poisons what each collection frees, as stress does, but
