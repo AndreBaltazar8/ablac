@@ -449,10 +449,10 @@ The check happens before evaluation starts, so a denied path never runs.
 | Capability | What it allows | Providers | Native object cache |
 |---|---|---|---|
 | `filesystem.read` | read files, list directories, file metadata | `abla/fs`: `p.readText()`, `p.readTextResult()`, `p.exists()`, `p.info()`, `p.revision()`, `p.isSymbolicLink()`, `p.entries()`, `currentDirectory()` (the internal `ablaHostReadFile`/`ablaHostListDirectory` too) | kept: each read is journaled and revalidated, a failed one too |
-| `filesystem.write` | write files, make directories, move and remove paths: real writes, as at run time | `compilerWriteFile(path, contents)`; `abla/fs`: `p.writeText()`, `p.writeTextAtomic()`, `p.appendText()`, `p.createDirectories()`, `p.createParentDirectories()`, `p.moveTo(destination)`, `p.remove()` | disabled |
+| `filesystem.write` | write files, make directories, move and remove paths: real writes, as at run time | `compilerWriteFile(path, contents)`; `abla/fs`: `p.writeText(contents)`, `p.writeTextAtomic(contents)`, `p.appendText(contents)`, `p.createDirectories()`, `p.createParentDirectories()`, `p.moveTo(destination)`, `p.remove()` | disabled |
 | `environment` | read named environment variables | `compilerEnvironment(name)` (`""` when unset) | kept: each value is journaled and revalidated |
 | `process.io` | run a child process | `compilerRunProcess(arguments)` | disabled |
-| `network` | one TCP request/response | `compilerTcpExchange(ipv4, port, request, maxBytes, timeoutMs)` | disabled |
+| `network` | one TCP request/response | `compilerTcpExchange(ipv4Address, port, request, maxResponseBytes, timeoutMilliseconds)` | disabled |
 | `clock` | read the clocks, sleep | `compilerClockMilliseconds()`; `abla/process/time`'s `sleep`, `monotonicMilliseconds()`, `realtimeMilliseconds()` and their nanosecond forms | disabled |
 | `random` | random integers | `compilerRandomInteger(maxExclusive)` | disabled |
 | `trusted.native` | run trusted and `extern` code (raw memory, C functions, system calls) | see [below](#what-works-at-compile-time-today) | disabled |

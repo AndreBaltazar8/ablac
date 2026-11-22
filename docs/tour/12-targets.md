@@ -5,8 +5,8 @@ with `ablac build targets.ab -o targets`. The test runs it on the current host;
 that does not prove it runs on every platform.
 
 The built-in `--target` names are `x86_64-linux`, `aarch64-linux`,
-`x86_64-macos` and `arm64-macos`. Cross-linking requires the corresponding
-SDK and libraries.
+`x86_64-macos`, `arm64-macos` and `x86_64-windows`. The Windows target is
+for freestanding programs. Cross-linking can require the target SDK and libraries.
 Wasm, Android and iOS targets are registered by their build libraries; they
 are not interchangeable built-in CLI aliases. Start with the platform's build
 example rather than guessing a target name. Linux programs are libc-free by

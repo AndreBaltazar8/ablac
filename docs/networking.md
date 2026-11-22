@@ -153,7 +153,7 @@ fun main {
 | `httpGet(path)`, `httpPost(path, body)`, `httpRequest(method, path, body, headers)` | build a request |
 | `httpParseRequest(text)`, `httpParseResponse(text)`, `response.render()` | parse and render the wire format |
 | `serveHttp(router, port)`, `serveHttpOnce`, `serveHttpOnListener` | serve over TCP, one request per connection, serially (persistent connections: `abla/http/event`) |
-| `httpIpv4Client(authority, address, port, maxBytes, timeout, deadline)`, `httpsClient(host, port, maxBytes, timeout, deadline)` (from `abla/http/tls`), `client.send(request)` | send requests; `timeout` bounds each read and write, the optional `deadline` the whole exchange, in milliseconds |
+| `httpIpv4Client(authority, address, port, maximumResponseBytes, timeoutMilliseconds, deadlineMilliseconds)`, `httpsClient(host, port, maximumResponseBytes, timeoutMilliseconds, deadlineMilliseconds)` (from `abla/http/tls`), `client.send(request)` | send requests. `timeoutMilliseconds` bounds each read and write. The optional `deadlineMilliseconds` bounds the whole exchange. |
 
 ### Portable sockets: `abla/net/hosted`
 
@@ -271,6 +271,8 @@ heartbeat and deadline sweep, flush), so a fixed-step simulation interleaves
 it with ticks and sends, broadcasts, or closes whenever it likes:
 
 ```abla fragment
+import "abla/http"
+import "abla/net"
 import "abla/websocket/server"
 
 val server = webSocketServer(
@@ -374,8 +376,9 @@ fails with `EPIPE` and only that connection closes, whichever thread drives the 
 `request(method, url, headers, body, timeoutMilliseconds)` returns an id;
 DNS (cached A records through `DnsAsyncResolver`, below), TCP connect, the abla/tls/pure
 TLS session (peer, SNI and name verification, no OpenSSL), writes, and reads advance only
-inside `step`, and finished requests come back from `takeCompletions` as
-`HttpAsyncCompletion(id, status, headers, body, error, elapsedMilliseconds)`.
+inside `step`. Finished requests come back from `takeCompletions()` as
+`HttpAsyncCompletion` values with `id`, `status`, `headers`, `body`,
+`error`, `elapsedMilliseconds`, `protocol` and `trailerList` fields.
 Connections are kept alive and pooled per scheme, host, and port up to
 `maximumConnectionsPerHost`; a request whose pooled connection was closed by
 the peer is retried once on a fresh connection. Register `pollDescriptor()`
@@ -435,20 +438,37 @@ with the pure-Abla X25519 and ECDSA; the first request of a connection is the ta
 `abla/http/event/tls` is the HTTPS counterpart of `HttpEventServer` (the plain HTTP/1.1 event server, which has no TLS): the same handler or router
 (`(HttpRequest) -> HttpResponse`), limits and responses, over TLS from `abla/tls/pure` (no OpenSSL), with HTTP/2 chosen by ALPN.
 
-```abla fragment
-val tls = httpsEventServerTls("fullchain.pem", "privkey.pem")   // TlsServerConfig? offering h2 and http/1.1; null if the certificate or key failed to load
-val server = httpsEventServer(router, ipv4Any(443), tls)
-while (true) server.step(1000)                                // or server.run(): graceful shutdown on SIGTERM
+When the certificate or key cannot be loaded, `httpsEventServerTls` returns
+`null`. Handle that before calling `httpsEventServer`, which serves plain TCP
+when given a null TLS configuration.
+
+```abla build
+import "abla/http"
+import "abla/http/event/tls"
+import "abla/io"
+import "abla/net"
+
+fun main: int {
+    val tls = httpsEventServerTls("fullchain.pem", "privkey.pem")
+    if (tls == null) {
+        println("Could not load the HTTPS certificate or key")
+        return 1
+    }
+    val router = httpRouter()
+    router.get("/", { request: HttpRequest -> httpText("hello") })
+    val server = httpsEventServer(router, ipv4Any(443), tls)
+    server.run()
+}
 ```
 
-Each connection handshakes without blocking (`handshakeTimeoutMilliseconds`, 5 s); then ALPN `h2` makes it an HTTP/2 connection and anything else HTTP/1.1.
+Each connection handshakes without blocking (`handshakeTimeoutMilliseconds`, 5 s by default). With both protocols enabled, ALPN `h2` selects HTTP/2 and other connections use HTTP/1.1.
 Without a TLS configuration the server speaks plain TCP: HTTP/1.1, and h2c with prior knowledge for a connection that begins with the HTTP/2 preface (there is no
-`Upgrade: h2c`). `HttpsEventServerOptions(http2 = false)` serves HTTP/1.1 only; `http1 = false` makes the port HTTP/2-only.
+`Upgrade: h2c`). For an HTTP/1.1-only TLS listener, set `http2 = false` both in `HttpsEventServerOptions` and when building the TLS configuration with `httpsEventServerTls`. Set `http1 = false` in the options for an HTTP/2-only port.
  A request that carries both `:authority` and `host` gets `host` set to the `:authority` value (RFC 9113 8.3.1), so a handler sees one origin; a request with only `:authority` gets `host` from it.
 The handler runs once per request, and over HTTP/2 once per stream when the request is whole (END_STREAM), on the event loop's thread: nothing in the router API changes.
-Requests and responses are fully buffered (`maximumBodyBytes`; a larger request body is answered 413 and the upload stopped). A response is sent as HEADERS and DATA under
+Ordinary routes buffer requests and responses. A request exceeding `maximumBodyBytes` receives 413 and the upload stops. A buffered response is sent as HEADERS and DATA under
 the client's flow-control windows and a 256 KiB output queue; `connection`, `keep-alive`, `transfer-encoding`, `upgrade` and `host` response headers are dropped, names are
-lower-cased, `content-length` is added, and a response with status 101 becomes a 500 (no WebSocket upgrade over HTTP/2, no push, no streaming bodies, no trailers).
+lower-cased, `content-length` is added, and a response with status 101 becomes a 500. Use `streamRoute` for streaming bodies and trailers.
 `abla/http/h2/server` is the sans-IO `H2Server` underneath (`feed`, `takeRequests`, `respond`, `takeOutput`, `shutdown`), for an event loop of your own.
 
 Limits a client cannot talk the server out of (each ends the connection with GOAWAY and the RFC 9113 error code, or resets the stream, and each has a test that fails with
@@ -499,6 +519,7 @@ a JWKS over HTTPS, caches it for a day, and refetches at most once per
 cooldown when a token names an unknown key:
 
 ```abla fragment
+import "abla/jwt"
 import "abla/jwt/remote"
 
 val jwks = jwksCache("https://auth.example.com/.well-known/jwks.json")
@@ -631,24 +652,24 @@ Client connections of both modules enable peer verification, system trust, SNI, 
 CA-file connector and certificate/private-key listener support local and private PKI deployments. `abla/http/tls` and
 `abla/websocket/tls` provide the HTTPS and WSS client transports, over `abla/tls/pure`.
 
-`abla/tls/hosted` dynamically loads OpenSSL 1.1 or 3 only when imported (a program that imports it directly, or the hosted platform modules). `ablac build` links OpenSSL for a program
-that imports it on its own; a program built with `--emit object` and linked by hand (for example with `gcc` for
-x86_64-linux) needs `-lssl -lcrypto` on the link line. Hosted secure random is supplied by `abla/random/hosted` on
-Linux and macOS.
+`ablac build` links OpenSSL for a program that uses `abla/tls/hosted`.
+When linking an object emitted with `--emit object` by hand, add
+`-lssl -lcrypto` to the link line. `abla/random/hosted` supplies
+hosted secure random on Linux and macOS.
 
 | Function | Result |
 |---|---|
 | `tlsConnect(host, port = 443, timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` | a verified `TlsConnection`, with `read`, `write` and `close` |
-| `tlsConnectWithCa(host, caPath, port, timeout, readWriteTimeout)` | the same, trusting the given CA file |
-| `tlsClientIdentityFromPem(certificatePem, keyPem, passphrase = "")`, `tlsClientIdentityFromPkcs12(der, password)` | a `TlsClientIdentity` for mutual TLS: a client certificate, any intermediates and its private key, checked against each other. `identity.ok()` and `identity.error` say how it went |
-| `tlsConnectWithIdentity(host, identity, caPath = "", port = 443, timeout, readWriteTimeout)` | as `tlsConnect`, presenting the identity, and trusting the CA file if given. Under TLS 1.3 a server's refusal of the certificate shows on the first read, since the handshake has already finished for the client |
+| `tlsConnectWithCa(host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds)` | the same, trusting the given CA file |
+| `tlsClientIdentityFromPem(certificatePem, keyPem, passphrase = "")`, `tlsClientIdentityFromPkcs12(der, password)` | load a certificate, intermediates and matching private key for mutual TLS. `abla/tls/pure` returns `TlsIdentity` and `abla/tls/hosted` returns `TlsClientIdentity`. Both expose `identity.ok()` and `identity.error`. |
+| `tlsConnectWithIdentity(host, identity, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds)` | as `tlsConnect`, presenting the identity, and trusting the CA file if given. Under TLS 1.3 a server's refusal of the certificate shows on the first read, since the handshake has already finished for the client |
 | `tlsUpgrade(var connection, host, caPath = "", timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` | start verified client TLS on an existing TCP or Unix connection; existing socket timeouts survive |
 | `tlsUpgradeWithIdentity(connection, host, identity, ...)` | upgrade while presenting a client identity |
 | `tlsServerUpgrade(connection, certificatePath, privateKeyPath, ...)` | server TLS on an accepted stream; loads certificate/key on each call, so prefer `tlsListen` for many TCP connections |
 | `connection.setTimeouts(readMilliseconds, writeMilliseconds)` | replace the limits on an open connection (also on a `TcpConnection`); 0 waits as long as it takes |
 | `tlsListen(certificatePath, privateKeyPath, host = "::", port = 443, ...)` | a `TlsListener`, with `accept(handshakeTimeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` |
 | `webSocketServerTls(certificatePath, privateKeyPath, handshakeTimeoutMilliseconds = 5000)` | from `abla/websocket/server/tls`: a `WebSocketServerTls` for `WebSocketServerOptions(tls = ...)` ([TLS](#tls-wss-and-https)); `webSocketServerTlsPem` takes PEM text |
-| `tlsAvailable()`, `tlsLastError()` | whether OpenSSL could be loaded, and the last error |
+| `tlsAvailable()`, `tlsLastError()` | whether the backend is available and the calling thread's last TLS error. Availability is always true for pure TLS and checks the linked OpenSSL version for hosted TLS. |
 
 Unix upgrades and ownership/deadline details are described in the [stdlib TLS guide](stdlib/security-and-dates.md#ablatlshosted-upgrading-streams).
 
@@ -692,7 +713,7 @@ accepted. A service behind a proxy that wants to keep connections to its
 origin open (a CDN, a load balancer) moves to
 `httpEventServer(router, address, options).run()` with the same router and
 handlers; `options` sets the connection ceiling (1023), header and body
-limits (64 KiB, 1 MiB), the requests allowed on one connection (100), the idle
+limits (64 KiB, 1 MiB), the requests allowed on one connection (1000), the idle
 timeout (30 s), the gzip threshold (256 bytes; a huge value turns gzip off)
 and the drain time at SIGTERM. Handlers still run on the one loop thread, so
 a handler that blocks holds every connection, as it does in the blocking
@@ -740,8 +761,7 @@ the managed collector can coordinate all thread root stacks.
 val server = httpEventServerHandler(
     handleRequest,
     ipv4Loopback(8080),
-    httpEventServerOptions(),
-    true
+    reusePort = true
 )
 server.run()
 ```
@@ -768,9 +788,9 @@ fun main {
 ```
 
 `sseResponseHead()` starts an event stream response, and `sseChunk(event)`
-frames one event as a chunk. `httpGzipResponse(request, response, minimum)`
+frames one event as a chunk. `httpGzipResponse(request, response, minimumBytes)`
 compresses a response when the client accepts gzip, and
-`httpChunkedResponse` streams a body in chunks.
+`httpChunkedResponse(chunks, status, headers)` renders a complete chunked response from an array of strings.
 
 ## HTTP upgrade behavior
 
@@ -786,7 +806,8 @@ The raw `abla/net` facade remains Linux-specific so a libc-free binary never
 silently acquires hosted dependencies; cross-platform programs select
 `abla/net/hosted`. The bounded DNS client currently implements UDP A/AAAA with
 compression pointers, but not DNSSEC, TCP fallback, IDNA, or a shared cache.
-TLS is hosted and OpenSSL-backed rather than part of the raw syscall target.
+`abla/tls/pure` runs over the raw socket layer. Select `abla/tls/hosted`
+when you want the OpenSSL backend.
 HTTP/2 is a default-on (https) client feature of `abla/http/async` and a server feature of `abla/http/event/tls` (both above); HTTP/3/QUIC, proxy negotiation, and automatic reconnection remain
 separate protocols rather than implicit behavior in the HTTP/1.1 APIs.
 

@@ -59,7 +59,7 @@ adjacent comments, not `@param` tags in a function's comment.
 | [Hashing, encryption, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/crypto/hosted`, `abla/date` |
 | [Testing](stdlib/testing.md) | `abla/test` and `ablac test` |
 | [JSON](json.md) | `abla/json`, `abla/http/json`, `$json` |
-| [Networking](networking.md) | `abla/net`, `abla/http/*`, `abla/websocket/*`, `abla/tls/hosted`, `abla/dns`, `abla/dns/async`, `abla/jwt` |
+| [Networking](networking.md) | `abla/net`, `abla/http/*`, `abla/websocket/*`, `abla/tls/pure`, `abla/tls/hosted`, `abla/dns`, `abla/dns/async`, `abla/jwt` |
 | [Compiler API](compiler-api.md), [subparsers](subparsers.md), [programmable builds](programmable-builds.md) | `abla/compiler`, `abla/compiler/parser`, `abla/build`, `abla/wasm/build`, `abla/android/build` |
 
 Built into the language rather than imported: `string`, arrays, `Map`,
@@ -126,7 +126,8 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/xtensa/companion` | Installer-internal module, not a stable public API. Offline descriptor-relative extraction spools and validates before writing payloads; limits are 512 MiB compressed and 1 GiB unpacked. The in-memory `companionValidateArchive` retains its 128 MiB / 256 MiB limits. |
 | `abla/fs/secure` | Descriptor-relative operations with component validation, bounded handle reads and directory listings, no-follow opens and no-replace rename. `replaceSymlink` requires a trusted parent; its non-symlink destination check is not atomic against a hostile writer. |
 | `abla/fs/watch` | `fileEvents(paths)`: waits (with a timeout) for a change to files, by inotify on Linux and kqueue on macOS through system calls, no libc. A wait can also report a write that changed nothing, or on macOS another file of the same directory: compare the contents (`watchFiles`) to know. `ablac run --watch` uses it. |
-| `abla/tls/hosted` | dynamically loaded OpenSSL client/listener transport with hostname and certificate verification |
+| `abla/tls/pure` | TLS client and server over raw sockets, with hostname and certificate verification |
+| `abla/tls/hosted` | OpenSSL-linked TLS client and listener, with hostname and certificate verification |
 | `abla/websocket` | bounded RFC 6455 handshake, framing, connection lifecycle, and routed server helpers |
 | `abla/websocket/client` | client masking keys |
 | `abla/websocket/json`, `/rpc` | bounded JSON messages and transport-neutral RPC method routing |
@@ -135,6 +136,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/websocket/server/tls` | TLS for `abla/websocket/server`: a certificate and key as `WebSocketServerOptions(tls = ...)`, nonblocking handshakes |
 | `abla/websocket/tls` | certificate-verified WSS client transport |
 | `abla/jwt`, `abla/jwt/remote` | JWS RS256/ES256 verification against a key set, and a cached remote JWKS |
+| `abla/xml` | [XML literals, tree nodes and namespace-aware access](stdlib/xml.md) |
 | `abla/sql` | [compile-time checked PostgreSQL-subset templates and separately typed bound parameters](../stdlib/abla/sql/README.md) |
 | `abla/compiler`, `abla/compiler/parser` | compile-time reflection, transforms, generated code and subparser APIs (compile time only) |
 | `abla/build` | framework-neutral compile-time program and export requests |
@@ -374,7 +376,7 @@ Collection has two modes:
   the program's own threads are stopped, and the pass waits on memory, one header read per registry slot): four passes over slices of the
   registry (clear the marks and count the kept and the unreachable entries; place the kept entries and the unreachable headers, which the
   helper frees, at their final places through the collection's dead worklist; copy the kept entries back), with no serial walk of the registry. Only the root scan is serial. The parallel mark needs the
-  page directory for every pointer, so it does not use the lazy registry lookup a serial collection tries first. It is part of the collector that frees in the background, so a program gets it only when it turns that on (`memorySetBackgroundFree(true)`; the compiler and the editor server do). A program can name a default with `runtimeMemorySetGcWorkers(n)`, which `ABLA_GC_WORKERS` (any value, `0` included) overrides: the editor service (`ablac analyze --stdio`) asks for 4, which halves its collection pauses over an edit loop on the compiler's own source (6.2 s to 3.1 s in total, 4 cores' worth of extra CPU time only while a collection runs, peak memory unchanged); the batch compiler asks for 4 as well (a one-stage self build on 6 cores: its 30 collections pause 1.68 s serial, 0.94 s on 4 threads always, 1.28 s adaptive, wall time 61.8 s serial and 59 to 61 s with threads, user CPU 134 s to 131 to 135 s). A program's request is clamped to the CPUs the process may use (one CPU stays serial) and is adaptive: a collection of fewer than 262,144 registry slots is serial, and a larger one parallel unless measured worse (the collector compares the cost per slot of consecutive collections run in the two modes, probing the other mode from the 2nd larger collection, then every 4th, 8th, ... up to 128th while a probe changes nothing; `ABLA_GC_TRACE=1` prints `gc: adaptive, parallel 0 or 1 ratio parallel/serial (thousandths) R probe every E`). ABLA_GC_WORKERS=n in the environment always uses the threads
+  page directory for every pointer, so it does not use the lazy registry lookup a serial collection tries first. It is part of the collector that frees in the background, so a program gets it only when it turns that on (`memorySetBackgroundFree(true)`; the compiler and the editor server do). A program can name a default with `memorySetGcWorkers(count)`, which `ABLA_GC_WORKERS` (any value, `0` included) overrides: the editor service (`ablac analyze --stdio`) asks for 4, which halves its collection pauses over an edit loop on the compiler's own source (6.2 s to 3.1 s in total, 4 cores' worth of extra CPU time only while a collection runs, peak memory unchanged); the batch compiler asks for 4 as well (a one-stage self build on 6 cores: its 30 collections pause 1.68 s serial, 0.94 s on 4 threads always, 1.28 s adaptive, wall time 61.8 s serial and 59 to 61 s with threads, user CPU 134 s to 131 to 135 s). A program's request is clamped to the CPUs the process may use (one CPU stays serial) and is adaptive: a collection of fewer than 262,144 registry slots is serial, and a larger one parallel unless measured worse (the collector compares the cost per slot of consecutive collections run in the two modes, probing the other mode from the 2nd larger collection, then every 4th, 8th, ... up to 128th while a probe changes nothing; `ABLA_GC_TRACE=1` prints `gc: adaptive, parallel 0 or 1 ratio parallel/serial (thousandths) R probe every E`). ABLA_GC_WORKERS=n in the environment always uses the threads
   Measured on the editor's edit loop over the compiler's own source (16 collections, 3 to 6 runs each, a machine
   under load): the collections' total pause 3.9 s serial, 3.1 s at 2 threads, 2.7 s at 4 and 2.5 s at 8
   (the mark itself about 2.1 s, 0.9 s at 4 threads), the loop's wall time 22.9 s, 22.1, 21.4 and 21.0, its user
@@ -441,10 +443,24 @@ newest version not newer than the requested version; no header selects latest.
 ISO dates are the initial canonical keys because lexical and chronological
 ordering agree.
 
-```abla fragment
-val api = httpRouter("Stripe-Version")
-api.version("2024-01-01").get("/customers/:id", customerV1)
-api.version("2025-01-01").get("/customers/:id", customerV2)
+```abla
+import "abla/http"
+import "abla/io"
+
+fun customerV1(request: HttpRequest): HttpResponse = httpText("v1")
+fun customerV2(request: HttpRequest): HttpResponse = httpText("v2")
+
+fun main {
+    val api = httpRouter("Stripe-Version")
+    api.version("2024-01-01").get("/customers/:id", customerV1)
+    api.version("2025-01-01").get("/customers/:id", customerV2)
+    val old = httpGet("/customers/42", [HttpHeader("Stripe-Version", "2024-06-01")])
+    println(api.dispatch(old).body)
+    println(api.dispatch(httpGet("/customers/42")).body)
+}
+// output:
+// v1
+// v2
 ```
 
 Handlers remain ordinary typed Abla functions, so V2 can call V1 and transform

@@ -263,25 +263,25 @@ fun main {
 ```
 
 `jsonStringify`, `toJson()` and `emit()` keep an object's members in source
-order. JavaScript orders an object's keys differently: keys that are array
-indexes (`"0"`, or digits without a leading zero, below 2^32 - 1) come first,
-ascending, then the others in the order they were added. `toJson(true)`,
-`emit(true)` (a document's or an edit list's) and `jsonJsKeyOrder(value)` (any
-tree) give that order, so `document.emit(true)` writes what
-`JSON.stringify(JSON.parse(source))` writes under `jsonPermissiveLimits`:
+order. JavaScript puts array-index keys (`"0"`, or digits without a leading
+zero, below 2^32 - 1) first in numeric order, then the other keys in
+insertion order. Pass `jsKeyOrder = true` to `JsonNode.toJson`,
+`JsonEdits.toJson`, `JsonDocument.emit` or `JsonEdits.emit` to use that
+ordering. Use `jsonJsKeyOrder(value)` for an existing `Json` tree.
+`emit(true)` still preserves the original number spellings, such as `1e2`.
 
 ```abla
 import "abla/io"
 import "abla/json"
 
 fun main {
-    val document = jsonDocument("{\"b\":1,\"10\":2,\"a\":3,\"2\":4,\"01\":5}", jsonPermissiveLimits).document
+    val document = jsonDocument("{\"b\":1e2,\"10\":2,\"a\":3,\"2\":4,\"01\":5}", jsonPermissiveLimits).document
     println(document.emit())
     println(document.emit(true))
 }
 // output:
-// {"b":1,"10":2,"a":3,"2":4,"01":5}
-// {"2":4,"10":2,"b":1,"a":3,"01":5}
+// {"b":1e2,"10":2,"a":3,"2":4,"01":5}
+// {"2":4,"10":2,"b":1e2,"a":3,"01":5}
 ```
 
 A reader (`jsonObjectReader(source, jsonPermissiveLimits)`) can't merge as it
@@ -315,8 +315,10 @@ fun main {
 `nextExpected` is the order-sensitive fast path for canonical producers.
 `nextExpectedRaw` is the still leaner form when the producer guarantees
 ordinary unescaped UTF-8 field names; it compares the source bytes directly.
-`next` supports ordinary member iteration when order is not known; consume its
-current value with `readString`, `readRaw`, or `skip`. `readRaw` validates any
+`JsonObjectReader.next()` returns the decoded key. Inspect `done` to
+distinguish the end of the object from a valid empty key, and call `finish()`
+to check that parsing completed successfully. Consume the current value with
+`readString`, `readRaw`, or `skip`. `readRaw` validates any
 nested value without materializing it. `readStringPairsRaw` is a smaller fast
 path for the common `[[name, value], ...]` protocol shape. Readers retain the
 same input, UTF-8, depth, node, string, member, duplicate-key, and trailing-byte

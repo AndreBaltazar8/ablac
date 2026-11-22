@@ -105,8 +105,8 @@ option for it: the program decides. `ablac build --verbose` prints a note
 naming why a build linked libc. macOS executables link libSystem (below), and libraries
 and objects are unchanged.
 
-The default `abla/tls` surface uses pure Abla TLS and does not by itself force
-a libc/OpenSSL link. A libc-free Linux executable links directly with LLD,
+`abla/tls/pure` provides TLS without libc or OpenSSL. The standard HTTPS
+client in `abla/http/tls` uses it. A libc-free Linux executable links directly with LLD,
 without a clang driver or C development files. A static compiler built with
 `ABLA_STATIC_LLD_LIB` and its header paths embeds LLD through
 `runtime/abla_lld_shim.cpp` on x86-64; otherwise it uses the external linker.
