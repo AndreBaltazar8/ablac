@@ -48,4 +48,9 @@ if [[ $mode == compare ]]; then
     cmp "$out/qemu/results.txt" "$out/hardware/results.txt"
     cmp "$out/qemu/static-artifact.log" "$out/hardware/static-artifact.log"
 fi
+# The compiler building itself on a board (#1124), about half an hour: ABLA_AARCH64_SELF_BUILD="<shim object> <deps dir>" asks for it.
+if [[ $mode != qemu && -n ${ABLA_AARCH64_SELF_BUILD:-} ]]; then
+    read -r shim_object deps_directory <<< "$ABLA_AARCH64_SELF_BUILD"
+    tools/test-aarch64-self-build.sh "$artifact" "$shim_object" "$deps_directory" 2>&1 | tee "$out/self-build.log"
+fi
 echo "AArch64 $mode: all checks passed"
