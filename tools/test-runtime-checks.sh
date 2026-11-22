@@ -123,6 +123,19 @@ set -e
 grep -q '^0x[0-9a-f]* in main$' "$out/bounds-backtrace-fast.err" ||
     fail "--fast --backtrace build named no main: $(head -12 "$out/bounds-backtrace-fast.err")"
 
+# macOS: what a handler is given for a raised, a killed and a real SIGSEGV (si_code, si_addr, the exception syndrome),
+# printed for the log: the facts a fault is told from a sent signal by. Informational; it never fails the test.
+if [[ $(uname -s) == Darwin ]]; then
+    if "${ABLA_MACOS_CLANG:-clang}" "$cases/siginfo-probe.c" -o "$out/siginfo-probe" 2> "$out/siginfo-probe.err"; then
+        for mode in raise kill store; do
+            printf 'siginfo probe (%s, %s): %s\n' "$(uname -m)" "$mode" \
+                "$("$out/siginfo-probe" "$mode" 2>&1 || true)" >&2
+        done
+    else
+        printf 'siginfo probe: not built: %s\n' "$(head -3 "$out/siginfo-probe.err")" >&2
+    fi
+fi
+
 # A stack overflow panics; another SIGSEGV still ends the process by the signal.
 for flags in "" "-g" "--backtrace"; do
     "$compiler" build "$cases/stack.ab" -o "$out/stack" $flags

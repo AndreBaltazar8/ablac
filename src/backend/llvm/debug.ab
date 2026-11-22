@@ -1719,6 +1719,29 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
 }
 
 // abla_runtime_stack_fault(signal, siginfo, context), when main installed it.
+// Whether the kernel raised the fault the stack guard's handler is in (true: its si_addr is the bad address), not a
+// process sending it (raise, kill): si_code (at 8 in `info`, Linux and macOS) a fault's own code, 1 to 15 (SEGV_MAPERR
+// 1, ... BUS_OBJERR 3; Linux's go to 9), not SI_USER (0 on Linux, 0x10001 on macOS), another sender's or Linux's
+// SI_KERNEL (0x80). On Apple Silicon, XNU gives every SIGSEGV and SIGBUS a fault's code and the fault address
+// register, sent or not (CI, both arm64 runs: a raised SIGSEGV named an address); there the machine context's
+// exception syndrome (`machine`, the mcontext: __es.__esr at 8) tells them apart. A fault's exception class (ESR bits
+// 26 to 31) is an abort: instruction 0x20, PC alignment 0x22, data 0x24, SP alignment 0x26 (ec & 0x39 == 0x20); a
+// sent signal arrives after a system call (SVC, 0x15).
+fun bootstrapLlvmFaultRaised(backend: BootstrapLlvmBackend, info: i64*, machine: i64*): i64* {
+    val i32 = backend.i32Type
+    val code = LLVMBuildLoad2(backend.builder, i32, bootstrapLlvmByteAt(backend, info, 32, 8), "fault.code")
+    // code - 1 ULT (36) 15: 1 to 15.
+    val faultCode = LLVMBuildICmp(backend.builder, 36,
+        LLVMBuildSub(backend.builder, code, LLVMConstInt(i32, 1, 0), ""), LLVMConstInt(i32, 15, 0), "")
+    if (!(backend.macOS && bootstrapLlvmMachOIsArm(backend.targetTriple))) return faultCode
+    val syndrome = LLVMBuildLoad2(backend.builder, i32, bootstrapLlvmByteAt(backend, machine, 16, 8), "fault.esr")
+    val exceptionClass = LLVMBuildLShr(backend.builder, syndrome, LLVMConstInt(i32, 26, 0), "")
+    // EQ (32).
+    val abort = LLVMBuildICmp(backend.builder, 32,
+        LLVMBuildAnd(backend.builder, exceptionClass, LLVMConstInt(i32, 57, 0), ""), LLVMConstInt(i32, 32, 0), "")
+    LLVMBuildAnd(backend.builder, faultCode, abort, "fault.raised")
+}
+
 fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
     val handler = LLVMGetNamedFunction(
         backend.module, "abla_runtime_stack_fault"
@@ -1864,15 +1887,11 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         // (SEGV_MAPERR 1, SEGV_ACCERR 2, BUS_ADRALN 1, BUS_ADRERR 2, ...; Linux's go to 9). A signal sent (raise,
         // kill) has no address and ends the process as before: si_code SI_USER, 0 on Linux but 0x10001 on macOS,
         // or another sender's (negative on Linux, 0x1000x on macOS); nor does Linux's SI_KERNEL (0x80, si_addr 0).
-        // The debug report below prints the stack instead.
-        val code = LLVMBuildLoad2(backend.builder, backend.i32Type, bootstrapLlvmByteAt(backend, info, 32, 8),
-            "fault.code")
+        // (On Apple Silicon a sent one looks like a fault: bootstrapLlvmFaultRaised.) The debug report below prints
+        // the stack instead.
         val reported = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.report")
         val quiet = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.default")
-        // code - 1 ULT (36) 15: 1 to 15.
-        LLVMBuildCondBr(backend.builder, LLVMBuildICmp(backend.builder, 36,
-            LLVMBuildSub(backend.builder, code, LLVMConstInt(backend.i32Type, 1, 0), ""),
-            LLVMConstInt(backend.i32Type, 15, 0), ""), reported, quiet)
+        LLVMBuildCondBr(backend.builder, bootstrapLlvmFaultRaised(backend, info, machine), reported, quiet)
         LLVMPositionBuilderAtEnd(backend.builder, reported)
         bootstrapLlvmDebugWrite(backend, "fatal signal: a bad memory access at ", "abla.fault.access")
         bootstrapLlvmWriteHexCompact(backend, address)
@@ -1898,12 +1917,8 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         // A bad access the kernel raised (SIGSEGV or SIGBUS with a fault's own si_code, 1 to 15, as a release build
         // reports it; not a sent one, SI_USER 0x10001 on macOS): the report names its address
         // (abla_runtime_fault_access 1; si_addr in abla_runtime_fault_address, 0 included).
-        val code = LLVMBuildLoad2(backend.builder, backend.i32Type, bootstrapLlvmByteAt(backend, info, 32, 8),
-            "fault.code")
-        // code - 1 ULT (36) 15, EQ (32).
-        val access = LLVMBuildAnd(backend.builder,
-            LLVMBuildICmp(backend.builder, 36, LLVMBuildSub(backend.builder, code, LLVMConstInt(backend.i32Type, 1, 0),
-                ""), LLVMConstInt(backend.i32Type, 15, 0), ""),
+        // EQ (32).
+        val access = LLVMBuildAnd(backend.builder, bootstrapLlvmFaultRaised(backend, info, machine),
             LLVMBuildOr(backend.builder, LLVMBuildICmp(backend.builder, 32, signal, LLVMConstInt(i64, 11, 0), ""),
                 LLVMBuildICmp(backend.builder, 32, signal, LLVMConstInt(i64, if (mac) 10 else 7, 0), ""), ""), "")
         LLVMBuildStore(backend.builder, LLVMBuildZExt(backend.builder, access, i64, ""),
