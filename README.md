@@ -80,17 +80,19 @@ steps:
 The action supports Linux x86-64 and both Apple Silicon and Intel macOS. Pin it
 to a full commit SHA when an immutable action reference is required.
 
-The Linux toolchain archive bundles its LLVM tools. After v0.2.56 it
-needs glibc 2.35 or later (Ubuntu 22.04, Debian 12; RHEL 9 and its rebuilds work
-although their glibc is 2.34, which carries the one 2.35 interface the bundled libgcc_s asks
-for; an upstream 2.34, as in Fedora 35, does not run it); v0.2.16 to v0.2.56 needed glibc 2.38. The programs it builds need no libc at
-all unless they bring a C library (docs/toolchain.md). The standalone
-`ablac-x86_64-linux` release binary is the statically linked compiler (a static-pie executable: no
-loader, no libLLVM, no C library; its self-build is a fixpoint, which the release checks) and the
-bootstrap compiler. It has no `dlopen`: compile-time `nativeLibraries` need the dynamic compiler,
-`ablac-dynamic-x86_64-linux` (shipped beside it for one release; it names a Nix-store dynamic loader and
-finds libLLVM, libssl and libcrypto through Nix-store RUNPATH entries, so it runs only where those store
-paths exist, and is the byte-reproducible one). The toolchain archive is the installable toolchain.
+The Linux toolchain archive, `abla-toolchain-x86_64-linux`, is statically linked from v0.2.66: the
+static compiler, the standard library and runtime, compiler-rt's builtins and the Xtensa installer, with no
+`libLLVM.so`, no loader and no external LLVM tools. It needs no C library on the host and runs with an empty
+`PATH`. The programs it builds need no libc at all unless they bring a C library (docs/toolchain.md). The
+standalone `ablac-x86_64-linux` release binary is the same statically linked compiler (a static-pie
+executable whose self-build is a fixpoint, which the release checks) and the bootstrap compiler. It has no
+`dlopen`: compile-time `nativeLibraries` need the dynamic compiler, shipped for one more release as
+`ablac-dynamic-x86_64-linux` (it names a Nix-store dynamic loader and finds libLLVM, libssl and libcrypto
+through Nix-store RUNPATH entries, so it runs only where those store paths exist, and is the byte-reproducible
+one) and as the `abla-toolchain-dynamic-x86_64-linux` archive. That archive bundles Abla's patched LLVM tools
+and needs glibc 2.35 or later (Ubuntu 22.04, Debian 12; RHEL 9 and its rebuilds work although their glibc is
+2.34, which carries the one 2.35 interface the bundled libgcc_s asks for; an upstream 2.34, as in Fedora 35,
+does not run it).
 The optional Xtensa companion is installed explicitly with the packaged native
 `bin/abla-install-xtensa --version 23.1.3-2`. It does not support HTTP proxies;
 use `--archive PATH` with an archive downloaded by other means when needed.

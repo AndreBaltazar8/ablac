@@ -11,22 +11,29 @@ directory. Installed or custom layouts may override that root with
 override. Project inputs, outputs, and caches continue to use project or
 invocation-relative paths.
 
-The Linux x86-64 toolchain archive requires glibc 2.35 or later. Ubuntu 22.04,
-Debian 12 and later meet that requirement; so do RHEL 9 and its rebuilds, whose
-glibc 2.34 carries the one 2.35 interface (`_dl_find_object`) that the bundled
-libgcc_s asks for. An upstream 2.34 without that interface, as in Fedora 35, cannot
-load it. The archive uses the system dynamic loader and bundles LLVM and its other
+The Linux x86-64 compiler and toolchain are statically linked. The standalone
+`ablac-x86_64-linux` release asset (from v0.2.65) is the static compiler: src/orc_main_static.ab on LLVM's
+static archives and Abla's own C library, a static-pie executable with no loader and no needed library, checked
+by tools/test-static-artifact.sh including its fixpoint. It is also the bootstrap compiler (docs/bootstrap.md).
+The `abla-toolchain-x86_64-linux` archive (from v0.2.66, decision #90 A) packages it
+(tools/package-linux-static-toolchain.sh): `bin/ablac` (the launcher), `libexec/ablac.bin`, the standard library
+and runtime under `share/abla`, compiler-rt's builtins and the Xtensa installer. It has no `libLLVM.so`, no
+dynamic loader, no clang and no external LLVM tools, and needs no C library on the host. It runs with an
+empty `PATH`, which the release job checks (`tools/test-package-static.sh`). The compiler generates code in
+its own process, cross targets included (RISC-V among them; opt and llc for a cross target run as `ablac --llvm-tool opt|llc`
+children), links with LLD in process, and starts wasm-ld and lld-link as children of itself. `ABLA_CODEGEN_INPROCESS=0`
+asks for the external opt and llc on the `PATH` instead.
+
+The static compiler cannot `dlopen`, so compile-time `nativeLibraries` need the dynamically linked compiler. It
+ships for one more release as `ablac-dynamic-x86_64-linux`, the compiler built in the Nix shell (byte-reproducible;
+it names a Nix-store dynamic loader and finds libLLVM through Nix-store RUNPATH entries, so it runs only where those
+store paths exist), and as the `abla-toolchain-dynamic-x86_64-linux` archive. That archive requires glibc 2.35 or
+later: Ubuntu 22.04, Debian 12 and later, and RHEL 9 and its rebuilds, whose glibc 2.34 carries the one 2.35
+interface (`_dl_find_object`) that the bundled libgcc_s asks for. An upstream 2.34 without it, as in Fedora 35,
+cannot load it. It uses the system dynamic loader and bundles Abla's patched portable LLVM build and its other
 non-glibc dependencies. The release job checks every ELF file of the archive
-(`tools/test-linux-toolchain-portability.sh`) and runs the compiler in Ubuntu 22.04
-and AlmaLinux 9.
-From v0.2.65, the standalone `ablac-x86_64-linux` release asset is the statically linked compiler
-(src/orc_main_static.ab on LLVM's static archives and Abla's own C library: a static-pie executable with no
-loader and no needed library, checked by tools/test-static-artifact.sh including its fixpoint) and the bootstrap
-compiler (docs/bootstrap.md). It cannot `dlopen`, so compile-time `nativeLibraries` need
-`ablac-dynamic-x86_64-linux`, which ships beside it for one release: that is the compiler built in the Nix shell,
-the byte-reproducible one, and it names a Nix-store dynamic loader and finds libLLVM and its dependencies through
-Nix-store RUNPATH entries, so it runs only where those store paths exist. Use the toolchain archive (still
-packaged from the dynamic compiler) for an installed toolchain.
+(`tools/test-linux-toolchain-portability.sh`), runs the compiler in Ubuntu 22.04 and AlmaLinux 9, and checks that
+its LLVM tools carry the instcombine fix (`tools/test-external-llvm-fdiv.sh`).
 
 ```sh
 ablac build app.ab -o build/app

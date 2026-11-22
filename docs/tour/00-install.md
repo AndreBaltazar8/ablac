@@ -8,8 +8,8 @@ Use the packaged `bin/ablac` wrapper, which locates the toolchain's libraries
 and tools. A standalone compiler binary and a complete toolchain archive
 serve different purposes; the standalone file is not an installer.
 
-On Linux, the archive bundles LLVM tools and its host requirements are listed
-in the [installation notes](../../README.md). On macOS, follow those notes for
+On Linux, the archive is statically linked: it needs no C library or LLVM on the
+host ([installation notes](../../README.md)). On macOS, follow those notes for
 the matching Homebrew LLVM, LLD and OpenSSL dependencies. In GitHub Actions,
 the README also shows the checksum-verifying `setup-abla` action. Keep the
 compiler and its bundled stdlib together.
