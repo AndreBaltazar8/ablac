@@ -181,11 +181,28 @@ fun BootstrapAnalysisService.graphEntry(): string {
     opened
 }
 
+private fun bootstrapAnalysisGraphDocumentJson(
+    uri: string, version: int, text: string, symbols: Json, occurrences: Json, diagnostics: Json
+): Json = $json {
+    "uri": uri, "version": version, "text": text, "symbols": symbols,
+    "occurrences": occurrences, "diagnostics": diagnostics
+}
+
+private fun bootstrapAnalysisGraphSnapshotJson(
+    revision: int, documents: array<Json>, mode: string, complete: bool, pending: array<Json>, entry: string
+): Json = $json {
+    "revision": "$revision", "documents": documents, "analysisMode": mode,
+    "complete": complete, "pending": pending, "entry": entry
+}
+
 fun bootstrapAnalysisGraphIncomplete(revision: int, message: string, mode: string): Json =
-    jsonObject(["revision", "documents", "analysisMode", "complete", "issues"],
-        [jsonString("$revision"), jsonArray([]), jsonString(mode), jsonBoolean(false),
-            jsonArray([jsonObject(["code", "message"],
-                [jsonString("E_ANALYSIS_SCOPE"), jsonString(message)])])])
+    $json {
+        "revision": "$revision",
+        "documents": [],
+        "analysisMode": mode,
+        "complete": false,
+        "issues": [{"code": "E_ANALYSIS_SCOPE", "message": message}]
+    }
 
 /** What a snapshot looks up many times: the document of a source identity, and a document's symbols by start and kind. */
 class BootstrapAnalysisGraphLookup(
@@ -558,11 +575,12 @@ fun bootstrapAnalysisGraphParse(source: string, uri: string, full: bool,
     val pending: array<Json> = []
     for (index in 0 until blocked.size) {
         val site = blocked[index]
-        pending.append(jsonObject(["code", "uri", "range", "message"],
-            [jsonString("E_ANALYSIS_CT_REQUIRED"),
-                jsonString(bootstrapAnalysisGraphUri(blockedSources[index])),
-                jsonObject(["start", "end"], [jsonInteger(site.begin), jsonInteger(site.end)]),
-                jsonString("compile-time evaluation was not performed; types describe the pre-evaluation source")]))
+        pending.append($json {
+            "code": "E_ANALYSIS_CT_REQUIRED",
+            "uri": bootstrapAnalysisGraphUri(blockedSources[index]),
+            "range": {"start": site.begin, "end": site.end},
+            "message": "compile-time evaluation was not performed; types describe the pre-evaluation source"
+        })
     }
     val surface = BootstrapParseResult(visible, raw.actions, raw.errors, raw.extensionErrors,
         raw.compileInputPaths, raw.compileInputContents, raw.diagnostics)
@@ -987,11 +1005,10 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
         fingerprints.set(uri, fingerprint)
         uris.append(uri)
         sets.set(key, set)
-        values.append(if (index != changed) old else jsonObject(
-            ["uri", "version", "text", "symbols", "occurrences", "diagnostics"],
-            [jsonString(uri), jsonInteger(document.document.version),
-             jsonString(document.document.text), bootstrapAnalysisStableSymbols(document.symbols, document.stable),
-             jsonNull(), old.get("diagnostics")]))
+        values.append(if (index != changed) old else bootstrapAnalysisGraphDocumentJson(
+            uri, document.document.version, document.document.text,
+            bootstrapAnalysisStableSymbols(document.symbols, document.stable), jsonNull(), old.get("diagnostics")
+        ))
     }
     val generated: Map<string, Json> = Map()
     for (id in previous.symbols.keys()) {
@@ -1000,9 +1017,7 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
         val symbol = previous.symbols.get(id)
         if (symbol != null) generated.set(id, symbol)
     }
-    val snapshot = jsonObject(["revision", "documents", "analysisMode", "complete", "pending", "entry"],
-        [jsonString("${this.revision}"), jsonArray(values), jsonString(this.graphModeName()),
-         jsonBoolean(true), jsonArray([]), jsonString(entry)])
+    val snapshot = bootstrapAnalysisGraphSnapshotJson(this.revision, values, this.graphModeName(), true, [], entry)
     BootstrapAnalysisReplaySnapshot(snapshot, sets, generated, fingerprints, uris)
 }
 
@@ -1257,11 +1272,10 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
             }
             // The occurrences are left out (null) here: the text of a document's set is made when an answer carries the document
             // (graphMaterialize), not for the documents a `since` answer leaves out.
-            values.append(jsonObject(["uri", "version", "text", "symbols", "occurrences",
-                "diagnostics"],
-                [jsonString(document.document.uri), jsonInteger(document.document.version),
-                    jsonString(document.document.text), document.exported,
-                    jsonNull(), diagnostics]))
+            values.append(bootstrapAnalysisGraphDocumentJson(
+                document.document.uri, document.document.version, document.document.text,
+                document.exported, jsonNull(), diagnostics
+            ))
         }
     } else {
         for (document in documents) {
@@ -1271,18 +1285,15 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
                     "${document.document.version}|${document.key}||${bootstrapAnalysisGraphHash(jsonStringify(diagnostics))}")
                 fingerprintUris.append(document.document.uri)
             }
-            values.append(jsonObject(["uri", "version", "text", "symbols", "occurrences",
-                "diagnostics"],
-                [jsonString(document.document.uri), jsonInteger(document.document.version),
-                    jsonString(document.document.text), document.exported, jsonArray([]),
-                    diagnostics]))
+            values.append(bootstrapAnalysisGraphDocumentJson(
+                document.document.uri, document.document.version, document.document.text,
+                document.exported, jsonArray([]), diagnostics
+            ))
         }
     }
-    val result = jsonObject(["revision", "documents", "analysisMode", "complete", "pending",
-        "entry"],
-        [jsonString("${this.revision}"), jsonArray(values), jsonString(this.graphModeName()),
-            jsonBoolean(analyzed != null && pending.size == 0), jsonArray(pending),
-            jsonString(entry)])
+    val result = bootstrapAnalysisGraphSnapshotJson(
+        this.revision, values, this.graphModeName(), analyzed != null && pending.size == 0, pending, entry
+    )
     bootstrapAnalysisSampleMemory("answer built")
     this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(result, this.revision, sets, generatedFields)
     this.graphIndexRevision = this.revision
@@ -1324,9 +1335,10 @@ fun bootstrapAnalysisGraphBuildReferences(index: BootstrapAnalysisGraphQueryInde
             for (item in 0 until set.begins.size) {
                 val id = set.ids[item]
                 if (id != "") {
-                    val location = jsonObject(["uri", "range"], [jsonString(uri),
-                        jsonObject(["start", "end"], [jsonInteger(set.begins[item]),
-                            jsonInteger(set.ends[item])])])
+                    val location = $json {
+                        "uri": uri,
+                        "range": {"start": set.begins[item], "end": set.ends[item]}
+                    }
                     val previous = references.get(id)
                     if (previous != null) previous.append(location)
                     else references.set(id, [location])
@@ -1379,10 +1391,11 @@ fun BootstrapAnalysisService.graphQuery(id: int, method: string, params: Json): 
     if (method == "query/definition") {
         if (symbol != null) value = index.withDocumentation(symbol)
     } else if (method == "query/hover") {
-        if (found >= 0) value = jsonObject(["range", "type", "symbol"],
-            [jsonObject(["start", "end"], [jsonInteger(occurrences.begins[found]),
-                jsonInteger(occurrences.ends[found])]), jsonString(occurrences.types[found]),
-                if (symbol != null) index.withDocumentation(symbol) else jsonNull()])
+        if (found >= 0) value = $json {
+            "range": {"start": occurrences.begins[found], "end": occurrences.ends[found]},
+            "type": occurrences.types[found],
+            "symbol": if (symbol != null) index.withDocumentation(symbol) else jsonNull()
+        }
     } else {
         // One location object per occurrence: only this query needs them, so they are made on its first use for a generation.
         if (this.graphReferencesRevision != this.revision) {
@@ -1392,8 +1405,12 @@ fun BootstrapAnalysisService.graphQuery(id: int, method: string, params: Json): 
         val references = this.graphReferences.get(identity)
         value = if (references != null) jsonArray(references) else jsonArray([])
     }
-    bootstrapAnalysisResponse(id, jsonObject(["revision", "complete", "pending", "value"],
-        [snapshot.get("revision"), snapshot.get("complete"), snapshot.get("pending"), value]))
+    bootstrapAnalysisResponse(id, $json {
+        "revision": snapshot.get("revision"),
+        "complete": snapshot.get("complete"),
+        "pending": snapshot.get("pending"),
+        "value": value
+    })
 }
 
 // Projection is a wire view of the existing immutable full snapshot. Keep the
