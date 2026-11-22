@@ -189,6 +189,7 @@ class Regex(
     }
 }
 
+// Holds a named capture's group slot and source span in the pattern.
 class RegexCaptureName(val name: string, val slot: int, val begin: int, val end: int)
 
 // A compiled regex when `succeeded` is true. On failure the regex is empty and `error` gives the reason and location.
@@ -199,18 +200,23 @@ class RegexCompileResult(
 
 /// Matcher for a literal with named captures. The underlying Regex keeps the indexed match API.
 class NamedRegex<Captures>(val regex: Regex, val project: (RegexMatch) -> Captures) {
+    // Returns true if the pattern matches the entire input.
     fun matches(text: string): bool = this.regex.matches(text)
+    // Returns the input with every non-overlapping match replaced using the regex replacement syntax.
     fun replace(text: string, replacement: string): string = this.regex.replace(text, replacement)
+    // Returns the named captures from a full-input match, or null if it fails.
     fun matchFull(text: string): Captures? {
         val matched = this.regex.matchFull(text)
         val project = this.project
         if (matched != null) project(matched) else null
     }
+    // Returns the first projected match at or after the byte offset, or null for no match or an invalid offset.
     fun find(text: string, start: int = 0): Captures? {
         val matched = this.regex.find(text, start)
         val project = this.project
         if (matched != null) project(matched) else null
     }
+    // Returns projected captures for every non-overlapping match in source order.
     fun findAll(text: string): array<Captures> {
         val matches = this.regex.findAll(text)
         val result: array<Captures> = []
@@ -312,6 +318,7 @@ private fun regexComplement(ranges: array<int>): array<int> {
     out
 }
 
+// Tracks the cursor, capture slots, character classes, and first error while parsing a UTF-8 regex.
 class RegexParser(
     val src: string,
     var pos: int,
@@ -323,6 +330,7 @@ class RegexParser(
     val classes: array<array<int>>,
     val captureNames: array<RegexCaptureName> = []
 ) {
+    // Records a parse failure with its source byte offset.
     fun fail(message: string, offset: int): RegexNode {
         if (!this.failed) {
             this.failed = true
@@ -332,15 +340,18 @@ class RegexParser(
         regexLeaf(0, 0, 0)
     }
 
+    // Returns the next pattern byte or -1 at the end of the source.
     fun peek(): int = if (this.pos < this.src.size) this.src[this.pos] else -1
 
     // The code point at `pos`; the pattern was checked to be valid UTF-8.
     fun codePoint(): int = utf8DecodeAt(this.src, this.pos)
 
+    // Advances past one UTF-8 scalar from a valid current source position.
     fun advanceCodePoint(): void {
         this.pos = this.pos + utf8SequenceLength(this.src[this.pos])
     }
 
+    // Copies the class's ranges into the parser table and returns its index.
     fun addClass(ranges: array<int>): int {
         val copy: array<int> = []
         for (value in ranges) copy.append(value)
@@ -348,6 +359,7 @@ class RegexParser(
         this.classes.size - 1
     }
 
+    // Returns syntax for the current pipe-separated branches, recording an error for malformed pattern syntax.
     fun parseAlternation(): RegexNode {
         val branches: array<RegexNode> = []
         branches.append(this.parseConcatenation())
@@ -358,6 +370,7 @@ class RegexParser(
         if (branches.size == 1) branches[0] else RegexNode(5, 0, 0, 0, branches)
     }
 
+    // Returns syntax for consecutive terms up to a pipe, closing group, or end of input.
     fun parseConcatenation(): RegexNode {
         val items: array<RegexNode> = []
         while (!this.failed && this.pos < this.src.size && this.peek() != 124 && this.peek() !=
@@ -401,6 +414,7 @@ class RegexParser(
         [low, high, i + 1 - this.pos]
     }
 
+    // Returns the atom with any following repetition applied and records an error for unsupported or malformed repeats.
     fun parseQuantifiers(atom: RegexNode, atomStart: int): RegexNode {
         var low = -1
         var high = -1
@@ -430,6 +444,7 @@ class RegexParser(
         RegexNode(6, low, high, lazy, [atom])
     }
 
+    // Returns the next pattern atom and records an error for an invalid or unexpected token.
     fun parseAtom(): RegexNode {
         val c = this.peek()
         if (c == 40) return this.parseGroup()
@@ -446,12 +461,14 @@ class RegexParser(
         regexLeaf(1, scalar, 0)
     }
 
+    // Allocates and returns the next capture slot, recording a parse error when the group limit is exceeded.
     fun captureSlot(open: int): int {
         this.groups += 1
         if (this.groups > regexMaximumGroups) this.fail("too many groups", open)
         this.groups
     }
 
+    // Parses and returns a named capture's slot, recording an error for invalid or repeated names.
     fun namedCapture(open: int): int {
         this.pos += 2
         val begin = this.pos
@@ -473,6 +490,7 @@ class RegexParser(
         slot
     }
 
+    // Returns a grouped expression and records a parse error for invalid group syntax or a missing closing parenthesis.
     fun parseGroup(): RegexNode {
         val open = this.pos
         this.pos += 1
@@ -502,6 +520,7 @@ class RegexParser(
         RegexNode(7, capture, 0, 0, [inner])
     }
 
+    // Returns the Unicode scalar for an escaped letter, recording an error for malformed or unsupported escapes.
     fun escapeScalar(letter: int): int {
         if (letter == 110) return 10
         if (letter == 114) return 13
@@ -554,6 +573,7 @@ class RegexParser(
         scalar
     }
 
+    // Returns syntax for one escaped scalar, class, or assertion and records an error for malformed escapes.
     fun parseEscape(): RegexNode {
         this.pos = this.pos + 1
         val e = this.peek()
@@ -571,6 +591,7 @@ class RegexParser(
         if (this.failed) regexLeaf(0, 0, 0) else regexLeaf(1, scalar, 0)
     }
 
+    // Returns syntax for a character class, recording an error if its ranges or closing bracket are invalid.
     fun parseClass(): RegexNode {
         val open = this.pos
         this.pos = this.pos + 1
@@ -635,9 +656,12 @@ class RegexParser(
     }
 }
 
+// Tracks the regex VM instructions and reports when the program exceeds its instruction limit.
 class RegexEmitter(val program: array<int>, var failed: bool, var groupSlots: int, val limit: int) {
+    // Returns the number of encoded VM instructions.
     fun count(): int = this.program.size / 3
 
+    // Appends an instruction and returns its index, marking the emitter failed if the program limit is exceeded.
     fun add(op: int, x: int, y: int): int {
         this.program.append(op)
         this.program.append(x)
@@ -646,9 +670,12 @@ class RegexEmitter(val program: array<int>, var failed: bool, var groupSlots: in
         this.program.size / 3 - 1
     }
 
+    // Replaces the first operand at an existing instruction index.
     fun setX(at: int, x: int): void { this.program[at * 3 + 1] = x }
+    // Replaces the second operand at an existing instruction index.
     fun setY(at: int, y: int): void { this.program[at * 3 + 2] = y }
 
+    // Appends the instructions for a parsed pattern node, stopping once the emitter records a failure.
     fun emit(node: RegexNode): void {
         if (this.failed) return
         val kind = node.kind
@@ -861,6 +888,7 @@ private trusted fun regexSkipTo(text: string, first: string, i: int, size: int):
 // entries [0, 2n) are the two thread lists (list 0 first, list 1 from n),
 // [2n, 4n + 2) the work stack, then a start entry, a result entry and a work
 // entry. `seen` marks the instructions already added in this generation.
+// Holds the compiled program, input text, and scratch state for matching.
 class RegexVm(
     val program: array<int>,
     val classes: array<array<int>>,
@@ -875,6 +903,7 @@ class RegexVm(
     val stackPcs: array<int>,
     var work: int
 ) {
+    // Returns whether the requested anchor or word-boundary condition holds at the byte position.
     fun assertionHolds(kind: int, position: int): bool {
         if (kind == 0) return position == 0
         if (kind == 1) return position == this.text.size
@@ -883,10 +912,14 @@ class RegexVm(
         if (kind == 2) before != after else before == after
     }
 
+    // Returns the scratch entry used to store the initial capture state.
     fun startEntry(): int = this.n * 4 + 2
+    // Returns the scratch entry that holds the current match result.
     fun resultEntry(): int = this.n * 4 + 3
+    // Returns the scratch entry used for temporary capture state.
     fun workEntry(): int = this.n * 4 + 4
 
+    // Copies all capture slots from one valid scratch entry to another.
     fun copyEntry(from: int, to: int): void {
         val a = from * this.slots
         val b = to * this.slots
@@ -991,6 +1024,7 @@ class RegexVm(
         }
     }
 
+    // Returns true if the code point matches the indexed character class and its negation rule.
     fun classMatches(index: int, c: int): bool {
         val ranges = this.classes[index]
         var i = 0
@@ -1513,8 +1547,10 @@ compile fun ablaRegexNamePart(text: string): string {
     buffer.toText()
 }
 
+// Returns the generated capture declaration source for the compiler to publish.
 compile fun ablaRegexFinalizeCaptures(source: string, origin: SyntaxExpression): string = source
 
+// Returns syntax that wraps the compiled regex with a generated typed capture projection.
 compile fun ablaRegexNamedMatcher(cursor: ParserCursor, pattern: SyntaxExpression,
     compiled: RegexCompileResult, constructor: SyntaxExpression): SyntaxExpression {
     val module = ablaRegexNamePart(parserSourceIdentity(cursor))
@@ -1552,6 +1588,7 @@ compile fun ablaRegexNamedMatcher(cursor: ParserCursor, pattern: SyntaxExpressio
     syntaxCompile(syntaxCall(factory, [constructor]), pattern)
 }
 
+// Returns syntax for a regex literal and records a parser diagnostic for invalid literal or pattern syntax.
 compile fun ablaRegexParseLiteral(cursor: ParserCursor): SyntaxExpression {
     parserExpect(cursor, "(")
     val pattern = parserParseAblaExpression(cursor)
@@ -1588,4 +1625,5 @@ compile fun ablaRegexParseLiteral(cursor: ParserCursor): SyntaxExpression {
     else ablaRegexNamedMatcher(cursor, pattern, compiled, constructor)
 }
 
+// Registers the regex literal syntax, including the typed projection for named capture groups.
 #compilerRegisterSubparser("regex", ablaRegexParseLiteral)
