@@ -1157,8 +1157,8 @@ async function incrementalBodyReplay() {
     const original = 'fun answer: int {\n    42\n}\nfun afterAnswer: int = 7\n';
     const main = 'import "dep.ab"\nfun main: int = answer()\n';
     const p = fixture('body-replay', { 'main.ab': main, 'dep.ab': original });
-    const env = { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TYPING: '2',
-        ABLA_ANALYSIS_INCREMENTAL_TRACE: '1', ABLA_ANALYSIS_CHECK: '1' };
+    const env = { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TRACE: '1', ABLA_ANALYSIS_CHECK: '1' };
+    delete env.ABLA_ANALYSIS_INCREMENTAL_TYPING;
     const replay = await start(p, { mode: 'graph-v2', env, log: 'replay.stderr' });
     const full = await start(p, { mode: 'graph-v2',
         env: { ...env, ABLA_ANALYSIS_INCREMENTAL_TYPING: '0', ABLA_ANALYSIS_CHECK: '0' }, log: 'full.stderr' });
