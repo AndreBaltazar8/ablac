@@ -127,7 +127,15 @@ cmp "$scratch/ordinary-staged" "$program"
 
 host=$ABLA_SYSROOT/stdlib/abla/runtime/platform/host.ab
 grep -q '^var __ablaRuntimeHostLimit: int = 4611686018427387903$' "$host"
-sed 's/^var __ablaRuntimeHostLimit: int = 4611686018427387903$/var __ablaRuntimeHostLimit: int = 67108864/' "$host" > "$host.next"
+sed -e 's/^var __ablaRuntimeHostLimit: int = 4611686018427387903$/var __ablaRuntimeHostLimit: int = 66846720/' \
+    -e 's/^    else __ablaRuntimeHostLimit$/    else __ablaRuntimeHostLimit + __ablaRuntimeHostFixtureReadSlots()/' \
+    "$host" > "$host.next"
+cat >> "$host.next" <<'ABLA'
+
+// New collector helpers follow their state into the object.
+val __ablaRuntimeHostFixtureSlots: int = __ablaRuntimeHostGcAdaptiveMinimumSlots
+private trusted fun __ablaRuntimeHostFixtureReadSlots(): int = __ablaRuntimeHostFixtureSlots
+ABLA
 mv "$host.next" "$host"
 "$compiler" build "$source_file" --fast -o "$program"
 "$program" > "$scratch/updated"

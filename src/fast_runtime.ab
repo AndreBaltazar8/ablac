@@ -336,6 +336,13 @@ class BootstrapFastRuntimeView(
     val error: string = ""
 )
 
+class BootstrapFastRuntimePartition(
+    val declarations: array<BootstrapDeclaration>,
+    val objectGlobals: Map<string, bool>,
+    val dependentFunctions: Map<string, bool>,
+    val error: string = ""
+)
+
 private class BootstrapFastRuntimeEdit(val begin: int, val end: int, val text: string)
 
 private fun bootstrapFastRuntimeShort(name: string): string =
@@ -515,6 +522,57 @@ private fun bootstrapFastRuntimeForwarder(
 private fun bootstrapFastRuntimeProgramOwns(short: string): bool =
     short == "HostStmCell" || short == "HostRootFrameAddress" || short == "HostGetenv"
 
+private fun bootstrapFastRuntimeUsesObjectGlobal(
+    expression: BootstrapExpression, objectGlobals: Map<string, bool>
+): bool {
+    if ((expression.kind == "identifier" || expression.kind == "assign") &&
+        objectGlobals.has(expression.text)) return true
+    for (child in expression.children) {
+        if (bootstrapFastRuntimeUsesObjectGlobal(child, objectGlobals)) return true
+    }
+    false
+}
+
+fun bootstrapFastRuntimePartition(source: string): BootstrapFastRuntimePartition {
+    val parsed = bootstrapParse(source)
+    val objectGlobals: Map<string, bool> = Map()
+    val dependentFunctions: Map<string, bool> = Map()
+    if (parsed.errors != 0) return BootstrapFastRuntimePartition([], objectGlobals,
+        dependentFunctions, "cannot parse host runtime")
+    for (short in bootstrapFastRuntimeObjectGlobals) {
+        objectGlobals.set(BOOTSTRAP_FAST_RUNTIME_PREFIX + short, true)
+    }
+    // An initializer that reads object-owned state must run with that state.
+    // Close over these dependencies before choosing where function bodies go.
+    var changed = true
+    while (changed) {
+        changed = false
+        for (declaration in parsed.declarations) {
+            if ((declaration.kind == "val" || declaration.kind == "var") &&
+                !objectGlobals.has(declaration.name) &&
+                bootstrapFastRuntimeUsesObjectGlobal(declaration.expression, objectGlobals)) {
+                objectGlobals.set(declaration.name, true)
+                changed = true
+            }
+        }
+    }
+    // Keep each accessor with its state. Other functions can still call it
+    // through the existing native bridge, so callers need not move with it.
+    for (declaration in parsed.declarations) {
+        if (declaration.kind != "fun" ||
+            !bootstrapFastRuntimeUsesObjectGlobal(declaration.expression, objectGlobals)) continue
+        val short = bootstrapFastRuntimeShort(declaration.name)
+        if (bootstrapFastRuntimeInlineAllocation(short) || bootstrapFastRuntimeProgramOwns(short)) {
+            return BootstrapFastRuntimePartition([], objectGlobals, dependentFunctions,
+                "program-owned runtime function reads object-owned state: ${declaration.name}")
+        }
+        if (!bootstrapFastRuntimeHas(bootstrapFastRuntimeMovedFunctions, short)) {
+            dependentFunctions.set(declaration.name, true)
+        }
+    }
+    BootstrapFastRuntimePartition(parsed.declarations, objectGlobals, dependentFunctions)
+}
+
 private fun bootstrapFastRuntimeAppendExport(
     var text: ByteBuffer, var exports: array<string>, symbol: string
 ): void {
@@ -533,16 +591,18 @@ private fun bootstrapFastRuntimePrivateStart(source: string, declaration: Bootst
     else declaration.begin
 }
 
-fun bootstrapFastRuntimeView(source: string, producer: bool): BootstrapFastRuntimeView {
-    val parsed = bootstrapParse(source)
-    if (parsed.errors != 0) return BootstrapFastRuntimeView("", [], "cannot parse host runtime")
+fun bootstrapFastRuntimeView(
+    source: string, partition: BootstrapFastRuntimePartition, producer: bool
+): BootstrapFastRuntimeView {
     val text = byteBuffer()
     val exports: array<string> = []
     var limit = ""
     var cursor = 0
-    for (declaration in parsed.declarations) {
+    for (declaration in partition.declarations) {
         val short = bootstrapFastRuntimeShort(declaration.name)
-        if (short == "") continue
+        val dependent = partition.dependentFunctions.has(declaration.name)
+        val objectGlobal = partition.objectGlobals.has(declaration.name)
+        if (short == "" && !dependent && !objectGlobal) continue
         val privateStart = bootstrapFastRuntimePrivateStart(source, declaration)
         var begin = privateStart
         for (annotation in declaration.annotationBegins) {
@@ -552,15 +612,15 @@ fun bootstrapFastRuntimeView(source: string, producer: bool): BootstrapFastRunti
         val special = bootstrapFastRuntimeSpecial(short, producer)
         val stateField = bootstrapFastRuntimeField(declaration.name)
         val isSmallLists = short == "HostSmallLists"
-        val moved = bootstrapFastRuntimeHas(bootstrapFastRuntimeMovedFunctions, short) && !bootstrapFastRuntimeInlineAllocation(short)
+        val moved = dependent || (bootstrapFastRuntimeHas(bootstrapFastRuntimeMovedFunctions, short) &&
+            !bootstrapFastRuntimeInlineAllocation(short))
         val forwarder = bootstrapFastRuntimeForwarder(short, declaration, moved)
         val symbol = if (forwarder == "") declaration.name else forwarder
         val cut = if (producer) bootstrapFastRuntimeProgramOwns(short) else moved
         val export = if (producer) !isSmallLists &&
-            (bootstrapFastRuntimeHas(bootstrapFastRuntimeExports, short) || forwarder != "")
+            (dependent || bootstrapFastRuntimeHas(bootstrapFastRuntimeExports, short) || forwarder != "")
         else short == "HostRootFrameAddress" || short == "HostStmCell"
-        val drop = stateField >= 0 || isSmallLists ||
-            (!producer && bootstrapFastRuntimeHas(bootstrapFastRuntimeObjectGlobals, short))
+        val drop = stateField >= 0 || isSmallLists || (!producer && objectGlobal)
         if (!drop && special == "" && !cut && !export && declaration.kind != "fun") continue
         if (begin < cursor || end < begin) return BootstrapFastRuntimeView("", [], "invalid host runtime declaration range")
         text.appendText(source.slice(cursor, begin))

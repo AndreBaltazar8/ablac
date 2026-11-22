@@ -54,7 +54,8 @@ builds and caches the runtime object for the installed compiler, runtime sources
 and build options.
 Editing the runtime selects a new cache entry. `--no-cache` still skips the
 program cache. Builds with an unavailable runtime cache, compile-time code,
-or the background collector use the regular runtime build. With
+the background collector, or an explicit import of the runtime platform
+use the regular runtime build. With
 `ABLA_KEEP_LLVM_TEXT=1`, the retained LLVM module includes the runtime.
 
 `ablac run` compiles the program in process, runs the `--o1` IR pipeline on it
