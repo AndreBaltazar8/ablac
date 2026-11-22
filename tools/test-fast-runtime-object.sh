@@ -50,7 +50,7 @@ ABLA_FAST_RUNTIME_OBJECT=0 "$compiler" build "$source_file" --fast --no-cache -o
 grep -qx 'limit 4611686018427387903' "$scratch/expected"
 cp "$program" "$scratch/ordinary"
 
-export ABLA_FAST_RUNTIME_OBJECT=1
+unset ABLA_FAST_RUNTIME_OBJECT
 "$compiler" build "$source_file" --fast --no-cache -o "$program"
 "$program" > "$scratch/actual"
 cmp "$scratch/expected" "$scratch/actual"
@@ -85,7 +85,10 @@ cmp "$scratch/cold" "$scratch/race-b"
 race_records=("$scratch/race-cache"/fast-runtime-v1/*/record)
 [[ ${#race_records[@]} == 1 && -s ${race_records[0]} ]]
 
-printf 'damaged object\n' > "${records[0]%/record}/runtime.o"
+runtime_object=${records[0]%/record}/runtime.o
+touch -r "$runtime_object" "$scratch/object-mtime"
+printf 'bad!' | dd of="$runtime_object" conv=notrunc status=none
+touch -r "$scratch/object-mtime" "$runtime_object"
 "$compiler" build "$source_file" --fast -o "$program"
 cmp "$scratch/cold" "$program"
 
@@ -101,6 +104,12 @@ cmp "$scratch/debug-first" "$program"
 touch "$scratch/blocked-cache"
 ABLA_CACHE_DIR=$scratch/blocked-cache "$compiler" build "$source_file" --fast --no-cache -o "$program"
 cmp "$scratch/ordinary" "$program"
+
+ABLA_KEEP_LLVM_TEXT=1 ABLA_FAST_RUNTIME_OBJECT=0 \
+    "$compiler" build "$source_file" --fast --no-cache -o "$program"
+cp "$program.ll" "$scratch/ordinary.ll"
+ABLA_KEEP_LLVM_TEXT=1 "$compiler" build "$source_file" --fast --no-cache -o "$program"
+cmp "$scratch/ordinary.ll" "$program.ll"
 
 cat > "$scratch/staged.ab" <<'ABLA'
 import "abla/io"
@@ -126,7 +135,7 @@ grep -qx 'limit 67108864' "$scratch/updated"
 records=("$ABLA_CACHE_DIR"/fast-runtime-v1/*/record)
 [[ ${#records[@]} == 2 && -s ${records[0]} && -s ${records[1]} ]]
 
-# The opt-in cannot influence an ordinary release link.
+# The switch cannot influence an ordinary release link.
 ABLA_FAST_RUNTIME_OBJECT=0 "$compiler" build "$source_file" --no-cache -o "$program"
 cp "$program" "$scratch/release"
 "$compiler" build "$source_file" --no-cache -o "$program"

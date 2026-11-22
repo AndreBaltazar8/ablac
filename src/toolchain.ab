@@ -4218,7 +4218,7 @@ fun bootstrapValidateCompileInputs(serialized: string): bool {
 
 private class BootstrapFastRuntimeArtifact(
     val objectPath: string = "",
-    val source: string = "",
+    val sourcePath: string = "",
     val key: string = "",
     val error: string = "",
     val descriptor: int = -1
@@ -4231,7 +4231,8 @@ private fun bootstrapFastRuntimeEligible(
     if (producer || profile != "inprocess-fast" || artifact != "executable" ||
         target.objectFormat != "elf" || !target.hosted ||
         !bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) || ablaHostIsMacOS() ||
-        linuxEnvironment("ABLA_FAST_RUNTIME_OBJECT").value != "1") return false
+        bootstrapKeepLlvmText() ||
+        linuxEnvironment("ABLA_FAST_RUNTIME_OBJECT").value == "0") return false
     // Compile-time code uses the compiler's own runtime, and its staged
     // operators may depend on the unsplit module. Background freeing swaps
     // in a collector body by name, which is a separate object variant.
@@ -4297,17 +4298,29 @@ private fun bootstrapFastRuntimePrepare(
         Path("${bootstrapCacheDirectory()}/fast-runtime-v1"), key)
 }
 
+// An entry is immutable after publication. Record the producer's observations
+// so a cache hit can validate both files without reading or hashing them.
+// Change time and inode also catch a write with its mtime restored or a rename.
+private fun bootstrapFastRuntimeFileStamp(path: Path): string {
+    val info = path.info()
+    if (!info.isFile() || info.size <= 0) return ""
+    "${info.size}:${info.inode}:${info.revision}:${info.changed}"
+}
+
+private fun bootstrapFastRuntimeRecord(path: Path, key: string): string {
+    val objectStamp = bootstrapFastRuntimeFileStamp(path.child("runtime.o"))
+    val sourceStamp = bootstrapFastRuntimeFileStamp(path.child("host.ab"))
+    if (objectStamp == "" || sourceStamp == "") return ""
+    "abla-fast-runtime-entry-2\n$key\n$objectStamp\n$sourceStamp\n"
+}
+
 private fun bootstrapFastRuntimeCacheRead(path: Path, key: string, descriptor: int): BootstrapFastRuntimeArtifact {
     val expected = path.child("record").readText()
-    if (expected == "") return BootstrapFastRuntimeArtifact()
-    val objectFile = path.child("runtime.o")
-    val source = path.child("host.ab").readText()
-    val bytes = objectFile.readText()
-    if (source == "" || bytes == "" ||
-        expected != "$key\n${bootstrapFastRuntimeDigest(bytes)}\n${bootstrapFastRuntimeDigest(source)}\n") {
+    if (expected == "" || expected != bootstrapFastRuntimeRecord(path, key)) {
         return BootstrapFastRuntimeArtifact()
     }
-    BootstrapFastRuntimeArtifact(objectFile.text, source, key, descriptor = descriptor)
+    BootstrapFastRuntimeArtifact(path.child("runtime.o").text, path.child("host.ab").text,
+        key, descriptor = descriptor)
 }
 
 private fun bootstrapFastRuntimeUnavailable(reason: string): BootstrapFastRuntimeArtifact {
@@ -4371,11 +4384,9 @@ private fun bootstrapFastRuntimePublish(
     scratch.removeTree()
     if (!scratch.createDirectories()) return ""
     val product = bootstrapFastRuntimeProduce(target, hostPath, objectView, emitObject, scratch)
-    if (product == "") {
-        val bytes = scratch.child("runtime.o").readText()
-        val record = "$key\n${bootstrapFastRuntimeDigest(bytes)}\n${bootstrapFastRuntimeDigest(programView.source)}\n"
-        if (bytes != "" && scratch.child("host.ab").writeText(programView.source) &&
-            scratch.child("record").writeText(record)) {
+    if (product == "" && scratch.child("host.ab").writeText(programView.source)) {
+        val record = bootstrapFastRuntimeRecord(scratch, key)
+        if (record != "" && scratch.child("record").writeText(record)) {
             destination.removeTree()
             scratch.moveTo(destination)
         }
@@ -4936,7 +4947,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         // The runtime key identifies the transformed source. A program
         // object cache hit needs neither its parser nor its discovery view.
         if (fastRuntime.objectPath != "") bootstrapFastRuntimeApply(
-            orderedSnapshots, bootstrapNormalizeModulePath(runtimePlatform), fastRuntime.source, moduleState
+            orderedSnapshots, bootstrapNormalizeModulePath(runtimePlatform),
+            Path(fastRuntime.sourcePath).readText(), moduleState
         )
         bootstrapLlvmTraceMemory("frontend.parse.begin")
         var parsedGraph = graph.parse()
