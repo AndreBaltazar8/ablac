@@ -293,84 +293,105 @@ fun bootstrapAnalysisCommentLine(text: string, block: bool): string {
     text.slice(begin, end)
 }
 
-/** The documentation of the declaration (or constructor parameter) that begins at `offset`: the `/** ... */` block directly above it, or the
- *  run of `//` lines directly above it, as plain text. Only modifiers (`val`, `var`, `own`, `borrow`) may come before it on its line, annotation
- *  lines between the comment and it are skipped, and a blank line ends the search. "" for none. */
-fun bootstrapAnalysisDocumentation(source: string, offset: int, limit: int = 4096): string {
-    if (offset <= 0 || offset > source.size) return ""
+// The comment's original byte span. Annotation lines are skipped, and a blank
+// line breaks the association. An empty array represents no comment.
+fun bootstrapAnalysisDocumentationSpan(source: string, offset: int): array<int> {
+    if (offset <= 0 || offset > source.size) return []
     val line = bootstrapAnalysisLineStart(source, offset)
-    // Only blanks and modifier words before the declaration on its line.
     var cursor = bootstrapAnalysisSkipBlanks(source, line, offset)
-    var modifiers = true
-    while (modifiers && cursor < offset) {
+    while (cursor < offset) {
         var word = cursor
         while (word < offset && source[word] != 32 && source[word] != 9) word = word + 1
         val text = source.slice(cursor, word)
-        if (text == "val" || text == "var" || text == "own" || text == "borrow") cursor = bootstrapAnalysisSkipBlanks(source, word, offset)
-        else modifiers = false
+        if (text != "val" && text != "var" && text != "own" && text != "borrow") return []
+        cursor = bootstrapAnalysisSkipBlanks(source, word, offset)
     }
-    if (cursor < offset) return ""
     var top = line
-    var collected: array<string> = []
-    var found = false
-    var block = false
-    while (top > 0 && !found) {
+    while (top > 0) {
         val previousStart = bootstrapAnalysisLineStart(source, top - 1)
         val first = bootstrapAnalysisSkipBlanks(source, previousStart, top - 1)
         val last = bootstrapAnalysisTrimEnd(source, first, top - 1)
-        if (first == last) return ""
-        if (source[first] == 64 && collected.size == 0) {
-            top = previousStart
-        } else if (last - first >= 2 && source[last - 2] == 42 && source[last - 1] == 47 && collected.size == 0) {
-            // A block comment ends here: find where it begins.
+        if (first == last) return []
+        if (source[first] == 64) top = previousStart
+        else if (last - first >= 2 && source[last - 2] == 42 && source[last - 1] == 47) {
             var open = last - 2
             while (open > 0 && !(source[open] == 47 && source[open + 1] == 42)) open = open - 1
-            if (source[open] != 47 || source[open + 1] != 42 || open + 2 >= source.size || source[open + 2] != 42) return ""
-            val inner = source.slice(open + 3, last - 2)
-            var lineBegin = 0
-            var index = 0
-            while (index <= inner.size) {
-                if (index == inner.size || inner[index] == 10) {
-                    collected.append(bootstrapAnalysisCommentLine(inner.slice(lineBegin, index), true))
-                    lineBegin = index + 1
-                }
-                index = index + 1
-            }
-            found = true
-            block = true
+            if (open + 3 > last - 2 || source[open] != 47 ||
+                source[open + 1] != 42 || source[open + 2] != 42) return []
+            return [open, last]
         } else if (last - first >= 2 && source[first] == 47 && source[first + 1] == 47) {
-            // A run of `//` lines, read from the bottom up.
-            val lines: array<string> = []
-            var upper = top
-            var more = true
-            while (more && upper > 0) {
+            var upper = previousStart
+            var begin = first
+            while (upper > 0) {
                 val start = bootstrapAnalysisLineStart(source, upper - 1)
                 val lead = bootstrapAnalysisSkipBlanks(source, start, upper - 1)
                 val trail = bootstrapAnalysisTrimEnd(source, lead, upper - 1)
-                if (trail - lead >= 2 && source[lead] == 47 && source[lead + 1] == 47) {
-                    lines.append(bootstrapAnalysisCommentLine(source.slice(lead, trail), false))
-                    upper = start
-                } else more = false
+                if (trail - lead < 2 || source[lead] != 47 || source[lead + 1] != 47) break
+                begin = lead
+                upper = start
             }
-            var at = lines.size
-            while (at > 0) {
-                at = at - 1
-                collected.append(lines[at])
-            }
-            found = true
-        } else return ""
+            return [begin, last]
+        } else return []
     }
-    if (!found) return ""
-    var text = collected.join("\n")
+    []
+}
+
+fun bootstrapAnalysisDocumentationText(source: string, start: int, end: int, limit: int): string {
+    val block = source[start + 1] == 42
+    var line = if (block) start + 3 else start
+    val stop = if (block) end - 2 else end
+    val lines: array<string> = []
+    var index = line
+    while (index <= stop) {
+        if (index == stop || source[index] == 10) {
+            lines.append(bootstrapAnalysisCommentLine(source.slice(line, index), block))
+            line = index + 1
+        }
+        index = index + 1
+    }
+    var text = lines.join("\n")
     if (block) {
-        // (Trailing and leading empty lines of a block comment are not part of its text.)
         var begin = 0
-        var end = text.size
-        while (begin < end && (text[begin] == 10 || text[begin] == 32)) begin = begin + 1
-        while (end > begin && (text[end - 1] == 10 || text[end - 1] == 32)) end = end - 1
-        text = text.slice(begin, end)
+        var last = text.size
+        while (begin < last && (text[begin] == 10 || text[begin] == 32)) begin = begin + 1
+        while (last > begin && (text[last - 1] == 10 || text[last - 1] == 32)) last = last - 1
+        text = text.slice(begin, last)
     }
     if (limit > 0 && text.size > limit) text.slice(0, limit) else text
+}
+
+fun bootstrapAnalysisDocumentation(source: string, offset: int, limit: int = 4096): string {
+    val span = bootstrapAnalysisDocumentationSpan(source, offset)
+    if (span.size == 0) "" else bootstrapAnalysisDocumentationText(source, span[0], span[1], limit)
+}
+
+// The symbol and its parameters share their document's immutable source.
+fun bootstrapAnalysisSymbolWithDocumentation(symbol: Json, source: string): Json {
+    val hasSpan = symbol.has("documentationSpan")
+    val parameters = symbol.get("parameters").values
+    var decorated: array<Json> = []
+    for (parameter in parameters) {
+        decorated.append(bootstrapAnalysisSymbolWithDocumentation(parameter, source))
+    }
+    if (!hasSpan && decorated.size == 0) return symbol
+    val keys: array<string> = []
+    val values: array<Json> = []
+    for (position in 0 until symbol.keys.size) {
+        val key = symbol.keys[position]
+        val value = symbol.values[position]
+        if (key == "documentationSpan") {
+            val text = bootstrapAnalysisDocumentationText(source,
+                value.at(0).asInt(), value.at(1).asInt(), 4096)
+            if (text != "") {
+                keys.append("documentation")
+                values.append(jsonString(text))
+            }
+        } else {
+            keys.append(key)
+            values.append(if (key == "parameters") jsonArray(decorated) else value)
+        }
+    }
+    jsonObject(keys, values)
 }
 
 /** The beginning of the source header, including visibility and sealed modifiers outside the parser's declaration range. */
@@ -437,10 +458,10 @@ fun bootstrapAnalysisParameters(source: string, tokens: array<BootstrapToken>,
         }
         val keys = ["name", "label"]
         val values = [jsonString(declaration.parameters[parameter]), jsonString(source.slice(begin, end))]
-        val documentation = bootstrapAnalysisDocumentation(source, selection[0])
-        if (documentation != "") {
-            keys.append("documentation")
-            values.append(jsonString(documentation))
+        val documentation = bootstrapAnalysisDocumentationSpan(source, selection[0])
+        if (documentation.size > 0) {
+            keys.append("documentationSpan")
+            values.append(jsonArray([jsonInteger(documentation[0]), jsonInteger(documentation[1])]))
         }
         parameters.append(jsonObject(keys, values))
     }
@@ -468,7 +489,7 @@ fun bootstrapAnalysisSymbolJson(
         "${declaration.kind} ${declaration.resultType}",
         topLevel,
         containerId,
-        bootstrapAnalysisDocumentation(source, bootstrapAnalysisDeclarationBegin(source, tokens, declaration)),
+        bootstrapAnalysisDocumentationSpan(source, bootstrapAnalysisDeclarationBegin(source, tokens, declaration)),
         bootstrapAnalysisSignature(source, tokens, declaration),
         bootstrapAnalysisParameters(source, tokens, declaration)
     )
@@ -486,7 +507,7 @@ fun bootstrapAnalysisNamedSymbolJson(
     detail: string,
     topLevel: bool,
     containerId: string,
-    documentation: string = "",
+    documentation: array<int> = [],
     signature: string = "",
     parameters: array<Json> = []
 ): Json {
@@ -514,10 +535,9 @@ fun bootstrapAnalysisNamedSymbolJson(
         keys.append("containerId")
         values.append(jsonString(containerId))
     }
-    // What the comment above the declaration says of it (a client shows it where it shows the declaration).
-    if (documentation != "") {
-        keys.append("documentation")
-        values.append(jsonString(documentation))
+    if (documentation.size > 0) {
+        keys.append("documentationSpan")
+        values.append(jsonArray([jsonInteger(documentation[0]), jsonInteger(documentation[1])]))
     }
     if (signature != "") {
         keys.append("signature")
@@ -679,7 +699,7 @@ fun bootstrapAnalysisCollectDeclarationSymbols(
                 declaration.parameterTypes[parameter] else "unknown",
             false,
             containerId,
-            bootstrapAnalysisDocumentation(source, selection[0])
+            bootstrapAnalysisDocumentationSpan(source, selection[0])
         ))
         parameter = parameter + 1
     }
@@ -1694,12 +1714,11 @@ fun BootstrapAnalysisService.handle(request: Json): string {
                 "since is a revision string, and needs analysisMode graph-v2")
         }
         val snapshot = this.snapshot()
-        val answer = this.graphMaterialize(if (params.has("since")) this.graphSince(snapshot, params.getString("since"))
-            else snapshot)
-        response = bootstrapAnalysisResponse(id,
-            if (params.has("fields")) bootstrapAnalysisGraphProjection(answer,
-                params.get("fields"))
-            else answer)
+        val answer = if (params.has("since")) this.graphSince(snapshot, params.getString("since"))
+            else snapshot
+        val projected = if (params.has("fields")) bootstrapAnalysisGraphProjection(answer,
+            params.get("fields")) else answer
+        this.graphWriteAnalysis(id, projected)
     } else if ((method == "query/definition" || method == "query/hover" ||
         method == "query/references")) {
         response = this.graphQuery(id, method, params)
@@ -1754,7 +1773,9 @@ fun bootstrapAnalysisService(): int {
                 response = service.handle(parsed.value)
                 bootstrapLexRequestEnd()
             }
-            if (response != "") linuxPrintStandardOutput("$response\n")
+            // The reply can be tens of megabytes. Write the delimiter without
+            // building another copy of the response.
+            if (response != "" && linuxWriteStandardOutputAll(response)) linuxPrintStandardOutput("\n")
         }
     }
     0

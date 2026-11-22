@@ -644,6 +644,26 @@ async function documentation(mode) {
     assert.equal(hover.symbol.documentation, 'Adds one.\nMore text.');
     assert.equal(hover.symbol.signature, 'fun inc(n: int): int');
     assert.deepEqual(hover.symbol.parameters, [{ name: 'n', label: 'n: int' }]);
+    assert.equal('documentationSpan' in hover.symbol, false);
+    assert.equal('documentationSpan' in symbolOf('withDocs').parameters[0], false);
+
+    // A diagnostics-only response projection still refreshes the text used by hover.
+    // Exercise shifted UTF-8 offsets and an overlay whose docs differ from disk.
+    const edited = '// café 😀\n\n' + main.replace('Adds one.', 'Adds one (overlay).');
+    await s.rpc('document/open', { uri: d.uri, version: 1, text: edited });
+    const projected = (await s.rpc('analyze', { fields: ['diagnostics'] })).result;
+    assert.equal('symbols' in doc(projected, path.join(p, 'main.ab')), false);
+    const offset = bytes(edited.slice(0, edited.indexOf('inc(1)')));
+    const query = { uri: d.uri, offset, revision: projected.revision };
+    const editedHover = (await s.rpc('query/hover', query)).result.value;
+    assert.equal(editedHover.symbol.documentation, 'Adds one (overlay).\nMore text.');
+    const symbolsOnly = (await s.rpc('analyze', { fields: ['symbols'] })).result;
+    const editedSymbols = doc(symbolsOnly, path.join(p, 'main.ab')).symbols;
+    assert.equal(editedSymbols.find((symbol) => symbol.name === 'inc').documentation,
+        editedHover.symbol.documentation);
+    await s.rpc('document/close', { uri: d.uri });
+    const restored = (await s.rpc('query/hover', { uri: d.uri, offset: call.range.start })).result.value;
+    assert.equal(restored.symbol.documentation, hover.symbol.documentation);
     await s.close();
 }
 

@@ -11,7 +11,9 @@ import "sema.ab"
 import "source_rewrite.ab"
 import "staged_parser.ab"
 import "abla/json"
+import "abla/bytes"
 import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
 import "abla/text"
 import "abla/runtime/memory"
 import "abla/sys/linux/process"
@@ -690,40 +692,78 @@ fun bootstrapAnalysisGraphSetHash(set: BootstrapAnalysisOccurrenceSet): string {
     "${first}.${second}.${set.begins.size}"
 }
 
-/** `answer` (a snapshot, or a `since` cut of one) with the occurrences of each document it carries made: the snapshot the service holds has
- *  them null (see graphSnapshotRun), and an answer says them as the text they encode to. */
+// Encode one symbol at a time so rendered docs do not accumulate as a second
+// symbol tree alongside the cached source spans.
+fun bootstrapAnalysisGraphSymbolText(symbols: Json, source: string): string {
+    var text = byteBuffer()
+    text.appendText("[")
+    var first = true
+    for (symbol in symbols.values) {
+        if (!first) text.appendText(",")
+        first = false
+        text.appendText(jsonStringify(bootstrapAnalysisSymbolWithDocumentation(symbol, source)))
+    }
+    text.appendText("]")
+    text.toText()
+}
+
+// Materialize only the fields a reply carries.
+fun BootstrapAnalysisService.graphMaterializeDocument(document: Json): Json {
+    val index = this.graphQueryIndex
+    val source = document.getString("text")
+    val values: array<Json> = []
+    for (position in 0 until document.keys.size) {
+        val key = document.keys[position]
+        val value = document.values[position]
+        if (key == "symbols") {
+            values.append(jsonRawUnchecked(bootstrapAnalysisGraphSymbolText(value, source)))
+        } else if (key == "occurrences" && value.isNull() && index != null) {
+            val set = index.occurrences.get(bootstrapAnalysisGraphPath(document.getString("uri")))
+            values.append(if (set != null) jsonRawUnchecked(bootstrapAnalysisOccurrenceSetText(source, set)) else value)
+        } else values.append(value)
+    }
+    jsonObject(document.keys, values)
+}
+
 fun BootstrapAnalysisService.graphMaterialize(answer: Json): Json {
-    if (!answer.has("documents")) return answer
     val carried = answer.get("documents")
     if (!carried.isArray()) return answer
-    val index = this.graphQueryIndex
     val documents: array<Json> = []
-    var any = false
-    for (document in carried.values) {
-        if (document.get("occurrences").isNull() && index != null) {
-            val set = index.occurrences.get(bootstrapAnalysisGraphPath(document.getString("uri")))
-            if (set != null) {
-                val values: array<Json> = []
-                for (position in 0 until document.keys.size) {
-                    values.append(if (document.keys[position] == "occurrences")
-                        jsonRawUnchecked(bootstrapAnalysisOccurrenceSetText(document.getString("text"), set))
-                        else document.values[position])
-                }
-                documents.append(jsonObject(document.keys, values))
-                any = true
-                continue
-            }
-        }
-        documents.append(document)
-    }
-    if (!any) return answer
-    val keys: array<string> = []
+    for (document in carried.values) documents.append(this.graphMaterializeDocument(document))
     val values: array<Json> = []
     for (position in 0 until answer.keys.size) {
-        keys.append(answer.keys[position])
         values.append(if (answer.keys[position] == "documents") jsonArray(documents) else answer.values[position])
     }
-    jsonObject(keys, values)
+    jsonObject(answer.keys, values)
+}
+
+// An analyze result can be tens of megabytes. Encode one document at a time
+// so neither the materialized fields nor the finished reply accumulate.
+fun BootstrapAnalysisService.graphWriteAnalysis(id: int, answer: Json): void {
+    if (!linuxWriteStandardOutputAll("{\"schema\":$ABLA_ANALYSIS_PROTOCOL_VERSION,\"id\":$id,\"result\":{")) return
+    for (position in 0 until answer.keys.size) {
+        val key = answer.keys[position]
+        val value = answer.values[position]
+        val delimiter = if (position == 0) "" else ","
+        val quoted = jsonQuote(key)
+        if (!linuxWriteStandardOutputAll("$delimiter$quoted:")) return
+        if (key == "documents" && value.isArray()) {
+            if (!linuxWriteStandardOutputAll("[")) return
+            for (item in 0 until value.values.size) {
+                if (item > 0 && !linuxWriteStandardOutputAll(",")) return
+                val document = this.graphMaterializeDocument(value.values[item])
+                if (!linuxWriteStandardOutputAll(jsonStringify(document))) return
+            }
+            if (!linuxWriteStandardOutputAll("]")) return
+        } else if (!linuxWriteStandardOutputAll(jsonStringify(value))) return
+    }
+    linuxPrintStandardOutput("}}\n")
+}
+
+fun BootstrapAnalysisGraphQueryIndex.withDocumentation(symbol: Json): Json {
+    val source = this.documents.get(bootstrapAnalysisGraphPath(symbol.getString("uri")))
+    if (source == null) return symbol
+    bootstrapAnalysisSymbolWithDocumentation(symbol, source.getString("text"))
 }
 
 fun bootstrapAnalysisCheckDigests(snapshot: Json): Map<string, string> {
@@ -1131,12 +1171,12 @@ fun BootstrapAnalysisService.graphQuery(id: int, method: string, params: Json): 
     val symbol = index.symbols.get(identity)
     var value = jsonNull()
     if (method == "query/definition") {
-        if (symbol != null) value = symbol
+        if (symbol != null) value = index.withDocumentation(symbol)
     } else if (method == "query/hover") {
         if (found >= 0) value = jsonObject(["range", "type", "symbol"],
             [jsonObject(["start", "end"], [jsonInteger(occurrences.begins[found]),
                 jsonInteger(occurrences.ends[found])]), jsonString(occurrences.types[found]),
-                if (symbol != null) symbol else jsonNull()])
+                if (symbol != null) index.withDocumentation(symbol) else jsonNull()])
     } else {
         // One location object per occurrence: only this query needs them, so they are made on its first use for a generation.
         if (this.graphReferencesRevision != this.revision) {
