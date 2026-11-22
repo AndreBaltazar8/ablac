@@ -28,6 +28,8 @@
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include <list>
 #include <string>
 #include <vector>
 
@@ -112,12 +114,16 @@ extern "C" int abla_archive_gnu(const char *arguments) {
     }
     if (paths.size() < 2) return 1;
     std::vector<llvm::NewArchiveMember> members;
+    std::list<std::string> names;  // the members' names (a StringRef each) live until the archive is written
     for (size_t index = 1; index < paths.size(); index++) {
         llvm::Expected<llvm::NewArchiveMember> member = llvm::NewArchiveMember::getFile(paths[index], /*Deterministic=*/true);
         if (!member) {
             llvm::errs() << paths[index] << ": " << llvm::toString(member.takeError()) << "\n";
             return 1;
         }
+        // llvm-ar names a regular archive's member by the file's base name (not the path it was given: the unit objects of a build live in a directory named after the process).
+        const std::string &stored = names.emplace_back(llvm::sys::path::filename(member->MemberName));
+        member->MemberName = stored;
         members.push_back(std::move(*member));
     }
     llvm::Error failure = llvm::writeArchive(paths[0], members, llvm::SymtabWritingMode::NormalSymtab, llvm::object::Archive::K_GNU, /*Deterministic=*/true, /*Thin=*/false);
