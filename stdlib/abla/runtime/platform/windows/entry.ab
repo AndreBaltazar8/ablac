@@ -993,15 +993,16 @@ private trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: int, a1: int
 // flags (1: standard error is standard output)). The result is the process id, kept with its handle in a table for wait4 and kill, or
 // -errno. A pipe is two descriptors over CreatePipe; the standard library closes the ends it does not use, as on Linux.
 
-private trusted fun __ablaRuntimeWindowsProcessTable(): int = nativeStaticAllocate(4096)
+private trusted fun __ablaRuntimeWindowsProcessTable(): int = nativeStaticAllocate(6144)
 
 private trusted fun __ablaRuntimeWindowsRememberProcess(pid: int, handle: int): bool {
     val table = __ablaRuntimeWindowsProcessTable()
     var index = 0
     while (index < 256) {
-        val entry = table + index * 16
+        val entry = table + index * 24
         if (ablaRuntimeAtomicLoadI64(entry) == 0 && ablaRuntimeAtomicCompareExchangeI64(entry, 0, pid) == 0) {
             ablaRuntimeStoreI64(entry + 8, handle)
+            ablaRuntimeStoreI64(entry + 16, pid)
             return true
         }
         index = index + 1
@@ -1014,7 +1015,7 @@ private trusted fun __ablaRuntimeWindowsProcessEntry(pid: int): int {
     val table = __ablaRuntimeWindowsProcessTable()
     var index = 0
     while (index < 256) {
-        if (ablaRuntimeAtomicLoadI64(table + index * 16) == pid) return table + index * 16
+        if (ablaRuntimeAtomicLoadI64(table + index * 24) == pid) return table + index * 24
         index = index + 1
     }
     0
@@ -1246,6 +1247,21 @@ private trusted fun __ablaRuntimeWindowsWait(pid: int, status: int, options: int
 // kill(pid, signal): signal 0 asks whether the process exists; any other ends it (a negative pid is its group, which is the process).
 private trusted fun __ablaRuntimeWindowsKill(target: int, signal: int): int {
     val pid = if (target < 0) 0 - target else target
+    if (target < 0 && signal != 0) {
+        // every process of the group (setpgid puts a pipeline's stages in the first one's)
+        val table = __ablaRuntimeWindowsProcessTable()
+        var ended = 0
+        var slot = 0
+        while (slot < 256) {
+            val member = table + slot * 24
+            if (ablaRuntimeAtomicLoadI64(member) != 0 && ablaRuntimeLoadI64(member + 16) == pid) {
+                TerminateProcess(ablaRuntimeLoadI64(member + 8), 1)
+                ended = ended + 1
+            }
+            slot = slot + 1
+        }
+        return if (ended > 0) 0 else -3
+    }
     val entry = __ablaRuntimeWindowsProcessEntry(pid)
     if (entry == 0) return -3
     val handle = ablaRuntimeLoadI64(entry + 8)
@@ -1284,7 +1300,11 @@ private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: in
     // kill(pid, signal)
     if (number == 62) return __ablaRuntimeWindowsKill(a0, a1)
     // setpgid and getpgid: a process group is the process
-    if (number == 109) return 0
+    if (number == 109) {
+        val member = __ablaRuntimeWindowsProcessEntry(a0)
+        if (member != 0) ablaRuntimeStoreI64(member + 16, if (a1 == 0) a0 else a1)
+        return 0
+    }
     if (number == 121) return if (a0 == 0) GetCurrentProcessId() & 4294967295 else a0
     // pipe2(descriptors, flags)
     if (number == 293) return __ablaRuntimeWindowsPipe(a0)
