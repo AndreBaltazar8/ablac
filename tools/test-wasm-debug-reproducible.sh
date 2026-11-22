@@ -106,3 +106,24 @@ do
 $prefixed"
     fi
 done
+
+# Without llvm-dwarfdump among the LLVM tools (the macOS LLVM archive ships none), a development build still succeeds:
+# the module and its DWARF module are written, there is no source map (not an earlier build's either), and a note
+# says why.
+module="$output_directory/module.wasm"
+tools="$output_directory/tools-without-dwarfdump"
+mkdir -p "$tools"
+for tool in "$(dirname "$(command -v opt)")"/*; do
+    [ "$(basename "$tool")" = llvm-dwarfdump ] || ln -s "$tool" "$tools/"
+done
+# (A sysroot path of its own: a build whose inputs an earlier one had would not rebuild.)
+ln -s "$sysroot" "$roots/w"
+rm -f "$module" "$module.debug.wasm"
+(cd "$project_root" && ABLA_LLVM_TOOLS="$tools" ABLA_SYSROOT="$roots/w" "$compiler" build \
+    tests/cases/wasm-debug-reproducible/build.ab \
+    -o "$output_directory/build-driver" --no-cache) 2> "$output_directory/without-dwarfdump.err" ||
+    fail "a build without llvm-dwarfdump failed: $(cat "$output_directory/without-dwarfdump.err")"
+[ -s "$module" ] && [ -s "$module.debug.wasm" ] || fail "no module or DWARF module without llvm-dwarfdump"
+[ ! -e "$module.map" ] || fail "a source map without llvm-dwarfdump"
+grep 'llvm-dwarfdump was not found' "$output_directory/without-dwarfdump.err" > /dev/null ||
+    fail "no note without llvm-dwarfdump: $(cat "$output_directory/without-dwarfdump.err")"

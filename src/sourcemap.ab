@@ -576,10 +576,13 @@ fun bootstrapSourceMapRewriteModule(
         }
         cursor = payloadEnd
     }
-    if (valid) {
+    // (No map, no section naming one: mapUrl "".)
+    if (valid && mapUrl != "") {
         bootstrapSourceMapAppendStringSection(
             output, "sourceMappingURL", mapUrl
         )
+    }
+    if (valid) {
         bootstrapSourceMapAppendStringSection(
             output, "external_debug_info", debugUrl
         )
@@ -599,7 +602,10 @@ fun bootstrapSourceMapBaseName(path: string): string {
 // Splits the debug information of the module at `modulePath` (to be
 // published as `outputPath`) into the artifacts described above. 0 on
 // success.
-fun bootstrapWasmDebugArtifacts(modulePath: string, outputPath: string): int {
+// `dwarfdump` is llvm-dwarfdump, as the caller finds the LLVM tools. Without it (an LLVM that ships none) the build
+// still succeeds: the module and its debug module are written, the module's functions keep their symbols' names, and
+// there is no source map; a note says so.
+fun bootstrapWasmDebugArtifacts(modulePath: string, outputPath: string, dwarfdump: string = "llvm-dwarfdump"): int {
     val name = bootstrapSourceMapBaseName(outputPath)
     val debugPath = "$outputPath.debug.wasm"
     val mapPath = "$outputPath.map"
@@ -607,14 +613,15 @@ fun bootstrapWasmDebugArtifacts(modulePath: string, outputPath: string): int {
     val infoPath = "$modulePath.debug-info"
     val module = Path(modulePath).readText()
     var status = if (Path(debugPath).writeTextAtomic(module)) 0 else 1
+    var toolMissing = false
     if (status == 0) {
         // The two dumps read the same file and write their own: both run at once.
-        val dump = linuxCommand("llvm-dwarfdump")
+        val dump = linuxCommand(dwarfdump)
         dump.argument("--debug-line")
         dump.argument("-o")
         dump.argument(dumpPath)
         dump.argument(debugPath)
-        val info = linuxCommand("llvm-dwarfdump")
+        val info = linuxCommand(dwarfdump)
         info.argument("--debug-info")
         info.argument("-o")
         info.argument(infoPath)
@@ -623,19 +630,28 @@ fun bootstrapWasmDebugArtifacts(modulePath: string, outputPath: string): int {
         val informing = info.start().process
         val dumped = if (dumping > 0) linuxWaitProcess(dumping).status else 127
         val informed = if (informing > 0) linuxWaitProcess(informing).status else 127
-        status = if (dumped != 0) dumped else informed
+        // 127: no such program (both dumps fail alike).
+        toolMissing = dumped == 127 && informed == 127
+        status = if (toolMissing) 0 else if (dumped != 0) dumped else informed
     }
     // The module itself, its functions named as the debug information names them (the code before them unchanged,
     // so the map's offsets are the rewritten module's too).
-    val info = if (status == 0) Path(infoPath).readText() else ""
+    val info = if (status == 0 && !toolMissing) Path(infoPath).readText() else ""
     val rewritten = bootstrapSourceMapRewriteModule(
-        module, "$name.map", "$name.debug.wasm", bootstrapSourceMapFunctionNames(info)
+        module, if (toolMissing) "" else "$name.map", "$name.debug.wasm", bootstrapSourceMapFunctionNames(info)
     )
     if (status == 0 && rewritten.codeOffset < 0) status = 1
     if (status == 0 && !Path(modulePath).writeTextAtomic(rewritten.bytes)) {
         status = 1
     }
-    if (status == 0) {
+    if (status == 0 && toolMissing) {
+        // (An earlier build's map would no longer describe the module.)
+        Path(mapPath).remove()
+        linuxPrintStandardError(
+            "note: $dwarfdump was not found: $outputPath has no source map (its debug module $name.debug.wasm is written)\n"
+        )
+    }
+    if (status == 0 && !toolMissing) {
         var rows = bootstrapSourceMapReadLineTables(Path(dumpPath).readText())
         bootstrapSourceMapApplyCalls(
             rows,
