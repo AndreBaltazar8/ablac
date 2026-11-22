@@ -36,4 +36,12 @@ ABLA_SIDECAR=1 "$compiler" build "$source" -o "$program" --no-cache --no-sidecar
 cmp -s "$program" "$output_directory/default" ||
     fail "the executable differs without the sidecar"
 
+# Through the cache too: a default build after a --sidecar one (whose entry it reuses) is the default executable.
+cache="$output_directory/cache"
+"$compiler" build "$source" -o "$program" --cache-dir "$cache" --sidecar
+cmp -s "$program" "$output_directory/default" || fail "a cached --sidecar build's executable differs"
+"$compiler" build "$source" -o "$program" --cache-dir "$cache"
+cmp -s "$program" "$output_directory/default" ||
+    fail "a default build after a cached --sidecar one differs"
+
 echo "sidecar: built only on request (--sidecar, ABLA_SIDECAR=1); the executable is the same either way"
