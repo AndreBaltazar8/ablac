@@ -4,7 +4,8 @@
 # the pthread family of src/static_libc is not threads yet, so the script's check builds with ABLA_NATIVE_JOBS=1 ABLA_CODEGEN_JOBS=1.
 # ABLA_STATIC_TARGET=aarch64-linux cross-builds it for AArch64 Linux instead (the AArch64 archives in ABLA_STATIC_LLVM_LIB and the target's libstdc++.a, libz.a,
 # libgcc.a in ABLA_STATIC_TARGET_LIBS; nix/aarch64-static-native-deps.nix makes both); run it under qemu-aarch64 or on an AArch64 machine.
-# ABLA_STATIC_LLD_LIB, ABLA_STATIC_LLD_INCLUDE, ABLA_STATIC_LLVM_INCLUDE: lld in the process, below.
+# ABLA_STATIC_LLD_LIB, ABLA_STATIC_LLD_INCLUDE, ABLA_STATIC_LLVM_INCLUDE: lld in the process, below; for AArch64 too (#1124): nix/aarch64-static-native-deps.nix makes them (lld/, include/lld-only,
+# include/llvm) and ABLA_STATIC_CXXFLAGS (its cxx-flags file: the target's headers), ABLA_STATIC_CXX the C++ compiler (c++; clang++ cross-builds the shim from x86-64).
 # Usage: tools/build-static-compiler.sh [compiler] [output]
 set -euo pipefail
 compiler=${1:-build/ablac}
@@ -21,12 +22,13 @@ export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-8192}
 # ABLA_STATIC_LLD_INCLUDE (lld's headers) and ABLA_STATIC_LLVM_INCLUDE (LLVM's) the compiler carries lld and runs its links in its own process (x86-64 only for now);
 # without them it carries a stub and runs the external ld.lld/wasm-ld as before. tools/static-llvm-env.sh prints all of them.
 shim_object=
-if [[ -n ${ABLA_STATIC_LLD_LIB:-} && -z ${ABLA_STATIC_TARGET:-} ]]; then
+if [[ -n ${ABLA_STATIC_LLD_LIB:-} ]]; then
     [[ -f ${ABLA_STATIC_LLD_LIB}/liblldELF.a && -f ${ABLA_STATIC_LLD_LIB}/liblldWasm.a && -f ${ABLA_STATIC_LLD_LIB}/liblldCOFF.a && -f ${ABLA_STATIC_LLD_LIB}/liblldCommon.a &&
         -f ${ABLA_STATIC_LLD_INCLUDE:-/none}/lld/Common/Driver.h && -f ${ABLA_STATIC_LLVM_INCLUDE:-/none}/llvm/Support/raw_ostream.h ]] ||
         { echo 'static compiler: ABLA_STATIC_LLD_LIB needs liblldELF.a, liblldWasm.a, liblldCOFF.a, liblldCommon.a, and ABLA_STATIC_LLD_INCLUDE and ABLA_STATIC_LLVM_INCLUDE the lld and LLVM headers' >&2; exit 2; }
     shim_object=$(dirname -- "$output")/abla_lld_shim.o
-    c++ -std=c++17 -O2 -fno-exceptions -fno-rtti -c "$root/runtime/abla_lld_shim.cpp" -I"$ABLA_STATIC_LLD_INCLUDE" -I"$ABLA_STATIC_LLVM_INCLUDE" -o "$shim_object"
+    # shellcheck disable=SC2086
+    ${ABLA_STATIC_CXX:-c++} ${ABLA_STATIC_CXXFLAGS:-} -std=c++17 -O2 -fno-exceptions -fno-rtti -c "$root/runtime/abla_lld_shim.cpp" -I"$ABLA_STATIC_LLD_INCLUDE" -I"$ABLA_STATIC_LLVM_INCLUDE" -o "$shim_object"
     export ABLA_STATIC_LLD_OBJECT=$shim_object ABLA_STATIC_LLD_LIB
 fi
 target_arguments=()
