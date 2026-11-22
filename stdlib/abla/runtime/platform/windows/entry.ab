@@ -144,6 +144,10 @@ trusted noescape extern:"c" fun SetHandleInformation(handle: int, mask: int, fla
 trusted noescape extern:"c" fun DuplicateHandle(sourceProcess: int, source: int, targetProcess: int, target: int, access: int, inherit: int, options: int): int
 /** kernel32 GetCurrentProcess: the pseudo handle of the calling process; never fails. */
 trusted noescape extern:"c" fun GetCurrentProcess(): int
+/** kernel32 GetProcessAffinityMask: stores the process's and the system's processor masks (one bit a CPU of the process's group); returns non-zero on success. */
+trusted noescape extern:"c" fun GetProcessAffinityMask(process: int, processMask: int, systemMask: int): int
+/** kernel32 GetModuleFileNameW: stores the path of a module's file (module 0: the process's executable) as UTF-16, terminated; returns the characters written without the terminator, `size` when the path was cut, 0 on failure. */
+trusted noescape extern:"c" fun GetModuleFileNameW(module: int, path: int, size: int): int
 /** kernel32 CreatePipe: makes an anonymous pipe, storing its read and write handles; returns non-zero on success. */
 trusted noescape extern:"c" fun CreatePipe(readHandle: int, writeHandle: int, security: int, size: int): int
 
@@ -317,12 +321,72 @@ private trusted fun __ablaRuntimeWindowsPathBuffer(): int {
 }
 
 // The UTF-8 path at `text` as UTF-16 in the thread's buffer (`slot` 0 or 1), or 0 when it is too long or not valid.
+// "/proc/self/exe" is the running image (__ablaRuntimeWindowsImagePath).
 private trusted fun __ablaRuntimeWindowsWidePath(text: int, slot: int): int {
     val buffer = __ablaRuntimeWindowsPathBuffer()
     if (buffer == 0) return 0
     val wide = buffer + slot * 65536
-    if (MultiByteToWideChar(65001, 0, text, -1, wide, 32767) <= 0) return 0
+    val named = if (__ablaRuntimeWindowsNamesImage(text)) __ablaRuntimeWindowsImagePath() else text
+    if (named == 0) return 0
+    if (MultiByteToWideChar(65001, 0, named, -1, wide, 32767) <= 0) return 0
     wide
+}
+
+// ---- the running image's path, "/proc/self/exe" ----
+// Linux names the running executable /proc/self/exe; the compiler opens, reads the link of and starts it by that name (its caches
+// are keyed on its own image, its code generation units run it again). Here the name stands for GetModuleFileNameW's path, as
+// UTF-8 with "/" for "\" as getcwd gives paths.
+
+// True when the C string at `path` is "/proc/self/exe".
+private trusted fun __ablaRuntimeWindowsNamesImage(path: int): bool {
+    if (path == 0) return false
+    val name = "/proc/self/exe"
+    var index = 0
+    while (index < 14) {
+        if (ablaRuntimeLoadU8(path + index) != name[index]) return false
+        index = index + 1
+    }
+    ablaRuntimeLoadU8(path + 14) == 0
+}
+
+private trusted fun __ablaRuntimeWindowsImageCell(): int = nativeStaticAllocate(98320)
+
+// The running image's path as a UTF-8 C string (made on first use: two threads that race write the same bytes), or 0 when it
+// cannot be read.
+private trusted fun __ablaRuntimeWindowsImagePath(): int {
+    val cell = __ablaRuntimeWindowsImageCell()
+    val text = cell + 16
+    if (ablaRuntimeAtomicLoadI64(cell) != 0) return text
+    val wide = VirtualAlloc(0, 65536, 12288, 4)
+    if (wide == 0) return 0
+    val count = GetModuleFileNameW(0, wide, 32767)
+    val length = if (count > 0 && count < 32767) WideCharToMultiByte(65001, 0, wide, -1, text, 98304, 0, 0) else 0
+    VirtualFree(wide, 0, 32768)
+    if (length <= 0) return 0
+    var index = 0
+    while (index < length) {
+        if (ablaRuntimeLoadU8(text + index) == 92) ablaRuntimeStoreU8(text + index, 47)
+        index = index + 1
+    }
+    ablaRuntimeStoreI64(cell + 8, length - 1)
+    ablaRuntimeAtomicStoreI64(cell, 1)
+    text
+}
+
+// readlink(path, buffer, size): the running image's path for "/proc/self/exe" (not terminated, cut to `size`, as Linux does);
+// any other path is not a link Windows programs make (EINVAL).
+private trusted fun __ablaRuntimeWindowsReadLink(path: int, buffer: int, size: int): int {
+    if (!__ablaRuntimeWindowsNamesImage(path)) return __ablaRuntimeWindowsEINVAL
+    val image = __ablaRuntimeWindowsImagePath()
+    if (image == 0) return -2
+    val length = ablaRuntimeLoadI64(__ablaRuntimeWindowsImageCell() + 8)
+    val count = if (length < size) length else size
+    var index = 0
+    while (index < count) {
+        ablaRuntimeStoreU8(buffer + index, ablaRuntimeLoadU8(image + index))
+        index = index + 1
+    }
+    count
 }
 
 // FILETIME (100 ns since 1601) at `at` as seconds and nanoseconds since 1970 stored at `seconds` and `seconds + 8`.
@@ -654,6 +718,8 @@ private trusted fun __ablaRuntimeWindowsFileCall(number: int, a0: int, a1: int, 
         if (DeleteFileW(wide) == 0) return __ablaRuntimeWindowsErrno()
         return 0
     }
+    // readlink(path, buffer, size)
+    if (number == 89) return __ablaRuntimeWindowsReadLink(a0, a1, a2)
     // getdents64(fd, buffer, count)
     if (number == 217) return __ablaRuntimeWindowsDirectoryEntries(a0, a1, a2)
     // openat(directory, path, flags, mode): relative to the working directory (AT_FDCWD) only
@@ -1118,7 +1184,14 @@ private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
             ablaRuntimeStoreU8(commandBytes + length, 32)
             length = length + 1
         }
-        length = __ablaRuntimeWindowsQuoteArgument(ablaRuntimeLoadI64(argv + index * 8), commandBytes, length)
+        // (a program started as "/proc/self/exe" is this one: the compiler runs its code generation units so)
+        val argument = ablaRuntimeLoadI64(argv + index * 8)
+        val named = if (index == 0 && __ablaRuntimeWindowsNamesImage(argument)) __ablaRuntimeWindowsImagePath() else argument
+        if (named == 0) {
+            VirtualFree(region, 0, 32768)
+            return -2
+        }
+        length = __ablaRuntimeWindowsQuoteArgument(named, commandBytes, length)
         if (length > 250000) {
             VirtualFree(region, 0, 32768)
             return -7
@@ -1374,6 +1447,26 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
     if (number == 186) return GetCurrentThreadId() & 4294967295
     // sigaltstack(new, old): a Windows thread has no alternate signal stack to install; the old one is left as zeroes, "none"
     if (number == 131) return 0
+    // getrlimit(resource, limits): the stack (RLIMIT_STACK, 3) is the 8 MiB every thread is given (/stack: and CreateThread), the
+    // descriptors (RLIMIT_NOFILE, 7) the table's size, both soft and hard; any other resource is unlimited (all ones).
+    if (number == 97) {
+        val limit = if (a0 == 3) 8388608 else if (a0 == 7) __ablaRuntimeWindowsFdCount else -1
+        ablaRuntimeStoreI64(a1, limit)
+        ablaRuntimeStoreI64(a1 + 8, limit)
+        return 0
+    }
+    // sched_getaffinity(process, size, mask): this process's (GetProcessAffinityMask, the CPUs of its group: up to 64) in the
+    // mask's first 8 bytes, the rest zeroes; returns the 8 bytes written, as Linux returns its mask's size.
+    if (number == 204) {
+        if (a1 < 8) return __ablaRuntimeWindowsEINVAL
+        var offset = 0
+        while (offset + 8 <= a1) {
+            ablaRuntimeStoreI64(a2 + offset, 0)
+            offset = offset + 8
+        }
+        if (GetProcessAffinityMask(GetCurrentProcess(), a2, __ablaRuntimeWindowsScratch()) == 0) return __ablaRuntimeWindowsEINVAL
+        return 8
+    }
     // futex(address, operation, value, ...): WAIT sleeps while the 32-bit word still holds `value` (WaitOnAddress compares the same
     // way), WAKE wakes one waiter or all of them. A wait may return early (the callers look at the word again); no timeout is passed.
     if (number == 202) {
@@ -1410,7 +1503,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 109 121 131 186 202 217 228 231 257 262 263 288 293 318 4001"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 89 97 109 121 131 186 202 204 217 228 231 257 262 263 288 293 318 4001"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;
