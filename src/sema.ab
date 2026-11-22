@@ -707,7 +707,8 @@ fun bootstrapExpressionMayMutateReceiver(
 
 fun bootstrapBuildMutableReceiverSummary(
     declarations: array<BootstrapDeclaration>,
-    affineTypes: array<string>
+    affineTypes: array<string>,
+    bodies: BootstrapBodyCalls
 ): BootstrapMutableReceiverSummary {
     val check = linuxEnvironment("ABLA_RECEIVER_INDEX_CHECK")
     val summary = BootstrapMutableReceiverSummary(
@@ -721,10 +722,20 @@ fun bootstrapBuildMutableReceiverSummary(
     val fields = bootstrapSummaryFields(declarations)
     // A body is walked again only once a method it calls joins the summary
     // (BootstrapBodySchedule).
-    val declarationOf: array<int> = []
-    val methodOf: array<int> = []
-    val callers = bootstrapCallersOf(declarations, declarationOf, methodOf, true)
-    var schedule = bootstrapBodySchedule(declarationOf.size)
+    val declarationOf = bodies.declarationOf
+    val methodOf = bodies.methodOf
+    val callers = bodies.callers
+    val receiverBodies: array<int> = []
+    for (body in 0 until declarationOf.size) {
+        if (methodOf[body] >= 0 || declarations[declarationOf[body]].extensionOwner != "") {
+            receiverBodies.append(body)
+        }
+    }
+    // Ordinary functions never enter the receiver summary. Mark their
+    // slots pending without queuing them so caller notifications skip them.
+    var schedule = BootstrapBodySchedule(
+        filledArray(declarationOf.size, true), receiverBodies, [], -1
+    )
     var round = true
     while (round) {
         var body = schedule.take()
@@ -4499,34 +4510,38 @@ fun bootstrapCollectEffectLocals(
     map: BootstrapEffectTypeMap,
     var names: array<string>,
     var types: array<string>,
-    owner: string
+    owner: string,
+    var delegatedNames: array<string>
 ): void {
-    if ((expression.kind == "local.val" || expression.kind == "local.var") &&
-        expression.children.size >= 2) {
-        var type = bootstrapEffectNormalizeType(expression.children[1].text)
-        if (type == "" || type == "inferred") {
-            type = bootstrapEffectExpressionType(expression.children[0], map, names, types, owner)
+    if (expression.kind == "local.val" || expression.kind == "local.var") {
+        bootstrapRememberDelegatedLocal(expression, delegatedNames)
+        if (expression.children.size >= 2) {
+            var type = bootstrapEffectNormalizeType(expression.children[1].text)
+            if (type == "" || type == "inferred") {
+                type = bootstrapEffectExpressionType(expression.children[0], map, names, types, owner)
+            }
+            names.append(expression.text)
+            types.append(if (type == "") "?" else type)
         }
-        names.append(expression.text)
-        types.append(if (type == "") "?" else type)
     }
     var child = 0
     while (child < expression.children.size) {
-        bootstrapCollectEffectLocals(expression.children[child], map, names, types, owner)
+        bootstrapCollectEffectLocals(expression.children[child], map, names, types, owner, delegatedNames)
         child = child + 1
     }
+}
+
+fun bootstrapRememberDelegatedLocal(expression: BootstrapExpression, var names: array<string>): void {
+    if (expression.children.size > 0 && expression.children[0].kind == "delegate.initializer" &&
+        !bootstrapAffineNamesContain(names, expression.text)) names.append(expression.text)
 }
 
 fun bootstrapCollectDelegatedNames(
     expression: BootstrapExpression,
     var names: array<string>
 ): void {
-    if ((expression.kind == "local.val" ||
-         expression.kind == "local.var") &&
-        expression.children.size > 0 &&
-        expression.children[0].kind == "delegate.initializer" &&
-        !bootstrapAffineNamesContain(names, expression.text)) {
-        names.append(expression.text)
+    if (expression.kind == "local.val" || expression.kind == "local.var") {
+        bootstrapRememberDelegatedLocal(expression, names)
     }
     var child = 0
     while (child < expression.children.size) {
@@ -4883,6 +4898,7 @@ fun bootstrapBuildCompileEffectSummary(
     // Receiver-typing scopes, one per summary entry (same order as `masks`).
     val entryScopeNames: array<array<string>> = []
     val entryScopeTypes: array<array<string>> = []
+    val entryDelegatedNames: array<array<string>> = []
     val entryOwners: array<string> = []
     val entryExpressions: array<BootstrapExpression> = []
     val entryWalked: array<bool> = []
@@ -4904,20 +4920,20 @@ fun bootstrapBuildCompileEffectSummary(
                     .parameterTypes[parameter]))
                 parameter = parameter + 1
             }
-            if (declaration.kind != "extern") {
-                bootstrapCollectEffectLocals(
-                    declaration.expression, typeMap, scopeNames, scopeTypes,
-                    declaration.extensionOwner
-                )
+            val sourceClass = bootstrapCompileDeclarationSourceClass(declaration)
+            val walk = declaration.kind != "extern" && !bootstrapCompileHostProvider(declaration) && sourceClass != 3
+            val delegatedNames = if (walk) bootstrapCopyBoundNames(globalDelegatedNames) else []
+            if (walk) {
+                bootstrapCollectEffectLocals(declaration.expression, typeMap, scopeNames, scopeTypes,
+                    declaration.extensionOwner, delegatedNames)
             }
             entryScopeNames.append(scopeNames)
             entryScopeTypes.append(scopeTypes)
+            entryDelegatedNames.append(delegatedNames)
             entryOwners.append(declaration.extensionOwner)
             entryExpressions.append(declaration.expression)
-            entryClasses.append(bootstrapCompileDeclarationSourceClass(declaration))
-            entryWalked.append(declaration.kind != "extern" &&
-                !bootstrapCompileHostProvider(declaration) &&
-                entryClasses[entryClasses.size - 1] != 3)
+            entryClasses.append(sourceClass)
+            entryWalked.append(walk)
             entryParameters.append(bootstrapEffectParameterKeys(declaration))
         }
         var methodIndex = 0
@@ -4940,20 +4956,22 @@ fun bootstrapBuildCompileEffectSummary(
                 scopeTypes.append(bootstrapEffectNormalizeType(declaration.parameterTypes[field]))
                 field = field + 1
             }
-            if (method.kind != "extern") {
-                bootstrapCollectEffectLocals(
-                    method.expression, typeMap, scopeNames, scopeTypes, declaration.name
-                )
-            }
-            entryScopeNames.append(scopeNames)
-            entryScopeTypes.append(scopeTypes)
-            entryOwners.append(declaration.name)
-            entryExpressions.append(method.expression)
             val methodClass = if (method.sourceIdentity != "")
                 bootstrapCompileDeclarationSourceClass(method)
             else bootstrapCompileDeclarationSourceClass(declaration)
+            val walk = method.kind != "extern" && methodClass != 3
+            val delegatedNames = if (walk) bootstrapCopyBoundNames(globalDelegatedNames) else []
+            if (walk) {
+                bootstrapCollectEffectLocals(method.expression, typeMap, scopeNames, scopeTypes,
+                    declaration.name, delegatedNames)
+            }
+            entryScopeNames.append(scopeNames)
+            entryScopeTypes.append(scopeTypes)
+            entryDelegatedNames.append(delegatedNames)
+            entryOwners.append(declaration.name)
+            entryExpressions.append(method.expression)
             entryClasses.append(methodClass)
-            entryWalked.append(method.kind != "extern" && methodClass != 3)
+            entryWalked.append(walk)
             entryParameters.append(bootstrapEffectParameterKeys(method))
             methodIndex = methodIndex + 1
         }
@@ -4992,17 +5010,10 @@ fun bootstrapBuildCompileEffectSummary(
             // bootstrapCompileTimeChildSkipped.)
             bootstrapCompileEffectsInLibrary = entryClasses[entry] != 0
             val expression = entryExpressions[entry]
-            val delegatedNames: array<string> = []
-            var globalDelegate = 0
-            while (globalDelegate < globalDelegatedNames.size) {
-                delegatedNames.append(globalDelegatedNames[globalDelegate])
-                globalDelegate = globalDelegate + 1
-            }
-            bootstrapCollectDelegatedNames(expression, delegatedNames)
             val inferred = bootstrapExpressionDelegatedCompileEffects(
                 expression,
                 summary,
-                delegatedNames,
+                entryDelegatedNames[entry],
                 typeMap,
                 entryScopeNames[entry],
                 entryScopeTypes[entry],
@@ -5773,7 +5784,8 @@ class BootstrapCallers(
     val names: BootstrapStringSet,
     val heads: array<int>,
     val bodies: array<int>,
-    val next: array<int>
+    val next: array<int>,
+    var usesStm: bool = false
 ) {
     fun add(name: string, body: int): void {
         var index = this.names.indexOf(name)
@@ -5792,9 +5804,10 @@ class BootstrapCallers(
     }
 
     fun collect(expression: BootstrapExpression, body: int): void {
-        if (expression.kind == "call" || expression.kind == "member.call") {
+        val kind = expression.kind
+        if (kind == "call" || kind == "member.call") {
             this.add(expression.text, body)
-        }
+        } else if (kind == "atomic") this.usesStm = true
         for (child in expression.children) this.collect(child, body)
         return
     }
@@ -5827,16 +5840,21 @@ class BootstrapCallers(
 fun bootstrapCallers(): BootstrapCallers =
     BootstrapCallers(bootstrapStringSet(), [], [], [])
 
-/** The callers of every body of `declarations` (each declaration's body, then
- *  each of its methods', numbered in that order), with `declarationOf` and
- *  `methodOf` (-1: the declaration's own body) filled in for each body. */
+class BootstrapBodyCalls(
+    val callers: BootstrapCallers,
+    val declarationOf: array<int>,
+    val methodOf: array<int>
+)
+
+// Both fixed-point summaries use the same body numbers, in declaration
+// order. A method follows its declaration, which has method index -1.
 fun bootstrapCallersOf(
     declarations: array<BootstrapDeclaration>,
-    var declarationOf: array<int>,
-    var methodOf: array<int>,
     receiversOnly: bool = false
-): BootstrapCallers {
+): BootstrapBodyCalls {
     val callers = bootstrapCallers()
+    val declarationOf: array<int> = []
+    val methodOf: array<int> = []
     var declarationIndex = 0
     while (declarationIndex < declarations.size) {
         val declaration = declarations[declarationIndex]
@@ -5856,7 +5874,7 @@ fun bootstrapCallersOf(
         }
         declarationIndex = declarationIndex + 1
     }
-    callers
+    BootstrapBodyCalls(callers, declarationOf, methodOf)
 }
 
 // The names lists keep their order; the sets beside them answer membership:
@@ -6583,7 +6601,8 @@ fun bootstrapRegionCheckModuleStores(
 }
 
 fun bootstrapBuildRegionCallSummary(
-    declarations: array<BootstrapDeclaration>
+    declarations: array<BootstrapDeclaration>,
+    bodies: BootstrapBodyCalls
 ): BootstrapRegionCallSummary {
     val summary = BootstrapRegionCallSummary(
         [], [], [], bootstrapStringSet(), bootstrapStringSet(),
@@ -6652,9 +6671,9 @@ fun bootstrapBuildRegionCallSummary(
     }
     // A body is walked again only once something it calls changes in the
     // summary (BootstrapBodySchedule).
-    val declarationOf: array<int> = []
-    val methodOf: array<int> = []
-    val callers = bootstrapCallersOf(declarations, declarationOf, methodOf)
+    val declarationOf = bodies.declarationOf
+    val methodOf = bodies.methodOf
+    val callers = bodies.callers
     var schedule = bootstrapBodySchedule(declarationOf.size)
     var round = true
     while (round) {
@@ -17878,13 +17897,12 @@ fun bootstrapAnalyzer(
     val symbols: array<BootstrapSymbol> = []
     val locals: array<BootstrapSymbol> = []
     val affineTypes = bootstrapBuildAffineTypeNames(parsed.declarations)
+    val bodies = bootstrapCallersOf(parsed.declarations, !regions)
     val mutableReceivers = bootstrapBuildMutableReceiverSummary(
-        parsed.declarations,
-        affineTypes
+        parsed.declarations, affineTypes, bodies
     )
-    val regionCalls = bootstrapBuildRegionCallSummary(
-        if (regions) parsed.declarations else none
-    )
+    val regionCalls = if (regions) bootstrapBuildRegionCallSummary(parsed.declarations, bodies)
+        else bootstrapBuildRegionCallSummary(none, bootstrapCallersOf(none))
     val compileEffects = bootstrapBuildCompileEffectSummary(
         if (effects) parsed.declarations else none
     )
@@ -17966,7 +17984,7 @@ fun bootstrapAnalyzer(
         -1,
         bootstrapNoInferredResults(),
         bootstrapNoInitEdges(),
-        stmEnabled = bootstrapProgramUsesStm(parsed.declarations),
+        stmEnabled = bodies.callers.usesStm || bootstrapProgramUsesStm(parsed.declarations, !regions),
         generics = generics,
         transactionalNames = bootstrapTransactionalClasses(parsed.declarations, false),
         runtimeValueNames = bootstrapTransactionalClasses(parsed.declarations, true)
@@ -17992,14 +18010,14 @@ fun bootstrapTransactionalClasses(declarations: array<BootstrapDeclaration>,
 /** Whether a program has an `atomic` or transactional delegates (abla/stm,
  *  which a program naming TVar has): only then are the transactions'
  *  checks recorded (bootstrapCheckStm). */
-fun bootstrapProgramUsesStm(declarations: array<BootstrapDeclaration>): bool {
+fun bootstrapProgramUsesStm(declarations: array<BootstrapDeclaration>, scanBodies: bool): bool {
     for (declaration in declarations) {
         if (declaration.kind == "interface" && declaration.name == "Transactional") return true
-        if (bootstrapExpressionUsesStm(declaration.expression)) return true
+        if (scanBodies && bootstrapExpressionUsesStm(declaration.expression)) return true
         for (fallback in declaration.parameterDefaults) {
             if (bootstrapExpressionUsesStm(fallback)) return true
         }
-        for (method in declaration.methods) {
+        if (scanBodies) for (method in declaration.methods) {
             if (bootstrapExpressionUsesStm(method.expression)) return true
         }
     }
