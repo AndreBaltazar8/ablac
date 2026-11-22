@@ -5,14 +5,35 @@
 #             AVX2), AArch64 under qemu, Wasm under Node.
 #   compiled: Xtensa, whose vectors are scalar code; nothing here runs it.
 # Then the misuses the compiler refuses, each with the error on its first line.
+# With --avx512-only after the compiler argument, run the native AVX-512 checks
+# when both CPU features are usable and record the result for GitHub Actions.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cases=tests/cases/simd
-out=build/simd
 cd "$project_root"
+
+if [[ ${2:-} == --avx512-only ]]; then
+    mkdir -p build
+    out=$(mktemp -d build/simd-avx512.XXXXXX)
+    trap 'rm -rf -- "$out"' EXIT
+    ABLA_TEST_FAST_BUILDS=0 "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache
+    status=0
+    "$out/native" --require-avx512 || status=$?
+    case $status in
+        0) summary='AVX-512: passed the native AVX-512F and AVX-512BW checks.' ;;
+        216) summary='AVX-512: skipped because the runner lacks usable AVX-512F or AVX-512BW.' ;;
+        *) summary="AVX-512: native validation failed with status $status." ;;
+    esac
+    printf '%s\n' "$summary"
+    if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then printf '%s\n' "$summary" >> "$GITHUB_STEP_SUMMARY"; fi
+    if [[ $status == 216 ]]; then exit 0; fi
+    exit "$status"
+fi
+
+out=build/simd
 rm -rf "$out"
 mkdir -p "$out"
 
