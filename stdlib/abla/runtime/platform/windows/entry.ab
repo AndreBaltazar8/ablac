@@ -50,6 +50,47 @@ trusted noescape extern:"c" fun WaitOnAddress(address: int, compare: int, size: 
 trusted noescape extern:"c" fun WakeByAddressSingle(address: int): void
 /** synchronization WakeByAddressAll: wakes every thread waiting on the word at address. */
 trusted noescape extern:"c" fun WakeByAddressAll(address: int): void
+/** kernel32 CreateFileW: opens or creates the file or directory at the UTF-16 path with the given access, sharing, disposition and flags; returns a handle, or -1 when it fails. */
+trusted noescape extern:"c" fun CreateFileW(path: int, access: int, share: int, security: int, disposition: int, flags: int, template: int): int
+/** kernel32 ReadFile: reads up to count bytes from handle into buffer, storing the count read at read; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun ReadFile(handle: int, buffer: int, count: int, read: int, overlapped: int): int
+/** kernel32 CloseHandle: closes a handle; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun CloseHandle(handle: int): int
+/** kernel32 SetFilePointerEx: moves the file pointer by distance from the start (0), current position (1) or end (2), storing the new position at position; returns non-zero on success. */
+trusted noescape extern:"c" fun SetFilePointerEx(handle: int, distance: int, position: int, method: int): int
+/** kernel32 GetFileInformationByHandle: fills the 52-byte BY_HANDLE_FILE_INFORMATION at info for an open file or directory; returns non-zero on success. */
+trusted noescape extern:"c" fun GetFileInformationByHandle(handle: int, info: int): int
+/** kernel32 CreateDirectoryW: creates the directory at the UTF-16 path; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun CreateDirectoryW(path: int, security: int): int
+/** kernel32 RemoveDirectoryW: removes the empty directory at the UTF-16 path; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun RemoveDirectoryW(path: int): int
+/** kernel32 DeleteFileW: deletes the file at the UTF-16 path; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun DeleteFileW(path: int): int
+/** kernel32 MoveFileExW: renames a file or directory, replacing the destination when flags has 1; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun MoveFileExW(from: int, to: int, flags: int): int
+/** kernel32 GetCurrentDirectoryW: stores the current directory as UTF-16 at buffer (size in characters); returns its length, or 0 on failure. */
+trusted noescape extern:"c" fun GetCurrentDirectoryW(size: int, buffer: int): int
+/** kernel32 SetCurrentDirectoryW: makes the UTF-16 path the current directory; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun SetCurrentDirectoryW(path: int): int
+/** kernel32 FlushFileBuffers: writes a file's buffered data to disk; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun FlushFileBuffers(handle: int): int
+/** kernel32 SetEndOfFile: ends the file at the current file pointer; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun SetEndOfFile(handle: int): int
+/** kernel32 GetLastError: the calling thread's last error code. */
+trusted noescape extern:"c" fun GetLastError(): int
+/** kernel32 MultiByteToWideChar: converts text of a code page (65001 is UTF-8) to UTF-16; returns the characters written or needed, 0 when it fails. */
+trusted noescape extern:"c" fun MultiByteToWideChar(page: int, flags: int, text: int, count: int, wide: int, wideCount: int): int
+/** kernel32 FindFirstFileW: starts listing the directory entries that match the UTF-16 pattern, storing the first at data (a 592-byte WIN32_FIND_DATAW); returns a search handle, or -1 when it fails. */
+trusted noescape extern:"c" fun FindFirstFileW(pattern: int, data: int): int
+/** kernel32 FindNextFileW: stores the next directory entry of a search at data; returns non-zero on success, 0 at the end. */
+trusted noescape extern:"c" fun FindNextFileW(search: int, data: int): int
+/** kernel32 FindClose: ends a directory search; returns non-zero on success. */
+trusted noescape extern:"c" fun FindClose(search: int): int
+/** kernel32 GetFileAttributesW: the attributes of the file at the UTF-16 path, or 0xFFFFFFFF when it does not exist. */
+trusted noescape extern:"c" fun GetFileAttributesW(path: int): int
+/** bcryptprimitives ProcessPrng: fills size bytes at buffer with cryptographically secure random bytes; returns non-zero (it cannot fail on Windows 10 and later). */
+trusted noescape extern:"c" fun ProcessPrng(buffer: int, size: int): int
+
 
 // A thread's own 64 bytes for out-parameters (a written count, a clock reading): the loader gives each thread a copy of the
 // thread-local template, so no two calls share them.
@@ -132,11 +173,453 @@ private trusted fun __ablaRuntimeWindowsRemap(base: int, before: int, after: int
 }
 
 // The Linux system call `number` with six arguments, answered with kernel32: the result, or -errno.
+// ---- files: descriptors over handles, paths over UTF-16 ----
+// A Linux descriptor is an index into a table of 64-byte entries (word 0 the handle, 0 when free; word 1 the kind, 1 a file or
+// device, 2 a directory; for a directory word 2 the page holding its search pattern and find data, word 3 the search handle (0
+// before the first entry), word 4 non-zero when the find data waits to be returned); 0, 1 and 2 are the standard handles. Paths are
+// converted to UTF-16 in a buffer of 128 KiB of the thread's own (64 KiB for each of two paths); "/" in a path is kept (kernel32
+// takes it), so the standard library's POSIX path syntax works unchanged.
+
+private val __ablaRuntimeWindowsFdCount = 4096
+
+private trusted fun __ablaRuntimeWindowsFdCell(): int = nativeStaticAllocate(8)
+
+// The descriptor table, made on first use (a race is settled by compare-and-exchange; the loser's memory is released).
+private trusted fun __ablaRuntimeWindowsFds(): int {
+    val cell = __ablaRuntimeWindowsFdCell()
+    val have = ablaRuntimeAtomicLoadI64(cell)
+    if (have != 0) return have
+    val made = VirtualAlloc(0, __ablaRuntimeWindowsFdCount * 64, 12288, 4)
+    if (made == 0) return 0
+    val seen = ablaRuntimeAtomicCompareExchangeI64(cell, 0, made)
+    if (seen != 0) {
+        VirtualFree(made, 0, 32768)
+        return seen
+    }
+    made
+}
+
+// The handle of descriptor `fd`, or 0 when it is not open.
+private trusted fun __ablaRuntimeWindowsHandle(fd: int): int {
+    if (fd == 0) return GetStdHandle(-10)
+    if (fd == 1) return GetStdHandle(-11)
+    if (fd == 2) return GetStdHandle(-12)
+    if (fd < 3 || fd >= __ablaRuntimeWindowsFdCount) return 0
+    val table = __ablaRuntimeWindowsFds()
+    if (table == 0) return 0
+    ablaRuntimeAtomicLoadI64(table + fd * 64)
+}
+
+// A free descriptor for `handle` of `kind` (word 2 for a directory), or -24 (EMFILE).
+private trusted fun __ablaRuntimeWindowsOpenFd(handle: int, kind: int, extra: int): int {
+    val table = __ablaRuntimeWindowsFds()
+    if (table == 0) return -24
+    var fd = 3
+    while (fd < __ablaRuntimeWindowsFdCount) {
+        val entry = table + fd * 64
+        if (ablaRuntimeAtomicLoadI64(entry) == 0 && ablaRuntimeAtomicCompareExchangeI64(entry, 0, handle) == 0) {
+            ablaRuntimeStoreI64(entry + 8, kind)
+            ablaRuntimeStoreI64(entry + 16, extra)
+            ablaRuntimeStoreI64(entry + 24, 0)
+            ablaRuntimeStoreI64(entry + 32, 0)
+            return fd
+        }
+        fd = fd + 1
+    }
+    -24
+}
+
+// The errno of the last kernel32 failure.
+private trusted fun __ablaRuntimeWindowsErrno(): int {
+    val code = GetLastError() & 4294967295
+    if (code == 2 || code == 3 || code == 15) return -2
+    if (code == 5 || code == 19) return -13
+    if (code == 80 || code == 183) return -17
+    if (code == 32 || code == 33 || code == 170) return -16
+    if (code == 145) return -39
+    if (code == 267) return -20
+    if (code == 87 || code == 123 || code == 161) return -22
+    if (code == 6) return -9
+    if (code == 8 || code == 14) return -12
+    -5
+}
+
+// The thread's own 128 KiB for UTF-16 paths (made on its first use; the 8 bytes of its thread-local record hold it).
+private trusted fun __ablaRuntimeWindowsPathBuffer(): int {
+    val cell = __ablaRuntimeWindowsScratch() + 48
+    var buffer = ablaRuntimeLoadI64(cell)
+    if (buffer == 0) {
+        buffer = VirtualAlloc(0, 131072, 12288, 4)
+        ablaRuntimeStoreI64(cell, buffer)
+    }
+    buffer
+}
+
+// The UTF-8 path at `text` as UTF-16 in the thread's buffer (`slot` 0 or 1), or 0 when it is too long or not valid.
+private trusted fun __ablaRuntimeWindowsWidePath(text: int, slot: int): int {
+    val buffer = __ablaRuntimeWindowsPathBuffer()
+    if (buffer == 0) return 0
+    val wide = buffer + slot * 65536
+    if (MultiByteToWideChar(65001, 0, text, -1, wide, 32767) <= 0) return 0
+    wide
+}
+
+// FILETIME (100 ns since 1601) at `at` as seconds and nanoseconds since 1970 stored at `seconds` and `seconds + 8`.
+private trusted fun __ablaRuntimeWindowsStoreTime(at: int, seconds: int): void {
+    val intervals = ablaRuntimeLoadI64(at)
+    ablaRuntimeStoreI64(seconds, intervals / 10000000 - 11644473600)
+    ablaRuntimeStoreI64(seconds + 8, intervals % 10000000 * 100)
+    return
+}
+
+// A Linux `struct stat` (144 bytes, x86-64) at `output` from the BY_HANDLE_FILE_INFORMATION at `info`: the mode is directory (the
+// attribute 0x10), link (a reparse point, when `link`) or regular file with the permission bits Windows does not have made up as
+// 755/644 (444 when read-only).
+private trusted fun __ablaRuntimeWindowsFillStat(info: int, output: int, link: bool): void {
+    var offset = 0
+    while (offset < 144) {
+        ablaRuntimeStoreI64(output + offset, 0)
+        offset = offset + 8
+    }
+    val attributes = ablaRuntimeLoadI32(info) & 4294967295
+    var mode = 33188
+    if ((attributes & 1) != 0) mode = 33060
+    if ((attributes & 16) != 0) mode = 16877
+    if (link && (attributes & 1024) != 0) mode = 41471
+    val size = (ablaRuntimeLoadI32(info + 32) & 4294967295) * 4294967296 + (ablaRuntimeLoadI32(info + 36) & 4294967295)
+    val links = ablaRuntimeLoadI32(info + 40) & 4294967295
+    val index = (ablaRuntimeLoadI32(info + 44) & 4294967295) * 4294967296 + (ablaRuntimeLoadI32(info + 48) & 4294967295)
+    ablaRuntimeStoreI64(output + 8, index)
+    ablaRuntimeStoreI64(output + 16, links)
+    ablaRuntimeStoreI32(output + 24, mode)
+    ablaRuntimeStoreI64(output + 48, size)
+    ablaRuntimeStoreI64(output + 56, 4096)
+    ablaRuntimeStoreI64(output + 64, (size + 511) / 512)
+    __ablaRuntimeWindowsStoreTime(info + 12, output + 72)
+    __ablaRuntimeWindowsStoreTime(info + 20, output + 88)
+    __ablaRuntimeWindowsStoreTime(info + 20, output + 104)
+    return
+}
+
+// The stat of the file or directory at the UTF-16 path (without following a link when `link`), or -errno.
+private trusted fun __ablaRuntimeWindowsStatPath(wide: int, output: int, link: bool): int {
+    val scratch = __ablaRuntimeWindowsScratch()
+    // backup semantics (0x02000000) so that a directory opens, reparse point (0x00200000) so that a link is itself
+    val handle = CreateFileW(wide, 0, 7, 0, 3, if (link) 35651584 else 33554432, 0)
+    if (handle == -1) return __ablaRuntimeWindowsErrno()
+    // The information is 52 bytes: after the 16 the scratch keeps for others.
+    val info = __ablaRuntimeWindowsPathBuffer() + 131072 - 64
+    val ok = GetFileInformationByHandle(handle, info) != 0
+    val error = if (ok) 0 else __ablaRuntimeWindowsErrno()
+    CloseHandle(handle)
+    if (!ok) return error
+    __ablaRuntimeWindowsFillStat(info, output, link)
+    0
+}
+
+// open(path, flags, mode) as CreateFileW: the access, disposition and attributes from the Linux flags (O_WRONLY 1, O_RDWR 2, O_CREAT
+// 0x40, O_EXCL 0x80, O_TRUNC 0x200, O_APPEND 0x400, O_DIRECTORY 0x10000, O_NOFOLLOW 0x20000); a directory gets a descriptor that
+// getdents64 lists. A descriptor, or -errno.
+private trusted fun __ablaRuntimeWindowsOpen(text: int, flags: int): int {
+    val wide = __ablaRuntimeWindowsWidePath(text, 0)
+    if (wide == 0) return -2
+    val mode = flags & 3
+    var access = 0
+    if (mode == 0) access = 2147483648
+    else if (mode == 1) access = 1073741824
+    else access = 3221225472
+    if ((flags & 1024) != 0) access = (access & 2147483648) + 4
+    val create = (flags & 64) != 0
+    val exclusive = (flags & 128) != 0
+    val truncate = (flags & 512) != 0
+    var disposition = 3
+    if (create && exclusive) disposition = 1
+    else if (create && truncate) disposition = 2
+    else if (create) disposition = 4
+    else if (truncate) disposition = 5
+    // 0x02000000 backup semantics (a directory may be opened), 0x00200000 reparse point for O_NOFOLLOW
+    var attributes = 33554432
+    if ((flags & 131072) != 0) attributes = attributes + 2097152
+    val handle = CreateFileW(wide, access, 7, 0, disposition, attributes, 0)
+    if (handle == -1) return __ablaRuntimeWindowsErrno()
+    val info = __ablaRuntimeWindowsPathBuffer() + 131072 - 64
+    var kind = 1
+    if (GetFileInformationByHandle(handle, info) != 0 && (ablaRuntimeLoadI32(info) & 16) != 0) kind = 2
+    if ((flags & 65536) != 0 && kind != 2) {
+        CloseHandle(handle)
+        return -20
+    }
+    var extra = 0
+    if (kind == 2) {
+        // a page for the pattern (the path and "\*") and the find data
+        extra = VirtualAlloc(0, 4096, 12288, 4)
+        if (extra == 0) {
+            CloseHandle(handle)
+            return -12
+        }
+        var length = 0
+        while (ablaRuntimeLoadU8(wide + length) != 0 || ablaRuntimeLoadU8(wide + length + 1) != 0) length = length + 2
+        var copy = 0
+        while (copy < length) {
+            ablaRuntimeStoreU8(extra + copy, ablaRuntimeLoadU8(wide + copy))
+            copy = copy + 1
+        }
+        if (length > 0 && ablaRuntimeLoadU8(extra + length - 2) != 92 && ablaRuntimeLoadU8(extra + length - 2) != 47) {
+            ablaRuntimeStoreU8(extra + length, 92)
+            ablaRuntimeStoreU8(extra + length + 1, 0)
+            length = length + 2
+        }
+        ablaRuntimeStoreU8(extra + length, 42)
+        ablaRuntimeStoreU8(extra + length + 1, 0)
+        ablaRuntimeStoreU8(extra + length + 2, 0)
+        ablaRuntimeStoreU8(extra + length + 3, 0)
+    }
+    val fd = __ablaRuntimeWindowsOpenFd(handle, kind, extra)
+    if (fd < 0) {
+        CloseHandle(handle)
+        if (extra != 0) VirtualFree(extra, 0, 32768)
+    }
+    fd
+}
+
+// close(fd): the handle, a directory's search and its page, and the descriptor's slot.
+private trusted fun __ablaRuntimeWindowsClose(fd: int): int {
+    if (fd < 3 || fd >= __ablaRuntimeWindowsFdCount) return if (fd >= 0 && fd < 3) 0 else -9
+    val table = __ablaRuntimeWindowsFds()
+    if (table == 0) return -9
+    val entry = table + fd * 64
+    val handle = ablaRuntimeAtomicLoadI64(entry)
+    if (handle == 0) return -9
+    if (ablaRuntimeLoadI64(entry + 8) == 2) {
+        val search = ablaRuntimeLoadI64(entry + 24)
+        if (search != 0 && search != -1) FindClose(search)
+        val page = ablaRuntimeLoadI64(entry + 16)
+        if (page != 0) VirtualFree(page, 0, 32768)
+    }
+    CloseHandle(handle)
+    ablaRuntimeAtomicStoreI64(entry, 0)
+    0
+}
+
+// getdents64(fd, buffer, count): linux_dirent64 records (inode, offset, length, type, name) from the directory's search; the entry a
+// full buffer could not take waits for the next call. Bytes written, 0 at the end, or -errno.
+private trusted fun __ablaRuntimeWindowsDirectoryEntries(fd: int, buffer: int, count: int): int {
+    val table = __ablaRuntimeWindowsFds()
+    if (table == 0 || fd < 3 || fd >= __ablaRuntimeWindowsFdCount) return -9
+    val entry = table + fd * 64
+    if (ablaRuntimeLoadI64(entry + 8) != 2) return -20
+    val page = ablaRuntimeLoadI64(entry + 16)
+    val data = page + 2048
+    var written = 0
+    var more = true
+    while (more) {
+        var have = ablaRuntimeLoadI64(entry + 32) != 0
+        if (!have) {
+            val search = ablaRuntimeLoadI64(entry + 24)
+            if (search == 0) {
+                val first = FindFirstFileW(page, data)
+                if (first == -1) {
+                    ablaRuntimeStoreI64(entry + 24, -1)
+                    if (written == 0) return if ((GetLastError() & 4294967295) == 2) 0 else __ablaRuntimeWindowsErrno()
+                    more = false
+                } else {
+                    ablaRuntimeStoreI64(entry + 24, first)
+                    have = true
+                }
+            } else if (search == -1) {
+                more = false
+            } else if (FindNextFileW(search, data) != 0) {
+                have = true
+            } else {
+                ablaRuntimeStoreI64(entry + 24, -1)
+                more = false
+            }
+        }
+        if (more && have) {
+            // the name: 44 bytes into WIN32_FIND_DATAW, UTF-16; a record is 19 bytes of header, the name, a NUL, rounded to 8
+            val name = buffer + written + 19
+            val room = count - written - 19
+            if (room <= 1) {
+                ablaRuntimeStoreI64(entry + 32, 1)
+                more = false
+            } else {
+                val length = WideCharToMultiByte(65001, 0, data + 44, -1, name, room, 0, 0)
+                if (length <= 0) {
+                    ablaRuntimeStoreI64(entry + 32, 1)
+                    more = false
+                    if (written == 0) return -22
+                } else {
+                    val record = ((19 + length + 7) / 8) * 8
+                    if (written + record > count) {
+                        ablaRuntimeStoreI64(entry + 32, 1)
+                        more = false
+                    } else {
+                        val attributes = ablaRuntimeLoadI32(data) & 4294967295
+                        var type = 8
+                        if ((attributes & 16) != 0) type = 4
+                        if ((attributes & 1024) != 0) type = 10
+                        ablaRuntimeStoreI64(buffer + written, 1)
+                        ablaRuntimeStoreI64(buffer + written + 8, written + record)
+                        ablaRuntimeStoreU8(buffer + written + 16, record & 255)
+                        ablaRuntimeStoreU8(buffer + written + 17, record / 256)
+                        ablaRuntimeStoreU8(buffer + written + 18, type)
+                        ablaRuntimeStoreI64(entry + 32, 0)
+                        written = written + record
+                    }
+                }
+            }
+        }
+    }
+    written
+}
+
+// The UTF-16 working directory as UTF-8 with "/" separators in `buffer` (size bytes): the length with the NUL, or -errno.
+private trusted fun __ablaRuntimeWindowsWorkingDirectory(buffer: int, size: int): int {
+    val wide = __ablaRuntimeWindowsPathBuffer()
+    if (wide == 0) return -12
+    if (GetCurrentDirectoryW(32767, wide) == 0) return __ablaRuntimeWindowsErrno()
+    val length = WideCharToMultiByte(65001, 0, wide, -1, buffer, size, 0, 0)
+    if (length <= 0) return -34
+    var index = 0
+    while (index < length) {
+        if (ablaRuntimeLoadU8(buffer + index) == 92) ablaRuntimeStoreU8(buffer + index, 47)
+        index = index + 1
+    }
+    length
+}
+
+// The file operation `number` with its arguments, or -1000 when it is not one of them.
+private trusted fun __ablaRuntimeWindowsFileCall(number: int, a0: int, a1: int, a2: int, a3: int): int {
+    // read(fd, buffer, count)
+    if (number == 0) {
+        val handle = __ablaRuntimeWindowsHandle(a0)
+        if (handle == 0) return -9
+        val scratch = __ablaRuntimeWindowsScratch()
+        ablaRuntimeStoreI64(scratch, 0)
+        if (ReadFile(handle, a1, a2, scratch, 0) == 0) {
+            // a pipe whose other end is closed (ERROR_BROKEN_PIPE) is the end of the input
+            if ((GetLastError() & 4294967295) == 109) return 0
+            return __ablaRuntimeWindowsErrno()
+        }
+        return ablaRuntimeLoadI32(scratch) & 4294967295
+    }
+    // close(fd)
+    if (number == 3) return __ablaRuntimeWindowsClose(a0)
+    // stat(path, buffer), lstat(path, buffer)
+    if (number == 4 || number == 6) {
+        val wide = __ablaRuntimeWindowsWidePath(a0, 0)
+        if (wide == 0) return -2
+        return __ablaRuntimeWindowsStatPath(wide, a1, number == 6)
+    }
+    // fstat(fd, buffer)
+    if (number == 5) {
+        val handle = __ablaRuntimeWindowsHandle(a0)
+        if (handle == 0) return -9
+        val info = __ablaRuntimeWindowsPathBuffer() + 131072 - 64
+        if (GetFileInformationByHandle(handle, info) == 0) return __ablaRuntimeWindowsErrno()
+        __ablaRuntimeWindowsFillStat(info, a1, false)
+        return 0
+    }
+    // lseek(fd, offset, whence)
+    if (number == 8) {
+        val handle = __ablaRuntimeWindowsHandle(a0)
+        if (handle == 0) return -9
+        val scratch = __ablaRuntimeWindowsScratch()
+        if (SetFilePointerEx(handle, a1, scratch, a2) == 0) return __ablaRuntimeWindowsErrno()
+        return ablaRuntimeLoadI64(scratch)
+    }
+    // access(path, mode)
+    if (number == 21) {
+        val wide = __ablaRuntimeWindowsWidePath(a0, 0)
+        if (wide == 0) return -2
+        if ((GetFileAttributesW(wide) & 4294967295) == 4294967295) return -2
+        return 0
+    }
+    // fsync(fd)
+    if (number == 74) {
+        val handle = __ablaRuntimeWindowsHandle(a0)
+        if (handle == 0) return -9
+        if (FlushFileBuffers(handle) == 0) return __ablaRuntimeWindowsErrno()
+        return 0
+    }
+    // ftruncate(fd, length)
+    if (number == 77) {
+        val handle = __ablaRuntimeWindowsHandle(a0)
+        if (handle == 0) return -9
+        if (SetFilePointerEx(handle, a1, 0, 0) == 0 || SetEndOfFile(handle) == 0) return __ablaRuntimeWindowsErrno()
+        return 0
+    }
+    // getcwd(buffer, size): the length with the NUL
+    if (number == 79) return __ablaRuntimeWindowsWorkingDirectory(a0, a1)
+    // chdir(path)
+    if (number == 80) {
+        val wide = __ablaRuntimeWindowsWidePath(a0, 0)
+        if (wide == 0) return -2
+        if (SetCurrentDirectoryW(wide) == 0) return __ablaRuntimeWindowsErrno()
+        return 0
+    }
+    // rename(old, new)
+    if (number == 82) {
+        val from = __ablaRuntimeWindowsWidePath(a0, 0)
+        val to = __ablaRuntimeWindowsWidePath(a1, 1)
+        if (from == 0 || to == 0) return -2
+        if (MoveFileExW(from, to, 1) == 0) return __ablaRuntimeWindowsErrno()
+        return 0
+    }
+    // mkdir(path, mode)
+    if (number == 83) {
+        val wide = __ablaRuntimeWindowsWidePath(a0, 0)
+        if (wide == 0) return -2
+        if (CreateDirectoryW(wide, 0) == 0) return __ablaRuntimeWindowsErrno()
+        return 0
+    }
+    // rmdir(path)
+    if (number == 84) {
+        val wide = __ablaRuntimeWindowsWidePath(a0, 0)
+        if (wide == 0) return -2
+        if (RemoveDirectoryW(wide) == 0) return __ablaRuntimeWindowsErrno()
+        return 0
+    }
+    // unlink(path)
+    if (number == 87) {
+        val wide = __ablaRuntimeWindowsWidePath(a0, 0)
+        if (wide == 0) return -2
+        if (DeleteFileW(wide) == 0) return __ablaRuntimeWindowsErrno()
+        return 0
+    }
+    // getdents64(fd, buffer, count)
+    if (number == 217) return __ablaRuntimeWindowsDirectoryEntries(a0, a1, a2)
+    // openat(directory, path, flags, mode): relative to the working directory (AT_FDCWD) only
+    if (number == 257) {
+        if (a0 != -100) return -38
+        return __ablaRuntimeWindowsOpen(a1, a2)
+    }
+    // newfstatat(directory, path, buffer, flags): AT_EMPTY_PATH (0x1000) takes the descriptor, AT_SYMLINK_NOFOLLOW (0x100) the link
+    if (number == 262) {
+        if ((a3 & 4096) != 0 && ablaRuntimeLoadU8(a1) == 0) return __ablaRuntimeWindowsFileCall(5, a0, a2, 0, 0)
+        if (a0 != -100) return -38
+        val wide = __ablaRuntimeWindowsWidePath(a1, 0)
+        if (wide == 0) return -2
+        return __ablaRuntimeWindowsStatPath(wide, a2, (a3 & 256) != 0)
+    }
+    // unlinkat(directory, path, flags): AT_REMOVEDIR (0x200) is rmdir
+    if (number == 263) {
+        if (a0 != -100) return -38
+        return __ablaRuntimeWindowsFileCall(if ((a2 & 512) != 0) 84 else 87, a1, 0, 0, 0)
+    }
+    // getrandom(buffer, length, flags)
+    if (number == 318) {
+        ProcessPrng(a0, a1)
+        return a1
+    }
+    -1000
+}
+
 /** The Linux system call number with six arguments, answered with kernel32: the result, or -errno; a number the translation does not handle ends the process with status 70 after naming it on standard error. */
 trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int): int {
     // write(fd, buffer, count)
     if (number == 1) {
-        val handle = if (a0 == 1) GetStdHandle(-11) else if (a0 == 2) GetStdHandle(-12) else 0
+        val handle = __ablaRuntimeWindowsHandle(a0)
         if (handle == 0) return __ablaRuntimeWindowsEBADF
         val scratch = __ablaRuntimeWindowsScratch()
         ablaRuntimeStoreI64(scratch, 0)
@@ -208,15 +691,16 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
         ExitProcess(a0)
         return 0
     }
-    // openat(directory, path, flags): the process's own /proc entries do not exist; the callers fall back (the collector builds its
-    // own directory)
-    if (number == 257) return __ablaRuntimeWindowsENOENT
+    // the file calls: read, close, stat, lseek, fsync, getcwd, rename, mkdir, unlink, getdents64, openat, newfstatat, getrandom ... (the process's own
+    // /proc entries do not exist: an openat of one is ENOENT, and the callers fall back)
+    val file = __ablaRuntimeWindowsFileCall(number, a0, a1, a2, a3)
+    if (file != -1000) return file
     __ablaRuntimeWindowsRefuse(number)
 }
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "1 9 10 11 25 28 35 39 60 131 186 202 228 231 257"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 8 9 10 11 21 25 28 35 39 60 74 77 79 80 82 83 84 87 131 186 202 217 228 231 257 262 263 318"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;

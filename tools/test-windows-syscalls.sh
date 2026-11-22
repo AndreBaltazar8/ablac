@@ -14,8 +14,7 @@ out=build/windows-syscalls
 rm -rf "$out"
 mkdir -p "$out"
 fail() { echo "windows-syscalls: $1" >&2; exit 1; }
-tested=$(awk '/^trusted fun __ablaRuntimeWindowsSyscall\(/ { inside = 1 } inside { print } inside && /^}/ { exit }' "$file" |
-    grep -oE 'number == [0-9]+' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+tested=$(grep -oE 'number == [0-9]+' "$file" | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
 listed=$(grep -E '^trusted fun __ablaRuntimeWindowsTranslated' "$file" | grep -oE '"[0-9 ]+"' | tr -d '"' | tr ' ' '\n' | sort -n | tr '\n' ' ')
 [[ -n $tested ]] || fail "no numbers found in __ablaRuntimeWindowsSyscall"
 [[ $tested == "$listed" ]] || fail "__ablaRuntimeWindowsTranslated lists [$listed] but the translation tests [$tested]"
