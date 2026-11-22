@@ -5572,7 +5572,8 @@ class BootstrapLowerer(
     val blockSelections: array<array<bool>> = [],
     // A global's type by name (lowerGlobalValueType). An inferred global's initializer was typed again in every function
     // that read it, since type queries are kept per function and scope: 13% of the client's compile-time lowering (#1022).
-    val globalValueTypes: Map<string, string> = Map()
+    val globalValueTypes: Map<string, string> = Map(),
+    var smallWhileDepth: int = 0
 ) {
     /** The entry of `blockSelections` that holds which statements of `block` its tail's type depends on (the locals
      *  the tail reads, and those their initializers read, transitively: bootstrapBlockTypeSelection), made once per
@@ -12818,6 +12819,29 @@ fun bootstrapFinishLoopStringBuild(
     }
 }
 
+val BOOTSTRAP_IR_SMALL_LOOP_NEST = "small-loop-nest"
+
+// A unit-step loop with a low literal limit is a cheap filter for the LLVM
+// unroller. LLVM still has to prove a small trip count from the actual
+// initial value and every path around the loop.
+fun bootstrapSmallCountedWhile(test: BootstrapExpression, body: BootstrapExpression): bool {
+    if (test.kind != "<" || test.children.size != 2) return false
+    val counter = test.children[0]
+    val limit = test.children[1]
+    if (counter.kind != "identifier" || limit.kind != "integer" ||
+        limit.text.size != 1 || limit.text[0] < 49 || limit.text[0] > 53) return false
+    val update = if (body.kind == "block" && body.children.size > 0)
+        body.children[body.children.size - 1] else body
+    if (update.kind != "assign" || update.text != counter.text || update.children.size != 1)
+        return false
+    val step = update.children[0]
+    if (step.kind != "+" || step.children.size != 2) return false
+    val previous = step.children[0]
+    val increment = step.children[1]
+    previous.kind == "identifier" && previous.text == counter.text &&
+        increment.kind == "integer" && increment.text == "1"
+}
+
 @noinline
 fun bootstrapLowerWhile(
     var lowerer: BootstrapLowerer,
@@ -12827,6 +12851,8 @@ fun bootstrapLowerWhile(
     var result = initial
     val build = bootstrapPrepareLoopStringBuild(lowerer, expression)
     val body = if (build == null) expression.children[1] else build.body
+    val test = expression.children[0]
+    val small = bootstrapSmallCountedWhile(test, body)
     val conditionLabel = lowerer.allocateLabel()
     val bodyLabel = lowerer.allocateLabel()
     val mergeLabel = lowerer.allocateLabel()
@@ -12841,17 +12867,20 @@ fun bootstrapLowerWhile(
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, conditionLabel, -1, "")
     val conditionMark = lowerer.locals.size
-    val condition = lowerer.lowerExpression(expression.children[0])
+    val condition = lowerer.lowerExpression(test)
     lowerer.dropTemporaries(conditionMark)
-    lowerer.emitControl("branch", condition, bodyLabel, mergeLabel, "")
+    lowerer.emitControl("branch", condition, bodyLabel, mergeLabel,
+        if (small && lowerer.smallWhileDepth > 0) BOOTSTRAP_IR_SMALL_LOOP_NEST else "")
     lowerer.emitControl("label", -1, bodyLabel, -1, "")
     val labeled = bootstrapEnterLoopTarget(
         lowerer, expression, mergeLabel, conditionLabel, lowerer.currentScope
     )
     val bodyMark = lowerer.locals.size
+    if (small) lowerer.smallWhileDepth = lowerer.smallWhileDepth + 1
     lowerer.dropDiscarded(
         lowerer.lowerExpression(body, false), body
     )
+    if (small) lowerer.smallWhileDepth = lowerer.smallWhileDepth - 1
     lowerer.dropTemporaries(bodyMark)
     bootstrapLeaveLoopTarget(lowerer, labeled)
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
