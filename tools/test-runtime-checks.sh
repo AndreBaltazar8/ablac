@@ -157,18 +157,6 @@ for flags in "" "-g" "--backtrace"; do
         grep -qx 'fatal signal: a bad memory access at 0x0000000000000010' "$out/stack-store.err" ||
             fail "a bad store in a release build: $(head -3 "$out/stack-store.err")"
         ! grep -q 'bad memory access' "$out/stack-segv.err" || fail "a sent SIGSEGV named an address"
-        # Nor one sent with macOS's SI_USER code (0x10001) and an si_addr, as macOS sends kill's (Linux only: queued
-        # by rt_sigqueueinfo to itself).
-        if [[ $(uname -s) == Linux ]]; then
-            "$compiler" build "$cases/sent-code.ab" -o "$out/sent-code"
-            set +e
-            "$out/sent-code" "$(uname -m)" > /dev/null 2> "$out/sent-code.err"
-            sent_status=$?
-            set -e
-            [[ $sent_status -eq 139 ]] || fail "a SIGSEGV sent with SI_USER 0x10001 exited $sent_status"
-            ! grep -q 'bad memory access' "$out/sent-code.err" ||
-                fail "a SIGSEGV sent with SI_USER 0x10001 named an address"
-        fi
     else
         # Its fault report names the address too, then prints the stack; a sent SIGSEGV's says what it may be.
         grep -qx 'fatal signal: a bad memory access at 0x0000000000000010' "$out/stack-store.err" ||
@@ -176,6 +164,18 @@ for flags in "" "-g" "--backtrace"; do
         grep -q '^stack ' "$out/stack-store.err" || fail "a bad store$flags printed no stack"
         grep -qx 'fatal signal: a trap, a bad memory access or an abort' "$out/stack-segv.err" ||
             fail "a sent SIGSEGV$flags: $(head -3 "$out/stack-segv.err")"
+    fi
+    # Nor does one sent with macOS's SI_USER code (0x10001) and an si_addr, as macOS sends kill's, in any build
+    # (Linux only: queued by rt_sigqueueinfo to itself).
+    if [[ $(uname -s) == Linux ]]; then
+        "$compiler" build "$cases/sent-code.ab" -o "$out/sent-code" $flags
+        set +e
+        "$out/sent-code" "$(uname -m)" > /dev/null 2> "$out/sent-code.err"
+        sent_status=$?
+        set -e
+        [[ $sent_status -eq 139 ]] || fail "a SIGSEGV sent with SI_USER 0x10001$flags exited $sent_status"
+        ! grep -q 'bad memory access at' "$out/sent-code.err" ||
+            fail "a SIGSEGV sent with SI_USER 0x10001$flags named an address"
     fi
     # Its stack starts at the faulting instruction, named, not in the handler that prints it.
     if [[ $flags == --backtrace ]]; then
