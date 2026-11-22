@@ -34,6 +34,10 @@ file -b "$out/ablac-static" | grep 'ARM aarch64.*static-pie linked' > /dev/null 
 needed=$(readelf -d "$out/ablac-static" | grep -c '(NEEDED)' || true)
 [[ $needed == 0 ]] || { echo "static compiler aarch64: $needed needed libraries" >&2; exit 1; }
 export ABLA_NATIVE_JOBS=1 ABLA_CODEGEN_JOBS=1
+# Under qemu-user a compiler cannot start itself as a child (/proc/self/exe is the emulator's, status 127), which the in-process code generation does for its parts of a
+# big program (src/codegen_units.ab, the --emit-object child): these builds make their objects with the external llc as before, and the empty-PATH check below, a program
+# small enough to be built in the compiler's own process, is the shim's. (Natively, on a Raspberry Pi, the children work: ab-rpi1.)
+[[ -z ${ABLA_STATIC_LLD_LIB:-} ]] || export ABLA_CODEGEN_INPROCESS=0
 count=0
 # Run natively (here under qemu) the compiler builds for the machine it runs on: no --target is the same as --target aarch64-linux (#806 step C). That
 # is its in-process code generation, not the external opt/llc the x86-64 compiler's cross build uses, so the executables are not byte-identical to the
