@@ -13,7 +13,7 @@ $bundle = Join-Path $root $asset
 $work = Join-Path $env:RUNNER_TEMP 'abla-llvm'
 $source = Join-Path $work 'src'
 $build = Join-Path $work 'build'
-$patch = Join-Path $root 'nix/llvm-instcombine-fdiv-zero.patch'
+$patch = Join-Path $work 'llvm-instcombine-fdiv-zero.patch'
 $pin = Get-Content (Join-Path $root 'nix/llvm-fork.nix') -Raw
 if ($pin -cnotmatch 'commit = "([0-9a-f]{40})";') {
     throw 'Could not read the LLVM fork commit from nix/llvm-fork.nix'
@@ -21,11 +21,18 @@ if ($pin -cnotmatch 'commit = "([0-9a-f]{40})";') {
 $commit = $Matches[1]
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-$vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-if (!$vs) { throw 'Visual Studio x64 C++ toolset unavailable' }
-& (Join-Path $vs 'Common7/Tools/Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
-if (!$env:VCToolsVersion -or $env:VSCMD_ARG_TGT_ARCH -notin @('x64', 'amd64')) {
-    throw 'Could not initialize the Visual Studio x64 C++ toolset'
+$vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64 -property installationPath
+if (!$vs) { throw 'MSVC 14.44 x64 C++ toolset unavailable' }
+# The runner's Clang 20 supports the 14.44 STL. Newer MSVC toolsets can require Clang 22.
+$vcvars = Join-Path $vs 'VC/Auxiliary/Build/vcvarsall.bat'
+$vcEnvironment = & cmd.exe /d /c ('call "{0}" amd64 -vcvars_ver=14.44 && set' -f $vcvars)
+foreach ($line in $vcEnvironment) {
+    if ($line -match '^([A-Za-z_][A-Za-z0-9_()]*)=(.*)$') {
+        [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+    }
+}
+if ($env:VCToolsVersion -notmatch '^14\.44\.' -or $env:VSCMD_ARG_TGT_ARCH -notin @('x64', 'amd64')) {
+    throw 'Could not initialize the MSVC 14.44 x64 C++ toolset'
 }
 $llvmTools = Join-Path $env:ProgramFiles 'LLVM/bin'
 $clang = Join-Path $llvmTools 'clang-cl.exe'
@@ -35,6 +42,8 @@ if (!(Test-Path $clang) -or !(Test-Path $linker)) {
 }
 
 New-Item -ItemType Directory -Path $source | Out-Null
+# The Windows checkout may expand the patch to CRLF, while the fork tarball uses LF.
+git -C $root cat-file blob 'HEAD:nix/llvm-instcombine-fdiv-zero.patch' > $patch
 $sourceArchive = Join-Path $work 'source.tar.gz'
 $prefix = "llvm-project-$commit"
 Invoke-WebRequest "https://codeload.github.com/AndreBaltazar8/llvm-project/tar.gz/$commit" -OutFile $sourceArchive
