@@ -7,19 +7,23 @@ import "abla/net"
 import "abla/sys/linux/process"
 import "abla/websocket"
 
+/// Describes the reply payload, frame kind and whether to close after sending it.
 class WebSocketEventReply(
     val kind: string,
     val payload: string,
     val close: bool
 )
 
+/// Pairs a path pattern with a message callback.
 class WebSocketEventRoute(
     val pattern: string,
     val handler: (string, string, string) -> WebSocketEventReply
 )
 
+/// Stores ordered path routes for event-driven WebSocket connections.
 class WebSocketEventRouter(val routes: array<WebSocketEventRoute>)
 
+/// Configures connection, buffer and shutdown limits for an event server.
 class WebSocketEventOptions(
     val maximumConnections: int,
     val maximumHeaderBytes: int,
@@ -28,6 +32,7 @@ class WebSocketEventOptions(
     val drainTimeoutMilliseconds: int
 )
 
+/// Owns the listening socket, poller and state of each connected client.
 resource class WebSocketEventServer(
     val router: WebSocketEventRouter,
     val listener: TcpListener,
@@ -47,6 +52,7 @@ resource class WebSocketEventServer(
     var drainDeadlineMilliseconds: int,
     var stopped: bool
 ) {
+    /// Closes all active client sockets, the poller and the listener.
     fun drop(): void {
         var index = 0
         while (index < this.descriptors.size) {
@@ -63,14 +69,17 @@ resource class WebSocketEventServer(
     }
 }
 
+/// Creates a reply with a text frame and an open connection by default.
 fun webSocketEventReply(
     payload: string,
     kind: string = "text",
     close: bool = false
 ): WebSocketEventReply = WebSocketEventReply(kind, payload, close)
 
+/// Creates a router with no registered routes.
 fun webSocketEventRouter(): WebSocketEventRouter = WebSocketEventRouter([])
 
+/// Appends a route and returns the router.
 fun WebSocketEventRouter.route(
     pattern: string,
     handler: (string, string, string) -> WebSocketEventReply
@@ -79,6 +88,7 @@ fun WebSocketEventRouter.route(
     this
 }
 
+/// Returns the first matching route index, or -1 when no pattern matches.
 fun WebSocketEventRouter.find(path: string): int {
     var found = -1
     var index = 0
@@ -94,6 +104,7 @@ fun WebSocketEventRouter.find(path: string): int {
 private fun webSocketEventOptions(): WebSocketEventOptions =
     WebSocketEventOptions(1023, 65536, 1048576, 2097152, 5000)
 
+/// Starts a nonblocking listener and returns the event server, whose listenError reports any setup failure.
 fun webSocketEventServer(
     router: WebSocketEventRouter,
     address: Ipv4SocketAddress,
@@ -111,6 +122,7 @@ fun webSocketEventServer(
     )
 }
 
+/// Returns the number of slots with an open socket.
 fun WebSocketEventServer.activeConnections(): int {
     var active = 0
     var index = 0
@@ -121,6 +133,7 @@ fun WebSocketEventServer.activeConnections(): int {
     active
 }
 
+/// Returns the first slot containing the descriptor, or -1 if no slot contains it.
 fun WebSocketEventServer.findDescriptor(descriptor: int): int {
     var found = -1
     var index = 0
@@ -131,6 +144,7 @@ fun WebSocketEventServer.findDescriptor(descriptor: int): int {
     found
 }
 
+/// Initializes a free or new slot for the descriptor and returns its index.
 fun WebSocketEventServer.allocateSlot(descriptor: int): int {
     var slot = -1
     var index = 0
@@ -165,6 +179,7 @@ fun WebSocketEventServer.allocateSlot(descriptor: int): int {
     slot
 }
 
+/// Unwatches and closes an active slot, ignoring slots outside the table.
 fun WebSocketEventServer.closeSlot(slot: int): void {
     if (slot >= 0 && slot < this.descriptors.size &&
         this.descriptors[slot] >= 0) {
@@ -182,6 +197,7 @@ fun WebSocketEventServer.closeSlot(slot: int): void {
     return
 }
 
+/// Queues bytes and enables write notifications, returning false when the slot is inactive or its output limit would be exceeded.
 fun WebSocketEventServer.queue(slot: int, bytes: string): bool {
     var queued = slot >= 0 && this.descriptors[slot] >= 0 &&
         this.outputs[slot].size + bytes.size <=
@@ -193,6 +209,7 @@ fun WebSocketEventServer.queue(slot: int, bytes: string): bool {
     queued
 }
 
+/// Completes a buffered HTTP upgrade and closes the connection if the handshake or route is invalid.
 fun WebSocketEventServer.processHandshake(slot: int): void {
     val headerEnd = httpHeaderEnd(this.inputs[slot])
     if (headerEnd < 0 && this.inputs[slot].size >
@@ -217,6 +234,7 @@ fun WebSocketEventServer.processHandshake(slot: int): void {
     return
 }
 
+/// Calls the matched handler for a complete message, then queues its reply or closes the client on a protocol or output error.
 fun WebSocketEventServer.handleMessage(
     slot: int,
     opcode: int,
@@ -250,6 +268,7 @@ fun WebSocketEventServer.handleMessage(
     return
 }
 
+/// Consumes complete frames, handles fragmentation and control frames, and closes or queues a close for invalid input.
 fun WebSocketEventServer.processFrames(slot: int): void {
     var processing = slot >= 0 && this.descriptors[slot] >= 0 &&
         this.upgraded[slot]
@@ -309,6 +328,7 @@ fun WebSocketEventServer.processFrames(slot: int): void {
     return
 }
 
+/// Accepts ready clients until accept fails, the connection limit is reached or the server is draining.
 fun WebSocketEventServer.acceptReady(): void {
     var accepting = !this.draining && this.activeConnections() <
         this.options.maximumConnections
@@ -328,6 +348,7 @@ fun WebSocketEventServer.acceptReady(): void {
     return
 }
 
+/// Reads and processes buffered input, closing on EOF, hard read errors or the configured input limit.
 fun WebSocketEventServer.readReady(slot: int): void {
     if (slot >= 0 && this.descriptors[slot] >= 0) {
         val connection = TcpConnection(this.descriptors[slot])
@@ -348,6 +369,7 @@ fun WebSocketEventServer.readReady(slot: int): void {
     return
 }
 
+/// Flushes queued bytes, retaining partial writes and closing on a hard error or completion of a closing reply.
 fun WebSocketEventServer.writeReady(slot: int): void {
     if (slot >= 0 && this.descriptors[slot] >= 0 &&
         this.outputOffsets[slot] < this.outputs[slot].size) {
@@ -372,6 +394,7 @@ fun WebSocketEventServer.writeReady(slot: int): void {
     return
 }
 
+/// Waits for socket events for up to the given timeout and returns the number handled.
 fun WebSocketEventServer.step(timeoutMilliseconds: int = 1000): int {
     var maximum = this.options.maximumConnections + 1
     if (maximum > 1024) maximum = 1024
@@ -408,6 +431,7 @@ fun WebSocketEventServer.listenError(): int =
     else if (this.poller.descriptor < 0) 0 - this.poller.descriptor
     else 0
 
+/// Services connections until shutdown, returning one if it cannot start listening and zero after stopping.
 fun WebSocketEventServer.run(): int {
     if (!this.stopped && this.listenError() != 0) return 1
     this.poller.watchGracefulShutdown()
@@ -415,11 +439,13 @@ fun WebSocketEventServer.run(): int {
     if (!this.stopped) this.drain() else 0
 }
 
+/// Starts a graceful shutdown without waiting for clients to finish.
 fun WebSocketEventServer.stop(): void {
     this.beginDrain()
     return
 }
 
+/// Stops accepting, queues close frames and sets the drain deadline.
 fun WebSocketEventServer.beginDrain(): void {
     if (!this.draining) {
         this.draining = true
@@ -445,6 +471,7 @@ fun WebSocketEventServer.beginDrain(): void {
     return
 }
 
+/// Closes all active clients and marks the server stopped.
 fun WebSocketEventServer.forceStop(): void {
     var slot = 0
     while (slot < this.descriptors.size) {
@@ -455,6 +482,7 @@ fun WebSocketEventServer.forceStop(): void {
     return
 }
 
+/// Services closing connections until they finish or the deadline passes, then closes the remaining clients and returns zero.
 fun WebSocketEventServer.drain(): int {
     this.beginDrain()
     while (this.activeConnections() > 0 &&
@@ -465,6 +493,7 @@ fun WebSocketEventServer.drain(): int {
     0
 }
 
+/// Closes active clients immediately and marks the server stopped.
 fun WebSocketEventServer.stopNow(): void {
     this.forceStop()
     return
