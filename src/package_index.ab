@@ -1,8 +1,6 @@
 import "package.ab"
 import "package_catalog.ab"
-import "abla/crypto"
-import "abla/http"
-import "abla/http/tls"
+import "ct_tier.ab"
 import "abla/sys/linux"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/io"
@@ -29,22 +27,29 @@ private fun packageIndexRead(path: string): PackageIndexSnapshot {
 
 private fun packageIndexFetch(url: string): PackageIndexSnapshot {
     if (url.startsWith("file:///")) return packageIndexRead(url.slice(7, url.size))
-    val client = httpsClient("abla.dev", 443, packageCatalogMaximumBytes + 16384, 5000, 20000)
-    val result = client.send(httpGet("/packages.toml"))
-    if (!result.succeeded || !result.complete) {
+    // Keep the TLS graph out of the compiler's own source graph. The shipped
+    // helper runs only for this request and uses the normal JIT object cache.
+    val helper = Path(bootstrapRuntimeRoot()).child("package-index-fetch.ab")
+    val cache = Path(bootstrapPackageCacheRoot()).child("index-helper")
+    val command = linuxCommand("/proc/self/exe").argument("run").argument("--no-live")
+        .argument("--fast").argument("--cache-dir").argument(cache.text).argument(helper.text)
+    command.environment("ABLA_INTERNAL_JIT_BUILD_NOTICE", "Building the package search helper...")
+    val result = command.capture()
+    if (result.status != 0 || result.output.indexOf("\n") != 3) {
         return PackageIndexSnapshot("", "cannot fetch $packageIndexUrl over HTTPS")
     }
-    if (result.response.status != 200) {
-        return PackageIndexSnapshot("", "$packageIndexUrl returned HTTP ${result.response.status}")
+    val status = result.output.slice(0, 3)
+    if (status != "200") {
+        return PackageIndexSnapshot("", "$packageIndexUrl returned HTTP $status")
     }
-    PackageIndexSnapshot(result.response.body)
+    PackageIndexSnapshot(result.output.slice(4, result.output.size))
 }
 
 fun bootstrapPackageIndex(offline: bool): PackageCatalog {
     val configured = linuxEnvironment("ABLA_PACKAGE_INDEX_URL")
     val url = if (configured.value == "") packageIndexUrl else configured.value
     val filename = if (url == packageIndexUrl) "abla.dev-packages.toml"
-        else if (url.startsWith("file:///")) "file-${hexEncode(sha256(url))}.toml"
+        else if (url.startsWith("file:///")) "file-${ctContentKey(url)}.toml"
         else return PackageCatalog([], "ABLA_PACKAGE_INDEX_URL must be $packageIndexUrl or an absolute file:// URL")
     val cache = Path(bootstrapPackageCacheRoot()).child("index").child(filename)
 

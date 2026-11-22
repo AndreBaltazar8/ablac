@@ -33,7 +33,7 @@ web=$(printf 'owner/abla-web\tHTTP server and middleware')
 
 snapshots=("$ABLA_PACKAGE_CACHE"/index/*.toml)
 [[ ${#snapshots[@]} == 1 ]]
-[[ ${snapshots[0]##*/} =~ ^file-[0-9a-f]{64}\.toml$ ]]
+[[ ${snapshots[0]##*/} =~ ^file-[0-9]+-[0-9a-f]{16}-[0-9a-f]{16}\.toml$ ]]
 cmp "$fixture" "${snapshots[0]}"
 mv "$fixture" "$work/catalog.saved"
 [[ $("$compiler" package search --offline RESP 2> "$work/error") == "$redis" ]]
@@ -84,3 +84,54 @@ updated=$(printf 'owner/abla-redis\tRedis protocol client')
 [[ ! -s "$work/error" ]]
 cmp "$fixture" "${snapshots[0]}"
 [[ $("$compiler" package search RESP --offline) == "$updated" ]]
+
+# Use a toolchain-local helper fixture for the online path without network.
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+mkdir -p "$work/toolchain/runtime"
+ln -s "$root/stdlib" "$work/toolchain/stdlib"
+for file in "$root/runtime/"*; do
+    [[ ${file##*/} == package-index-fetch.ab ]] || ln -s "$file" "$work/toolchain/runtime/"
+done
+cat > "$work/toolchain/runtime/package-index-fetch.ab" <<'ABLA'
+import "abla/sys/linux/io"
+
+fun main(): int {
+    linuxPrintStandardOutput("200\n[[package]]\nrepository = \"owner/abla-helper\"\ndescription = \"Helper fixture\"\nkeywords = []\n")
+    return 0
+}
+ABLA
+
+search_with_helper() {
+    env -u ABLA_PACKAGE_INDEX_URL ABLA_SYSROOT="$work/toolchain" \
+        ABLA_PACKAGE_CACHE="$work/helper-index" ABLA_JIT_CACHE_TRACE=1 \
+        "$compiler" package search helper 2> "$work/helper-error"
+}
+
+helper_result=$(printf 'owner/abla-helper\tHelper fixture')
+[[ $(search_with_helper) == "$helper_result" ]]
+grep -Fx 'Building the package search helper...' "$work/helper-error"
+grep -F '[jit-cache] stored ' "$work/helper-error"
+[[ $(search_with_helper) == "$helper_result" ]]
+if grep -Fx 'Building the package search helper...' "$work/helper-error"; then exit 1; fi
+grep -F '[jit-cache] hit ' "$work/helper-error"
+
+# A record without its object must rebuild, and a partial record can likewise
+# be ignored. The result remains available on the first retry.
+records=("$work"/helper-index/index-helper/run-*.record)
+[[ ${#records[@]} == 1 ]]
+record=${records[0]}
+object=$(sed -n '2p' "$record")
+[[ -f "$object" ]]
+rm -- "$object"
+[[ $(search_with_helper) == "$helper_result" ]]
+grep -Fx 'Building the package search helper...' "$work/helper-error"
+grep -F '[jit-cache] miss ' "$work/helper-error"
+grep -F '[jit-cache] stored ' "$work/helper-error"
+object=$(sed -n '2p' "$record")
+printf 'incomplete object\n' > "$object"
+[[ $(search_with_helper) == "$helper_result" ]]
+grep -F '[jit-cache] stored ' "$work/helper-error"
+printf 'abla-run-object-v5\n' > "$record"
+[[ $(search_with_helper) == "$helper_result" ]]
+grep -F '[jit-cache] miss ' "$work/helper-error"
+grep -F '[jit-cache] stored ' "$work/helper-error"
