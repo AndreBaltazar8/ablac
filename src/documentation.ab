@@ -4,6 +4,7 @@ import "parser.ab"
 import "lexer.ab"
 import "module_paths.ab"
 import "module.ab"
+import "ct_tier.ab"
 import "abla/json"
 import "abla/bytes"
 import "abla/text"
@@ -14,6 +15,15 @@ import "abla/sys/linux/process"
 // This is the analysis service's unevaluated module surface. It never loads or
 // executes compile-time code, including subparser handlers.
 class BootstrapDocumentationModule(val name: string, val files: array<string>)
+
+class BootstrapDocumentationDebt(val path: string, val rows: array<string> = [])
+
+fun BootstrapDocumentationDebt.record(moduleName: string, name: string,
+    kind: string, signature: string): void {
+    if (this.path == "") return
+    val fingerprint = ctContentKey("$kind\n$signature")
+    this.rows.append("$moduleName\t$name\t$fingerprint")
+}
 
 fun bootstrapDocumentationCollect(path: Path, root: string,
     var modules: array<BootstrapDocumentationModule>): bool {
@@ -52,7 +62,7 @@ fun bootstrapDocumentationEntry(var page: ByteBuffer, name: string, kind: string
 
 fun bootstrapDocumentationDeclaration(var page: ByteBuffer, source: string,
     tokens: array<BootstrapToken>, declaration: BootstrapDeclaration, owner: string,
-    var counts: array<int>): void {
+    var counts: array<int>, moduleName: string, var debt: BootstrapDocumentationDebt): void {
     if (declaration.isPrivate || declaration.name.startsWith("__abla_default_")) return
     val signature = bootstrapAnalysisSignature(source, tokens, declaration)
     val offset = bootstrapAnalysisDeclarationBegin(source, tokens, declaration)
@@ -61,12 +71,14 @@ fun bootstrapDocumentationDeclaration(var page: ByteBuffer, source: string,
         "") "${declaration.extensionOwner}." else ""
     val kind = if (owner != "") "method" else if (declaration.extensionOwner !=
         "") "extension ${declaration.kind}" else declaration.kind
-    bootstrapDocumentationEntry(page, "$prefix${declaration.name}", kind, signature, documentation)
+    val name = "$prefix${declaration.name}"
+    bootstrapDocumentationEntry(page, name, kind, signature, documentation)
+    if (documentation == "") debt.record(moduleName, name, kind, signature)
     val bucket = if (documentation != "") 0 else 1
     counts[bucket] = counts[bucket] + 1
     for (method in declaration.methods) bootstrapDocumentationDeclaration(page, source, tokens,
         method,
-        "$prefix${declaration.name}", counts)
+        name, counts, moduleName, debt)
 }
 
 fun bootstrapDocumentationCoverage(name: string, counts: array<int>): Json = jsonObject(
@@ -74,13 +86,14 @@ fun bootstrapDocumentationCoverage(name: string, counts: array<int>): Json = jso
     [jsonString(name), jsonInteger(counts[0]), jsonInteger(counts[1]),
         jsonInteger(counts[0] + counts[1])])
 
-fun bootstrapDocumentationGenerate(root: string, output: string): int {
+fun bootstrapDocumentationGenerate(root: string, output: string, debtPath: string): int {
     val modules: array<BootstrapDocumentationModule> = []
     if (!bootstrapDocumentationCollect(Path(root).child("abla"), root, modules)) {
         linuxPrintStandardError("error[E_DOC]: cannot read $root/abla\n")
         return 1
     }
     val coverage: array<Json> = []
+    var debt = BootstrapDocumentationDebt(debtPath)
     val totals = [0, 0]
     val index = byteBuffer()
     index
@@ -124,7 +137,7 @@ fun bootstrapDocumentationGenerate(root: string, output: string): int {
             }
             val tokens = bootstrapLexShared(source)
             for (declaration in graph.parsed.declarations) bootstrapDocumentationDeclaration(page,
-                source, tokens, declaration, "", counts)
+                source, tokens, declaration, "", counts, module.name, debt)
             // Registrations are compiler-parsed actions, never text matches or
             // executed handlers. The call itself is the language's signature.
             for (action in graph.parsed.actions) {
@@ -134,9 +147,10 @@ fun bootstrapDocumentationGenerate(root: string, output: string): int {
                     (expression.children.size == 2 || expression.children.size == 3) &&
                     expression.children[0].kind == "string") {
                     val documentation = bootstrapAnalysisDocumentation(source, action.begin, 0)
-                    bootstrapDocumentationEntry(page, "$${expression.children[0].text}",
-                        "sub-language",
-                        source.slice(action.begin, action.end), documentation)
+                    val name = "$${expression.children[0].text}"
+                    val signature = source.slice(action.begin, action.end)
+                    bootstrapDocumentationEntry(page, name, "sub-language", signature, documentation)
+                    if (documentation == "") debt.record(module.name, name, "sub-language", signature)
                     val bucket = if (documentation != "") 0 else 1
                     counts[bucket] = counts[bucket] + 1
                 }
@@ -160,6 +174,13 @@ fun bootstrapDocumentationGenerate(root: string, output: string): int {
             jsonInteger(totals[1]), jsonInteger(totals[0] + totals[1])])])
     if (!Path(output).child("index.md").writeText(index.toText()) ||
         !Path(output).child("coverage.json").writeText("${jsonStringify(report)}\n")) return 1
+    if (debtPath != "") {
+        val rows = if (debt.rows.size == 0) "" else "${debt.rows.join("\n")}\n"
+        if (!Path(debtPath).writeText(rows)) {
+            linuxPrintStandardError("error[E_DOC]: cannot write $debtPath\n")
+            return 1
+        }
+    }
     linuxPrintStandardOutput("total: ${totals[0]} documented, ${totals[1]} undocumented\n")
     0
 }
@@ -167,20 +188,23 @@ fun bootstrapDocumentationGenerate(root: string, output: string): int {
 fun bootstrapDocumentationCommand(): int {
     var root = bootstrapStandardLibraryRoot()
     var output = "build/docs"
+    var debtPath = ""
     var index = 1
     while (index < linuxArgumentCount()) {
         val argument = linuxArgument(index)
-        if ((argument == "--stdlib" || argument == "--output") && index + 1 <
+        if ((argument == "--stdlib" || argument == "--output" || argument == "--coverage-debt") && index + 1 <
             linuxArgumentCount()) {
-            if (argument == "--stdlib") root = linuxArgument(index + 1) else output =
-                linuxArgument(index + 1)
+            val value = linuxArgument(index + 1)
+            if (argument == "--stdlib") root = value
+            else if (argument == "--output") output = value
+            else debtPath = value
             index = index + 2
         } else {
-            linuxPrintStandardError("usage: ablac doc [--stdlib <stdlib-root>] [--output <directory>]\n")
+            linuxPrintStandardError("usage: ablac doc [--stdlib <stdlib-root>] [--output <directory>] [--coverage-debt <file>]\n")
             return 2
         }
     }
     // Remove trailing separators so module identities do not depend on them.
     while (root.endsWith("/") && root.size > 1) root = root.slice(0, root.size - 1)
-    bootstrapDocumentationGenerate(root, output)
+    bootstrapDocumentationGenerate(root, output, debtPath)
 }

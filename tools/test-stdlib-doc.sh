@@ -54,7 +54,7 @@ fun helper: int = 2
 AB
 { printf '/** '; printf '%05000d' 0; printf ' END_OF_LONG_DOCUMENTATION */\nfun longDocs(): int = 0\n'; } > "$out/stdlib/abla/long.ab"
 rm -f "$out/forbidden"
-"$compiler" doc --stdlib "$out/stdlib/" --output "$out/docs" > "$out/coverage.txt"
+"$compiler" doc --stdlib "$out/stdlib/" --output "$out/docs" --coverage-debt "$out/debt.tsv" > "$out/coverage.txt"
 [[ ! -e $out/forbidden ]]
 page=$(cat "$out/docs/abla/sample.md")
 [[ $page == *'class Box<T>(val value: T)'* ]]
@@ -75,11 +75,24 @@ cat > "$out/expected.json" <<'JSON'
 {"schemaVersion":1,"modules":[{"module":"abla/long","documented":1,"undocumented":0,"total":1},{"module":"abla/sample","documented":10,"undocumented":2,"total":12},{"module":"abla/sample/helper","documented":1,"undocumented":0,"total":1}],"totals":{"documented":12,"undocumented":2,"total":14}}
 JSON
 cmp "$out/expected.json" "$out/docs/coverage.json"
+[[ $(cut -f 1,2 "$out/debt.tsv") == $'abla/sample\tundocumented\nabla/sample\tNamed.label' ]]
 cp "$out/docs/coverage.json" "$out/first.json"
 cp "$out/docs/abla/sample.md" "$out/first.md"
 "$compiler" doc --stdlib "$out/stdlib" --output "$out/docs" > "$out/coverage.txt"
 cmp "$out/first.json" "$out/docs/coverage.json"
 cmp "$out/first.md" "$out/docs/abla/sample.md"
+
+# The undocumented count stays the same when one legacy declaration gains a
+# comment and a different overload is added without a comment.
+sed 's/^fun undocumented/\/\/ Returns seventeen.\nfun undocumented/' "$out/stdlib/abla/sample/entry.ab" > "$out/edited.ab"
+mv "$out/edited.ab" "$out/stdlib/abla/sample/entry.ab"
+printf '\nfun undocumented(value: int): int = value\n' >> "$out/stdlib/abla/sample/entry.ab"
+"$compiler" doc --stdlib "$out/stdlib" --output "$out/docs" --coverage-debt "$out/changed.tsv" > "$out/coverage.txt"
+grep -Fq '"totals":{"documented":13,"undocumented":2,"total":15}' "$out/docs/coverage.json"
+LC_ALL=C sort "$out/changed.tsv" > "$out/changed.sorted"
+LC_ALL=C sort "$out/debt.tsv" > "$out/debt.sorted"
+LC_ALL=C comm -23 "$out/changed.sorted" "$out/debt.sorted" > "$out/new.tsv"
+[[ $(cut -f 1,2 "$out/new.tsv") == $'abla/sample\tundocumented' ]]
 printf 'fun broken(\n' > "$out/stdlib/abla/broken.ab"
 if "$compiler" doc --stdlib "$out/stdlib" --output "$out/bad" > "$out/bad.log" 2>&1; then
     echo 'stdlib-doc: malformed module unexpectedly accepted' >&2

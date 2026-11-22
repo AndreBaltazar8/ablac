@@ -27,6 +27,14 @@ Coverage schema version 1 contains `modules` (each with `module`, `documented`,
 `/** ... */` or run of `//` comments counts as documentation, matching editor hover
 documentation. Modules and declarations appear in deterministic source order.
 
+The suite tracks legacy declarations without comments in
+`tools/doc-coverage-floor.txt`. Each row identifies a declaration by module,
+name, and signature fingerprint, so adding an undocumented overload fails
+even when another declaration gains a comment. When you document or remove a
+legacy declaration, run `tools/test-doc-coverage-floor.sh build/ablac` and
+remove the rows it lists as resolved. The Linux CI suite checks that those
+exceptions only shrink relative to the tested base revision.
+
 The same extraction is exposed by `ablac analyze --stdio` graph symbols and
 hover results: `signature` is the exact source header, `documentation` is the
 adjacent comment, and optional `parameters` contains `{name, label,
