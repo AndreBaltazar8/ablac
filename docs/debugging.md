@@ -178,6 +178,14 @@ stack (return addresses: subtract the load address, then addr2line or gdb on the
 load address 0x000055718b500000
 ```
 
+It is opt-in, on the build: a plain release build stays as small and fast as
+before and, when it dies, prints only its message (the panic, or the fault
+and its address), with no stack. Asking for `--backtrace` costs about 9 KB
+on a small program, up to 7% in speed from its frame pointers, and a
+`.debug` (or `.dSYM`) file beside the program that needn't ship (the numbers
+are under [Cost](#cost)). There is no run-time switch: what a program prints
+when it dies is decided when it is built.
+
 A frame is named by the function its address is in, so a function inlined
 into another shows as the one it was inlined into. On Linux (and Windows:
 below) the build also
