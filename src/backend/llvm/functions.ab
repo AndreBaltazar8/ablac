@@ -311,7 +311,7 @@ class BootstrapLlvmFunctionStorage(
     val rootValues: array<bool>,
     // Which locals (by declaring instruction) the frame holds.
     val rootLocals: array<bool>,
-    val denseIntegers: array<int>,
+    val denseWords: array<int>,
     val localIndex: BootstrapLlvmNameIndex,
     val labels: array<int>,
     val blocks: array<i64*>,
@@ -739,7 +739,8 @@ fun bootstrapLlvmCreateFunctionStorage(
     rootLocals: array<bool>,
     localIndex: BootstrapLlvmNameIndex,
     scalarPlan: BootstrapLlvmScalarPlan,
-    tables: BootstrapLlvmConstantTables
+    tables: BootstrapLlvmConstantTables,
+    packedFloatReads: array<bool>
 ): BootstrapLlvmFunctionStorage {
     val values: array<i64*> = []
     val nativeValues: array<i64*> = []
@@ -1032,12 +1033,18 @@ fun bootstrapLlvmCreateFunctionStorage(
             backend.builder, gcRootsType, "gc.roots"
         )
     }
+    val denseIntegers = bootstrapLlvmDenseLocalIntegers(function, scalarPlan.valueTypes)
+    val denseWords = if (packedFloatReads.size > 0 && denseIntegers.size == 0)
+        filledArray(valueCount, -1) else denseIntegers
+    for (value in 0 until packedFloatReads.size) {
+        if (packedFloatReads[value]) denseWords[value] = 0
+    }
     BootstrapLlvmFunctionStorage(
         values, nativeValues, scalarPlan.valueTypes,
         locals, nativeLocals, scalarPlan.localTypes,
         parameters, scratch, scratchTypes, auxiliary,
         rootValues, rootLocals,
-        bootstrapLlvmDenseLocalIntegers(function, scalarPlan.valueTypes), localIndex,
+        denseWords, localIndex,
         labels, blocks, gcFrame, gcRoots, gcRootsType, rootCount, rootBlock, rootBlockCount
     )
 }
@@ -2084,8 +2091,7 @@ fun bootstrapLlvmEmitScalarOperation(
     backend: BootstrapLlvmBackend,
     llvmFunction: i64*,
     var storage: BootstrapLlvmFunctionStorage,
-    instruction: BootstrapInstruction,
-    packedFloatReads: array<bool>
+    instruction: BootstrapInstruction
 ): bool {
     var emitted = false
     if (instruction.result >= 0 &&
@@ -2293,11 +2299,8 @@ fun bootstrapLlvmEmitScalarOperation(
             val arrayValue = instruction.left
             val array = storage.values[arrayValue]
             val index = bootstrapLlvmScalarOperand(backend, storage, instruction.right, "i64")
-            val denseInteger = instruction.opcode == "array.get.i64" &&
-                arrayValue < storage.denseIntegers.size && storage.denseIntegers[arrayValue] >= 0
-            val denseFloat = instruction.opcode == "array.get.f64" &&
-                arrayValue < packedFloatReads.size && packedFloatReads[arrayValue]
-            if (denseInteger || denseFloat) {
+            if ((instruction.opcode == "array.get.i64" || instruction.opcode == "array.get.f64") &&
+                arrayValue < storage.denseWords.size && storage.denseWords[arrayValue] >= 0) {
                 val element = bootstrapLlvmDenseArrayElement(
                     backend, llvmFunction, array, index, nativeNullPointer()
                 )
@@ -2354,8 +2357,8 @@ fun bootstrapLlvmEmitScalarOperation(
                 backend.builder, value, backend.i64Type, "scalar.array.set.bool"
             ) else value
             val arrayValue = instruction.operands[0]
-            if (arraySetScalar == "i64" && arrayValue < storage.denseIntegers.size &&
-                storage.denseIntegers[arrayValue] >= 0) {
+            if (arraySetScalar == "i64" && arrayValue < storage.denseWords.size &&
+                storage.denseWords[arrayValue] >= 0) {
                 val index = bootstrapLlvmScalarOperand(backend, storage, instruction.operands[1], "i64")
                 val element = bootstrapLlvmDenseArrayElement(
                     backend, llvmFunction, storage.values[arrayValue], index, word
@@ -8002,13 +8005,11 @@ fun bootstrapLlvmEmitFunction(
     val collecting = functionId < mayCollect.size &&
         mayCollect[functionId] && !runtimeImplementation
     var directlyAllocates = false
-    var writesGlobal = false
     var allocationInstruction = 0
     while (allocationInstruction < function.instructions.size) {
         if (bootstrapLlvmInstructionMayAllocate(
             function.instructions[allocationInstruction]
         )) directlyAllocates = true
-        if (function.instructions[allocationInstruction].opcode == "global.assign") writesGlobal = true
         allocationInstruction = allocationInstruction + 1
     }
     val pressure = backend.pressureSafePoints && collecting &&
@@ -8057,23 +8058,23 @@ fun bootstrapLlvmEmitFunction(
         if (functionId < bootstrapLlvmStackClosureSitesAll.size)
             bootstrapLlvmStackClosureSitesAll[functionId]
         else bootstrapLlvmNoStackClosures
-    var storage = bootstrapLlvmCreateFunctionStorage(
-        backend, function, llvmFunction, collecting, rootValues,
-        rootLocals, localIndex, scalarPlan, tables
-    )
-    // The slot is local to this invocation. Every ordinary exit publishes
-    // the final scalar, and a closed executable has no recoverable panic.
-    val loopGlobal = if (writesGlobal && function.blocks.size > 2 &&
-        loopGlobalsClosed &&
+    val loopGlobalName = if (loopGlobalsClosed && function.blocks.size > 2 &&
         !runtimeImplementation && !debug.variables && !addressTaken[functionId] &&
         !nativeFunctionRoots[functionId]) {
         val candidate = bootstrapLlvmLoopGlobalCandidate(program, function, functionId, functionIndex, backend.noPanicRecovery)
         if (candidate != "" && !bootstrapLlvmReachesCall(
             program, functionIndex, addressTaken, nativeFunctionRoots, [function.name]
-        )) bootstrapLlvmPrepareLoopGlobal(backend, program, candidate) else null
-    } else null
-    val packedFloatReads = if (loopGlobal != null)
-        bootstrapLlvmPackedFloatReads(program, function, storage.values.size) else []
+        )) candidate else ""
+    } else ""
+    val packedFloatReads = if (loopGlobalName != "")
+        bootstrapLlvmPackedFloatReads(program, function, scalarPlan.valueTypes.size) else []
+    var storage = bootstrapLlvmCreateFunctionStorage(
+        backend, function, llvmFunction, collecting, rootValues,
+        rootLocals, localIndex, scalarPlan, tables, packedFloatReads
+    )
+    // The slot is local to this invocation. Every ordinary exit publishes
+    // the final scalar, and a closed executable has no recoverable panic.
+    val loopGlobal = bootstrapLlvmPrepareLoopGlobal(backend, program, loopGlobalName)
     bootstrapLlvmInitializeParameters(
         backend, function, llvmFunction, storage
     )
@@ -8798,7 +8799,7 @@ fun bootstrapLlvmEmitFunction(
         }
         var scalarOperation = false
         if (reachable) scalarOperation = bootstrapLlvmEmitScalarOperation(
-            backend, llvmFunction, storage, instruction, packedFloatReads
+            backend, llvmFunction, storage, instruction
         )
         if (scalarOperation) matched = true
         val frameCell = (opcodeHead == 99 && opcode == "cell.create") &&
