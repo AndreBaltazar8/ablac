@@ -12,8 +12,8 @@ mkdir -p "$output_directory"
 # address-space limit), against the last line of the record. The allocator's free lists once held
 # each size's high-water mark for good: that took this build from 1.26-1.40 GB to 1.67 GB, and an
 # Xtensa build of abla-embedded's package-import past the 4 GB limit. Runs land near either end of
-# that range. More than 10% over the record fails, and so does more than 20% under it, so later
-# growth can't hide in a gain: add a line to the record in the commit that moves it, saying why.
+# that range. The resident peak is only a loose ceiling (more than 20% over the record fails: add a line to the record in
+# the commit that moves it, saying why); what holds a commit to its memory is the live bytes per source byte, below.
 if ! /usr/bin/env time --version >/dev/null 2>&1; then
     echo "compiler-memory-peak: needs GNU time (shell.nix has it)" >&2
     exit 1
@@ -65,21 +65,42 @@ for round in 1 2 3 4 5; do
         fi
     done
     rounds=$round
-    if [[ $all_rounds != 5 ]] && (( round >= 2 && peak * 100 <= relative_peak * 103 &&
-        peak * 100 <= recorded * 107 && peak * 100 >= recorded * 83 )); then
+    if [[ $all_rounds != 5 ]] && (( round >= 2 && peak * 100 <= relative_peak * 103 && peak * 100 <= recorded * 115 )); then
         break
     fi
 done
+# What a commit can be held to is the live bytes, which load, the machine and the checkout do not move (two runs of one
+# compiler: 0.02% apart; the resident peak moves 1.5-2% inside one commit and 10% with four days of source growth): the
+# largest value ABLA_COMPILER_MEMORY_TRACE prints, per byte of the modules the compile parses (the trace names each one),
+# may not exceed 72 (measured 68.6 on 2026-11-22 with the relative path the test uses, +5%). A stage's growth of over 5% fails whatever the resident peak says.
+reachable_per_source_byte_hundredths=7200
+traced="$output_directory/traced.err"
+(
+    cd "$project_root"
+    ABLA_COMPILER_MEMORY_TRACE=1 ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=120 \
+        "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm src/orc_main.ab >"$output_directory/self.ll" 2>"$traced"
+) || {
+    echo "compiler-memory-peak: the traced --emit-llvm failed" >&2
+    tr -d '\0' <"$traced" | sed -n '1,20p' >&2
+    exit 1
+}
+reachable=$(tr -d '\0' <"$traced" | awk '/^abla-[a-z]+-memory / && $NF + 0 > m { m = $NF + 0 } END { printf "%d", m }')
+source_bytes=$(tr -d '\0' <"$traced" | sed -n 's/^abla-frontend-memory graph\.acquire:\(.*\) [0-9]*$/\1/p' | sort -u |
+    (cd "$project_root" && xargs -d '\n' cat) | wc -c)
+if (( reachable <= 0 || source_bytes <= 0 )); then
+    echo "compiler-memory-peak: no live-bytes lines in the trace (reachable $reachable, source $source_bytes)" >&2
+    exit 1
+fi
+if (( reachable * 100 > source_bytes * reachable_per_source_byte_hundredths )); then
+    echo "compiler-memory-peak: $reachable live bytes at the trace's peak for $source_bytes bytes of source: $((reachable / source_bytes)) per byte, over the limit of $((reachable_per_source_byte_hundredths / 100)). Find the phase that grew (ABLA_COMPILER_MEMORY_TRACE=1), or raise the limit in the commit that adds the memory, saying why." >&2
+    exit 1
+fi
 if (( peak * 100 > relative_peak * 105 )); then
     echo "compiler-memory-peak: $peak kB with the absolute path to src/orc_main.ab, $relative_peak kB with the relative one: a build's peak must not follow the length of the path (what keeps the path per name or local?)." >&2
     exit 1
 fi
-if (( peak * 100 > recorded * 110 )); then
-    echo "compiler-memory-peak: $peak kB, over the recorded $recorded kB by more than 10%. Find what grew (ABLA_COMPILER_MEMORY_TRACE=1 prints live bytes by phase), or add a line to $record saying why." >&2
+if (( peak * 100 > recorded * 120 )); then
+    echo "compiler-memory-peak: $peak kB, over the recorded $recorded kB by more than 20% (a loose ceiling: the live-bytes check is the tight one, and it passed). Add a line to $record saying why, or find what grew." >&2
     exit 1
 fi
-if (( peak * 100 < recorded * 80 )); then
-    echo "compiler-memory-peak: $peak kB, more than 20% under the recorded $recorded kB: add a line to $record." >&2
-    exit 1
-fi
-echo "compiler-memory-peak: --emit-llvm of the compiler peaks at $peak kB (recorded $recorded kB; $relative_peak kB given a relative path; $rounds rounds)"
+echo "compiler-memory-peak: --emit-llvm of the compiler peaks at $peak kB resident (recorded $recorded kB; $relative_peak kB given a relative path; $rounds rounds), $reachable live bytes for $source_bytes source bytes ($((reachable * 100 / source_bytes)) hundredths per byte)"
