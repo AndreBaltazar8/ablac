@@ -137,22 +137,13 @@ class Regex(
     fun findAll(text: string): array<RegexMatch> {
         val found: array<RegexMatch> = []
         val fixed = this.fixedBytes
-        if (fixed != null) {
-            var position = 0
-            while (position < text.size) {
-                val end = regexFixedFindEnd(fixed, text, position)
-                if (end < 0) break
-                found.append(RegexMatch(text, [end - fixed.width, end]))
-                position = end
-            }
-            return found
-        }
         var vm = regexVm(this, text)
         var position = 0
         var advance = false
         var more = true
         while (more && position <= text.size) {
-            val spans = regexRun(this, vm, position, false, false, advance)
+            val spans = if (fixed != null) regexFixedSpans(fixed, text, position)
+                else regexRun(this, vm, position, false, false, advance)
             if (spans.size == 0) {
                 more = false
             } else {
@@ -173,7 +164,6 @@ class Regex(
         // A replacement without `$` is the same text for every match: it is not expanded each time.
         val plain = !replacement.contains("$")
         val fixed = this.fixedBytes
-        if (fixed != null) return regexFixedReplace(fixed, text, replacement, plain)
         val out = byteBuffer()
         var last = 0
         var vm = regexVm(this, text)
@@ -181,7 +171,8 @@ class Regex(
         var advance = false
         var more = true
         while (more && position <= text.size) {
-            val spans = regexRun(this, vm, position, false, false, advance)
+            val spans = if (fixed != null) regexFixedSpans(fixed, text, position)
+                else regexRun(this, vm, position, false, false, advance)
             if (spans.size == 0) {
                 more = false
             } else {
@@ -770,7 +761,7 @@ fun regexCompileWithin(pattern: string, maximumInstructions: int): RegexCompileR
         for (i in 0..parser.groups) required.append(false)
         regexMarkRequired(tree, required)
     }
-    val fixed = if (parser.groups == 0 && !ablaAtCompileTime()) regexFixedPlan(tree, parser.classes) else null
+    val fixed = if (parser.groups == 0 && !ablaAtCompileTime()) regexFixedPlan(emitter.program, parser.classes) else null
     RegexCompileResult(Regex(pattern, parser.groups, emitter.program, parser.classes,
         regexFirstBytes(emitter.program, parser.classes), null, "", fixed), true, RegexError("", 0),
         parser.captureNames, required)
@@ -1170,54 +1161,50 @@ private fun regexExpand(m: RegexMatch, replacement: string): string {
 // makes the scan linear even when a pattern matches many overlapping prefixes.
 class RegexFixedBytes(val width: int, val starts: int, val accepts: int, val masks: string)
 
-private fun regexFixedAtoms(node: RegexNode, var atoms: array<RegexNode>): bool {
-    if (node.kind == 0) return true
-    if (node.kind == 1 || node.kind == 3) {
-        if (atoms.size >= 32 || (node.kind == 1 && node.a >= 128) ||
-            (node.kind == 3 && node.b != 0)) return false
-        atoms.append(node)
-        return true
-    }
-    if (node.kind == 4) {
-        for (child in node.kids) if (!regexFixedAtoms(child, atoms)) return false
-        return true
-    }
-    if (node.kind == 7 && node.a < 0) return regexFixedAtoms(node.kids[0], atoms)
-    if (node.kind == 6 && node.a == node.b && node.a <= 32) {
-        if (node.a == 0) return true
-        val body: array<RegexNode> = []
-        if (!regexFixedAtoms(node.kids[0], body) || atoms.size + node.a * body.size > 32) return false
-        for (_ in 0 until node.a) for (atom in body) atoms.append(atom)
-        return true
-    }
-    false
-}
-
-private fun regexFixedPlan(tree: RegexNode, classes: array<array<int>>): RegexFixedBytes? {
-    var root = tree
-    while (root.kind == 7 && root.a < 0) root = root.kids[0]
-    val branches = if (root.kind == 5) root.kids else [root]
-    val atoms: array<RegexNode> = []
+// Recognize the emitter's layout for top-level alternatives of consuming
+// ASCII instructions. Every branch must have the same nonzero width.
+private @noinline fun regexFixedPlan(program: array<int>, classes: array<array<int>>): RegexFixedBytes? {
+    val terminal = program.size / 3 - 2
+    if (terminal < 3 || terminal > 64) return null
+    val positions: array<int> = []
     var width = 0
     var starts = 0
     var accepts = 0
-    for (branch in branches) {
-        val begin = atoms.size
-        if (!regexFixedAtoms(branch, atoms)) return null
-        val size = atoms.size - begin
-        if (size < 2 || (width != 0 && size != width)) return null
+    var branch = 1
+    while (branch < terminal) {
+        var begin = branch
+        var next = terminal
+        var end = terminal
+        if (program[branch * 3] == 3) {
+            begin = program[branch * 3 + 1]
+            next = program[branch * 3 + 2]
+            if (begin != branch + 1 || next <= begin + 2 || next >= terminal) return null
+            end = next - 1
+            if (program[end * 3] != 4 || program[end * 3 + 1] != terminal) return null
+        }
+        val size = end - begin
+        if (size < 2 || (width != 0 && size != width) || positions.size + size > 32) return null
         width = size
-        starts = starts | (1 << begin)
-        accepts = accepts | (1 << (atoms.size - 1))
+        starts = starts | (1 << positions.size)
+        for (pc in begin until end) {
+            val op = program[pc * 3]
+            if (op != 0 && op != 2) return null
+            if (op == 0 && program[pc * 3 + 1] >= 128) return null
+            if (op == 2 && program[pc * 3 + 2] != 0) return null
+            positions.append(pc)
+        }
+        accepts = accepts | (1 << (positions.size - 1))
+        branch = next
     }
 
     val masks = filledArray(128, 0)
-    for (index in 0 until atoms.size) {
+    for (index in 0 until positions.size) {
         val bit = 1 << index
-        val atom = atoms[index]
-        if (atom.kind == 1) masks[atom.a] = masks[atom.a] | bit
+        val at = positions[index] * 3
+        val value = program[at + 1]
+        if (program[at] == 0) masks[value] = masks[value] | bit
         else {
-            val ranges = classes[atom.a]
+            val ranges = classes[value]
             if (ranges.size > 64) return null
             var pair = 0
             while (pair < ranges.size) {
@@ -1227,12 +1214,19 @@ private fun regexFixedPlan(tree: RegexNode, classes: array<array<int>>): RegexFi
             }
         }
     }
-    val table = byteBuffer()
-    for (mask in masks) {
-        for (shift in 0 until 4) table.appendByteValue((mask >> (shift * 8)) & 255)
+    RegexFixedBytes(width, starts, accepts, regexFixedTable(masks))
+}
+
+private trusted fun regexFixedTable(masks: array<int>): string {
+    val address = ablaUnsafePointerAddress(ablaUnsafeAllocate(1025))
+    for (byte in 0 until 256) {
+        val mask = if (byte < 128) masks[byte] else 0
+        for (offset in 0 until 4) {
+            ablaUnsafeStoreU8(nativePointerFromAddress(address + byte * 4 + offset), (mask >> (offset * 8)) & 255)
+        }
     }
-    table.appendText("\x00".repeat(512))
-    RegexFixedBytes(width, starts, accepts, table.toText())
+    ablaUnsafeStoreU8(nativePointerFromAddress(address + 1024), 0)
+    adoptNativeString(address, 1024)
 }
 
 // The table has four little-endian bytes per input byte. Reading each byte
@@ -1243,7 +1237,7 @@ private @inline trusted fun regexFixedMask(address: int): int =
     (ablaUnsafeLoadU8(nativePointerFromAddress(address + 2)) << 16) |
     (ablaUnsafeLoadU8(nativePointerFromAddress(address + 3)) << 24)
 
-private trusted fun regexFixedFindEnd(plan: RegexFixedBytes, text: string, start: int): int {
+private @noinline trusted fun regexFixedFindEnd(plan: RegexFixedBytes, text: string, start: int): int {
     val masks = plan.masks
     if (masks.size != 1024 || start < 0) return -1
     val table = ablaUnsafeStringAddress(masks)
@@ -1262,19 +1256,9 @@ private trusted fun regexFixedFindEnd(plan: RegexFixedBytes, text: string, start
     -1
 }
 
-private fun regexFixedReplace(plan: RegexFixedBytes, text: string, replacement: string, plain: bool): string {
-    val out = byteBuffer()
-    var last = 0
-    while (last < text.size) {
-        val end = regexFixedFindEnd(plan, text, last)
-        if (end < 0) break
-        val start = end - plan.width
-        out.appendText(text.slice(last, start))
-        out.appendText(if (plain) replacement else regexExpand(RegexMatch(text, [start, end]), replacement))
-        last = end
-    }
-    out.appendText(text.slice(last, text.size))
-    out.toText()
+private @noinline fun regexFixedSpans(plan: RegexFixedBytes, text: string, start: int): array<int> {
+    val end = regexFixedFindEnd(plan, text, start)
+    if (end < 0) [] else [end - plan.width, end]
 }
 
 // Recognize up to four ordered, nonempty ASCII string alternatives. Exiting
