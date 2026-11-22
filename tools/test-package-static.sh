@@ -2,7 +2,7 @@
 # The static toolchain package (tools/package-linux-static-toolchain.sh): built from the static compiler, unpacked in a directory of its own, and used with an EMPTY PATH (no clang, no
 # ld.lld, no coreutils: not even `ls`): hello builds, links in the compiler's process and runs, built a second time it is the same executable, and the package holds no loader,
 # no shared library and no libLLVM. Prints the package's size. Needs the static compiler (tools/build-static-compiler.sh after eval "$(tools/static-llvm-env.sh)").
-# The Xtensa installer is built by the packaged compiler, on the same empty PATH.
+# The Xtensa installer and a Windows executable also build with the packaged compiler on an empty PATH.
 # Usage: tools/test-package-static.sh <static compiler> [dynamic-package.tar.gz to compare sizes with]
 set -euo pipefail
 export LC_ALL=C
@@ -25,7 +25,7 @@ for part in bin/ablac libexec/ablac.bin libexec/abla-install-xtensa-native share
     [[ -e $pkg/$part ]] || fail "the package lacks $part"
 done
 # no shared library, no libLLVM, no tool of an LLVM install
-found=$(find "$pkg" -type f \( -name '*.so' -o -name '*.so.*' -o -name 'libLLVM*' -o -name 'libclang-cpp*' -o -name clang -o -name ld.lld -o -name wasm-ld -o -name opt -o -name llc \) -print)
+found=$(find "$pkg" -type f \( -name '*.so' -o -name '*.so.*' -o -name 'libLLVM*' -o -name 'libclang-cpp*' -o -name clang -o -name ld.lld -o -name wasm-ld -o -name lld-link -o -name opt -o -name llc \) -print)
 [[ -z $found ]] || fail "the package holds: $found"
 for executable in "$pkg/libexec/ablac.bin" "$pkg/libexec/abla-install-xtensa-native"; do
     interpreter=$(readelf -lW "$executable" | grep -c 'INTERP\|Shared library' || true)
@@ -45,4 +45,16 @@ cmp -s "$out/hello1" "$out/hello2" || fail "two builds of hello differ"
 # a program with a compile-time action and a second module build too (the standard library is the package's own)
 env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/cache3" "$PWD/$pkg/bin/ablac" run tests/cases/libc-imports/strings-arrays.ab > "$out/run.log" 2>&1 ||
     { tail -5 "$out/run.log" >&2; fail "a run with an empty PATH failed"; }
-echo "$report; hello builds, runs and is reproducible with an empty PATH"
+windows() {
+    local output=$1
+    shift
+    env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/cache-windows" "$@" \
+        "$PWD/$pkg/bin/ablac" build tests/cases/windows/exit7.ab --target x86_64-windows --no-cache \
+        -o "$out/$output.exe" > "$out/$output.log" 2>&1
+}
+windows windows || { tail -5 "$out/windows.log" >&2; fail 'Windows link on an empty PATH failed'; }
+[[ -s $out/windows.exe ]] || fail 'Windows build produced no executable'
+if windows windows-external ABLA_LINK_INPROCESS=0; then
+    fail 'Windows link succeeded with the embedded linker disabled and an empty PATH'
+fi
+echo "$report; hello builds, runs and is reproducible, and Windows links with an empty PATH"
