@@ -33,6 +33,7 @@ stressed=$(ABLA_GC_STRESS=1 ABLA_GC_GROWTH=2097152 "$out/exact")
 # A kept slice points into its parent's block: the directory is needed, the result the same.
 interior=$("$out/interior")
 expected_interior='total 3948890 kept 66000 first 0-with-some-longer-text-to-slice- last 1999-with-some-longer-text-to-sli'
+expected_interior+=$'\nlarge 299998 bca cab'
 [[ $interior == "$expected_interior"$'\n'"directory true" ]] || fail "interior pointers: '$interior'"
 forced=$(ABLA_GC_LOOKUP=directory "$out/interior")
 [[ $forced == "$expected_interior"$'\n'"directory true" ]] || fail "interior pointers, ABLA_GC_LOOKUP=directory: '$forced'"

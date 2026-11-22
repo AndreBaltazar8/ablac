@@ -299,6 +299,28 @@ trusted fun __ablaRuntimeHostHeapClassBelow(t: int): int {
 trusted fun __ablaRuntimeHostHeapBinOf(t: int): int =
     if (t > 131072) 120 else __ablaRuntimeHostHeapClassBelow(t)
 
+// Bounds of the mappings acquired by the native heap. Publish the bounds
+// before returning a mapping and leave them wide after unmap, so recycled
+// blocks and interior pointers are always covered.
+trusted fun __ablaRuntimeHostHeapExtent(): int = nativeStaticAllocate(16)
+
+trusted fun __ablaRuntimeHostHeapTrackMapping(address: int, bytes: int): void {
+    val extent = __ablaRuntimeHostHeapExtent()
+    val end = address + bytes
+    var minimum = ablaRuntimeAtomicLoadI64(extent)
+    while (minimum == 0 || address < minimum) {
+        val observed = ablaRuntimeAtomicCompareExchangeI64(extent, minimum, address)
+        if (observed == minimum) break
+        minimum = observed
+    }
+    var maximum = ablaRuntimeAtomicLoadI64(extent + 8)
+    while (end > maximum) {
+        val observed = ablaRuntimeAtomicCompareExchangeI64(extent + 8, maximum, end)
+        if (observed == maximum) break
+        maximum = observed
+    }
+}
+
 // The last mapping the system refused, kept for the out-of-memory report (the errno, the bytes asked): a macOS
 // heap that is refused memory says why instead of leaving a guess.
 var __ablaRuntimeHostMapFailErrno: int = 0
@@ -312,6 +334,7 @@ trusted fun __ablaRuntimeHostHeapMap(bytes: int): int {
         __ablaRuntimeHostMapFailBytes = bytes
         return 0
     }
+    __ablaRuntimeHostHeapTrackMapping(address, bytes)
     address
 }
 
@@ -332,9 +355,12 @@ trusted fun __ablaRuntimeHostHeapRemapCopy(base: int, before: int, after: int): 
 
 // A mapping resized to `after` bytes: MREMAP_MAYMOVE where there is mremap; macOS has none (a new mapping, the old bytes
 // copied, the old one unmapped). The new base, or a negative errno.
-trusted fun __ablaRuntimeHostHeapRemap(base: int, before: int, after: int): int =
-    if (ablaHostIsMacOS()) __ablaRuntimeHostHeapRemapCopy(base, before, after)
-    else ablaLinuxSyscall(25, base, before, after, 1, 0, 0)
+trusted fun __ablaRuntimeHostHeapRemap(base: int, before: int, after: int): int {
+    if (ablaHostIsMacOS()) return __ablaRuntimeHostHeapRemapCopy(base, before, after)
+    val moved = ablaLinuxSyscall(25, base, before, after, 1, 0, 0)
+    if (moved >= 0) __ablaRuntimeHostHeapTrackMapping(moved, after)
+    moved
+}
 
 // The operating system's side of the frozen groups' reserved window (docs/design/frozen-heap.md), named here so that the
 // system calls of the heap and the collector are the functions above and these, and nowhere inline:
@@ -2919,6 +2945,16 @@ trusted fun __ablaRuntimeHostCollectionMappingsLoad(): bool {
     __ablaRuntimeHostCollectionMappedLast = 0
     __ablaRuntimeHostCollectionMinimum = ablaRuntimeLoadI64(pairs)
     __ablaRuntimeHostCollectionMaximum = ablaRuntimeLoadI64(pairs + (count - 1) * 16 + 8)
+    // Narrow the candidate bounds on the native heap only. This rejects static
+    // addresses before a lazy lookup needs its directory. The mapping list
+    // still decides whether it is safe to read a possible header.
+    if (__ablaRuntimeHostHeapNative()) {
+        val extent = __ablaRuntimeHostHeapExtent()
+        val low = ablaRuntimeAtomicLoadI64(extent)
+        val high = ablaRuntimeAtomicLoadI64(extent + 8)
+        if (low > __ablaRuntimeHostCollectionMinimum) __ablaRuntimeHostCollectionMinimum = low
+        if (high != 0 && high < __ablaRuntimeHostCollectionMaximum) __ablaRuntimeHostCollectionMaximum = high
+    }
     true
 }
 
