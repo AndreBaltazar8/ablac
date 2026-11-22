@@ -31,10 +31,10 @@ for profile in release fast o1; do
     "$compiler" build "$project_root/tests/cases/arrays-dense/local-integers.ab" \
         --no-cache -o "$output_directory/locals-$profile" "${flags[@]}"
     for stress in 0 1; do
-        for mode in read write escaped; do
+        for mode in read write escaped growing; do
             arguments=()
             if [[ $mode == write ]]; then arguments=(valid write)
-            elif [[ $mode == escaped ]]; then arguments=(escaped); fi
+            elif [[ $mode == escaped || $mode == growing ]]; then arguments=("$mode"); fi
             status=0
             ABLA_GC_STRESS=$stress "$output_directory/locals-$profile" "${arguments[@]}" || status=$?
             [[ $status == 42 ]] || exit 1

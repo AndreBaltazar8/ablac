@@ -39,6 +39,9 @@ class BootstrapLlvmBackend(
     val aliasKind: i32,
     val aliasSlot: i64*,
     val aliasRaw: i64*,
+    val aliasStackValue: i64*,
+    val aliasArrayHeader: i64*,
+    val aliasArrayElement: i64*,
     // Immutable, context-owned attributes shared by declarations and calls.
     val sretAttribute: i64*,
     val byvalAttribute: i64*,
@@ -107,6 +110,9 @@ fun bootstrapLlvmBackend(targetTriple: string): BootstrapLlvmBackend {
         rootFrameType, LLVMGetMDKindIDInContext(context, "tbaa", i32(4)),
         bootstrapLlvmAliasTag(context, i64Type, "abla field slot"),
         bootstrapLlvmAliasTag(context, i64Type, "abla raw memory"),
+        bootstrapLlvmAliasTag(context, i64Type, "abla stack value", "abla raw memory"),
+        bootstrapLlvmAliasTag(context, i64Type, "abla dense array header", "abla raw memory"),
+        bootstrapLlvmAliasTag(context, i64Type, "abla dense array element", "abla raw memory"),
         LLVMCreateTypeAttribute(context, bootstrapLlvmAttributeKind("sret"), valueType),
         LLVMCreateTypeAttribute(context, bootstrapLlvmAttributeKind("byval"), valueType),
         bootstrapLlvmCreatePointerScratch()
@@ -1064,7 +1070,9 @@ var bootstrapLlvmDetectSmallLoopNests = false
 // by-name field access, extension fields, value cells) has neither tag and
 // may alias both. Each backend makes its tags with its own context: metadata
 // never outlives the context it belongs to, and compile-time evaluation makes
-// and disposes contexts all the time.
+// and disposes contexts all the time. Compiler-owned value slots, dense array
+// headers and dense array payload elements occupy disjoint regions. They are
+// children of raw memory so a general raw access can still alias any of them.
 
 fun bootstrapLlvmMetadataNode(context: i64*, nodes: array<i64*>): i64* {
     val vector = llvmPointerVector(nodes.size)
@@ -1074,15 +1082,19 @@ fun bootstrapLlvmMetadataNode(context: i64*, nodes: array<i64*>): i64* {
     node
 }
 
-// The access tag for type `name` under the shared root, as a value.
-fun bootstrapLlvmAliasTag(context: i64*, i64Type: i64*, name: string): i64* {
+fun bootstrapLlvmAliasTag(
+    context: i64*, i64Type: i64*, name: string, parentName: string = ""
+): i64* {
     val rootName = "abla memory"
     val root = bootstrapLlvmMetadataNode(
         context, [LLVMMDStringInContext2(context, rootName, rootName.size)]
     )
     val zero = LLVMValueAsMetadata(LLVMConstInt(i64Type, 0, 0))
+    val parent = if (parentName == "") root else bootstrapLlvmMetadataNode(
+        context, [LLVMMDStringInContext2(context, parentName, parentName.size), root, zero]
+    )
     val type = bootstrapLlvmMetadataNode(
-        context, [LLVMMDStringInContext2(context, name, name.size), root, zero]
+        context, [LLVMMDStringInContext2(context, name, name.size), parent, zero]
     )
     LLVMMetadataAsValue(context, bootstrapLlvmMetadataNode(context, [type, type, zero]))
 }
@@ -1542,7 +1554,7 @@ fun bootstrapLlvmCopyValue(
         backend.builder, backend.valueType, source, name
     )
     LLVMSetAlignment(value, 8)
-    if (sourceIsStack) bootstrapLlvmTagAccess(backend, value, false)
+    if (sourceIsStack) LLVMSetMetadata(value, backend.aliasKind, backend.aliasStackValue)
     val stored = LLVMBuildStore(backend.builder, value, destination)
     LLVMSetAlignment(stored, 8)
 }
