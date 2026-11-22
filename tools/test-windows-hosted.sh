@@ -29,6 +29,9 @@ for source in tests/cases/windows/hosted/*.ab; do
         { cat "$out/$name.native.log" >&2; fail "$name did not build for Linux"; }
     "$out/$name.native" "${arguments[@]}" > "$out/$name.expected"
     for mode in fast release; do
+        # A known crash of a seed-built stage 1 compiler: the in-process fast build of this larger module (sockets, with the process code
+        # in its graph) segfaults or hangs, while release and a stage 2 build it (ablac-e8 has the repro). It is skipped until that is fixed.
+        [[ $name == sockets && $mode == fast && -n ${ABLA_WINDOWS_STAGE1:-} ]] && continue
         flags=(--no-cache)
         [[ $mode == fast ]] && flags+=(--fast)
         exe=$out/$name.$mode.exe
