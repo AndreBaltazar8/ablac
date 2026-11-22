@@ -18,6 +18,20 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/MC/MCAsmBackend.h"
+#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCCodeEmitter.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCInstrInfo.h"
+#include "llvm/MC/MCObjectFileInfo.h"
+#include "llvm/MC/MCObjectWriter.h"
+#include "llvm/MC/MCParser/MCAsmParser.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MCTargetOptions.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/ArchiveWriter.h"
 #include "llvm/Support/CommandLine.h"
@@ -486,11 +500,59 @@ static int abla_llvm_ar(const std::vector<std::string> &arguments) {
     return 0;
 }
 
+// llvm-mc's job for the one thing the compiler needs it for: an assembly file to a relocatable object, without an assembler on the machine (the generated libc-data file of
+// the static compiler's own link, src/toolchain.ab). Arguments, one a line: -triple=<triple>, -filetype=obj, -o <object>, the input. Exit code 0, or 1 with the diagnostics on standard error.
+static int abla_llvm_mc(const std::vector<std::string> &arguments) {
+    abla_initialize_targets();
+    std::string input, output, triple;
+    for (size_t index = 0; index < arguments.size(); index++) {
+        const std::string &argument = arguments[index];
+        if (argument == "-o" && index + 1 < arguments.size()) output = arguments[++index];
+        else if (argument.rfind("-triple=", 0) == 0) triple = argument.substr(8);
+        else if (argument.rfind("--triple=", 0) == 0) triple = argument.substr(9);
+        else if (argument.rfind("-filetype=", 0) == 0 || argument.rfind("--filetype=", 0) == 0) { /* only objects */ }
+        else if (!argument.empty() && argument[0] != '-') input = argument;
+        else { llvm::errs() << "llvm-mc: unsupported option " << argument << "\n"; return 1; }
+    }
+    if (input.empty() || output.empty() || triple.empty()) { llvm::errs() << "llvm-mc: needs -triple=, -o and an input\n"; return 1; }
+    llvm::Triple parsed(triple);
+    std::string error;
+    const llvm::Target *target = llvm::TargetRegistry::lookupTarget(parsed, error);
+    if (!target) { llvm::errs() << "llvm-mc: " << error << "\n"; return 1; }
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer = llvm::MemoryBuffer::getFile(input);
+    if (!buffer) { llvm::errs() << "llvm-mc: cannot read " << input << "\n"; return 1; }
+    llvm::SourceMgr sourceManager;
+    sourceManager.AddNewSourceBuffer(std::move(*buffer), llvm::SMLoc());
+    llvm::MCTargetOptions options;
+    std::unique_ptr<llvm::MCRegisterInfo> registers(target->createMCRegInfo(parsed));
+    std::unique_ptr<llvm::MCAsmInfo> asmInfo(target->createMCAsmInfo(*registers, parsed, options));
+    std::unique_ptr<llvm::MCInstrInfo> instructions(target->createMCInstrInfo());
+    std::unique_ptr<llvm::MCSubtargetInfo> subtarget(target->createMCSubtargetInfo(parsed, "", ""));
+    if (!registers || !asmInfo || !instructions || !subtarget) { llvm::errs() << "llvm-mc: no machine code layer for " << triple << "\n"; return 1; }
+    llvm::MCContext context(parsed, *asmInfo, *registers, *subtarget, &sourceManager);
+    std::unique_ptr<llvm::MCObjectFileInfo> objectInfo(target->createMCObjectFileInfo(context, /*PIC=*/true));
+    context.setObjectFileInfo(objectInfo.get());
+    std::unique_ptr<llvm::MCCodeEmitter> emitter(target->createMCCodeEmitter(*instructions, context));
+    std::unique_ptr<llvm::MCAsmBackend> backend(target->createMCAsmBackend(*subtarget, *registers, options));
+    std::error_code code;
+    llvm::raw_fd_ostream stream(output, code, llvm::sys::fs::OF_None);
+    if (code) { llvm::errs() << "llvm-mc: cannot write " << output << ": " << code.message() << "\n"; return 1; }
+    std::unique_ptr<llvm::MCObjectWriter> writer = backend->createObjectWriter(stream);
+    std::unique_ptr<llvm::MCStreamer> streamer(target->createMCObjectStreamer(parsed, context, std::move(backend), std::move(writer), std::move(emitter), *subtarget));
+    std::unique_ptr<llvm::MCAsmParser> parser(llvm::createMCAsmParser(sourceManager, context, *streamer, *asmInfo));
+    std::unique_ptr<llvm::MCTargetAsmParser> targetParser(target->createMCAsmParser(*subtarget, *parser, *instructions));
+    if (!targetParser) { llvm::errs() << "llvm-mc: no assembler for " << triple << "\n"; return 1; }
+    parser->setTargetParser(*targetParser);
+    const bool failed = parser->Run(false);
+    return failed ? 1 : 0;
+}
+
 extern "C" int abla_tool_main(const char *tool, const char *arguments) {
     std::vector<std::string> lines = abla_lines(arguments);
     if (std::string(tool) == "llc") return abla_llc(lines);
     if (std::string(tool) == "llvm-extract") return abla_llvm_extract(lines);
     if (std::string(tool) == "llvm-ar") return abla_llvm_ar(lines);
+    if (std::string(tool) == "llvm-mc") return abla_llvm_mc(lines);
     if (std::string(tool) == "ld.lld" || std::string(tool) == "wasm-ld" || std::string(tool) == "lld-link") {
         // lld in a process of its own: its WebAssembly LTO cannot run twice in one process (src/static_lld.ab runs wasm-ld and lld-link this way). Diagnostics go to standard error.
         abla_initialize_targets();

@@ -78,6 +78,37 @@ if [[ -n ${ABLA_STATIC_LLD_LIB:-} ]]; then
         [[ $(qemu-aarch64 "$out/empty-$mode") == hello ]] || { echo "static compiler aarch64: the $mode hello built on an empty PATH did not print hello" >&2; exit 1; }
     done
     echo 'static compiler aarch64: hello builds (release and --fast) on an empty PATH'
+    # The compiler's own link generates an assembly file (the libc data and trampolines, src/toolchain.ab) and assembles it with LLVM MC in the shim, so a
+    # self-build needs no clang or `as` (a whole self-build is too long under qemu; ab-rpi1 builds it natively). Here: `--llvm-tool llvm-mc` on an empty PATH makes
+    # an AArch64 relocatable object whose defined symbols are the file's, and a bad file fails with a message.
+    cat > "$out/mc.s" <<'ASM'
+.data
+.p2align 3
+.globl environ
+.type environ,%object
+.size environ,8
+environ:
+.quad 0
+.text
+.p2align 2
+.globl abla_mc_probe
+.type abla_mc_probe,%function
+abla_mc_probe:
+	b environ_jump
+environ_jump:
+	ret
+ASM
+    env -i PATH="$PWD/$out/empty" "$(command -v qemu-aarch64)" "$out/ablac-static" --llvm-tool llvm-mc -triple=aarch64-unknown-linux-gnu -filetype=obj "$out/mc.s" -o "$out/mc.o" ||
+        { echo "static compiler aarch64: llvm-mc failed on an empty PATH" >&2; exit 1; }
+    symbols=$(readelf -sW "$out/mc.o") || { echo "static compiler aarch64: llvm-mc's object does not read" >&2; exit 1; }
+    [[ $(readelf -hW "$out/mc.o") == *"Machine:"*"AArch64"* && $symbols == *" environ"* && $symbols == *" abla_mc_probe"* ]] ||
+        { echo "static compiler aarch64: llvm-mc's object is not the AArch64 object of the file: $symbols" >&2; exit 1; }
+    printf '.text\n\tnot_an_instruction x0\n' > "$out/mc-bad.s"
+    if env -i PATH="$PWD/$out/empty" "$(command -v qemu-aarch64)" "$out/ablac-static" --llvm-tool llvm-mc -triple=aarch64-unknown-linux-gnu -filetype=obj "$out/mc-bad.s" -o "$out/mc-bad.o" > "$out/mc-bad.log" 2>&1; then
+        echo "static compiler aarch64: llvm-mc accepted a file with a bad instruction" >&2; exit 1
+    fi
+    grep -q 'instruction' "$out/mc-bad.log" || { echo "static compiler aarch64: llvm-mc's error names no instruction: $(cat "$out/mc-bad.log")" >&2; exit 1; }
+    echo 'static compiler aarch64: llvm-mc assembles the generated data file on an empty PATH'
 fi
 # The JIT: `ablac run` and the compile-time jit tier find the process's symbols through the library's dlsym table (src/static_libc/dl.ab), here with
 # LLVM's AArch64 JIT running under qemu-aarch64; and the three compile-time evaluation tiers agree.
