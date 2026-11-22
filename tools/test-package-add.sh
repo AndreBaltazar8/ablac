@@ -6,6 +6,7 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 export GIT_ALLOW_PROTOCOL=file GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$work/gitconfig"
 export ABLA_PACKAGE_CACHE="$work/cache"
+export ABLA_PACKAGE_INDEX_URL="file://$work/index.toml"
 git config --global uploadpack.allowFilter true
 
 repo() {
@@ -32,11 +33,24 @@ record() {
 }
 
 mkdir -p "$work/no-manifest" "$work/app/src"
-if "$compiler" package add owner/first --project "$work/no-manifest" > "$work/out" 2> "$work/err"; then exit 1; fi
+if "$compiler" package add first --project "$work/no-manifest" > "$work/out" 2> "$work/err"; then exit 1; fi
 grep -F 'missing package manifest' "$work/err"
 [[ -z $(ls -A "$work/no-manifest") && ! -s "$work/out" ]]
+[[ ! -e "$work/cache" ]]
+
+cat > "$work/index.toml" <<'TOML'
+[[package]]
+repository = "owner/first"
+description = "First library"
+keywords = ["example"]
+[[package]]
+repository = "owner/second"
+description = "Second library"
+keywords = []
+TOML
 
 repo first
+printf 'description = "First manifest"\nlicense = "MIT"\ncompiler = ">=0.2.60"\n' >> "$work/first/abla.toml"
 commit first 'fun firstValue(): int = 40'
 first_pin=$(git -C "$work/first" rev-parse HEAD)
 repo second
@@ -46,12 +60,22 @@ git -C "$work/second" tag -am release v1.2.0
 commit second 'fun secondValue(): int = 99'
 git -C "$work/second" branch v1.2.0 # A branch of the same name must not win.
 
+"$compiler" package info SeCoNd > "$work/out"
+grep -Fx 'Repository: owner/second' "$work/out"
+grep -Fx 'Name: second' "$work/out"
+grep -Fx '  v1.2.0' "$work/out"
+"$compiler" package info first > "$work/out"
+grep -Fx 'Catalog description: First library' "$work/out"
+grep -Fx 'Description: First manifest' "$work/out"
+grep -Fx 'Licence: MIT' "$work/out"
+grep -Fx 'Declared compiler range: >=0.2.60' "$work/out"
+
 app="$work/app"
 printf 'name = "app"\nentry = "src/main.ab"\n' > "$app/abla.toml"
 printf 'import "deps.ab"\nfun main: int = 0\n' > "$app/src/main.ab"
 printf '// Keep this source.\n' > "$app/src/deps.ab"
 printf '// Outside the entry graph.\n' > "$app/src/unused.ab"
-(cd "$app" && "$compiler" package add owner/first) > "$work/out"
+(cd "$app" && "$compiler" package add FIRST) > "$work/out"
 grep -Fx 'Name: first' "$work/out"
 grep -Fx 'import github("owner/first")' "$app/src/main.ab"
 diff -u <(printf '"HEAD"\n"%s"\n' "$first_pin") <(record first)
@@ -61,6 +85,10 @@ diff -u <(printf '"HEAD"\n"%s"\n' "$first_pin") <(record first)
 commit first 'fun firstValue(): int = 60'
 cp "$app/abla.lock" "$work/lock.before"
 cp "$app/src/deps.ab" "$work/deps.before"
+if "$compiler" package add missing --project "$app" > "$work/out" 2> "$work/err"; then exit 1; fi
+grep -F "package 'missing' is not in the index" "$work/err"
+cmp "$work/lock.before" "$app/abla.lock"
+cmp "$work/deps.before" "$app/src/deps.ab"
 if "$compiler" package add owner/second --project "$app" --tag absent --module src/deps.ab > "$work/out" 2> "$work/err"; then exit 1; fi
 grep -F "could not fetch tag 'absent'" "$work/err"
 cmp "$work/lock.before" "$app/abla.lock"
@@ -70,7 +98,7 @@ grep -F 'is not imported by the project entry' "$work/err"
 cmp "$work/lock.before" "$app/abla.lock"
 grep -Fx '// Outside the entry graph.' "$app/src/unused.ab"
 
-"$compiler" package add owner/second --project "$app" --tag v1.2.0 --module src/deps.ab > "$work/out"
+"$compiler" package add second --project "$app" --tag v1.2.0 --module src/deps.ab > "$work/out"
 grep -Fx "Metadata: tag v1.2.0 at $second_pin" "$work/out"
 grep -Fx 'import gitImportSource("second", "https://github.com/owner/second.git", "tag", "v1.2.0")' "$app/src/deps.ab"
 grep -Fx '// Keep this source.' "$app/src/deps.ab"

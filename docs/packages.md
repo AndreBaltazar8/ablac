@@ -32,21 +32,33 @@ keys, and canonical declarations continue to use the resolved package and
 module identity.
 
 ## Inspecting a package
-Run `ablac package search <term>` to find public repositories by name,
-description, or keyword. Search fetches the simple catalog from
-`https://abla.dev/packages.toml` using curl. It can run outside a project.
+Run `ablac package search <words>` to find public libraries. Each word must
+occur in the repository name, description, or keywords. Search can run
+outside a project and fetches `https://abla.dev/packages.toml` with Abla’s
+HTTPS client.
 
+Run `ablac package info <name>` to look up a library by its repository name.
+Names are case-insensitive, and you can omit the `abla-` prefix if there is no
+exact match. If several repositories match, use the listed `owner/repo`.
+You can also use `ablac package info owner/repo` directly for any public
+GitHub repository. Online info reads the root `abla.toml` at the default
+branch and lists the repository’s Git tags. It shows the manifest version
+separately from the tags.
 
-Run `ablac package info owner/repo` to read the root `abla.toml` at the
-GitHub repository’s default-branch commit and list its Git tags. The command
-shows the manifest version separately from the tags. It does not read each
-tag’s manifest or test the package against a compiler.
+Search and name lookups save the latest valid catalog in the `index`
+directory under the package cache. This is usually `$XDG_CACHE_HOME/abla`
+or `$HOME/.cache/abla` and can be set with `ABLA_PACKAGE_CACHE`.
+If a refresh fails, the command warns and uses the saved catalog. Pass
+`--offline` to search or info to use the cache without network access.
+Offline info shows the repository, catalog description, and keywords.
+For local testing, `ABLA_PACKAGE_INDEX_URL=file:///absolute/path/packages.toml`
+uses a separate snapshot for that file.
 
 The optional top-level metadata keys are `description`, `license` (an SPDX
 expression), and `compiler` (a maintainer-declared range such as
 `">=0.2.60, <0.3.0"`). Use single-line quoted strings. Omitted fields are shown
-as not declared. The command works outside an Abla project and needs Git and
-network access. It leaves project files and the package cache untouched.
+as not declared. Reading the live manifest and tags needs Git and network
+access.
 
 To check a project’s locked dependencies, run `ablac package outdated
 [--project <dir>]`. For Git packages, it shows the locked tag or commit and
@@ -56,10 +68,12 @@ comes from the manifest at that tag. Non-Git providers are skipped. The
 command reads `abla.lock` and uses temporary Git repositories. It does not
 edit the lock or install packages.
 
-To add a GitHub dependency, run `ablac package add owner/repo` in an
-existing project. The command shows the selected manifest, adds an import
-to the entry module, and pins that revision in `abla.lock` along with any
-new transitive dependencies. Existing pins keep their revisions. Use
+To add a GitHub dependency in an existing project, run
+`ablac package add <name>` for an indexed library or
+`ablac package add owner/repo` directly. The command shows the selected
+manifest, adds an import to the entry module, and pins that revision in
+`abla.lock` along with any new transitive dependencies. Existing pins keep
+their revisions. Use
 `--tag <tag>` to select a release, `--project <dir>` to select another
 project, or `--module src/example.ab` to put the import in an existing
 module reached by the project entry. Commit the module and lockfile together.

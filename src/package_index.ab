@@ -1,0 +1,100 @@
+import "package.ab"
+import "package_catalog.ab"
+import "abla/crypto"
+import "abla/http"
+import "abla/http/tls"
+import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/text"
+
+private val packageIndexUrl = "https://abla.dev/packages.toml"
+
+private class PackageIndexSnapshot(val source: string, val error: string = "")
+
+private fun packageIndexRead(path: string): PackageIndexSnapshot {
+    if (!Path(path).info().isFile()) return PackageIndexSnapshot("", "cannot read $path")
+    val file = linuxOpen(path, 2048) // O_NONBLOCK if a local fixture changes type before open.
+    if (file.descriptor < 0) return PackageIndexSnapshot("", "cannot read $path")
+    var source = ""
+    while (source.size <= packageCatalogMaximumBytes) {
+        val part = file.read(packageCatalogMaximumBytes + 1 - source.size)
+        if (part == "") break
+        source = source + part
+    }
+    file.close()
+    PackageIndexSnapshot(source)
+}
+
+private fun packageIndexFetch(url: string): PackageIndexSnapshot {
+    if (url.startsWith("file:///")) return packageIndexRead(url.slice(7, url.size))
+    val client = httpsClient("abla.dev", 443, packageCatalogMaximumBytes + 16384, 5000, 20000)
+    val result = client.send(httpGet("/packages.toml"))
+    if (!result.succeeded || !result.complete) {
+        return PackageIndexSnapshot("", "cannot fetch $packageIndexUrl over HTTPS")
+    }
+    if (result.response.status != 200) {
+        return PackageIndexSnapshot("", "$packageIndexUrl returned HTTP ${result.response.status}")
+    }
+    PackageIndexSnapshot(result.response.body)
+}
+
+fun bootstrapPackageIndex(offline: bool): PackageCatalog {
+    val configured = linuxEnvironment("ABLA_PACKAGE_INDEX_URL")
+    val url = if (configured.value == "") packageIndexUrl else configured.value
+    val filename = if (url == packageIndexUrl) "abla.dev-packages.toml"
+        else if (url.startsWith("file:///")) "file-${hexEncode(sha256(url))}.toml"
+        else return PackageCatalog([], "ABLA_PACKAGE_INDEX_URL must be $packageIndexUrl or an absolute file:// URL")
+    val cache = Path(bootstrapPackageCacheRoot()).child("index").child(filename)
+
+    var refreshError = ""
+    if (!offline) {
+        val fresh = packageIndexFetch(url)
+        val catalog = if (fresh.error == "") packageCatalogParse(fresh.source)
+            else PackageCatalog([], fresh.error)
+        if (catalog.error == "") {
+            if (!cache.parent().createDirectories() || !cache.writeTextAtomic(fresh.source)) {
+                linuxPrintStandardError("warning: cannot save the package index cache at ${cache.text}\n")
+            }
+            return catalog
+        }
+        refreshError = catalog.error
+    }
+
+    val saved = packageIndexRead(cache.text)
+    val cached = if (saved.error == "") packageCatalogParse(saved.source)
+        else PackageCatalog([], saved.error)
+    if (cached.error == "") {
+        if (!offline) linuxPrintStandardError("warning: $refreshError. Using the cached package index.\n")
+        return cached
+    }
+    if (offline) return PackageCatalog([], "no usable cached package index (${cached.error}). Run package search online first.")
+    PackageCatalog([], "$refreshError. No usable cached package index (${cached.error}).")
+}
+
+class PackageIndexMatch(val entry: PackageCatalogEntry?, val error: string = "")
+
+fun bootstrapPackageIndexResolve(name: string, offline: bool): PackageIndexMatch {
+    val catalog = bootstrapPackageIndex(offline)
+    if (catalog.error != "") return PackageIndexMatch(null, catalog.error)
+
+    val query = name.lowercase()
+    val qualified = query.indexOf("/") >= 0
+    var exact: array<PackageCatalogEntry> = []
+    var shorthand: array<PackageCatalogEntry> = []
+    for (entry in catalog.entries) {
+        val repository = entry.repository.lowercase()
+        val candidate = if (qualified) repository else repository.split("/")[1]
+        if (candidate == query) exact.append(entry)
+        else if (!qualified && candidate == "abla-$query") shorthand.append(entry)
+    }
+    val matches = if (exact.size > 0) exact else shorthand
+    if (matches.size == 1) return PackageIndexMatch(matches[0])
+    if (matches.size == 0) {
+        return PackageIndexMatch(null, "package '$name' is not in the index. Try package search.")
+    }
+    var choices: array<string> = []
+    for (entry in matches) choices.append(entry.repository)
+    PackageIndexMatch(null, "package '$name' is ambiguous. Use ${choices.join(" or ")}.")
+}

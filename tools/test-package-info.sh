@@ -26,7 +26,8 @@ git -C "$repo" tag v0.2.0
 git -C "$repo" tag -am release v0.10.0
 
 cd "$work/caller"
-export GIT_CONFIG_GLOBAL="$work/gitconfig" GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL="$work/gitconfig" GIT_CONFIG_NOSYSTEM=1 GIT_ALLOW_PROTOCOL=file
+export ABLA_PACKAGE_INDEX_URL="file://$work/no-index"
 git config --global "url.file://$repo.insteadOf" https://github.com/fixture/metadata.git
 git config --global "uploadpack.allowFilter" true
 export TMPDIR="$work/tmp" ABLA_PACKAGE_CACHE="$work/cache"
@@ -48,7 +49,7 @@ diff -u "$work/expected" "$work/info"
 diff -u <(printf 'existing lock\n') abla.lock
 [[ ! -e .abla && ! -e $ABLA_PACKAGE_CACHE && -z $(ls -A "$TMPDIR") ]]
 if "$compiler" package info fixture/../metadata > "$work/info" 2> "$work/error"; then exit 1; fi
-grep -Fx 'usage: ablac package info <owner/repo>' "$work/error"
+grep -Fx 'usage: ablac package info <name|owner/repo> [--offline]' "$work/error"
 
 git -C "$repo" tag -d v0.2.0 v0.10.0 >/dev/null
 printf 'name = "fixture"\n[unrelated]\ncompiler = "incorrect"\n' > "$repo/abla.toml"
