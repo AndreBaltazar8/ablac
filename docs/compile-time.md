@@ -413,9 +413,8 @@ toolchain, `/proc/self/exe`): `filesystem.read` is what grants that. A `trusted.
 site's own raw system calls (`linuxOpen` and the like) are not resolved, as nothing else of its native access is
 checked.
 
-For one release (v0.2.66) a read whose file is missing next to the source file but is there from the working
-directory, or a write whose directory is, keeps the old working-directory reading with `warning[W_BUILD_PATH_CWD]`;
-`ABLA_BUILD_PATH_CWD=error` makes it `E_BUILD_PATH_CWD`.
+The working-directory reading that v0.2.65 (build calls) and v0.2.66 (the rest) kept with `W_BUILD_PATH_CWD` is gone
+(#1044): a path found only from the working directory is not found at all.
 
 ## Capabilities: files, environment, processes, network
 
@@ -494,8 +493,8 @@ The `compiler*` providers come from `import "abla/compiler"`. Every relative
 path compile-time code names, for file operations and for build calls
 (`compilerBuildProgram`, `buildProgram`, `wasmBuildModule`, independent-module
 `emit`) alike, is read against its source file and kept inside that file's
-project ([paths at compile time](#paths-at-compile-time); the transition and the
-project boundary are in [build paths](programmable-builds.md)).
+project ([paths at compile time](#paths-at-compile-time); the project boundary
+is in [build paths](programmable-builds.md)).
 
 Under `#`, the `abla/fs` writes, moves and removals, and `compilerWriteFile`,
 are real writes, as at run time: each one is on disk when the call returns, so

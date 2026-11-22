@@ -562,8 +562,7 @@ or use `export import` when a package entry is meant to pass that module on.
 | `E_TARGET_HOST_LINK` | a hosted Linux executable or shared library built on macOS, which has no Linux sysroot to link against |
 | `E_BUILD_GRAPH_*`, `E_BUILD_PROGRAM_REQUEST`, `E_BUILD_OUTPUT`, `E_BUILD_IO` | a programmable build graph that is invalid or couldn't be published |
 | `E_SOURCE_NOT_FOUND` (a build call's program) | a program a build file requests whose entry is not there ([programmable-builds.md](programmable-builds.md)) |
-| `W_BUILD_PATH_CWD`, `E_BUILD_PATH_CWD` | a build call's path read from the working directory, not against the build file: kept for v0.2.65 with the warning, an error under `ABLA_BUILD_PATH_CWD=error` ([programmable-builds.md](programmable-builds.md)) |
-| `E_BUILD_PATH_OUTSIDE` | a build call's entry or output outside the build file's project (its `abla.toml` directory, else the repository root, else the working directory) ([programmable-builds.md](programmable-builds.md)) |
+| `E_BUILD_PATH_OUTSIDE` | a path compile-time code names (a build call's entry or output, a file operation) outside its source file's project (the nearest `abla.toml` with a `name`, else the repository root, else the working directory) ([programmable-builds.md](programmable-builds.md), [compile-time.md](compile-time.md#paths-at-compile-time)) |
 | `E_ARTIFACT_*` | artifact roots and slices ([programmable-builds.md](programmable-builds.md)) |
 | `E_NATIVE_TOOLCHAIN` | the linker or another native tool failed |
 

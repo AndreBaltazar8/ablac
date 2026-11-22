@@ -7,7 +7,7 @@
 # (the same output and exit status; not the same bytes: an executable names its source file as the build was given it, so
 # the same program built from two working directories differs in that string, as a plain `ablac build` does); the artifact is
 # a program whose output is the axis's result, which the fuzzer compares with every other mode's. Two more cases per program:
-# the old working-directory reading (W_BUILD_PATH_CWD, an error under ABLA_BUILD_PATH_CWD=error, nothing from elsewhere)
+# an entry spelled from the working directory (refused since #1044: not found, nothing written)
 # and paths that leave the project (E_BUILD_PATH_OUTSIDE, nothing written).
 #
 #   build-paths.sh <compiler> <program.ab> <workdir>
@@ -80,13 +80,12 @@ from_dirs=("$proj" "$builddir" "$work/elsewhere" "$work")
 from_files=("${buildfile#"$proj"/}" build.ab "$buildfile" "proj/${buildfile#"$proj"/}")
 for index in 0 1 2 3; do
     rm -rf "$proj/bin" "$builddir/out" "$builddir/x"
-    if ! (cd "${from_dirs[$index]}" && ABLA_BUILD_PATH_CWD=error "$compiler" build "${from_files[$index]}" -o "$work/rootbin.$index" --fast --no-cache) \
+    if ! (cd "${from_dirs[$index]}" && "$compiler" build "${from_files[$index]}" -o "$work/rootbin.$index" --fast --no-cache) \
         > "$work/build.$index.log" 2>&1; then
         cat "$work/build.$index.log" >> "$log"
         violation "the build from ${from_names[$index]} failed (entry $entry, output $output, depth $depth)"
     fi
     [[ -x $artifact ]] || { cat "$work/build.$index.log" >> "$log"; violation "no artifact at $artifact from ${from_names[$index]} (entry $entry, output $output, depth $depth)"; }
-    grep -q 'W_BUILD_PATH_CWD' "$work/build.$index.log" && violation "a W_BUILD_PATH_CWD warning from ${from_names[$index]}"
     behaviour "$artifact" > "$work/behaviour.$index"
     # The control (tools/test-fuzz-abla.sh): a planted difference between the builds must be reported.
     [[ ${ABLA_FUZZ_BUILD_PATHS_PLANT:-} == behaviour && $index == 2 ]] && echo planted >> "$work/behaviour.$index"
@@ -96,35 +95,28 @@ for index in 1 2 3; do
         violation "the artifact built from ${from_names[$index]} behaves differently from the one built from the root (entry $entry, output $output, depth $depth)"
 done
 
-# The old reading: an entry that is not next to the build file but is there from the working directory (the project root).
+# An entry spelled from the working directory (the project root), not next to the build file: since the old reading went
+# (#1044) it is not found, from the root or from above, and nothing is written.
 mkdir -p "$proj/d1" "$proj/legacy"
 cp "$program" "$proj/legacy/child.ab"
 legacy=$proj/d1/legacy.ab
 driver legacy/child.ab legacyout/x > "$legacy"
 rm -rf "$proj/legacyout"
-if ! (cd "$proj" && env -u ABLA_BUILD_PATH_CWD "$compiler" build d1/legacy.ab -o "$work/legacy-root" --fast --no-cache) > "$work/legacy.log" 2>&1; then
-    cat "$work/legacy.log" >> "$log"; violation "the working-directory reading no longer builds"
-fi
-grep -q 'warning\[W_BUILD_PATH_CWD\]' "$work/legacy.log" || { cat "$work/legacy.log" >> "$log"; violation "the old reading gave no W_BUILD_PATH_CWD"; }
-[[ -x $proj/legacyout/x ]] || violation "the old reading's artifact is not at the working directory's legacyout/x"
-[[ $(behaviour "$proj/legacyout/x") == "$(cat "$work/behaviour.0")" ]] || violation "the old reading's artifact behaves differently from the new reading's"
-rm -rf "$proj/legacyout"
-if (cd "$proj" && ABLA_BUILD_PATH_CWD=error "$compiler" build d1/legacy.ab -o "$work/legacy-strict" --fast --no-cache) > "$work/strict.log" 2>&1; then
-    violation "ABLA_BUILD_PATH_CWD=error let the old reading build"
-fi
-grep -q 'E_BUILD_PATH_CWD' "$work/strict.log" || { cat "$work/strict.log" >> "$log"; violation "no E_BUILD_PATH_CWD under ABLA_BUILD_PATH_CWD=error"; }
-[[ ! -e $proj/legacyout ]] || violation "the refused old reading wrote its artifact"
-if (cd "$work" && env -u ABLA_BUILD_PATH_CWD "$compiler" build proj/d1/legacy.ab -o "$work/legacy-above" --fast --no-cache) > "$work/above.log" 2>&1; then
-    violation "the old reading built from a directory it does not name"
-fi
-[[ ! -e $work/legacyout && ! -e $proj/legacyout ]] || violation "the old reading from elsewhere wrote an artifact"
+for from in "$proj" "$work"; do
+    if (cd "$from" && "$compiler" build "$legacy" -o "$work/legacy-built" --fast --no-cache) > "$work/legacy.log" 2>&1; then
+        violation "an entry spelled from the working directory built from $from"
+    fi
+    grep -q 'BUILD_PATH_CWD' "$work/legacy.log" && { cat "$work/legacy.log" >> "$log"; violation "a working-directory diagnostic from $from"; }
+    [[ ! -e $work/legacyout/x && ! -e $proj/legacyout/x && ! -e $proj/d1/legacyout/x ]] ||
+        violation "the refused working-directory entry wrote an artifact (from $from)"
+done
 
 # Paths that leave the project: refused with E_BUILD_PATH_OUTSIDE, nothing written.
 mkdir -p "$work/outside"
 cp "$program" "$work/outside/child.ab"
 refused() { # $1 = label, $2 = entry, $3 = output, $4 = a path that must stay absent
     driver "$2" "$3" > "$proj/d1/refuse.ab"
-    if (cd "$proj" && ABLA_BUILD_PATH_CWD=error "$compiler" build d1/refuse.ab -o "$work/refused" --fast --no-cache) > "$work/refused.log" 2>&1; then
+    if (cd "$proj" && "$compiler" build d1/refuse.ab -o "$work/refused" --fast --no-cache) > "$work/refused.log" 2>&1; then
         cat "$work/refused.log" >> "$log"; violation "$1 built"
     fi
     grep -q 'E_BUILD_PATH_OUTSIDE' "$work/refused.log" || { cat "$work/refused.log" >> "$log"; violation "$1 was refused without E_BUILD_PATH_OUTSIDE"; }

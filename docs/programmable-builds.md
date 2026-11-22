@@ -41,12 +41,9 @@ Every other path compile-time code names follows the same rule (decision #95 A, 
 ([compile-time.md](compile-time.md#paths-at-compile-time)), so a helper that writes a generated project and then builds
 it (abla/android/build, abla/mvc/wasm/build) reads both against the same file.
 
-*Transition:* a build file written for the old reading, from the working directory, still builds for one release
-(build calls: v0.2.65; the rest of compile-time file access: v0.2.66): when the entry (or, for a read, the file; for a
-write, its directory) is not next to the source file but is there from the working directory, that path is read the
-old way, with `warning[W_BUILD_PATH_CWD]` (found both ways, the source file's wins, silently). Rewrite such paths
-relative to the source file; the old reading goes in the following release. `ABLA_BUILD_PATH_CWD=error` makes it an
-error now (`E_BUILD_PATH_CWD`; the compiler's own suite runs with it).
+The working-directory reading kept for one release with `warning[W_BUILD_PATH_CWD]` (build calls in v0.2.65, the rest
+of compile-time file access in v0.2.66) is gone (#1044): a path spelled from the working directory is not found, and
+the build says so. Write it relative to the source file.
 
 For a program assembled from declarations in the current compilation, the
 higher-level independent-module surface owns entry generation and the child

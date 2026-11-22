@@ -3,8 +3,9 @@
 # its source file's directory, inside its project, in both tiers alike (a native slice's file operations reach the
 # same providers through the bridge). The same site, built from the
 # repository root, from its own directory and from a decoy's (with a data.txt of its own), in ABLA_COMPILE_EVAL=interp
-# and =jit: the same program and the same files. A write above the package is refused (E_BUILD_PATH_OUTSIDE), an absolute read is as given; the
-# working-directory reading builds with W_BUILD_PATH_CWD and fails under ABLA_BUILD_PATH_CWD=error.
+# and =jit: the same program and the same files. A write above the package is refused (E_BUILD_PATH_OUTSIDE), an
+# absolute read is as given; a path found only from the working directory is not found (the v0.2.66 fallback is gone,
+# #1044).
 # A library's writes for a transform or a subparser go where the file using them says, not beside the library.
 set -euo pipefail
 compiler=${1:-build/ablac.bin}
@@ -19,7 +20,6 @@ cp -R "$tracked/sub" "$out/package/sub"
 package=$out/package
 relative=build/compile-paths/package
 printf 'decoy-data-file' > "$out/decoy/data.txt"
-unset ABLA_BUILD_PATH_CWD
 
 site() { # $1 = tier, $2 = directory to run from, $3 = the site as named from there
     local log=$out/$1-$(basename "$2").log
@@ -33,7 +33,6 @@ site() { # $1 = tier, $2 = directory to run from, $3 = the site as named from th
             fail "$1 from $2: no sub/out/$written.txt beside the site" "$log"
     done
     [[ ! -e $2/out ]] || [[ $2 == "$package/sub" ]] || fail "$1 from $2: a write landed in the working directory" "$log"
-    ! grep -q 'W_BUILD_PATH_CWD' "$log" || fail "$1 from $2: a warning" "$log"
 }
 for tier in interp jit; do
     site "$tier" "$project_root" $relative/sub/site.ab
@@ -55,7 +54,6 @@ for tier in interp jit; do
                 fail "library under $tier from $from: no sub/out/$written.txt" "$log"
         done
         [[ ! -e $package/sub/lib/out ]] || fail "library under $tier from $from: a write landed beside the library" "$log"
-        ! grep -q 'W_BUILD_PATH_CWD' "$log" || fail "library under $tier from $from: a warning" "$log"
     done
 done
 
@@ -79,14 +77,13 @@ for tier in interp jit; do
     grep -q 'E_BUILD_PATH_OUTSIDE' "$out/absolute-write-$tier.log" ||
         fail "$tier: the absolute write gave no E_BUILD_PATH_OUTSIDE" "$out/absolute-write-$tier.log"
 
-    (cd "$package" && ABLA_COMPILE_EVAL=$tier "$compiler" build sub/legacy.ab -o "$out/legacy" --no-cache) \
-        > "$out/legacy-$tier.log" 2>&1 || fail "$tier: the working-directory reading didn't build" "$out/legacy-$tier.log"
+    # The old working-directory reading is gone (#1044): "sub/data.txt", there only from the package's directory, is
+    # looked for beside the site, where there is none, so the site reads nothing (readText of a missing file is "");
+    # the old reading found data.txt's 5 bytes.
+    (cd "$package" && ABLA_BUILD_PATH_CWD=warn ABLA_COMPILE_EVAL=$tier "$compiler" build sub/legacy.ab \
+        -o "$out/legacy" --no-cache) > "$out/legacy-$tier.log" 2>&1 || fail "$tier: the legacy site didn't build" "$out/legacy-$tier.log"
     set +e; "$out/legacy"; status=$?; set -e
-    [[ $status == 5 ]] || fail "$tier: the legacy read gave $status" "$out/legacy-$tier.log"
-    grep -q 'warning\[W_BUILD_PATH_CWD\]' "$out/legacy-$tier.log" || fail "$tier: no W_BUILD_PATH_CWD" "$out/legacy-$tier.log"
-    if (cd "$package" && ABLA_BUILD_PATH_CWD=error ABLA_COMPILE_EVAL=$tier "$compiler" build sub/legacy.ab \
-        -o "$out/legacy-strict" --no-cache) > "$out/strict-$tier.log" 2>&1; then
-        fail "$tier: ABLA_BUILD_PATH_CWD=error let the old reading build" "$out/strict-$tier.log"
-    fi
+    [[ $status == 0 ]] || fail "$tier: the legacy site read $status bytes: the working-directory reading" "$out/legacy-$tier.log"
+    ! grep -q 'BUILD_PATH_CWD' "$out/legacy-$tier.log" || fail "$tier: a working-directory diagnostic" "$out/legacy-$tier.log"
 done
-echo "compile paths: reads and writes against the source file from the root, its directory and a decoy's, in both tiers; an escape refused; the working-directory reading warns, and fails under the error setting"
+echo "compile paths: reads and writes against the source file from the root, its directory and a decoy's, in both tiers; a library's writes where its user says; an escape refused; no working-directory reading"

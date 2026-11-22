@@ -273,86 +273,33 @@ fun bootstrapContainBuildCallPath(var evaluator: BootstrapEvaluator, directory: 
     if (resolved.startsWith("$working/")) resolved.slice(working.size + 1, resolved.size) else resolved
 }
 
-/** The entry and output of a build call, resolved and contained: [entry, output], a refused one "". The
- *  working-directory reading of a relative entry stays for one release (v0.2.65): when the entry isn't there next to
- *  the build file but is there from the working directory, both paths are read the old way (relative, below the
- *  working directory, as before) and W_BUILD_PATH_CWD says what to write. */
+/** The entry and output of a build call, resolved against the build file and contained: [entry, output], a refused
+ *  one "". */
 fun bootstrapResolveBuildCallPaths(var evaluator: BootstrapEvaluator, entry: string, output: string): array<string> {
     val directory = bootstrapBuildCallDirectory(evaluator)
-    val fileEntry = bootstrapBuildCallPath(directory, entry)
-    if (entry.startsWith("/") || Path(fileEntry).exists() || !Path(entry).exists()) {
-        return [
-            bootstrapContainBuildCallPath(evaluator, directory, entry),
-            bootstrapContainBuildCallPath(evaluator, directory, output)
-        ]
-    }
-    bootstrapBuildPathCwdReport(evaluator, "entry \"$entry\" was found", directory)
     [
-        if (bootstrapCompileOutputPathValid(entry)) entry else "",
-        if (bootstrapCompileOutputPathValid(output)) output else ""
+        bootstrapContainBuildCallPath(evaluator, directory, entry),
+        bootstrapContainBuildCallPath(evaluator, directory, output)
     ]
 }
 
-/** W_BUILD_PATH_CWD, or with ABLA_BUILD_PATH_CWD=error (the suite's setting, so that none of its own build files
- *  relies on the old reading) E_BUILD_PATH_CWD, which fails the build call. */
-fun bootstrapBuildPathCwdReport(var evaluator: BootstrapEvaluator, what: string, directory: string,
-    subject: string = "the build call's"): void {
-    val mode = linuxEnvironment("ABLA_BUILD_PATH_CWD")
-    val strict = mode.found && mode.value == "error"
-    val text = "${if (strict) "error[E_BUILD_PATH_CWD]" else "warning[W_BUILD_PATH_CWD]"}: $subject $what from the working directory, not next to its source file (${if (directory == "") "." else directory}); paths compile-time code names are read against its source file's directory (as imports are), and the working-directory reading goes in a following release: write it relative to that directory\n"
-    // An error goes with the build's diagnostics (printed when it fails); a warning to standard error now, as the build
-    // goes on and its diagnostics are not printed when it succeeds.
-    if (strict) {
-        bootstrapStageDriverDiagnostic(text)
-        evaluator.errors = evaluator.errors + 1
-    } else if (!bootstrapBuildPathCwdWarned.has(text)) {
-        // Once per path and use: an operation resolves its path more than once (a write's directory, then its file).
-        bootstrapBuildPathCwdWarned.set(text, true)
-        linuxPrintStandardError(text)
-    }
-}
-val bootstrapBuildPathCwdWarned: Map<string, bool> = Map()
-
-/** An output with no entry to decide by (an independent module's emit): read against the build file's directory, or,
- *  for v0.2.65, from the working directory with W_BUILD_PATH_CWD when only there does its first directory exist. */
-fun bootstrapResolveBuildCallOutput(var evaluator: BootstrapEvaluator, output: string): string {
-    val directory = bootstrapBuildCallDirectory(evaluator)
-    val fileOutput = bootstrapBuildCallPath(directory, output)
-    val slash = output.indexOf("/")
-    val first = if (slash > 0) output.slice(0, slash) else ""
-    if (output.startsWith("/") || fileOutput == output || first == "" ||
-        Path(bootstrapBuildCallPath(directory, first)).exists() || !Path(first).exists()) {
-        return bootstrapContainBuildCallPath(evaluator, directory, output)
-    }
-    bootstrapBuildPathCwdReport(evaluator, "output \"$output\" is read", directory)
-    if (bootstrapCompileOutputPathValid(output)) output else ""
-}
+/** An output with no entry to decide by (an independent module's emit): read against the build file's directory and
+ *  contained. */
+fun bootstrapResolveBuildCallOutput(var evaluator: BootstrapEvaluator, output: string): string =
+    bootstrapContainBuildCallPath(evaluator, bootstrapBuildCallDirectory(evaluator), output)
 
 /** A path compile-time code names for a file operation (decision #95 A: reads, writes, listings, metadata, moves),
  *  read as a build call's is: against the source file's directory, inside its project (E_BUILD_PATH_OUTSIDE, ""
- *  then), with the working-directory reading kept for one release when only it finds the file (a read) or the
- *  directory to write in (a write), with W_BUILD_PATH_CWD. A path with no source file to read it against (the
- *  compiler's own) is as given. An absolute path is read as given (a toolchain, an SDK, /proc: filesystem.read
- *  grants those, wherever they are installed) but written only inside the project. Both tiers come here: a native
- *  slice's file operations reach the same providers (ct_native.ab) through the bridge. A trusted.native site's own raw
- *  system calls (linuxOpen and the like) are not seen, as nothing else of its native access is. */
+ *  then). A path with no source file to read it against (the compiler's own) is as given. An absolute path is read as
+ *  given (a toolchain, an SDK, /proc: filesystem.read grants those, wherever they are installed) but written only
+ *  inside the project. Both tiers come here: a native slice's file operations reach the same providers (ct_native.ab)
+ *  through the bridge. A trusted.native site's own raw system calls (linuxOpen and the like) are not seen, as nothing
+ *  else of its native access is. */
 fun bootstrapResolveCompilePath(var evaluator: BootstrapEvaluator, path: string, write: bool): string {
     val directory = bootstrapBuildCallDirectory(evaluator)
     if (directory == "" || path == "") return path
-    if (path.startsWith("/")) {
-        return if (write) bootstrapContainBuildCallPath(evaluator, directory, path, "compile-time code's") else path
-    }
-    val fileProbe = bootstrapBuildCallPath(directory, path)
-    val probe = if (write) Path(fileProbe).parent().text else fileProbe
-    val cwdProbe = if (write) Path(path).parent().text else path
-    // The old reading took only a path under the working directory (no ".."): one with ".." is the new reading's.
-    if (Path(probe).exists() || !Path(cwdProbe).exists() || cwdProbe == "." || cwdProbe == "" ||
-        !bootstrapCompileOutputPathValid(path)) {
-        return bootstrapContainBuildCallPath(evaluator, directory, path, "compile-time code's")
-    }
-    bootstrapBuildPathCwdReport(evaluator, "\"$path\" is ${if (write) "written" else "read"}", directory,
-        "compile-time code's path")
-    path
+    if (path.startsWith("/") && !write) return path
+    bootstrapContainBuildCallPath(evaluator, directory, path, "compile-time code's")
 }
 
 fun bootstrapTakeCompileRoundEdits(): array<BootstrapDeclarationEdit> {
