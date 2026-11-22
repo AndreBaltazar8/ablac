@@ -1,0 +1,153 @@
+// public: none
+// The x86-64 baseline provides SSE2. Every load and store is within the
+// caller's supplied byte range. Scalar callers finish partial blocks.
+
+import "../../simd/byte-lanes.ab"
+import "./entry.ab"
+
+// A lane mask from a 16-byte block, known to contain a match.
+private @inline fun __ablaRuntimeFirstByteLane(mask: int): int {
+    var lane = 0
+    var rest = mask
+    if ((rest & 255) == 0) { lane += 8; rest = rest >> 8 }
+    if ((rest & 15) == 0) { lane += 4; rest = rest >> 4 }
+    if ((rest & 3) == 0) { lane += 2; rest = rest >> 2 }
+    lane + ((rest & 1) ^ 1)
+}
+
+/** Scans complete blocks in the JSON byte range. Returns the complement of the first control, escape, quote or non-ASCII byte offset, or the first scalar tail offset. The range must be readable. */
+@inline trusted fun __ablaRuntimeScanJsonAscii(data: int, begin: int, end: int): int {
+    var offset = begin
+    val quote = u8x16Splat(34)
+    val slash = u8x16Splat(92)
+    val space = u8x16Splat(32)
+    while (end - offset >= 16) {
+        val bytes = u8x16LoadAddress(data + offset)
+        val special = (bytes | bytes.lt(space) | bytes.eq(quote) | bytes.eq(slash)).bitmask()
+        if (special != 0) return ~(offset + __ablaRuntimeFirstByteLane(special))
+        offset += 16
+    }
+    offset
+}
+
+// A match is a nonnegative byte offset. Its complement marks the scalar tail.
+/** Searches complete blocks of candidate start positions up to the inclusive last position. Returns the first match or the complement of the first remaining position. Both buffers must cover the tested ranges. */
+@inline trusted fun __ablaRuntimeScanSequence(data: int, sequence: int, begin: int, last: int, size: int): int {
+    var index = begin
+    val head = u8x16Splat(u8(ablaRuntimeLoadU8(sequence)))
+    val tailOffset = size - 1
+    val tail = u8x16Splat(u8(ablaRuntimeLoadU8(sequence + tailOffset)))
+    while (last - index >= 15) {
+        val heads = u8x16LoadAddress(data + index).eq(head)
+        var matches = if (tailOffset == 0) heads.bitmask()
+            else (heads & u8x16LoadAddress(data + index + tailOffset).eq(tail)).bitmask()
+        // On a dense range the anchor check has not narrowed the candidates.
+        if (matches == 65535 && tailOffset > 1) return ~index
+        while (matches != 0) {
+            val start = index + __ablaRuntimeFirstByteLane(matches)
+            var offset = 1
+            while (offset < tailOffset &&
+                ablaRuntimeLoadU8(data + start + offset) ==
+                ablaRuntimeLoadU8(sequence + offset)) offset += 1
+            if (offset >= tailOffset) return start
+            matches = matches & (matches - 1)
+        }
+        index += 16
+    }
+    ~index
+}
+
+/** Searches complete blocks for the unsigned byte, stopping before the exclusive end. Returns the first match or the complement of the first scalar tail offset. The range must be readable. */
+@inline trusted fun __ablaRuntimeScanByte(data: int, byte: int, begin: int, end: int): int {
+    var index = begin
+    val target = u8x16Splat(u8(byte))
+    while (end - index >= 16) {
+        val matches = u8x16LoadAddress(data + index).eq(target).bitmask()
+        if (matches != 0) return index + __ablaRuntimeFirstByteLane(matches)
+        index += 16
+    }
+    ~index
+}
+
+/** Returns the first non-ASCII byte offset or the first offset of a partial block. The input must contain the specified number of readable bytes. */
+@inline trusted fun __ablaRuntimeScanAscii(data: int, length: int): int {
+    var offset = 0
+    while (length - offset >= 16) {
+        val high = u8x16LoadAddress(data + offset).bitmask()
+        if (high != 0) {
+            return offset + __ablaRuntimeFirstByteLane(high)
+        }
+        offset += 16
+    }
+    offset
+}
+
+private @inline trusted fun __ablaRuntimeBase64EncodeBlock(input: int, output: int): void {
+    val bytes = u8x16LoadAddress(input)
+    val zero = u8x16Splat(0)
+    // Put four triples into 32-bit lanes. The largest byte read by the
+    // unaligned load is checked at the call site.
+    val words = u8x16Shuffle(bytes, zero, 2, 1, 0, 16, 5, 4, 3, 16,
+        8, 7, 6, 16, 11, 10, 9, 16).asU32x4()
+    // Put one six-bit digit in each byte of each 32-bit lane.
+    val digits = (((words >> 18) & u32x4Splat(0x0000003f)) |
+        ((words >> 4) & u32x4Splat(0x00003f00)) |
+        ((words << 10) & u32x4Splat(0x003f0000)) |
+        ((words << 24) & u32x4Splat(0x3f000000))).asU8x16()
+    val alphabet = digits + u8x16Splat(65) +
+        (digits.ge(u8x16Splat(26)) & u8x16Splat(6)) -
+        (digits.ge(u8x16Splat(52)) & u8x16Splat(75)) -
+        (digits.ge(u8x16Splat(62)) & u8x16Splat(15)) +
+        (digits.eq(u8x16Splat(63)) & u8x16Splat(3))
+    alphabet.storeAddress(output)
+}
+
+/** Encodes complete groups into the output and returns the number of input bytes consumed. The buffers must cover the supplied input length and its encoded output. */
+@inline trusted fun __ablaRuntimeScanBase64Encode(input: int, output: int, length: int): int {
+    var source = 0
+    var destination = 0
+    while (length - source >= 16) {
+        __ablaRuntimeBase64EncodeBlock(input + source, output + destination)
+        source += 12
+        destination += 16
+    }
+    source
+}
+
+private @inline trusted fun __ablaRuntimeBase64DecodeBlock(input: int, output: int): bool {
+    val bytes = u8x16LoadAddress(input)
+    val upper = bytes.ge(u8x16Splat(65)) & bytes.le(u8x16Splat(90))
+    val lower = bytes.ge(u8x16Splat(97)) & bytes.le(u8x16Splat(122))
+    val numbers = bytes.ge(u8x16Splat(48)) & bytes.le(u8x16Splat(57))
+    val plus = bytes.eq(u8x16Splat(43))
+    val slash = bytes.eq(u8x16Splat(47))
+    if (!(upper | lower | numbers | plus | slash).all()) return false
+    val digits = (((bytes - u8x16Splat(65)) & upper) |
+        ((bytes - u8x16Splat(71)) & lower) |
+        ((bytes + u8x16Splat(4)) & numbers) |
+        (plus & u8x16Splat(62)) | (slash & u8x16Splat(63))).asU32x4()
+    // Turn four six-bit digits back into three bytes per 32-bit lane.
+    val packed = (((digits & u32x4Splat(0x0000003f)) << 2) |
+        ((digits >> 12) & u32x4Splat(0x00000003)) |
+        ((digits & u32x4Splat(0x00000f00)) << 4) |
+        ((digits >> 10) & u32x4Splat(0x00000f00)) |
+        ((digits & u32x4Splat(0x00030000)) << 6) |
+        ((digits >> 8) & u32x4Splat(0x003f0000))).asU8x16()
+    // A 16-byte store writes a 12-byte result. The caller reserves the
+    // remaining four bytes for the next block or scalar tail.
+    u8x16Shuffle(packed, u8x16Splat(0), 0, 1, 2, 4, 5, 6, 8, 9,
+        10, 12, 13, 14, 16, 16, 16, 16).storeAddress(output)
+    true
+}
+
+/** Decodes complete groups and returns the number of input bytes consumed. A partial or invalid group stays for scalar decoding. The buffers must cover their supplied lengths. */
+@inline trusted fun __ablaRuntimeScanBase64Decode(input: int, output: int, length: int, outputLength: int): int {
+    var source = 0
+    var destination = 0
+    while (length - source >= 16 && outputLength - destination >= 16) {
+        if (!__ablaRuntimeBase64DecodeBlock(input + source, output + destination)) break
+        source += 16
+        destination += 12
+    }
+    source
+}

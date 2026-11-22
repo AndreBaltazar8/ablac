@@ -492,6 +492,7 @@ test-serial: ablac
 	tools/test-rsa-fast.sh $(COMPILER)
 	tools/test-p384.sh $(COMPILER)
 	tools/test-text-native.sh $(COMPILER)
+	tools/test-simd-scanners.sh $(COMPILER)
 	tools/test-sha512-boundaries.sh $(COMPILER)
 	tools/test-hex-native.sh $(COMPILER)
 	tools/test-array-sort.sh $(COMPILER)

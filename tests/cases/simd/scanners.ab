@@ -1,0 +1,94 @@
+// Byte-preserving differential input for the SIMD and scalar scanner paths.
+import "abla/bytes"
+import "abla/crypto"
+import "abla/io"
+import "abla/integer"
+import "abla/json"
+import "abla/process/arguments"
+import "abla/process/exit"
+import "abla/runtime/self"
+import "abla/text"
+
+class ScannerRandom(var state: int) {
+    fun below(limit: int): int {
+        this.state = this.state ^ (this.state << 13)
+        this.state = this.state ^ (this.state >>> 7)
+        this.state = this.state ^ (this.state << 17)
+        (this.state & 2147483647) % limit
+    }
+}
+
+private fun rawByte(value: int): string {
+    val bytes = byteBuffer()
+    bytes.appendByteValue(value)
+    bytes.toText()
+}
+
+private fun randomBytes(var random: ScannerRandom, length: int, alphabet: int): string {
+    val bytes = byteBuffer()
+    for (at in 0 until length) bytes.appendByteValue(random.below(alphabet))
+    bytes.toText()
+}
+
+private fun scanRandom(seed: int): void {
+    var random = ScannerRandom(seed)
+    val length = if ((seed & 7) == 0) random.below(2049) else random.below(513)
+    val data = randomBytes(random, length, if ((seed & 3) == 0) 4 else 256)
+    val start = random.below(length + 3) - 1
+    val end = if (start < 0 || start > length) length
+        else start + random.below(length - start + 3) - 1
+    val beginNeedle = random.below(length + 1)
+    val sizeNeedle = random.below(25)
+    val stopNeedle = if (length - beginNeedle < sizeNeedle) length else beginNeedle + sizeNeedle
+    val sequence = if ((seed & 2) == 0) data.slice(beginNeedle, stopNeedle)
+        else randomBytes(random, sizeNeedle, 4)
+    val searched = random.below(258) - 1
+    val found = textFindByte(data, searched, start, end)
+    val foundSequence = textFindSequence(data, sequence, start, end)
+    val encoded = base64Encode(data)
+    if (base64Decode(encoded) != data) panic("base64 round trip at seed $seed")
+    val at = if (encoded.size == 0) 0 else random.below(encoded.size)
+    val tampered = if (encoded.size == 0) data else
+        encoded.slice(0, at) + rawByte(random.below(256)) + encoded.slice(at + 1, encoded.size)
+    val raw = hexEncode(base64Decode(tampered))
+    println("$seed|$found|$foundSequence|${data.isValidUtf8()}|$encoded|$raw")
+}
+
+private fun readJson(seed: int, text: string, start: int, end: int): void {
+    val whitespace = __ablaRuntimeJsonWhitespaceEnd(text, start)
+    val nextQuote = __ablaRuntimeJsonFindPlainStringEnd(text, start, end)
+    val plain = __ablaRuntimeJsonStringIsPlain(text)
+    val parsed = jsonValidate(text)
+    println("$seed|$whitespace|$nextQuote|$plain|${parsed.succeeded}|${parsed.error.code}|${parsed.error.byteOffset}")
+}
+
+private fun scanBoundaries(): void {
+    val repeated = "a".repeat(192) + "babaaaa"
+    if (textFindSequence(repeated, "ababa") != 191) panic("sequence dense fallback")
+    if (textFindSequence(repeated, "aacaa") != -1) panic("sequence dense miss")
+    val bounded = "a:€abcdéz:tail"
+    if (textFindSequence(bounded, "€abcdéz", 2, 12) != 2) panic("bounded sequence match")
+    if (textFindSequence(bounded, "€abcdéx", 2, 12) != -1) panic("bounded sequence miss")
+
+    val points = [0, 1, 7, 8, 15, 16, 17, 30, 31, 32, 33, 63, 64, 65, 127, 128, 129, 143, 144, 145, 255, 256, 257]
+    val bytes = [0, 1, 9, 10, 13, 31, 32, 34, 47, 92, 127, 128, 191, 192, 194, 224, 237, 240, 244, 245, 255]
+    for (prefix in points) {
+        for (byte in bytes) {
+            val data = "a".repeat(prefix) + rawByte(byte) + "é😀"
+            println("$prefix|$byte|${data.isValidUtf8()}|${textFindByte(data, byte)}")
+            readJson(prefix, " \n\r\t".repeat(prefix) + "\"" + data + "\"", 0, data.size)
+            readJson(prefix, "\"" + data + "\"", 1, data.size + 2)
+        }
+        val valid = "a".repeat(prefix) + "é😀" + "z".repeat(191)
+        if (!valid.isValidUtf8()) panic("UTF-8 boundary at $prefix")
+        if (textFindSequence(valid, "é😀z") != prefix) panic("sequence boundary at $prefix")
+        if (textFindByte(valid, 122) != prefix + 6) panic("byte boundary at $prefix")
+    }
+}
+
+fun main: int {
+    val count = if (processArgumentCount() == 0) 1200 else processArgument(0).parseInt() ?? 1200
+    scanBoundaries()
+    for (seed in 1 until count + 1) scanRandom(seed * 134775813)
+    0
+}

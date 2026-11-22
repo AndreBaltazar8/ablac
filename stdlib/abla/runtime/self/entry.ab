@@ -9,6 +9,7 @@
 // objects, arithmetic, comparisons, and ownership policy are ordinary Abla.
 
 import "abla/runtime/scalar"
+import "./simd-scan.ab"
 import "abla/unsafe/memory/raw"
 
 // Portable bootstrap/interpreter fallback. The LLVM emitter folds this
@@ -2771,6 +2772,10 @@ trusted fun __ablaRuntimeBase64Encode(value: string): any {
     val input: int = __ablaRuntimeStringData(value)
     var source: int = 0
     var destination: int = 0
+    if (length >= 32) {
+        source = __ablaRuntimeScanBase64Encode(input, output, length)
+        destination = (source / 3) * 4
+    }
     while (source < length) {
         val remaining: int = length - source
         val first: int = ablaRuntimeLoadU8(input + source)
@@ -2832,6 +2837,10 @@ trusted fun __ablaRuntimeBase64Decode(value: string): any {
     var source: int = 0
     var destination: int = 0
     var valid: bool = true
+    if (length >= 32) {
+        source = __ablaRuntimeScanBase64Decode(input, output, length, outputLength)
+        destination = (source / 4) * 3
+    }
     while (valid && source < length) {
         val byte2: int = ablaRuntimeLoadU8(input + source + 2)
         val byte3: int = ablaRuntimeLoadU8(input + source + 3)
@@ -3995,8 +4004,9 @@ trusted fun __ablaRuntimeJsonAsciiWordPlain(word: int): bool {
 // for longer ranges, so short keys keep their original per-byte loop.
 @noinline
 trusted fun __ablaRuntimeJsonAsciiPrefixEnd(data: int, begin: int, end: int): int {
-    var offset = begin
-    val aligned = begin + ((8 - ((data + begin) & 7)) & 7)
+    var offset = __ablaRuntimeScanJsonAscii(data, begin, end)
+    if (offset < 0) return ~offset
+    val aligned = offset + ((8 - ((data + offset) & 7)) & 7)
     var ascii = true
     while (ascii && offset < aligned && offset < end) {
         val byte = ablaRuntimeLoadU8(data + offset)
@@ -4295,10 +4305,20 @@ trusted fun __ablaRuntimeTextFindSequence(
 
     val textData: int = __ablaRuntimeStringData(text)
     val sequenceData: int = __ablaRuntimeStringData(sequence)
-    val first: int = ablaRuntimeLoadU8(sequenceData)
     val last: int = end - sequenceLength
     var index: int = begin
 
+    if (last - begin >= 31) {
+        val scanned = __ablaRuntimeScanSequence(textData, sequenceData, begin, last, sequenceLength)
+        if (scanned >= 0) return scanned
+        index = ~scanned
+    } else if (last == begin && sequenceLength >= 8) {
+        // startsWith and endsWith search a range with exactly one candidate.
+        return if (__ablaRuntimeFlatBytesEqual(textData + begin, sequenceData, sequenceLength))
+            begin else -1
+    }
+
+    val first: int = ablaRuntimeLoadU8(sequenceData)
     if (sequenceLength == 1) {
         while (index <= last) {
             if (ablaRuntimeLoadU8(textData + index) == first) return index
@@ -4355,11 +4375,15 @@ trusted fun __ablaRuntimeTextFindByte(
     end: int
 ): int {
     val textLength: int = __ablaRuntimeStringLengthValue(text)
-    if (byte < 0 || byte > 255 || begin < 0 || end < begin ||
+    if (byte < 0 || byte > 255 || begin < 0 || end <= begin ||
         end > textLength) return -1
-    if (begin == end) return -1
     val data: int = __ablaRuntimeStringData(text)
     var index: int = begin
+    if (end - begin >= 16) {
+        val scanned = __ablaRuntimeScanByte(data, byte, begin, end)
+        if (scanned >= 0) return scanned
+        index = ~scanned
+    }
     while (index < end) {
         if (ablaRuntimeLoadU8(data + index) == byte) return index
         index = index + 1
@@ -4429,6 +4453,7 @@ trusted fun __ablaRuntimeTextIsValidUtf8(text: string): bool {
     val length: int = __ablaRuntimeStringLengthValue(text)
     val data: int = if (length == 0) 0 else __ablaRuntimeStringData(text)
     var offset: int = 0
+    if (length >= 32) offset = __ablaRuntimeScanAscii(data, length)
     while (valid && offset < length) {
         val lead: int = ablaRuntimeLoadU8(data + offset)
         if (lead < 128) {
