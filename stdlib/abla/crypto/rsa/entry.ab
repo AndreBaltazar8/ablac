@@ -17,7 +17,9 @@ export import "abla/crypto/pbe"
 
 // --- Randomness: encryption and blinding need it, and refuse without it --------------------
 
+// Indicates whether a caller installed a random-byte provider.
 var cryptoRandomIsSet = false
+// The caller-supplied random-byte provider used when installed.
 var cryptoRandomSource: (int) -> string = { count: int -> "" }
 
 /** What gives `count` random bytes on a target with no getrandom here: Wasm (a host's
@@ -51,9 +53,11 @@ private val rsaMaximumBits = 16384
 
 /** A public key: the modulus, big-endian without leading zeros, and the exponent. Check `error` or `ok()`. */
 class RsaPublicKey(val modulus: string, val exponent: string, val bits: int, val error: string) {
+    // Returns true if constructing the public key reported no error.
     fun ok(): bool = this.error == ""
 }
 
+// Returns an unusable public key carrying the supplied error.
 fun rsaPublicFailed(error: string): RsaPublicKey = RsaPublicKey("", "", 0, error)
 
 /** A private key, its numbers in memory wiped when dropped. Check `error` or `ok()`. */
@@ -61,24 +65,33 @@ resource class RsaPrivateKey(
     val modulus: string, val publicExponent: string, val bits: int, val error: string,
     val memory: int, val primeWords: int, val fieldWords: int
 ) {
+    // Wipes and releases the owned private-key limbs, if present.
     trusted fun drop(): void {
         if (this.memory != 0) bnRelease(this.memory, this.fieldWords)
         return
     }
+    // Returns true when a private-key allocation is present.
     fun ok(): bool = this.memory != 0
 
     // Each is primeWords limbs in the key's memory.
     fun primeP(): int = this.memory
+    // Returns the borrowed address of the second prime's limbs in a valid key.
     fun primeQ(): int = this.memory + this.primeWords * 4
+    // Returns the borrowed address of the exponent modulo p - 1 in a valid key.
     fun exponentP(): int = this.memory + this.primeWords * 8
+    // Returns the borrowed address of the exponent modulo q - 1 in a valid key.
     fun exponentQ(): int = this.memory + this.primeWords * 12
+    // Returns the borrowed address of the CRT coefficient q inverse modulo p in a valid key.
     fun inverseQ(): int = this.memory + this.primeWords * 16
+    // Returns the borrowed address of the implicit rejection key bytes for a valid RSA key.
     fun rejectionKey(): int = this.memory + this.primeWords * 20
 }
 
+// Returns an unusable private key with the supplied error and no key storage.
 trusted fun rsaPrivateFailed(error: string): RsaPrivateKey = RsaPrivateKey("", "", 0, error, 0, 0,
     0)
 
+// Returns the bit length of a big-endian magnitude without leading zero bytes, or zero for empty input.
 fun rsaBitLength(value: string): int {
     if (value.size == 0) return 0
     var top = int(value[0])
@@ -90,6 +103,7 @@ fun rsaBitLength(value: string): int {
     bits
 }
 
+// Returns a public key from big-endian modulus and exponent bytes, or an error key when the numbers are missing or invalid.
 fun rsaPublicFromNumbers(modulus: string, exponent: string, unreadable: string): RsaPublicKey {
     if (modulus == "" || exponent == "") return rsaPublicFailed(unreadable)
     val bits = rsaBitLength(modulus)
@@ -221,6 +235,7 @@ trusted fun rsaPrivateFromPkcs1(der: string, begin: int, end: int,
 
 private val RSA_CHECK_FAILED = "the RSA private key failed its consistency check"
 
+// Returns an owned private key from the supplied big-endian RSA numbers, or an error key if the consistency checks fail.
 trusted fun rsaPrivateFromNumbers(
     modulus: string, exponent: string, p: string, q: string, dp: string, dq: string,
     qInverse: string,
@@ -416,6 +431,7 @@ private @noinline trusted fun rsaPrivateExportPem(key: RsaPrivateKey): CryptoRes
     CryptoResult("-----BEGIN PRIVATE KEY-----\n" + body + "-----END PRIVATE KEY-----\n", true, "")
 }
 
+// Returns true if the PEM body contains a legacy Proc-Type header.
 fun bodyHasHeaders(body: string): bool = pemFind(body, "Proc-Type:", 0) >= 0
 
 // --- The private operation -------------------------------------------------------------------
@@ -575,6 +591,7 @@ trusted fun rsaCrt(key: RsaPrivateKey, modulus: BnModulus, out: int, value: int)
     bnModulusRelease(q)
 }
 
+// Returns a bignum modulus from the specified readable limbs and clears the temporary byte encoding.
 trusted fun rsaModulusFromLimbs(limbs: int, words: int): BnModulus {
     val bytes = nativeByteBuffer(words * 4 + 1)
     val address = ablaUnsafePointerAddress(bytes.pointerAt(0))
@@ -611,6 +628,7 @@ private val DIGEST_INFO_SHA1 = "\x30\x21\x30\x09\x06\x05\x2b\x0e\x03\x02\x1a\x05
 private val DIGEST_INFO_SHA256 =
     "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20"
 
+// Returns a PKCS#1 v1.5 encoded digest block, or empty text when fewer than eight padding bytes fit.
 fun rsaEncodedSignature(size: int, digestInfo: string, digest: string): string {
     val filler = size - 3 - digestInfo.size - digest.size
     if (filler < 8) return ""
@@ -639,6 +657,7 @@ trusted fun rsaPublicOperation(key: RsaPublicKey, value: string): string {
     result
 }
 
+// Returns true when the recovered signature exactly matches the encoded digest, or false for a mismatch or unusable key.
 fun rsaVerifyWith(key: RsaPublicKey, digestInfo: string, digest: string, signature: string): bool {
     val expected = rsaEncodedSignature(key.modulus.size, digestInfo, digest)
     if (expected == "") return false
@@ -646,6 +665,7 @@ fun rsaVerifyWith(key: RsaPublicKey, digestInfo: string, digest: string, signatu
     recovered != "" && recovered == expected
 }
 
+// Returns a PKCS#1 v1.5 signature or an error if the key is too small or the private operation fails.
 trusted fun rsaSignWith(key: RsaPrivateKey, digestInfo: string, digest: string): CryptoResult {
     val encoded = rsaEncodedSignature(key.modulus.size, digestInfo, digest)
     if (encoded == "") return cryptoFailed("the key is too small for this hash")
@@ -666,6 +686,7 @@ private @noinline trusted fun rsaPrivateSignPkcs1Sha256Work(receiver: RsaPrivate
     rsaSignWith(receiver, DIGEST_INFO_SHA256, sha256(message))
 }
 
+// Returns true for a valid SHA-256 PKCS#1 v1.5 signature under an accepted key of at least 2048 bits.
 fun RsaPublicKey.verifyPkcs1Sha256(message: string, signature: string): bool =
     this.ok() && this.bits >= rsaMinimumBits && rsaVerifyWith(this, DIGEST_INFO_SHA256,
         sha256(message), signature)
@@ -685,12 +706,14 @@ private @noinline trusted fun rsaPrivateSignPkcs1Sha1LegacyWork(receiver: RsaPri
     rsaSignWith(receiver, DIGEST_INFO_SHA1, sha1(message))
 }
 
+// Returns true for a valid legacy SHA-1 PKCS#1 v1.5 signature under an accepted key of at least 1024 bits.
 fun RsaPublicKey.verifyPkcs1Sha1Legacy(message: string, signature: string): bool =
     this.ok() && this.bits >= rsaLegacyMinimumBits && rsaVerifyWith(this, DIGEST_INFO_SHA1,
         sha1(message), signature)
 
 // --- Encryption ---------------------------------------------------------------------------------
 
+// Returns the requested number of MGF1 mask bytes using a digest function that produces a nonempty result.
 fun rsaMgf1(seed: string, size: int, hash: (string) -> string): string {
     var out = ""
     var counter = 0
@@ -703,8 +726,10 @@ fun rsaMgf1(seed: string, size: int, hash: (string) -> string): string {
     out.slice(0, size)
 }
 
+// Returns the low eight bits as a one-byte string.
 fun rsaByte(value: int): string = byteEncode(value & 255)
 
+// Returns OAEP ciphertext or an error if the plaintext cannot fit, randomness is unavailable, or the public operation fails.
 fun rsaEncryptOaep(key: RsaPublicKey, plaintext: string, hash: (string) -> string,
     hashSize: int): CryptoResult {
     val size = key.modulus.size
@@ -816,6 +841,7 @@ trusted fun rsaDecryptBlock(key: RsaPrivateKey, ciphertext: string): CryptoResul
     rsaPrivateOperation(key, ciphertext)
 }
 
+// Returns OAEP plaintext or a failure result if the private operation or encoded block validation fails.
 trusted fun rsaDecryptOaep(key: RsaPrivateKey, ciphertext: string, hash: (string) -> string,
     hashSize: int): CryptoResult {
     if (key.modulus.size < 2 * hashSize + 2) return cryptoFailed(RSA_DECRYPT_FAILED)
