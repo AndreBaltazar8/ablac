@@ -81,8 +81,16 @@ if (mode === 'prepare') {
     };
     const run = (variant, phase, command, arguments_, input, env = {}) => {
         const stats = path.join(out, `${index}.${variant}.${phase}.time`);
+        // Optional PMU counters accompany the same alternating workload; the
+        // caller selects events suitable for its pinned CPU type.
+        const perf = process.env.JSON_STREAM_PERF;
+        const counters = path.join(out, `${index}.${variant}.${phase}.perf.tsv`);
+        const measuredCommand = perf || command;
+        const measuredArguments = perf ? ['stat', '-x', '\t', '-e',
+            process.env.JSON_STREAM_PERF_EVENTS || 'cycles:u,instructions:u',
+            '-o', counters, '--', command, ...arguments_] : arguments_;
         const start = process.hrtime.bigint();
-        const result = spawnSync('time', ['-f', '%U\t%S\t%M', '-o', stats, command, ...arguments_], {
+        const result = spawnSync('time', ['-f', '%U\t%S\t%M', '-o', stats, measuredCommand, ...measuredArguments], {
             cwd: root, input, maxBuffer: 256 * 1024 * 1024,
             env: { ...process.env, ABLA_SYSROOT: root, ABLA_DEBUG: '0', ABLA_COMPILE_EVAL: 'auto', ...env },
         });
@@ -91,7 +99,8 @@ if (mode === 'prepare') {
         assert.ifError(result.error);
         assert.equal(result.status, 0, `${variant} ${phase}: ${result.stderr?.toString()}`);
         const [userSeconds, systemSeconds, peakKiB] = fs.readFileSync(stats, 'utf8').trim().split(/\s+/).map(Number);
-        return { pair: index, variant, phase, elapsedNs, userSeconds, systemSeconds, peakKiB, stdout: result.stdout };
+        return { pair: index, variant, phase, elapsedNs, userSeconds, systemSeconds, peakKiB,
+            ...(perf ? { perfCounters: path.basename(counters) } : {}), stdout: result.stdout };
     };
     const record = row => {
         const { stdout, ...metrics } = row;
