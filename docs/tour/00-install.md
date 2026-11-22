@@ -32,4 +32,21 @@ See [development setup](../../README.md#development) and the
 and environment overrides. Once the version command works, move to your
 first program.
 
+## Start a project
+
+On a compiler that supports `ablac new`, create and run a starter app
+from a directory you own:
+
+```sh
+ablac new hello-app
+cd hello-app
+ablac run --project .
+ablac test tests/greeting.ab
+```
+
+The app prints `Hello, Abla!`. The scaffold includes a manifest, an entry
+at `src/main.ab` and a greeting test. Use `ablac new hello-lib --lib` for
+a library skeleton. The [scaffold test](../../tools/test-new-project.sh)
+checks that both generated projects build, run and pass their tests.
+
 [Tour](README.md) · [Next: Hello, Abla](01-hello.md)

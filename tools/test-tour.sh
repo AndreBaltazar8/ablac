@@ -33,7 +33,7 @@ for doc in docs/tour/*.md; do
         count=$((count + 1))
     done < "$blocks/index"
 done
-[[ $count == 14 ]] || { echo "tour: expected 13 programs and one helper, got $count" >&2; exit 1; }
+[[ $count == 19 ]] || { echo "tour: expected 18 programs and one helper, got $count" >&2; exit 1; }
 # Keep the visible transcript tied to the actual REPL input as well.
 awk '/^```text$/ {inside=1; next} inside && /^```$/ {inside=0; next} inside {print}' docs/tour/13-repl.md > "$out/repl.input"
 cmp "$out/repl.input" tests/cases/tour/repl.in
@@ -43,3 +43,16 @@ printf 'abla> defined\nabla> 42\nabla> ' > "$out/repl.expected"
 cmp "$out/repl.expected" "$out/repl.stdout"
 [[ ! -s $out/repl.stderr ]] || { cat "$out/repl.stderr" >&2; exit 1; }
 echo "tour: $count source blocks match; REPL stdout and successful exit checked"
+awk '/^```text source=repl-load.in$/ {inside=1; next} inside && /^```$/ {inside=0; next} inside {print}' \
+    docs/tour/13-repl.md > "$out/repl-load.input"
+cmp "$out/repl-load.input" tests/cases/tour/repl-load.in
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64|Darwin-arm64|Darwin-x86_64)
+        ABLA_MAX_MEMORY_MB=3072 ABLA_MAX_SECONDS=180 "$root/tools/run-limited.sh" "$compiler" repl \
+            < "$out/repl-load.input" > "$out/repl-load.stdout" 2> "$out/repl-load.stderr"
+        printf 'abla> loaded 1 declarations from tests/cases/tour/pricing.ab\nabla> 240\nabla> ' > "$out/repl-load.expected"
+        cmp "$out/repl-load.expected" "$out/repl-load.stdout"
+        [[ ! -s $out/repl-load.stderr ]] || { cat "$out/repl-load.stderr" >&2; exit 1; }
+        echo 'tour: live REPL load and output checked'
+        ;;
+esac

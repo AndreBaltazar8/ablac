@@ -12,6 +12,14 @@ changes the resolution. Builds install already locked packages automatically.
 An offline build cannot fetch an uncached revision. The local two-file example
 needs no network dependency and no lockfile.
 
+To add a GitHub dependency with a compiler that supports the package
+commands, run `ablac package add owner/repo` in your project. It adds an
+import to the entry module and updates the lock while retaining existing
+pins. Use `--tag <tag>` for a specific release. Commit the import and the
+lockfile together. Run `ablac package outdated` to see newer tags for
+locked Git dependencies before deciding whether to update. These commands
+use Git and network access for ordinary GitHub repositories.
+
 See [modules](../language.md#modules-and-imports) and [packages](../packages.md)
 for manifests, resolving the initial lock, vendoring and offline builds.
 
