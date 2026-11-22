@@ -84,7 +84,8 @@ class BootstrapAnalysisGraphParsed(
     val exported: Json,
     // What a document's export depends on that a parse fixes (graph-v2's `since`): the hash of its text and exported symbols.
     val key: string,
-    val hostSource: string = ""
+    val pending: array<Json>,
+    val hostSource: string
 )
 
 class BootstrapAnalysisGraphDocument(
@@ -468,7 +469,7 @@ fun bootstrapAnalysisGraphSemantic(
 }
 
 fun bootstrapAnalysisGraphDiagnostics(
-    document: BootstrapAnalysisGraphDocument, project: BootstrapFrontendProject,
+    document: BootstrapAnalysisGraphDocument, project: BootstrapFrontendHostProject,
     semanticDiagnostics: string,
     unusedImports: string = ""
 ): Json {
@@ -489,7 +490,7 @@ fun bootstrapAnalysisGraphDiagnostics(
 // Workspace revisions include disk and configuration inputs, not only overlay
 // message counts. Keep immutable strings, and compare exact contents rather
 // than treating a hash collision as permission to validate stale edits.
-fun BootstrapAnalysisService.graphObserveInputs(project: BootstrapFrontendProject,
+fun BootstrapAnalysisService.graphObserveInputs(project: BootstrapFrontendHostProject,
     entry: string): void {
     val paths: array<string> = ["entry", "errors", "diagnostics"]
     val values: array<string> = [entry, "${project.written.errors}", project.written.diagnostics]
@@ -544,9 +545,23 @@ fun bootstrapAnalysisGraphFrozen(entry: BootstrapAnalysisGraphParsed): Bootstrap
 fun bootstrapAnalysisGraphParse(source: string, uri: string, full: bool,
     path: string, stableIds: bool, hostSource: string = ""): BootstrapAnalysisGraphParsed {
     val raw = bootstrapParseModuleSurface(BootstrapModule(path, source, hostSource))
+    // Collect compile-time sites from the original surface before projecting the exported declarations.
+    val blocked: array<BootstrapExpression> = []
+    val blockedSources: array<string> = []
     val visible: array<BootstrapDeclaration> = []
     for (declaration in raw.declarations) {
+        bootstrapFrontendCollectDeclarationCompile(declaration, blocked, blockedSources)
         if (full || !declaration.isPrivate) visible.append(declaration)
+    }
+    for (action in raw.actions) bootstrapFrontendCollectCompile(action, path, blocked, blockedSources)
+    val pending: array<Json> = []
+    for (index in 0 until blocked.size) {
+        val site = blocked[index]
+        pending.append(jsonObject(["code", "uri", "range", "message"],
+            [jsonString("E_ANALYSIS_CT_REQUIRED"),
+                jsonString(bootstrapAnalysisGraphUri(blockedSources[index])),
+                jsonObject(["start", "end"], [jsonInteger(site.begin), jsonInteger(site.end)]),
+                jsonString("compile-time evaluation was not performed; types describe the pre-evaluation source")]))
     }
     val surface = BootstrapParseResult(visible, raw.actions, raw.errors, raw.extensionErrors,
         raw.compileInputPaths, raw.compileInputContents, raw.diagnostics)
@@ -556,7 +571,7 @@ fun bootstrapAnalysisGraphParse(source: string, uri: string, full: bool,
     val exported = if (stableIds) bootstrapAnalysisStableSymbols(symbols, stable) else symbols
     BootstrapAnalysisGraphParsed(source, uri, full, contract, symbols, bootstrapSourceRewriteOf(path),
         stable, exported, if (stableIds) bootstrapAnalysisGraphHash("${bootstrapAnalysisGraphHash(source)}${jsonStringify(exported)}") else "",
-        hostSource)
+        pending, hostSource)
 }
 
 /** How many generations `since` can name (the one the client holds is the one it last analyzed: the last few cover queries and
@@ -796,14 +811,12 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     val keptParsed = this.graphParsed
     val keptModules = bootstrapAnalysisGraphModules
     val keptEntry = bootstrapAnalysisGraphActiveEntry
-    val keptSites = bootstrapFrontendSiteCache
     val keptIndex = this.graphQueryIndex
     val keptIndexRevision = this.graphIndexRevision
     val keptGenerations: array<BootstrapAnalysisGraphGeneration> = []
     for (generation in this.graphGenerations) keptGenerations.append(generation)
     // Nothing of the incremental run is reached from the cold one.
     bootstrapAnalysisGraphActiveEntry = ""
-    bootstrapFrontendSiteCache = Map()
     this.graphQueryIndex = null
     this.graphIndexRevision = -1
     val cold = this.graphSnapshotRun()
@@ -811,7 +824,6 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     this.graphParsed = keptParsed
     bootstrapAnalysisGraphModules = keptModules
     bootstrapAnalysisGraphActiveEntry = keptEntry
-    bootstrapFrontendSiteCache = keptSites
     this.graphQueryIndex = keptIndex
     this.graphIndexRevision = keptIndexRevision
     this.graphGenerations.truncate(0)
@@ -888,6 +900,8 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
         bootstrapFunctionValueUses = Map()
         bootstrapUnusedLocalUsed = Map()
     }
+    // An overlay already advanced the revision. Release its stale answer before loading the next project.
+    if (this.graphIndexRevision != this.revision) this.graphQueryIndex = null
     bootstrapAnalysisSampleMemory("analysis begin")
     val project = bootstrapFrontendLoadHostProject(entry, bootstrapAnalysisGraphModules)
     bootstrapAnalysisSampleMemory("project loaded")
@@ -902,6 +916,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
     this.graphQueryIndex = null
     val documents: array<BootstrapAnalysisGraphDocument> = []
     val names: Map<string, string> = Map()
+    val pending: array<Json> = []
     var sourceBytes = 0
     // Only an analysis that follows another holds anything yet: the first has nothing to re-mark, and keeps the compiler's step.
     val holdsProject = this.graphParsed.size > 0
@@ -926,6 +941,10 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
                 else bootstrapAnalysisGraphFrozen(
                     bootstrapAnalysisGraphParse(source, uri, full, module.path, this.graphStableIds, module.hostSource))
             this.graphParsed.set(module.path, entryParsed)
+            // Contract-only placeholders have no implementation to evaluate.
+            if (module.source != "") {
+                for (site in entryParsed.pending) pending.append(site)
+            }
             val parsed = entryParsed.parsed
             sourceBytes = sourceBytes + source.size
             documents.append(BootstrapAnalysisGraphDocument(
@@ -976,7 +995,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
         bootstrapAnalysisCollectTypedRequests(action, entry, begins, ends, kinds, sources)
     }
     bootstrapAnalysisSampleMemory("documents parsed")
-    val analyzed = bootstrapFrontendTypeProject(project, begins, ends, kinds, sources)
+    val analyzed = bootstrapFrontendTypeProject(project.written, begins, ends, kinds, sources)
     bootstrapAnalysisSampleMemory("typed")
     val aliases: Map<string, string> = Map()
     for (document in documents) bootstrapAnalysisGraphLocalAliases(document, aliases)
@@ -1062,15 +1081,6 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
                     jsonString(document.document.text), document.exported, jsonArray([]),
                     diagnostics]))
         }
-    }
-    val pending: array<Json> = []
-    for (index in 0 until project.blocked.size) {
-        val site = project.blocked[index]
-        pending.append(jsonObject(["code", "uri", "range", "message"],
-            [jsonString("E_ANALYSIS_CT_REQUIRED"),
-                jsonString(bootstrapAnalysisGraphUri(project.blockedSources[index])),
-                jsonObject(["start", "end"], [jsonInteger(site.begin), jsonInteger(site.end)]),
-                jsonString("compile-time evaluation was not performed; types describe the pre-evaluation source")]))
     }
     val result = jsonObject(["revision", "documents", "analysisMode", "complete", "pending",
         "entry"],

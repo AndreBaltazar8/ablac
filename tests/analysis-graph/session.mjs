@@ -240,6 +240,20 @@ async function contractSurface() {
     const d = doc(a, path.join(p, 'api.ab'));
     assert.ok(!d.symbols.some((x) => x.name === 'implementation'));
     assert.ok(occurrence(d, 'implementation').every((x) => !('declarationId' in x) && !('type' in x)), JSON.stringify(d.occurrences));
+    // Compile-time expressions in a contract-only implementation are inert.
+    const uriPath = uri(path.join(p, 'api.ab'));
+    const text = 'private fun implementation: int = #42\nfun remote(value: int): int = implementation() + value\n';
+    await s.rpc('document/open', { uri: uriPath, version: 1, text });
+    assert.deepEqual((await s.analyze()).pending, []);
+    const entry = uri(path.join(p, 'main.ab'));
+    await s.rpc('document/open', { uri: entry, version: 1, text: 'import "api.ab"\nfun main: int = 0\n' });
+    const edited = await s.analyze();
+    assert.equal(edited.complete, false);
+    assert.equal(edited.pending.length, 1);
+    assert.equal(edited.pending[0].uri, uriPath);
+    assert.equal(text.slice(edited.pending[0].range.start, edited.pending[0].range.end), '#42');
+    await s.rpc('document/close', { uri: entry });
+    assert.deepEqual((await s.analyze()).pending, []);
     await s.close();
 }
 
