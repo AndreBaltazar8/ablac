@@ -16,15 +16,17 @@ const uri = (file) => pathToFileURL(file).href;
 const bytes = (text) => Buffer.byteLength(text);
 
 class Session {
-    constructor(project, { mode = 'graph-v1', initialize = true } = {}) {
+    constructor(project, { mode = 'graph-v1', initialize = true, env = process.env, log = 'service.stderr' } = {}) {
         this.id = 0;
         this.project = project;
         this.mode = mode;
         this.initialize = initialize;
+        this.env = env;
+        this.log = path.join(project, log);
     }
     async start() {
-        const stderr = fs.openSync(path.join(this.project, 'service.stderr'), 'w');
-        this.process = spawn(compiler, ['analyze', '--stdio'], { stdio: ['pipe', 'pipe', stderr] });
+        const stderr = fs.openSync(this.log, 'w');
+        this.process = spawn(compiler, ['analyze', '--stdio'], { stdio: ['pipe', 'pipe', stderr], env: this.env });
         fs.closeSync(stderr);
         this.exit = new Promise((resolve) => this.process.on('close', resolve));
         this.lines = readline.createInterface({ input: this.process.stdout })[Symbol.asyncIterator]();
@@ -40,7 +42,7 @@ class Session {
         this.id += 1;
         this.process.stdin.write(JSON.stringify({ schema: 1, id: this.id, method, params }) + '\n');
         const next = await this.lines.next();
-        assert.ok(!next.done, `${method}: the service ended: ${fs.readFileSync(path.join(this.project, 'service.stderr'), 'utf8')}`);
+        assert.ok(!next.done, `${method}: the service ended: ${fs.readFileSync(this.log, 'utf8')}`);
         const result = JSON.parse(next.value);
         assert.equal(result.schema, 1);
         assert.equal(result.id, this.id);
@@ -1151,7 +1153,66 @@ fun main: int {
     }
 }
 
-const tests = { regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+async function incrementalBodyReplay() {
+    const original = 'fun answer: int {\n    42\n}\nfun afterAnswer: int = 7\n';
+    const main = 'import "dep.ab"\nfun main: int = answer()\n';
+    const p = fixture('body-replay', { 'main.ab': main, 'dep.ab': original });
+    const env = { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TYPING: '2',
+        ABLA_ANALYSIS_INCREMENTAL_TRACE: '1', ABLA_ANALYSIS_CHECK: '1' };
+    const replay = await start(p, { mode: 'graph-v2', env, log: 'replay.stderr' });
+    const full = await start(p, { mode: 'graph-v2',
+        env: { ...env, ABLA_ANALYSIS_INCREMENTAL_TYPING: '0', ABLA_ANALYSIS_CHECK: '0' }, log: 'full.stderr' });
+    const sessions = [replay, full];
+    let revision;
+    const check = async (label) => {
+        const [a, b] = await Promise.all(sessions.map(session => session.analyze()));
+        assert.deepEqual(a, b, label);
+        if (revision !== undefined) {
+            const [actual, expected] = await Promise.all(sessions.map(s => s.rpc('analyze', { since: revision })));
+            assert.deepEqual(actual, expected, label + ' delta');
+        }
+        revision = a.revision;
+        const editor = { uri: uri(path.join(p, 'main.ab')), offset: bytes(main.slice(0, main.indexOf('answer()'))), revision };
+        for (const method of ['query/definition', 'query/hover', 'query/references']) {
+            const [actual, expected] = await Promise.all(sessions.map(s => s.rpc(method, editor)));
+            assert.deepEqual(actual, expected, label + ' ' + method);
+        }
+        return fs.readFileSync(replay.log, 'utf8').split('\n').filter(line => line.includes('replayed a type-inert')).length;
+    };
+    let version = 0;
+    const edit = async (text) => {
+        version++;
+        const params = { uri: uri(path.join(p, 'dep.ab')), version, text };
+        const method = version === 1 ? 'document/open' : 'document/change';
+        for (const session of sessions) assert.ok(!('error' in await session.rpc(method, params)));
+    };
+    try {
+        assert.equal(await check('initial full check'), 0);
+        let count = 0;
+        for (let seed of [17, 863]) {
+            for (let i = 0; i < 4; i++) {
+                seed ^= seed << 13;
+                seed ^= seed >>> 17;
+                seed ^= seed << 5;
+                const inserted = '    val deliberatelyUnused' + (seed >>> 0) + ' = ' + i + '\n';
+                const candidate = original.replace('    42', inserted + '    42');
+                await edit(candidate);
+                assert.equal(await check('unused binding ' + i), count + 1);
+                count++;
+                await edit(candidate.replace('    42', '    intentionallyMissing()'));
+                assert.equal(await check('changed expression ' + i), count);
+                await edit(original);
+                assert.equal(await check('restore ' + i), count);
+            }
+        }
+        const log = fs.readFileSync(replay.log, 'utf8');
+        assert.ok(!/abla-analysis-check.*(?:DIFFERENT|FAILED)/.test(log), log);
+    } finally {
+        await Promise.all(sessions.map(session => session.close()));
+    }
+}
+
+const tests = { body_replay: incrementalBodyReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;

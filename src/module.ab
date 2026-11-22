@@ -688,6 +688,41 @@ fun bootstrapCompileInputsCurrent(parsed: BootstrapParseResult): bool {
     current
 }
 
+fun bootstrapModuleCopyStrings(values: array<string>): array<string> {
+    val copied: array<string> = []
+    for (value in values) copied.append(value)
+    copied
+}
+
+// Exact parser inputs and staged results for optional editor replay.
+class BootstrapModuleSyntaxInputs(
+    val paths: array<string> = [],
+    val sources: array<string> = [],
+    val hosts: array<string> = [],
+    val aliases: array<string> = [],
+    val expansions: array<string> = [],
+    var expansionBytes: int = 0,
+    var replayable: bool = true
+) {
+    fun copy(): BootstrapModuleSyntaxInputs = BootstrapModuleSyntaxInputs(
+        bootstrapModuleCopyStrings(this.paths), bootstrapModuleCopyStrings(this.sources),
+        bootstrapModuleCopyStrings(this.hosts), bootstrapModuleCopyStrings(this.aliases),
+        bootstrapModuleCopyStrings(this.expansions), this.expansionBytes, this.replayable)
+
+    fun expanded(path: string, parsed: BootstrapParseResult): void {
+        if (!this.replayable) return
+        val payload = bootstrapDiscoveryPayload(parsed)
+        if (payload == "" || this.expansionBytes + payload.size > 8388608 ||
+            parsed.stackDepthStoppedSources.size > 0 || parsed.compileInputPaths.size > 0) {
+            this.replayable = false
+        } else {
+            this.expansions.append(path)
+            this.expansions.append(payload)
+            this.expansionBytes = this.expansionBytes + payload.size
+        }
+    }
+}
+
 // Long-lived commands retain one state object across compilations. A normal
 // one-shot build creates a fresh state, while `serve` reuses it and therefore
 // rereads and rescans only files whose stat identity changed.
@@ -717,7 +752,9 @@ class BootstrapModuleState(
     var overlays: array<BootstrapModuleOverlay> = [],
     val overlaySnapshots: Map<string, bool> = Map(),
     var syntaxOnly: bool = false,
-    val rawDiscoveredIn: Map<string, int> = Map()
+    val rawDiscoveredIn: Map<string, int> = Map(),
+    var syntaxInputs: BootstrapModuleSyntaxInputs = BootstrapModuleSyntaxInputs(),
+    var captureSyntaxInputs: bool = false
 ) {
     fun beginBuild(): void {
         if (this.discoveryPrepared) this.discoveryPrepared = false
@@ -953,10 +990,12 @@ class BootstrapModuleState(
             if (!bootstrapSourceUsesSubparser(snapshot.source, registry, snapshot.hostSource)) {
                 return bootstrapParseWithTokens(snapshot.source, snapshot.path, bootstrapModuleTokens(snapshot))
             }
-            return bootstrapParseStagedRegistered(
+            val expanded = bootstrapParseStagedRegistered(
                 snapshot.source, snapshot.path, declarations, currentDeclarationBegin, currentDeclarationCount, registry,
                 allowedCompileEffects, snapshot.hostSource, snapshot.rawSites
             )
+            if (this.captureSyntaxInputs) this.syntaxInputs.expanded(snapshot.path, expanded)
+            return expanded
         }
         var existing = this.frontendIndex(
             snapshot,
@@ -5072,6 +5111,21 @@ class BootstrapModuleGraph(
                 preparedSnapshots.append(bootstrapContractTwinSnapshot(prepared))
             }
             preparedIndex = preparedIndex + 1
+        }
+        if (this.state.captureSyntaxInputs) {
+            for (prepared in preparedSnapshots) {
+                this.state.syntaxInputs.paths.append(prepared.path)
+                this.state.syntaxInputs.sources.append(prepared.source)
+                this.state.syntaxInputs.hosts.append(prepared.hostSource)
+                this.state.syntaxInputs.aliases.append(if (aliasSummary.isContractTarget(prepared.path)) "contract" else "full")
+            }
+            for (alias in this.aliases) {
+                this.state.syntaxInputs.aliases.append(alias.importer)
+                this.state.syntaxInputs.aliases.append(alias.target)
+                this.state.syntaxInputs.aliases.append(alias.alias)
+                this.state.syntaxInputs.aliases.append(alias.written)
+                this.state.syntaxInputs.aliases.append("${alias.contractOnly}:${alias.exported}:${alias.begin}:${alias.end}")
+            }
         }
         bootstrapFrontendTraceMemory(
             "parse.prepared:${preparedSnapshots.size}"

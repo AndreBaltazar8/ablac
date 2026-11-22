@@ -2,6 +2,7 @@ import "generic_types.ab"
 import "json_construction.ab"
 // Opt-in graph-aware analysis for compiler-protocol clients. No LSP transport.
 import "analysis_service.ab"
+import "analysis_body_edit.ab"
 import "frontend.ab"
 import "frontend_diagnostics.ab"
 import "module.ab"
@@ -799,9 +800,9 @@ fun bootstrapAnalysisCheckDigests(snapshot: Json): Map<string, string> {
 
 fun BootstrapAnalysisService.graphSnapshot(): Json {
     if (!bootstrapAnalysisCheckEnabled()) return this.graphSnapshotRun()
-    val fresh = this.graphIndexRevision != this.revision
+    val previousRevision = this.graphIndexRevision
     val result = this.graphSnapshotRun()
-    if (!fresh || this.graphQueryIndex == null) return result
+    if (previousRevision == this.graphIndexRevision || this.graphQueryIndex == null) return result
     val incremental = bootstrapAnalysisCheckDigests(this.graphMaterialize(result))
     // ABLA_ANALYSIS_CHECK=2 (the check's own test): the incremental answer's first document is taken to differ, and the run must say so.
     val selfTest = linuxEnvironment("ABLA_ANALYSIS_CHECK")
@@ -819,7 +820,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     bootstrapAnalysisGraphActiveEntry = ""
     this.graphQueryIndex = null
     this.graphIndexRevision = -1
-    val cold = this.graphSnapshotRun()
+    val cold = this.graphSnapshotRun(false)
     val reference = bootstrapAnalysisCheckDigests(this.graphMaterialize(cold))
     this.graphParsed = keptParsed
     bootstrapAnalysisGraphModules = keptModules
@@ -861,7 +862,143 @@ fun bootstrapAnalysisCount(text: string, needle: string): int {
     count
 }
 
-fun BootstrapAnalysisService.graphSnapshotRun(): Json {
+class BootstrapAnalysisReplaySnapshot(
+    val snapshot: Json,
+    val sets: Map<string, BootstrapAnalysisOccurrenceSet>,
+    val generated: Map<string, Json>,
+    val fingerprints: Map<string, string>,
+    val uris: array<string>
+)
+
+fun bootstrapAnalysisRejectReplay(reason: string): BootstrapAnalysisReplaySnapshot? {
+    if (linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TRACE").value == "1") {
+        linuxPrintStandardError("abla-analysis-typing fallback: $reason\n")
+    }
+    null
+}
+
+// Lowered null guards name a synthetic temporary by the source offset.
+// Such a temporary has no spelling with an occurrence in the source.
+fun bootstrapAnalysisReplayShiftedTemporary(before: Json, after: Json,
+    splice: BootstrapAnalysisBodyInsert): bool {
+    val prefix = "__abla_null_default_"
+    val name = before.getString("name")
+    val nextName = after.getString("name")
+    if (!name.startsWith(prefix) || !nextName.startsWith(prefix)) return false
+    val offset = name.slice(prefix.size, name.size)
+    if (offset.size == 0 || offset.size > 10) return false
+    var original = 0
+    for (index in 0 until offset.size) {
+        val digit = offset[index] - 48
+        if (digit < 0 || digit > 9) return false
+        original = original * 10 + digit
+    }
+    if (original < splice.at || nextName != "$prefix${original + splice.size}") return false
+    val id = before.getString("id")
+    id.endsWith(name) && after.getString("id") == "${id.slice(0, id.size - name.size)}$nextName" &&
+        before.getString("kind") == after.getString("kind") &&
+        before.getString("containerId") == after.getString("containerId") &&
+        before.get("selectionRange").getInt("start") + splice.size == after.get("selectionRange").getInt("start") &&
+        before.get("selectionRange").getInt("end") + splice.size == after.get("selectionRange").getInt("end")
+}
+
+// Reuse the previous checked graph for a single type-inert body splice.
+fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQueryIndex,
+    documents: array<BootstrapAnalysisGraphDocument>, entry: string,
+    before: BootstrapAnalysisReplayInputs, after: BootstrapAnalysisReplayInputs): BootstrapAnalysisReplaySnapshot? {
+    if (!previous.snapshot.get("complete").asBoolean() ||
+        previous.snapshot.getString("entry") != entry ||
+        previous.snapshot.get("documents").values.size != documents.size) return bootstrapAnalysisRejectReplay("old snapshot")
+    var changed = -1
+    for (index in 0 until documents.size) {
+        val document = documents[index].document
+        val old = previous.snapshot.get("documents").values[index]
+        if (old.getString("uri") != document.uri || old.get("diagnostics").values.size != 0) return bootstrapAnalysisRejectReplay("old document or diagnostics")
+        if (old.getString("text") != document.text) {
+            if (changed >= 0) return bootstrapAnalysisRejectReplay("multiple changed sources")
+            changed = index
+        } else if (old.getInt("version") != document.version) return bootstrapAnalysisRejectReplay("overlay version")
+    }
+    if (changed < 0) return bootstrapAnalysisRejectReplay("no changed source")
+    val doc = documents[changed]
+    val changedPath = doc.document.path
+    val original = previous.snapshot.get("documents").values[changed]
+    val splice = bootstrapAnalysisBodyInsertion(original.getString("text"), doc.document.text)
+    if (splice == null || doc.hostSource != "" || !bootstrapAnalysisPlainBodyInsertion(doc.parsed, splice) ||
+        !bootstrapAnalysisReplayInputsAgree(before, after, changedPath, splice)) return bootstrapAnalysisRejectReplay("insertion or parser inputs")
+    val oldSymbols = original.get("symbols").values
+    if (doc.exported.values.size != oldSymbols.size + 1) return bootstrapAnalysisRejectReplay("symbol count")
+    var added = ""
+    var matched = 0
+    val retired: Map<string, bool> = Map()
+    for (symbol in doc.exported.values) {
+        val id = symbol.getString("id")
+        if (symbol.get("selectionRange").getInt("start") == splice.nameBegin &&
+            symbol.getString("name") == splice.name && symbol.getString("detail") == "local.val" &&
+            added == "") {
+            added = id
+        } else {
+            if (matched >= oldSymbols.size) return bootstrapAnalysisRejectReplay("symbol count")
+            val old = oldSymbols[matched]
+            val oldId = old.getString("id")
+            if (oldId != id) {
+                if (!bootstrapAnalysisReplayShiftedTemporary(old, symbol, splice)) return bootstrapAnalysisRejectReplay("symbol changed")
+                retired.set(oldId, true)
+            }
+            matched = matched + 1
+        }
+    }
+    if (added == "" || matched != oldSymbols.size) return bootstrapAnalysisRejectReplay("new symbol missing")
+    val path = bootstrapAnalysisGraphPath(doc.document.uri)
+    val oldSet = previous.occurrences.get(path)
+    if (oldSet == null) return bootstrapAnalysisRejectReplay("old occurrences missing")
+    val updated = bootstrapAnalysisReplayOccurrence(oldSet, splice, added)
+    if (updated == null) return bootstrapAnalysisRejectReplay("occurrence overlaps")
+    val values: array<Json> = []
+    val sets: Map<string, BootstrapAnalysisOccurrenceSet> = Map()
+    val fingerprints: Map<string, string> = Map()
+    val uris: array<string> = []
+    val offsetIdPrefix = "abla:$changedPath:"
+    val contractIdPrefix = "abla:$changedPath#contract:"
+    for (index in 0 until documents.size) {
+        val document = documents[index]
+        val uri = document.document.uri
+        val key = bootstrapAnalysisGraphPath(uri)
+        val set = if (index == changed) updated else previous.occurrences.get(key)
+        if (set == null) return bootstrapAnalysisRejectReplay("set missing")
+        // Graph-v2 normally exports stable IDs. Any residual offset-based
+        // target into the edited module must go through full typing.
+        for (id in set.ids) {
+            if (id.startsWith(offsetIdPrefix) || id.startsWith(contractIdPrefix) || retired.has(id)) return bootstrapAnalysisRejectReplay("offset ID")
+        }
+        val old = previous.snapshot.get("documents").values[index]
+        val fingerprint = if (index == changed)
+            "${document.document.version}|${document.key}|${bootstrapAnalysisGraphSetHash(updated)}|${bootstrapAnalysisGraphHash("[]")}"
+            else this.graphFingerprint("${previous.revision}", uri)
+        if (fingerprint == "") return bootstrapAnalysisRejectReplay("fingerprint missing")
+        fingerprints.set(uri, fingerprint)
+        uris.append(uri)
+        sets.set(key, set)
+        values.append(if (index != changed) old else jsonObject(
+            ["uri", "version", "text", "symbols", "occurrences", "diagnostics"],
+            [jsonString(uri), jsonInteger(document.document.version),
+             jsonString(document.document.text), bootstrapAnalysisStableSymbols(document.symbols, document.stable),
+             jsonNull(), old.get("diagnostics")]))
+    }
+    val generated: Map<string, Json> = Map()
+    for (id in previous.symbols.keys()) {
+        if (!id.contains("#generated:")) continue
+        if (id.startsWith("abla:$changedPath#generated:")) return bootstrapAnalysisRejectReplay("generated symbol")
+        val symbol = previous.symbols.get(id)
+        if (symbol != null) generated.set(id, symbol)
+    }
+    val snapshot = jsonObject(["revision", "documents", "analysisMode", "complete", "pending", "entry"],
+        [jsonString("${this.revision}"), jsonArray(values), jsonString(this.graphModeName()),
+         jsonBoolean(true), jsonArray([]), jsonString(entry)])
+    BootstrapAnalysisReplaySnapshot(snapshot, sets, generated, fingerprints, uris)
+}
+
+fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
     val entry = this.graphEntry()
     if (entry == "") return bootstrapAnalysisGraphIncomplete(this.revision,
         "select one project entry with entryPoints or analyze roots; no project entry was found",
@@ -871,6 +1008,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
         bootstrapAnalysisGraphModules = bootstrapModuleState()
         bootstrapModuleFreezeSnapshots = bootstrapAnalysisFreezeEnabled()
         this.graphParsed = Map()
+        if (reuseTyping) this.graphReplayInputs = null
     }
     bootstrapAnalysisGraphModules.overlays = []
     for (document in this.overlays) {
@@ -900,10 +1038,18 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
         bootstrapFunctionValueUses = Map()
         bootstrapUnusedLocalUsed = Map()
     }
-    // An overlay already advanced the revision. Release its stale answer before loading the next project.
-    if (this.graphIndexRevision != this.revision) this.graphQueryIndex = null
+    val setting = linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TYPING")
+    val replay = reuseTyping && this.graphStableIds && setting.value == "2" &&
+        !this.graphUnusedImports && !this.graphUnusedLocals && !this.graphUnusedParameters &&
+        !this.graphUnusedDeclarations && !this.graphJsonConstruction
+    if (!replay && this.graphIndexRevision != this.revision) this.graphQueryIndex = null
     bootstrapAnalysisSampleMemory("analysis begin")
+    if (replay) bootstrapAnalysisGraphModules.syntaxInputs = BootstrapModuleSyntaxInputs()
+    bootstrapAnalysisGraphModules.captureSyntaxInputs = replay
     val project = bootstrapFrontendLoadHostProject(entry, bootstrapAnalysisGraphModules)
+    bootstrapAnalysisGraphModules.captureSyntaxInputs = false
+    val syntax = if (replay) bootstrapAnalysisGraphModules.syntaxInputs.copy() else null
+    if (replay) bootstrapAnalysisGraphModules.syntaxInputs = BootstrapModuleSyntaxInputs()
     bootstrapAnalysisSampleMemory("project loaded")
     this.graphObserveInputs(project, entry)
     // The slot of `cached` is only set when this returns: on the way to a new generation nothing here holds the old one.
@@ -913,7 +1059,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
     }
     // The previous generation (its answer tree and indexes, ~2 GB on the compiler's own source) is released before the new one
     // is built, not when it is replaced: both were resident for the length of an analysis.
-    this.graphQueryIndex = null
+    if (!replay) this.graphQueryIndex = null
     val documents: array<BootstrapAnalysisGraphDocument> = []
     val names: Map<string, string> = Map()
     val pending: array<Json> = []
@@ -984,6 +1130,42 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
         builtinIds = bootstrapAnalysisGraphBuiltinIds(builtinParsed.parsed.declarations)
         for (declaration in builtinParsed.parsed.declarations) builtinDeclarations.append(declaration)
     }
+    val replayInputs = if (syntax != null && syntax.replayable && project.written.errors == 0 &&
+        project.written.extensionErrors == 0 && project.written.diagnostics == "" &&
+        pending.size == 0) {
+        val metadata: array<string> = []
+        for (index in 0 until this.graphInputPaths.size) {
+            val observed = this.graphInputPaths[index]
+            if (observed.startsWith("metadata:")) {
+                metadata.append(observed)
+                metadata.append(this.graphInputValues[index])
+            }
+        }
+        BootstrapAnalysisReplayInputs(syntax.copy(), metadata)
+    } else null
+    if (replay && linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TRACE").value == "1" && syntax != null) {
+        linuxPrintStandardError("abla-analysis-typing capture ready=${replayInputs != null} valid=${syntax.replayable} bytes=${syntax.expansionBytes} errors=${project.written.errors} diagnostics=${project.written.diagnostics.size} pending=${pending.size}\n")
+    }
+    if (replay && replayInputs != null) {
+        val prior = this.graphQueryIndex
+        val before = this.graphReplayInputs
+        if (prior != null && before != null) {
+            val reused = this.graphReplayBody(prior, documents, entry, before, replayInputs)
+            if (reused != null) {
+                this.graphReplayInputs = BootstrapAnalysisReplayInputs(replayInputs.syntax.copy(),
+                    bootstrapModuleCopyStrings(replayInputs.metadata))
+                this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(reused.snapshot, this.revision, reused.sets, reused.generated)
+                this.graphIndexRevision = this.revision
+                this.graphRememberGeneration(BootstrapAnalysisGraphGeneration(reused.snapshot.getString("revision"), reused.fingerprints, reused.uris))
+                if (linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TRACE").value == "1") {
+                    linuxPrintStandardError("abla-analysis-typing replayed a type-inert body edit\n")
+                }
+                bootstrapAnalysisSampleMemory("answer built")
+                return reused.snapshot
+            }
+        }
+    }
+    this.graphQueryIndex = null
     val begins: array<int> = []
     val ends: array<int> = []
     val kinds: array<string> = []
@@ -996,6 +1178,12 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
     }
     bootstrapAnalysisSampleMemory("documents parsed")
     val analyzed = bootstrapFrontendTypeProject(project.written, begins, ends, kinds, sources)
+    if (replay) {
+        this.graphReplayInputs = if (replayInputs != null && analyzed != null && analyzed.semantic.errors == 0 &&
+            analyzed.semantic.extensionErrors == 0 && analyzed.semantic.diagnostics == "") {
+            BootstrapAnalysisReplayInputs(replayInputs.syntax.copy(), bootstrapModuleCopyStrings(replayInputs.metadata))
+        } else null
+    }
     bootstrapAnalysisSampleMemory("typed")
     val aliases: Map<string, string> = Map()
     for (document in documents) bootstrapAnalysisGraphLocalAliases(document, aliases)

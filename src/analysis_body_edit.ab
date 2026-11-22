@@ -1,0 +1,137 @@
+// Replay a checked graph across the insertion of an unreferenced integer
+// binding. The proof operates on whole source lines and the parsed body;
+// other body edits continue through the ordinary checker.
+import "analysis_service.ab"
+import "module.ab"
+import "parser.ab"
+import "lexer.ab"
+import "abla/text"
+
+class BootstrapAnalysisBodyInsert(
+    val at: int,
+    val size: int,
+    val declarationBegin: int,
+    val name: string,
+    val nameBegin: int,
+    val nameEnd: int,
+    val line: string
+)
+
+fun bootstrapAnalysisBodyInsertion(before: string, after: string): BootstrapAnalysisBodyInsert? {
+    val size = after.size - before.size
+    if (size <= 0 || size > 256) return null
+    var common = 0
+    while (common < before.size && before[common] == after[common]) common = common + 1
+    var at = bootstrapAnalysisLineStart(before, common)
+    // An inserted line can share its entire prefix with the following line.
+    while (at <= common && at + size <= after.size) {
+        if (after[at + size - 1] == 10 &&
+            after.slice(at + size, after.size) == before.slice(at, before.size)) {
+            val line = after.slice(at, at + size)
+            val tokens = bootstrapLexShared(line.slice(0, line.size - 1))
+            if (tokens.size == 5 &&
+                bootstrapTokenText(line, tokens[0]) == "val" &&
+                tokens[1].kind == BOOTSTRAP_TOKEN_IDENTIFIER &&
+                tokens[2].kind == BOOTSTRAP_TOKEN_EQUAL &&
+                tokens[3].kind == BOOTSTRAP_TOKEN_INTEGER) {
+                val name = bootstrapTokenText(line, tokens[1])
+                val digits = bootstrapTokenText(line, tokens[3])
+                var decimal = digits.size > 0 && digits.size < 10
+                for (index in 0 until digits.size) {
+                    if (digits[index] < 48 || digits[index] > 57) decimal = false
+                }
+                // Require the single new name to be fresh throughout the
+                // source, including quoted text and interpolation.
+                if (decimal && before.indexOf(name) < 0 && !name.startsWith("__abla_") &&
+                    !line.contains("//") && !line.contains("/*")) {
+                    return BootstrapAnalysisBodyInsert(at, size, at + tokens[0].begin, name,
+                        at + tokens[1].begin, at + tokens[1].end, line)
+                }
+            }
+            return null
+        }
+        val end = before.indexOf("\n", at)
+        if (end < 0) return null
+        at = end + 1
+    }
+    null
+}
+
+fun bootstrapAnalysisPlainBodyInsertion(parsed: BootstrapParseResult, change: BootstrapAnalysisBodyInsert): bool {
+    if (parsed.errors != 0 || parsed.extensionErrors != 0) return false
+    for (declaration in parsed.declarations) {
+        val body = declaration.expression
+        if (declaration.kind != "fun" || declaration.resultType == "inferred" ||
+            declaration.typeParameters.size != 0 || declaration.annotations.size != 0 ||
+            declaration.extensionOwner != "" || declaration.generatedNamespace != "" ||
+            body.kind != "block" || body.begin >= change.at || body.end <= change.at + change.size ||
+            body.children.size < 2) continue
+        val added = body.children[0]
+        if (added.kind == "local.val" && added.text == change.name && added.begin == change.declarationBegin &&
+            added.end <= change.at + change.size && added.children.size == 2 &&
+            added.children[0].kind == "integer" && added.children[1].text == "inferred") return true
+    }
+    false
+}
+
+class BootstrapAnalysisReplayInputs(
+    val syntax: BootstrapModuleSyntaxInputs,
+    val metadata: array<string>
+)
+
+fun bootstrapAnalysisReplayStrings(left: array<string>, right: array<string>): bool {
+    if (left.size != right.size) return false
+    for (index in 0 until left.size) {
+        if (left[index] != right[index]) return false
+    }
+    true
+}
+
+fun bootstrapAnalysisReplayInputsAgree(before: BootstrapAnalysisReplayInputs,
+    after: BootstrapAnalysisReplayInputs, path: string, change: BootstrapAnalysisBodyInsert): bool {
+    val left = before.syntax
+    val right = after.syntax
+    if (!left.replayable || !right.replayable ||
+        !bootstrapAnalysisReplayStrings(before.metadata, after.metadata) ||
+        !bootstrapAnalysisReplayStrings(left.paths, right.paths) ||
+        !bootstrapAnalysisReplayStrings(left.hosts, right.hosts) ||
+        !bootstrapAnalysisReplayStrings(left.aliases, right.aliases) ||
+        !bootstrapAnalysisReplayStrings(left.expansions, right.expansions)) return false
+    var changed = false
+    for (index in 0 until left.paths.size) {
+        if (left.sources[index] == right.sources[index]) continue
+        if (changed || left.paths[index] != path || left.hosts[index] != "") return false
+        val prepared = bootstrapAnalysisBodyInsertion(left.sources[index], right.sources[index])
+        if (prepared == null || prepared.line != change.line) return false
+        changed = true
+    }
+    changed
+}
+
+fun bootstrapAnalysisReplayOccurrence(set: BootstrapAnalysisOccurrenceSet,
+    change: BootstrapAnalysisBodyInsert, id: string): BootstrapAnalysisOccurrenceSet? {
+    val begins: array<int> = []
+    val ends: array<int> = []
+    val ids: array<string> = []
+    val types: array<string> = []
+    var inserted = false
+    for (i in 0 until set.begins.size) {
+        val begin = set.begins[i]
+        val end = set.ends[i]
+        if (begin < change.at && end > change.at) return null
+        if (begin >= change.at && !inserted) {
+            begins.append(change.nameBegin)
+            ends.append(change.nameEnd)
+            ids.append(id)
+            types.append("")
+            inserted = true
+        }
+        val shift = if (begin < change.at) 0 else change.size
+        begins.append(begin + shift)
+        ends.append(end + shift)
+        ids.append(set.ids[i])
+        types.append(set.types[i])
+    }
+    if (!inserted) return null
+    BootstrapAnalysisOccurrenceSet(begins, ends, ids, types)
+}
