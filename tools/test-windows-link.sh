@@ -24,7 +24,7 @@ done
 cmp "$out/kernel32.lib" "$out/kernel32-again.lib" || fail "the import library is not reproducible"
 "$compiler" build tests/cases/windows/exit7.ab --target-triple x86_64-pc-windows-msvc --object-format coff -o "$out/exit7.obj" > "$out/compile.log" 2>&1 ||
     { cat "$out/compile.log" >&2; fail "exit7.ab did not compile to a COFF object"; }
-link() { lld-link /nologo /subsystem:console /entry:abla_start /nodefaultlib /machine:x64 /brepro "/out:$1" "$out/exit7.obj" "$out/kernel32.lib"; }
+link() { lld-link /nologo /subsystem:console /entry:abla_start /nodefaultlib /machine:x64 /brepro /fixed /highentropyva:no "/out:$1" "$out/exit7.obj" "$out/kernel32.lib"; }
 link "$out/exit7.exe" 2> "$out/link.log" || { cat "$out/link.log" >&2; fail "lld-link failed"; }
 link "$out/exit7-again.exe" 2> "$out/link.log"
 cmp "$out/exit7.exe" "$out/exit7-again.exe" || fail "the executable is not reproducible (/brepro)"
@@ -33,6 +33,8 @@ check_executable() { # $1 = the image, $2 = what it is
     headers=$(llvm-readobj --file-headers "$1")
     grep -q 'Format: COFF-x86-64' <<< "$headers" || fail "$2: not a PE x86-64 image"
     grep -q 'Subsystem: IMAGE_SUBSYSTEM_WINDOWS_CUI' <<< "$headers" || fail "$2: not a console image"
+    grep -q IMAGE_FILE_RELOCS_STRIPPED <<< "$headers" || fail "$2: a freestanding image has no relocations and is linked fixed"
+    ! grep -q IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE <<< "$headers" || fail "$2: DYNAMIC_BASE without a relocation table"
     entry=$(awk '/AddressOfEntryPoint/ { print $2 }' <<< "$headers")
     [[ -n $entry && $entry != 0x0 ]] || fail "$2: no entry point"
     imports=$(llvm-readobj --coff-imports "$1" | awk '/^ *Name:/ { dll = $2 } /^ *Symbol:/ { print dll, $2 }')
