@@ -150,7 +150,8 @@ for program in "$out/float-text.ab" "$out/math-fold.ab" tests/cases/libc-imports
     name=$(basename -- "$program" .ab)
     ABLA_SYSROOT="$root" "$out/ablac-static" --emit-llvm "$program" > "$out/$name.static.ll" 2> "$out/$name.static.ll.err" ||
         { echo "static compiler: --emit-llvm failed on $name" >&2; tail -3 "$out/$name.static.ll.err" >&2; exit 1; }
-    "$compiler" --emit-llvm "$program" > "$out/$name.dynamic.ll" 2> "$out/$name.dynamic.ll.err" ||
+    # (the same sysroot for both: the module names in the text carry the stdlib path as the compiler was given it)
+    ABLA_SYSROOT="$root" "$compiler" --emit-llvm "$program" > "$out/$name.dynamic.ll" 2> "$out/$name.dynamic.ll.err" ||
         { echo "static compiler: the ordinary compiler's --emit-llvm failed on $name" >&2; exit 1; }
     cmp -s "$out/$name.static.ll" "$out/$name.dynamic.ll" || { echo "static compiler: the LLVM text of $name differs from the ordinary compiler's" >&2; exit 1; }
 done
