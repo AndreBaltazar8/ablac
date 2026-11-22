@@ -27,7 +27,8 @@ export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-8192}
 out=build/static-compiler-aarch64
 rm -rf "$out"
 mkdir -p "$out"
-"$compiler" build src/orc_main_static.ab --target aarch64-linux -o "$out/ablac-static" --no-cache > "$out/build.log" 2>&1 ||
+# (with ABLA_STATIC_LLD_LIB, ABLA_STATIC_LLD_INCLUDE, ABLA_STATIC_LLVM_INCLUDE, ABLA_STATIC_CXX and ABLA_STATIC_CXXFLAGS the build script carries the real shim: #1124)
+ABLA_STATIC_TARGET=aarch64-linux tools/build-static-compiler.sh "$compiler" "$out/ablac-static" > "$out/build.log" 2>&1 ||
     { echo 'static compiler aarch64: the build failed' >&2; grep -v 'warning' "$out/build.log" | tail -8 >&2; exit 1; }
 file -b "$out/ablac-static" | grep 'ARM aarch64.*static-pie linked' > /dev/null || { echo 'static compiler aarch64: not an AArch64 static-pie image' >&2; exit 1; }
 needed=$(readelf -d "$out/ablac-static" | grep -c '(NEEDED)' || true)
@@ -59,6 +60,20 @@ for source in tests/cases/libc-imports/hello.ab tests/cases/libc-imports/strings
         diff "$out/$name.static.out" "$out/$name.cross.out" | head -5 >&2; exit 1; }
     count=$((count + 1))
 done
+# With the shim (#1124): the compiler needs no tools of its own PATH for an AArch64 build, the way a Raspberry Pi without LLVM installed uses it: an empty PATH,
+# release and --fast, programs that print what the ordinary compiler's builds do.
+if [[ -n ${ABLA_STATIC_LLD_LIB:-} ]]; then
+    mkdir -p "$out/empty"
+    for mode in release fast; do
+        flags=()
+        [[ $mode == fast ]] && flags=(--fast)
+        env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_SYSROOT="$ABLA_SYSROOT" ABLA_MAX_MEMORY_MB="$ABLA_MAX_MEMORY_MB" ABLA_CACHE_DIR="$PWD/$out/empty-$mode.cache" \
+            "$(command -v qemu-aarch64)" "$out/ablac-static" build tests/cases/libc-imports/hello.ab -o "$out/empty-$mode" --no-cache "${flags[@]}" > "$out/empty-$mode.log" 2>&1 ||
+            { echo "static compiler aarch64: hello ($mode) did not build on an empty PATH" >&2; grep -v 'warning' "$out/empty-$mode.log" | tail -5 >&2; exit 1; }
+        [[ $(qemu-aarch64 "$out/empty-$mode") == hello ]] || { echo "static compiler aarch64: the $mode hello built on an empty PATH did not print hello" >&2; exit 1; }
+    done
+    echo 'static compiler aarch64: hello builds (release and --fast) on an empty PATH'
+fi
 # The JIT: `ablac run` and the compile-time jit tier find the process's symbols through the library's dlsym table (src/static_libc/dl.ab), here with
 # LLVM's AArch64 JIT running under qemu-aarch64; and the three compile-time evaluation tiers agree.
 run=$(qemu-aarch64 "$out/ablac-static" run tests/cases/libc-imports/hello.ab 2>&1) || { echo "static compiler aarch64: ablac run failed: $run" >&2; exit 1; }
