@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # #811: `--target aarch64-linux` builds a static executable that needs no libc and no
 # dynamic loader, and the small hosted programs and the system call checks behave under
-# qemu-aarch64 exactly as the x86-64 builds do (output and exit status).
+# the selected AArch64 runner exactly as the x86-64 builds do (output and exit status).
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -44,8 +44,9 @@ wait_one() { # waits for the oldest worker; records the argument of one that fai
     pids=("${pids[@]:1}")
     arguments=("${arguments[@]:1}")
 }
-have_qemu=1
-command -v qemu-aarch64 > /dev/null || have_qemu=0
+source "$root/tools/aarch64-test-runner.sh"
+have_runner=1
+aarch64_runner_available || have_runner=0
 programs='tests/cases/libc-imports/hello.ab tests/cases/libc-imports/float-remainder.ab
 tests/cases/libc-imports/strings-arrays.ab tests/cases/libc-imports/files.ab
 tests/cases/libc-imports/tasks.ab tests/cases/libc-imports/threads.ab'
@@ -53,7 +54,7 @@ checks='tests/cases/linux-syscall/main.ab tests/cases/linux-syscall/legacy.ab te
 tests/cases/modules/http-client.ab
 tests/cases/linux-syscall/random.ab tests/cases/linux-syscall/wide.ab tests/cases/linux-syscall/int128.ab tests/cases/linux-syscall/memory.ab
 tests/cases/libc-memory-routines/main.ab tests/cases/rsa-default-random/main.ab'
-program_check() { # SOURCE: both modes, built for AArch64, checked, and run under qemu against the native build
+program_check() { # SOURCE: both modes, built for AArch64, checked, and run on AArch64 against the native build
     local source=$1 name mode flags file_kind native_status foreign_status
     name=$(basename "$source" .ab)-$(basename "$(dirname "$source")")
     for mode in release fast; do
@@ -67,15 +68,15 @@ program_check() { # SOURCE: both modes, built for AArch64, checked, and run unde
         if readelf -d "$out/$name-$mode" 2> /dev/null | grep NEEDED >/dev/null || readelf -l "$out/$name-$mode" | grep INTERP >/dev/null; then
             fail "$name $mode needs a shared library or a loader"
         fi
-        [[ $have_qemu -eq 1 ]] || continue
+        [[ $have_runner -eq 1 ]] || continue
         native_status=0
         foreign_status=0
         # shellcheck disable=SC2086
         "$compiler" build "$source" -o "$out/$name-native-$mode" --no-cache $flags > /dev/null 2>&1 \
             || fail "$name $mode native build failed"
         (cd "$out" && timeout 120 "./$name-native-$mode" < /dev/null > "$name-$mode.native.out" 2> /dev/null) || native_status=$?
-        (cd "$out" && timeout 300 qemu-aarch64 "./$name-$mode" < /dev/null > "$name-$mode.out" 2> /dev/null) || foreign_status=$?
-        [[ $native_status -eq $foreign_status ]] || fail "$name $mode: status $foreign_status under qemu, $native_status natively"
+        (cd "$out" && aarch64_run --timeout 300 -- "./$name-$mode" < /dev/null > "$name-$mode.out" 2> /dev/null) || foreign_status=$?
+        [[ $native_status -eq $foreign_status ]] || fail "$name $mode: status $foreign_status on AArch64, $native_status natively"
         cmp -s "$out/$name-$mode.native.out" "$out/$name-$mode.out" || fail "$name $mode: output differs from the native build"
     done
 }
@@ -118,26 +119,26 @@ fi
 parallel_each static_both_check $static_both
 # shellcheck disable=SC2086
 parallel_each static_fast_check $static_fast
-if [[ $have_qemu -eq 1 ]]; then
+if [[ $have_runner -eq 1 ]]; then
     # A bad access in a --fast build: the fault report, then the default action (SIGSEGV).
     # The debug runtime needs debug information, which the suite turns off (ABLA_DEBUG=0).
     ABLA_DEBUG=1 "$compiler" build tests/cases/linux-syscall/fault.ab --target aarch64-linux -o "$out/fault" --fast --no-cache > /dev/null 2>&1 || fail "the fault program did not build"
     status=0
-    (ulimit -c 0; timeout 300 qemu-aarch64 "$out/fault" < /dev/null > /dev/null 2> "$out/fault.err") || status=$?
+    (ulimit -c 0; aarch64_run --timeout 300 -- "$out/fault" < /dev/null > /dev/null 2> "$out/fault.err") || status=$?
     [[ $status -eq 139 ]] && grep -q "^fatal signal" "$out/fault.err" && grep -q "^0x" "$out/fault.err" || fail "fault report: status $status, $(cat "$out/fault.err")"
     for mode in "" --fast; do
         # shellcheck disable=SC2086
         "$compiler" build tests/cases/linux-syscall/stack-overflow.ab --target aarch64-linux -o "$out/overflow" --no-cache $mode > /dev/null 2>&1 || fail "the stack overflow program did not build"
         status=0
-        timeout 300 qemu-aarch64 "$out/overflow" < /dev/null > /dev/null 2> "$out/overflow.err" || status=$?
+        aarch64_run --timeout 300 -- "$out/overflow" < /dev/null > /dev/null 2> "$out/overflow.err" || status=$?
         [[ $status -eq 101 ]] && grep -qx "panic: stack overflow" "$out/overflow.err" || fail "stack overflow: status $status, $(cat "$out/overflow.err")"
         # shellcheck disable=SC2086
         "$compiler" build tests/cases/linux-syscall/thread-stack-overflow.ab --target aarch64-linux -o "$out/thread-overflow" --no-cache $mode > /dev/null 2>&1 || fail "the thread stack overflow program did not build"
         status=0
-        timeout 300 qemu-aarch64 "$out/thread-overflow" < /dev/null > /dev/null 2> "$out/thread-overflow.err" || status=$?
+        aarch64_run --timeout 300 -- "$out/thread-overflow" < /dev/null > /dev/null 2> "$out/thread-overflow.err" || status=$?
         [[ $status -eq 101 ]] && grep -qx "panic: stack overflow" "$out/thread-overflow.err" || fail "a thread's stack overflow: status $status, $(cat "$out/thread-overflow.err")"
     done
-    echo 'aarch64 linux: static libc-free builds run under qemu-aarch64 like the x86-64 ones'
+    echo 'aarch64 linux: static libc-free builds run on AArch64 like the x86-64 ones'
 else
-    echo 'aarch64 linux: static libc-free builds made; no qemu-aarch64, not run'
+    echo 'aarch64 linux: static libc-free builds made; no AArch64 runner, not run'
 fi

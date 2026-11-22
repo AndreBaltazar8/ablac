@@ -15,6 +15,7 @@ rounds=${CHACHA_ROUNDS:-2}
 rm -rf "$out"
 mkdir -p "$out"
 cd "$project_root"
+source "$project_root/tools/aarch64-test-runner.sh"
 cases=tests/cases/crypto-chacha
 
 status=0
@@ -54,7 +55,7 @@ fi
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache > "$out/aarch64.log" 2>&1 || { cat "$out/aarch64.log"; fail "aarch64 build"; }
 llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s -o "$out/aarch64-start.o"
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
-if qemu-aarch64 -cpu max "$out/aarch64"; then echo "ok   aarch64 under qemu: RFC 8439 vectors"; else fail "aarch64: check $?"; fi
+if aarch64_run --cpu max -- "$out/aarch64"; then echo "ok   aarch64: RFC 8439 vectors"; else fail "aarch64: check $?"; fi
 
 tools_directory="$out/xtensa-tools"
 . "$project_root/tools/xtensa-test-tools.sh"

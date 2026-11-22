@@ -7,6 +7,7 @@ compiler=${1:-$project_root/build/ablac}
 out="$project_root/build/coverage"
 rm -rf "$out"; mkdir -p "$out"
 cd "$project_root"
+source "$project_root/tools/aarch64-test-runner.sh"
 fixture=tests/cases/coverage/main.ab
 "$compiler" build "$fixture" -o "$out/flagged" --fast --coverage-functions
 "$compiler" build "$fixture" -o "$out/plain" --fast --no-cache
@@ -96,37 +97,43 @@ grep -qx 'tests/cases/coverage-nested/child.ab' "$out/nested/child.txt"
 ABLA_COVERAGE_OUT="$out/nested/grandchild.txt" "$out/nested/grandchild" return
 expect_ran "$out/nested/grandchild.txt"
 [ -s "$out/nested/host.wasm" ] || { echo "coverage: unsupported child not built"; exit 1; }
-# AArch64 Linux, under qemu-aarch64: the dump by system calls too (no libc), in --fast and release; each end, %p,
+# AArch64 Linux: the dump by system calls too (no libc), in --fast and release; each end, %p,
 # SIGTERM (143) and threads. It could not build before: the dump's string helpers were x86-64 assembly.
-if command -v qemu-aarch64 > /dev/null; then
+if aarch64_runner_available; then
     a64=$out/aarch64; mkdir -p "$a64"
+    coverage_run() ( # report executable [args...]
+        cd "$a64"
+        report=$1
+        shift
+        aarch64_run --collect "$a64" --env "ABLA_COVERAGE_OUT=$report" -- "$@"
+    )
     for build in fast release; do
         flags=--fast; [ "$build" = release ] && flags=
         "$compiler" build "$fixture" -o "$a64/flagged-$build" --target aarch64-linux $flags --coverage-functions \
             > "$a64/build-$build.log" 2>&1 || { cat "$a64/build-$build.log"; echo "coverage: aarch64 $build did not build"; exit 1; }
         for mode in return exit panic; do
-            ABLA_COVERAGE_OUT="$a64/$build-$mode.txt" qemu-aarch64 "$a64/flagged-$build" "$mode" > /dev/null 2>&1 || true
+            coverage_run "$build-$mode.txt" "./flagged-$build" "$mode" > /dev/null 2>&1 || true
             expect_ran "$a64/$build-$mode.txt"; sorted "$a64/$build-$mode.txt"
             [ ! -e "$a64/$build-$mode.txt.tmp" ] || { echo "coverage: aarch64 $build $mode left its .tmp"; exit 1; }
         done
-        ABLA_COVERAGE_OUT="$a64/$build-pid-%p.txt" qemu-aarch64 "$a64/flagged-$build" return
+        coverage_run "$build-pid-%p.txt" "./flagged-$build" return
         [ "$(ls "$a64"/$build-pid-*.txt | wc -l)" = 1 ] && ! ls "$a64/$build-pid-%p.txt" 2>/dev/null ||
             { echo "coverage: aarch64 $build %p was not the pid"; exit 1; }
-        (cd "$a64" && qemu-aarch64 "$a64/flagged-$build" return)
+        coverage_run "" "./flagged-$build" return
         [ -z "$(ls "$a64" | grep -v -e flagged -e '\.txt$' -e '\.log$')" ] || { echo "coverage: aarch64 wrote without the variable"; exit 1; }
-        # SIGTERM in --fast only: the fixture's wait is an empty loop, which a release build removes.
-        [ "$build" = fast ] || continue
-        ABLA_COVERAGE_OUT="$a64/$build-term.txt" qemu-aarch64 "$a64/flagged-$build" wait & pid=$!
-        sleep 1; kill -TERM "$pid"; status=0; wait "$pid" || status=$?
+        # Have the fixture send SIGTERM after running its helper, so this also
+        # checks the real signal on a remote host where the PID is not local.
+        status=0
+        coverage_run "$build-term.txt" "./flagged-$build" term || status=$?
         [ "$status" = 143 ] || { echo "coverage: aarch64 $build SIGTERM status $status, expected 143"; exit 1; }
         expect_ran "$a64/$build-term.txt"
     done
     "$compiler" build tests/cases/coverage/threads.ab -o "$a64/threads" --target aarch64-linux --fast --coverage-functions
-    ABLA_COVERAGE_OUT="$a64/threads.txt" qemu-aarch64 "$a64/threads" > /dev/null 2>&1 || true
+    coverage_run "threads.txt" ./threads > /dev/null 2>&1 || true
     grep -qx 'tests/cases/coverage/sub/third.ab' "$a64/threads.txt" && grep -qx 'tests/cases/coverage/sub/used.ab' "$a64/threads.txt" ||
         { echo "coverage: an aarch64 thread's file is missing"; cat "$a64/threads.txt"; exit 1; }
 else
-    echo "coverage: no qemu-aarch64, the aarch64 runs skipped"
+    echo "coverage: no AArch64 runner"
 fi
 # Refused where it does not apply.
 if "$compiler" build "$fixture" -o "$out/refused" --fast --coverage-functions --target-triple wasm32-unknown-unknown --object-format wasm --emit object > "$out/refused.log" 2>&1; then

@@ -8,6 +8,7 @@ compiler=${1:-build/ablac}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 sysroot=${ABLA_SYSROOT:-$root}
 cd "$root"
+source "$root/tools/aarch64-test-runner.sh"
 out=${ABLA_TAGGED_POINTERS_OUT:-$root/build/android-pointer-tags}
 mkdir -p "$out"
 bash tests/cases/android-pointer-tags/prepare.sh "$root" "$sysroot" "$out"
@@ -36,7 +37,7 @@ for profile in release fast; do
         ld.lld -static --no-pie -z notext "$out/$profile.o" "$out/$entry-start.o" -o "$out/$entry-$profile"
         expected=0
         [[ $entry == bad_* ]] && expected=66
-        run_case "$entry-$profile" "$expected" timeout 60 qemu-aarch64 -cpu max "$out/$entry-$profile"
+        run_case "$entry-$profile" "$expected" aarch64_run --timeout 60 --cpu max -- "$out/$entry-$profile"
     done
 done
 [[ $failures == 0 ]] || { echo "tagged pointers: $failures cases failed" >&2; exit 1; }

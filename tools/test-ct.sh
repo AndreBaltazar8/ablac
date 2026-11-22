@@ -19,6 +19,7 @@ out=build/ct
 [[ $parts == all ]] || out=build/ct-${parts// /-}
 cases=$out/cases
 cd "$project_root"
+source "$project_root/tools/aarch64-test-runner.sh"
 rm -rf "$out"
 mkdir -p "$out"
 # The checker, its fixture generators and their self-tests are Abla programs (tools/ct/check, tools/ct/fixtures). They
@@ -1008,7 +1009,7 @@ if part aarch64; then
 "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache
 llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s -o "$out/aarch64-start.o"
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
-qemu-aarch64 -cpu max "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
+aarch64_run --cpu max -- "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
 read_target aarch64 "$out/aarch64.o"
 owner_wipe_read aarch64 "$out/aarch64.o"
 # The allocation probe as an AArch64 object (built by the driver above): the same out-of-line check as x86-64.

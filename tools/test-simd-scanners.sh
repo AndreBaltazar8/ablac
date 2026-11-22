@@ -6,14 +6,15 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* ]] || compiler="$PWD/$compiler"
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+source "$root/tools/aarch64-test-runner.sh"
 cases=tests/cases/simd
 out=build/simd-scanners
 mkdir -p "$out"
 "$compiler" build "$cases/scanners.ab" -o "$out/native" --no-cache
 "$out/native" "${ABLA_SCAN_FUZZ_CASES:-1200}" > "$out/native.out"
-if [[ $(uname -m) == x86_64 ]] && command -v qemu-aarch64 >/dev/null; then
+if [[ $(uname -m) == x86_64 ]] && aarch64_runner_available; then
     "$compiler" build "$cases/scanners.ab" --target aarch64-linux -o "$out/scalar" --no-cache
-    qemu-aarch64 "$out/scalar" "${ABLA_SCAN_FUZZ_CASES:-1200}" > "$out/scalar.out"
+    aarch64_run -- "$out/scalar" "${ABLA_SCAN_FUZZ_CASES:-1200}" > "$out/scalar.out"
     cmp "$out/native.out" "$out/scalar.out"
     echo "SIMD scanners: x86-64 and scalar AArch64 agree"
 else

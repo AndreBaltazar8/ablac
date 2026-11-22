@@ -11,6 +11,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+source "$root/tools/aarch64-test-runner.sh"
 [[ $(uname -s) == Linux ]] || { echo 'fork heap: Linux only'; exit 0; }
 out="$root/build/fork-heap"
 rm -rf "$out"
@@ -71,9 +72,9 @@ for mode in release fast; do
         "$compiler" build tests/cases/fork-heap/syscall.ab -o "$out/syscall-$mode" "${flags[@]}"
         run "fork system call ($mode)" "$out/syscall-$mode"
     fi
-    if command -v qemu-aarch64 > /dev/null; then
+    if aarch64_runner_available; then
         "$compiler" build tests/cases/fork-heap/syscall.ab --target aarch64-linux -o "$out/arm-$mode" "${flags[@]}"
-        run "fork system call, AArch64 ($mode)" qemu-aarch64 "$out/arm-$mode"
+        run "fork system call, AArch64 ($mode)" "$root/tools/aarch64-test-runner.sh" --timeout 120 -- "$out/arm-$mode"
     fi
 done
 host_cc=${CC:-}

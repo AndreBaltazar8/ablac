@@ -16,6 +16,7 @@ rm -rf "$out"
 mkdir -p "$out/keys" "$out/work"
 chmod 700 "$out/keys"
 cd "$project_root"
+source "$project_root/tools/aarch64-test-runner.sh"
 cases=tests/cases/crypto-pure
 
 status=0
@@ -249,7 +250,7 @@ llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
 llvm-objdump -d "$out/aarch64" > "$out/aarch64.s"
 grep -q aese "$out/aarch64.s" || fail "no AESE in the AArch64 program"
-if qemu-aarch64 -cpu max "$out/aarch64"; then echo "ok   aarch64 under qemu: known answers, hardware and software"; else fail "aarch64: check $?"; fi
+if aarch64_run --cpu max -- "$out/aarch64"; then echo "ok   aarch64: known answers, hardware and software"; else fail "aarch64: check $?"; fi
 tools_directory="$out/xtensa-tools"
 . "$project_root/tools/xtensa-test-tools.sh"
 abla_xtensa_test_prepare "$tools_directory"

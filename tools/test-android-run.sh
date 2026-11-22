@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # An arm64 Android library actually executed (#811): the library tests/cases/android-run/lib.ab is built by the Android
 # build step, loaded with dlopen by a small NDK-built driver running under bionic's own linker (linker64, libc, libm,
-# libdl of Google's arm64 Android 36 image) on qemu-aarch64, and its exports are called: getrandom (secureRandomBytes)
+# libdl of Google's arm64 Android 36 image) on AArch64, and its exports are called: getrandom (secureRandomBytes)
 # through the library's own system call routine, and heap, strings, maps and thread-locals (emulated TLS on bionic's
 # pthread keys). It catches what the link check (tools/test-android-link.sh) cannot: a library the dynamic linker
 # refuses (an import no needed library provides: no DT_NEEDED libc.so, a symbol newer than the API level), a crash
 # in the library's start-up (init arrays, relocations), a wrong system call number or translation, a TLS or heap
 # fault, a wrong result.
-# Needs the NDK (ABLA_ANDROID_NDK, ANDROID_NDK_ROOT, ... as the other Android tests), qemu-aarch64 and a bionic sysroot
+# Needs the NDK (ABLA_ANDROID_NDK, ANDROID_NDK_ROOT, ... as the other Android tests), an AArch64 runner and a bionic sysroot
 # made by tools/prepare-bionic-sysroot.sh (ABLA_BIONIC_ROOT=<directory>); without any of them it says so and skips.
 set -euo pipefail
 compiler=${1:-build/ablac}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+source "$root/tools/aarch64-test-runner.sh"
 if [[ $(uname -s) != Linux ]]; then echo 'android run: Linux only'; exit 0; fi
 missing() {
     if [[ ${ABLA_REQUIRE_ANDROID_TESTS:-0} == 1 ]]; then
@@ -25,7 +26,8 @@ missing() {
 bionic=${ABLA_BIONIC_ROOT:-}
 [[ -n $bionic && -x $bionic/system/bin/bootstrap/linker64 ]] ||
     missing 'bionic sysroot (set ABLA_BIONIC_ROOT)'
-command -v qemu-aarch64 > /dev/null || missing qemu-aarch64
+aarch64_runner_available || missing 'AArch64 runner'
+bionic=$(cd -- "$bionic" && pwd)
 clang=
 for r in "${ABLA_ANDROID_NDK:-}" "${ANDROID_NDK_ROOT:-}" "${ANDROID_NDK_HOME:-}" "${ANDROID_HOME:-}/ndk" \
     "${ANDROID_SDK_ROOT:-}/ndk" "${ANDROID_HOME:-}/ndk-bundle" "${ANDROID_SDK_ROOT:-}/ndk-bundle"; do
@@ -47,9 +49,38 @@ status=0
 library=$PWD/$out/lib/src/main/jniLibs/arm64-v8a/libabla_app.so
 [[ -f $library ]] || fail "no $library"
 "$clang" tests/cases/android-run/driver.c -o "$out/driver" -ldl -Wl,--export-dynamic || fail 'the driver did not build'
+bionic_inputs=()
+if [[ -n ${ABLA_AARCH64_RUN:-} ]]; then
+    # The Android linker takes an absolute program path. /proc/self/cwd
+    # resolves inside the per-job directory in both the Pi and QEMU lanes.
+    mkdir -p "$out/bionic/lib64/bootstrap"
+    for lib in lib64/liblog.so lib64/bootstrap/{libc,libdl_android,libdl,libm}.so; do
+        cp -L -- "$bionic/system/$lib" "$out/bionic/$lib"
+        bionic_inputs+=(--input "bionic/$lib")
+    done
+fi
+run_android() ( # timeout library arguments...
+    duration=$1
+    image=$2
+    shift 2
+    stress=()
+    if [[ -v ABLA_GC_STRESS ]]; then stress=(--env "ABLA_GC_STRESS=$ABLA_GC_STRESS"); fi
+    linker=$bionic/system/bin/bootstrap/linker64
+    if [[ -n ${ABLA_AARCH64_RUN:-} ]]; then
+        cd "$out"
+        relative_image=${image#"$root/$out/"}
+        aarch64_run --timeout "$duration" "${stress[@]}" "${bionic_inputs[@]}" \
+            --input driver --input "$relative_image" \
+            --env 'LD_LIBRARY_PATH=/proc/self/cwd/bionic/lib64/bootstrap:/proc/self/cwd/bionic/lib64' \
+            -- "$linker" /proc/self/cwd/driver "/proc/self/cwd/$relative_image" "$@"
+    else
+        aarch64_run --timeout "$duration" "${stress[@]}" \
+            --env "LD_LIBRARY_PATH=$bionic/system/lib64/bootstrap:$bionic/system/lib64" \
+            -- "$linker" "$PWD/$out/driver" "$image" "$@"
+    fi
+)
 status=0
-LD_LIBRARY_PATH="$bionic/system/lib64/bootstrap:$bionic/system/lib64" timeout 300 qemu-aarch64 \
-    "$bionic/system/bin/bootstrap/linker64" "$PWD/$out/driver" "$library" \
+run_android 300 "$library" \
     abla_run_random nonzero abla_run_heap 465 abla_run_thread 142 abla_run_threads_heap 1860 abla_run_seed 78 abla_run_nested 77 abla_run_collected 1 > "$out/run.out" 2> "$out/run.err" < /dev/null || status=$?
 if [[ $status -ne 0 ]]; then
     cat "$out/run.out" >&2
@@ -64,8 +95,7 @@ for stress in 0 1; do
     count=8
     [[ $stress -eq 0 ]] || count=4
     status=0
-    ABLA_GC_STRESS=$stress LD_LIBRARY_PATH="$bionic/system/lib64/bootstrap:$bionic/system/lib64" timeout 600 qemu-aarch64 \
-        "$bionic/system/bin/bootstrap/linker64" "$PWD/$out/driver" "$library" -t "$count" abla_run_churn 1 \
+    ABLA_GC_STRESS=$stress run_android 600 "$library" -t "$count" abla_run_churn 1 \
         > "$out/threads-$stress.out" 2> "$out/threads-$stress.err" < /dev/null || status=$?
     if [[ $status -ne 0 ]]; then
         cat "$out/threads-$stress.out" >&2
@@ -82,10 +112,9 @@ ABLA_DEBUG=1 "$out/build-debug" > "$out/generate-debug.log" 2>&1 || status=$?
 [[ $status -eq 37 ]] || { cat "$out/generate-debug.log" >&2; fail "building the debug library failed ($status)"; }
 debug_library=$PWD/$out/lib-debug/src/main/jniLibs/arm64-v8a/libabla_app.so
 status=0
-LD_LIBRARY_PATH="$bionic/system/lib64/bootstrap:$bionic/system/lib64" timeout 300 qemu-aarch64 \
-    "$bionic/system/bin/bootstrap/linker64" "$PWD/$out/driver" "$debug_library" abla_run_panic 0 \
+run_android 300 "$debug_library" abla_run_panic 0 \
     > "$out/panic.out" 2> "$out/panic.err" < /dev/null || status=$?
 [[ $status -eq 101 ]] && grep -qx 'panic: index 5 out of bounds for array of size 1' "$out/panic.err" &&
     grep -q '^stack (return addresses' "$out/panic.err" && grep -q '^load address 0x' "$out/panic.err" ||
     { grep -v 'linkerconfig' "$out/panic.err" >&2; fail "the panic report: status $status"; }
-echo 'android run: the arm64 Android library loads in bionic'"'"'s linker and its exports run under qemu-aarch64, also from concurrent foreign threads, and a debug panic reports'
+echo 'android run: the arm64 Android library loads in bionic'"'"'s linker and its exports run on AArch64, also from concurrent foreign threads, and a debug panic reports'

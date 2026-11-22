@@ -13,6 +13,7 @@ compiler=${1:-build/ablac}
 unset ABLA_DEBUG ABLA_TEST_FAST_BUILDS
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+source "$root/tools/aarch64-test-runner.sh"
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || { echo 'static compiler aarch64: x86-64 Linux only'; exit 0; }
 if [[ -z ${ABLA_STATIC_LLVM_LIB:-} || ! -f ${ABLA_STATIC_LLVM_LIB}/libLLVMSupport.a || -z ${ABLA_STATIC_TARGET_LIBS:-} ||
     ! -f ${ABLA_STATIC_TARGET_LIBS}/libstdc++.a ]] || ! command -v qemu-aarch64 > /dev/null; then
@@ -41,10 +42,10 @@ export ABLA_NATIVE_JOBS=1 ABLA_CODEGEN_JOBS=1
 count=0
 # Run natively (here under qemu) the compiler builds for the machine it runs on: no --target is the same as --target aarch64-linux (#806 step C). That
 # is its in-process code generation, not the external opt/llc the x86-64 compiler's cross build uses, so the executables are not byte-identical to the
-# cross build's; what must agree is what the programs do, run under qemu-aarch64 in a directory of their own: output and exit status.
+# cross build's; what must agree is what the programs do, run in a directory of their own: output and exit status.
 run_program() { # executable directory output
     mkdir -p "$2"
-    (cd "$2" && qemu-aarch64 "$OLDPWD/$1" > "$OLDPWD/$3" 2>&1 < /dev/null; echo "exit $?" >> "$OLDPWD/$3") || true
+    (cd "$2" && aarch64_run -- "$OLDPWD/$1" > "$OLDPWD/$3" 2>&1 < /dev/null; echo "exit $?" >> "$OLDPWD/$3") || true
 }
 for source in tests/cases/libc-imports/hello.ab tests/cases/libc-imports/strings-arrays.ab tests/cases/libc-imports/files.ab \
     tests/cases/libc-imports/float-remainder.ab tests/cases/libc-imports/tasks.ab tests/cases/libc-imports/threads.ab \
@@ -97,7 +98,7 @@ AB
 for tier in interp jit auto; do
     ABLA_COMPILE_EVAL_TIMES=1 ABLA_COMPILE_EVAL=$tier qemu-aarch64 "$out/ablac-static" build "$out/compile-time.ab" -o "$out/compile-time-$tier" --no-cache > "$out/compile-time-$tier.log" 2>&1 ||
         { echo "static compiler aarch64: the $tier tier failed" >&2; grep -v 'warning' "$out/compile-time-$tier.log" | tail -5 >&2; exit 1; }
-    [[ $(qemu-aarch64 "$out/compile-time-$tier") == 'answer 6765' ]] || { echo "static compiler aarch64: the $tier tier answered wrong" >&2; exit 1; }
+    [[ $(aarch64_run -- "$out/compile-time-$tier") == 'answer 6765' ]] || { echo "static compiler aarch64: the $tier tier answered wrong" >&2; exit 1; }
     # Which tier ran the `#` site is in the times the compiler reports (ABLA_COMPILE_EVAL_TIMES=1): jit must have run it as native AArch64 code (the
     # JIT generated and ran it in the process, not the evaluator), interp must have used the evaluator.
     case $tier in
@@ -108,7 +109,7 @@ for tier in interp jit auto; do
     esac
 done
 [[ $(head -n 1 "$out/hello.static.out") == hello ]] || { echo 'static compiler aarch64: the hello it built did not print hello' >&2; exit 1; }
-echo "static compiler aarch64: static-pie, no needed library, the default target is AArch64, $count programs it builds behave as the ordinary compiler's cross builds under qemu, ablac run and the three compile-time tiers work (jit runs the site as native code), hello runs"
+echo "static compiler aarch64: static-pie, no needed library, the default target is AArch64, $count program outputs match the ordinary compiler's cross builds, ablac run and the three compile-time tiers work (jit runs the site as native code), hello runs"
 # End to end: with STATIC_AARCH64_MODULES=1 the AArch64 half of the module-program check (tests/cases/modules built --fast for aarch64-linux link no
 # C library, tools/test-libc-free-programs.sh) has this compiler, under qemu, as its builder; no x86-64 compiler builds a program. About nine minutes on
 # eight cores. ABLA_STATIC_LLVM_LIB is left out of that run so the programs that import LLVM stay the exceptions the allowlist names.

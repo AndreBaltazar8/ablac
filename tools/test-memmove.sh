@@ -9,6 +9,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+source "$root/tools/aarch64-test-runner.sh"
 out=build/memmove
 rm -rf "$out"
 mkdir -p "$out"
@@ -21,9 +22,10 @@ for mode in release fast; do
         result=$("$root/tools/run-limited.sh" "$out/native-$mode") || { echo "memmove x86-64 ($mode): $result" >&2; exit 1; }
         [[ $result == 'memmove ok' ]] || { echo "memmove x86-64 ($mode): $result" >&2; exit 1; }
     fi
-    if command -v qemu-aarch64 > /dev/null; then
+    if aarch64_runner_available; then
         "$compiler" build "$source" --target aarch64-linux -o "$out/arm-$mode" "${flags[@]}"
-        result=$("$root/tools/run-limited.sh" qemu-aarch64 "$out/arm-$mode") || { echo "memmove AArch64 ($mode): $result" >&2; exit 1; }
+        result=$("$root/tools/run-limited.sh" "$root/tools/aarch64-test-runner.sh" \
+            --timeout "${ABLA_MAX_SECONDS:-600}" -- "$out/arm-$mode") || { echo "memmove AArch64 ($mode): $result" >&2; exit 1; }
         [[ $result == 'memmove ok' ]] || { echo "memmove AArch64 ($mode): $result" >&2; exit 1; }
     fi
 done

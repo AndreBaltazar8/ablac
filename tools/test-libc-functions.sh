@@ -11,6 +11,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+source "$root/tools/aarch64-test-runner.sh"
 [[ $(uname -s) == Linux ]] || { echo 'libc functions: Linux only'; exit 0; }
 out=build/libc-functions
 rm -rf "$out"
@@ -32,20 +33,20 @@ code=0
 echo 'libc functions: math, iconv, posix_spawn, wcsftime and __stack_chk_fail agree'
 # The same modules for AArch64 Linux (#806 step C, the static compiler's second target): the programs that do not run another program are
 # built with --target aarch64-linux and run under qemu-aarch64 (posix_spawn's test starts the host's /bin/sh, which the guest cannot).
-if command -v qemu-aarch64 > /dev/null; then
+if aarch64_runner_available; then
     for name in math-functions correct-rounding iconv wcsftime stack-chk-fail; do
         "$compiler" build "tests/cases/libc-$name/main.ab" -o "$out/$name.aarch64" --target aarch64-linux --no-cache > "$out/$name.aarch64.build.log" 2>&1 ||
             { echo "libc functions: libc-$name did not build for aarch64-linux" >&2; tail -20 "$out/$name.aarch64.build.log" >&2; exit 1; }
     done
     for name in math-functions correct-rounding iconv wcsftime; do
         code=0
-        qemu-aarch64 "$out/$name.aarch64" > "$out/$name.aarch64.out" 2>&1 < /dev/null || code=$?
-        [[ $code == 42 ]] || { echo "libc functions: libc-$name exited $code under qemu-aarch64" >&2; cat "$out/$name.aarch64.out" >&2; exit 1; }
+        aarch64_run -- "$out/$name.aarch64" > "$out/$name.aarch64.out" 2>&1 < /dev/null || code=$?
+        [[ $code == 42 ]] || { echo "libc functions: libc-$name exited $code on AArch64" >&2; cat "$out/$name.aarch64.out" >&2; exit 1; }
     done
     code=0
-    { qemu-aarch64 "$out/stack-chk-fail.aarch64" > /dev/null 2> "$out/stack-chk-fail.aarch64.err" < /dev/null; } 2> /dev/null || code=$?
-    [[ $code == 134 ]] || { echo "libc functions: __stack_chk_fail ended with status $code under qemu-aarch64" >&2; exit 1; }
+    { aarch64_run -- "$out/stack-chk-fail.aarch64" > /dev/null 2> "$out/stack-chk-fail.aarch64.err" < /dev/null; } 2> /dev/null || code=$?
+    [[ $code == 134 ]] || { echo "libc functions: AArch64 __stack_chk_fail ended with status $code" >&2; exit 1; }
     [[ $(head -n 1 "$out/stack-chk-fail.aarch64.err") == '*** stack smashing detected ***: terminated' ]] ||
-        { echo "libc functions: __stack_chk_fail wrote [$(head -n 1 "$out/stack-chk-fail.aarch64.err")] under qemu-aarch64" >&2; exit 1; }
+        { echo "libc functions: AArch64 __stack_chk_fail wrote [$(head -n 1 "$out/stack-chk-fail.aarch64.err")]" >&2; exit 1; }
     echo 'libc functions: the same four agree for aarch64-linux under qemu'
 fi

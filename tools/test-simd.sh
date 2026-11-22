@@ -2,7 +2,7 @@
 # abla/simd: every operation on every vector type against values worked out without the
 # compiler (tests/cases/simd/checks.ab), and the target-specific operations against FIPS-197.
 #   run:      x86-64 (release and --fast, on this CPU and under qemu with no AES, CLMUL or
-#             AVX2), AArch64 under qemu, Wasm under Node.
+#             AVX2), AArch64, Wasm under Node.
 #   compiled: Xtensa, whose vectors are scalar code; nothing here runs it.
 # Then the misuses the compiler refuses, each with the error on its first line.
 # With --avx512-only after the compiler argument, run the native AVX-512 checks
@@ -92,7 +92,8 @@ grep -q 'f32x4\.nearest' "$out/simd.wat" || { echo "no Wasm SIMD rounding in the
 echo "ok   wasm under node $(node --version): SIMD128 instructions, no AES"
 
 # AArch64: build the same program as an ordinary static Linux executable.
-if command -v qemu-aarch64 >/dev/null; then
+source "$project_root/tools/aarch64-test-runner.sh"
+if aarch64_runner_available; then
     "$compiler" build "$cases/native.ab" --target aarch64-linux -o "$out/aarch64" --no-cache
     "$compiler" build "$cases/gather-bounds.ab" --target aarch64-linux -o "$out/aarch64-gather-bounds" --no-cache
     llvm-objdump -d "$out/aarch64" > "$out/aarch64.s"
@@ -100,13 +101,16 @@ if command -v qemu-aarch64 >/dev/null; then
     grep -q 'pmull' "$out/aarch64.s" || { echo "no PMULL in the AArch64 program" >&2; exit 1; }
     grep -qE '[[:space:]]tbl[[:space:]]' "$out/aarch64.s" || { echo "no NEON table lookup in the program" >&2; exit 1; }
     grep -q 'frintn' "$out/aarch64.s" || { echo "no NEON ties-to-even rounding in the program" >&2; exit 1; }
-    for cpu in max cortex-a57; do
-        qemu-aarch64 -cpu "$cpu" "$out/aarch64" || { echo "simd aarch64 $cpu: check $? failed" >&2; exit 1; }
-        check_gather_bounds qemu-aarch64 -cpu "$cpu" "$out/aarch64-gather-bounds"
+    cpus=(max)
+    # With the default emulator, keep the second QEMU CPU profile too.
+    if [[ -z ${ABLA_AARCH64_RUN:-} ]]; then cpus+=(cortex-a57); fi
+    for cpu in "${cpus[@]}"; do
+        aarch64_run --cpu "$cpu" -- "$out/aarch64" || { echo "simd aarch64: check $? failed" >&2; exit 1; }
+        check_gather_bounds aarch64_run --cpu "$cpu" -- "$out/aarch64-gather-bounds"
     done
-    echo "ok   aarch64-linux under qemu (max, cortex-a57), with AES and PMULL taken"
+    echo "ok   aarch64-linux: NEON, with AES and PMULL where available"
 else
-    echo "skip aarch64: no qemu-aarch64"
+    echo "skip aarch64: no AArch64 runner"
 fi
 
 # Xtensa is compiled only: nothing here runs it, as in tools/test-f32.sh.

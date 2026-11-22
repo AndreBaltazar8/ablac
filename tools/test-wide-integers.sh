@@ -25,6 +25,7 @@ compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 out=build/$type
 cd "$project_root"
+source "$project_root/tools/aarch64-test-runner.sh"
 rm -rf "$out"
 mkdir -p "$out/src"
 node tools/wide-integers/stage.mjs "$type" tests/cases/wide-integers "$out/cases"
@@ -79,12 +80,12 @@ start() { # triple, flags, name
         -c "$cases/start.c" -o "$out/start-$3.o" 2>/dev/null
     ld.lld -static --no-pie -z notext "$out/$3.o" "$out/start-$3.o" -o "$out/$3"
 }
-if command -v qemu-aarch64 > /dev/null; then
+if aarch64_runner_available; then
     start aarch64-linux-gnu "" aarch64
-    qemu-aarch64 "$out/aarch64" || { echo "$type aarch64: failed with $?" >&2; exit 1; }
+    aarch64_run -- "$out/aarch64" || { echo "$type aarch64: failed with $?" >&2; exit 1; }
     echo "ok   aarch64 under qemu"
 else
-    echo "skip aarch64: no qemu-aarch64"
+    echo "skip aarch64: no AArch64 runner"
 fi
 if command -v qemu-riscv64 > /dev/null; then
     start riscv64-linux-gnu "-march=rv64i -mabi=lp64" riscv64

@@ -12,6 +12,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_root"
+source "$project_root/tools/aarch64-test-runner.sh"
 out=build/pbe-native-residue
 rm -rf "$out"
 mkdir -p "$out"
@@ -75,16 +76,16 @@ for mode in release fast; do
         { cat "$out/x86-$mode.log" >&2; echo "pbe native residue: x86-64 $mode did not build" >&2; exit 1; }
     check "x86-64 $mode" "$out/x86-$mode"
 done
-if command -v qemu-aarch64 > /dev/null; then
+if aarch64_runner_available; then
     for mode in release fast; do
         flags=(); [[ $mode == release ]] || flags=(--fast)
         "$compiler" build "$out/main.ab" --target aarch64-linux -o "$out/a64-$mode" --no-cache "${flags[@]}" \
             > "$out/a64-$mode.log" 2>&1 ||
             { cat "$out/a64-$mode.log" >&2; echo "pbe native residue: AArch64 $mode did not build" >&2; exit 1; }
-        check "AArch64 $mode" timeout 600 qemu-aarch64 "$out/a64-$mode"
+        check "AArch64 $mode" aarch64_run --timeout 600 -- "$out/a64-$mode"
     done
 else
-    echo "pbe native residue: no qemu-aarch64, AArch64 not run"
+    echo "pbe native residue: no AArch64 runner"
 fi
 (( failed == 0 )) || exit 1
 echo "pbe native residue: opened keys and passwords leave nothing in the process's memory; an unwiped key is found"

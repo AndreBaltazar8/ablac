@@ -5,6 +5,7 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_root"
+source "$project_root/tools/aarch64-test-runner.sh"
 out=build/bignum-secret-tests
 mkdir -p "$out"
 # Compile the exact private production bodies in the same temporary module as
@@ -37,5 +38,5 @@ sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM
 "$compiler" build tests/cases/crypto-bignum-secret/aarch64-build.ab -o "$out/aarch64-driver" --no-cache
 llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s -o "$out/aarch64-start.o"
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
-timeout 180 qemu-aarch64 -cpu max "$out/aarch64" || { echo "AArch64 bignum numerical oracle failed" >&2; exit 1; }
+aarch64_run --timeout 180 --cpu max -- "$out/aarch64" || { echo "AArch64 bignum numerical oracle failed" >&2; exit 1; }
 echo "ok   AArch64 numerical oracle under qemu"

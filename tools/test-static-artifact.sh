@@ -21,17 +21,20 @@ expected_version=${args[1]:-}
 [[ $artifact == /* ]] || artifact="$PWD/$artifact"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+source "$root/tools/aarch64-test-runner.sh"
 [[ $(uname -s) == Linux ]] || { echo 'static artifact: Linux only'; exit 0; }
 [[ -x $artifact ]] || { echo "static artifact: $artifact is not an executable" >&2; exit 1; }
 # An AArch64 artifact runs natively on an AArch64 host and under qemu-aarch64 on an x86-64 one (the build it makes is for the machine it runs on); the
 # fixpoint of an AArch64 artifact is not run under emulation unless STATIC_ARTIFACT_FIXPOINT_AARCH64=1 (it is two builds of the compiler, an hour of qemu).
 runner=()
+program_runner=()
 machine=$(readelf -hW "$artifact" | awk -F: '/Machine:/ { gsub(/^ +| +$/, "", $2); print $2 }')
 case $machine in
     *AArch64*)
         if [[ $(uname -m) != aarch64 ]]; then
             command -v qemu-aarch64 > /dev/null || { echo "static artifact: $artifact is an AArch64 file and this host has no qemu-aarch64" >&2; exit 1; }
             runner=(qemu-aarch64)
+            program_runner=(aarch64_run --)
         fi
         if ((fixpoint)) && [[ ${STATIC_ARTIFACT_FIXPOINT_AARCH64:-0} != 1 ]]; then
             fixpoint=0
@@ -57,12 +60,12 @@ echo "static artifact: no PT_INTERP, no DT_NEEDED"
 
 # 2. smoke compile
 if [[ -n $expected_version ]]; then
-    version=$("${runner[@]}" "$artifact" --version)
+    version=$("${program_runner[@]}" "$artifact" --version)
     [[ $version == "ablac $expected_version" ]] || fail "--version is '$version', expected 'ablac $expected_version'"
 fi
 printf 'import "abla/io"\nfun main: int {\n    println("static hello")\n    0\n}\n' > "$out/hello.ab"
 "${runner[@]}" "$artifact" build "$out/hello.ab" -o "$out/hello" --no-cache > "$out/hello.build.log" 2>&1 || { tail -5 "$out/hello.build.log" >&2; fail "the smoke compile failed"; }
-[[ $("${runner[@]}" "$out/hello") == "static hello" ]] || fail "the smoke program printed the wrong text"
+[[ $("${program_runner[@]}" "$out/hello") == "static hello" ]] || fail "the smoke program printed the wrong text"
 echo "static artifact: smoke compile ran"
 
 # 3. the fixpoint
