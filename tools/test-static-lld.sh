@@ -68,6 +68,19 @@ done
 run "units.nolinker" PATH=$PWD/$bin "${units[@]}" ABLA_COMPILER_RT_BUILTINS=$builtins ABLA_CACHE_DIR=$PWD/$out/units.nolinker.cache "$compiler" build tests/cases/libc-imports/hello.ab -o "$out/units.nolinker" --fast ||
     { tail -5 "$out/units.nolinker.log" >&2; fail "hello with units did not build with no linker or llvm-ar on the PATH"; }
 cmp -s "$out/units.nolinker" "$out/units.hello.ex" || fail "hello with units, built with no llvm-ar, differs from the external one"
+# The Windows target (W1a): --target x86_64-windows links a freestanding program with lld-link, in process too (lld's COFF driver in the shim, #1092): byte for byte what the external
+# lld-link makes (/brepro), and built with no lld-link on the PATH.
+if [[ -f tests/cases/windows/exit7.ab ]]; then
+    run "windows.inprocess" ABLA_CACHE_DIR=$PWD/$out/windows.in.cache "$compiler" build tests/cases/windows/exit7.ab --target x86_64-windows -o "$out/exit7.in.exe" --no-cache ||
+        { tail -5 "$out/windows.inprocess.log" >&2; fail "exit7 for Windows: the in-process link failed"; }
+    run "windows.external" ABLA_LINK_INPROCESS=0 ABLA_CACHE_DIR=$PWD/$out/windows.ex.cache "$compiler" build tests/cases/windows/exit7.ab --target x86_64-windows -o "$out/exit7.ex.exe" --no-cache ||
+        { tail -5 "$out/windows.external.log" >&2; fail "exit7 for Windows: the external link failed"; }
+    cmp -s "$out/exit7.in.exe" "$out/exit7.ex.exe" || fail "exit7 for Windows: the in-process lld-link differs from the external one"
+    run "windows.nolinker" PATH=$PWD/$bin ABLA_COMPILER_RT_BUILTINS=$builtins ABLA_CACHE_DIR=$PWD/$out/windows.nl.cache "$compiler" build tests/cases/windows/exit7.ab --target x86_64-windows \
+        -o "$out/exit7.nl.exe" --no-cache || { tail -5 "$out/windows.nolinker.log" >&2; fail "exit7 for Windows did not build with no lld-link on the PATH"; }
+    cmp -s "$out/exit7.nl.exe" "$out/exit7.ex.exe" || fail "exit7 for Windows built with no linker differs from the external link's"
+    count=$((count + 1))
+fi
 # No linker on the PATH.
 for variant in "x86:" "aarch64:--target aarch64-linux"; do
     tag=${variant%%:*}

@@ -33,6 +33,7 @@
 
 LLD_HAS_DRIVER(elf)
 LLD_HAS_DRIVER(wasm)
+LLD_HAS_DRIVER(coff)
 
 // What the prebuilt lld and LLVM archives name that the static compiler does not carry (weak: a real definition wins). lld's driver initialises every target
 // it was built for, and the compiler's archives leave out the targets it has no use for (src/toolchain.ab, bootstrapStaticLlvmOtherTarget); none of them is
@@ -76,12 +77,13 @@ extern "C" int abla_lld_main(const char *arguments, const char *errors) {
         start = end + 1;
     }
     // lld's output does not depend on its thread count, and the static compiler's thread library is not complete: one thread.
-    owned.push_back("--threads=1");
+    // (lld-link takes its options the Windows way.)
+    owned.push_back(owned[0] == "lld-link" ? "/threads:1" : "--threads=1");
     std::vector<const char *> argv;
     for (const std::string &argument : owned) argv.push_back(argument.c_str());
     std::string diagnostics;
     llvm::raw_string_ostream errorStream(diagnostics);
-    lld::Result result = lld::lldMain(argv, llvm::outs(), errorStream, {{lld::Gnu, &lld::elf::link}, {lld::Wasm, &lld::wasm::link}});
+    lld::Result result = lld::lldMain(argv, llvm::outs(), errorStream, {{lld::Gnu, &lld::elf::link}, {lld::Wasm, &lld::wasm::link}, {lld::WinLink, &lld::coff::link}});
     errorStream.flush();
     if (!diagnostics.empty()) {
         std::error_code failure;
@@ -321,4 +323,25 @@ extern "C" int abla_tool_main(const char *tool, const char *arguments) {
     std::vector<char *> argv;
     for (std::string &line : lines) argv.push_back(&line[0]);
     return optMain(static_cast<int>(argv.size()), argv.data(), {});
+}
+
+// libxml2, which lld's COFF driver reaches through LLVM's WindowsManifestMerger (only for /manifest:embed, /manifestinput and the like): the archives carry no libxml2, and the
+// compiler's own Windows links write no manifest. Weak stubs that fail what they are asked: a link that did want to merge a manifest gets lld's "manifest merging failed", not a link error here.
+extern "C" {
+__attribute__((weak)) void *xmlAddChild(void *, void *) { return nullptr; }
+__attribute__((weak)) void *xmlCopyNamespace(void *) { return nullptr; }
+__attribute__((weak)) void xmlDocDumpFormatMemoryEnc(void *, unsigned char **buffer, int *size, const char *, int) { if (buffer) *buffer = nullptr; if (size) *size = 0; }
+__attribute__((weak)) void *xmlDocGetRootElement(void *) { return nullptr; }
+__attribute__((weak)) void *xmlDocSetRootElement(void *, void *) { return nullptr; }
+__attribute__((weak)) void xmlFree(void *) {}
+__attribute__((weak)) void xmlFreeDoc(void *) {}
+__attribute__((weak)) void xmlFreeNode(void *) {}
+__attribute__((weak)) void xmlFreeNs(void *) {}
+__attribute__((weak)) void *xmlNewDoc(const unsigned char *) { return nullptr; }
+__attribute__((weak)) void *xmlNewNs(void *, const unsigned char *, const unsigned char *) { return nullptr; }
+__attribute__((weak)) void *xmlNewProp(void *, const unsigned char *, const unsigned char *) { return nullptr; }
+__attribute__((weak)) void *xmlReadMemory(const char *, int, const char *, const char *, int) { return nullptr; }
+__attribute__((weak)) void xmlSetGenericErrorFunc(void *, void *) {}
+__attribute__((weak)) unsigned char *xmlStrdup(const unsigned char *) { return nullptr; }
+__attribute__((weak)) void xmlUnlinkNode(void *) {}
 }
