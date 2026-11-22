@@ -1,0 +1,244 @@
+// The routines a Windows executable carries itself (W1c, docs/design/windows-target.md): no C runtime is linked, so the module
+// defines what LLVM and the runtime call by name, as module assembly in COFF form and the Win64 convention (arguments in rcx, rdx,
+// r8, r9; rbx, rbp, rdi, rsi, r12-r15 and xmm6-xmm15 are the callee's to keep):
+//   - memcpy, memmove, memset, memcmp, bcmp, strlen (byte-wise with rep; correct first, fast later);
+//   - _setjmp and _longjmp for the runtime's panic recovery, in a jmp_buf of their own (the backend allots 512 bytes);
+//   - (bootstrapLlvmEmitWindowsStart, below) the PE entry abla_windows_start, which asks the runtime for argc and argv
+//     (abla/runtime/platform/windows), calls the program's main and ends the process through kernel32's ExitProcess;
+//   - the thread-local storage directory (_tls_used, _tls_index, the .tls delimiters) that a C runtime's start-up object would
+//     supply, so that LLVM's native thread-locals work without one: the loader gives each thread a copy of .tls and a slot.
+
+import "./bindings.ab"
+import "core.ab"
+import "functions.ab"
+import "debug.ab"
+import "abla/unsafe/memory/raw"
+
+// The direct symbol of the runtime's `__ablaRuntimeWindowsArguments(argcOut): argv` in a Windows module being built, or "".
+var bootstrapLlvmWindowsArgumentsSymbol = ""
+
+fun bootstrapLlvmWindowsFunction(name: string): string =
+    ".def $name\n.scl 2\n.type 32\n.endef\n.globl $name\n"
+
+fun bootstrapLlvmWindowsRoutinesAssembly(): string {
+    var text = ".text\n.p2align 4\n" +
+        bootstrapLlvmWindowsFunction("memmove") +
+        bootstrapLlvmWindowsFunction("memcpy") +
+        "memmove:\n" +
+        "memcpy:\n" +
+        "    movq %rcx, %rax\n" +
+        "    pushq %rdi\n" +
+        "    pushq %rsi\n" +
+        "    movq %rcx, %rdi\n" +
+        "    movq %rdx, %rsi\n" +
+        "    movq %r8, %rcx\n" +
+        "    cmpq %rsi, %rdi\n" +
+        "    jbe .Labla_win_forward\n" +
+        "    leaq (%rsi,%rcx), %rdx\n" +
+        "    cmpq %rdx, %rdi\n" +
+        "    jae .Labla_win_forward\n" +
+        "    leaq -1(%rdi,%rcx), %rdi\n" +
+        "    leaq -1(%rsi,%rcx), %rsi\n" +
+        "    std\n" +
+        "    rep movsb\n" +
+        "    cld\n" +
+        "    jmp .Labla_win_copied\n" +
+        ".Labla_win_forward:\n" +
+        "    rep movsb\n" +
+        ".Labla_win_copied:\n" +
+        "    popq %rsi\n" +
+        "    popq %rdi\n" +
+        "    ret\n" +
+        ".p2align 4\n" +
+        bootstrapLlvmWindowsFunction("memset") +
+        "memset:\n" +
+        "    movq %rcx, %r9\n" +
+        "    pushq %rdi\n" +
+        "    movq %rcx, %rdi\n" +
+        "    movl %edx, %eax\n" +
+        "    movq %r8, %rcx\n" +
+        "    rep stosb\n" +
+        "    popq %rdi\n" +
+        "    movq %r9, %rax\n" +
+        "    ret\n" +
+        ".p2align 4\n" +
+        bootstrapLlvmWindowsFunction("memcmp") +
+        bootstrapLlvmWindowsFunction("bcmp") +
+        "memcmp:\n" +
+        "bcmp:\n" +
+        "    xorl %eax, %eax\n" +
+        "    testq %r8, %r8\n" +
+        "    je .Labla_win_compared\n" +
+        ".Labla_win_compare:\n" +
+        "    movzbl (%rcx), %eax\n" +
+        "    movzbl (%rdx), %r9d\n" +
+        "    subl %r9d, %eax\n" +
+        "    jne .Labla_win_compared\n" +
+        "    incq %rcx\n" +
+        "    incq %rdx\n" +
+        "    decq %r8\n" +
+        "    jne .Labla_win_compare\n" +
+        ".Labla_win_compared:\n" +
+        "    ret\n" +
+        ".p2align 4\n" +
+        bootstrapLlvmWindowsFunction("strlen") +
+        "strlen:\n" +
+        "    movq %rcx, %rax\n" +
+        ".Labla_win_length:\n" +
+        "    cmpb \$0, (%rax)\n" +
+        "    je .Labla_win_measured\n" +
+        "    incq %rax\n" +
+        "    jmp .Labla_win_length\n" +
+        ".Labla_win_measured:\n" +
+        "    subq %rcx, %rax\n" +
+        "    ret\n" +
+        ".p2align 4\n" +
+        bootstrapLlvmWindowsFunction("_setjmp") +
+        "_setjmp:\n" +
+        "    movq %rbx, (%rcx)\n" +
+        "    movq %rbp, 8(%rcx)\n" +
+        "    movq %rdi, 16(%rcx)\n" +
+        "    movq %rsi, 24(%rcx)\n" +
+        "    movq %r12, 32(%rcx)\n" +
+        "    movq %r13, 40(%rcx)\n" +
+        "    movq %r14, 48(%rcx)\n" +
+        "    movq %r15, 56(%rcx)\n" +
+        "    leaq 8(%rsp), %rdx\n" +
+        "    movq %rdx, 64(%rcx)\n" +
+        "    movq (%rsp), %rax\n" +
+        "    movq %rax, 72(%rcx)\n" +
+        "    movdqu %xmm6, 80(%rcx)\n" +
+        "    movdqu %xmm7, 96(%rcx)\n" +
+        "    movdqu %xmm8, 112(%rcx)\n" +
+        "    movdqu %xmm9, 128(%rcx)\n" +
+        "    movdqu %xmm10, 144(%rcx)\n" +
+        "    movdqu %xmm11, 160(%rcx)\n" +
+        "    movdqu %xmm12, 176(%rcx)\n" +
+        "    movdqu %xmm13, 192(%rcx)\n" +
+        "    movdqu %xmm14, 208(%rcx)\n" +
+        "    movdqu %xmm15, 224(%rcx)\n" +
+        "    xorl %eax, %eax\n" +
+        "    ret\n" +
+        ".p2align 4\n" +
+        bootstrapLlvmWindowsFunction("_longjmp") +
+        "_longjmp:\n" +
+        "    movq (%rcx), %rbx\n" +
+        "    movq 8(%rcx), %rbp\n" +
+        "    movq 16(%rcx), %rdi\n" +
+        "    movq 24(%rcx), %rsi\n" +
+        "    movq 32(%rcx), %r12\n" +
+        "    movq 40(%rcx), %r13\n" +
+        "    movq 48(%rcx), %r14\n" +
+        "    movq 56(%rcx), %r15\n" +
+        "    movdqu 80(%rcx), %xmm6\n" +
+        "    movdqu 96(%rcx), %xmm7\n" +
+        "    movdqu 112(%rcx), %xmm8\n" +
+        "    movdqu 128(%rcx), %xmm9\n" +
+        "    movdqu 144(%rcx), %xmm10\n" +
+        "    movdqu 160(%rcx), %xmm11\n" +
+        "    movdqu 176(%rcx), %xmm12\n" +
+        "    movdqu 192(%rcx), %xmm13\n" +
+        "    movdqu 208(%rcx), %xmm14\n" +
+        "    movdqu 224(%rcx), %xmm15\n" +
+        "    movl %edx, %eax\n" +
+        "    testl %eax, %eax\n" +
+        "    jne .Labla_win_jump\n" +
+        "    incl %eax\n" +
+        ".Labla_win_jump:\n" +
+        "    movq 64(%rcx), %rsp\n" +
+        "    jmp *72(%rcx)\n"
+    // The TLS directory: the delimiters sort around LLVM's `.tls$` section (".tls" < ".tls$" < ".tls$ZZZ"), `_tls_used` is the
+    // IMAGE_TLS_DIRECTORY64 (start, end, index, callbacks, zero fill, characteristics) that lld-link points the PE header at.
+    text = text +
+        ".section .tls,\"dw\"\n" +
+        ".globl _tls_start\n" +
+        "_tls_start:\n" +
+        "    .long 0\n" +
+        ".section .tls\$ZZZ,\"dw\"\n" +
+        ".globl _tls_end\n" +
+        "_tls_end:\n" +
+        "    .long 0\n" +
+        ".data\n" +
+        ".p2align 2\n" +
+        ".globl _tls_index\n" +
+        "_tls_index:\n" +
+        "    .long 0\n" +
+        ".p2align 3\n" +
+        "__abla_tls_callbacks:\n" +
+        "    .quad 0\n" +
+        ".section .rdata\$T,\"dr\"\n" +
+        ".p2align 3\n" +
+        ".globl _tls_used\n" +
+        "_tls_used:\n" +
+        "    .quad _tls_start\n" +
+        "    .quad _tls_end\n" +
+        "    .quad _tls_index\n" +
+        "    .quad __abla_tls_callbacks\n" +
+        "    .long 0\n" +
+        "    .long 0\n" +
+        ".text\n"
+    text
+}
+
+fun bootstrapLlvmEmitWindowsRoutines(backend: BootstrapLlvmBackend): void {
+    val assembly = bootstrapLlvmWindowsRoutinesAssembly()
+    LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
+    return
+}
+
+// The PE entry, in IR so that the runtime's argument reader (an internal function) is referenced and kept: it builds argc and argv
+// into a slot, calls the program's `main(argc, argv)` that exports.ab defined and ends the process with its status.
+fun bootstrapLlvmEmitWindowsStart(backend: BootstrapLlvmBackend): void {
+    val arguments = LLVMGetNamedFunction(backend.module, bootstrapLlvmWindowsArgumentsSymbol)
+    val main = LLVMGetNamedFunction(backend.module, "main")
+    if (pointerIsNull(arguments) || pointerIsNull(main)) return
+    val start = bootstrapLlvmDeclare(backend, "abla_windows_start", backend.voidType, [], false, [])
+    val entry = LLVMAppendBasicBlockInContext(backend.context, start, "entry")
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    val slot = LLVMBuildAlloca(backend.builder, backend.i64Type, "argc.slot")
+    LLVMBuildStore(backend.builder, LLVMConstInt(backend.i64Type, 0, 0), slot)
+    val slotAddress = LLVMBuildPtrToInt(backend.builder, slot, backend.i64Type, "argc.address")
+    val argv = bootstrapLlvmCall(backend, arguments, [slotAddress], "argv", false, [false])
+    val argc = LLVMBuildLoad2(backend.builder, backend.i32Type, slot, "argc")
+    val argvPointer = LLVMBuildIntToPtr(backend.builder, argv, backend.pointerType, "argv.pointer")
+    val status = bootstrapLlvmCall(backend, main, [argc, argvPointer], "status", false, [false, false])
+    // ExitProcess is declared by the runtime (platform/windows) with an integer (i64) parameter: the same declaration, the status widened.
+    val exit = bootstrapLlvmDeclare(backend, "ExitProcess", backend.voidType, [backend.i64Type], false, [false])
+    val wide = LLVMBuildZExt(backend.builder, status, backend.i64Type, "status.wide")
+    bootstrapLlvmCall(backend, exit, [wide], "", false, [false])
+    LLVMBuildUnreachable(backend.builder)
+    return
+}
+
+// The C functions the libc-host half of the runtime calls for its own standard-error writes and its exit (platform/host.ab declares
+// `write` and `_exit`): defined in IR over the runtime's translation of the Linux calls, so they are ordinary references and the
+// translation is not dropped.
+fun bootstrapLlvmEmitWindowsLibc(backend: BootstrapLlvmBackend): void {
+    val syscall = LLVMGetNamedFunction(backend.module, bootstrapLlvmWindowsSyscallSymbol)
+    val write = LLVMGetNamedFunction(backend.module, "write")
+    if (!pointerIsNull(syscall) && !pointerIsNull(write) && LLVMIsDeclaration(write) != 0) {
+        val entry = LLVMAppendBasicBlockInContext(backend.context, write, "entry")
+        LLVMPositionBuilderAtEnd(backend.builder, entry)
+        val buffer = LLVMBuildPtrToInt(backend.builder, LLVMGetParam(write, 1), backend.i64Type, "buffer")
+        val zero = LLVMConstInt(backend.i64Type, 0, 0)
+        val all = [LLVMConstInt(backend.i64Type, 1, 0), LLVMGetParam(write, 0), buffer, LLVMGetParam(write, 2), zero, zero, zero]
+        // The direct form takes the arguments up to the last one the translation reads.
+        val taken: array<i64*> = []
+        val flags: array<bool> = []
+        while (taken.size < int(LLVMCountParams(syscall))) {
+            taken.append(all[taken.size])
+            flags.append(false)
+        }
+        val result = bootstrapLlvmCall(backend, syscall, taken, "write.result", false, flags)
+        LLVMBuildRet(backend.builder, result)
+    }
+    val exit = LLVMGetNamedFunction(backend.module, "_exit")
+    val terminate = LLVMGetNamedFunction(backend.module, "ExitProcess")
+    if (!pointerIsNull(exit) && !pointerIsNull(terminate) && LLVMIsDeclaration(exit) != 0) {
+        val entry = LLVMAppendBasicBlockInContext(backend.context, exit, "entry")
+        LLVMPositionBuilderAtEnd(backend.builder, entry)
+        bootstrapLlvmCall(backend, terminate, [LLVMGetParam(exit, 0)], "", false, [false])
+        LLVMBuildUnreachable(backend.builder)
+    }
+    return
+}

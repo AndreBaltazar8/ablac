@@ -1,0 +1,288 @@
+// public: none
+// Windows (W1c, docs/design/windows-target.md): the Linux system calls of the portable runtime and standard library, answered with
+// kernel32, in a file of their own that only a Windows target loads (a Linux, macOS or Wasm build never parses it), as
+// platform/darwin does for the BSD calls. `__ablaRuntimeWindowsSyscall` is what the backend calls for `ablaLinuxSyscall` on this
+// target (src/backend/llvm/backend.ab names it); a number it does not translate is refused loudly (a named diagnostic and exit
+// status 70), never answered with a quiet success, and tools/test-windows-syscalls.sh lists the translated numbers. The process's
+// arguments come from GetCommandLineW (`__ablaRuntimeWindowsArguments`, called by the PE entry in src/backend/llvm/windows.ab).
+//
+// The imports are kernel32's, listed in runtime/windows/imports/kernel32.txt (tools/windows-imports-allowlist.txt checks them);
+// every extern here takes and returns integers and pointers, never a struct (Win64 passes aggregates by hidden pointer, the Abla
+// value ABI has no business crossing this boundary).
+import "abla/unsafe/memory"
+import "abla/runtime/scalar"
+import "abla/unsafe/memory/raw"
+
+
+trusted noescape extern:"c" fun ExitProcess(code: int): void
+trusted noescape extern:"c" fun GetStdHandle(which: int): int
+trusted noescape extern:"c" fun WriteFile(handle: int, buffer: int, count: int, written: int, overlapped: int): int
+trusted noescape extern:"c" fun VirtualAlloc(address: int, size: int, kind: int, protect: int): int
+trusted noescape extern:"c" fun VirtualFree(address: int, size: int, kind: int): int
+trusted noescape extern:"c" fun VirtualProtect(address: int, size: int, protect: int, old: int): int
+trusted noescape extern:"c" fun DiscardVirtualMemory(address: int, size: int): int
+trusted noescape extern:"c" fun GetCommandLineW(): int
+trusted noescape extern:"c" fun WideCharToMultiByte(page: int, flags: int, wide: int, wideCount: int, narrow: int, narrowCount: int, defaultCharacter: int, usedDefault: int): int
+trusted noescape extern:"c" fun QueryPerformanceCounter(value: int): int
+trusted noescape extern:"c" fun QueryPerformanceFrequency(value: int): int
+trusted noescape extern:"c" fun GetSystemTimePreciseAsFileTime(value: int): void
+trusted noescape extern:"c" fun Sleep(milliseconds: int): void
+trusted noescape extern:"c" fun GetCurrentProcessId(): int
+trusted noescape extern:"c" fun GetCurrentThreadId(): int
+
+// A thread's own 64 bytes for out-parameters (a written count, a clock reading): the loader gives each thread a copy of the
+// thread-local template, so no two calls share them.
+private trusted fun __ablaRuntimeWindowsScratch(): int =
+    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+
+// The errno a Linux caller expects.
+private val __ablaRuntimeWindowsENOMEM = -12
+private val __ablaRuntimeWindowsEINVAL = -22
+private val __ablaRuntimeWindowsEBADF = -9
+private val __ablaRuntimeWindowsEIO = -5
+private val __ablaRuntimeWindowsENOENT = -2
+
+// Writes `text` (a NUL-ended message at `address`) to standard error and ends the process with status 70.
+private trusted fun __ablaRuntimeWindowsRefuse(number: int): int {
+    val scratch = __ablaRuntimeWindowsScratch()
+    // "abla: Windows runtime: unsupported Linux system call NNN\n", the number in decimal
+    val prefix = __ablaRuntimeWord0("abla: Windows runtime: unsupported Linux system call ")
+    var length = 0
+    while (ablaRuntimeLoadU8(prefix + length) != 0) length = length + 1
+    val handle = GetStdHandle(-12)
+    WriteFile(handle, prefix, length, scratch, 0)
+    var digits = scratch + 16
+    var count = 0
+    var value = if (number < 0) 0 else number
+    var scale = 1
+    while (value / scale >= 10) scale = scale * 10
+    while (scale > 0) {
+        ablaRuntimeStoreU8(digits + count, 48 + value / scale % 10)
+        count = count + 1
+        scale = scale / 10
+    }
+    ablaRuntimeStoreU8(digits + count, 10)
+    WriteFile(handle, digits, count + 1, scratch, 0)
+    ExitProcess(70)
+    -38
+}
+
+// Protection bits of mmap/mprotect (PROT_READ 1, PROT_WRITE 2, PROT_EXEC 4) as a page protection constant.
+private trusted fun __ablaRuntimeWindowsProtection(protection: int): int {
+    val write = (protection & 2) != 0
+    val execute = (protection & 4) != 0
+    if (protection == 0) return 1
+    if (execute) return if (write) 64 else 32
+    if (write) 4 else 2
+}
+
+// The monotonic or real-time clock in a Linux timespec at `output` (clockid 1: QueryPerformanceCounter; 0 and others: the system
+// time since 1970).
+private trusted fun __ablaRuntimeWindowsClock(clock: int, output: int): int {
+    val scratch = __ablaRuntimeWindowsScratch()
+    if (clock == 1 || clock == 7) {
+        QueryPerformanceFrequency(scratch)
+        QueryPerformanceCounter(scratch + 8)
+        val frequency = ablaRuntimeLoadI64(scratch)
+        val ticks = ablaRuntimeLoadI64(scratch + 8)
+        val seconds = ticks / frequency
+        val rest = ticks % frequency
+        ablaRuntimeStoreI64(output, seconds)
+        ablaRuntimeStoreI64(output + 8, rest * 1000000000 / frequency)
+        return 0
+    }
+    GetSystemTimePreciseAsFileTime(scratch)
+    // 100 ns intervals since 1601: 11644473600 seconds before the Unix epoch.
+    val intervals = ablaRuntimeLoadI64(scratch)
+    val seconds = intervals / 10000000 - 11644473600
+    ablaRuntimeStoreI64(output, seconds)
+    ablaRuntimeStoreI64(output + 8, intervals % 10000000 * 100)
+    0
+}
+
+// mremap: Windows cannot resize a reservation, so a new one is made and the old bytes copied (what the runtime does by itself on
+// macOS), the old one released.
+private trusted fun __ablaRuntimeWindowsRemap(base: int, before: int, after: int): int {
+    val moved = VirtualAlloc(0, after, 12288, 4)
+    if (moved == 0) return __ablaRuntimeWindowsENOMEM
+    ablaUnsafeCopyMemory(moved, base, if (before < after) before else after)
+    VirtualFree(base, 0, 32768)
+    moved
+}
+
+// The Linux system call `number` with six arguments, answered with kernel32: the result, or -errno.
+trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int): int {
+    // write(fd, buffer, count)
+    if (number == 1) {
+        val handle = if (a0 == 1) GetStdHandle(-11) else if (a0 == 2) GetStdHandle(-12) else 0
+        if (handle == 0) return __ablaRuntimeWindowsEBADF
+        val scratch = __ablaRuntimeWindowsScratch()
+        ablaRuntimeStoreI64(scratch, 0)
+        if (WriteFile(handle, a1, a2, scratch, 0) == 0) return __ablaRuntimeWindowsEIO
+        return ablaRuntimeLoadI32(scratch) & 4294967295
+    }
+    // mmap(address, length, protection, flags, fd, offset): anonymous memory only; MAP_FIXED (16) over an existing range is not
+    // translated (the frozen groups' window needs it: a later step)
+    if (number == 9) {
+        if (a4 != -1 || (a3 & 16) != 0) return -38
+        val reserve = a2 == 0
+        val address = VirtualAlloc(a0, a1, if (reserve) 8192 else 12288, __ablaRuntimeWindowsProtection(a2))
+        if (address == 0) return __ablaRuntimeWindowsENOMEM
+        return address
+    }
+    // mprotect(address, length, protection)
+    if (number == 10) {
+        val scratch = __ablaRuntimeWindowsScratch()
+        if (VirtualProtect(a0, a1, __ablaRuntimeWindowsProtection(a2), scratch) == 0) return __ablaRuntimeWindowsEINVAL
+        return 0
+    }
+    // munmap(address, length): a whole reservation (the runtime unmaps what it mapped, whole); a part of one is refused
+    if (number == 11) {
+        if (VirtualFree(a0, 0, 32768) == 0) return __ablaRuntimeWindowsEINVAL
+        return 0
+    }
+    // mremap(base, before, after, flags)
+    if (number == 25) return __ablaRuntimeWindowsRemap(a0, a1, a2)
+    // madvise(address, length, advice): MADV_DONTNEED (4) gives the pages back; MADV_WIPEONFORK (18) has no fork to serve
+    if (number == 28) {
+        if (a2 == 4) {
+            DiscardVirtualMemory(a0, a1)
+            return 0
+        }
+        return __ablaRuntimeWindowsEINVAL
+    }
+    // nanosleep(request, remaining)
+    if (number == 35) {
+        val seconds = ablaRuntimeLoadI64(a0)
+        val nanoseconds = ablaRuntimeLoadI64(a0 + 8)
+        Sleep(seconds * 1000 + (nanoseconds + 999999) / 1000000)
+        return 0
+    }
+    // getpid, gettid
+    if (number == 39) return GetCurrentProcessId() & 4294967295
+    if (number == 186) return GetCurrentThreadId() & 4294967295
+    // sigaltstack(new, old): a Windows thread has no alternate signal stack to install; the old one is left as zeroes, "none"
+    if (number == 131) return 0
+    // futex(address, operation, value, ...): the WAKE half needs no waiters; the WAIT half returns at once (EAGAIN), which every
+    // caller answers by looking at the word again. A real wait (WaitOnAddress) is the step that brings threads.
+    if (number == 202) {
+        val operation = a1 & 127
+        if (operation == 1) return 0
+        if (operation == 0) return -11
+        return __ablaRuntimeWindowsRefuse(number)
+    }
+    // clock_gettime(clock, timespec)
+    if (number == 228) return __ablaRuntimeWindowsClock(a0, a1)
+    // exit_group(status), exit(status)
+    if (number == 231 || number == 60) {
+        ExitProcess(a0)
+        return 0
+    }
+    // openat(directory, path, flags): the process's own /proc entries do not exist; the callers fall back (the collector builds its
+    // own directory)
+    if (number == 257) return __ablaRuntimeWindowsENOENT
+    __ablaRuntimeWindowsRefuse(number)
+}
+
+// The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
+trusted fun __ablaRuntimeWindowsTranslated(): string = "1 9 10 11 25 28 35 39 60 131 186 202 228 231 257"
+
+// argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
+// program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;
+// 2n+1 make n and a literal quote), in memory of its own (the runtime's heap is not up yet). Stores argc at `argcOut` and returns argv.
+trusted fun __ablaRuntimeWindowsArguments(argcOut: int): int {
+    val wide = GetCommandLineW()
+    val size = WideCharToMultiByte(65001, 0, wide, -1, 0, 0, 0, 0)
+    if (size <= 0) {
+        ablaRuntimeStoreI32(argcOut, 0)
+        return 0
+    }
+    // The text, then room for 1 + size / 2 argument pointers and the terminator.
+    val slots = size / 2 + 2
+    val block = VirtualAlloc(0, size + slots * 8 + 16, 12288, 4)
+    if (block == 0) {
+        ablaRuntimeStoreI32(argcOut, 0)
+        return 0
+    }
+    val text = block
+    val argv = block + ((size + 15) / 16) * 16
+    WideCharToMultiByte(65001, 0, wide, -1, text, size, 0, 0)
+    // The pieces are written back into `text` (an argument is never longer than its source).
+    var read = 0
+    var count = 0
+    var written = 0
+    val end = size - 1
+    var first = true
+    while (read < end) {
+        while (read < end && (ablaRuntimeLoadU8(text + read) == 32 || ablaRuntimeLoadU8(text + read) == 9)) read = read + 1
+        if (read >= end) break
+        ablaRuntimeStoreI64(argv + count * 8, text + written)
+        count = count + 1
+        if (first) {
+            // The program name: up to the closing quote when it opens with one, else up to white space; no escapes.
+            first = false
+            if (ablaRuntimeLoadU8(text + read) == 34) {
+                read = read + 1
+                while (read < end && ablaRuntimeLoadU8(text + read) != 34) {
+                    ablaRuntimeStoreU8(text + written, ablaRuntimeLoadU8(text + read))
+                    written = written + 1
+                    read = read + 1
+                }
+                if (read < end) read = read + 1
+            } else {
+                while (read < end && ablaRuntimeLoadU8(text + read) != 32 && ablaRuntimeLoadU8(text + read) != 9) {
+                    ablaRuntimeStoreU8(text + written, ablaRuntimeLoadU8(text + read))
+                    written = written + 1
+                    read = read + 1
+                }
+            }
+        } else {
+            var quoted = false
+            var going = true
+            while (going && read < end) {
+                val byte = ablaRuntimeLoadU8(text + read)
+                if (byte == 92) {
+                    var slashes = 0
+                    while (read < end && ablaRuntimeLoadU8(text + read) == 92) {
+                        slashes = slashes + 1
+                        read = read + 1
+                    }
+                    if (read < end && ablaRuntimeLoadU8(text + read) == 34) {
+                        var literal = slashes / 2
+                        while (literal > 0) {
+                            ablaRuntimeStoreU8(text + written, 92)
+                            written = written + 1
+                            literal = literal - 1
+                        }
+                        if (slashes % 2 == 1) {
+                            ablaRuntimeStoreU8(text + written, 34)
+                            written = written + 1
+                            read = read + 1
+                        }
+                    } else {
+                        while (slashes > 0) {
+                            ablaRuntimeStoreU8(text + written, 92)
+                            written = written + 1
+                            slashes = slashes - 1
+                        }
+                    }
+                } else if (byte == 34) {
+                    quoted = !quoted
+                    read = read + 1
+                } else if (!quoted && (byte == 32 || byte == 9)) {
+                    going = false
+                } else {
+                    ablaRuntimeStoreU8(text + written, byte)
+                    written = written + 1
+                    read = read + 1
+                }
+            }
+        }
+        ablaRuntimeStoreU8(text + written, 0)
+        written = written + 1
+        if (read < end) read = read + 1
+    }
+    ablaRuntimeStoreI64(argv + count * 8, 0)
+    ablaRuntimeStoreI32(argcOut, count)
+    argv
+}
