@@ -42,6 +42,10 @@ trusted noescape extern:"c" fun GetSystemTimePreciseAsFileTime(value: int): void
 trusted noescape extern:"c" fun Sleep(milliseconds: int): void
 /** kernel32 GetCurrentProcessId: the calling process's id; never fails. */
 trusted noescape extern:"c" fun GetCurrentProcessId(): int
+/** kernel32 GetEnvironmentStringsW: the address of the process's environment block (UTF-16 NAME=value strings, each NUL-ended, an empty one at the end), to be released with FreeEnvironmentStringsW; 0 when it cannot be read. */
+trusted noescape extern:"c" fun GetEnvironmentStringsW(): int
+/** kernel32 FreeEnvironmentStringsW: releases a block GetEnvironmentStringsW returned; returns non-zero on success. */
+trusted noescape extern:"c" fun FreeEnvironmentStringsW(block: int): int
 /** kernel32 GetCurrentThreadId: the calling thread's id; never fails. */
 trusted noescape extern:"c" fun GetCurrentThreadId(): int
 /** synchronization WaitOnAddress: sleeps while the size-byte word at address still equals the one at compare (a futex wait), until woken or for milliseconds; returns non-zero when it returns for another reason than a timeout. */
@@ -713,9 +717,27 @@ trusted fun __ablaRuntimeWindowsArguments(argcOut: int): int {
         ablaRuntimeStoreI32(argcOut, 0)
         return 0
     }
-    // The text, then room for 1 + size / 2 argument pointers and the terminator.
-    val slots = size / 2 + 2
-    val block = VirtualAlloc(0, size + slots * 8 + 16, 12288, 4)
+    // The environment block: UTF-16 "NAME=value" strings, each NUL-ended, and an empty one at the end (units: the characters through it).
+    val environment = GetEnvironmentStringsW()
+    var units = 0
+    var entries = 0
+    if (environment != 0) {
+        var scanning = true
+        while (scanning) {
+            if (ablaRuntimeLoadU8(environment + units * 2) == 0 && ablaRuntimeLoadU8(environment + units * 2 + 1) == 0) {
+                units = units + 1
+                scanning = false
+            } else {
+                while (ablaRuntimeLoadU8(environment + units * 2) != 0 || ablaRuntimeLoadU8(environment + units * 2 + 1) != 0) units = units + 1
+                units = units + 1
+                entries = entries + 1
+            }
+        }
+    }
+    val environmentBytes = if (environment != 0) WideCharToMultiByte(65001, 0, environment, units, 0, 0, 0, 0) else 0
+    // The text, then room for 1 + size / 2 argument pointers and the terminator, the same for the environment pointers, and its text.
+    val slots = size / 2 + 2 + entries + 2
+    val block = VirtualAlloc(0, size + slots * 8 + environmentBytes + 32, 12288, 4)
     if (block == 0) {
         ablaRuntimeStoreI32(argcOut, 0)
         return 0
@@ -799,6 +821,25 @@ trusted fun __ablaRuntimeWindowsArguments(argcOut: int): int {
         if (read < end) read = read + 1
     }
     ablaRuntimeStoreI64(argv + count * 8, 0)
+    // The environment follows argv as Linux lays it out (envp = argv + argc + 1 words), entries that begin with "=" (the per-drive
+    // working directories) left out.
+    val pointers = argv + (count + 1) * 8
+    var variables = 0
+    if (environment != 0) {
+        val texts = argv + slots * 8
+        WideCharToMultiByte(65001, 0, environment, units, texts, environmentBytes, 0, 0)
+        var at = 0
+        while (at < environmentBytes && ablaRuntimeLoadU8(texts + at) != 0) {
+            if (ablaRuntimeLoadU8(texts + at) != 61) {
+                ablaRuntimeStoreI64(pointers + variables * 8, texts + at)
+                variables = variables + 1
+            }
+            while (ablaRuntimeLoadU8(texts + at) != 0) at = at + 1
+            at = at + 1
+        }
+        FreeEnvironmentStringsW(environment)
+    }
+    ablaRuntimeStoreI64(pointers + variables * 8, 0)
     ablaRuntimeStoreI32(argcOut, count)
     argv
 }

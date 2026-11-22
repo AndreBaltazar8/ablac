@@ -21,6 +21,8 @@ allowed=$(grep -v '^#' tools/windows-imports-allowlist.txt | grep -v '^$' || tru
 ran=0
 skipped=0
 arguments=(one "two words" three)
+export ABLA_WINDOWS_TEST="two words and = signs"
+export ABLA_WINDOWS_UNICODE="héllo €"
 for source in tests/cases/windows/hosted/*.ab; do
     name=$(basename -- "$source" .ab)
     "$compiler" build "$source" -o "$out/$name.native" --fast --no-cache > "$out/$name.native.log" 2>&1 ||
