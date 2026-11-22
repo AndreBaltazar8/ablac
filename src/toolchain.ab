@@ -4236,7 +4236,14 @@ private fun bootstrapFastRuntimeEligible(
     // Compile-time code uses the compiler's own runtime, and its staged
     // operators may depend on the unsplit module. Background freeing swaps
     // in a collector body by name, which is a separate object variant.
+    var hasMain = false
     for (snapshot in graph.orderedSnapshots) {
+        if (snapshot.path == graph.index.entryPath) {
+            for (declaration in snapshot.discovery.declarations) {
+                if (declaration.kind == "fun" && declaration.name == "main" &&
+                    declaration.externalLibrary == "" && declaration.extensionOwner == "") hasMain = true
+            }
+        }
         val standard = bootstrapStandardLibraryModuleSource(snapshot.path)
         val declaresBackgroundFree = standard &&
             (snapshot.path.endsWith("abla/memory/entry.ab") ||
@@ -4254,7 +4261,8 @@ private fun bootstrapFastRuntimeEligible(
             }
         }
     }
-    true
+    // The compiler-generated bridge exports must not stand in for main.
+    hasMain
 }
 
 private fun bootstrapFastRuntimeDigest(bytes: string): string =
@@ -4441,10 +4449,30 @@ private fun bootstrapFastRuntimeProduce(
         BootstrapModuleOverlay(hostPath, view.source, 0)
     ]
     val output = scratch.child("runtime.o")
+    // The nested build has its own synthetic entry. Leave the application's
+    // requested warnings and project root for the outer build to establish.
+    val unusedImportsRequested = bootstrapUnusedImportsRequested
+    val unusedImportsDeclined = bootstrapUnusedImportsDeclined
+    val unusedLocalsRequested = bootstrapUnusedLocalsRequested
+    val unusedParametersRequested = bootstrapUnusedParametersRequested
+    val unusedDeclarationsRequested = bootstrapUnusedDeclarationsRequested
+    val jsonConstructionRequested = bootstrapJsonConstructionRequested
+    bootstrapUnusedImportsRequested = false
+    bootstrapUnusedImportsDeclined = true
+    bootstrapUnusedLocalsRequested = false
+    bootstrapUnusedParametersRequested = false
+    bootstrapUnusedDeclarationsRequested = false
+    bootstrapJsonConstructionRequested = false
     val compiled = bootstrapNativeBuildWithEmitterStateCache(
         root, output.text, emitObject, "inprocess-fast", state, bootstrapIrCacheState(),
         false, target, "object", fastRuntimeExports = view.exports
     )
+    bootstrapUnusedImportsRequested = unusedImportsRequested
+    bootstrapUnusedImportsDeclined = unusedImportsDeclined
+    bootstrapUnusedLocalsRequested = unusedLocalsRequested
+    bootstrapUnusedParametersRequested = unusedParametersRequested
+    bootstrapUnusedDeclarationsRequested = unusedDeclarationsRequested
+    bootstrapJsonConstructionRequested = jsonConstructionRequested
     for (entry in scratch.entries()) if (entry.text != output.text) entry.remove()
     if (compiled.status == 0) "" else "cannot compile the prebuilt runtime"
 }
@@ -4589,19 +4617,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         "frontend.graph-load.platform:${orderedSnapshots.size}"
     )
     if (selfHostedRuntime != "") graph.load(selfHostedRuntime)
-    var fastRuntime = BootstrapFastRuntimeArtifact()
-    if (!importsRuntimePlatform &&
-        bootstrapFastRuntimeEligible(target, artifact, cacheProfile, fastRuntimeExports.size > 0, graph)) {
-        fastRuntime = bootstrapFastRuntimePrepare(
-            target, bootstrapNormalizeModulePath(runtimePlatform),
-            bootstrapNormalizeModulePath(selfHostedRuntime), emitObject, moduleState
-        )
-        if (fastRuntime.error != "") {
-            linuxPrintStandardError("error[E_FAST_RUNTIME_OBJECT]: ${fastRuntime.error}\n")
-            bootstrapDiscardCompileOutputs()
-            return BootstrapNativeBuild(1, [], false, 0, 0, 0, 0, 0, 0, 0, 0)
-        }
-    }
     bootstrapFloatBridgeAvailable = compilerRuntime && bootstrapFloatBridgeMustPreload(graph)
     bootstrapFloatFormattingRequested = false
     if (bootstrapFloatBridgeAvailable) graph.load(bootstrapFloatBridgeSource(graph, sourcePath))
@@ -4642,6 +4657,21 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         )
         sourceModule = sourceModule + 1
     }
+    // Preserve program-specific pruning of libc imports in OpenSSL builds.
+    // Eligibility is decided before generating the program object.
+    var fastRuntime = BootstrapFastRuntimeArtifact()
+    if (!importsRuntimePlatform && !linkOpenSsl &&
+        bootstrapFastRuntimeEligible(target, artifact, cacheProfile, fastRuntimeExports.size > 0, graph)) {
+        fastRuntime = bootstrapFastRuntimePrepare(
+            target, bootstrapNormalizeModulePath(runtimePlatform),
+            bootstrapNormalizeModulePath(selfHostedRuntime), emitObject, moduleState
+        )
+        if (fastRuntime.error != "") {
+            linuxPrintStandardError("error[E_FAST_RUNTIME_OBJECT]: ${fastRuntime.error}\n")
+            bootstrapDiscardCompileOutputs()
+            return BootstrapNativeBuild(1, [], false, 0, 0, 0, 0, 0, 0, 0, 0)
+        }
+    }
     // Filesystem-read providers have serialized content identities. Other
     // ambient effects remain uncached because they do not yet have a stable
     // deterministic provider contract.
@@ -4649,11 +4679,15 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapGraphCompileCapabilitiesCacheable(graph)
     val paths = bootstrapModulePaths(graph)
     val llvmPath = "$outputPath.ll"
-    val objectPath = "$outputPath.o"
+    val sidecarPath = "$outputPath.o"
+    // A stopped link must leave the old complete sidecar or the new one.
+    // Keep the program-only member private until the sidecar is combined.
+    val objectTemporary = "$sidecarPath.tmp.${linuxProcessId()}"
+    val objectPath = if (fastRuntime.objectPath == "") sidecarPath else "$objectTemporary.program.o"
     val hostPath = "$outputPath.host.o"
     val ltoObjectPath = "$outputPath.lto-program.o"
     val ltoPreparedPath = "$outputPath.lto-prepared.bc"
-    val combinedObjectPath = "$outputPath.combined.o"
+    val combinedObjectPath = "$objectTemporary.combined.o"
     // The artifact is written beside its output and renamed over it. Darwin's
     // linker signs an image with its file name as the identifier, and a Wasm
     // module's name section records its file name, so those are written under
@@ -4923,7 +4957,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     Path(publishPath).remove()
     Path(optimizedWasmPath).remove()
     Path(compilerBitcodePath).remove()
-    val emittedObjectPath = "$objectPath.tmp.${linuxProcessId()}"
+    val emittedObjectPath = objectTemporary
     // Earlier files that no longer describe this build's artifact go once it is
     // published: a failed build leaves the earlier ones as they were.
     var staleLlvm = false
@@ -5918,7 +5952,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 bootstrapPublishCacheFile(combinedObjectPath, cachedSidecar)
             }
         }
-        if (status == 0 && !Path(combinedObjectPath).moveTo(Path(objectPath))) {
+        if (status == 0 && !Path(combinedObjectPath).moveTo(Path(sidecarPath))) {
             status = 145
             failureKind = "io"
         }
