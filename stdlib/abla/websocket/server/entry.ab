@@ -58,6 +58,7 @@ private val webSocketServerFinishing = 6
 // closed connection can never address the connection that reused its slot.
 private val webSocketServerSlotBits = 1048576
 
+// Sets limits for connections, framing, pending output, and WebSocket lifecycle deadlines.
 class WebSocketServerOptions(
     val maximumConnections: int = 4096,
     val maximumHeaderBytes: int = 16384,
@@ -105,7 +106,9 @@ class WebSocketServerTls(
     val release: (int) -> void
 )
 
+// Sentinel indicating that a TLS operation must wait for the socket to become readable.
 val webSocketServerTlsWantsRead = -1002
+// Sentinel indicating that a TLS operation must wait for the socket to become writable.
 val webSocketServerTlsWantsWrite = -1003
 
 // Per-connection TLS flags.
@@ -114,6 +117,7 @@ private val webSocketServerTlsWriteBlockedOnRead = 2
 private val webSocketServerTlsWriteBlockedOnWrite = 4
 private val webSocketServerTlsFailed = 8
 
+// Holds a connection identifier and the request, message, or closure data for one server event.
 class WebSocketServerEvent(
     val kind: int,
     val id: int,
@@ -123,28 +127,37 @@ class WebSocketServerEvent(
     val code: int,
     val reason: string
 ) {
+    // Returns true for an upgrade request awaiting an admission decision.
     fun isRequest(): bool = this.kind == 1
+    // Returns true for an event announcing an open WebSocket connection.
     fun isOpen(): bool = this.kind == 2
+    // Returns true for an event containing a WebSocket message.
     fun isMessage(): bool = this.kind == 3
+    // Returns true for an event announcing a closed WebSocket connection.
     fun isClose(): bool = this.kind == 4
+    // Returns true for a regular HTTP request event.
     fun isHttp(): bool = this.kind == 5
 }
 
+// Returns the request path or empty text if this event has no request.
 fun WebSocketServerEvent.path(): string {
     val request = this.request
     if (request != null) request.path else ""
 }
 
+// Returns the HTTP method or empty text if this event has no request.
 fun WebSocketServerEvent.method(): string {
     val request = this.request
     if (request != null) request.method else ""
 }
 
+// Returns the named request header or empty text if absent.
 fun WebSocketServerEvent.header(name: string): string {
     val request = this.request
     if (request != null) request.header(name) else ""
 }
 
+// Returns the percent-decoded query parameter or empty text if absent.
 fun WebSocketServerEvent.query(name: string): string {
     val request = this.request
     if (request != null) {
@@ -152,11 +165,13 @@ fun WebSocketServerEvent.query(name: string): string {
     } else ""
 }
 
+// Returns the request body or empty text if this event has no request.
 fun WebSocketServerEvent.body(): string {
     val request = this.request
     if (request != null) request.body else ""
 }
 
+// Counts accepted, rejected, released, and processed WebSocket traffic and failures.
 class WebSocketServerStats(
     var accepted: int,
     var rejected: int,
@@ -172,6 +187,7 @@ class WebSocketServerStats(
     var tlsHandshakeFailures: int = 0
 )
 
+// Owns the listener, poller, TLS sessions, and state for each connection slot.
 resource class WebSocketServer(
     val listener: TcpListener,
     val poller: SocketPoller,
@@ -216,6 +232,7 @@ resource class WebSocketServer(
     val tlsHandshaking: array<bool>,
     val tlsFlags: array<int>
 ) {
+    // Frees TLS sessions and closes remaining client descriptors when the server is released.
     fun drop(): void {
         val tls = this.tls
         var index = 0
@@ -250,6 +267,7 @@ fun webSocketServer(
     tcpListenAddress(address, options.backlog, options.reusePort), options
 )
 
+// Returns a server listening on the IPv6 address, with an invalid listener if setup fails.
 fun webSocketServerIpv6(
     address: Ipv6SocketAddress,
     options: WebSocketServerOptions = WebSocketServerOptions(),
@@ -325,6 +343,7 @@ private fun webSocketServerSetNoDelay(descriptor: int): bool {
 // the socket would block); otherwise `status` holds the byte count.
 class WebSocketServerRead(var text: string, var status: int)
 
+// Reads up to the requested capacity into the reusable result and records the byte count or negative errno.
 trusted fun webSocketServerReceive(
     descriptor: int,
     capacity: int,
@@ -482,12 +501,14 @@ private fun webSocketServerPercentDecode(value: string): string {
 // ---------------------------------------------------------------------------
 // Slots
 
+// Returns the active slot for a current connection identifier, or -1 for an unknown or stale identifier.
 fun WebSocketServer.slotOf(id: int): int {
     val slot = id & (webSocketServerSlotBits - 1)
     if (id > 0 && slot < this.ids.size && this.ids[slot] == id &&
         this.states[slot] != 0) slot else -1
 }
 
+// Initializes and returns a slot for the accepted descriptor, or -1 if the server cannot admit it.
 fun WebSocketServer.allocateSlot(descriptor: int, now: int): int {
     var slot = -1
     if (this.freeCount > 0) {
@@ -600,6 +621,7 @@ fun WebSocketServer.release(slot: int, code: int, reason: string): void {
     return
 }
 
+// Schedules an active slot for output processing unless it is already scheduled.
 fun WebSocketServer.markDirty(slot: int): void {
     if (!this.dirty[slot]) {
         this.dirty[slot] = true
@@ -611,6 +633,7 @@ fun WebSocketServer.markDirty(slot: int): void {
     return
 }
 
+// Queues bytes for a valid slot and returns false if the pending-byte limit would be exceeded.
 fun WebSocketServer.enqueue(slot: int, bytes: string): bool {
     val pending = this.outputs[slot].size - this.outputOffsets[slot]
     if (pending + bytes.size > this.options.maximumPendingBytes) {
@@ -625,6 +648,7 @@ fun WebSocketServer.enqueue(slot: int, bytes: string): bool {
     true
 }
 
+// Attempts to send the queued bytes and updates the slot when the socket blocks or fails.
 fun WebSocketServer.writeSlot(slot: int): void {
     if (this.tlsSessions[slot] != 0) {
         this.tlsWriteSlot(slot)
@@ -687,6 +711,7 @@ fun WebSocketServer.flush(): void {
 // ---------------------------------------------------------------------------
 // Inbound processing
 
+// Starts the close handshake for an open slot with the supplied close code and reason.
 fun WebSocketServer.startClose(slot: int, code: int, reason: string): void {
     if (this.states[slot] == webSocketServerOpen) {
         this.closeCodes[slot] = code
@@ -701,6 +726,7 @@ fun WebSocketServer.startClose(slot: int, code: int, reason: string): void {
     return
 }
 
+// Queues a final HTTP response and schedules the connection to close.
 fun WebSocketServer.finishWithResponse(slot: int, response: string): void {
     this.states[slot] = webSocketServerFinishing
     this.deadlines[slot] = linuxMonotonicMilliseconds() +
@@ -709,6 +735,7 @@ fun WebSocketServer.finishWithResponse(slot: int, response: string): void {
     return
 }
 
+// Emits a message event for an open connection or starts closing if a text payload contains invalid UTF-8.
 fun WebSocketServer.deliver(slot: int, opcode: int, payload: string): void {
     if (opcode == 1 && !payload.isValidUtf8()) {
         this.startClose(slot, 1007, "invalid utf-8")
@@ -847,6 +874,7 @@ fun WebSocketServer.processFrames(slot: int, data: string, begin: int): int {
     offset
 }
 
+// Processes a buffered HTTP request and returns bytes consumed, or zero while more header or body input is needed.
 fun WebSocketServer.processRequest(slot: int, data: string): int {
     val headerEnd = httpHeaderEnd(data)
     if (headerEnd < 0) {
@@ -915,6 +943,7 @@ fun WebSocketServer.processRequest(slot: int, data: string): int {
     headerEnd + length
 }
 
+// Processes complete request or frame bytes from an active slot and returns the byte count consumed.
 fun WebSocketServer.processInput(slot: int, data: string): int {
     var consumed = 0
     var progressing = true
@@ -942,6 +971,7 @@ fun WebSocketServer.processInput(slot: int, data: string): int {
     consumed
 }
 
+// Reads from the active slot and dispatches complete input, stopping on would-block or closure.
 fun WebSocketServer.readSlot(slot: int): void {
     var reads = 0
     var reading = true
@@ -1005,6 +1035,7 @@ fun WebSocketServer.readSlot(slot: int): void {
 // for in `tlsFlags`, and `tlsSyncInterest` watches writability exactly while
 // some call waits for it.
 
+// Starts TLS for the connection and releases the slot if the TLS adapter cannot create a session.
 fun WebSocketServer.tlsStart(slot: int): void {
     val tls = this.tls
     if (tls != null) {
@@ -1025,6 +1056,7 @@ fun WebSocketServer.tlsStart(slot: int): void {
     return
 }
 
+// Updates the poller interests required by the slot's pending TLS operations.
 fun WebSocketServer.tlsSyncInterest(slot: int): void {
     if (this.states[slot] != 0 && this.tlsSessions[slot] != 0) {
         val wanted = (this.tlsFlags[slot] & (
@@ -1038,6 +1070,7 @@ fun WebSocketServer.tlsSyncInterest(slot: int): void {
     return
 }
 
+// Advances the TLS handshake or releases the slot if the adapter reports a fatal error.
 fun WebSocketServer.tlsHandshake(slot: int): void {
     val tls = this.tls
     if (tls != null) {
@@ -1085,6 +1118,7 @@ fun WebSocketServer.tlsReceive(slot: int, session: int): void {
     return
 }
 
+// Returns true if the TLS adapter already has decrypted input ready for the slot.
 fun WebSocketServer.tlsPending(slot: int): bool {
     val tls = this.tls
     if (tls != null) {
@@ -1141,6 +1175,7 @@ fun WebSocketServer.tlsWriteSlot(slot: int): void {
     return
 }
 
+// Advances handshakes or application I/O according to the socket readiness flags.
 fun WebSocketServer.tlsReady(slot: int, readable: bool, writable: bool): void {
     if (this.tlsHandshaking[slot]) {
         if (readable || writable) this.tlsHandshake(slot)
@@ -1162,6 +1197,7 @@ fun WebSocketServer.tlsReady(slot: int, readable: bool, writable: bool): void {
 // ---------------------------------------------------------------------------
 // Event loop
 
+// Accepts ready client descriptors until the listener drains or no more are available.
 fun WebSocketServer.acceptReady(): void {
     var accepting = !this.draining
     while (accepting) {
@@ -1185,6 +1221,7 @@ fun WebSocketServer.acceptReady(): void {
     return
 }
 
+// Processes expired timeouts, pending close deadlines, and scheduled pings.
 fun WebSocketServer.sweep(now: int): void {
     val pingInterval = this.options.pingIntervalMilliseconds
     val idleTimeout = this.options.idleTimeoutMilliseconds
@@ -1290,11 +1327,13 @@ fun WebSocketServer.takeEvents(): array<WebSocketServerEvent> {
     taken
 }
 
+// Returns the number of queued application events.
 fun WebSocketServer.pendingEvents(): int = this.events.size
 
 // ---------------------------------------------------------------------------
 // Application API
 
+// Accepts the pending upgrade at a valid slot and queues the switching-protocols response.
 fun WebSocketServer.admit(slot: int): void {
     val response =
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${webSocketAccept(this.acceptKeys[slot])}\r\n\r\n"
@@ -1354,24 +1393,29 @@ fun WebSocketServer.respond(id: int, response: HttpResponse): bool {
 fun webSocketServerEncode(payload: string, binary: bool = false): string =
     webSocketServerFrame(payload, if (binary) 2 else 1)
 
+// Queues an encoded frame and returns false if the connection is closed, unknown, or over its pending-byte limit.
 fun WebSocketServer.sendEncoded(id: int, frame: string): bool {
     val slot = this.slotOf(id)
     slot >= 0 && this.states[slot] == webSocketServerOpen &&
         this.enqueue(slot, frame)
 }
 
+// Queues a text or binary frame and returns false if the connection is closed, unknown, or over its pending-byte limit.
 fun WebSocketServer.send(id: int, payload: string, binary: bool = false): bool {
     val slot = this.slotOf(id)
     slot >= 0 && this.states[slot] == webSocketServerOpen &&
         this.enqueue(slot, webSocketServerFrame(payload, if (binary) 2 else 1))
 }
 
+// Queues a text frame and returns false if the connection cannot accept it.
 fun WebSocketServer.sendText(id: int, payload: string): bool =
     this.send(id, payload, false)
 
+// Queues a binary frame and returns false if the connection cannot accept it.
 fun WebSocketServer.sendBinary(id: int, payload: string): bool =
     this.send(id, payload, true)
 
+// Queues a ping and returns false if the connection cannot accept it or the payload exceeds 125 bytes.
 fun WebSocketServer.ping(id: int, payload: string = ""): bool {
     val slot = this.slotOf(id)
     slot >= 0 && this.states[slot] == webSocketServerOpen &&
@@ -1391,6 +1435,7 @@ fun WebSocketServer.broadcastEncoded(frame: string): int {
     delivered
 }
 
+// Queues a text or binary message for every open connection and returns the number that accepted it.
 fun WebSocketServer.broadcast(payload: string, binary: bool = false): int =
     this.broadcastEncoded(webSocketServerEncode(payload, binary))
 
@@ -1419,6 +1464,7 @@ fun WebSocketServer.terminate(id: int, code: int = 1006, reason: string = ""): b
     slot >= 0
 }
 
+// Returns true when the current connection identifier names an open WebSocket.
 fun WebSocketServer.isOpen(id: int): bool {
     val slot = this.slotOf(id)
     slot >= 0 && this.states[slot] == webSocketServerOpen
@@ -1443,6 +1489,7 @@ fun WebSocketServer.watchExternal(descriptor: int): bool {
     this.poller.watchDescriptor(descriptor)
 }
 
+// Returns true if an external descriptor is successfully removed from the poller.
 fun WebSocketServer.unwatchExternal(descriptor: int): bool {
     if (descriptor < 0 || descriptor >= this.slotsByDescriptor.size ||
         this.slotsByDescriptor[descriptor] != -2) return false
@@ -1450,20 +1497,26 @@ fun WebSocketServer.unwatchExternal(descriptor: int): bool {
     this.poller.unwatchDescriptor(descriptor)
 }
 
+// Returns the number of active connection slots.
 fun WebSocketServer.connectionCount(): int = this.activeCount
 
+// Returns the number of admitted WebSocket connections that are still open.
 fun WebSocketServer.openCount(): int = this.openConnections
 
+// Returns the listener's bound port, or -1 if the lookup fails.
 fun WebSocketServer.localPort(): int = this.listener.localPort()
 
 // ---------------------------------------------------------------------------
 // Shutdown
 
+// Returns true if the host installs TCP graceful-shutdown handling.
 fun WebSocketServer.enableGracefulShutdown(): bool = tcpEnableGracefulShutdown()
 
+// Returns true if the server is stopped or the host has requested TCP shutdown.
 fun WebSocketServer.shutdownRequested(): bool =
     this.stopped || tcpShutdownRequested()
 
+// Stops accepting new clients and starts the deadline for closing existing connections.
 fun WebSocketServer.beginDrain(): void {
     if (!this.draining) {
         this.draining = true
@@ -1490,11 +1543,13 @@ fun WebSocketServer.beginDrain(): void {
     return
 }
 
+// Starts graceful draining of existing connections.
 fun WebSocketServer.stop(): void {
     this.beginDrain()
     return
 }
 
+// Releases all active connection slots and stops the server.
 fun WebSocketServer.forceStop(): void {
     var slot = 0
     while (slot < this.states.size) {
@@ -1517,6 +1572,7 @@ fun WebSocketServer.drain(): int {
     0
 }
 
+// Stops the server immediately and releases active connections.
 fun WebSocketServer.stopNow(): void {
     this.forceStop()
     return
