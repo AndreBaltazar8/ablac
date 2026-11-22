@@ -164,6 +164,16 @@ void LLVMInitializeWebAssemblyAsmParser();
 
 static llvm::codegen::RegisterCodeGenFlags abla_codegen_flags;
 
+// The compiler's targets, initialised (the compiler process does it when it first needs LLVM; a process of its own for lld, `--llvm-tool wasm-ld`, has not: lld's WebAssembly LTO needs them).
+static void abla_initialize_targets() {
+    static bool initialized = false;
+    if (initialized) return;
+    initialized = true;
+    LLVMInitializeX86TargetInfo(); LLVMInitializeX86Target(); LLVMInitializeX86TargetMC(); LLVMInitializeX86AsmPrinter(); LLVMInitializeX86AsmParser();
+    LLVMInitializeAArch64TargetInfo(); LLVMInitializeAArch64Target(); LLVMInitializeAArch64TargetMC(); LLVMInitializeAArch64AsmPrinter(); LLVMInitializeAArch64AsmParser();
+    LLVMInitializeWebAssemblyTargetInfo(); LLVMInitializeWebAssemblyTarget(); LLVMInitializeWebAssemblyTargetMC(); LLVMInitializeWebAssemblyAsmPrinter(); LLVMInitializeWebAssemblyAsmParser();
+}
+
 extern "C" int abla_emit_object(const char *bitcode, const char *object, int verify, int sections, int alignLoops) {
     static bool initialized = false;
     static int aligned = -1;
@@ -229,14 +239,23 @@ extern "C" int abla_emit_object(const char *bitcode, const char *object, int ver
 // library driver, so this is its compileModule for the options the compiler passes (-filetype, -O, -mtriple, -relocation-model, --function-sections and the other code
 // generation flags LLVM registers itself, --disable-verify, --discard-value-names, the input and -o): the same target machine, the same pipeline.
 //
-//   int abla_tool_main(const char *tool, const char *arguments)     tool "opt" or "llc"; the arguments one a line; the tool's exit code
-//   int abla_shim_version()                                        2 here; the stub the build without the shim has returns 0
+//   int abla_tool_main(const char *tool, const char *arguments)     tool "opt", "llc", "llvm-extract" or "llvm-ar"; the arguments one a line; the tool's exit code
+//   int abla_shim_version()                                        3 here; the stub the build without the shim has returns 0
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Bitcode/BitcodeWriterPass.h"
+#include "llvm/IRPrinter/IRPrintingPasses.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Transforms/IPO/ExtractGV.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Transforms/IPO/StripDeadPrototypes.h"
+#include "llvm/Transforms/IPO/StripSymbols.h"
 
 extern "C" int optMain(int argc, char **argv, llvm::ArrayRef<llvm::PassPlugin> PassPlugins);
 
-extern "C" int abla_shim_version() { return 2; }
+extern "C" int abla_shim_version() { return 3; }
 
 static std::vector<std::string> abla_lines(const char *text) {
     std::vector<std::string> lines;
@@ -321,9 +340,156 @@ static int abla_llc(const std::vector<std::string> &arguments) {
     return 0;
 }
 
+// llvm-extract in this process, for the options the compiler passes (--func=NAME one or more, --delete, -S, -o, the input): llvm-extract's own sequence over the same IR: the module read lazily,
+// the named functions (or, with --delete, everything else) materialised, ExtractGVPass, then GlobalDCE (not with --delete), StripDeadDebugInfo, StripDeadPrototypes, StripDeadCGProfile and the
+// module written as text (-S) or bitcode. Its other options (--glob, --alias, --rfunc, --bb, --recursive ...) are not here: the compiler uses none.
+static int abla_llvm_extract(const std::vector<std::string> &arguments) {
+    std::string input = "-", output = "-";
+    std::vector<std::string> functions;
+    bool deleting = false, text = false;
+    for (size_t index = 0; index < arguments.size(); index++) {
+        const std::string &argument = arguments[index];
+        if (argument == "-o" && index + 1 < arguments.size()) output = arguments[++index];
+        else if (argument.rfind("--func=", 0) == 0) functions.push_back(argument.substr(7));
+        else if (argument == "--delete" || argument == "-delete") deleting = true;
+        else if (argument == "-S") text = true;
+        else if (!argument.empty() && argument[0] != '-') input = argument;
+        else {
+            llvm::errs() << "llvm-extract: unsupported option " << argument << "\n";
+            return 1;
+        }
+    }
+    llvm::LLVMContext context;
+    llvm::SMDiagnostic diagnostic;
+    std::unique_ptr<llvm::Module> module = llvm::getLazyIRFileModule(input, diagnostic, context);
+    if (!module) {
+        diagnostic.print("llvm-extract", llvm::errs());
+        return 1;
+    }
+    llvm::SetVector<llvm::GlobalValue *> selected;
+    for (const std::string &name : functions) {
+        llvm::GlobalValue *function = module->getFunction(name);
+        if (!function) {
+            llvm::errs() << "llvm-extract: program doesn't contain function named '" << name << "'!\n";
+            return 1;
+        }
+        selected.insert(function);
+    }
+    auto materialize = [&](llvm::GlobalValue &value) { llvm::ExitOnError exitOnError("llvm-extract: "); exitOnError(value.materialize()); };
+    if (!deleting) {
+        for (llvm::GlobalValue *value : selected) materialize(*value);
+    } else {
+        llvm::SmallPtrSet<llvm::GlobalValue *, 8> set(llvm::from_range, selected);
+        for (llvm::Function &function : *module)
+            if (!set.count(&function)) materialize(function);
+    }
+    {
+        std::vector<llvm::GlobalValue *> values(selected.begin(), selected.end());
+        llvm::LoopAnalysisManager loops;
+        llvm::FunctionAnalysisManager functionsManager;
+        llvm::CGSCCAnalysisManager sccs;
+        llvm::ModuleAnalysisManager modules;
+        llvm::PassBuilder builder;
+        builder.registerModuleAnalyses(modules);
+        builder.registerCGSCCAnalyses(sccs);
+        builder.registerFunctionAnalyses(functionsManager);
+        builder.registerLoopAnalyses(loops);
+        builder.crossRegisterProxies(loops, functionsManager, sccs, modules);
+        llvm::ModulePassManager passes;
+        passes.addPass(llvm::ExtractGVPass(values, deleting, false));
+        passes.run(*module, modules);
+        llvm::ExitOnError exitOnError("llvm-extract: ");
+        exitOnError(module->materializeAll());
+    }
+    llvm::LoopAnalysisManager loops;
+    llvm::FunctionAnalysisManager functionsManager;
+    llvm::CGSCCAnalysisManager sccs;
+    llvm::ModuleAnalysisManager modules;
+    llvm::PassBuilder builder;
+    builder.registerModuleAnalyses(modules);
+    builder.registerCGSCCAnalyses(sccs);
+    builder.registerFunctionAnalyses(functionsManager);
+    builder.registerLoopAnalyses(loops);
+    builder.crossRegisterProxies(loops, functionsManager, sccs, modules);
+    llvm::ModulePassManager passes;
+    if (!deleting) passes.addPass(llvm::GlobalDCEPass());
+    passes.addPass(llvm::StripDeadDebugInfoPass());
+    passes.addPass(llvm::StripDeadPrototypesPass());
+    passes.addPass(llvm::StripDeadCGProfilePass());
+    std::error_code failure;
+    llvm::ToolOutputFile out(output, failure, llvm::sys::fs::OF_None);
+    if (failure) {
+        llvm::errs() << failure.message() << '\n';
+        return 1;
+    }
+    if (text) passes.addPass(llvm::PrintModulePass(out.os(), "", /*ShouldPreserveUseListOrder=*/false));
+    else passes.addPass(llvm::BitcodeWriterPass(out.os(), /*ShouldPreserveUseListOrder=*/true));
+    passes.run(*module, modules);
+    out.keep();
+    return 0;
+}
+
+// llvm-ar in this process, for what the compiler passes: `rcs` or `rcsD`, optionally `--format=gnu|darwin|bsd|default`, the archive, its members. llvm-ar's own writer with its own options
+// (Deterministic unless U, the symbol table with s); the default format is the one llvm-ar infers from the first member (a Mach-O member makes a Darwin archive, as on macOS).
+static int abla_llvm_ar(const std::vector<std::string> &arguments) {
+    std::string format = "default";
+    std::vector<std::string> positional;
+    std::string modifiers;
+    for (const std::string &argument : arguments) {
+        if (argument.rfind("--format=", 0) == 0) format = argument.substr(9);
+        else if (modifiers.empty() && !argument.empty() && argument[0] != '-') modifiers = argument;
+        else positional.push_back(argument);
+    }
+    if (modifiers.empty() || modifiers[0] != 'r' || positional.empty()) {
+        llvm::errs() << "llvm-ar: only the r (replace into a new archive) operation is supported here\n";
+        return 1;
+    }
+    bool deterministic = true, symtab = false;
+    for (char modifier : modifiers.substr(1)) {
+        if (modifier == 'c') continue;
+        else if (modifier == 's') symtab = true;
+        else if (modifier == 'D') deterministic = true;
+        else if (modifier == 'U') deterministic = false;
+        else { llvm::errs() << "llvm-ar: unsupported modifier " << modifier << "\n"; return 1; }
+    }
+    std::vector<llvm::NewArchiveMember> members;
+    std::list<std::string> names;  // the members' names (a StringRef each) live until the archive is written
+    for (size_t index = 1; index < positional.size(); index++) {
+        llvm::Expected<llvm::NewArchiveMember> member = llvm::NewArchiveMember::getFile(positional[index], deterministic);
+        if (!member) {
+            llvm::errs() << positional[index] << ": " << llvm::toString(member.takeError()) << "\n";
+            return 1;
+        }
+        // llvm-ar names a regular archive's member by the file's base name.
+        const std::string &stored = names.emplace_back(llvm::sys::path::filename(member->MemberName));
+        member->MemberName = stored;
+        members.push_back(std::move(*member));
+    }
+    llvm::object::Archive::Kind kind;
+    if (format == "gnu") kind = llvm::object::Archive::K_GNU;
+    else if (format == "darwin") kind = llvm::object::Archive::K_DARWIN;
+    else if (format == "bsd") kind = llvm::object::Archive::K_BSD;
+    else if (format == "default") kind = members.empty() ? llvm::object::Archive::getDefaultKind() : members.front().detectKindFromObject();
+    else { llvm::errs() << "llvm-ar: unsupported format " << format << "\n"; return 1; }
+    llvm::Error failure = llvm::writeArchive(positional[0], members, symtab ? llvm::SymtabWritingMode::NormalSymtab : llvm::SymtabWritingMode::NoSymtab, kind, deterministic, /*Thin=*/false);
+    if (failure) {
+        llvm::errs() << positional[0] << ": " << llvm::toString(std::move(failure)) << "\n";
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" int abla_tool_main(const char *tool, const char *arguments) {
     std::vector<std::string> lines = abla_lines(arguments);
     if (std::string(tool) == "llc") return abla_llc(lines);
+    if (std::string(tool) == "llvm-extract") return abla_llvm_extract(lines);
+    if (std::string(tool) == "llvm-ar") return abla_llvm_ar(lines);
+    if (std::string(tool) == "ld.lld" || std::string(tool) == "wasm-ld" || std::string(tool) == "lld-link") {
+        // lld in a process of its own: its WebAssembly LTO cannot run twice in one process (src/static_lld.ab runs wasm-ld and lld-link this way). Diagnostics go to standard error.
+        abla_initialize_targets();
+        const int status = abla_lld_main((std::string(tool) + "\n" + arguments).c_str(), nullptr);
+        return status < 0 ? 1 : status;
+    }
     if (std::string(tool) != "opt") return 127;
     lines.insert(lines.begin(), "opt");
     std::vector<char *> argv;

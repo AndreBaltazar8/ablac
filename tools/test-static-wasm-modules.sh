@@ -20,23 +20,28 @@ rm -rf "$out"
 mkdir -p "$out"
 fail() { echo "static wasm modules: $*" >&2; exit 1; }
 count=0
-for case in wasm-export-extern wasm-alloc-limit wasm-debug-reproducible; do
+for case in wasm-export-extern wasm-alloc-limit wasm-debug-reproducible wasm-two-modules; do
     [[ -f tests/cases/$case/build.ab ]] || fail "no tests/cases/$case/build.ab"
-    module=$(sed -n 's/^.*"\(\.\.\/\.\.\/\.\.\/build\/[^"]*\.wasm\)".*$/\1/p' tests/cases/$case/build.ab | head -1)
-    [[ -n $module ]] || fail "$case: no module path in its build.ab"
-    target=$root/tests/cases/$case/$module
+    # Every module the build file writes (a build file with two builds links WebAssembly twice in one process: lld's WebAssembly LTO cannot run twice in a process, so the static compiler runs
+    # wasm-ld as a process of its own each time).
+    modules=$(grep -o '"\.\./\.\./\.\./build/[^"]*\.wasm"' tests/cases/$case/build.ab | tr -d '"')
+    [[ -n $modules ]] || fail "$case: no module path in its build.ab"
     for which in static ordinary; do
         if [[ $which == static ]]; then builder=$static; else builder=$ordinary; fi
         [[ -n $builder ]] || continue
-        rm -f "$target"
+        for module in $modules; do rm -f "$root/tests/cases/$case/$module"; done
         ABLA_CACHE_DIR=$PWD/$out/$case.$which.cache "$builder" build "tests/cases/$case/build.ab" -o "$out/$case.$which.driver" --no-cache > "$out/$case.$which.log" 2>&1 ||
-            { tail -5 "$out/$case.$which.log" >&2; fail "$case: the $which compiler did not build the module"; }
-        [[ -s $target ]] || fail "$case: the $which compiler left no module at $target"
-        cp "$target" "$out/$case.$which.wasm"
+            { tail -5 "$out/$case.$which.log" >&2; fail "$case: the $which compiler did not build the module(s)"; }
+        for module in $modules; do
+            [[ -s $root/tests/cases/$case/$module ]] || fail "$case: the $which compiler left no module at $module"
+            cp "$root/tests/cases/$case/$module" "$out/$case.$which.$(basename -- "$module")"
+        done
     done
     if [[ -n $ordinary ]]; then
-        cmp -s "$out/$case.static.wasm" "$out/$case.ordinary.wasm" || fail "$case: the static compiler's module differs from the ordinary compiler's"
+        for module in $modules; do
+            cmp -s "$out/$case.static.$(basename -- "$module")" "$out/$case.ordinary.$(basename -- "$module")" || fail "$case: the static compiler's $(basename -- "$module") differs from the ordinary compiler's"
+        done
     fi
-    count=$((count + 1))
+    count=$((count + $(wc -w <<< "$modules")))
 done
 echo "static wasm modules: $count modules built by the static compiler$([[ -n $ordinary ]] && echo ', byte for byte the ordinary compiler'"'"'s')"
