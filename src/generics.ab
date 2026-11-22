@@ -659,22 +659,30 @@ fun bootstrapGenericProbedBodies(
     declarations: array<BootstrapDeclaration>,
     table: BootstrapGenericTable,
     also: BootstrapStringSet,
-    onlyAlso: bool
+    onlyAlso: bool,
+    var inactiveProgram: array<bool>
 ): BootstrapStringSet {
     var bodies = bootstrapStringSet()
-    for (declaration in declarations) {
+    for (position in 0 until declarations.size) {
+        val declaration = declarations[position]
         val instance = also.contains(declaration.name)
+        val canCache = !onlyAlso && !instance && position < inactiveProgram.size
+        if (canCache && inactiveProgram[position]) continue
+        var selected = false
         if (declaration.kind == "fun" || declaration.kind == "compile.fun") {
             if (instance || (!onlyAlso && bootstrapGenericBodyMayResolve(declaration, table))) {
                 bodies.add(bootstrapOverloadBodyKey(declaration))
+                selected = true
             }
         } else if (bootstrapGenericIsTypeKind(declaration.kind)) {
             for (method in declaration.methods) {
                 if (instance || (!onlyAlso && bootstrapGenericBodyMayResolve(method, table))) {
                     bodies.add(bootstrapOverloadBodyKey(method))
+                    selected = true
                 }
             }
         }
+        if (canCache) inactiveProgram[position] = !selected
     }
     bodies
 }
@@ -785,15 +793,15 @@ fun bootstrapGenericMarkCopies(
 ): BootstrapExpression {
     // A leaf that is neither a call nor a member call is never marked: it is itself, not a copy (see
     // bootstrapGenericRewriteExpression).
-    if (expression.children.size == 0 && expression.kind != "call" && expression.kind != "member.call") return expression
+    val kind = expression.kind
+    if (expression.children.size == 0 && kind != "call" && kind != "member.call") return expression
     val children: array<BootstrapExpression> = []
     for (child in expression.children) children.append(
         bootstrapGenericMarkCopies(child, identity, free, extensions, seen)
     )
     var text = expression.text
-    val name = bootstrapGenericCalleeName(text)
-    if ((expression.kind == "call" && free.contains(name)) ||
-        (expression.kind == "member.call" && extensions.contains(name))) {
+    if ((kind == "call" && free.contains(bootstrapGenericCalleeName(text))) ||
+        (kind == "member.call" && extensions.contains(bootstrapGenericCalleeName(text)))) {
         val key =
             "$identity$BOOTSTRAP_GENERIC_SOURCE_MARK${expression.begin}:${expression.end}:${expression.kind}:$text"
         if (seen.contains(key)) {
@@ -1178,6 +1186,10 @@ fun bootstrapInstantiateGenericsIn(parsed: BootstrapParseResult): BootstrapParse
     var failedCalls: array<BootstrapOverloadResolution> = []
     var program: array<BootstrapDeclaration> = []
     for (declaration in declarations) program.append(declaration)
+    // The probe input starts with program, in the same order each round.
+    // An untouched declaration with no candidate calls can skip discovery.
+    // The cache excludes the appended parameter classes and fresh instances.
+    val inactiveProgram = filledArray(program.size, false)
     var round = 0
     var probing = true
     while (probing) {
@@ -1185,7 +1197,7 @@ fun bootstrapInstantiateGenericsIn(parsed: BootstrapParseResult): BootstrapParse
         for (declaration in program) input.append(declaration)
         for (declaration in parameterClasses) input.append(declaration)
         for (declaration in state.instances) input.append(declaration)
-        val bodies = bootstrapGenericProbedBodies(input, state.table, state.fresh, false)
+        val bodies = bootstrapGenericProbedBodies(input, state.table, state.fresh, false, inactiveProgram)
         val delegating = bootstrapGenericDelegatingClasses(input, state.table, state.fresh)
         if (bodies.keys.size == 0 && delegating.size == 0) {
             failures = ""
@@ -1228,6 +1240,7 @@ fun bootstrapInstantiateGenericsIn(parsed: BootstrapParseResult): BootstrapParse
                         bootstrapGenericProbedIn(declaration, bodies)) {
                         program[position] = bootstrapOverloadRewriteDeclaration(declaration,
                             resolutions, index)
+                        inactiveProgram[position] = false
                     }
                     position = position + 1
                 }
@@ -1267,10 +1280,11 @@ fun bootstrapInstantiateGenericsIn(parsed: BootstrapParseResult): BootstrapParse
         parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics, [],
         parsed.stackDepthStoppedSources
     )
+    val noProbeCache: array<bool> = []
     var check = bootstrapAnalyzer(
         checkResult, [], [], [], [], bootstrapNoOverloads(), false, false,
         BootstrapGenericTable(ids, names, owners, templates, true,
-            bootstrapGenericProbedBodies(checkInput, state.table, checked, true))
+            bootstrapGenericProbedBodies(checkInput, state.table, checked, true, noProbeCache))
     )
     check.analyze(checkResult)
     val bodyDiagnostics = bootstrapGenericBodyDiagnostics(check.diagnostics)
