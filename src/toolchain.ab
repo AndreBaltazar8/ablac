@@ -3299,12 +3299,13 @@ fun bootstrapLlvmAssemblyNamesIn(text: string, begin: int, end: int,
 // reading back and parsing well over 100 MB of text cost seconds.
 fun bootstrapPrepareLtoLlvm(
     llvmPath: string,
-    preparedPath: string
+    preparedPath: string,
+    wasm: bool = false
 ): int {
     val visiblePath = "$preparedPath.visible.bc"
     var status = bootstrapPrepareParallelLlvm(llvmPath, visiblePath, false)
     if (status == 0) {
-        status = bootstrapInternalizeLlvmUserFunctionWrapperBitcode(visiblePath, preparedPath)
+        status = bootstrapInternalizeLlvmUserFunctionWrapperBitcode(visiblePath, preparedPath, wasm)
     }
     Path(visiblePath).remove()
     status
@@ -3318,7 +3319,8 @@ fun bootstrapPrepareLtoLlvm(
 // dropped on the way: nothing after this reads them.
 trusted fun bootstrapInternalizeLlvmUserFunctionWrapperBitcode(
     inputPath: string,
-    outputPath: string
+    outputPath: string,
+    wasm: bool = false
 ): int {
     val nullPointer = nativeNullPointer()
     val buffer = nativePointerCell(nullPointer)
@@ -3353,7 +3355,8 @@ trusted fun bootstrapInternalizeLlvmUserFunctionWrapperBitcode(
         }
         // The --backtrace table, before clang's link-time optimization (which this compiler cannot follow), so it
         // names every function the module defines and keeps each one out of line.
-        bootstrapLlvmDefineBacktraceTable(module.load(), context)
+        if (wasm) bootstrapLlvmBacktraceWasmNames(module.load())
+        else bootstrapLlvmDefineBacktraceTable(module.load(), context)
         if (LLVMWriteBitcodeToFile(module.load(), outputPath) != 0) status = 145
     }
     if (!pointerIsNull(module.load())) LLVMDisposeModule(module.load())
@@ -5137,7 +5140,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // (A build that failed before using it.)
     bootstrapDisposeHeldModule()
     if (status == 0 && ltoEligible && !linkLlvm && !wholeProgram && !ltoReused) {
-        status = bootstrapPrepareLtoLlvm(llvmPath, ltoPreparedPath)
+        status = bootstrapPrepareLtoLlvm(llvmPath, ltoPreparedPath, target.objectFormat == "wasm")
         // Preparing read and rewrote the module's text (well over 100 MB for a large
         // program): garbage now, while the LTO compile and link run beside this process.
         bootstrapCollectAndRelease()
@@ -5659,7 +5662,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             // A build without debug information publishes a module without the
             // custom name section; a debug build keeps the name section and DWARF
             // (and gets a source map below).
-            if (!bootstrapLlvmDebugInfo) linkModule.argument("--strip-all")
+            // (--backtrace keeps the name section alone: its functions' readable names, for a host's stack traces.)
+            if (!bootstrapLlvmDebugInfo) linkModule.argument(if (bootstrapLlvmBacktrace) "--strip-debug" else "--strip-all")
             linkModule.argument(if (!wasmLtoEligible)
                 objectPath
                 else if (panicWriteLinked) ltoObjectPath
@@ -5710,6 +5714,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         // game's client comes out within 0.01% of one size whatever the partitioning, and 0.3%
         // smaller than in link order (the most called functions get the shortest indices).
         optimizeModule.argument("--reorder-functions")
+        // (Binaryen drops the name section unless asked to keep it.)
+        if (bootstrapLlvmBacktrace) optimizeModule.argument("-g")
         optimizeModule.argument("-O3")
         optimizeModule.argument(publishPath)
         optimizeModule.argument("-o")

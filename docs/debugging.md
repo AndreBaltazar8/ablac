@@ -184,6 +184,17 @@ same text adds file:line and the inlined calls. Frames outside the program
 (the C library's, in a program that links it) are left unnamed. Without
 `--backtrace` a release build is byte for byte what it was.
 
+A WebAssembly module's host walks its stack, so there `--backtrace` (on the
+build that runs `wasmBuildModule` or `buildProgram`) keeps the module's name
+section, its functions under their readable names, and a trap's stack in a
+browser or Node names them:
+
+```text
+RuntimeError: unreachable
+    at crash.wasm.self.__ablaRuntimePanic (wasm://wasm/crash.wasm-948bddf2:wasm-function[5]:0x16c6)
+    at crash.wasm.crash.crash (wasm://wasm/crash.wasm-948bddf2:wasm-function[8]:0x1c1e)
+```
+
 ## WebAssembly: browser developer tools
 
 A debug module (`artifact = "module"` on a WebAssembly target) is published with
@@ -297,7 +308,9 @@ hello (30 KB to 39 KB) and binary-trees (36 KB to 45 KB); to the compiler
 itself (about 3,250 functions) 116 KB of names and 52 KB of table, offset by
 smaller code. Its frame pointers cost up to 7% in speed (binary-trees +6.9%,
 fannkuch +1.8%, fasta +1.2%, mandelbrot and spectral-norm unchanged) and
-nothing measurable in the compiler's build time.
+nothing measurable in the compiler's build time. On a WebAssembly module the
+name section is the whole cost: 496 bytes on tests/cases/wasm-backtrace (7,576
+to 8,072), 653 on binary-trees, about 100 KB for 6,900 functions.
 
 ## Collector trace: `ABLA_GC_TRACE=1`
 
