@@ -5,6 +5,7 @@
 # (bin/ablac.exe beside share/abla), it runs under Wine from another directory with no ABLA_SYSROOT:
 #   - `--version` prints its version;
 #   - `fmt` rewrites a file;
+#   - compile-time code captures processes (src/ct_process.ab through the runtime's spawn): its --version, past a limit, a missing one;
 #   - `build` finds its standard library beside its own image (/proc/self/exe) and takes a program through parsing, analysis
 #     and IR to its first LLVM call, which the stub fails: an LLVM error, not a missing toolchain or a refused system call.
 # Without Wine (or lld-link, llvm-mc, llvm-ar) the undefined-symbol check still runs and the rest is skipped with a message.
@@ -68,4 +69,34 @@ run fmt fmt hello.ab
 run build build hello.ab -o hello.exe
 grep -q 'E_TOOLCHAIN_ROOT\|no standard library' "$out/build.out" && fail "build found no toolchain: $(head -3 "$out/build.out")"
 grep -q 'E_LLVM' "$out/build.out" || fail "build did not reach LLVM ($status): $(head -5 "$out/build.out")"
-echo "windows-compiler: ablac.exe (a stub LLVM) runs --version, fmt and build up to its first LLVM call under Wine, its toolchain found beside it"
+
+# Compile-time processes (src/ct_process.ab: the runtime's spawn, no fork), in the evaluator (the JIT needs LLVM) before the
+# first LLVM call: the compiler's own --version, its output past a 3-byte limit, and a program that does not exist.
+mkdir -p "$out/work/capture"
+printf 'compileCapabilities = ["process.io"]\n' > "$out/work/capture/abla.toml"
+cat > "$out/work/capture/main.ab" <<'EOF'
+import "abla/compiler"
+import "abla/text"
+import "abla/io"
+#compilerGrant("process.io")
+compile fun show(label: string, result: CompilerProcessResult): string {
+    println("capture $label: failure='${result.failure}' exit=${result.exitCode} read=${result.bytesRead} ${result.stdout.trim()}")
+    label
+}
+compile fun captures(): string {
+    show("version", compilerCaptureProcess(["/proc/self/exe", "--version"]))
+    show("limit", compilerCaptureProcess(["/proc/self/exe", "--version"], 3, 10000))
+    show("missing", compilerCaptureProcess(["Z:/abla-capture-nonexistent.exe"]))
+    "done"
+}
+val DONE = #captures()
+fun main { println(DONE) }
+EOF
+ABLA_COMPILE_EVAL=interp run capture build capture/main.ab -o capture.exe
+grep -q "capture version: failure='' exit=0 read=[0-9]* ablac [0-9]" "$out/capture.out" ||
+    fail "a compile-time capture of ablac --version: $(grep -m3 'capture\|error' "$out/capture.out")"
+grep -q "capture limit: failure='output-limit' exit=-\?[0-9]* read=4 *$" "$out/capture.out" ||
+    fail "a capture past its limit: $(grep -m1 'capture limit' "$out/capture.out")"
+grep -q "capture missing: failure='launch'" "$out/capture.out" ||
+    fail "a capture of a missing program: $(grep -m1 'capture missing' "$out/capture.out")"
+echo "windows-compiler: ablac.exe (a stub LLVM) runs --version, fmt, compile-time process captures and build up to its first LLVM call under Wine, its toolchain found beside it"

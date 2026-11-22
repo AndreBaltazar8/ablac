@@ -3,6 +3,7 @@
 import "abla/sys/linux"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
+import "abla/sys/linux/fs"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
@@ -25,6 +26,7 @@ class BootstrapProcessCapture(
 
 trusted fun bootstrapProcessCapture(arguments: array<string>, maximum: int,
     timeout: int): BootstrapProcessCapture {
+    if (linuxHostIsWindows()) return bootstrapProcessCaptureWindows(arguments, maximum, timeout)
     val started = linuxMonotonicMilliseconds()
     val executable = linuxExecutablePath(arguments[0])
     val table = (arguments.size + 1) * 8
@@ -250,6 +252,54 @@ trusted fun bootstrapProcessCapture(arguments: array<string>, maximum: int,
     BootstrapProcessCapture(status, text, failure, measured)
 }
 
+// bootstrapProcessCapture on Windows, where there is no fork: the runtime's spawn (LinuxCommand.start, system call 4001) with
+// standard input from the null device and standard output into a scratch file beside the build's temporary files, standard error
+// the compiler's as on Linux. The child is polled to the same deadline; its file growing past `maximum` stops it as the pipe does
+// (output-limit), and a stop ends its process (stopTree). What it wrote is read once it has exited.
+trusted fun bootstrapProcessCaptureWindows(arguments: array<string>, maximum: int, timeout: int): BootstrapProcessCapture {
+    val started = linuxMonotonicMilliseconds()
+    var directory = "."
+    for (name in ["TMP", "TEMP"]) {
+        val temporary = linuxEnvironment(name)
+        if (temporary.found && temporary.value != "") directory = temporary.value
+    }
+    val scratch = Path(directory).child("abla-capture-${linuxProcessId()}-${linuxMonotonicNanoseconds()}.out")
+    val command = linuxCommand(arguments[0])
+    var index = 1
+    while (index < arguments.size) {
+        command.argument(arguments[index])
+        index = index + 1
+    }
+    command.input("/dev/null")
+    command.output(scratch.text)
+    val child = command.start()
+    if (child.process <= 0) {
+        scratch.remove()
+        bootstrapProcessLaunchReport(arguments[0], 10 * 4096 + (if (child.process < 0) 0 - child.process else 0))
+        return BootstrapProcessCapture(-1, "", "launch", 0)
+    }
+    var status = -1
+    var failure = ""
+    var running = true
+    while (running && failure == "") {
+        val observed = linuxWaitProcess(child.process, true)
+        if (observed.output != "pending") {
+            status = observed.status
+            running = false
+            if (status < 0) failure = "wait"
+        } else if (scratch.info().size > maximum) failure = "output-limit"
+        else if (linuxMonotonicMilliseconds() - started >= timeout) failure = "timeout"
+        else linuxSleepMillisecondsChecked(10)
+    }
+    if (failure != "" && running) status = child.stopTree(0)
+    val written = scratch.info().size
+    if (failure == "" && written > maximum) failure = "output-limit"
+    val measured = if (written > maximum + 1) maximum + 1 else written
+    val text = if (failure == "") scratch.readText() else ""
+    scratch.remove()
+    BootstrapProcessCapture(status, text, failure, measured)
+}
+
 // A launch that failed, on standard error (the build's log): which step and its errno (#1041), so a spawn that
 // fails now and then explains itself. `code` is step * 4096 + errno.
 fun bootstrapProcessLaunchText(executable: string, code: int): string {
@@ -264,6 +314,7 @@ fun bootstrapProcessLaunchText(executable: string, code: int): string {
         else if (step == 7) "exec"
         else if (step == 8) "fork"
         else if (step == 9) "making the pipes nonblocking"
+        else if (step == 10) "starting it (Windows)"
         else "an unknown step ($code)"
     "compilerCaptureProcess: $executable did not start: $what failed" +
         (if (errno != 0) " (errno $errno)" else "")
