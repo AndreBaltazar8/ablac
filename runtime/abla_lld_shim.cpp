@@ -92,6 +92,9 @@ extern "C" int abla_lld_main(const char *arguments, const char *errors) {
     return result.canRunAgain || result.retCode == 0 ? result.retCode : -1;
 }
 
+// The shim's version: 1 here (linker, archive writer, object emission). The stub a build without the shim carries answers 0 (src/toolchain.ab), and src/static_lld.ab installs nothing then.
+extern "C" int abla_shim_version() { return 1; }
+
 // An archive of object files, as `llvm-ar rcsD --format=gnu OUTPUT MEMBER...` writes it (what the compiler's code generation units are combined into: src/codegen_units.ab):
 // the same library routine with the same options, so the same bytes.
 //
