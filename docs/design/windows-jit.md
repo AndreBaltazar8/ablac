@@ -103,11 +103,27 @@ to the thread. The design:
   jumps on its way out. In JIT'd code: `SuspendThread`, `GetThreadContext`, and if Rip is still in JIT memory, the same CONTEXT
   change as for a fault with 3, `SetThreadContext`, `ResumeThread`. A suspended thread may hold a lock only in the compiler's
   or the runtime's code, which is exactly the deferred case, so the redirect never leaves a lock held.
+- **The redirect's conditions** (ablac-60's review; the technique Go's asynchronous preemption and .NET use; Win64 has no red
+  zone, so lowering Rsp and pointing Rip at the jump routine is safe and the old frame is never resumed):
+  1. only when Rip is inside a JIT allocation: in ntdll, kernel32 or the runtime (JIT'd code in the middle of a system call),
+     the thread is resumed and the watchdog tries again about a millisecond later, since a redirect there could leave a loader,
+     heap or I/O lock held;
+  2. a thread suspended in a kernel wait reports the wait's call site, and the redirect takes effect only when the wait returns,
+     so the wait slices and CancelSynchronousIo below are needed beside it, not instead of it;
+  3. the watchdog never suspends itself, and between SuspendThread and ResumeThread it allocates nothing and takes no lock the
+     target could hold (the heap's above all);
+  4. Wine does SuspendThread and SetThreadContext through wineserver and signals: they work, more slowly and less exactly, so the
+     windows-run job on Windows is the answer for this part.
 - **A blocked call** (an interpreted site's file or pipe read, the case the Linux alarm breaks with EINTR): the watchdog calls
   `CancelSynchronousIo` on the thread, which ends a synchronous ReadFile/WriteFile with ERROR_OPERATION_ABORTED, which the runtime
-  reports as EINTR. Waits the runtime makes itself (`Sleep`, `WaitOnAddress`, `WaitForSingleObject` in wait4) take a timeout
-  slice and look at a per-thread "interrupted" word, so they return EINTR too. **[confirm]** under Wine and on the runner that
-  CancelSynchronousIo ends a pipe read.
+  reports as EINTR (ERROR_OPERATION_ABORTED to -4 in the read and write translations). Waits the runtime makes itself (`Sleep`,
+  `WaitOnAddress`, `WaitForSingleObject` in wait4, the poll loops) go through one helper that waits at most about 20 ms a slice
+  and then looks at the thread's "interrupted" word, so every wait returns EINTR (WaitOnAddress is not alertable: an APC would
+  not wake it). The word is per thread, not one for the process: the compiler's other threads (code generation, a generation's
+  own threads) must not see EINTR. The runtime gives each thread its word in native TLS and a function that returns its address
+  (`abla_runtime_windows_interrupt_cell`); the guard records that address while it is armed, and the watchdog writes 1 through
+  it. CreatePipe's handles are synchronous, so **[confirm]** under Wine and on the runner that CancelSynchronousIo ends a read
+  of one.
 - **New kernel32 imports** (for the compiler, which is CRT-linked per #104, so they can come from the CRT's kernel32 import
   library rather than our list): SuspendThread, ResumeThread, GetThreadContext, SetThreadContext, CancelSynchronousIo,
   CreateEventW, SetEvent, WaitForSingleObject (already), SetThreadStackGuarantee.
