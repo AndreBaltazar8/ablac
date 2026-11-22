@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Declared field slots (ablaRuntimeLoadSlot*/StoreSlot*, the typed field
-# accessors) and abla/unsafe memory carry separate TBAA tags; nothing else is
-# tagged. The program interleaving raw and field accesses reads what was last
-# written, as is and when every safe point collects (ABLA_GC_STRESS=1).
+# accessors) and raw memory carry separate TBAA tags. Stack values, dense
+# array headers and dense array elements are children of the raw-memory type.
+# The program reads what was last written, including under ABLA_GC_STRESS=1.
 set -euo pipefail
 compiler=${1:-build/ablac}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -12,23 +12,46 @@ source="$project_root/tests/cases/bootstrap/slot-alias.ab"
 
 "$compiler" --emit-llvm "$source" > "$output_directory/program.ll"
 ir="$output_directory/program.ll"
-# The tag a node named $1 gives: its access-tag metadata id.
-tag_of() {
+# Find the type node by name and, when supplied, require its parent.
+type_of() {
+    local pattern="^![0-9]+ = ![{]!\"$1\", ${2:-![0-9]+}, i64 0[}]$"
     local type
-    type=$(grep -E "^![0-9]+ = !\{!\"$1\", " "$ir" | head -1 | cut -d' ' -f1)
-    [[ -n $type ]] || { echo "slot alias: no type node named '$1'" >&2; exit 1; }
-    grep -E "^![0-9]+ = !\{$type, $type, i64 0\}" "$ir" | head -1 | cut -d' ' -f1
+    type=$(awk -v pattern="$pattern" '$0 ~ pattern {print $1; exit}' "$ir")
+    [[ -n $type ]] || { echo "slot alias: missing type '$1' with expected parent" >&2; exit 1; }
+    printf '%s\n' "$type"
 }
-slot=$(tag_of "abla field slot")
-raw=$(tag_of "abla raw memory")
-[[ -n $slot && -n $raw ]] || { echo "slot alias: missing access tags" >&2; exit 1; }
+
+tag_of() {
+    local type=$1 tag
+    tag=$(awk -v node="!{$type, $type, i64 0}" '$1 ~ /^![0-9]+$/ && substr($0, index($0, " = ") + 3) == node {print $1; exit}' "$ir")
+    [[ -n $tag ]] || { echo "slot alias: missing access tag for $type" >&2; exit 1; }
+    printf '%s\n' "$tag"
+}
+
+raw_type=$(type_of "abla raw memory")
+slot_type=$(type_of "abla field slot")
+stack_type=$(type_of "abla stack value" "$raw_type")
+header_type=$(type_of "abla dense array header" "$raw_type")
+element_type=$(type_of "abla dense array element" "$raw_type")
+slot=$(tag_of "$slot_type")
+raw=$(tag_of "$raw_type")
+stack=$(tag_of "$stack_type")
+header=$(tag_of "$header_type")
+element=$(tag_of "$element_type")
 grep -qE "load i64, ptr .*!tbaa $slot( |,|$)" "$ir" || { echo "slot alias: no slot-tagged load" >&2; exit 1; }
 grep -qE "store i64 .*!tbaa $slot( |,|$)" "$ir" || { echo "slot alias: no slot-tagged store" >&2; exit 1; }
 grep -qE "store i64 .*!tbaa $raw( |,|$)" "$ir" || { echo "slot alias: no raw-tagged store" >&2; exit 1; }
 grep -qE "load i64, ptr .*!tbaa $raw( |,|$)" "$ir" || { echo "slot alias: no raw-tagged load" >&2; exit 1; }
+grep -qE "load %AblaValue, ptr .*!tbaa $stack( |,|$)" "$ir" || { echo "slot alias: no stack-tagged value load" >&2; exit 1; }
+for field in length data; do
+    grep -qE "%dense[.]array[.]$field[0-9]* = load i64, ptr .*!tbaa $header( |,|$)" "$ir" ||
+        { echo "slot alias: no header-tagged $field load" >&2; exit 1; }
+done
+grep -qE "%dense[.]array[.]word[0-9]* = load i64, ptr .*!tbaa $element( |,|$)" "$ir" || { echo "slot alias: no element-tagged load" >&2; exit 1; }
+grep -qE "store i64 .*, ptr %dense[.]array[.]element[0-9]*, .*!tbaa $element( |,|$)" "$ir" || { echo "slot alias: no element-tagged store" >&2; exit 1; }
 tagged=$(grep -cE "!tbaa " "$ir")
-slot_or_raw=$(grep -cE "!tbaa ($slot|$raw)( |,|$)" "$ir")
-[[ $tagged -eq $slot_or_raw ]] || { echo "slot alias: $tagged tagged accesses, $slot_or_raw slot or raw" >&2; exit 1; }
+recognized=$(grep -cE "!tbaa ($slot|$raw|$stack|$header|$element)( |,|$)" "$ir")
+[[ $tagged -eq $recognized ]] || { echo "slot alias: $tagged tagged accesses, $recognized recognized" >&2; exit 1; }
 
 "$compiler" build "$source" -o "$output_directory/program" --no-cache \
     > "$output_directory/build.log" 2>&1 || { cat "$output_directory/build.log" >&2; exit 1; }
@@ -47,4 +70,4 @@ for stress in 0 1; do
         exit 1
     fi
 done
-echo "slot alias: field slots and raw memory tagged apart ($slot_or_raw accesses), nothing else tagged; the program agrees with and without collection at every safe point"
+echo "slot alias: field slots and raw memory tagged apart ($recognized accesses), with separate tags under raw memory for stack values, array headers and dense elements; runtime output agrees under GC stress"
