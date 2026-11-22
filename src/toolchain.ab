@@ -1941,6 +1941,28 @@ trusted fun bootstrapEmitCodegenUnit(
     status
 }
 
+// opt and llc of the cross targets in this process (#101, runtime/abla_lld_shim.cpp, abla_tool_main): a child of the compiler itself (`--llvm-tool opt|llc`, src/orc_main.ab)
+// stands where the tool's process stood, with the same arguments. Only where the compiler carries them (the static one) and the target is not a microcontroller's, whose
+// companion brings tools of its own. ABLA_CODEGEN_INPROCESS=0 runs the external tools.
+var bootstrapInProcessTool: (string, string) -> int = bootstrapNoInProcessTool
+var bootstrapInProcessToolInstalled: bool = false
+fun bootstrapNoInProcessTool(tool: string, arguments: string): int = -1
+
+fun bootstrapOwnToolCommand(tool: string): LinuxCommand {
+    val command = linuxCommand("/proc/self/exe")
+    command.argument("--llvm-tool")
+    command.argument(tool)
+    command
+}
+
+// An LLVM tool of the host path (opt): the compiler's own when it carries them (the static one), else the toolchain's. ABLA_CODEGEN_INPROCESS=0 runs the external one.
+fun bootstrapLlvmToolCommand(name: string): LinuxCommand =
+    if (bootstrapInProcessToolInstalled && bootstrapInProcessEmitterOn()) bootstrapOwnToolCommand(name)
+    else linuxCommand(bootstrapHostLlvmTool(name))
+
+fun bootstrapCrossCommand(own: bool, tools: BootstrapXtensaTools, name: string): LinuxCommand =
+    if (own) bootstrapOwnToolCommand(name) else bootstrapXtensaCommand(tools, name)
+
 fun bootstrapExternalEmitObjectForTargetWithTools(
     llvmPath: string,
     objectPath: string,
@@ -1974,7 +1996,8 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
     // constrain ordinary programs. Only this uncommon path prints optimized IR.
     val inputPath = "$objectPath.bc"
     val checkedPath = "$objectPath.checked.ll"
-    val optimize = bootstrapXtensaCommand(tools, "opt")
+    val ownTools = bootstrapInProcessToolInstalled && tools.root == "" && !mcuTarget && bootstrapInProcessEmitterOn()
+    val optimize = bootstrapCrossCommand(ownTools, tools, "opt")
     bootstrapXtensaTargetOptions(tools, optimize)
     val passes = if (fast) {
         // Scalar promotion, local cleanup and the inliner (small helpers and
@@ -2035,7 +2058,7 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
         }
     }
     if (status == 0) {
-        val emitObject = bootstrapXtensaCommand(tools, "llc")
+        val emitObject = bootstrapCrossCommand(ownTools, tools, "llc")
         bootstrapXtensaTargetOptions(tools, emitObject)
         emitObject.argument(if (tools.root != "") "-filetype=asm" else "-filetype=obj")
         // A WebAssembly module links as one static module (no -pie), so
@@ -2567,7 +2590,7 @@ fun bootstrapPreparePartitionLlvm(
     llvmPath: string,
     preparedPath: string
 ): int {
-    val prepare = linuxCommand(bootstrapHostLlvmTool("opt"))
+    val prepare = bootstrapLlvmToolCommand("opt")
     prepare.argument(
         "-passes=always-inline,function(sroa,mem2reg,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse,adce),globaldce"
     )
@@ -2778,7 +2801,7 @@ fun bootstrapKeepCompilerBitcode(bitcodePath: string, outputPath: string): void 
 }
 
 fun bootstrapPrepareSplitLlvm(llvmPath: string, preparedPath: string): int {
-    val prepare = linuxCommand(bootstrapHostLlvmTool("opt"))
+    val prepare = bootstrapLlvmToolCommand("opt")
     prepare.argument("-passes=$BOOTSTRAP_COMPILER_RELEASE_PASSES")
     // No consumer of the release bitcode needs temporary value names. The
     // explicit text/debug path keeps them for inspection.
@@ -2789,7 +2812,7 @@ fun bootstrapPrepareSplitLlvm(llvmPath: string, preparedPath: string): int {
     val status = prepare.run()
     // As with the custom O2 profile, an older LLVM may not recognize an option.
     if (status == 0) 0 else {
-        val fallback = linuxCommand(bootstrapHostLlvmTool("opt"))
+        val fallback = bootstrapLlvmToolCommand("opt")
         fallback.argument("-passes=default<O1>,globaldce")
         if (llvmPath.endsWith(".bc")) fallback.argument("--discard-value-names")
         fallback.argument(llvmPath)
@@ -2808,7 +2831,7 @@ fun bootstrapPrepareParallelLlvm(
     preparedPath: string,
     text: bool = true
 ): int {
-    val prepare = linuxCommand(bootstrapHostLlvmTool("opt"))
+    val prepare = bootstrapLlvmToolCommand("opt")
     prepare.argument(
         "-passes=function(sroa,early-cse),always-inline,cgscc(devirt<1>(inline,function(sroa,early-cse,simplifycfg))),globalopt,globaldce"
     )
@@ -2833,7 +2856,7 @@ fun bootstrapOptimizeWholeProgram(
     objectPath: string,
     abiManifest: string
 ): int {
-    val optimize = linuxCommand(bootstrapHostLlvmTool("opt"))
+    val optimize = bootstrapLlvmToolCommand("opt")
     val visible = bootstrapNativeAbiExportSymbols(abiManifest)
     visible.append("main")
     for (name in bootstrapFreestandingRoutineNames()) visible.append(name)
@@ -5363,8 +5386,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 // shim, a stub abla_lld_main that returns -1 (the compiler then runs the external linker).
                 val lldObject = linuxEnvironment("ABLA_STATIC_LLD_OBJECT").value
                 // (the stubs: abla_lld_main and abla_archive_gnu both return -1)
-                val lldStub = if (lldObject != "") "" else if (aarch64Linux) ".text\n.globl abla_lld_main\n.type abla_lld_main,%function\nabla_lld_main:\nmov x0, #-1\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,%function\nabla_archive_gnu:\nmov x0, #-1\nret\n.globl abla_emit_object\n.type abla_emit_object,%function\nabla_emit_object:\nmov x0, #-1\nret\n.globl abla_shim_version\n.type abla_shim_version,%function\nabla_shim_version:\nmov x0, #0\nret\n"
-                    else ".text\n.globl abla_lld_main\n.type abla_lld_main,@function\nabla_lld_main:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,@function\nabla_archive_gnu:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_emit_object\n.type abla_emit_object,@function\nabla_emit_object:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_shim_version\n.type abla_shim_version,@function\nabla_shim_version:\nxorq %rax, %rax\nret\n"
+                val lldStub = if (lldObject != "") "" else if (aarch64Linux) ".text\n.globl abla_lld_main\n.type abla_lld_main,%function\nabla_lld_main:\nmov x0, #-1\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,%function\nabla_archive_gnu:\nmov x0, #-1\nret\n.globl abla_emit_object\n.type abla_emit_object,%function\nabla_emit_object:\nmov x0, #-1\nret\n.globl abla_tool_main\n.type abla_tool_main,%function\nabla_tool_main:\nmov x0, #-1\nret\n.globl abla_shim_version\n.type abla_shim_version,%function\nabla_shim_version:\nmov x0, #0\nret\n"
+                    else ".text\n.globl abla_lld_main\n.type abla_lld_main,@function\nabla_lld_main:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,@function\nabla_archive_gnu:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_emit_object\n.type abla_emit_object,@function\nabla_emit_object:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_tool_main\n.type abla_tool_main,@function\nabla_tool_main:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_shim_version\n.type abla_shim_version,@function\nabla_shim_version:\nxorq %rax, %rax\nret\n"
                 Path(dataPath).writeText((if (aarch64Linux) bootstrapStaticLibcDataAarch64() else bootstrapStaticLibcData()) + lldStub)
                 if (lldObject != "") link.argument(lldObject)
                 link.argument(dataPath)

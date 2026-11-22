@@ -61,6 +61,7 @@ ABLA_NO_TARGET(SPIRV)
 ABLA_NO_TARGET(SystemZ)
 ABLA_NO_TARGET(VE)
 ABLA_NO_TARGET(XCore)
+ABLA_NO_TARGET(Xtensa)
 __attribute__((weak)) llvm::PassPluginLibraryInfo getPollyPluginInfo() {
     return {LLVM_PLUGIN_API_VERSION, "Polly", LLVM_VERSION_STRING, [](llvm::PassBuilder &) {}};
 }
@@ -91,9 +92,6 @@ extern "C" int abla_lld_main(const char *arguments, const char *errors) {
     }
     return result.canRunAgain || result.retCode == 0 ? result.retCode : -1;
 }
-
-// The shim's version: 1 here (linker, archive writer, object emission). The stub a build without the shim carries answers 0 (src/toolchain.ab), and src/static_lld.ab installs nothing then.
-extern "C" int abla_shim_version() { return 1; }
 
 // An archive of object files, as `llvm-ar rcsD --format=gnu OUTPUT MEMBER...` writes it (what the compiler's code generation units are combined into: src/codegen_units.ab):
 // the same library routine with the same options, so the same bytes.
@@ -215,4 +213,112 @@ extern "C" int abla_emit_object(const char *bitcode, const char *object, int ver
     passes.run(*module);
     out.keep();
     return 0;
+}
+
+// ---- opt and llc in this process, for the cross targets (#101) -------------------------------------------------------------------------------------------------------------
+// The compiler runs them as children of itself (`ablac --llvm-tool opt ARGUMENTS`, src/orc_main.ab), so each is a process of its own as the tools were and nothing of
+// LLVM's global option state is reused. opt is LLVM's own driver (libLLVMOptDriver's optMain, which opt's main calls): its arguments, its passes, its bitcode. llc has no
+// library driver, so this is its compileModule for the options the compiler passes (-filetype, -O, -mtriple, -relocation-model, --function-sections and the other code
+// generation flags LLVM registers itself, --disable-verify, --discard-value-names, the input and -o): the same target machine, the same pipeline.
+//
+//   int abla_tool_main(const char *tool, const char *arguments)     tool "opt" or "llc"; the arguments one a line; the tool's exit code
+//   int abla_shim_version()                                        2 here; the stub the build without the shim has returns 0
+#include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+
+extern "C" int optMain(int argc, char **argv, llvm::ArrayRef<llvm::PassPlugin> PassPlugins);
+
+extern "C" int abla_shim_version() { return 2; }
+
+static std::vector<std::string> abla_lines(const char *text) {
+    std::vector<std::string> lines;
+    const std::string all(text);
+    for (size_t start = 0; start <= all.size();) {
+        size_t end = all.find('\n', start);
+        if (end == std::string::npos) end = all.size();
+        lines.push_back(all.substr(start, end - start));
+        start = end + 1;
+    }
+    return lines;
+}
+
+static int abla_llc(const std::vector<std::string> &arguments) {
+    LLVMInitializeX86TargetInfo(); LLVMInitializeX86Target(); LLVMInitializeX86TargetMC(); LLVMInitializeX86AsmPrinter(); LLVMInitializeX86AsmParser();
+    LLVMInitializeAArch64TargetInfo(); LLVMInitializeAArch64Target(); LLVMInitializeAArch64TargetMC(); LLVMInitializeAArch64AsmPrinter(); LLVMInitializeAArch64AsmParser();
+    LLVMInitializeWebAssemblyTargetInfo(); LLVMInitializeWebAssemblyTarget(); LLVMInitializeWebAssemblyTargetMC(); LLVMInitializeWebAssemblyAsmPrinter(); LLVMInitializeWebAssemblyAsmParser();
+    std::string input, output = "-", fileType = "asm", triplePrefix;
+    int optLevel = 2;
+    bool verify = true, discardNames = false;
+    std::vector<std::string> options{"llc"};
+    for (size_t index = 0; index < arguments.size(); index++) {
+        const std::string &argument = arguments[index];
+        if (argument == "-o" && index + 1 < arguments.size()) output = arguments[++index];
+        else if (argument.rfind("-filetype=", 0) == 0) fileType = argument.substr(10);
+        else if (argument == "-O0" || argument == "-O1" || argument == "-O2" || argument == "-O3") optLevel = argument[2] - '0';
+        else if (argument == "--disable-verify" || argument == "-disable-verify") verify = false;
+        else if (argument == "--discard-value-names" || argument == "-discard-value-names") discardNames = true;
+        else if (argument.rfind("-mtriple=", 0) == 0) triplePrefix = argument.substr(9);
+        else if (argument.rfind("--mtriple=", 0) == 0) triplePrefix = argument.substr(10);
+        else if (!argument.empty() && argument[0] != '-') input = argument;
+        else options.push_back(argument);
+    }
+    std::vector<const char *> argv;
+    for (const std::string &option : options) argv.push_back(option.c_str());
+    llvm::cl::ResetAllOptionOccurrences();
+    if (!llvm::cl::ParseCommandLineOptions(static_cast<int>(argv.size()), argv.data(), "", &llvm::errs())) return 1;
+    llvm::LLVMContext context;
+    context.setDiscardValueNames(discardNames);
+    llvm::SMDiagnostic diagnostic;
+    std::unique_ptr<llvm::Module> module = llvm::parseIRFile(input, diagnostic, context);
+    if (!module) {
+        diagnostic.print("llc", llvm::errs());
+        return 1;
+    }
+    llvm::Triple triple;
+    if (!triplePrefix.empty()) module->setTargetTriple(llvm::Triple(triplePrefix));
+    triple = module->getTargetTriple();
+    std::string error;
+    const llvm::Target *target = llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target) {
+        llvm::errs() << "llc: " << error << "\n";
+        return 1;
+    }
+    llvm::TargetOptions targetOptions = llvm::codegen::InitTargetOptionsFromCodeGenFlags(triple);
+    llvm::CodeGenOptLevel level = optLevel == 0 ? llvm::CodeGenOptLevel::None : optLevel == 1 ? llvm::CodeGenOptLevel::Less
+                                  : optLevel == 3 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::Default;
+    llvm::codegen::setFunctionAttributes(*module, llvm::codegen::getCPUStr(), llvm::codegen::getFeaturesStr());
+    std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(triple, llvm::codegen::getCPUStr(), llvm::codegen::getFeaturesStr(), targetOptions,
+                                                                             llvm::codegen::getExplicitRelocModel(), llvm::codegen::getExplicitCodeModel(), level));
+    if (!machine) {
+        llvm::errs() << "llc: could not create a target machine\n";
+        return 1;
+    }
+    module->setDataLayout(machine->createDataLayout());
+    llvm::TargetLibraryInfoImpl libraryInfo(triple);
+    std::error_code failure;
+    llvm::ToolOutputFile out(output, failure, fileType == "obj" ? llvm::sys::fs::OF_None : llvm::sys::fs::OF_TextWithCRLF);
+    if (failure) {
+        llvm::errs() << "llc: " << output << ": " << failure.message() << "\n";
+        return 1;
+    }
+    llvm::legacy::PassManager passes;
+    passes.add(new llvm::TargetLibraryInfoWrapperPass(libraryInfo));
+    auto *machineInfo = new llvm::MachineModuleInfoWrapperPass(machine.get());
+    if (machine->addPassesToEmitFile(passes, out.os(), nullptr, fileType == "obj" ? llvm::CodeGenFileType::ObjectFile : llvm::CodeGenFileType::AssemblyFile, !verify, machineInfo)) {
+        llvm::errs() << "llc: the target does not support generation of this file type\n";
+        return 1;
+    }
+    passes.run(*module);
+    out.keep();
+    return 0;
+}
+
+extern "C" int abla_tool_main(const char *tool, const char *arguments) {
+    std::vector<std::string> lines = abla_lines(arguments);
+    if (std::string(tool) == "llc") return abla_llc(lines);
+    if (std::string(tool) != "opt") return 127;
+    lines.insert(lines.begin(), "opt");
+    std::vector<char *> argv;
+    for (std::string &line : lines) argv.push_back(&line[0]);
+    return optMain(static_cast<int>(argv.size()), argv.data(), {});
 }
