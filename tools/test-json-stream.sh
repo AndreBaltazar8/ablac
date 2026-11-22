@@ -17,7 +17,7 @@ done
 # targets must retain the original receiver's identity in runtime and staging.
 cat > "$out/aliases.ab" <<'ABLA'
 import "abla/bytes" as buffers
-import "abla/json" as json
+import "abla/json" as jsonProvider
 
 fun aliased(selected: bool): string {
     val out = buffers.byteBuffer()
@@ -26,9 +26,10 @@ fun aliased(selected: bool): string {
 }
 val staged = #aliased(true)
 fun main: int {
-    val expected = json.jsonStringify($json {"text": "quote\"", "number": 42})
+    val expected = "{\"text\":\"quote\\\"\",\"number\":42}"
     if (aliased(true) != expected || staged != expected) return 1
-    if (aliased(false) != json.jsonStringify($json {"text": "quote\""})) return 1
+    if (aliased(false) != "{\"text\":\"quote\\\"\"}") return 1
+    if (jsonProvider.jsonStringify(jsonProvider.jsonInteger(42)) != "42") return 1
     0
 }
 ABLA
