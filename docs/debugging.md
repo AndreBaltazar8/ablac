@@ -31,16 +31,22 @@ What a debug build contains:
 - **Variables and their types** in a native development build (`--fast`):
   every function's parameters and locals, by the names the source gave them
   ([Variables](#variables)).
-- **Source paths as the build names them.** A native object's compilation
-  directory is `.` (like clang's `-fdebug-compilation-dir=.`): a source the
-  build reached by a relative path keeps that path, and the standard library's
-  keep their absolute ones. Run the debugger from the directory the build ran
-  in (the project root) and it finds the sources; elsewhere, map them
+- **Source paths relative to the project.** A native object's compilation
+  directory is `.` (like clang's `-fdebug-compilation-dir=.`) and a source is
+  named relative to the entry source's directory, the project root: `ablac build
+  d/main.ab`, `cd d && ablac build main.ab` and `ablac build /abs/d/main.ab` give
+  the same bytes, naming `main.ab` and `sub/helper.ab`. A source outside the
+  root that the build named relatively keeps a `..` path from it; the standard
+  library's (and any other absolute file outside the root) keep their absolute
+  paths, which `--path-prefix-map OLD=NEW` rewrites (clang's
+  `-fdebug-prefix-map`: `--path-prefix-map $ABLA_SYSROOT=/abla` makes the object
+  the same on every machine; a build that gives it skips the build cache). Run the
+  debugger from the project root and it finds the sources; elsewhere, map them
   (`settings set target.source-map . /path/to/project` in lldb). The working
   directory never reaches the object, so a copy of a project built from its own
   root gives the same object, and a shared build cache (`--cache-dir`) serves
-  both. A WebAssembly module's DWARF keeps absolute paths, which browser
-  developer tools resolve as file URLs.
+  both (tools/test-reproducible-paths.sh). A WebAssembly module's DWARF keeps
+  absolute paths, which browser developer tools resolve as file URLs.
 - **Readable symbols.** Each emitted function is named
   `<module>.<declaration>`: `renderer.Renderer.draw` for the method `draw` of
   `Renderer` in `renderer.ab`, `exit.panic` for `panic` in

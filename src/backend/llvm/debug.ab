@@ -262,19 +262,99 @@ fun bootstrapLlvmDebugAbsolutePath(path: string, directory: string): string {
     if (result == "") "/" else result
 }
 
+// The directory a build's sources are named against: the entry source's own, absolute ("" when the build has no
+// entry source, which keeps the names as the build gave them).
+fun bootstrapLlvmDebugProjectRoot(cwd: string): string {
+    if (bootstrapLlvmDebugEntry == "" || bootstrapLlvmDebugEntry == "<abla>") return ""
+    val entry = bootstrapLlvmDebugAbsolutePath(bootstrapLlvmDebugEntry, cwd)
+    val parts = bootstrapLlvmDebugSplitPath(entry)
+    if (parts[0] == "") "/" else parts[0]
+}
+
+// `path` relative to the project root, or "" when it should stay absolute: a file under the root is named by its path
+// below it; a file the build named relatively but that lies outside (`../lib/x.ab`) by the `..` path from the root,
+// still independent of the working directory; an absolute file outside it (the standard library, another project)
+// keeps its absolute path, which --path-prefix-map may rewrite.
+fun bootstrapLlvmDebugProjectRelative(path: string, cwd: string, root: string): string {
+    if (root == "" || (path.size > 0 && path[0] == 60)) return ""
+    val absolute = bootstrapLlvmDebugAbsolutePath(path, cwd)
+    val prefix = if (root == "/") "/" else "$root/"
+    if (absolute.size > prefix.size && absolute.slice(0, prefix.size) == prefix) {
+        return absolute.slice(prefix.size, absolute.size)
+    }
+    if (path.size > 0 && path[0] == 47) return ""
+    val rootParts = bootstrapLlvmDebugSplitAll(root)
+    val parts = bootstrapLlvmDebugSplitAll(absolute)
+    var common = 0
+    while (common < rootParts.size && common < parts.size && rootParts[common] == parts[common]) {
+        common = common + 1
+    }
+    var result = ""
+    var up = common
+    while (up < rootParts.size) {
+        result = "$result../"
+        up = up + 1
+    }
+    var below = common
+    while (below < parts.size) {
+        result = if (below == common) "$result${parts[below]}" else "$result/${parts[below]}"
+        below = below + 1
+    }
+    result
+}
+
+fun bootstrapLlvmDebugSplitAll(path: string): array<string> {
+    val parts: array<string> = []
+    var begin = 0
+    var index = 0
+    while (index <= path.size) {
+        if (index == path.size || path[index] == 47) {
+            if (index > begin) parts.append(path.slice(begin, index))
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    parts
+}
+
+// --path-prefix-map OLD=NEW (like clang's -fdebug-prefix-map), pairs of OLD and NEW: the first OLD that is a prefix of an absolute path
+// source name is replaced by NEW.
+var bootstrapLlvmDebugPrefixMap: array<string> = []
+
+fun bootstrapLlvmDebugMapPrefix(path: string): string {
+    var index = 0
+    while (index + 1 < bootstrapLlvmDebugPrefixMap.size) {
+        val old = bootstrapLlvmDebugPrefixMap[index]
+        if (old.size > 0 && path.size >= old.size && path.slice(0, old.size) == old &&
+            (path.size == old.size || old[old.size - 1] == 47 || path[old.size] == 47)) {
+            return "${bootstrapLlvmDebugPrefixMap[index + 1]}${path.slice(old.size, path.size)}"
+        }
+        index = index + 2
+    }
+    path
+}
+
 // A source file's DIFile. For a native object the compilation directory is ".", as
-// clang's -fdebug-compilation-dir=. and Go's -trimpath make it: a path the build names
-// relatively stays relative (a debugger resolves it from where it runs, the project
-// root), and an absolute one (the standard library's) is split into its directory and
-// name. The working directory never reaches the object, so a copy of the project built
-// from its own root gives the same object, and the build cache may share it. A
+// clang's -fdebug-compilation-dir=. and Go's -trimpath make it, and a source is named
+// relative to the project root, the entry source's directory (bootstrapLlvmDebugProjectRelative):
+// `ablac build d/x.ab`, `cd d && ablac build x.ab` and `ablac build $PWD/d/x.ab` give the same
+// object, and so does a copy of the project built from its own root. A debugger resolves the
+// names from where it runs, the project root. The standard library's files (and any other
+// outside the root) keep their absolute path, which --path-prefix-map may rewrite. A
 // WebAssembly module's DWARF keeps absolute paths (`directory`, the working directory,
-// joined): browser tools resolve them as file URLs.
+// joined): browser tools resolve them as file URLs; they do not depend on the working
+// directory either.
 fun bootstrapLlvmDebugCreateFile(builder: i64*, path: string, directory: string): i64* {
+    if (directory == "") {
+        val cwd = currentDirectory().text
+        val project = bootstrapLlvmDebugProjectRelative(path, cwd, bootstrapLlvmDebugProjectRoot(cwd))
+        if (project != "") {
+            return LLVMDIBuilderCreateFile(builder, project, project.size, ".", 1)
+        }
+    }
     if (directory != "" || (path.size > 0 && path[0] == 47)) {
-        val parts = bootstrapLlvmDebugSplitPath(bootstrapLlvmDebugAbsolutePath(
-            path, if (directory != "") directory else "/"
-        ))
+        val absolute = bootstrapLlvmDebugAbsolutePath(path, if (directory != "") directory else "/")
+        val parts = bootstrapLlvmDebugSplitPath(bootstrapLlvmDebugMapPrefix(absolute))
         return LLVMDIBuilderCreateFile(
             builder, parts[1], parts[1].size, parts[0], parts[0].size
         )

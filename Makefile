@@ -180,6 +180,7 @@ test-serial: ablac
 	tools/test-borrow-duplicates.sh $(COMPILER)
 	tools/test-host-llvm-tools.sh $(COMPILER)
 	tools/test-llvm-miscompiles.sh
+	tools/test-reproducible-paths.sh $(COMPILER)
 	tools/test-compiler-memory-peak.sh $(COMPILER)
 	tools/test-borrow-lifetimes.sh $(COMPILER)
 	tools/test-lambda-borrow-return.sh $(COMPILER)
