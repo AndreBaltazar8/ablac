@@ -31,6 +31,7 @@ fun commandByte(): int {
 
 trusted fun main: int {
     val mode = linuxArgument(0)
+    if (mode == "final-readiness") return checkFinalReadiness()
     if (mode == "signals") signal(if (ablaHostIsMacOS()) 30 else 10,
         nativePointerFromAddress(nativeFunctionAddress(ignoreSignal)))
     if (mode == "leaks") {
@@ -111,5 +112,45 @@ trusted fun main: int {
     val closed = linuxSyscall3(72, descriptor, 1, 0) // F_GETFD must now be EBADF.
     val configuredClosed = device.configureSerial(SerialSettings())
     println("CLOSED $firstClose $secondClose ${device.opened()} ${after.state} ${after.written} ${after.error.code} $closed ${configuredClosed.code}")
+    0
+}
+
+// writeUntil operates on a nonblocking descriptor. An empty Linux pipe can
+// accept exactly its measured capacity, then stays non-writable until read.
+// Keep the reader open and idle until writeUntil returns.
+private fun checkFinalReadiness(): int {
+    val descriptors = nativeByteBuffer(8)
+    val opened = linuxSyscall2(293, nativePointerAddress(descriptors.address), 2048 | 524288) // pipe2, O_NONBLOCK | O_CLOEXEC
+    if (opened != 0) {
+        println("FAIL: cannot open final-readiness pipe: $opened")
+        return 1
+    }
+    val pair = descriptors.loadI64(0)
+    descriptors.close()
+    val reader = pair & 4294967295
+    val writer = (pair >> 32) & 4294967295
+    var device = DeviceConnection(writer, networkNoError("open"))
+    val capacity = linuxSyscall3(72, writer, 1032, 0) // F_GETPIPE_SZ
+    if (capacity <= 0) {
+        linuxSyscall1(3, reader)
+        println("FAIL: cannot measure final-readiness pipe: $capacity")
+        return 1
+    }
+    val bytes = nativeByteBuffer(capacity + 1)
+    for (index in 0 until capacity) bytes.store(index, 65 + index % 26)
+    val payload = bytes.adoptString(capacity)
+    val result = device.writeWithin(payload, 1000)
+    if (!result.timedOut() || result.written != capacity || result.error.code != 110) {
+        linuxSyscall1(3, reader)
+        println("FAIL: final POLLOUT wait: state ${result.state}, wrote ${result.written}/$capacity, error ${result.error.code}")
+        return 1
+    }
+    val received = LinuxFileDescriptor(reader).read(capacity)
+    linuxSyscall1(3, reader)
+    if (received != payload) {
+        println("FAIL: bytes accepted before the final POLLOUT timeout did not match")
+        return 1
+    }
+    println("device final readiness: timeout after all $capacity bytes accepted")
     0
 }

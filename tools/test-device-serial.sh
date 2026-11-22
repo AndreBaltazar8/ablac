@@ -18,6 +18,9 @@ fi
 rm -rf "$out/driver-scratch"
 mkdir -p "$out/driver-scratch"
 "$out/driver" "$out/main" "$out/driver-scratch"
+if [[ $(uname -s) == Linux ]]; then
+    "$out/main" final-readiness
+fi
 # Device handles are native runtime effects, not implicit compile-time I/O.
 for evaluator in interp jit; do
     status=0
