@@ -23,7 +23,7 @@ tar -C "$deps" -c llvm lld libs | ssh -q "$host" "tar -x -C ~/$dir/deps"
 scp -q "$artifact" "$host:$dir/pass1"
 scp -q "$shim" "$host:$dir/shim.o"
 # The whole run in one ssh session: a board without lingering ends its background jobs with the session.
-ssh -q "$host" "bash -s" "$dir" <<'REMOTE' | tee /dev/stderr | grep -q '^SELF-BUILD OK$'
+ssh -q "$host" "bash -s" "$dir" <<'REMOTE' | tee /dev/stderr | grep '^SELF-BUILD OK$' > /dev/null
 set -u
 dir=$HOME/$1
 export ABLA_SYSROOT=$dir/tree ABLA_MAX_MEMORY_MB=7000 ABLA_NATIVE_JOBS=1 ABLA_CODEGEN_JOBS=1
