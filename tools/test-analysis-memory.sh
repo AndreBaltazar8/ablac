@@ -48,13 +48,25 @@
 # compiler's own source and the loop's peak 0.74 to 0.81 GB, 1.08 to 1.19 times it; an absolute bound of 1,030,000,000 bytes on live bytes read between
 # collections, which hold the garbage made since the last one, tripped at 1,031,677,366 after 520 lines of source were added), and a loop that
 # keeps the previous answer (about twice the cold analysis) is far over it.
+#
+# 2026-11-22: the cold analysis's guard is no longer its resident size. That varies with the machine (4 GitHub cores read about 150 MB more than 8 local ones for
+# the same source, with 2.1 GB against the old 2.15 GB bound, so source growth alone made CI red) and by up to 36 MB from run to run. What a per-occurrence
+# string (the regression this test was written for: 2,270,000 kB) adds is reachable heap, which ABLA_COMPILER_MEMORY_TRACE reports at the cold analysis's
+# 'answer built' and which does not depend on the machine: it is held to 96 bytes per byte of analysed source (90 to 93 measured over the .ab files copied below,
+# 1,006 to 1,035 MB for 11,147,446 bytes), so growth of the compiler's own source moves both sides and a string per occurrence (+150 MB, +15%) trips it.
+# The resident size is only a loose sanity ceiling now (2,600,000 kB). Mutation check: one 450-character string per occurrence in resolvedNames
+# (analysis_graph.ab) adds about 140 MB of reachable heap and fails the ratio.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $compiler == /* ]] || compiler="$PWD/$compiler"
 output_directory="$project_root/build/analysis-memory"
-bound_kilobytes=2150000
+bound_kilobytes=2600000
+# The cold analysis's reachable heap (what ABLA_COMPILER_MEMORY_TRACE reports at 'answer built': deterministic, whatever the machine) per byte of
+# source analysed, in hundredths: 90 to 93 bytes per source byte measured on 2026-11-22 (1,006 to 1,035 MB over the 11,147,446 bytes of .ab files that
+# are copied below), 3 to 6% of margin. Source growth moves both sides; a string per occurrence (+150 MB or more) does not fit.
+reachable_per_source_byte_hundredths=9600
 edit_bound_kilobytes=3300000
 edit_retention_percent=135
 mkdir -p "$output_directory"
@@ -150,6 +162,12 @@ if (( parallel_sweeps == 0 )); then
     exit 1
 fi
 read -r first_live loop_live < <(awk '/^abla-analysis-memory / { live = $NF + 0; if (!cold_done && live > first) first = live; if (live > peak) peak = live; if ($2 == "answer" && $3 == "built") cold_done = 1 } END { print first + 0, peak + 0 }' "$output_directory/traced-error.txt")
+cold_answer=$(awk '/^abla-analysis-memory answer built / { print $NF + 0; exit }' "$output_directory/traced-error.txt")
+source_bytes=$(find "$root" -name '*.ab' -print0 | xargs -0 cat | wc -c)
+if (( cold_answer == 0 || source_bytes == 0 )); then
+    echo "analysis-memory: no reachable size at the cold analysis's 'answer built' ($cold_answer) or no source ($source_bytes)" >&2
+    exit 1
+fi
 if (( first_live == 0 || loop_live == 0 )); then
     echo "analysis-memory: the service did not report the live heap at its phases (abla-analysis-memory)" >&2
     exit 1
@@ -164,6 +182,10 @@ for (const document of last.documents) for (const occurrence of document.occurre
 if (named < 100000) throw new Error(`only ${named} occurrences name a declaration after the edits`);
 ' "$output_directory/edit-output.jsonl"
 
+if (( cold_answer * 100 > source_bytes * reachable_per_source_byte_hundredths )); then
+    echo "analysis-memory: the cold analysis holds $cold_answer reachable bytes at its answer for $source_bytes bytes of source ($((cold_answer / source_bytes)) per byte, over $((reachable_per_source_byte_hundredths / 100))): what keeps a string per occurrence (resolvedNames, the occurrence index, the path)?" >&2
+    exit 1
+fi
 if (( loop_live * 100 > first_live * edit_retention_percent )); then
     echo "analysis-memory: the edit loop's reachable heap peaked at $loop_live bytes, over $edit_retention_percent% of the cold analysis's $first_live: what keeps the previous answer alive while the next is built?" >&2
     exit 1
@@ -176,4 +198,4 @@ if (( peak > bound_kilobytes )); then
     echo "analysis-memory: analyze --stdio over src/orc_main.ab peaked at $peak kB, over $bound_kilobytes kB: what keeps the path or a string per occurrence (resolvedNames, the occurrence index)?" >&2
     exit 1
 fi
-echo "analysis memory: analyze --stdio over the compiler's own source peaks at $peak kB (bound $bound_kilobytes kB), and after edits at $edit_peak kB (bound $edit_bound_kilobytes kB), with a reachable heap of $loop_live bytes against the cold analysis's $first_live (bound $edit_retention_percent%)"
+echo "analysis memory: analyze --stdio over the compiler's own source holds $((cold_answer / source_bytes)) reachable bytes per source byte at its answer (bound $((reachable_per_source_byte_hundredths / 100))) and peaks at $peak kB (ceiling $bound_kilobytes kB), after edits at $edit_peak kB (bound $edit_bound_kilobytes kB), with a reachable heap of $loop_live bytes against the cold analysis's $first_live (bound $edit_retention_percent%)"
