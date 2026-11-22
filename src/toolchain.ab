@@ -3525,12 +3525,13 @@ fun bootstrapBacktraceSplitTarget(target: BootstrapTargetDescriptor): bool =
     target.objectFormat == "elf" || (target.objectFormat == "coff" && target.hosted) ||
         (target.objectFormat == "macho" && target.hosted && ablaHostIsMacOS())
 
-// A macOS --backtrace executable's DWARF (bootstrapLlvmBacktraceSplit): the linked program at `linkedPath` names its
-// objects in a debug map (the link-time-optimized one kept at `ltoObjectPath`), which dsymutil reads into
-// `<output>.dSYM` beside the program, its DWARF file named after the program and tied to it by the image's UUID;
-// `strip -S` then drops the debug map, and an image whose signature that broke (arm64's linker signature) is signed
-// again, ad hoc. atos (ablac symbolize) and lldb find the bundle beside the program.
-fun bootstrapSplitMacBacktraceDebug(linkedPath: string, outputPath: string, ltoObjectPath: string): int {
+// A macOS executable with debug information, built on a Mac: the linked program at `linkedPath` names its objects in a
+// debug map (the link-time-optimized one kept at `ltoObjectPath`), objects the build removes, so dsymutil reads their
+// DWARF into `<output>.dSYM` beside the program, its DWARF file named after the program and tied to it by the image's
+// UUID (as clang's driver does when it compiles and links in one step). atos (ablac symbolize) and lldb find the bundle
+// beside the program. A --backtrace program (`strip`, bootstrapLlvmBacktraceSplit) then loses its debug map (`strip
+// -S`), and an image whose signature that broke (arm64's linker signature) is signed again, ad hoc.
+fun bootstrapMacDebugBundle(linkedPath: string, outputPath: string, ltoObjectPath: string, strip: bool): int {
     val bundle = "$outputPath.dSYM"
     Path(bundle).removeTree()
     val dsym = linuxCommand("dsymutil")
@@ -3547,13 +3548,13 @@ fun bootstrapSplitMacBacktraceDebug(linkedPath: string, outputPath: string, ltoO
             if (entry.name() != programName && !entry.moveTo(Path("$dwarf/$programName"))) status = 145
         }
     }
-    if (status == 0) {
-        val strip = linuxCommand("strip")
-        strip.argument("-S")
-        strip.argument(linkedPath)
-        status = strip.run()
+    if (status == 0 && strip) {
+        val stripping = linuxCommand("strip")
+        stripping.argument("-S")
+        stripping.argument(linkedPath)
+        status = stripping.run()
     }
-    if (status == 0) {
+    if (status == 0 && strip) {
         val verify = linuxCommand("codesign")
         verify.argument("--verify")
         verify.argument(linkedPath)
@@ -4822,6 +4823,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         cacheProfile == "cross-o2" ||
         cacheProfile == "raw-inprocess-o2" ||
         cacheProfile == "raw-cross-o2"
+    // A release macOS executable with debug information (-g, or --backtrace's line tables), built on a Mac, gets its DWARF in
+    // <output>.dSYM (bootstrapMacDebugBundle): its debug map names objects the build removes. (A --fast build's stay in the cache.)
+    val macDebugBundle = macTarget && target.hosted && artifact == "executable" && releaseProfile &&
+        bootstrapLlvmDebugInfo && ablaHostIsMacOS()
     val balancedProfile = cacheProfile == "inprocess-o1" ||
         cacheProfile == "raw-inprocess-o1"
     val hostedLtoEligible = target.hosted && artifact == "executable" &&
@@ -5781,7 +5786,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 link.argument("-O2")
                 link.argument("-flto")
                 // The object ld64 generates from the bitcode, which the debug map names, kept for dsymutil.
-                if (macTarget && bootstrapLlvmBacktraceSplit) link.argument("-Wl,-object_path_lto,$publishPath.lto.o")
+                if (macDebugBundle) link.argument("-Wl,-object_path_lto,$publishPath.lto.o")
             }
             if (macTarget) {
                 link.argument("--target=${target.llvmTriple}")
@@ -6015,9 +6020,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (status == 0 && bootstrapBuildVerbose && libcReason != "") {
             linuxPrintStandardError("note: $outputPath links libc: $libcReason\n")
         }
-        if (status == 0 && bootstrapLlvmBacktraceSplit) {
-            status = if (macTarget) bootstrapSplitMacBacktraceDebug(publishPath, outputPath, "$publishPath.lto.o")
-                else bootstrapSplitBacktraceDebug(publishPath, outputPath, false)
+        if (status == 0 && macDebugBundle) {
+            status = bootstrapMacDebugBundle(publishPath, outputPath, "$publishPath.lto.o", bootstrapLlvmBacktraceSplit)
+            if (status != 0) failureKind = "io"
+        } else if (status == 0 && bootstrapLlvmBacktraceSplit) {
+            status = bootstrapSplitBacktraceDebug(publishPath, outputPath, false)
             if (status != 0) failureKind = "io"
         }
     }

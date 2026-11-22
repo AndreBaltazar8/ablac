@@ -136,7 +136,10 @@ The stack a debug build prints on its own resolves with `ablac symbolize`,
 given the program and the text it printed (a file, or standard input): each
 frame's function and file:line:column, with the functions inlined into it
 (llvm-symbolizer on the program; atos on macOS, with the load address the text
-names). The program must be the very one that crashed.
+names). The program must be the very one that crashed. On macOS a release
+`-g` build writes `<output>.dSYM` beside the program (dsymutil's bundle of its
+DWARF, since the objects its debug map names are gone after the build); keep
+it with the program, where atos and lldb find it.
 
 ```sh
 build/app 2> crash.txt

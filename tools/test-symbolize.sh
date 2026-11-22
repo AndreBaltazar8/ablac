@@ -16,6 +16,10 @@ out="$project_root/build/symbolize-test"
 rm -rf "$out"
 mkdir -p "$out"
 "$compiler" build "$project_root/tests/cases/symbolize/crash.ab" -o "$out/crash" -g --no-cache
+# On macOS the program's debug map names objects the build removes: its DWARF is in crash.dSYM beside it.
+if [[ $(uname -s) == Darwin && ! -s $out/crash.dSYM/Contents/Resources/DWARF/crash ]]; then
+    echo 'symbolize: a -g build wrote no crash.dSYM' >&2; ls -la "$out" >&2; exit 1
+fi
 set +e
 "$out/crash" > /dev/null 2> "$out/crash.txt"
 status=$?
