@@ -160,6 +160,20 @@ long long __moddi3(long long a, long long b) {
 #if defined(__riscv)
 // ablac's RISC-V code has no M extension, so any `*` calls one of these, as it would libgcc's.
 #if __riscv_xlen == 64
+// RV64I has no atomic instructions. The hosted runtime lowers its native
+// allocation counter to this libatomic call. This fixture runs one thread,
+// so a load and store suffice, as with its no-op pthread mutexes above.
+unsigned long long fixtureFetchAdd8(volatile unsigned long long *address,
+                                    unsigned long long increment, int order)
+    __asm__("__atomic_fetch_add_8");
+unsigned long long fixtureFetchAdd8(volatile unsigned long long *address,
+                                    unsigned long long increment, int order) {
+    (void)order;
+    unsigned long long previous = *address;
+    *address = previous + increment;
+    return previous;
+}
+
 unsigned __int128 __multi3(unsigned __int128 a, unsigned __int128 b) {
     unsigned __int128 out = 0;
     while (b) {
