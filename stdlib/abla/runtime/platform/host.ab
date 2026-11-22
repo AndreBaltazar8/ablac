@@ -2074,11 +2074,10 @@ var __ablaRuntimeHostCollectionMinimum: int = 0
 var __ablaRuntimeHostCollectionMaximum: int = 0
 /// Holds the serial mark worklist address.
 var __ablaRuntimeHostCollectionWorklist: int = 0
-/// Counts pending allocation headers in the serial mark worklist.
+/// Counts pending payload addresses in the serial mark worklist.
 var __ablaRuntimeHostCollectionWorklistCount: int = 0
-// The collection's page directory: for each 64 KiB page holding the header of a small
-// allocation (header and payload within 32 KiB), a bitmap of where in the page those headers
-// start, one bit per 16 bytes (open-addressed, two words an entry: page + 1, its bitmap).
+// For each 64 KiB page holding the start of a small allocation's payload, the directory has
+// a bitmap with one bit per 16 bytes. Page entries hold the page number plus one and its bitmap.
 // The allocation behind a pointer is a probe and a scan back through at most two pages'
 // bitmaps; no allocation needs sorting. The larger allocations, few, are kept apart in
 // address order (`Ranges`, `LargeCount`).
@@ -2239,7 +2238,7 @@ trusted fun __ablaRuntimeRecoveryRestore(frame: int): int {
     0
 }
 
-// The latest allocation still registered (its header), or 0.
+// The latest registered payload address, or 0.
 @inline
 trusted fun __ablaRuntimeHostRegistryLast(): int =
     if (__ablaRuntimeHostRegistrySlots == 0) 0
@@ -2266,26 +2265,59 @@ trusted fun __ablaRuntimeHostRegistryGrow(): void {
     return
 }
 
-/// Registers a tracked header and records its slot in the allocation registry.
-trusted fun __ablaRuntimeHostRegister(header: int, large: bool): void {
+// Both tracked formats end with the exact size and the packed registry slot/state.
+// The state takes the low six bits (0..47), leaving 58 bits for the reverse slot.
+// The registry names payload starts. Its bit 0 marks a large block, bit 1 is
+// the parallel sweep's garbage tag, and bit 2 marks a compact native block.
+// A region has no registry slot: state 63 names its owner at payload - 24.
+/// Enables compact headers for eligible small class allocations.
+var __ablaRuntimeHostCompactHeaders: bool = __ablaRuntimeHostCompactHeadersConfigured()
+
+private trusted fun __ablaRuntimeHostCompactHeadersConfigured(): bool {
+    // Enable the compact lane only for runtime-owned x86-64 processes with an
+    // environment vector. Library entry points without one keep the 32-byte format.
+    if (!ablaHostOwnsRuntime() || ablaSimdTargetArch() != 1 ||
+        ablaRuntimePointerAddress(ablaLinuxEnvironmentPointer()) == 0) return false
+    val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
+        __ablaRuntimeWord0("ABLA_COMPACT_HEADERS")
+    )))
+    value == 0 || ablaRuntimeLoadU8(value) != 48 || ablaRuntimeLoadU8(value + 1) != 0
+}
+
+/// Returns the native header size of a registry entry, even if its garbage bit is set.
+@inline
+trusted fun __ablaRuntimeHostEntryWidth(entry: int): int =
+    32 - ((entry & 4) << 2)
+
+/// Publishes a tracked payload and initializes its size and slot/state words.
+@inline
+trusted fun __ablaRuntimeHostWriteHeader(payload: int, size: int, layout: int, slot: int, flags: int): void {
+    ablaRuntimeStoreI64(payload - 16, size)
+    ablaRuntimeStoreI64(payload - 8, (slot << 6) | layout)
+    ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + slot * 8, payload | flags)
+    __ablaRuntimeHostRegistrySlots = slot + 1
+}
+
+/// Registers a tracked payload with its native block format.
+trusted fun __ablaRuntimeHostRegister(payload: int, size: int, layout: int, width: int): void {
     if (__ablaRuntimeHostRegistrySlots == __ablaRuntimeHostRegistryCapacity) {
         __ablaRuntimeHostRegistryGrow()
     }
-    ablaRuntimeStoreI64(header, __ablaRuntimeHostRegistrySlots)
-    ablaRuntimeStoreI64(
-        __ablaRuntimeHostRegistry + __ablaRuntimeHostRegistrySlots * 8,
-        if (large) header + 1 else header
-    )
-    __ablaRuntimeHostRegistrySlots = __ablaRuntimeHostRegistrySlots + 1
+    val flags = (((32 - width) >> 2) |
+        (if (size > __ablaRuntimeHostCollectionSmallBytes - 32) 1 else 0))
+    __ablaRuntimeHostWriteHeader(payload, size, layout, __ablaRuntimeHostRegistrySlots, flags)
     return
 }
 
-/// Clears a tracked object's registry slot and shortens the registry tail when possible.
-trusted fun __ablaRuntimeHostUnregister(header: int): void {
-    ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + ablaRuntimeLoadI64(header) * 8, 0)
+/// Clears a slot and returns its old entry, shrinking the registry tail when possible.
+trusted fun __ablaRuntimeHostUnregister(slot: int): int {
+    val at = __ablaRuntimeHostRegistry + slot * 8
+    val entry = ablaRuntimeLoadI64(at)
+    ablaRuntimeStoreI64(at, 0)
     while (__ablaRuntimeHostRegistrySlots > 0 && __ablaRuntimeHostRegistryLast() == 0) {
         __ablaRuntimeHostRegistrySlots = __ablaRuntimeHostRegistrySlots - 1
     }
+    entry
 }
 
 /// Swaps two allocation ranges in the collector's range table.
@@ -2431,9 +2463,9 @@ trusted fun __ablaRuntimeHostRegionAllocate(size: int): int {
     val header = page + 32 + offset
     ablaRuntimeStoreI64(page + 16, offset + required)
     ablaRuntimeStoreI64(header, 0)
-    ablaRuntimeStoreI64(header + 8, 0)
+    ablaRuntimeStoreI64(header + 8, regionState)
     ablaRuntimeStoreI64(header + 16, size)
-    ablaRuntimeStoreI64(header + 24, regionState)
+    ablaRuntimeStoreI64(header + 24, 63)
     ablaRuntimeStoreI64(
         regionState + 16,
         ablaRuntimeLoadI64(regionState + 16) + size
@@ -2495,8 +2527,8 @@ trusted fun __ablaRuntimeHostSmallListsSettle(): void {
 
 /// Allocates a tracked block and returns its header address, reporting exhaustion if allocation fails.
 @inline
-trusted fun __ablaRuntimeHostBlockAllocate(size: int): int {
-    val total = (size + 39) & -8
+trusted fun __ablaRuntimeHostBlockAllocate(size: int, width: int): int {
+    val total = (size + width + 7) & -8
     if (total <= 512) {
         val list = __ablaRuntimeHostSmallLists() + total
         /// Releases a C allocator pointer.
@@ -2508,7 +2540,7 @@ trusted fun __ablaRuntimeHostBlockAllocate(size: int): int {
         }
     }
     val header = ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(if (total <=
-        512) total else size + 32))
+        512) total else size + width))
     if (header == 0) __ablaRuntimeHostOutOfMemory()
     header
 }
@@ -2520,9 +2552,9 @@ trusted fun __ablaRuntimeHostBlockKept(size: int): bool =
 
 /// Releases the block using its header address and payload size.
 @inline
-trusted fun __ablaRuntimeHostBlockFree(header: int, size: int): void {
+trusted fun __ablaRuntimeHostBlockFree(header: int, size: int, width: int): void {
     if (__ablaRuntimeHostBlockKept(size)) {
-        val total = (size + 39) & -8
+        val total = (size + width + 7) & -8
         val list = __ablaRuntimeHostSmallLists() + total
         ablaRuntimeStoreI64(header, ablaRuntimeLoadI64(list))
         ablaRuntimeStoreI64(list, header)
@@ -2536,15 +2568,11 @@ trusted fun __ablaRuntimeHostBlockFree(header: int, size: int): void {
 @inline
 trusted fun __ablaRuntimeHostTrackedAllocate(size: int, layout: int): int {
     if (size > 4611686018427387871) ablaRuntimeTrap()
-    val header = __ablaRuntimeHostBlockAllocate(size)
-    ablaRuntimeStoreI64(header + 8, 0)
-    ablaRuntimeStoreI64(header + 16, size)
-    ablaRuntimeStoreI64(header + 24, layout)
-    __ablaRuntimeHostRegister(
-        header, size > __ablaRuntimeHostCollectionSmallBytes - 32
-    )
+    val width: int = if (layout == 5 && size <= 480 && __ablaRuntimeHostCompactHeaders) 16 else 32
+    val payload = __ablaRuntimeHostBlockAllocate(size, width) + width
+    __ablaRuntimeHostRegister(payload, size, layout, width)
     __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
-    header + 32
+    payload
 }
 
 // The general allocation: under the heap lock, in a region or from the lists, malloc, or past the
@@ -2595,7 +2623,8 @@ trusted fun __ablaRuntimePlatformAllocateLayout(
     if (layout == 5) {
         val size: int = if (requested <= 0) 1 else requested
         if (__ablaRuntimeHostHeapMutex == 0 && size <= 480) {
-            val total = (size + 39) & -8
+            val width: int = if (__ablaRuntimeHostCompactHeaders) 16 else 32
+            val total = (size + width + 7) & -8
             val list = __ablaRuntimeHostSmallLists() + total
             /// Releases a C allocator pointer.
             val free = ablaRuntimeLoadI64(list)
@@ -2608,14 +2637,10 @@ trusted fun __ablaRuntimePlatformAllocateLayout(
                 __ablaRuntimeHostRegionLoad() == 0) {
                 ablaRuntimeStoreI64(list, ablaRuntimeLoadI64(free))
                 __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes - total
-                ablaRuntimeStoreI64(free + 8, 0)
-                ablaRuntimeStoreI64(free + 16, size)
-                ablaRuntimeStoreI64(free + 24, layout)
-                ablaRuntimeStoreI64(free, slots)
-                ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + slots * 8, free)
-                __ablaRuntimeHostRegistrySlots = slots + 1
+                val payload = free + width
+                __ablaRuntimeHostWriteHeader(payload, size, layout, slots, (32 - width) >> 2)
                 __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
-                return free + 32
+                return payload
             }
         }
         return __ablaRuntimeHostAllocateGeneral(requested, layout)
@@ -2631,22 +2656,19 @@ trusted fun __ablaRuntimePlatformAllocate(requested: int): int =
 /// Releases a tracked allocation while the caller holds the heap lock.
 trusted fun __ablaRuntimeHostFreeUnlocked(address: int): void {
     if (address != 0) {
-        val header = address - 32
-        val size = ablaRuntimeLoadI64(header + 16)
+        val size = ablaRuntimeLoadI64(address - 16)
         if (size != 0) {
-            val owner = ablaRuntimeLoadI64(header + 24)
-            if (owner >= 0 && owner < 48) {
-                // (Unconditional, as in __ablaRuntimePlatformRawAllocate. With an explicit growth the
-                // charge is only read once adaptive pacing is chosen again: one early collection at most.)
-                if (owner == 10) ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostNativePressure(), size)
-                __ablaRuntimeHostUnregister(header)
-                __ablaRuntimeHostBlockFree(header, size)
+            val packed = ablaRuntimeLoadI64(address - 8)
+            val state = packed & 63
+            if (state == 63) {
+                val owner = ablaRuntimeLoadI64(address - 24)
+                ablaRuntimeStoreI64(owner + 16, ablaRuntimeLoadI64(owner + 16) - size)
+                ablaRuntimeStoreI64(address - 16, 0)
             } else {
-                ablaRuntimeStoreI64(
-                    owner + 16,
-                    ablaRuntimeLoadI64(owner + 16) - size
-                )
-                ablaRuntimeStoreI64(header + 16, 0)
+                if (state == 10) ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostNativePressure(), size)
+                val entry = __ablaRuntimeHostUnregister(packed >>> 6)
+                val width = __ablaRuntimeHostEntryWidth(entry)
+                __ablaRuntimeHostBlockFree(address - width, size, width)
             }
             __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - size
         }
@@ -2669,8 +2691,8 @@ trusted fun __ablaRuntimePlatformFree(address: int): void {
 trusted fun __ablaRuntimePlatformMemoryCheckpoint(): int {
     val mutex = __ablaRuntimeHostHeapLock()
     var marker = __ablaRuntimeHostRegistryLast()
-    if (marker == 0 || ablaRuntimeLoadI64(marker + 24) != 12) {
-        marker = __ablaRuntimeHostTrackedAllocate(8, 12) - 32
+    if (marker == 0 || (ablaRuntimeLoadI64(marker - 8) & 63) != 12) {
+        marker = __ablaRuntimeHostTrackedAllocate(8, 12)
     }
     __ablaRuntimeHostHeapUnlock(mutex)
     marker
@@ -2680,7 +2702,7 @@ trusted fun __ablaRuntimePlatformMemoryCheckpoint(): int {
 trusted fun __ablaRuntimePlatformMemoryReset(checkpoint: int): void {
     while (__ablaRuntimeHostRegistryLast() != checkpoint) {
         if (__ablaRuntimeHostRegistrySlots == 0) ablaRuntimeTrap()
-        __ablaRuntimePlatformFree(__ablaRuntimeHostRegistryLast() + 32)
+        __ablaRuntimePlatformFree(__ablaRuntimeHostRegistryLast())
     }
 }
 
@@ -2721,7 +2743,10 @@ trusted fun __ablaRuntimePlatformMemoryCensusTake(): void {
         val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
         if (entry != 0) {
             // Each allocation's header, and its registry slot.
-            __ablaRuntimeMemoryCensusCount(__ablaRuntimeHostCensus, entry & -16, 40)
+            val width = __ablaRuntimeHostEntryWidth(entry)
+            val payload = entry & -16
+            __ablaRuntimeMemoryCensusCount(__ablaRuntimeHostCensus, payload,
+                ablaRuntimeLoadI64(payload - 16), ablaRuntimeLoadI64(payload - 8) & 63, width + 8)
         }
         slot = slot + 1
     }
@@ -2829,10 +2854,9 @@ trusted fun __ablaRuntimePlatformMemorySetLayout(
     layout: int
 ): void {
     if (address == 0 || layout < 0 || layout >= 16) ablaRuntimeTrap()
-    val header = address - 32
-    val owner = ablaRuntimeLoadI64(header + 24)
-    if (owner >= 0 && owner < 48) {
-        ablaRuntimeStoreI64(header + 24, layout)
+    val packed = ablaRuntimeLoadI64(address - 8)
+    if ((packed & 63) < 48) {
+        ablaRuntimeStoreI64(address - 8, (packed & -64) | layout)
     }
 }
 
@@ -3044,18 +3068,18 @@ trusted fun __ablaRuntimeHostCollectionMappingsLoad(): bool {
     true
 }
 
-// Whether the 32 bytes at `address` (an allocation's header) are in mapped, readable memory.
+// Whether the two words at the supplied address are in mapped, readable memory.
 trusted fun __ablaRuntimeHostCollectionIsMapped(address: int): bool {
     val pairs = __ablaRuntimeHostCollectionMapped
     // Candidates come in runs from one range (the heap's): try the last range that held one first.
     val last = __ablaRuntimeHostCollectionMappedLast
     if (u64(ablaRuntimeLoadI64(pairs + last * 16)) <= u64(address) &&
-        u64(address + 31) < u64(ablaRuntimeLoadI64(pairs + last * 16 + 8))) return true
+        u64(address + 15) < u64(ablaRuntimeLoadI64(pairs + last * 16 + 8))) return true
     var lower = 0
     var upper = __ablaRuntimeHostCollectionMappedCount
     while (lower < upper) {
         val middle = lower + (upper - lower) / 2
-        if (u64(ablaRuntimeLoadI64(pairs + middle * 16 + 8)) <= u64(address + 31)) lower = middle +
+        if (u64(ablaRuntimeLoadI64(pairs + middle * 16 + 8)) <= u64(address + 15)) lower = middle +
             1
         else upper = middle
     }
@@ -3067,16 +3091,16 @@ trusted fun __ablaRuntimeHostCollectionIsMapped(address: int): bool {
     false
 }
 
-// Whether the registry's first and last headers are in the mapped ranges: a target whose heap
+// Whether the registry's first and last payload prefixes are in the mapped ranges: a target whose heap
 // addresses carry tag bits (Android's tagged pointers) shows none of /proc/self/maps' untagged ones.
 trusted fun __ablaRuntimeHostCollectionRegistryMapped(): bool {
     if (__ablaRuntimeHostCollectionForce == 3) return false
     val registry = __ablaRuntimeHostRegistry
     val slots = __ablaRuntimeHostRegistrySlots
-    val first = ablaRuntimeLoadI64(registry) & -16
-    val last = ablaRuntimeLoadI64(registry + (slots - 1) * 8) & -16
-    (first == 0 || __ablaRuntimeHostCollectionIsMapped(first)) &&
-        (last == 0 || __ablaRuntimeHostCollectionIsMapped(last))
+    val first = ablaRuntimeLoadI64(registry)
+    val last = ablaRuntimeLoadI64(registry + (slots - 1) * 8)
+    (first == 0 || __ablaRuntimeHostCollectionIsMapped((first & -16) - 16)) &&
+        (last == 0 || __ablaRuntimeHostCollectionIsMapped((last & -16) - 16))
 }
 
 // Every registered allocation into the page directory (or, when larger, the address-ordered
@@ -3182,7 +3206,7 @@ trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
     if (listed > 0) {
         val first = ablaRuntimeLoadI64(list)
         val last = ablaRuntimeLoadI64(list + (listed - 1) * 8)
-        val lastEnd = last + 32 + ablaRuntimeLoadI64(last + 16)
+        val lastEnd = last + ablaRuntimeLoadI64(last - 16)
         if (__ablaRuntimeHostCollectionMaximum == 0 ||
             u64(first) < u64(__ablaRuntimeHostCollectionMinimum)) {
             __ablaRuntimeHostCollectionMinimum = first
@@ -3246,7 +3270,7 @@ trusted fun __ablaRuntimeHostHighestBit(bits: int): int {
     index
 }
 
-// The header of the small allocation starting last at or before bit `bit` of `page`, or 0.
+// The small payload starting last at or before bit `bit` of `page`, or zero.
 trusted fun __ablaRuntimeHostCollectionNearest(bitmap: int, page: int, bit: int): int {
     var word = bit >> 6
     var bits = ablaRuntimeLoadI64(bitmap + word * 8) & ((2 << (bit & 63)) - 1)
@@ -3258,70 +3282,60 @@ trusted fun __ablaRuntimeHostCollectionNearest(bitmap: int, page: int, bit: int)
     else (page << 16) + (word * 64 + __ablaRuntimeHostHighestBit(bits)) * 16
 }
 
-// The allocation `candidate` points into (its header), or 0. A small allocation holding it
-// starts in its page or the one before: the last small header at or before it is the only
-// one that can. Otherwise a large allocation may: the last whose payload starts at or before
-// the candidate.
+/// Returns true when the aligned address is marked as a payload start in the bitmap.
+@inline
+trusted fun __ablaRuntimeHostDirectoryContains(bitmap: int, candidate: int): bool {
+    if (bitmap == 0) return false
+    val bit = (candidate & 65535) >> 4
+    ((ablaRuntimeLoadI64(bitmap + (bit >> 6) * 8) >>> (bit & 63)) & 1) != 0
+}
+
+/// Finds the start of the payload that contains a candidate, or zero.
 trusted fun __ablaRuntimeHostCollectionLocate(candidate: int): int {
-    // Most references point at a payload's start, 32 bytes past its header: when a small
-    // allocation's header starts there (its bit), that allocation holds the candidate unless
-    // its payload is empty, and no backward scan is needed.
-    val start = candidate - 32
-    if ((start & 15) == 0) {
-        val startBitmap = __ablaRuntimeHostCollectionBitmapOf(start >>> 16)
-        val startBit = (start & 65535) >> 4
-        if (startBitmap != 0 &&
-            ((ablaRuntimeLoadI64(startBitmap + (startBit >> 6) * 8) >>> (startBit & 63)) & 1) !=
-            0 &&
-            ablaRuntimeLoadI64(start + 16) > 0) return start
-    }
     val page = candidate >>> 16
-    var header = 0
     val bitmap = __ablaRuntimeHostCollectionBitmapOf(page)
+    if ((candidate & 15) == 0 && __ablaRuntimeHostDirectoryContains(bitmap, candidate) &&
+        ablaRuntimeLoadI64(candidate - 16) > 0) return candidate
+    var payload = 0
     if (bitmap != 0) {
-        header = __ablaRuntimeHostCollectionNearest(bitmap, page, (candidate & 65535) >> 4)
+        payload = __ablaRuntimeHostCollectionNearest(bitmap, page, (candidate & 65535) >> 4)
     }
-    if (header == 0) {
+    if (payload == 0) {
         val previous = __ablaRuntimeHostCollectionBitmapOf(page - 1)
-        if (previous != 0) header = __ablaRuntimeHostCollectionNearest(previous, page - 1, 4095)
+        if (previous != 0) payload = __ablaRuntimeHostCollectionNearest(previous, page - 1, 4095)
     }
-    if (header != 0) {
-        val payload = header + 32
-        if (u64(candidate) >= u64(payload) && u64(candidate - payload) <
-            u64(ablaRuntimeLoadI64(header + 16))) {
-            return header
-        }
-    }
+    if (payload != 0 && u64(candidate - payload) < u64(ablaRuntimeLoadI64(payload - 16))) return payload
+    __ablaRuntimeHostCollectionLocateLarge(candidate)
+}
+
+/// Finds a candidate in the address-ordered table of large payloads.
+@inline
+trusted fun __ablaRuntimeHostCollectionLocateLarge(candidate: int): int {
     val ranges = __ablaRuntimeHostCollectionRanges
     var lower = 0
     var upper = __ablaRuntimeHostCollectionLargeCount
     while (lower < upper) {
         val middle = lower + (upper - lower) / 2
-        if (u64(ablaRuntimeLoadI64(ranges + middle * 8) + 32) <= u64(candidate)) lower = middle + 1
+        if (u64(ablaRuntimeLoadI64(ranges + middle * 8)) <= u64(candidate)) lower = middle + 1
         else upper = middle
     }
     if (lower == 0) return 0
-    val large = ablaRuntimeLoadI64(ranges + (lower - 1) * 8)
-    val payload = large + 32
-    if (u64(candidate) >= u64(payload) && u64(candidate - payload) < u64(ablaRuntimeLoadI64(large +
-        16))) large else 0
+    val payload = ablaRuntimeLoadI64(ranges + (lower - 1) * 8)
+    if (u64(candidate - payload) < u64(ablaRuntimeLoadI64(payload - 16))) payload else 0
 }
 
-// The allocation holding `candidate` while the collection is lazy (mode 1) or checks the registry
-// against the directory (mode 2), or 0.
+// An exact candidate's prefix is readable when it is in a mapped range or
+// is marked in the directory. The packed slot must name this very payload.
 @noinline
 trusted fun __ablaRuntimeHostCollectionFind(candidate: int): int {
-    // A payload's start: the word before it, 32 bytes back, is its slot in the registry, and that
-    // slot names this header. Anything else needs the page directory.
     var exact = 0
-    val at = candidate - 32
-    if (u64(at) >= u64(__ablaRuntimeHostCollectionMinimum) && (at & 15) == 0 &&
-        (if (__ablaRuntimeHostCollectionMode == 1) __ablaRuntimeHostCollectionIsMapped(at)
-            else __ablaRuntimeHostCollectionBitmapOf(at >>> 16) != 0)) {
-        val slot = ablaRuntimeLoadI64(at)
-        if (u64(slot) < u64(__ablaRuntimeHostRegistrySlots) &&
-            (ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8) & -16) == at &&
-            ablaRuntimeLoadI64(at + 16) > 0) exact = at
+    if ((candidate & 15) == 0 &&
+        (if (__ablaRuntimeHostCollectionMode == 1) __ablaRuntimeHostCollectionIsMapped(candidate - 16)
+        else __ablaRuntimeHostDirectoryContains(__ablaRuntimeHostCollectionBitmapOf(candidate >>> 16), candidate))) {
+        val slot = ablaRuntimeLoadI64(candidate - 8) >>> 6
+        if (slot < __ablaRuntimeHostRegistrySlots &&
+            (ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8) & -16) == candidate &&
+            ablaRuntimeLoadI64(candidate - 16) > 0) exact = candidate
     }
     if (__ablaRuntimeHostCollectionMode == 1) {
         if (exact != 0) return exact
@@ -3332,7 +3346,7 @@ trusted fun __ablaRuntimeHostCollectionFind(candidate: int): int {
         val found = __ablaRuntimeHostCollectionLocate(candidate)
         if (__ablaRuntimeHostGcTrace) {
             val source = if (__ablaRuntimeHostCollectionReadingRoots) 1 else 2
-            val result = if (found == 0) 0 else if (found + 32 == candidate) 1 else 2
+            val result = if (found == 0) 0 else if (found == candidate) 1 else 2
             __ablaRuntimeHostStwTrace("gc: directory miss source ", 26, source, " result ", 8)
             __ablaRuntimeHostStwTrace("", 0, result, "\n", 1)
         }
@@ -3340,9 +3354,9 @@ trusted fun __ablaRuntimeHostCollectionFind(candidate: int): int {
     }
     // Under ABLA_GC_STRESS=1 every collection builds the directory: the registry's answer, where it
     // has one, must be the directory's.
-    val header = __ablaRuntimeHostCollectionLocate(candidate)
-    if (exact != 0 && exact != header) ablaRuntimeTrap()
-    header
+    val payload = __ablaRuntimeHostCollectionLocate(candidate)
+    if (exact != 0 && exact != payload) ablaRuntimeTrap()
+    payload
 }
 
 /// Marks the allocation reached by the candidate pointer and returns whether a new mark was added.
@@ -3357,32 +3371,29 @@ trusted fun __ablaRuntimeHostMarkPointer(candidate: int): bool {
     }
     if (u64(candidate) < u64(__ablaRuntimeHostCollectionMinimum) ||
         u64(candidate) >= u64(__ablaRuntimeHostCollectionMaximum)) return false
-    val header = if (__ablaRuntimeHostCollectionMode ==
+    val payload = if (__ablaRuntimeHostCollectionMode ==
         0) __ablaRuntimeHostCollectionLocate(candidate)
         else __ablaRuntimeHostCollectionFind(candidate)
-    if (header == 0) return false
-    val payload = header + 32
-    val size = ablaRuntimeLoadI64(header + 16)
-    val layout = ablaRuntimeLoadI64(header + 24)
-    if (u64(candidate) < u64(payload) || u64(candidate - payload) >= u64(size) ||
-        layout < 0 || layout >= 16) return false
-    __ablaRuntimeHostClaimSerial(header, layout)
+    if (payload == 0) return false
+    val packed = ablaRuntimeLoadI64(payload - 8)
+    if ((packed & 63) >= 16) return false
+    __ablaRuntimeHostClaimSerial(payload, packed)
     true
 }
 
-/// Claims the allocation header and traces according to its layout on the serial marking path.
+/// Queues a payload for serial tracing and sets the queued bit in its slot/state word.
 @inline
-trusted fun __ablaRuntimeHostClaimSerial(header: int, layout: int): void {
-    ablaRuntimeStoreI64(header + 24, layout + 16)
+trusted fun __ablaRuntimeHostClaimSerial(payload: int, packed: int): void {
+    ablaRuntimeStoreI64(payload - 8, packed + 16)
     val work = __ablaRuntimeHostCollectionWorklistCount
     if (work >= __ablaRuntimeHostCollectionCount) ablaRuntimeTrap()
-    ablaRuntimeStoreI64(__ablaRuntimeHostCollectionWorklist + work * 8, header)
+    ablaRuntimeStoreI64(__ablaRuntimeHostCollectionWorklist + work * 8, payload)
     __ablaRuntimeHostCollectionWorklistCount = work + 1
 }
 
 // Kinds 4 and 5 hold runtime-created one-word references to payload starts.
 // Objects, arrays and maps have an allocation header, except in the frozen
-// window. A region header carries its owner's address in place of a layout.
+// window. The region state is outside the range of unmarked layouts.
 @inline
 trusted fun __ablaRuntimeHostMarkExactReference(candidate: int): void {
     if (candidate == 0) return
@@ -3390,13 +3401,10 @@ trusted fun __ablaRuntimeHostMarkExactReference(candidate: int): void {
         __ablaRuntimeHostFrozenMark(candidate)
         return
     }
-    val header = candidate - 32
-    val layout = ablaRuntimeLoadI64(header + 24)
-    if (u64(layout) >= 16) return
-    if (__ablaRuntimeHostGcStress && __ablaRuntimeHostCollectionLocate(candidate) != header) {
-        ablaRuntimeTrap()
-    }
-    __ablaRuntimeHostClaimSerial(header, layout)
+    val packed = ablaRuntimeLoadI64(candidate - 8)
+    if ((packed & 63) >= 16) return
+    if (__ablaRuntimeHostGcStress && __ablaRuntimeHostCollectionLocate(candidate) != candidate) ablaRuntimeTrap()
+    __ablaRuntimeHostClaimSerial(candidate, packed)
 }
 
 // The root and layout walkers share this tag dispatch instead of duplicating it.
@@ -3464,14 +3472,14 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
     while (__ablaRuntimeHostCollectionWorklistCount != 0) {
         __ablaRuntimeHostCollectionWorklistCount =
             __ablaRuntimeHostCollectionWorklistCount - 1
-        val header = ablaRuntimeLoadI64(
+        val payload = ablaRuntimeLoadI64(
             __ablaRuntimeHostCollectionWorklist +
                 __ablaRuntimeHostCollectionWorklistCount * 8
         )
-        val layout = ablaRuntimeLoadI64(header + 24) - 16
-        ablaRuntimeStoreI64(header + 24, layout + 32)
-        val size = ablaRuntimeLoadI64(header + 16)
-        val payload = header + 32
+        val packed = ablaRuntimeLoadI64(payload - 8)
+        val layout = packed & 15
+        ablaRuntimeStoreI64(payload - 8, packed + 16)
+        val size = ablaRuntimeLoadI64(payload - 16)
         if (layout == 0) {
             // Raw words are candidates of any value: only the directory may answer for them.
             if (__ablaRuntimeHostCollectionMode == 1) {
@@ -3558,7 +3566,7 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
 // ---- Parallel mark (ABLA_GC_WORKERS=n, off by default) ---------------------------------------------------------------
 // The mark of __ablaRuntimeHostTraceMarkedAllocations on n threads (the collecting thread and n - 1 started for the mark):
 // each claims an object by a compare-and-swap of its state word (layout -> layout + 16; the loser of a race leaves it),
-// keeps a stack of its own claimed headers (4,096 entries), and gives half of it to a shared pool (the collection's work
+// keeps a stack of its own claimed payloads (4,096 entries), and gives half of it to a shared pool (the collection's work
 // list, under a spin lock) when the stack fills or when another thread has run dry; a thread with nothing takes from the
 // pool, and the mark is over when no thread is busy and the pool is empty. The page directory answers every candidate
 // (the lazy registry lookup switches a global mode on its first interior pointer: no race-free form), through a page
@@ -3610,7 +3618,7 @@ private trusted fun __ablaRuntimeHostMarkDonate(context: int, given: int): void 
     return
 }
 
-// Up to 256 headers from the pool onto the (empty) stack; false when the pool was empty.
+// Up to 256 payload addresses from the pool onto the (empty) stack; false when the pool was empty.
 private trusted fun __ablaRuntimeHostMarkTake(context: int): bool {
     val shared = __ablaRuntimeHostMarkShared()
     __ablaRuntimeHostMarkPoolLock(shared)
@@ -3647,42 +3655,20 @@ trusted fun __ablaRuntimeHostMarkBitmapOf(cache: int, page: int): int {
 
 // __ablaRuntimeHostCollectionLocate with the thread's own page cache.
 private trusted fun __ablaRuntimeHostMarkLocate(cache: int, candidate: int): int {
-    val start = candidate - 32
-    if ((start & 15) == 0) {
-        val startBitmap = __ablaRuntimeHostMarkBitmapOf(cache, start >>> 16)
-        val startBit = (start & 65535) >> 4
-        if (startBitmap != 0 &&
-            ((ablaRuntimeLoadI64(startBitmap + (startBit >> 6) * 8) >>> (startBit & 63)) & 1) != 0 &&
-            ablaRuntimeLoadI64(start + 16) > 0) return start
-    }
     val page = candidate >>> 16
-    var header = 0
     val bitmap = __ablaRuntimeHostMarkBitmapOf(cache, page)
+    if ((candidate & 15) == 0 && __ablaRuntimeHostDirectoryContains(bitmap, candidate) &&
+        ablaRuntimeLoadI64(candidate - 16) > 0) return candidate
+    var payload = 0
     if (bitmap != 0) {
-        header = __ablaRuntimeHostCollectionNearest(bitmap, page, (candidate & 65535) >> 4)
+        payload = __ablaRuntimeHostCollectionNearest(bitmap, page, (candidate & 65535) >> 4)
     }
-    if (header == 0) {
+    if (payload == 0) {
         val previous = __ablaRuntimeHostMarkBitmapOf(cache, page - 1)
-        if (previous != 0) header = __ablaRuntimeHostCollectionNearest(previous, page - 1, 4095)
+        if (previous != 0) payload = __ablaRuntimeHostCollectionNearest(previous, page - 1, 4095)
     }
-    if (header != 0) {
-        val payload = header + 32
-        if (u64(candidate) >= u64(payload) && u64(candidate - payload) < u64(ablaRuntimeLoadI64(header + 16))) {
-            return header
-        }
-    }
-    val ranges = __ablaRuntimeHostCollectionRanges
-    var lower = 0
-    var upper = __ablaRuntimeHostCollectionLargeCount
-    while (lower < upper) {
-        val middle = lower + (upper - lower) / 2
-        if (u64(ablaRuntimeLoadI64(ranges + middle * 8) + 32) <= u64(candidate)) lower = middle + 1
-        else upper = middle
-    }
-    if (lower == 0) return 0
-    val large = ablaRuntimeLoadI64(ranges + (lower - 1) * 8)
-    val payload = large + 32
-    if (u64(candidate) >= u64(payload) && u64(candidate - payload) < u64(ablaRuntimeLoadI64(large + 16))) large else 0
+    if (payload != 0 && u64(candidate - payload) < u64(ablaRuntimeLoadI64(payload - 16))) return payload
+    __ablaRuntimeHostCollectionLocateLarge(candidate)
 }
 
 // __ablaRuntimeHostMarkPointer for a thread of the parallel mark: the claim is a compare-and-swap.
@@ -3696,20 +3682,17 @@ private trusted fun __ablaRuntimeHostMarkPointerParallel(context: int, candidate
     }
     if (u64(candidate) < u64(__ablaRuntimeHostCollectionMinimum) ||
         u64(candidate) >= u64(__ablaRuntimeHostCollectionMaximum)) return
-    val header = __ablaRuntimeHostMarkLocate(ablaRuntimeLoadI64(context + 16), candidate)
-    if (header == 0) return
-    val payload = header + 32
-    val size = ablaRuntimeLoadI64(header + 16)
-    val layout = ablaRuntimeAtomicLoadI64(header + 24)
-    if (u64(candidate) < u64(payload) || u64(candidate - payload) >= u64(size) ||
-        layout < 0 || layout >= 16) return
-    if (ablaRuntimeAtomicCompareExchangeI64(header + 24, layout, layout + 16) != layout) return
+    val payload = __ablaRuntimeHostMarkLocate(ablaRuntimeLoadI64(context + 16), candidate)
+    if (payload == 0) return
+    val packed = ablaRuntimeAtomicLoadI64(payload - 8)
+    if ((packed & 63) >= 16) return
+    if (ablaRuntimeAtomicCompareExchangeI64(payload - 8, packed, packed + 16) != packed) return
     var count = ablaRuntimeLoadI64(context + 8)
     if (count == __ablaRuntimeHostMarkStack) {
         __ablaRuntimeHostMarkDonate(context, __ablaRuntimeHostMarkStack / 2)
         count = ablaRuntimeLoadI64(context + 8)
     }
-    ablaRuntimeStoreI64(ablaRuntimeLoadI64(context) + count * 8, header)
+    ablaRuntimeStoreI64(ablaRuntimeLoadI64(context) + count * 8, payload)
     count = count + 1
     ablaRuntimeStoreI64(context + 8, count)
     // Another thread has run dry: share early, not only when the stack is full. A depth-first walk of a tree (a binary tree of a
@@ -3824,15 +3807,15 @@ private trusted fun __ablaRuntimeHostMarkTakeRange(context: int): bool {
     true
 }
 
-// One claimed object's fields (the body of __ablaRuntimeHostTraceMarkedAllocations for one header).
-private trusted fun __ablaRuntimeHostMarkTraceParallel(context: int, header: int): void {
-    val state = ablaRuntimeLoadI64(header + 24)
+// The fields of one claimed allocation, starting at its payload.
+private trusted fun __ablaRuntimeHostMarkTraceParallel(context: int, payload: int): void {
+    val packed = ablaRuntimeLoadI64(payload - 8)
+    val state = packed & 63
     // Only the thread that claimed it is here, once: any other state is a double claim.
     if (state < 16 || state >= 32) ablaRuntimeTrap()
     val layout = state - 16
-    ablaRuntimeStoreI64(header + 24, layout + 32)
-    val size = ablaRuntimeLoadI64(header + 16)
-    val payload = header + 32
+    ablaRuntimeStoreI64(payload - 8, packed + 16)
+    val size = ablaRuntimeLoadI64(payload - 16)
     if (layout == 0 || layout == 2 || layout == 3) __ablaRuntimeHostMarkScan(context, payload, size, layout)
     if (layout == 4 && size >= 24) {
         val count = ablaRuntimeLoadI64(payload)
@@ -4019,15 +4002,17 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
     while (slot < slots) {
         val entry = ablaRuntimeLoadI64(registry + slot * 8)
         if (entry != 0) {
-            val header = entry & -16
-            val state = ablaRuntimeLoadI64(header + 24)
-            if (state >= 0 && state < 16 && state != 10 && state != 12) {
-                val size = ablaRuntimeLoadI64(header + 16)
+            val payload = entry & -16
+            val state = ablaRuntimeLoadI64(payload - 8) & 63
+            if (state < 16 && state != 10 && state != 12) {
+                val width = __ablaRuntimeHostEntryWidth(entry)
+                val header = payload - width
+                val size = ablaRuntimeLoadI64(payload - 16)
                 freedBytes = freedBytes + size
-                if (poison) __ablaRuntimeHostHeapPoison(header + 32, size)
+                if (poison) __ablaRuntimeHostHeapPoison(payload, size)
                 // __ablaRuntimeHostBlockFree, with its counters held here.
                 if (size <= 480 && smallBytes < keptLimit) {
-                    val total = (size + 39) & -8
+                    val total = (size + width + 7) & -8
                     val list = lists + total
                     ablaRuntimeStoreI64(header, ablaRuntimeLoadI64(list))
                     ablaRuntimeStoreI64(list, header)
@@ -4035,8 +4020,7 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
                     pushed = pushed + total
                 } else __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(header))
             } else {
-                if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
-                ablaRuntimeStoreI64(header, kept)
+                ablaRuntimeStoreI64(payload - 8, (kept << 6) | (state & 15))
                 ablaRuntimeStoreI64(registry + kept * 8, entry)
                 kept = kept + 1
             }
@@ -4118,10 +4102,9 @@ trusted fun __ablaRuntimeHostFreeWorker(batch: int): int {
 }
 
 // A block the sweep found unreachable, for the helper.
-trusted fun __ablaRuntimeHostFreeLater(header: int): void {
-    val blockSize = ablaRuntimeLoadI64(header + 16)
-    if (__ablaRuntimeHostBlockKept(blockSize)) {
-        __ablaRuntimeHostBlockFree(header, blockSize)
+trusted fun __ablaRuntimeHostFreeLater(header: int, size: int, width: int): void {
+    if (__ablaRuntimeHostBlockKept(size)) {
+        __ablaRuntimeHostBlockFree(header, size, width)
         return
     }
     __ablaRuntimeHostFreeBatch(header)
@@ -4520,7 +4503,7 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
 //    worker counts its kept and tagged entries.
 //  (serial, n steps) the counts give each slice its place in the dense registry (kept entries) and in the scratch array's tagged part.
 //  3 (parallel, no header is read of a tagged entry): the slice's kept entries go to the scratch array, in order, at their place, and each
-//    kept header's word 0 becomes its new index (a free clears registry[word 0]); its tagged entries go to the scratch array after the
+//    kept payload receives its new slot and unmarked state; tagged native block addresses go to the scratch array after the
 //    kept ones.
 //  4 (parallel, n slices of the dense registry): the kept entries are copied from the scratch array to the registry.
 //  (serial) the tagged entries are appended to the helper's batch.
@@ -4548,14 +4531,16 @@ private trusted fun __ablaRuntimeHostSweepPassA(context: int): void {
     while (slot < end) {
         val entry = ablaRuntimeLoadI64(registry + slot * 8)
         if (entry != 0) {
-            val header = entry & -16
-            val state = ablaRuntimeLoadI64(header + 24)
-            if (state >= 0 && state < 16 && state != 10 && state != 12) {
-                val size = ablaRuntimeLoadI64(header + 16)
+            val payload = entry & -16
+            val state = ablaRuntimeLoadI64(payload - 8) & 63
+            if (state < 16 && state != 10 && state != 12) {
+                val width = __ablaRuntimeHostEntryWidth(entry)
+                val header = payload - width
+                val size = ablaRuntimeLoadI64(payload - 16)
                 freed = freed + size
-                if (poison) __ablaRuntimeHostHeapPoison(header + 32, size)
+                if (poison) __ablaRuntimeHostHeapPoison(payload, size)
                 if (size <= 480 && added < budget) {
-                    val total = (size + 39) & -8
+                    val total = (size + width + 7) & -8
                     val heads = context + 64
                     ablaRuntimeStoreI64(header, ablaRuntimeLoadI64(heads + total))
                     if (ablaRuntimeLoadI64(heads + total) == 0) ablaRuntimeStoreI64(heads + 520 + total, header)
@@ -4567,7 +4552,6 @@ private trusted fun __ablaRuntimeHostSweepPassA(context: int): void {
                     tagged = tagged + 1
                 }
             } else {
-                if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
                 kept = kept + 1
             }
         }
@@ -4580,8 +4564,9 @@ private trusted fun __ablaRuntimeHostSweepPassA(context: int): void {
     return
 }
 
-// Pass 3: the slice's kept entries to the scratch array at their place, each header's word 0 their new index, and its tagged entries
-// (the headers) after the kept ones.
+// Pass 3: place kept entries in the dense registry scratch array and reset
+// their mark states while writing the new reverse slots. Append tagged native
+// block addresses to the free batch.
 private trusted fun __ablaRuntimeHostSweepPassPlace(context: int): void {
     val registry = __ablaRuntimeHostRegistry
     val scratch = ablaRuntimeLoadI64(__ablaRuntimeHostSweepShared() + 16)
@@ -4594,11 +4579,13 @@ private trusted fun __ablaRuntimeHostSweepPassPlace(context: int): void {
         val entry = ablaRuntimeLoadI64(registry + slot * 8)
         if (entry != 0) {
             if ((entry & 2) != 0) {
-                ablaRuntimeStoreI64(tagBase + tag * 8, entry & -16)
+                ablaRuntimeStoreI64(tagBase + tag * 8, (entry & -16) - __ablaRuntimeHostEntryWidth(entry))
                 tag = tag + 1
             } else {
                 ablaRuntimeStoreI64(scratch + keep * 8, entry)
-                ablaRuntimeStoreI64(entry & -16, keep)
+                val payload = entry & -16
+                val layout = ablaRuntimeLoadI64(payload - 8) & 15
+                ablaRuntimeStoreI64(payload - 8, (keep << 6) | layout)
                 keep = keep + 1
             }
         }
@@ -4665,13 +4652,14 @@ private trusted fun __ablaRuntimeHostSweepRun(pass: int, contexts: int, workers:
     return
 }
 
-// Whether the registry's entries are as a sweep leaves them: each header's word 0 is its entry's slot (stress runs check it after
-// every parallel sweep).
+// Check the dense registry, reverse slots and cleared states after a parallel sweep under stress.
 trusted fun __ablaRuntimeHostRegistryCheck(): void {
     var slot = 0
     while (slot < __ablaRuntimeHostRegistrySlots) {
         val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
-        if (entry == 0 || (entry & 2) != 0 || ablaRuntimeLoadI64(entry & -16) != slot) ablaRuntimeTrap()
+        if (entry == 0 || (entry & 2) != 0) ablaRuntimeTrap()
+        val packed = ablaRuntimeLoadI64((entry & -16) - 8)
+        if ((packed >>> 6) != slot || (packed & 63) >= 16) ablaRuntimeTrap()
         slot = slot + 1
     }
     return
@@ -4915,18 +4903,19 @@ trusted fun __ablaRuntimeHostBackgroundSweep(): void {
     while (slot < __ablaRuntimeHostRegistrySlots) {
         val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
         if (entry != 0) {
-            val header = entry & -16
-            val state = ablaRuntimeLoadI64(header + 24)
-            if (state >= 0 && state < 16 && state != 10 && state != 12) {
-                __ablaRuntimeHostLiveBytes =
-                    __ablaRuntimeHostLiveBytes - ablaRuntimeLoadI64(header + 16)
+            val payload = entry & -16
+            val state = ablaRuntimeLoadI64(payload - 8) & 63
+            if (state < 16 && state != 10 && state != 12) {
+                val width = __ablaRuntimeHostEntryWidth(entry)
+                val header = payload - width
+                val size = ablaRuntimeLoadI64(payload - 16)
+                __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - size
                 if (__ablaRuntimeHostGcStress || __ablaRuntimeHostGcPoison) {
-                    __ablaRuntimeHostHeapPoison(header + 32, ablaRuntimeLoadI64(header + 16))
+                    __ablaRuntimeHostHeapPoison(payload, size)
                 }
-                __ablaRuntimeHostFreeLater(header)
+                __ablaRuntimeHostFreeLater(header, size, width)
             } else {
-                if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
-                ablaRuntimeStoreI64(header, kept)
+                ablaRuntimeStoreI64(payload - 8, (kept << 6) | (state & 15))
                 ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + kept * 8, entry)
                 kept = kept + 1
             }
@@ -5443,32 +5432,32 @@ trusted fun __ablaRuntimeHostFrozenReclaim(): void {
     return
 }
 
-// The block index of old header `header` in the forwarding table, or -1.
-trusted fun __ablaRuntimeHostFreezeFind(header: int): int {
+// The index of the original payload in the forwarding table, or -1.
+trusted fun __ablaRuntimeHostFreezeFind(payload: int): int {
     val context = __ablaRuntimeHostFreezeContext()
     val table = ablaRuntimeLoadI64(context + 24)
     val mask = ablaRuntimeLoadI64(context + 32) - 1
-    var slot = ((header >>> 4) * -7046029254386353131) & mask
+    var slot = ((payload >>> 4) * -7046029254386353131) & mask
     var key = ablaRuntimeLoadI64(table + slot * 16)
     while (key != 0) {
-        if (key == header) return ablaRuntimeLoadI64(table + slot * 16 + 8) - 1
+        if (key == payload) return ablaRuntimeLoadI64(table + slot * 16 + 8) - 1
         slot = (slot + 1) & mask
         key = ablaRuntimeLoadI64(table + slot * 16)
     }
     -1
 }
 
-/// Records the frozen-copy index for an original allocation header.
-trusted fun __ablaRuntimeHostFreezeTableInsert(table: int, mask: int, header: int, index: int): void {
-    var slot = ((header >>> 4) * -7046029254386353131) & mask
+/// Records the frozen-copy index for an original allocation payload.
+trusted fun __ablaRuntimeHostFreezeTableInsert(table: int, mask: int, payload: int, index: int): void {
+    var slot = ((payload >>> 4) * -7046029254386353131) & mask
     while (ablaRuntimeLoadI64(table + slot * 16) != 0) slot = (slot + 1) & mask
-    ablaRuntimeStoreI64(table + slot * 16, header)
+    ablaRuntimeStoreI64(table + slot * 16, payload)
     ablaRuntimeStoreI64(table + slot * 16 + 8, index + 1)
     return
 }
 
-// Adds the block at `header` to the group: its place, its flag.
-trusted fun __ablaRuntimeHostFreezeAdd(header: int, mode: int): void {
+// Adds the block at `payload` to the group: its place, its flag.
+trusted fun __ablaRuntimeHostFreezeAdd(payload: int, mode: int): void {
     val context = __ablaRuntimeHostFreezeContext()
     var count = ablaRuntimeLoadI64(context + 8)
     var capacity = ablaRuntimeLoadI64(context + 16)
@@ -5498,29 +5487,25 @@ trusted fun __ablaRuntimeHostFreezeAdd(header: int, mode: int): void {
         ablaRuntimeStoreI64(context + 24, table)
         ablaRuntimeStoreI64(context + 32, newCapacity)
     }
-    ablaRuntimeStoreI64(ablaRuntimeLoadI64(context) + count * 8, header)
+    ablaRuntimeStoreI64(ablaRuntimeLoadI64(context) + count * 8, payload)
     ablaRuntimeStoreI64(ablaRuntimeLoadI64(context + 48) + count * 8, ablaRuntimeLoadI64(context + 40))
     ablaRuntimeStoreI64(ablaRuntimeLoadI64(context + 56) + count * 8, mode)
     __ablaRuntimeHostFreezeTableInsert(ablaRuntimeLoadI64(context + 24), ablaRuntimeLoadI64(context + 32) - 1,
-        header, count)
-    ablaRuntimeStoreI64(context + 40,
-        ablaRuntimeLoadI64(context + 40) + 32 + (((if ((mode & 15) == 2) ablaRuntimeLoadI64(header + 32) + 1 else ablaRuntimeLoadI64(header + 16)) + 15) & -16))
+        payload, count)
+    val size = if ((mode & 15) == 2) ablaRuntimeLoadI64(payload) + 1
+        else ablaRuntimeLoadI64(payload - 16)
+    ablaRuntimeStoreI64(context + 40, ablaRuntimeLoadI64(context + 40) + 32 + ((size + 15) & -16))
     ablaRuntimeStoreI64(context + 8, count + 1)
     return
 }
 
-// The heap block holding `candidate` (its header), or 0 when it names no block of the heap.
+// The payload that contains `candidate` and has an unmarked layout, or zero.
 trusted fun __ablaRuntimeHostFreezeLocate(candidate: int): int {
     if (candidate == 0 || u64(candidate) < u64(__ablaRuntimeHostCollectionMinimum) ||
         u64(candidate) >= u64(__ablaRuntimeHostCollectionMaximum)) return 0
-    val header = __ablaRuntimeHostCollectionLocate(candidate)
-    if (header == 0) return 0
-    val payload = header + 32
-    val size = ablaRuntimeLoadI64(header + 16)
-    val layout = ablaRuntimeLoadI64(header + 24)
-    if (u64(candidate) < u64(payload) || u64(candidate - payload) >= u64(size) ||
-        layout < 0 || layout >= 16) return 0
-    header
+    val payload = __ablaRuntimeHostCollectionLocate(candidate)
+    if (payload == 0 || (ablaRuntimeLoadI64(payload - 8) & 63) >= 16) return 0
+    payload
 }
 
 // Discovery: the pointer `candidate` found in a block being copied.
@@ -5542,34 +5527,34 @@ trusted fun __ablaRuntimeHostFreezeNote(candidate: int, mode: int): void {
         }
         return
     }
-    val header = __ablaRuntimeHostFreezeLocate(candidate)
-    if (header == 0) return
-    val found = __ablaRuntimeHostFreezeFind(header)
+    val payload = __ablaRuntimeHostFreezeLocate(candidate)
+    if (payload == 0) return
+    val found = __ablaRuntimeHostFreezeFind(payload)
     if (found >= 0) {
         val kept = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 56) + found * 8)
         if ((mode & 15) == 0 && (kept & 15) == 1) ablaRuntimeStoreI64(ablaRuntimeLoadI64(context + 56) + found * 8, kept & -16)
         return
     }
-    val layout = ablaRuntimeLoadI64(header + 24)
+    val layout = ablaRuntimeLoadI64(payload - 8) & 63
     // Layouts 0 to 5 are copied; a raw block is checked when it is scanned.
     if (layout > 5 && !(layout == 8 && mode >> 4 > 0) && !((mode & 15) == 2 && layout == 6) || (mode & 15) == 2 && layout != 6) {
         if (ablaRuntimeLoadI64(context + 80) == 0) ablaRuntimeStoreI64(context + 80, 100 + layout)
         return
     }
-    __ablaRuntimeHostFreezeAdd(header, mode)
+    __ablaRuntimeHostFreezeAdd(payload, mode)
     return
 }
 
 // The copy's address for `candidate` (a pointer into a block of the group, or elsewhere: unchanged).
 trusted fun __ablaRuntimeHostFreezeRelocate(candidate: int): int {
     if (candidate == 0 || __ablaRuntimeHostFrozenIn(candidate)) return candidate
-    val header = __ablaRuntimeHostFreezeLocate(candidate)
-    if (header == 0) return candidate
+    val payload = __ablaRuntimeHostFreezeLocate(candidate)
+    if (payload == 0) return candidate
     val context = __ablaRuntimeHostFreezeContext()
-    val index = __ablaRuntimeHostFreezeFind(header)
+    val index = __ablaRuntimeHostFreezeFind(payload)
     if (index < 0) return candidate
     ablaRuntimeLoadI64(context + 88) + ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 48) + index * 8) + 32 +
-        (candidate - (header + 32))
+        (candidate - payload)
 }
 
 // One pointer slot of a block: `offset` from its payload. Discovery notes the pointer; the copy pass (`copy` is the
@@ -5605,11 +5590,10 @@ trusted fun __ablaRuntimeHostFreezeValueSlots(payload: int, copy: int, offset: i
     return
 }
 
-// The pointer slots of the block at `header`, by its layout as the marker walks it. `copy`: 0 to discover, else the copy's payload.
-trusted fun __ablaRuntimeHostFreezeScan(header: int, copy: int, mode: int): void {
-    val payload = header + 32
-    val size = ablaRuntimeLoadI64(header + 16)
-    val layout = ablaRuntimeLoadI64(header + 24)
+// The pointer slots of the block at `payload`, by its layout as the marker walks it. `copy`: 0 to discover, else the copy's payload.
+trusted fun __ablaRuntimeHostFreezeScan(payload: int, copy: int, mode: int): void {
+    val size = ablaRuntimeLoadI64(payload - 16)
+    val layout = ablaRuntimeLoadI64(payload - 8) & 63
     val context = __ablaRuntimeHostFreezeContext()
     if (layout == 0 && (mode & 15) == 0 && copy == 0) {
         // A raw block is conservative to the marker: one that holds a word naming a heap block cannot be copied.
@@ -5796,9 +5780,9 @@ trusted fun __ablaRuntimeHostFreezeBody(value: any): any {
     if (vtag >= 6 && vtag <= 14) __ablaRuntimeHostFreezeNote(ablaRuntimeLoadI64(address + 8), 0)
     var next = 0
     while (next < ablaRuntimeLoadI64(context + 8) && ablaRuntimeLoadI64(context + 80) == 0) {
-        val header = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + next * 8)
+        val payload = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + next * 8)
         val flag = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 56) + next * 8)
-        if ((flag & 15) != 2) __ablaRuntimeHostFreezeScan(header, 0, flag)
+        if ((flag & 15) != 2) __ablaRuntimeHostFreezeScan(payload, 0, flag)
         next = next + 1
     }
     val total = ablaRuntimeLoadI64(context + 40)
@@ -5846,17 +5830,19 @@ trusted fun __ablaRuntimeHostFreezeBody(value: any): any {
         ablaRuntimeStoreI64(context + 88, base)
         var block = 0
         while (block < count) {
-            val old = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + block * 8)
+            val payload = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + block * 8)
             val place = base + ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 48) + block * 8)
             if ((ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 56) + block * 8) & 15) == 2) {
                 // A rope: its flat bytes (a string's, with the terminator the fresh page already has).
-                val length = ablaRuntimeLoadI64(old + 32)
-                __ablaRuntimeHostFreezeFlatten(old + 32, place + 32)
+                val length = ablaRuntimeLoadI64(payload)
+                __ablaRuntimeHostFreezeFlatten(payload, place + 32)
                 ablaRuntimeStoreI64(place + 16, length + 1)
                 ablaRuntimeStoreI64(place + 24, 1)
             } else {
-                val size = ablaRuntimeLoadI64(old + 16)
-                ablaUnsafeCopyMemory(place, old, 32 + size)
+                val size = ablaRuntimeLoadI64(payload - 16)
+                ablaRuntimeStoreI64(place + 16, size)
+                ablaRuntimeStoreI64(place + 24, ablaRuntimeLoadI64(payload - 8) & 63)
+                ablaUnsafeCopyMemory(place + 32, payload, size)
             }
             ablaRuntimeStoreI64(place, -1)
             ablaRuntimeStoreI64(place + 8, 0)
@@ -5864,10 +5850,10 @@ trusted fun __ablaRuntimeHostFreezeBody(value: any): any {
         }
         block = 0
         while (block < count) {
-            val old = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + block * 8)
+            val payload = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context) + block * 8)
             val place = base + ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 48) + block * 8)
             val flag = ablaRuntimeLoadI64(ablaRuntimeLoadI64(context + 56) + block * 8)
-            if ((flag & 15) != 2) __ablaRuntimeHostFreezeScan(old, place + 32, flag)
+            if ((flag & 15) != 2) __ablaRuntimeHostFreezeScan(payload, place + 32, flag)
             block = block + 1
         }
         __ablaRuntimeOsProtect(base, pages, false)
@@ -5957,15 +5943,15 @@ trusted fun __ablaRuntimeHostFreezeFlatten(rope: int, destination: int): void {
 // Whether `candidate` is a rope node (a layout 6 block's payload, the start of one).
 trusted fun __ablaRuntimeHostFreezeIsRope(candidate: int): bool {
     if (candidate == 0 || __ablaRuntimeHostFrozenIn(candidate)) return false
-    val header = __ablaRuntimeHostFreezeLocate(candidate)
-    header != 0 && ablaRuntimeLoadI64(header + 24) == 6 && candidate == header + 32
+    val payload = __ablaRuntimeHostFreezeLocate(candidate)
+    payload != 0 && (ablaRuntimeLoadI64(payload - 8) & 63) == 6 && candidate == payload
 }
 
 // A block that lives as long as `owner`: in the owner's region when it was allocated in the active one, else outside every
 // region (a global's rope flattened first inside a request's region would otherwise keep a copy the region frees).
 trusted fun __ablaRuntimePlatformAllocateOwned(requested: int, layout: int, owner: int): int {
     val region = __ablaRuntimeHostRegionLoad()
-    if (region == 0 || ablaRuntimeLoadI64(owner - 8) == region) return __ablaRuntimePlatformAllocateLayout(requested, layout)
+    if (region == 0 || ((ablaRuntimeLoadI64(owner - 8) & 63) == 63 && ablaRuntimeLoadI64(owner - 24) == region)) return __ablaRuntimePlatformAllocateLayout(requested, layout)
     __ablaRuntimeHostRegionStore(0)
     val result = __ablaRuntimePlatformAllocateLayout(requested, layout)
     __ablaRuntimeHostRegionStore(region)

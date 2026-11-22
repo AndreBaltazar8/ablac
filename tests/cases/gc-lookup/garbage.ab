@@ -6,7 +6,7 @@ import "@HOST_PLATFORM@"
 import "abla/runtime/scalar"
 
 // Garbage that reaches the marker as a candidate: none of these may be taken for an allocation, and none
-// may fault the registry lookup, which reads the 32 bytes before a candidate only inside the ranges
+// may fault the registry lookup, which reads the payload prefix before a candidate only inside the ranges
 // /proc/self/maps listed. Candidates: 0, -1, small and unaligned values, 2^63, the bytes around each listed
 // range, a PROT_NONE page, a page that was mapped and is gone, an address inside the snapshot's own buffer.
 trusted noescape extern:"c" fun mmap(address: int, length: int, protection: int, flags: int, descriptor: int, offset: int): int
@@ -16,6 +16,9 @@ trusted noescape extern:"c" fun malloc(size: int): i64*
 class Item(val value: int, val next: Item?)
 
 trusted fun probe(): int {
+    // Keep the first chunk's boundary probes outside tracked blocks. Its first
+    // compact object's payload could otherwise start 32 bytes into the mapping.
+    val prefix = __ablaRuntimeHostMalloc(128)
     // Something in the registry, so that the lookup has headers to compare against.
     var list: Item? = null
     for (index in 0 until 200) list = Item(index, list)
@@ -25,7 +28,10 @@ trusted fun probe(): int {
     __ablaRuntimeHostCollectionCount = 64
     __ablaRuntimeHostCollectionWorklist = ablaRuntimePointerAddress(malloc(512))
     __ablaRuntimeHostCollectionWorklistCount = 0
-    if (!__ablaRuntimeHostCollectionMappingsLoad()) return 0
+    if (!__ablaRuntimeHostCollectionMappingsLoad()) {
+        __ablaRuntimeHostFree(prefix)
+        return 0
+    }
     val candidates: array<int> = [0, -1, 1, 7, 8, 40, 4096, 0x7fffffffffffffff, -9223372036854775807 - 1,
         guard, guard + 32, guard + 4095, gone, gone + 32, gone + 4095,
         __ablaRuntimeHostCollectionMappedBuffer, __ablaRuntimeHostCollectionMappedBuffer + 32,
@@ -53,6 +59,7 @@ trusted fun probe(): int {
         index = index + 1
     }
     __ablaRuntimeHostCollectionMode = 0
+    __ablaRuntimeHostFree(prefix)
     wrong
 }
 

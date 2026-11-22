@@ -65,7 +65,21 @@ if [[ -r /proc/self/maps ]]; then
     sed "s|@HOST_PLATFORM@|$project_root/stdlib/abla/runtime/platform/host.ab|" \
         "$project_root/tests/cases/gc-lookup/garbage.ab" > "$out/garbage.ab"
     "$compiler" build "$out/garbage.ab" -o "$out/garbage" --fast --no-cache
-    garbage=$("$out/garbage")
+    garbage=$("$out/garbage") || fail "garbage candidates: '$garbage'"
     [[ $garbage == 'garbage candidates taken for allocations: 0' ]] || fail "garbage candidates: '$garbage'"
+fi
+# The x86-64 native heap can carry both formats in one registry.
+if [[ $(uname -sm) == 'Linux x86_64' ]]; then
+    sed "s|@HOST_PLATFORM@|$project_root/stdlib/abla/runtime/platform/host.ab|" \
+        "$project_root/tests/cases/gc-lookup/compact.ab" > "$out/compact.ab"
+    "$compiler" build "$out/compact.ab" -o "$out/compact" --fast --no-cache
+    for stress in 0 1; do
+        mixed=$(ABLA_GC_STRESS=$stress ABLA_COMPACT_HEADERS=1 "$out/compact") ||
+            fail "mixed headers, stress=$stress: exit $?, '$mixed'"
+        [[ $mixed == 'mixed tracked headers ok' ]] || fail "mixed headers, stress=$stress: '$mixed'"
+        legacy=$(ABLA_GC_STRESS=$stress ABLA_COMPACT_HEADERS=0 "$out/compact" legacy) ||
+            fail "legacy headers, stress=$stress: exit $?, '$legacy'"
+        [[ $legacy == "$mixed" ]] || fail "legacy headers, stress=$stress: '$legacy'"
+    done
 fi
 echo 'gc lookup: from the registry for payload starts, through the directory for interior pointers, under each forced fallback and under stress'

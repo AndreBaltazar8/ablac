@@ -1,0 +1,57 @@
+import "abla/io"
+import "abla/memory"
+import "abla/process/arguments"
+import "abla/runtime/scalar"
+import "@HOST_PLATFORM@"
+
+class Node(val value: int, val next: Node?)
+
+// Inspect the two rooted 32-byte Nodes after the collector has moved their slots.
+trusted fun checkHeaders(compact: bool): bool {
+    val width = if (compact) 16 else 32
+    var nodes = 0
+    var slot = 0
+    while (slot < __ablaRuntimeHostRegistrySlots) {
+        val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
+        if (entry != 0) {
+            val payload = entry & -16
+            val packed = ablaRuntimeLoadI64(payload - 8)
+            val size = ablaRuntimeLoadI64(payload - 16)
+            if ((packed & 63) == 5 && size == 32) {
+                if (__ablaRuntimeHostEntryWidth(entry) != width || (packed >>> 6) != slot) return false
+                nodes = nodes + 1
+            }
+        }
+        slot = slot + 1
+    }
+    nodes >= 2
+}
+
+fun makeNodes(seed: int): Node {
+    Node(seed, Node(seed + 1, null))
+}
+
+trusted fun checkReset(): bool {
+    memoryCollect()
+    val checkpoint = memoryCheckpoint()
+    val before = __ablaRuntimeHostLiveBytes
+    val value = makeNodes(8)
+    val text = "legacy allocation at ${value.value} for reset"
+    if (text.size < 20 || __ablaRuntimeHostLiveBytes <= before) return false
+    memoryReset(checkpoint)
+    __ablaRuntimeHostLiveBytes == before
+}
+
+fun main: int {
+    val compact = processArgumentCount() == 0
+    if (!checkReset()) return 1
+    val kept = makeNodes(41)
+    val other = "separate legacy allocation ${kept.value}"
+    memoryCollect()
+    memoryCollect()
+    val next = kept.next
+    if (next == null || next.value != 42 || other != "separate legacy allocation 41") return 2
+    if (!checkHeaders(compact)) return 3
+    println("mixed tracked headers ok")
+    0
+}
