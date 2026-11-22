@@ -32,6 +32,7 @@ import "abla/sys/linux"
 import "abla/unsafe/memory"
 import "abla/sys/linux/process"
 
+// Sets connection, DNS cache, timeout, and response limits for the asynchronous client.
 class HttpAsyncOptions(
     val maximumConnectionsPerHost: int = 8,
     val maximumResponseBytes: int = 8388608,
@@ -97,11 +98,16 @@ fun HttpAsyncCompletion.header(name: string): string {
 // Streaming requests (requestStream, getStream): what happened to one, in order. HEADERS: `status` and `headers`; READABLE: bytes wait for readStream (sent when there were none
 // waiting; read until it returns ""); WRITABLE: writeBody has room again; END: the response ended well (`trailers`); ERROR: the request failed (`error`; the id is done).
 val HTTP_STREAM_HEADERS = 1
+// Event indicating that response body bytes are waiting to be read.
 val HTTP_STREAM_READABLE = 2
+// Event indicating that the request stream can accept more body bytes.
 val HTTP_STREAM_WRITABLE = 3
+// Terminal stream event with the successful response status and any trailers.
 val HTTP_STREAM_END = 4
+// Terminal stream event containing the reason the request failed.
 val HTTP_STREAM_ERROR = 5
 
+// Holds the request identifier and the status, headers, trailers, or error for a stream event.
 class HttpAsyncStreamEvent(val kind: int, val id: int, val status: int = 0, val headers: array<HttpHeader> = [], val trailers: array<HttpHeader> = [], val error: string = "")
 
 // The HTTP/1.1 half of a streaming request (per request slot): the response body framing and what waits for readStream, and the request body's framing.
@@ -122,6 +128,7 @@ class HttpAsyncStreamState(
     var trailers: array<HttpHeader> = []
 )
 
+// Holds the parsed scheme, host, port, and request path with a URL validity flag.
 class HttpAsyncTarget(
     val secure: bool,
     val host: string,
@@ -130,6 +137,7 @@ class HttpAsyncTarget(
     val valid: bool
 )
 
+// Holds temporary read bytes and the socket or TLS read status.
 class HttpAsyncRead(var text: string, var status: int)
 
 // Request states.
@@ -155,6 +163,7 @@ private val httpAsyncOriginUnknown = 0
 private val httpAsyncOriginHttp1 = 1
 private val httpAsyncOriginH2 = 2
 
+// Owns network descriptors, queued requests, connection pools, and pending HTTP events.
 resource class HttpAsyncClient(
     val poller: SocketPoller,
     val options: HttpAsyncOptions,
@@ -231,6 +240,7 @@ resource class HttpAsyncClient(
     var streamEvents: array<HttpAsyncStreamEvent> = [],
     val streamStates: array<HttpAsyncStreamState> = []
 ) {
+    // Releases the client's open sockets and TLS connections.
     trusted fun drop(): void {
         var slot = 0
         while (slot < this.connectionStates.size) {
@@ -249,6 +259,7 @@ resource class HttpAsyncClient(
     }
 }
 
+// Returns a client with a new kernel poller and asynchronous resolver using the supplied options.
 fun httpAsyncClient(options: HttpAsyncOptions = HttpAsyncOptions()): HttpAsyncClient =
     HttpAsyncClient(
         socketPoller(), options,
@@ -458,17 +469,20 @@ fun HttpAsyncClient.tlsFree(slot: int): void {
 // ---------------------------------------------------------------------------
 // Bookkeeping
 
+// Associates a nonnegative descriptor with an event dispatch slot, growing the table as needed.
 fun HttpAsyncClient.route(descriptor: int, value: int): void {
     while (this.routes.size <= descriptor) this.routes.append(-1)
     this.routes[descriptor] = value
     return
 }
 
+// Removes the dispatch mapping for a descriptor when it is present.
 fun HttpAsyncClient.unroute(descriptor: int): void {
     if (descriptor >= 0 && descriptor < this.routes.size) this.routes[descriptor] = -1
     return
 }
 
+// Queues the terminal event or buffered completion for an active request and releases its slot.
 fun HttpAsyncClient.complete(
     request: int,
     status: int,
@@ -506,6 +520,7 @@ fun HttpAsyncClient.complete(
     return
 }
 
+// Closes the socket, unregisters it, and releases TLS state for the connection slot.
 fun HttpAsyncClient.closeConnection(slot: int): void {
     if (slot >= 0 && this.connectionStates[slot] != 0) {
         this.tlsFree(slot)
@@ -556,6 +571,7 @@ fun HttpAsyncClient.fail(slot: int, error: string): void {
     return
 }
 
+// Updates the connection's writable poller interest while retaining readable interest.
 fun HttpAsyncClient.interest(slot: int, write: bool): void {
     if (this.connectionWriteInterest[slot] != write) {
         this.poller.modifyDescriptor(this.connectionDescriptors[slot], true, write)
@@ -564,6 +580,7 @@ fun HttpAsyncClient.interest(slot: int, write: bool): void {
     return
 }
 
+// Returns a fresh or reused connection slot initialized from the request.
 fun HttpAsyncClient.allocateConnection(request: int): int {
     var slot = -1
     if (this.freeConnectionCount > 0) {
@@ -614,6 +631,7 @@ fun HttpAsyncClient.allocateConnection(request: int): int {
 // ---------------------------------------------------------------------------
 // Connection state machine
 
+// Returns a numeric IPv4 address or unexpired cached DNS answer, or empty text when unresolved.
 fun HttpAsyncClient.cachedAddress(host: string): string {
     val numeric = httpAsyncNumericIpv4(host)
     if (numeric != "") return numeric
@@ -629,6 +647,7 @@ fun HttpAsyncClient.cachedAddress(host: string): string {
     result
 }
 
+// Stores a DNS answer with its time to live bounded by the cache options.
 fun HttpAsyncClient.remember(host: string, address: string, ttlSeconds: int): void {
     var ttl = ttlSeconds
     if (ttl > this.options.dnsCacheSeconds) ttl = this.options.dnsCacheSeconds
@@ -662,6 +681,7 @@ fun HttpAsyncClient.unwatchQuery(query: int): void {
     return
 }
 
+// Starts asynchronous IPv4 DNS resolution for the connection slot.
 fun HttpAsyncClient.startResolve(slot: int): void {
     val query = this.resolver.start(this.connectionHosts[slot], 1)
     this.connectionDnsQueries[slot] = query
@@ -676,6 +696,7 @@ fun HttpAsyncClient.startResolve(slot: int): void {
     return
 }
 
+// Consumes a ready DNS reply and advances the slot if resolution completed.
 fun HttpAsyncClient.dnsReady(slot: int): void {
     val query = this.connectionDnsQueries[slot]
     if (this.resolver.receive(this.resolver.descriptorOf(query))) {
@@ -714,6 +735,7 @@ fun HttpAsyncClient.resolved(slot: int): void {
     return
 }
 
+// Starts a nonblocking connection or fails the slot if the socket cannot be opened.
 fun HttpAsyncClient.startConnect(slot: int, address: string): void {
     val descriptor = httpAsyncConnect(address, this.connectionPorts[slot])
     if (descriptor < 0) {
@@ -729,6 +751,7 @@ fun HttpAsyncClient.startConnect(slot: int, address: string): void {
     return
 }
 
+// Starts the TLS handshake for HTTPS or begins the HTTP request write for a plain connection.
 fun HttpAsyncClient.connected(slot: int): void {
     if (this.connectionSecure[slot]) {
         // An empty caPath is the system trust store. The name is checked (a DNS name or an IP address, by subjectAltName).
@@ -748,6 +771,7 @@ fun HttpAsyncClient.connected(slot: int): void {
     return
 }
 
+// Advances the connection's TLS handshake, updating readiness interests or failing the request if negotiation fails.
 fun HttpAsyncClient.handshake(slot: int): void {
     val result = this.tlsHandshake(slot)
     if (result == 1) this.handshakeDone(slot)
@@ -784,6 +808,7 @@ fun HttpAsyncClient.beginWrite(slot: int): void {
     return
 }
 
+// Writes pending request bytes until they are sent, the socket blocks, or the connection fails.
 fun HttpAsyncClient.writeSlot(slot: int): void {
     var writing = true
     while (writing && this.connectionStates[slot] == httpAsyncConnectionWriting) {
@@ -904,6 +929,7 @@ fun HttpAsyncClient.parseResponse(slot: int, eof: bool): bool {
     true
 }
 
+// Consumes ready response bytes and handles complete responses, EOF, or failed reads.
 fun HttpAsyncClient.readSlot(slot: int): void {
     var reading = true
     while (reading && this.connectionStates[slot] != 0) {
@@ -943,6 +969,7 @@ fun HttpAsyncClient.readSlot(slot: int): void {
     return
 }
 
+// Dispatches readiness and failure signals according to the current connection state.
 fun HttpAsyncClient.socketReady(slot: int, readable: bool, writable: bool, failed: bool): void {
     val state = this.connectionStates[slot]
     if (state == httpAsyncConnectionConnecting) {
@@ -1000,6 +1027,7 @@ fun HttpAsyncClient.originProtocol(key: string, secure: bool): int {
     httpAsyncOriginUnknown
 }
 
+// Caches the selected protocol for an origin until the configured expiry.
 fun HttpAsyncClient.rememberOrigin(key: string, protocol: int): void {
     val expires = linuxMonotonicMilliseconds() + this.options.dnsCacheSeconds * 1000
     for (i in 0 until this.originKeys.size) {
@@ -1069,6 +1097,7 @@ fun HttpAsyncClient.h2Attach(slot: int, request: int): bool {
     true
 }
 
+// Returns the active request slot for an HTTP/2 stream or -1 when no request owns it.
 fun HttpAsyncClient.requestOnStream(slot: int, stream: int): int {
     for (request in 0 until this.requestStates.size) {
         if (this.requestStates[request] != 0 && this.requestSlots[request] == slot && this.requestStreams[request] == stream) return request
@@ -1176,12 +1205,14 @@ fun HttpAsyncClient.h2Write(slot: int): void {
     return
 }
 
+// Processes pending HTTP/2 events and writes queued frames while the connection remains active.
 fun HttpAsyncClient.h2Pump(slot: int): void {
     this.h2Events(slot, false)
     if (this.connectionStates[slot] == httpAsyncConnectionH2) this.h2Write(slot)
     return
 }
 
+// Reads ready HTTP/2 bytes and dispatches frames until blocked or the connection closes.
 fun HttpAsyncClient.h2Read(slot: int): void {
     var reading = true
     while (reading && this.connectionStates[slot] == httpAsyncConnectionH2) {
@@ -1253,6 +1284,7 @@ fun HttpAsyncClient.connectionsComing(key: string): int {
     count
 }
 
+// Allocates a slot for a queued request and begins DNS resolution or connects to the cached address.
 fun HttpAsyncClient.openConnectionFor(request: int): void {
     this.requestStates[request] = httpAsyncRequestActive
     val slot = this.allocateConnection(request)
@@ -1266,6 +1298,7 @@ fun HttpAsyncClient.openConnectionFor(request: int): void {
 // ---------------------------------------------------------------------------
 // Dispatch, timers, and the public API
 
+// Returns the number of active connections for the given origin key.
 fun HttpAsyncClient.connectionsFor(key: string): int {
     var count = 0
     var slot = 0
@@ -1278,6 +1311,7 @@ fun HttpAsyncClient.connectionsFor(key: string): int {
     count
 }
 
+// Returns a reusable idle connection slot for the origin, or -1 when none is available.
 fun HttpAsyncClient.idleConnection(key: string): int {
     var found = -1
     var slot = 0
@@ -1289,6 +1323,7 @@ fun HttpAsyncClient.idleConnection(key: string): int {
     found
 }
 
+// Assigns queued requests to existing connections or opens new ones within the connection limits.
 fun HttpAsyncClient.pumpEvents(): void {
     var request = 0
     while (request < this.requestStates.size) {
@@ -1328,6 +1363,7 @@ fun HttpAsyncClient.pumpEvents(): void {
     return
 }
 
+// Enforces request, DNS, and idle-connection deadlines at the supplied monotonic timestamp.
 fun HttpAsyncClient.sweep(now: int): void {
     var request = 0
     while (request < this.requestStates.size) {
@@ -1469,10 +1505,12 @@ private fun HttpAsyncClient.openRequest(
     id
 }
 
+// Starts a buffered GET and returns its request identifier, with errors delivered through the completion queue.
 fun HttpAsyncClient.get(url: string, headers: array<HttpHeader> = [],
     timeoutMilliseconds: int = 10000): int =
     this.request("GET", url, headers, "", timeoutMilliseconds)
 
+// Starts a buffered POST with a JSON content type and returns the request identifier for its completion or error.
 fun HttpAsyncClient.postJson(url: string, json: string, headers: array<HttpHeader> = [],
     timeoutMilliseconds: int = 10000): int {
     val all: array<HttpHeader> = [HttpHeader("Content-Type", "application/json")]
@@ -1512,6 +1550,7 @@ fun HttpAsyncClient.streamInterest(slot: int, write: bool): void {
     return
 }
 
+// Associates a connection with a streaming request and prepares its initial output.
 fun HttpAsyncClient.startStream(slot: int, request: int): void {
     this.connectionStates[slot] = httpAsyncConnectionStreaming
     this.connectionOutputs[slot] = this.requestPayloads[request]
@@ -1778,6 +1817,7 @@ fun HttpAsyncClient.streamFinish(slot: int): void {
 // read), the request body is written with writeBody. The events (takeStreamEvents) say when: HEADERS, READABLE, WRITABLE, END, ERROR; an id ends with exactly one END or ERROR.
 // `idleTimeoutMilliseconds` is not a total: it counts from the last event, read or accepted write. Start writing a body after the first WRITABLE (before it writeBody takes 0).
 
+// Starts a streaming request and returns its identifier, with failures delivered as stream events.
 fun HttpAsyncClient.requestStream(
     method: string,
     url: string,
@@ -1786,6 +1826,7 @@ fun HttpAsyncClient.requestStream(
     idleTimeoutMilliseconds: int = 30000
 ): int = this.openRequest(method, url, headers, "", idleTimeoutMilliseconds, true, length)
 
+// Starts a GET with a streaming response and returns the identifier used to read bytes and receive errors.
 fun HttpAsyncClient.getStream(url: string, headers: array<HttpHeader> = [], idleTimeoutMilliseconds: int = 30000): int =
     this.openRequest("GET", url, headers, "", idleTimeoutMilliseconds, true, 0)
 
