@@ -158,11 +158,11 @@ Tests: `tools/test-windows-compiler.sh` grows each step's case with the real LLV
 stop, the limit), under Wine; the windows-run job runs the same `ablac.exe` on Windows, which is the answer for §4 and §5 (Wine's
 SuspendThread/SetThreadContext and exception dispatch are close to Windows but not the truth).
 
-## Questions for the lead and ablac-60
+## Decisions (the lead, 2026-11-22)
 
-1. §2: exports (recommended) or absolute symbols?
-2. §5: the watchdog redirecting a suspended thread is the one part with real risk (a redirect at the wrong moment corrupts the
-   compiler). The alternative is a cooperative limit: the slice checks a deadline word at loop back-edges and calls, as the
-   evaluator does (cost: a load and a branch per back-edge in compile-time native code, on every host). Redirect (recommended,
-   same behaviour as Linux), or cooperative?
-3. §7: a supervising parent on Windows only, or for every host (one restart path to test)?
+1. §2: **exports through a `.def`**, the `--export-dynamic` equivalent, one symbol path. Built first: it needs no LLVM.
+2. §5: **the suspended-thread redirect**, as on Linux and free on other hosts (the cooperative check would cost every host a
+   load and a branch per back-edge). Its tests: a JIT'd tight loop with no calls interrupted at its limit, and a site blocked in
+   I/O.
+3. §7: **the supervising parent on Windows only**; Linux and macOS keep exec (it works, with no extra process). One restart
+   path for every host only if it simplifies later.
