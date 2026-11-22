@@ -7,7 +7,7 @@
 #   - `fmt` rewrites a file;
 #   - `build` finds its standard library beside its own image (/proc/self/exe) and takes a program through parsing, analysis
 #     and IR to its first LLVM call, which the stub fails: an LLVM error, not a missing toolchain or a refused system call.
-# Skipped with a message without lld-link, llvm-mc, llvm-ar or Wine.
+# Without Wine (or lld-link, llvm-mc, llvm-ar) the undefined-symbol check still runs and the rest is skipped with a message.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -17,9 +17,7 @@ out=build/windows-compiler
 rm -rf "$out"
 mkdir -p "$out/libs" "$out/tools"
 fail() { echo "windows-compiler: $1" >&2; exit 1; }
-for tool in lld-link llvm-mc llvm-ar llvm-nm; do
-    command -v "$tool" > /dev/null || { echo "windows-compiler: skipped ($tool is not installed)"; exit 0; }
-done
+command -v llvm-nm > /dev/null || { echo "windows-compiler: skipped (llvm-nm is not installed)"; exit 0; }
 "$compiler" build src/orc_main.ab --target x86_64-windows-hosted -o "$out/ablac.exe" > "$out/build.log" 2>&1 || true
 [[ -s $out/ablac.exe.o ]] || { tail -20 "$out/build.log" >&2; fail "src/orc_main.ab gave no object for Windows"; }
 
@@ -28,6 +26,10 @@ llvm-nm -u "$out/ablac.exe.o" | awk '{ print $NF }' | sort -u > "$out/undefined.
 cat runtime/windows/imports/*.txt | grep -vE '^[[:space:]]*(#|$)' | sort -u > "$out/imported.txt"
 { grep -vE '^(LLVM|__ImageBase$)' "$out/undefined.txt" || true; } | comm -23 - "$out/imported.txt" > "$out/unexpected.txt"
 [[ ! -s $out/unexpected.txt ]] || fail "the compiler names what Windows does not give it: $(tr '\n' ' ' < "$out/unexpected.txt")"
+for tool in lld-link llvm-mc llvm-ar; do
+    command -v "$tool" > /dev/null ||
+        { echo "windows-compiler: the compiler names only LLVM beyond the runtime's imports; the stub link and Wine runs are skipped ($tool is not installed)"; exit 0; }
+done
 
 # Import libraries from the runtime's lists (llvm-ar run as llvm-dlltool) and a stub for every LLVM-C function.
 ln -sf "$(command -v llvm-ar)" "$out/tools/llvm-dlltool"
@@ -53,7 +55,7 @@ run() {
     status=0
     (cd "$out/work" && env -u ABLA_SYSROOT -u ABLA_STDLIB "$root/tools/windows/wine-run.sh" ../package/bin/ablac.exe "$@") \
         > "$out/$name.out" 2>&1 || status=$?
-    [[ $status != 125 ]] || { echo "windows-compiler: built and linked; runs skipped (Wine is not installed)"; exit 0; }
+    [[ $status != 125 ]] || { echo "windows-compiler: the compiler names only LLVM beyond the runtime's imports and links against a stub LLVM; the Wine runs are skipped (Wine is not installed)"; exit 0; }
     ! grep -q 'unsupported Linux system call' "$out/$name.out" || fail "$name: $(grep 'unsupported Linux system call' "$out/$name.out")"
     return 0
 }
