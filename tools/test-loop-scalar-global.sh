@@ -9,7 +9,7 @@ out=build/loop-scalar-global
 mkdir -p "$out"
 ABLA_KEEP_LLVM_TEXT=1 "$compiler" build tests/cases/loop-optimization/scalar-global.ab \
     -o "$out/program" --no-cache
-expected=$'15 15\n63 63\n63 63\n36 13'
+expected=$'15 15\n63 63\n63 63\n36 13\n2 3\n1'
 [[ $("$out/program") == "$expected" ]]
 
 body_of() {
@@ -24,6 +24,11 @@ body_of() {
 
 body_of advance > "$out/isolated.ll"
 body_of advanceObserved > "$out/observed.ll"
+body_of advancePacked > "$out/packed.ll"
+body_of advanceGeneral > "$out/general.ll"
+grep -q 'dense.array.in.bounds' "$out/packed.ll"
+grep -q "%loop.global.slot" "$out/general.ll"
+if grep -q 'dense.array.in.bounds' "$out/general.ll"; then exit 1; fi
 grep -q '%loop.global.slot = alloca i64' "$out/isolated.ll"
 [[ $(grep -c 'load i64, ptr @abla_global_' "$out/isolated.ll") == 1 ]]
 [[ $(grep -c 'store i64 %loop.global.final.*ptr @abla_global_' "$out/isolated.ll") == 2 ]]

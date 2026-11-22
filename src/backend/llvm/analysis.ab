@@ -1096,6 +1096,84 @@ fun bootstrapLlvmLoopGlobalCandidate(
     ""
 }
 
+// A nonempty float literal is allocated as a dense array of numeric words.
+// Requiring its only use to be this call rules out aliases that could box it.
+private fun bootstrapLlvmFreshPackedFloatArgument(
+    caller: BootstrapIrFunction, callIndex: int, argumentIndex: int
+): bool {
+    val call = caller.instructions[callIndex]
+    if (argumentIndex >= call.operands.size) return false
+    val value = call.operands[argumentIndex]
+    val producer = bootstrapLlvmProducerOf(caller, value)
+    if (producer < 0) return false
+    val literal = caller.instructions[producer]
+    if (literal.opcode != "array.create" || literal.operands.size == 0) return false
+    for (element in literal.operands) {
+        val definition = bootstrapLlvmProducerOf(caller, element)
+        if (definition < 0 || caller.instructions[definition].opcode != "const.f64") return false
+    }
+    for (at in 0 until caller.instructions.size) {
+        val use = caller.instructions[at]
+        if (at != callIndex && (use.left == value || use.right == value)) return false
+        for (operand in 0 until use.operands.size) {
+            if (use.operands[operand] == value && (at != callIndex || operand != argumentIndex)) return false
+        }
+    }
+    true
+}
+
+private fun bootstrapLlvmPackedFloatParameter(
+    program: BootstrapIrProgram, function: BootstrapIrFunction, parameterIndex: int
+): bool {
+    var called = false
+    for (caller in program.functions) {
+        for (at in 0 until caller.instructions.size) {
+            val call = caller.instructions[at]
+            if (call.opcode != "call" || call.text != function.name) continue
+            if (!bootstrapLlvmFreshPackedFloatArgument(caller, at, parameterIndex)) return false
+            called = true
+        }
+    }
+    called
+}
+
+// Only a plain internal function with no indirect entry can get facts from
+// its direct callers. A parameter must stay read-only for each invocation.
+fun bootstrapLlvmPackedFloatReads(
+    program: BootstrapIrProgram, function: BootstrapIrFunction, valueCount: int
+): array<bool> {
+    if (function.name == "main" || function.parameters.size == 0 ||
+        function.parameters[0] == "this") return []
+    val values = filledArray(valueCount, false)
+    for (parameter in 0 until function.parameters.size) {
+        if (parameter >= function.parameterTypes.size ||
+            bootstrapArrayElementType(bootstrapBorrowElementType(function.parameterTypes[parameter])) != "f64") continue
+        val name = function.parameters[parameter]
+        val loads: array<int> = []
+        var readOnly = true
+        for (instruction in function.instructions) {
+            if (instruction.text != name) continue
+            if (instruction.opcode == "parameter.load" || instruction.opcode == "place.root") {
+                loads.append(instruction.result)
+            } else readOnly = false
+        }
+        if (!readOnly || loads.size == 0) continue
+        for (instruction in function.instructions) {
+            for (load in loads) {
+                val read = instruction.left == load &&
+                    (instruction.opcode == "array.get.f64" || instruction.opcode == "array.length")
+                if (instruction.right == load || (instruction.left == load && !read)) readOnly = false
+                for (operand in 0 until instruction.operands.size) {
+                    if (instruction.operands[operand] == load && !(read && operand == 0)) readOnly = false
+                }
+            }
+        }
+        if (!readOnly || !bootstrapLlvmPackedFloatParameter(program, function, parameter)) continue
+        for (load in loads) values[load] = true
+    }
+    values
+}
+
 fun bootstrapLlvmLoopSafePoint(loopSafePoints: array<bool>, index: int): bool =
     index < loopSafePoints.size && loopSafePoints[index]
 
