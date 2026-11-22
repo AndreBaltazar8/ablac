@@ -10,7 +10,7 @@ rm -f "$output_directory/shim.log"
 # An llc first on PATH that compiles for the ESP32, as abla-embedded's esp-llvm-bin does
 # for a PaperMono build, which also builds a host program there. A host build takes its opt
 # and llc from its own toolchain (ABLA_LLVM_TOOLS, or a PATH directory holding both); a
-# non-Xtensa cross build still runs PATH's llc. Xtensa now selects its explicit
+# non-Xtensa cross build still runs PATH's llc (with ABLA_CODEGEN_INPROCESS=0 for a static compiler). Xtensa now selects its explicit
 # companion, covered separately by test-xtensa-routing.
 real_llc=$(command -v llc)
 cat > "$output_directory/shim/llc" <<EOF
@@ -61,7 +61,8 @@ host_build configured
 host_build unconfigured -u ABLA_LLVM_TOOLS
 
 printf 'fun main: int = 42\n' > "$output_directory/cross.ab"
-PATH="$output_directory/shim:$PATH" "$compiler" build "$output_directory/cross.ab" \
+# (a static compiler makes this object in its own process by default, #101: ABLA_CODEGEN_INPROCESS=0 asks for the llc on PATH, which is what is held here)
+ABLA_CODEGEN_INPROCESS=0 PATH="$output_directory/shim:$PATH" "$compiler" build "$output_directory/cross.ab" \
     -o "$output_directory/hello-wasm.o" --no-cache \
     --target-triple wasm32-unknown-unknown --object-format wasm --emit object >"$output_directory/cross.out" 2>&1 || {
     echo "host-llvm-tools: the non-Xtensa cross object failed to build" >&2

@@ -39,7 +39,7 @@ LLD_HAS_DRIVER(coff)
 
 // What the prebuilt lld and LLVM archives name that the static compiler does not carry (weak: a real definition wins). lld's driver initialises every target
 // it was built for, and the compiler's archives leave out the targets it has no use for (src/toolchain.ab, bootstrapStaticLlvmOtherTarget); none of them is
-// ever asked for a target (only X86, AArch64 and WebAssembly objects are linked), so they do nothing. LLVM's LTO backend asks for Polly's plugin, which the
+// ever asked for a target (only X86, AArch64, RISCV and WebAssembly objects are linked), so they do nothing. LLVM's LTO backend asks for Polly's plugin, which the
 // archives were built without (an empty plugin: it registers nothing).
 #define ABLA_NO_TARGET(name)                                                         \
     extern "C" __attribute__((weak)) void LLVMInitialize##name##Target() {}          \
@@ -58,7 +58,6 @@ ABLA_NO_TARGET(Mips)
 ABLA_NO_TARGET(MSP430)
 ABLA_NO_TARGET(NVPTX)
 ABLA_NO_TARGET(PowerPC)
-ABLA_NO_TARGET(RISCV)
 ABLA_NO_TARGET(Sparc)
 ABLA_NO_TARGET(SPIRV)
 ABLA_NO_TARGET(SystemZ)
@@ -142,7 +141,7 @@ extern "C" int abla_archive_gnu(const char *arguments) {
 //
 //   int abla_emit_object(const char *bitcode, const char *object, int verify, int sections, int alignLoops)
 //
-// Returns 0, or non-zero with the reason on standard error. (The compiler's targets only: X86, AArch64, WebAssembly.) The objects are byte for byte llc's
+// Returns 0, or non-zero with the reason on standard error. (The compiler's targets only: X86, AArch64, RISC-V, WebAssembly.) The objects are byte for byte llc's
 // (tools/test-codegen-inprocess.sh).
 extern "C" {
 void LLVMInitializeX86TargetInfo();
@@ -160,6 +159,11 @@ void LLVMInitializeWebAssemblyTarget();
 void LLVMInitializeWebAssemblyTargetMC();
 void LLVMInitializeWebAssemblyAsmPrinter();
 void LLVMInitializeWebAssemblyAsmParser();
+void LLVMInitializeRISCVTargetInfo();
+void LLVMInitializeRISCVTarget();
+void LLVMInitializeRISCVTargetMC();
+void LLVMInitializeRISCVAsmPrinter();
+void LLVMInitializeRISCVAsmParser();
 }
 
 static llvm::codegen::RegisterCodeGenFlags abla_codegen_flags;
@@ -172,6 +176,7 @@ static void abla_initialize_targets() {
     LLVMInitializeX86TargetInfo(); LLVMInitializeX86Target(); LLVMInitializeX86TargetMC(); LLVMInitializeX86AsmPrinter(); LLVMInitializeX86AsmParser();
     LLVMInitializeAArch64TargetInfo(); LLVMInitializeAArch64Target(); LLVMInitializeAArch64TargetMC(); LLVMInitializeAArch64AsmPrinter(); LLVMInitializeAArch64AsmParser();
     LLVMInitializeWebAssemblyTargetInfo(); LLVMInitializeWebAssemblyTarget(); LLVMInitializeWebAssemblyTargetMC(); LLVMInitializeWebAssemblyAsmPrinter(); LLVMInitializeWebAssemblyAsmParser();
+    LLVMInitializeRISCVTargetInfo(); LLVMInitializeRISCVTarget(); LLVMInitializeRISCVTargetMC(); LLVMInitializeRISCVAsmPrinter(); LLVMInitializeRISCVAsmParser();
 }
 
 extern "C" int abla_emit_object(const char *bitcode, const char *object, int verify, int sections, int alignLoops) {
@@ -181,6 +186,7 @@ extern "C" int abla_emit_object(const char *bitcode, const char *object, int ver
         LLVMInitializeX86TargetInfo(); LLVMInitializeX86Target(); LLVMInitializeX86TargetMC(); LLVMInitializeX86AsmPrinter(); LLVMInitializeX86AsmParser();
         LLVMInitializeAArch64TargetInfo(); LLVMInitializeAArch64Target(); LLVMInitializeAArch64TargetMC(); LLVMInitializeAArch64AsmPrinter(); LLVMInitializeAArch64AsmParser();
         LLVMInitializeWebAssemblyTargetInfo(); LLVMInitializeWebAssemblyTarget(); LLVMInitializeWebAssemblyTargetMC(); LLVMInitializeWebAssemblyAsmPrinter(); LLVMInitializeWebAssemblyAsmParser();
+        LLVMInitializeRISCVTargetInfo(); LLVMInitializeRISCVTarget(); LLVMInitializeRISCVTargetMC(); LLVMInitializeRISCVAsmPrinter(); LLVMInitializeRISCVAsmParser();
         initialized = true;
     }
     if (aligned != alignLoops) {
@@ -273,6 +279,7 @@ static int abla_llc(const std::vector<std::string> &arguments) {
     LLVMInitializeX86TargetInfo(); LLVMInitializeX86Target(); LLVMInitializeX86TargetMC(); LLVMInitializeX86AsmPrinter(); LLVMInitializeX86AsmParser();
     LLVMInitializeAArch64TargetInfo(); LLVMInitializeAArch64Target(); LLVMInitializeAArch64TargetMC(); LLVMInitializeAArch64AsmPrinter(); LLVMInitializeAArch64AsmParser();
     LLVMInitializeWebAssemblyTargetInfo(); LLVMInitializeWebAssemblyTarget(); LLVMInitializeWebAssemblyTargetMC(); LLVMInitializeWebAssemblyAsmPrinter(); LLVMInitializeWebAssemblyAsmParser();
+    LLVMInitializeRISCVTargetInfo(); LLVMInitializeRISCVTarget(); LLVMInitializeRISCVTargetMC(); LLVMInitializeRISCVAsmPrinter(); LLVMInitializeRISCVAsmParser();
     std::string input, output = "-", fileType = "asm", triplePrefix;
     int optLevel = 2;
     bool verify = true, discardNames = false;
