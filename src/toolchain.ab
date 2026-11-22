@@ -1179,7 +1179,7 @@ fun bootstrapLlvmToolsVerify(): bool {
 // The two late SROAs also do no useful work on the 13 benchmarks, NovaKind's tool,
 // the MVC server and QR (2026-11-04): dropping them keeps all 16 executables exact
 // and cuts O2 instructions 0.4–0.65% on those three real programs. Keep both early SROAs.
-val BOOTSTRAP_HOST_RELEASE_PASSES =
+val BOOTSTRAP_HOST_RELEASE_BEFORE_ARGUMENT_PROMOTION =
     "memprof-remove-attributes,annotation2metadata,forceattrs,inferattrs,coro-early," +
     "function<eager-inv>(ee-instrument<>,lower-expect," +
     "simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;no-switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>," +
@@ -1205,7 +1205,10 @@ val BOOTSTRAP_HOST_RELEASE_PASSES =
     "correlated-propagation,memcpyopt,dse,move-auto-init,coro-elide," +
     "simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;switch-to-arithmetic;no-switch-to-lookup;keep-loops;hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>)," +
     "function-attrs,function(require<should-not-run-function-passes>),coro-split," +
-    "coro-annotation-elide)),deadargelim,coro-cleanup,globalopt,globaldce," +
+    "coro-annotation-elide)"
+
+val BOOTSTRAP_HOST_RELEASE_AFTER_ARGUMENT_PROMOTION =
+    "),deadargelim,coro-cleanup,globalopt,globaldce," +
     "elim-avail-extern,rpo-function-attrs,recompute-globalsaa," +
     "function<eager-inv>(drop-unnecessary-assumes,float2int,lower-constant-intrinsics," +
     "loop(loop-rotate<header-duplication;no-prepare-for-lto;check-exit-count>," +
@@ -1218,6 +1221,17 @@ val BOOTSTRAP_HOST_RELEASE_PASSES =
     "tailcallelim),alloc-token,globaldce,constmerge,cg-profile," +
     "rel-lookup-table-converter,lower-comment-string,function(annotation-remarks)," +
     "globaldce"
+
+val BOOTSTRAP_HOST_RELEASE_PASSES =
+    BOOTSTRAP_HOST_RELEASE_BEFORE_ARGUMENT_PROMOTION + BOOTSTRAP_HOST_RELEASE_AFTER_ARGUMENT_PROMOTION
+
+// After inlining the field operations, LLVM can see which argument words the
+// recursive body reads. Later passes remove the boxes left at the callers.
+fun bootstrapHostReleasePasses(promoteArguments: bool): string =
+    if (promoteArguments) {
+        BOOTSTRAP_HOST_RELEASE_BEFORE_ARGUMENT_PROMOTION + ",argpromotion" +
+            BOOTSTRAP_HOST_RELEASE_AFTER_ARGUMENT_PROMOTION
+    } else BOOTSTRAP_HOST_RELEASE_PASSES
 
 // Fully unroll short loops after whole-program optimization has exposed their
 // bounds. The second pass can see constant inner-loop bounds after cloning an
@@ -2932,7 +2946,9 @@ fun bootstrapOptimizeWholeProgram(
     optimize.argument("-internalize-public-api-list=$names")
     optimize.argument("-inline-threshold=225")
     if (!bootstrapLlvmDebugInfo) optimize.argument("-force-attribute=nounwind")
-    var passes = BOOTSTRAP_HOST_RELEASE_PASSES
+    var passes = bootstrapHostReleasePasses(
+        bootstrapTextContains(source, "\n!$BOOTSTRAP_LLVM_RECURSIVE_CLASS_ARGUMENT = ")
+    )
     if (bootstrapTextContains(source, "\n!$BOOTSTRAP_LLVM_SMALL_LOOP_NEST = ")) {
         optimize.argument(BOOTSTRAP_HOST_SMALL_LOOP_BUDGET)
         passes = "$passes,$BOOTSTRAP_HOST_SMALL_LOOP_PASSES"
@@ -3048,9 +3064,10 @@ trusted fun bootstrapOptimizeHeldWholeProgram(
         LLVMPassBuilderOptionsSetSLPVectorization(options, 1)
         LLVMPassBuilderOptionsSetLoopUnrolling(options, 1)
         bootstrapDiscardOptimizedLocalNames()
-        status = llvmConsumeError(
-            LLVMRunPasses(module, BOOTSTRAP_HOST_RELEASE_PASSES, machine, options), 167
+        val passes = bootstrapHostReleasePasses(
+            LLVMGetNamedMetadataNumOperands(module, BOOTSTRAP_LLVM_RECURSIVE_CLASS_ARGUMENT) != 0
         )
+        status = llvmConsumeError(LLVMRunPasses(module, passes, machine, options), 167)
         // (A pipeline LLVM can't parse fails before any pass runs.)
         if (status == 0 && LLVMGetNamedMetadataNumOperands(
             module, BOOTSTRAP_LLVM_SMALL_LOOP_NEST) != 0 && llvmLibraryVersion().startsWith("23.")) {
@@ -4999,7 +5016,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         val enclosingBitcodePath = bootstrapLlvmBitcodePath
         val enclosingInlineThreshold = bootstrapLlvmFastInlineThreshold
         val enclosingHoldModule = bootstrapLlvmHoldModule
-        val enclosingSmallLoopNests = bootstrapLlvmDetectSmallLoopNests
+        val enclosingReleaseOptimizations = bootstrapLlvmDetectReleaseOptimizations
         val enclosingRuntimeObjectProducer = bootstrapLlvmFastRuntimeExports
         bootstrapLlvmFastRuntimeExports = fastRuntimeExports
         val enclosingInitializerChunk = bootstrapLlvmInitializerChunk
@@ -5049,7 +5066,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             if (fastCross) bootstrapFastInlineThreshold()
             else if (balancedProfile) llvmBalancedAotInlineThreshold() else 0
         bootstrapLlvmHoldModule = inProcessCodegen || nativeHeld || wholeProgramHeld
-        bootstrapLlvmDetectSmallLoopNests = hostedLtoEligible &&
+        bootstrapLlvmDetectReleaseOptimizations = hostedLtoEligible &&
             bootstrapLlvmTargetIsX8664Linux(target.llvmTriple)
         val baseSnapshots = orderedSnapshots.size
         bootstrapFloatBridgeProbe = compilerRuntime
@@ -5100,7 +5117,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmBitcodePath = enclosingBitcodePath
         bootstrapLlvmFastInlineThreshold = enclosingInlineThreshold
         bootstrapLlvmHoldModule = enclosingHoldModule
-        bootstrapLlvmDetectSmallLoopNests = enclosingSmallLoopNests
+        bootstrapLlvmDetectReleaseOptimizations = enclosingReleaseOptimizations
         bootstrapLlvmFastRuntimeExports = enclosingRuntimeObjectProducer
         bootstrapLlvmInitializerChunk = enclosingInitializerChunk
         bootstrapLlvmStackGuard = enclosingStackGuard

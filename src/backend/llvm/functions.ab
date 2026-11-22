@@ -8034,6 +8034,17 @@ fun bootstrapLlvmEmitFunction(
     val runtimeImplementation = bootstrapLlvmRuntimeFunction(function)
     val collecting = functionId < mayCollect.size &&
         mayCollect[functionId] && !runtimeImplementation
+    // Branching recursion over a concrete class can otherwise materialize
+    // an argument box on each edge. Mark only private, noncollecting walkers
+    // and leave the actual promotion proof to LLVM after field-read inlining.
+    var recursiveCallsNeeded = if (bootstrapLlvmDetectReleaseOptimizations &&
+        !runtimeImplementation && !collecting && !debug.variables &&
+        function.parameters.size == 1 && function.parameterTypes.size == 1 &&
+        classIndex.find(function.parameterTypes[0]) >= 0 &&
+        !addressTaken[functionId] && !nativeFunctionRoots[functionId] &&
+        bootstrapLlvmDirectResultIsScalar(function) &&
+        LLVMGetNamedMetadataNumOperands(backend.module, BOOTSTRAP_LLVM_RECURSIVE_CLASS_ARGUMENT) == 0)
+        2 else 0
     var directlyAllocates = false
     var allocationInstruction = 0
     while (allocationInstruction < function.instructions.size) {
@@ -8914,7 +8925,7 @@ fun bootstrapLlvmEmitFunction(
         if (reachable && (opcodeHead == 98 && opcode == "branch")) {
             matched = true
             if (instruction.text == BOOTSTRAP_IR_SMALL_LOOP_NEST &&
-                bootstrapLlvmDetectSmallLoopNests && !bootstrapLlvmRuntimeFunction(function) &&
+                bootstrapLlvmDetectReleaseOptimizations && !bootstrapLlvmRuntimeFunction(function) &&
                 LLVMGetNamedMetadataNumOperands(backend.module, BOOTSTRAP_LLVM_SMALL_LOOP_NEST) == 0) {
                 val marker = bootstrapLlvmMetadataNode(backend.context, [])
                 LLVMAddNamedMetadataOperand(backend.module, BOOTSTRAP_LLVM_SMALL_LOOP_NEST,
@@ -8946,6 +8957,14 @@ fun bootstrapLlvmEmitFunction(
         if (reachable && (opcodeHead == 99 && opcode == "call")) {
             matched = true
             val called = functionIndex.find(instruction.text)
+            if (recursiveCallsNeeded > 0 && called == functionId) {
+                recursiveCallsNeeded = recursiveCallsNeeded - 1
+                if (recursiveCallsNeeded == 0) {
+                    val marker = bootstrapLlvmMetadataNode(backend.context, [])
+                    LLVMAddNamedMetadataOperand(backend.module, BOOTSTRAP_LLVM_RECURSIVE_CLASS_ARGUMENT,
+                        LLVMMetadataAsValue(backend.context, marker))
+                }
+            }
             if (called < 0) supported = false
             if (called >= 0 && instruction.text == "ablaRuntimeFloatReflectionEnabled") {
                 bootstrapLlvmSetNativeValue(backend, storage, instruction.result,
