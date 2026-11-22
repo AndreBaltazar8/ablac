@@ -20,7 +20,7 @@ for directory in "$abla_root/runtime" "$abla_root/stdlib"; do
         exit 1
     }
 done
-for tool in clang ld.lld llc lld llvm-ar llvm-config llvm-extract llvm-readelf llvm-split \
+for tool in clang ld.lld llc lld llvm-ar llvm-as llvm-config llvm-extract llvm-readelf llvm-split \
     opt patchelf wasm-ld wasm-opt; do
     command -v "$tool" >/dev/null 2>&1 || {
         printf 'missing packaging tool: %s\n' "$tool" >&2
@@ -44,13 +44,17 @@ mkdir -p "$bundle/bin" "$bundle/lib" "$bundle/libexec" \
     "$bundle/share/abla" "$bundle/share/licenses"
 
 cp "$compiler_binary" "$bundle/libexec/ablac.bin"
-for tool in clang ld.lld llc lld llvm-ar llvm-config llvm-extract llvm-readelf llvm-split \
+for tool in clang ld.lld llc lld llvm-ar llvm-as llvm-config llvm-extract llvm-readelf llvm-split \
     opt wasm-ld wasm-opt; do
     cp "$(realpath "$(command -v "$tool")")" "$bundle/libexec/$tool"
     ln -s "../libexec/$tool" "$bundle/bin/$tool"
 done
 cp -R "$abla_root/runtime" "$abla_root/stdlib" "$bundle/share/abla/"
 cp "$abla_root/LICENSE" "$bundle/share/licenses/abla.txt"
+if [[ -n ${ABLA_PORTABLE_LLVM_ROOT:-} ]]; then
+    cp "$ABLA_PORTABLE_LLVM_ROOT/LICENSE.TXT" "$bundle/share/licenses/llvm.txt"
+    cp "$ABLA_PORTABLE_LLVM_ROOT/SOURCE" "$bundle/share/llvm-source.txt"
+fi
 chmod 0755 "$bundle/libexec/ablac.bin" "$bundle"/libexec/*
 
 cat > "$bundle/bin/ablac" <<'SH'
@@ -104,6 +108,10 @@ copy_dependencies() {
 for executable in "$bundle/libexec/ablac.bin" "$bundle"/libexec/*; do
     copy_dependencies "$executable"
 done
+
+# Once the cohort is in the package, its loader must find only the bundled
+# files and the container's system library. Never mask a missing packaged LLVM.
+if [[ -n ${ABLA_PORTABLE_LLVM_ROOT:-} ]]; then unset LD_LIBRARY_PATH; fi
 
 for executable in "$bundle/libexec/ablac.bin" "$bundle"/libexec/*; do
     if patchelf --print-interpreter "$executable" >/dev/null 2>&1; then
