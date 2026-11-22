@@ -348,7 +348,8 @@ fun bootstrapRunLinker(command: LinuxCommand): int {
 /** The Windows executable of a freestanding program (the x86_64-windows target): the program's object linked by lld-link with
  *  the PE entry point the target names, against an import library for each DLL listed in runtime/windows/imports (written
  *  here, beside the output, from the names in the list: src/coff_import.ab), /brepro so that the same inputs give the same bytes. */
-fun bootstrapLinkWindowsExecutable(target: BootstrapTargetDescriptor, objectPath: string, publishPath: string, compiler: bool = false): int {
+fun bootstrapLinkWindowsExecutable(target: BootstrapTargetDescriptor, objectPath: string, publishPath: string, compiler: bool = false,
+    outputPath: string = ""): int {
     val architecture = bootstrapTripleArchitecture(target.llvmTriple)
     val lists: array<string> = []
     for (entry in Path(bootstrapRuntimeRoot()).child("windows").child("imports").entries()) {
@@ -406,8 +407,26 @@ fun bootstrapLinkWindowsExecutable(target: BootstrapTargetDescriptor, objectPath
         }
         link.argument(library)
     }
+    // The compiler (`compiler`) exports every external definition of its object, which the JIT'd code it runs finds through
+    // the process symbol generator (docs/design/windows-jit.md §2; --export-dynamic on Linux).
+    if (compiler) {
+        val definition = "$work/exports.def"
+        if (!Path(definition).writeText(bootstrapCoffExportsDefinition(bootstrapCoffDefinedExternals(Path(objectPath).readText())))) {
+            linuxPrintStandardError("error[E_BUILD_IO]: cannot write the export list $definition\n")
+            return 1
+        }
+        link.argument("/def:$definition")
+    }
     val status = bootstrapRunLinker(link)
-    Path(work).removeTree()
+    // ABLA_WINDOWS_LINK_KEEP=1 keeps the import libraries and the export list as <output>.imports, whether the link succeeded
+    // or not (debugging; the Windows compiler test links its stub ablac.exe with them). The work directory itself is beside the
+    // output's temporary name, which the build removes.
+    val keep = linuxEnvironment("ABLA_WINDOWS_LINK_KEEP")
+    if (keep.found && keep.value == "1") {
+        val kept = Path("${if (outputPath == "") publishPath else outputPath}.imports")
+        kept.removeTree()
+        if (!Path(work).moveTo(kept)) Path(work).removeTree()
+    } else Path(work).removeTree()
     status
 }
 
@@ -5709,7 +5728,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
     }
     if (status == 0 && windowsTarget && artifact == "executable") {
-        status = bootstrapLinkWindowsExecutable(target, objectPath, publishPath, linkLlvm)
+        status = bootstrapLinkWindowsExecutable(target, objectPath, publishPath, linkLlvm, outputPath)
         if (status != 0) failureKind = "reported"
         if (status == 0 && bootstrapLlvmBacktraceSplit) {
             status = bootstrapSplitBacktraceDebug(publishPath, outputPath, true)

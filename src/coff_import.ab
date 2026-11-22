@@ -69,3 +69,56 @@ fun bootstrapCoffImportLibrary(dll: string, architecture: string, names: array<s
     for (member in members) result = result + member
     result
 }
+
+// ---- the exports of a Windows executable that links LLVM (docs/design/windows-jit.md §2) ----
+// Code the compiler JIT-compiles calls the runtime and the compiler bridge in the compiler's own image, which its process symbol
+// generator finds in the loaded modules' export tables: ablac.exe exports every external definition of its object, as the Linux
+// compiler does with --export-dynamic.
+
+fun bootstrapCoffU16(bytes: string, at: int): int = bytes[at] + bytes[at + 1] * 256
+
+fun bootstrapCoffU32(bytes: string, at: int): int = bootstrapCoffU16(bytes, at) + bootstrapCoffU16(bytes, at + 2) * 65536
+
+// The names of the symbols a COFF object (the ordinary format, or the big-object one past 65,279 sections) defines and exports:
+// storage class EXTERNAL (2) with a section, each with " DATA" after it unless its type says function (0x20), in the symbol
+// table's order; [] for a file that is not a COFF object.
+fun bootstrapCoffDefinedExternals(bytes: string): array<string> {
+    val names: array<string> = []
+    if (bytes.size < 20) return names
+    val big = bootstrapCoffU16(bytes, 0) == 0 && bootstrapCoffU16(bytes, 2) == 65535
+    if (big && bytes.size < 56) return names
+    val table = bootstrapCoffU32(bytes, if (big) 48 else 8)
+    val count = bootstrapCoffU32(bytes, if (big) 52 else 12)
+    val record = if (big) 20 else 18
+    val strings = table + count * record
+    if (table <= 0 || strings + 4 > bytes.size) return names
+    var index = 0
+    while (index < count) {
+        val at = table + index * record
+        val section = if (big) bootstrapCoffU32(bytes, at + 12) else bootstrapCoffU16(bytes, at + 12)
+        // (A section number is signed: 0 undefined, -1 absolute, -2 debugging; in the ordinary format 16 bits wide.)
+        val defined = section > 0 && section < (if (big) 2147483648 else 32768)
+        val type = bootstrapCoffU16(bytes, at + (if (big) 16 else 14))
+        val storage = bytes[at + (if (big) 18 else 16)]
+        if (defined && storage == 2) {
+            var name = ""
+            if (bootstrapCoffU32(bytes, at) == 0) {
+                val start = strings + bootstrapCoffU32(bytes, at + 4)
+                var end = start
+                while (end < bytes.size && bytes[end] != 0) end = end + 1
+                name = bytes.slice(start, end)
+            } else {
+                var end = at
+                while (end < at + 8 && bytes[end] != 0) end = end + 1
+                name = bytes.slice(at, end)
+            }
+            if (name != "") names.append(if ((type & 240) == 32) name else "$name DATA")
+        }
+        index = index + 1 + bytes[at + record - 1]
+    }
+    names
+}
+
+// A module-definition file that exports `names` (bootstrapCoffDefinedExternals' lines) from an executable.
+fun bootstrapCoffExportsDefinition(names: array<string>): string =
+    if (names.size == 0) "EXPORTS\n" else "EXPORTS\n    ${names.join("\n    ")}\n"
