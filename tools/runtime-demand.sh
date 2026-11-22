@@ -27,8 +27,8 @@ for program in "$@"; do
     name=$(basename -- "$program" .ab)
     ABLA_COMPILER_DEMAND_TRACE=1 "$compiler" build "$program" -o "$out/$name.exe" --fast --no-cache 2> "$out/$name.trace" > /dev/null || true
     # `abla-demanded <identity> <kind> <receiver>.<name> <up front>`
-    awk '$1 == "abla-demanded" && ($2 ~ /abla\/runtime\/platform\/host\.ab$/ || $2 ~ /abla\/runtime\/self\/entry\.ab$/) {
-        module = ($2 ~ /host\.ab$/) ? "host" : "self"; declaration = $4; sub(/^\./, "", declaration); print module, $3, declaration }' "$out/$name.trace" | sort -u > "$out/$name.txt"
+    awk '$1 == "abla-demanded" && ($2 ~ /abla\/runtime\/platform\/host(_os)?\.ab$/ || $2 ~ /abla\/runtime\/self\/entry\.ab$/) {
+        module = ($2 ~ /host(_os)?\.ab$/) ? "host" : "self"; declaration = $4; sub(/^\./, "", declaration); print module, $3, declaration }' "$out/$name.trace" | sort -u > "$out/$name.txt"
     names+=("$name")
     summary "$name" "$out/$name.txt"
 done

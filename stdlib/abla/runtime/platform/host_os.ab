@@ -1,0 +1,145 @@
+// public: none
+// The operating system under the hosted runtime (platform/host.ab): every system call the heap, the collector and the
+// threads make on Linux, AArch64 Linux and (translated) macOS, as small functions that call nothing else of the runtime.
+// This file is the interface a Windows runtime replaces (docs/design/windows-target-interface.md): host.ab holds the heap,
+// the collector and the locks, and reaches the system only through these functions. The numbers and the per-architecture
+// differences (x86-64 and a translated AArch64 build use x86-64's; native AArch64 its own) stay here.
+//
+// The raw system call and the target's facts, as host.ab used to declare them (private here: a program importing both
+// files must not see two).
+private trusted noescape extern:"intrinsic" fun ablaLinuxSyscall(
+    number: int,
+    argument0: int,
+    argument1: int,
+    argument2: int,
+    argument3: int,
+    argument4: int,
+    argument5: int
+): int
+private trusted noescape extern:"intrinsic" fun ablaDarwinSyscall(
+    number: int,
+    argument0: int,
+    argument1: int,
+    argument2: int,
+    argument3: int,
+    argument4: int,
+    argument5: int
+): int
+private noescape extern:"intrinsic" fun ablaSimdTargetArch(): int
+private noescape extern:"intrinsic" fun ablaHostOwnsRuntime(): bool
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+
+// ---- locks ----
+
+// futex(2) on the low 32 bits of an 8-byte word, private to the process: FUTEX_WAIT_PRIVATE sleeps while the word still
+// holds `expected`, and FUTEX_WAKE_PRIVATE wakes up to `count` sleepers. An early return (EAGAIN, EINTR) is fine: every
+// caller looks at the word again.
+trusted fun __ablaRuntimeFutexWait(address: int, expected: int): void {
+    ablaLinuxSyscall(202, address, 128, expected & 4294967295, 0, 0, 0)
+    return
+}
+
+trusted fun __ablaRuntimeFutexWake(address: int, count: int): void {
+    ablaLinuxSyscall(202, address, 129, count, 0, 0, 0)
+    return
+}
+
+// ---- address space ----
+
+// Anonymous zeroed read-write pages: the address, or a negative errno.
+trusted fun __ablaRuntimeOsMap(bytes: int): int = ablaLinuxSyscall(9, 0, bytes, 3, 34, -1, 0)
+
+trusted fun __ablaRuntimeOsUnmap(address: int, bytes: int): void {
+    ablaLinuxSyscall(11, address, bytes, 0, 0, 0, 0)
+    return
+}
+
+// A mapping resized in place or moved (MREMAP_MAYMOVE): the new base, or a negative errno. Not on macOS, which has no mremap.
+trusted fun __ablaRuntimeOsRemap(base: int, before: int, after: int): int =
+    ablaLinuxSyscall(25, base, before, after, 1, 0, 0)
+
+// The frozen groups' window (docs/design/frozen-heap.md):
+//  - ReserveWindow: `span` bytes of address space, no access, not backed (MAP_NORESERVE), or a negative errno;
+//  - ReserveFixed: the range [address, address + length) made again that reserved, unbacked space (MAP_FIXED over it);
+//  - Protect: pages made read-write (writable) or read-only.
+trusted fun __ablaRuntimeOsReserveWindow(span: int): int = ablaLinuxSyscall(9, 0, span, 0, 16418, -1, 0)
+
+trusted fun __ablaRuntimeOsReserveFixed(address: int, length: int): void {
+    ablaLinuxSyscall(9, address, length, 0, 16418 + 16, -1, 0)
+    return
+}
+
+trusted fun __ablaRuntimeOsProtect(address: int, length: int, writable: bool): void {
+    ablaLinuxSyscall(10, address, length, if (writable) 3 else 1, 0, 0, 0)
+    return
+}
+
+// The pages of [address, address + length) given back to the system (MADV_DONTNEED): the range is already whole pages.
+trusted fun __ablaRuntimeOsDiscard(address: int, length: int): void {
+    ablaLinuxSyscall(28, address, length, 4, 0, 0, 0)
+    return
+}
+
+// One page that is zero in a forked child (MADV_WIPEONFORK), the child's way to learn the heap lock's holder did not survive.
+trusted fun __ablaRuntimeOsWipeOnFork(page: int): void {
+    ablaLinuxSyscall(28, page, 4096, 18, 0, 0, 0)
+    return
+}
+
+// ---- time and identity ----
+
+// The monotonic clock in the 16 bytes at `scratch`: seconds, then nanoseconds.
+trusted fun __ablaRuntimeOsMonotonicTime(scratch: int): void {
+    ablaLinuxSyscall(228, 1, scratch, 0, 0, 0, 0)
+    return
+}
+
+// A sleep of the 16 bytes at `scratch` (seconds, nanoseconds).
+trusted fun __ablaRuntimeOsSleep(scratch: int): void {
+    ablaLinuxSyscall(35, scratch, 0, 0, 0, 0, 0)
+    return
+}
+
+// The calling process's id (a forked child has its own).
+trusted fun __ablaRuntimeOsProcessId(): int = ablaLinuxSyscall(39, 0, 0, 0, 0, 0, 0)
+
+// The calling thread's kernel id (x86-64 and AArch64 Linux); 0 elsewhere, where a thread's state cannot be read.
+trusted fun __ablaRuntimeOsThreadId(): int {
+    if (ablaHostIsMacOS()) return 0
+    val arch = ablaSimdTargetArch()
+    if (arch != 1 && arch != 2) return 0
+    val id = ablaLinuxSyscall(if (arch == 1 || ablaHostOwnsRuntime()) 186 else 178, 0, 0, 0, 0, 0, 0)
+    if (id < 0) 0 else id
+}
+
+// ---- reading a small file (the process's own /proc entries) ----
+// x86-64 and AArch64 Linux, the Darwin adapter taking both numberings (openat, read, close); a build whose AArch64 system calls
+// are translated (ablaHostOwnsRuntime) passes x86-64's numbers. A negative result is an error, -38 for a target that has none.
+
+private trusted fun __ablaRuntimeOsX86Numbers(): bool = ablaSimdTargetArch() == 1 || ablaHostOwnsRuntime()
+
+// The NUL-ended path at `path` opened read-only: a descriptor, or a negative errno.
+trusted fun __ablaRuntimeOsOpenRead(path: int): int {
+    val arch = ablaSimdTargetArch()
+    if (arch != 1 && arch != 2) return -38
+    ablaLinuxSyscall(if (__ablaRuntimeOsX86Numbers()) 257 else 56, -100, path, 0, 0, 0, 0)
+}
+
+trusted fun __ablaRuntimeOsRead(descriptor: int, buffer: int, count: int): int =
+    ablaLinuxSyscall(if (__ablaRuntimeOsX86Numbers()) 0 else 63, descriptor, buffer, count, 0, 0, 0)
+
+trusted fun __ablaRuntimeOsClose(descriptor: int): void {
+    ablaLinuxSyscall(if (__ablaRuntimeOsX86Numbers()) 3 else 57, descriptor, 0, 0, 0, 0, 0)
+    return
+}
+
+// ---- signals ----
+
+// sigaltstack(installed, previous): true when it succeeded. 131 on x86-64 Linux (and in an AArch64 build whose system calls are
+// translated), 132 on AArch64, 53 on Darwin, whose stack_t has its flags after the size (and SS_DISABLE 4, not 2).
+trusted fun __ablaRuntimeOsSignalStackCall(installed: int, previous: int): bool {
+    if (ablaHostIsMacOS()) return ablaDarwinSyscall(53, installed, previous, 0, 0, 0, 0) == 0
+    val arch = ablaSimdTargetArch()
+    val number = if (arch == 1 || ablaHostOwnsRuntime()) 131 else 132
+    ablaLinuxSyscall(number, installed, previous, 0, 0, 0, 0) == 0
+}

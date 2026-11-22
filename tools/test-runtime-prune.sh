@@ -55,7 +55,7 @@ done
 hint() { # program -> a hint file of its demand
     local program=$1 trace=$out/hint-$(basename -- "$1" .ab).trace file=$out/hint-$(basename -- "$1" .ab).txt
     ABLA_COMPILER_DEMAND_TRACE=1 "$compiler" build "$program" -o "$out/hint.bin" --no-cache --fast > /dev/null 2> "$trace" || fail "$program did not build for its hint"
-    { echo abla-runtime-demand-1; awk '$1 == "abla-demanded" && $3 == "fun" && $4 ~ /^\./ && ($2 ~ /abla\/runtime\/platform\/(host|wasm)\.ab$/ || $2 ~ /abla\/runtime\/self\/entry\.ab$/ || $2 ~ /darwin\/entry\.ab$/) { n = $4; sub(/^\./, "", n); print n }' "$trace" | sort -u; } > "$file"
+    { echo abla-runtime-demand-1; awk '$1 == "abla-demanded" && $3 == "fun" && $4 ~ /^\./ && ($2 ~ /abla\/runtime\/platform\/(host|host_os|wasm)\.ab$/ || $2 ~ /abla\/runtime\/self\/entry\.ab$/ || $2 ~ /darwin\/entry\.ab$/) { n = $4; sub(/^\./, "", n); print n }' "$trace" | sort -u; } > "$file"
     echo "$file"
 }
 small=$(hint tests/cases/libc-imports/hello.ab)
