@@ -809,13 +809,59 @@ fun bootstrapGeneratedSourceWithPrivates(
     "$output${source.slice(cursor, source.size)}"
 }
 
+// A source finalizer can associate constructor fields with byte intervals
+// in its decoded string request. Replace the carrier annotation's argument
+// with compiler-verified source spans before passing the class to sema.
+fun bootstrapAttachGeneratedFieldOrigins(
+    declaration: BootstrapDeclaration, request: BootstrapExtensionRequest, source: string
+): BootstrapDeclaration {
+    if (declaration.kind != "class" || request.expression.kind != "string") return declaration
+    var carrier = -1
+    for (index in 0 until declaration.annotations.size) {
+        if (declaration.annotations[index] == "__ablaDecodedFieldSpans") carrier = index
+    }
+    if (carrier < 0) return declaration
+    val offsets = declaration.annotationArguments[carrier]
+    if (offsets.kind != "array" || offsets.children.size != declaration.parameters.size * 2) return declaration
+    val spans = bootstrapPlainStringByteSpans(source, request.expression)
+    val fields: array<BootstrapExpression> = []
+    for (index in 0 until declaration.parameters.size) {
+        val first = offsets.children[index * 2]
+        val last = offsets.children[index * 2 + 1]
+        if (first.kind != "integer" || last.kind != "integer") return declaration
+        val begin = bootstrapDecimalIndex(first.text)
+        val end = bootstrapDecimalIndex(last.text)
+        val name = declaration.parameters[index]
+        if (begin < 0 || end <= begin || end > spans.begins.size ||
+            request.expression.text.slice(begin, end) != name) return declaration
+        fields.append(BootstrapExpression("generated.field", name,
+            spans.begins[begin], spans.ends[end - 1], []))
+    }
+    val arguments: array<BootstrapExpression> = []
+    for (index in 0 until declaration.annotationArguments.size) {
+        arguments.append(if (index == carrier)
+            BootstrapExpression("generated.field.origins", request.sourceIdentity,
+                request.expression.begin, request.expression.end, fields)
+            else declaration.annotationArguments[index])
+    }
+    BootstrapDeclaration(declaration.kind, declaration.name, declaration.begin, declaration.end,
+        declaration.expression, declaration.parameters, declaration.parameterTypes, declaration.resultType,
+        declaration.methods, declaration.parameterDefaults, declaration.externalLibrary, declaration.parameterKinds,
+        declaration.extensionOwner, declaration.isTrusted, declaration.isResource, declaration.isNoEscape,
+        declaration.generatedNamespace, declaration.generatedOriginBegin, declaration.generatedOriginEnd,
+        declaration.annotations, arguments, declaration.annotationBegins, declaration.annotationEnds,
+        declaration.sourceIdentity, declaration.conformances, declaration.isSealed, declaration.isPrivate,
+        declaration.typeParameters)
+}
+
 fun bootstrapApplyGeneratedModules(
     parsed: BootstrapParseResult,
     handlerDeclarations: array<BootstrapDeclaration>,
     currentDeclarationBegin: int,
     currentDeclarationCount: int,
     extensionRequests: array<BootstrapExtensionRequest>,
-    allowedCompileEffects: int
+    allowedCompileEffects: int,
+    source: string
 ): BootstrapParseResult {
     // Nearly all modules in a source-owned firmware graph contain ordinary
     // declarations only. Avoid copying the complete program declaration set
@@ -1104,7 +1150,8 @@ fun bootstrapApplyGeneratedModules(
             var generatedDeclaration = 0
             while (generatedDeclaration < generated.declarations.size) {
                 declarations.append(
-                    generated.declarations[generatedDeclaration]
+                    bootstrapAttachGeneratedFieldOrigins(
+                        generated.declarations[generatedDeclaration], extensionRequest, source)
                 )
                 generatedDeclaration = generatedDeclaration + 1
             }
@@ -1566,7 +1613,8 @@ fun bootstrapParseStagedRegistered(
         currentDeclarationBegin,
         currentDeclarationCount,
         extensionRequests,
-        allowedCompileEffects
+        allowedCompileEffects,
+        source
     )
 }
 

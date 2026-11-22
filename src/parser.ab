@@ -699,6 +699,71 @@ fun bootstrapDecodeString(raw: string): string {
     result
 }
 
+/** Source spans of the decoded bytes of a plain string. Work on demand so
+ * ordinary literals never allocate a map. The parser has already checked the
+ * escapes and raw-string indentation before an extension asks for origins. */
+class BootstrapDecodedByteSpans(val begins: array<int> = [], val ends: array<int> = [])
+
+fun bootstrapDecodedAppendSpan(var spans: BootstrapDecodedByteSpans,
+    begin: int, end: int, width: int): void {
+    for (_ in 0 until width) {
+        spans.begins.append(begin)
+        spans.ends.append(end)
+    }
+}
+
+fun bootstrapDecodedRawSpans(body: string, offset: int, var spans: BootstrapDecodedByteSpans): void {
+    var first = 0
+    while (first < body.size && body[first] != 10) first = first + 1
+    if (first == body.size) {
+        for (at in 0 until body.size) bootstrapDecodedAppendSpan(spans, offset + at, offset + at + 1, 1)
+        return
+    }
+    var last = body.size - 1
+    while (body[last] != 10) last = last - 1
+    if (first == last) return
+    val indent = body.slice(last + 1, body.size)
+    val limit = if (last > first + 1 && body[last - 1] == 13) last - 1 else last
+    var cursor = first + 1
+    while (cursor < limit) {
+        var end = cursor
+        while (end < limit && body[end] != 10) end = end + 1
+        val lineEnd = if (end < limit && end > cursor && body[end - 1] == 13) end - 1 else end
+        val begin = cursor + indent.size
+        if (begin <= lineEnd && body.slice(cursor, begin) == indent) {
+            for (at in begin until lineEnd) bootstrapDecodedAppendSpan(spans, offset + at, offset + at + 1, 1)
+        }
+        if (end < limit) bootstrapDecodedAppendSpan(spans, offset + lineEnd, offset + end + 1, 1)
+        cursor = end + 1
+    }
+}
+
+fun bootstrapPlainStringByteSpans(source: string, origin: BootstrapExpression): BootstrapDecodedByteSpans {
+    val spans = BootstrapDecodedByteSpans()
+    if (origin.kind != "string" || origin.begin < 0 || origin.end > source.size ||
+        origin.end - origin.begin < 2 || source[origin.begin] != 34 || source[origin.end - 1] != 34) return spans
+    val raw = origin.end - origin.begin >= 6 && source[origin.begin + 1] == 34 && source[origin.begin + 2] == 34
+    val delimiter = if (raw) 3 else 1
+    val offset = origin.begin + delimiter
+    val body = source.slice(offset, origin.end - delimiter)
+    if (raw) bootstrapDecodedRawSpans(body, offset, spans)
+    else {
+        var cursor = 0
+        while (cursor < body.size) {
+            val finish = if (body[cursor] == 92) bootstrapEscapeEnd(body, cursor) else -1
+            if (finish > cursor) {
+                val decoded = bootstrapDecodeString(body.slice(cursor, finish))
+                bootstrapDecodedAppendSpan(spans, offset + cursor, offset + finish, decoded.size)
+                cursor = finish
+            } else {
+                bootstrapDecodedAppendSpan(spans, offset + cursor, offset + cursor + 1, 1)
+                cursor = cursor + 1
+            }
+        }
+    }
+    if (spans.begins.size == origin.text.size) spans else BootstrapDecodedByteSpans()
+}
+
 class BootstrapParser(
     val sourceIdentity: string,
     val source: string,

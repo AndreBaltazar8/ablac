@@ -348,6 +348,38 @@ fun bootstrapAnalysisGraphLocalAliases(
     return
 }
 
+/** Generated fields are navigation targets without becoming surface
+ * declarations that a client can move or rename. Bind them by the same
+ * compiler field id as ordinary fields, never by display name alone. */
+fun bootstrapAnalysisGraphGeneratedFields(
+    declaration: BootstrapDeclaration,
+    documents: array<BootstrapAnalysisGraphDocument>,
+    var lookup: BootstrapAnalysisGraphLookup,
+    var aliases: Map<string, string>,
+    var targets: Map<string, Json>
+): void {
+    if (!declaration.sourceIdentity.startsWith("<generated:")) return
+    for (origins in declaration.annotationArguments) {
+        if (origins.kind != "generated.field.origins") continue
+        val documentIndex = bootstrapAnalysisGraphDocumentIndex(documents, origins.text, lookup)
+        if (documentIndex < 0) continue
+        val document = documents[documentIndex]
+        for (index in 0 until origins.children.size) {
+            val field = origins.children[index]
+            val begin = document.rewrite.original(field.begin)
+            val end = document.rewrite.originalEnd(field.end)
+            if (begin < 0 || end <= begin || end > document.document.text.size) continue
+            val owner = "abla:${declaration.sourceIdentity}:${declaration.begin}:field:"
+            val id = "abla:${document.document.path}#generated:${declaration.name}/field:${field.text}"
+            aliases.set("$owner$index:${field.text}", id)
+            aliases.set("$owner${field.text}", id)
+            targets.set(id, bootstrapAnalysisNamedSymbolJson(id, field.text, "property",
+                document.document.uri, begin, end, begin, end,
+                declaration.parameterTypes[index], false, ""))
+        }
+    }
+}
+
 fun bootstrapAnalysisGraphCallNames(
     expression: BootstrapExpression, source: string, var names: Map<string, string>
 ): void {
@@ -909,6 +941,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
     val aliases: Map<string, string> = Map()
     for (document in documents) bootstrapAnalysisGraphLocalAliases(document, aliases)
     val lookup = BootstrapAnalysisGraphLookup()
+    val generatedFields: Map<string, Json> = Map()
     val values: array<Json> = []
     val sets: Map<string, BootstrapAnalysisOccurrenceSet> = Map()
     val fingerprints: Map<string, string> = Map()
@@ -918,6 +951,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
     if (analyzed != null) {
         for (declaration in analyzed.parsed.declarations) {
             bootstrapAnalysisGraphDeclarationAliases(declaration, documents, aliases, lookup)
+            bootstrapAnalysisGraphGeneratedFields(declaration, documents, lookup, aliases, generatedFields)
         }
         for (declaration in builtinDeclarations) {
             bootstrapAnalysisGraphDeclarationAliases(declaration, documents, aliases, lookup)
@@ -1004,7 +1038,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(): Json {
             jsonBoolean(analyzed != null && pending.size == 0), jsonArray(pending),
             jsonString(entry)])
     bootstrapAnalysisSampleMemory("answer built")
-    this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(result, this.revision, sets)
+    this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(result, this.revision, sets, generatedFields)
     this.graphIndexRevision = this.revision
     if (this.graphStableIds) this.graphRememberGeneration(BootstrapAnalysisGraphGeneration(
         "${this.revision}", fingerprints, fingerprintUris))
@@ -1023,9 +1057,9 @@ class BootstrapAnalysisGraphQueryIndex(
 )
 
 fun bootstrapAnalysisGraphQueryIndex(snapshot: Json, revision: int,
-    occurrences: Map<string, BootstrapAnalysisOccurrenceSet>): BootstrapAnalysisGraphQueryIndex {
+    occurrences: Map<string, BootstrapAnalysisOccurrenceSet>,
+    var symbols: Map<string, Json>): BootstrapAnalysisGraphQueryIndex {
     val documents: Map<string, Json> = Map()
-    val symbols: Map<string, Json> = Map()
     for (document in snapshot.get("documents").values) {
         val uri = document.getString("uri")
         documents.set(bootstrapAnalysisGraphPath(uri), document)

@@ -1049,7 +1049,75 @@ async function validateOccurrences() {
     await s.close();
 }
 
-const tests = { validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+async function typedRegexDefinitions() {
+    const text = String.raw`// λ 😀
+import "abla/regex"
+import "abla/process/exit"
+import "other.ab"
+
+fun main: int {
+    val matcher = $regex("\\dé\u{1F600}(?<\x79ear>[0-9]+)(?:-(?<month>[0-9]+))?")
+    val local = matcher.find("1é😀2026") ?? panic("local")
+    val twin = $regex("(?<year>q)").find("q") ?? panic("twin")
+    val remote = otherCapture() ?? panic("remote")
+    val raw = $regex("""
+        é
+        (?<day>z)
+        """
+    ).find("é\nz") ?? panic("raw")
+    local.year.size + (local.month ?? "").size + twin.year.size + remote.year.size + raw.day.size
+}
+`;
+    const otherText = 'import "abla/regex"\nfun otherCapture() = $regex("(?<year>z)").find("z")\n';
+    const project = fixture('typed-regex-definitions', { 'main.ab': text, 'other.ab': otherText });
+    const mainPath = path.join(project, 'main.ab');
+    const otherPath = path.join(project, 'other.ab');
+    const s = await start(project, { mode: 'graph-v2' });
+    const assertDefinition = async (snapshot, source, use, destination, name, spelling, type) => {
+        const useAt = source.indexOf(use);
+        assert.ok(useAt >= 0);
+        const offset = bytes(source.slice(0, useAt + use.indexOf('.') + 1));
+        const location = { uri: uri(mainPath), offset, revision: snapshot.revision };
+        const definition = (await s.rpc('query/definition', location)).result.value;
+        assert.ok(definition, use + ' needs a definition');
+        const targetDoc = doc(snapshot, destination);
+        const startAt = targetDoc.text.indexOf(spelling);
+        assert.ok(startAt >= 0);
+        const start = bytes(targetDoc.text.slice(0, startAt));
+        const expected = { start, end: start + bytes(spelling) };
+        assert.equal(definition.uri, targetDoc.uri, use);
+        assert.equal(definition.name, name, use);
+        assert.equal(definition.kind, 'property', use);
+        assert.deepEqual(definition.selectionRange, expected, use);
+        assert.deepEqual(definition.range, expected, use);
+        assert.equal((await s.rpc('query/hover', location)).result.value.type, type, use);
+        assert.ok(!targetDoc.symbols.some(symbol => symbol.id === definition.id), 'navigation-only target');
+        return definition.id;
+    };
+    try {
+        const initial = await s.analyze();
+        noErrors(initial);
+        assert.equal(initial.complete, true, JSON.stringify(initial.pending));
+        const local = await assertDefinition(initial, text, 'local.year', mainPath, 'year', String.raw`\x79ear`, 'string');
+        const twin = await assertDefinition(initial, text, 'twin.year', mainPath, 'year', 'year', 'string');
+        const remote = await assertDefinition(initial, text, 'remote.year', otherPath, 'year', 'year', 'string');
+        assert.notEqual(local, twin, 'same spelling in one file is distinct');
+        assert.notEqual(twin, remote, 'same spelling across files is distinct');
+        assert.notEqual(local, remote, 'same spelling across literals is distinct');
+        await assertDefinition(initial, text, 'local.month', mainPath, 'month', 'month', 'nullable:string');
+        await assertDefinition(initial, text, 'raw.day', mainPath, 'day', 'day', 'string');
+        const shifted = '// moved 😀\n' + text;
+        await s.rpc('document/open', { uri: uri(mainPath), version: 1, text: shifted });
+        const edited = await s.analyze();
+        noErrors(edited);
+        const moved = await assertDefinition(edited, shifted, 'local.year', mainPath, 'year', String.raw`\x79ear`, 'string');
+        assert.equal(moved, local, 'a prefix-only overlay moves the range while preserving the field id');
+    } finally {
+        await s.close();
+    }
+}
+
+const tests = { regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
