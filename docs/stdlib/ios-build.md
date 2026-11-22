@@ -85,8 +85,15 @@ compile fun buildIos(entry: string): bool {
 fun main(): int = 0
 ```
 
+The package's paths are read as its slices' `buildProgram` paths are: against the
+directory of the source file that makes the call, inside its project
+([programmable-builds.md](../programmable-builds.md)). The headers directory is a read,
+so an absolute one is used as given. A path outside the project is
+`E_BUILD_PATH_OUTSIDE`. Before #1044 (v0.2.66 and earlier) packaging read these
+paths from the working directory instead.
+
 Packaging requires macOS and Xcode. Other hosts return false with the named
-`E_IOS_XCFRAMEWORK_HOST` diagnostic. Imports and unused build functions do not run
+`E_IOS_XCFRAMEWORK_HOST` diagnostic, which names the resolved package path. Imports and unused build functions do not run
 packaging. `ablac run`, `serve` and `--emit-llvm` reject staged packaging, just as
 they reject staged program builds; use `ablac build`.
 
