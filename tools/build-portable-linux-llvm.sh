@@ -20,7 +20,9 @@ test "$(git -C "$work/source" rev-parse HEAD)" = "$commit"
 patch -d "$work/source/llvm" -p1 -F 0 < "$root/nix/llvm-instcombine-fdiv-zero.patch"
 
 prefix="$work/install"
-components='LLVM;LTO;clang;clang-resource-headers;lld;opt;llc;llvm-ar;llvm-as;llvm-config;llvm-extract;llvm-readelf;llvm-readobj;llvm-split'
+# Linux clang links libclang-cpp when LLVM_LINK_LLVM_DYLIB is on. Both
+# shared libraries must be in the distribution that moves with the tools.
+components='LLVM;LTO;clang;clang-cpp;clang-resource-headers;lld;opt;llc;llvm-ar;llvm-as;llvm-config;llvm-dwarfdump;llvm-extract;llvm-readelf;llvm-readobj;llvm-split'
 cmake -G Ninja -S "$work/source/llvm" -B "$work/build" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 \
     -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib \
@@ -44,7 +46,10 @@ bundle="$work/$name"
 mv "$prefix" "$bundle"
 test "$("$bundle/bin/llvm-config" --version)" = 23.1.3
 test -f "$bundle/lib/libLLVM.so.23.1"
-test -f "$("$bundle/bin/clang" --rtlib=compiler-rt -print-libgcc-file-name)"
+test -f "$bundle/lib/libclang-cpp.so.23.1"
+"$bundle/bin/clang" --version
+builtins=$("$bundle/bin/clang" --rtlib=compiler-rt -print-libgcc-file-name)
+test -f "$builtins"
 "$root/tools/test-external-llvm-fdiv.sh" "$bundle/bin"
 "$bundle/bin/llc" -filetype=obj "$root/tests/cases/llvm-miscompiles/fdiv-zero-by-zero-times-value.ll" -o "$work/native.o"
 "$bundle/bin/ld.lld" -r "$work/native.o" -o "$work/linked.o"
