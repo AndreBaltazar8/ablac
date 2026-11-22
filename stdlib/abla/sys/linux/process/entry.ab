@@ -82,6 +82,8 @@ trusted fun linuxEnvironment(name: string): LinuxEnvironmentValue {
 
 // Returns the first executable match in PATH, or the original text for a path containing a slash or a name with no match.
 fun linuxExecutablePath(executable: string): string {
+    // Windows searches PATH itself (CreateProcessW, with its ";" separators, drive letters and ".exe"): the name goes through as given
+    if (linuxIsWindows()) return executable
     var hasSlash = false
     var index = 0
     while (index < executable.size) {
@@ -412,6 +414,42 @@ fun linuxFailForkNumber(number: int): void {
     return
 }
 
+// Whether this is a Windows target, found out once: the Windows runtime answers its own system call 4001 (spawn) with EINVAL for a null
+// block, every other target with ENOSYS. (An intrinsic would say it at compile time; the pinned bootstrap compiler does not know one yet.)
+var linuxWindowsKnown: int = 0
+
+private fun linuxIsWindows(): bool {
+    if (linuxWindowsKnown == 0) linuxWindowsKnown = if (linuxSyscall1(4001, 0) == -22) 1 else 2
+    linuxWindowsKnown == 1
+}
+
+// A Windows child is made by one call, not by fork and exec (Windows has no fork): the executable, argument and environment vectors,
+// working directory and redirect paths of `addresses`, and the descriptors standard input, output and error come from (-1: the
+// parent's own); `flags` 1 sends standard error where standard output goes. The process id, or -errno.
+private fun linuxWindowsSpawn(
+    addresses: LinuxExecAddresses,
+    vector: NativeByteBuffer,
+    environment: NativeByteBuffer,
+    inputDescriptor: int,
+    outputDescriptor: int,
+    errorDescriptor: int,
+    flags: int
+): int {
+    val block = nativeByteBuffer(80)
+    block.storeI64(0, addresses.executable)
+    block.storeI64(8, nativePointerAddress(vector.address))
+    block.storeI64(16, nativePointerAddress(environment.address))
+    block.storeI64(24, addresses.directory)
+    block.storeI64(32, addresses.input)
+    block.storeI64(40, addresses.output)
+    block.storeI64(48, addresses.error)
+    block.storeI64(56, (inputDescriptor + 1) + (outputDescriptor + 1) * 65536 + (errorDescriptor + 1) * 4294967296)
+    block.storeI64(64, flags)
+    val process = linuxSyscall1(4001, nativePointerAddress(block.address))
+    block.close()
+    process
+}
+
 private fun linuxFork(): int {
     linuxSignalWatchState()
     if (linuxForkFailureAt > 0) {
@@ -520,8 +558,9 @@ fun LinuxCommand.run(): int {
         val addresses = this.execAddresses(strings)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
-        val process = linuxFork()
-        if (process == 0) {
+        val windows = linuxIsWindows()
+        val process = if (windows) linuxWindowsSpawn(addresses, vector, environment, -1, -1, -1, 0) else linuxFork()
+        if (process == 0 && !windows) {
             this.execPrepared(addresses, vector, environment)
             linuxSyscall1(60, 127)
         }
@@ -574,8 +613,9 @@ fun LinuxCommand.capture(): LinuxProcessResult {
                 descriptors.load(5) * 256 +
                 descriptors.load(6) * 65536 +
                 descriptors.load(7) * 16777216
-            val process = linuxFork()
-            if (process == 0) {
+            val windows = linuxIsWindows()
+            val process = if (windows) linuxWindowsSpawn(addresses, vector, environment, -1, writeDescriptor, -1, 0) else linuxFork()
+            if (process == 0 && !windows) {
                 linuxSyscall1(3, readDescriptor)
                 linuxSyscall2(33, writeDescriptor, 1)
                 linuxSyscall1(3, writeDescriptor)
@@ -617,8 +657,9 @@ fun LinuxCommand.start(): LinuxChildProcess {
         val addresses = this.execAddresses(strings)
         val vector = linuxArgumentVector(this.arguments)
         val environment = this.environmentVector()
-        process = linuxFork()
-        if (process == 0) {
+        val windows = linuxIsWindows()
+        process = if (windows) linuxWindowsSpawn(addresses, vector, environment, -1, -1, -1, 0) else linuxFork()
+        if (process == 0 && !windows) {
             this.execPrepared(addresses, vector, environment)
             linuxSyscall1(60, 127)
         }
@@ -640,6 +681,7 @@ fun linuxStartConfiguredProcess(
     environmentValues: array<string> = [],
     outputPath: string = ""
 ): LinuxChildProcess {
+    if (linuxIsWindows()) return linuxWindowsStartConfigured(directory, arguments, environmentNames, environmentValues, outputPath)
     var process = -1
     if (arguments.size > 0 &&
         environmentNames.size == environmentValues.size) {
@@ -1275,4 +1317,40 @@ fun LinuxRunningPipeline.stop(graceMilliseconds: int = 5000): LinuxPipelineResul
         linuxSyscall2(62, 0 - this.group, 9)
     }
     this.wait()
+}
+
+// linuxStartConfiguredProcess on Windows: the environment overrides are built into the child's environment (there is no `env` to
+// launch), the output path takes standard output and error, and the child has a process group of its own (as always on Windows).
+private fun linuxWindowsStartConfigured(
+    directory: string,
+    arguments: array<string>,
+    environmentNames: array<string>,
+    environmentValues: array<string>,
+    outputPath: string
+): LinuxChildProcess {
+    var process = -1
+    if (arguments.size > 0 && environmentNames.size == environmentValues.size) {
+        val command = linuxCommand(arguments[0])
+        var index = 1
+        while (index < arguments.size) {
+            command.argument(arguments[index])
+            index = index + 1
+        }
+        index = 0
+        while (index < environmentNames.size) {
+            command.environment(environmentNames[index], environmentValues[index])
+            index = index + 1
+        }
+        if (directory != "") command.directory(directory)
+        if (outputPath != "") command.output(outputPath)
+        val strings = command.execStrings(linuxExecutablePath(arguments[0]))
+        val addresses = command.execAddresses(strings)
+        val vector = linuxArgumentVector(command.arguments)
+        val environment = command.environmentVector()
+        process = linuxWindowsSpawn(addresses, vector, environment, -1, -1, -1, if (outputPath != "") 1 else 0)
+        environment.close()
+        vector.close()
+        strings.close()
+    }
+    LinuxChildProcess(process)
 }

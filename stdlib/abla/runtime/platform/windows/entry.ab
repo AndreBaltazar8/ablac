@@ -132,6 +132,24 @@ trusted noescape extern:"c" fun getpeername(socket: int, address: int, length: i
 trusted noescape extern:"c" fun ioctlsocket(socket: int, command: int, argument: int): int
 /** ws2_32 WSAPoll: waits up to milliseconds (-1: for ever) for events on count WSAPOLLFD entries (16 bytes: socket, events, revents); returns the number of ready entries, 0 on timeout, -1 on failure. */
 trusted noescape extern:"c" fun WSAPoll(entries: int, count: int, milliseconds: int): int
+/** kernel32 CreateProcessW: starts a process from the UTF-16 command line with an environment block, working directory, STARTUPINFOW and PROCESS_INFORMATION, inheriting handles when inherit is non-zero; returns non-zero on success, 0 on failure. */
+trusted noescape extern:"c" fun CreateProcessW(application: int, commandLine: int, processSecurity: int, threadSecurity: int, inherit: int, flags: int, environment: int, directory: int, startup: int, information: int): int
+/** kernel32 GetExitCodeProcess: stores a process's exit code (259, STILL_ACTIVE, while it runs) at code; returns non-zero on success. */
+trusted noescape extern:"c" fun GetExitCodeProcess(process: int, code: int): int
+/** kernel32 TerminateProcess: ends a process at once with the exit code; returns non-zero on success. */
+trusted noescape extern:"c" fun TerminateProcess(process: int, code: int): int
+/** kernel32 SetHandleInformation: sets the flags in mask of a handle (HANDLE_FLAG_INHERIT is 1) to flags; returns non-zero on success. */
+trusted noescape extern:"c" fun SetHandleInformation(handle: int, mask: int, flags: int): int
+/** kernel32 DuplicateHandle: duplicates a handle of a source process into a target process (options 2: same access), storing the new handle at target; returns non-zero on success. */
+trusted noescape extern:"c" fun DuplicateHandle(sourceProcess: int, source: int, targetProcess: int, target: int, access: int, inherit: int, options: int): int
+/** kernel32 GetCurrentProcess: the pseudo handle of the calling process; never fails. */
+trusted noescape extern:"c" fun GetCurrentProcess(): int
+/** kernel32 CreatePipe: makes an anonymous pipe, storing its read and write handles; returns non-zero on success. */
+trusted noescape extern:"c" fun CreatePipe(readHandle: int, writeHandle: int, security: int, size: int): int
+
+/** kernel32 WaitForSingleObject: waits up to milliseconds (0xFFFFFFFF: for ever) for an object to be signalled; returns 0 when it is, 258 on timeout. */
+trusted noescape extern:"c" fun WaitForSingleObject(handle: int, milliseconds: int): int
+
 
 
 
@@ -949,6 +967,8 @@ private trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: int, a1: int
         if (result != 0) return __ablaRuntimeWindowsSocketErrno()
         return 0
     }
+    // fcntl(fd, F_DUPFD or F_DUPFD_CLOEXEC, minimum) duplicates the handle into a new descriptor
+    if (number == 72 && (a1 == 0 || a1 == 1030)) return __ablaRuntimeWindowsDuplicate(a0)
     // fcntl(fd, command, argument): F_GETFD/F_SETFD succeed, F_SETFL sets O_NONBLOCK (2048) on a socket, F_GETFL says 2 (O_RDWR)
     if (number == 72) {
         if (a1 == 1 || a1 == 2) return 0
@@ -963,6 +983,315 @@ private trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: int, a1: int
         }
         return -22
     }
+    -1000
+}
+
+// ---- processes: CreateProcessW instead of fork and exec ----
+// Windows has no fork, so the standard library asks for the whole launch at once (the Windows-only system call 4001, `spawn`, with a
+// block of eight words: executable, argument vector, environment vector, working directory, the paths standard input, output and
+// error are redirected from and to (0: none), the descriptors they come from (packed, each plus one in 16 bits; 0: inherit), and
+// flags (1: standard error is standard output)). The result is the process id, kept with its handle in a table for wait4 and kill, or
+// -errno. A pipe is two descriptors over CreatePipe; the standard library closes the ends it does not use, as on Linux.
+
+private trusted fun __ablaRuntimeWindowsProcessTable(): int = nativeStaticAllocate(4096)
+
+private trusted fun __ablaRuntimeWindowsRememberProcess(pid: int, handle: int): bool {
+    val table = __ablaRuntimeWindowsProcessTable()
+    var index = 0
+    while (index < 256) {
+        val entry = table + index * 16
+        if (ablaRuntimeAtomicLoadI64(entry) == 0 && ablaRuntimeAtomicCompareExchangeI64(entry, 0, pid) == 0) {
+            ablaRuntimeStoreI64(entry + 8, handle)
+            return true
+        }
+        index = index + 1
+    }
+    false
+}
+
+// The entry of process `pid` in the table, or 0.
+private trusted fun __ablaRuntimeWindowsProcessEntry(pid: int): int {
+    val table = __ablaRuntimeWindowsProcessTable()
+    var index = 0
+    while (index < 256) {
+        if (ablaRuntimeAtomicLoadI64(table + index * 16) == pid) return table + index * 16
+        index = index + 1
+    }
+    0
+}
+
+// Appends the C string at `argument` to the UTF-8 command line at `out` + `at` as one argument by the rules of CommandLineToArgvW
+// (quoted when it is empty or has a space, tab or quote; the backslashes before a quote doubled, and one more for the quote);
+// the new length.
+private trusted fun __ablaRuntimeWindowsQuoteArgument(argument: int, out: int, at: int): int {
+    var length = 0
+    var plain = true
+    while (ablaRuntimeLoadU8(argument + length) != 0) {
+        val byte = ablaRuntimeLoadU8(argument + length)
+        if (byte == 32 || byte == 9 || byte == 34) plain = false
+        length = length + 1
+    }
+    if (length == 0) plain = false
+    var position = at
+    if (plain) {
+        var copy = 0
+        while (copy < length) {
+            ablaRuntimeStoreU8(out + position, ablaRuntimeLoadU8(argument + copy))
+            position = position + 1
+            copy = copy + 1
+        }
+        return position
+    }
+    ablaRuntimeStoreU8(out + position, 34)
+    position = position + 1
+    var index = 0
+    while (index < length) {
+        var slashes = 0
+        while (index < length && ablaRuntimeLoadU8(argument + index) == 92) {
+            slashes = slashes + 1
+            index = index + 1
+        }
+        var emit = slashes
+        if (index == length) emit = slashes * 2
+        else if (ablaRuntimeLoadU8(argument + index) == 34) emit = slashes * 2 + 1
+        while (emit > 0) {
+            ablaRuntimeStoreU8(out + position, 92)
+            position = position + 1
+            emit = emit - 1
+        }
+        if (index < length) {
+            ablaRuntimeStoreU8(out + position, ablaRuntimeLoadU8(argument + index))
+            position = position + 1
+            index = index + 1
+        }
+    }
+    ablaRuntimeStoreU8(out + position, 34)
+    position + 1
+}
+
+// The handle for one standard stream of the child: the file at `path` opened with the access and disposition (inheritable), else the
+// handle of descriptor `fd` (made inheritable), else the parent's own standard handle `which`; 0 when there is none, -1 on failure.
+private trusted fun __ablaRuntimeWindowsChildStream(path: int, fd: int, which: int, write: bool, security: int): int {
+    if (path != 0) {
+        val wide = __ablaRuntimeWindowsWidePath(path, 0)
+        if (wide == 0) return -1
+        val handle = CreateFileW(wide, if (write) 1073741824 else 2147483648, 7, security, if (write) 2 else 3, 0, 0)
+        return handle
+    }
+    var handle = 0
+    if (fd >= 0) handle = __ablaRuntimeWindowsHandle(fd)
+    else handle = GetStdHandle(which)
+    if (handle == 0 || handle == -1) return 0
+    SetHandleInformation(handle, 1, 1)
+    handle
+}
+
+// The Windows-only system call 4001: starts the process the eight-word block describes; the process id or -errno.
+private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
+    // a null block is how the standard library asks whether this is Windows: EINVAL (every other target answers ENOSYS)
+    if (block == 0) return -22
+    val argv = ablaRuntimeLoadI64(block + 8)
+    val envp = ablaRuntimeLoadI64(block + 16)
+    val directory = ablaRuntimeLoadI64(block + 24)
+    val inputPath = ablaRuntimeLoadI64(block + 32)
+    val outputPath = ablaRuntimeLoadI64(block + 40)
+    val errorPath = ablaRuntimeLoadI64(block + 48)
+    val packed = ablaRuntimeLoadI64(block + 56)
+    val flags = ablaRuntimeLoadI64(block + 64)
+    if (argv == 0 || ablaRuntimeLoadI64(argv) == 0) return -22
+    // 2 MiB of scratch: UTF-8 command (256 KiB), UTF-16 command (256 KiB), UTF-8 environment (512 KiB), UTF-16 environment (1 MiB), and
+    // the STARTUPINFOW, PROCESS_INFORMATION and SECURITY_ATTRIBUTES.
+    val region = VirtualAlloc(0, 2101248, 12288, 4)
+    if (region == 0) return -12
+    val commandBytes = region
+    val commandWide = region + 262144
+    val environmentBytes = region + 524288
+    val environmentWide = region + 1048576
+    val startup = region + 2097152
+    val information = startup + 128
+    val security = startup + 160
+    var length = 0
+    var index = 0
+    while (ablaRuntimeLoadI64(argv + index * 8) != 0) {
+        if (index > 0) {
+            ablaRuntimeStoreU8(commandBytes + length, 32)
+            length = length + 1
+        }
+        length = __ablaRuntimeWindowsQuoteArgument(ablaRuntimeLoadI64(argv + index * 8), commandBytes, length)
+        if (length > 250000) {
+            VirtualFree(region, 0, 32768)
+            return -7
+        }
+        index = index + 1
+    }
+    ablaRuntimeStoreU8(commandBytes + length, 0)
+    if (MultiByteToWideChar(65001, 0, commandBytes, length + 1, commandWide, 131072) <= 0) {
+        VirtualFree(region, 0, 32768)
+        return -22
+    }
+    var environment = 0
+    if (envp != 0) {
+        var at = 0
+        var entry = 0
+        while (ablaRuntimeLoadI64(envp + entry * 8) != 0) {
+            val text = ablaRuntimeLoadI64(envp + entry * 8)
+            var size = 0
+            while (ablaRuntimeLoadU8(text + size) != 0) size = size + 1
+            if (at + size + 4 > 500000) {
+                VirtualFree(region, 0, 32768)
+                return -7
+            }
+            var copy = 0
+            while (copy < size) {
+                ablaRuntimeStoreU8(environmentBytes + at + copy, ablaRuntimeLoadU8(text + copy))
+                copy = copy + 1
+            }
+            ablaRuntimeStoreU8(environmentBytes + at + size, 0)
+            at = at + size + 1
+            entry = entry + 1
+        }
+        ablaRuntimeStoreU8(environmentBytes + at, 0)
+        at = at + 1
+        if (entry == 0) {
+            // an empty environment is the two NULs
+            ablaRuntimeStoreU8(environmentBytes + at, 0)
+            at = at + 1
+        }
+        if (MultiByteToWideChar(65001, 0, environmentBytes, at, environmentWide, 524288) <= 0) {
+            VirtualFree(region, 0, 32768)
+            return -22
+        }
+        environment = environmentWide
+    }
+    var directoryWide = 0
+    if (directory != 0) {
+        directoryWide = __ablaRuntimeWindowsWidePath(directory, 1)
+        if (directoryWide == 0) {
+            VirtualFree(region, 0, 32768)
+            return -2
+        }
+    }
+    var offset = 0
+    while (offset < 224) {
+        ablaRuntimeStoreI64(startup + offset, 0)
+        offset = offset + 8
+    }
+    // SECURITY_ATTRIBUTES: size 24, no descriptor, inheritable
+    ablaRuntimeStoreI32(security, 24)
+    ablaRuntimeStoreI64(security + 16, 1)
+    val inputFd = (packed & 65535) - 1
+    val outputFd = ((packed / 65536) & 65535) - 1
+    val errorFd = ((packed / 4294967296) & 65535) - 1
+    val input = __ablaRuntimeWindowsChildStream(inputPath, inputFd, -10, false, security)
+    val output = __ablaRuntimeWindowsChildStream(outputPath, outputFd, -11, true, security)
+    var error = 0
+    if ((flags & 1) != 0) error = output
+    else error = __ablaRuntimeWindowsChildStream(errorPath, errorFd, -12, true, security)
+    if (input == -1 || output == -1 || error == -1) {
+        VirtualFree(region, 0, 32768)
+        return -2
+    }
+    ablaRuntimeStoreI32(startup, 104)
+    // STARTF_USESTDHANDLES
+    ablaRuntimeStoreI32(startup + 60, 256)
+    ablaRuntimeStoreI64(startup + 80, input)
+    ablaRuntimeStoreI64(startup + 88, output)
+    ablaRuntimeStoreI64(startup + 96, error)
+    // CREATE_UNICODE_ENVIRONMENT, and its own process group so that a group-wide kill reaches only it
+    val created = CreateProcessW(0, commandWide, 0, 0, 1, 1024 + 512, environment, directoryWide, startup, information)
+    val failure = if (created != 0) 0 else __ablaRuntimeWindowsErrno()
+    // the handles the child inherited are the parent's no more: opened files closed, descriptor handles private again
+    if (inputPath != 0 && input > 0) CloseHandle(input)
+    if (outputPath != 0 && output > 0) CloseHandle(output)
+    if (errorPath != 0 && error > 0 && (flags & 1) == 0) CloseHandle(error)
+    if (inputPath == 0 && inputFd >= 0 && input > 0) SetHandleInformation(input, 1, 0)
+    if (outputPath == 0 && outputFd >= 0 && output > 0) SetHandleInformation(output, 1, 0)
+    if (errorPath == 0 && errorFd >= 0 && error > 0 && (flags & 1) == 0) SetHandleInformation(error, 1, 0)
+    var result = failure
+    if (created != 0) {
+        val pid = ablaRuntimeLoadI32(information + 16) & 4294967295
+        CloseHandle(ablaRuntimeLoadI64(information + 8))
+        if (__ablaRuntimeWindowsRememberProcess(pid, ablaRuntimeLoadI64(information))) result = pid
+        else {
+            CloseHandle(ablaRuntimeLoadI64(information))
+            result = -12
+        }
+    }
+    VirtualFree(region, 0, 32768)
+    result
+}
+
+// wait4(pid, status, options): the exit code as a Linux wait status (code << 8; a crash code, 0xC0000000 and up, as SIGSEGV); with
+// WNOHANG (1) 0 while the process runs; the pid when it is collected, or -errno.
+private trusted fun __ablaRuntimeWindowsWait(pid: int, status: int, options: int): int {
+    val entry = __ablaRuntimeWindowsProcessEntry(pid)
+    if (entry == 0) return -10
+    val handle = ablaRuntimeLoadI64(entry + 8)
+    val waited = WaitForSingleObject(handle, if ((options & 1) != 0) 0 else 4294967295) & 4294967295
+    if (waited == 258) return 0
+    if (waited != 0) return -10
+    val scratch = __ablaRuntimeWindowsScratch()
+    ablaRuntimeStoreI64(scratch, 0)
+    GetExitCodeProcess(handle, scratch)
+    val code = ablaRuntimeLoadI32(scratch) & 4294967295
+    if (status != 0) {
+        if (code >= 3221225472) ablaRuntimeStoreI32(status, 11)
+        else ablaRuntimeStoreI32(status, (code & 255) * 256)
+    }
+    CloseHandle(handle)
+    ablaRuntimeAtomicStoreI64(entry, 0)
+    pid
+}
+
+// kill(pid, signal): signal 0 asks whether the process exists; any other ends it (a negative pid is its group, which is the process).
+private trusted fun __ablaRuntimeWindowsKill(target: int, signal: int): int {
+    val pid = if (target < 0) 0 - target else target
+    val entry = __ablaRuntimeWindowsProcessEntry(pid)
+    if (entry == 0) return -3
+    val handle = ablaRuntimeLoadI64(entry + 8)
+    if (signal == 0) return if ((WaitForSingleObject(handle, 0) & 4294967295) == 258) 0 else -3
+    if (TerminateProcess(handle, 1) == 0) return __ablaRuntimeWindowsErrno()
+    0
+}
+
+// pipe2(descriptors, flags): two descriptors over CreatePipe, the read end first.
+private trusted fun __ablaRuntimeWindowsPipe(descriptors: int): int {
+    val scratch = __ablaRuntimeWindowsScratch()
+    if (CreatePipe(scratch, scratch + 8, 0, 65536) == 0) return __ablaRuntimeWindowsErrno()
+    val readFd = __ablaRuntimeWindowsOpenFd(ablaRuntimeLoadI64(scratch), 1, 0)
+    if (readFd < 0) return readFd
+    val writeFd = __ablaRuntimeWindowsOpenFd(ablaRuntimeLoadI64(scratch + 8), 1, 0)
+    if (writeFd < 0) return writeFd
+    ablaRuntimeStoreI32(descriptors, readFd)
+    ablaRuntimeStoreI32(descriptors + 4, writeFd)
+    0
+}
+
+// fcntl(fd, F_DUPFD, minimum): a duplicate of the descriptor's handle as a new descriptor, or -errno.
+private trusted fun __ablaRuntimeWindowsDuplicate(fd: int): int {
+    val handle = __ablaRuntimeWindowsHandle(fd)
+    if (handle == 0) return -9
+    val scratch = __ablaRuntimeWindowsScratch()
+    val me = GetCurrentProcess()
+    if (DuplicateHandle(me, handle, me, scratch, 0, 0, 2) == 0) return __ablaRuntimeWindowsErrno()
+    __ablaRuntimeWindowsOpenFd(ablaRuntimeLoadI64(scratch), 1, 0)
+}
+
+// The process calls: -1000 when `number` is none of them.
+private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: int, a2: int, a3: int): int {
+    // wait4(pid, status, options, usage)
+    if (number == 61) return __ablaRuntimeWindowsWait(a0, a1, a2)
+    // kill(pid, signal)
+    if (number == 62) return __ablaRuntimeWindowsKill(a0, a1)
+    // setpgid and getpgid: a process group is the process
+    if (number == 109) return 0
+    if (number == 121) return if (a0 == 0) GetCurrentProcessId() & 4294967295 else a0
+    // pipe2(descriptors, flags)
+    if (number == 293) return __ablaRuntimeWindowsPipe(a0)
+    // fork and exec are not translated: the standard library launches with spawn (4001)
+    if (number == 57 || number == 56 || number == 58 || number == 59) return -38
+    // spawn(block)
+    if (number == 4001) return __ablaRuntimeWindowsSpawn(a0)
     -1000
 }
 
@@ -1050,6 +1379,8 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
     }
     // the file calls: read, close, stat, lseek, fsync, getcwd, rename, mkdir, unlink, getdents64, openat, newfstatat, getrandom ... (the process's own
     // /proc entries do not exist: an openat of one is ENOENT, and the callers fall back)
+    val process = __ablaRuntimeWindowsProcessCall(number, a0, a1, a2, a3)
+    if (process != -1000) return process
     val network = __ablaRuntimeWindowsSocketCall(number, a0, a1, a2, a3, a4, a5)
     if (network != -1000) return network
     val file = __ablaRuntimeWindowsFileCall(number, a0, a1, a2, a3)
@@ -1059,7 +1390,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 60 72 74 77 79 80 82 83 84 87 131 186 202 217 228 231 257 262 263 288 318"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 109 121 131 186 202 217 228 231 257 262 263 288 293 318 4001"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;
