@@ -28,6 +28,34 @@ status=0
 for profile in release fast o1; do
     flags=()
     [[ $profile == release ]] || flags=(--"$profile")
+    "$compiler" build "$project_root/tests/cases/arrays-dense/local-integers.ab" \
+        --no-cache -o "$output_directory/locals-$profile" "${flags[@]}"
+    for stress in 0 1; do
+        for mode in read write escaped; do
+            arguments=()
+            if [[ $mode == write ]]; then arguments=(valid write)
+            elif [[ $mode == escaped ]]; then arguments=(escaped); fi
+            status=0
+            ABLA_GC_STRESS=$stress "$output_directory/locals-$profile" "${arguments[@]}" || status=$?
+            [[ $status == 42 ]] || exit 1
+        done
+    done
+    for mode in negative upper empty; do
+        index=0 size=5
+        if [[ $mode == negative ]]; then index=-1
+        elif [[ $mode == upper ]]; then index=5
+        else size=0; fi
+        for action in read write; do
+            arguments=("$mode")
+            [[ $action == read ]] || arguments+=(write)
+            status=0
+            "$output_directory/locals-$profile" "${arguments[@]}" \
+                > "$output_directory/trap.out" 2> "$output_directory/trap.err" || status=$?
+            [[ $status == 101 ]] || { cat "$output_directory/trap.err"; exit 1; }
+            IFS= read -r message < "$output_directory/trap.err"
+            [[ $message == "panic: index $index out of bounds for array of size $size" ]] || exit 1
+        done
+    done
     "$compiler" build "$project_root/tests/cases/modules/scalar-array-setters.ab" \
         --no-cache -o "$output_directory/scalars-$profile" "${flags[@]}"
     for stress in 0 1; do

@@ -311,6 +311,7 @@ class BootstrapLlvmFunctionStorage(
     val rootValues: array<bool>,
     // Which locals (by declaring instruction) the frame holds.
     val rootLocals: array<bool>,
+    val denseIntegers: array<int>,
     val localIndex: BootstrapLlvmNameIndex,
     val labels: array<int>,
     val blocks: array<i64*>,
@@ -1035,7 +1036,8 @@ fun bootstrapLlvmCreateFunctionStorage(
         values, nativeValues, scalarPlan.valueTypes,
         locals, nativeLocals, scalarPlan.localTypes,
         parameters, scratch, scratchTypes, auxiliary,
-        rootValues, rootLocals, localIndex,
+        rootValues, rootLocals,
+        bootstrapLlvmDenseLocalIntegers(function, scalarPlan.valueTypes), localIndex,
         labels, blocks, gcFrame, gcRoots, gcRootsType, rootCount, rootBlock, rootBlockCount
     )
 }
@@ -1971,6 +1973,109 @@ fun bootstrapLlvmEmitFloatRemainder(
     LLVMBuildFPTrunc(backend.builder, wide, backend.f32Type, "scalar.fremainder")
 }
 
+// An empty local array acquires dense word storage when its first integer
+// is appended. Direct integer reads and writes preserve that layout; an
+// empty array has no valid element. Any other use can replace the local
+// or expose its array to a write that boxes the storage.
+private fun bootstrapLlvmDenseLocalIntegers(
+    function: BootstrapIrFunction, valueTypes: array<string>
+): array<int> {
+    val instructions = function.instructions
+    val declarations: array<int> = []
+    for (at in 1 until instructions.size) {
+        val fresh = instructions[at - 1]
+        val local = instructions[at]
+        if (fresh.opcode == "array.create" && fresh.operands.size == 0 &&
+            local.opcode == "local.declare" && local.left == fresh.result) {
+            declarations.append(at)
+        }
+    }
+    if (declarations.size == 0) return []
+    val names = bootstrapIrNameTable(declarations.size)
+    val allowed = filledArray(declarations.size, 1)
+    val owner = filledArray(valueTypes.size, -1)
+    for (id in 0 until declarations.size) {
+        val local = instructions[declarations[id]]
+        names.put(local.text, id)
+        owner[local.left] = id
+        if (local.result >= 0) owner[local.result] = id
+    }
+    for (at in 0 until instructions.size) {
+        val instruction = instructions[at]
+        val opcode = instruction.opcode
+        if (instruction.text != "") {
+            val id = names.find(instruction.text, -1)
+            if (id >= 0) {
+                if ((opcode == "local.load" || opcode == "place.root") && instruction.result >= 0) {
+                    owner[instruction.result] = id
+                } else if (at != declarations[id] && opcode != "borrow.mutate") allowed[id] = 0
+            }
+        }
+    }
+    for (at in 0 until instructions.size) {
+        val instruction = instructions[at]
+        val count = if (instruction.operands.size > 0) instruction.operands.size else 2
+        for (position in 0 until count) {
+            val value = if (instruction.operands.size > 0) instruction.operands[position]
+                else if (position == 0) instruction.left else instruction.right
+            if (value < 0 || value >= owner.size) continue
+            val id = owner[value]
+            if (id < 0 || allowed[id] == 0) continue
+            val opcode = instruction.opcode
+            val local = opcode == "local.declare" && at == declarations[id]
+            val appended = if (opcode == "array.append" && instruction.operands.size == 2)
+                instruction.operands[1] else -1
+            val append = appended >= 0 && appended < valueTypes.size && valueTypes[appended] == "i64"
+            if (position != 0 || !(local || append || opcode == "array.get.i64" ||
+                opcode == "array.set.i64" || opcode == "array.length")) allowed[id] = 0
+        }
+    }
+    for (value in 0 until owner.size) {
+        val id = owner[value]
+        if (id >= 0 && allowed[id] == 0) owner[value] = -1
+    }
+    owner
+}
+
+private fun bootstrapLlvmDenseArrayElement(
+    backend: BootstrapLlvmBackend, function: i64*, array: i64*, index: i64*, word: i64*
+): i64* {
+    val payload = LLVMBuildStructGEP2(
+        backend.builder, backend.valueType, array, 2, "dense.array.payload"
+    )
+    val field = LLVMBuildStructGEP2(
+        backend.builder, backend.payloadType, payload, 0, "dense.array.reference"
+    )
+    val address = LLVMBuildLoad2(backend.builder, backend.i64Type, field, "dense.array.address")
+    val header = LLVMBuildIntToPtr(backend.builder, address, backend.pointerType, "dense.array.header")
+    val length = LLVMBuildLoad2(backend.builder, backend.i64Type, header, "dense.array.length")
+    // Array lengths are nonnegative, so an unsigned comparison rejects
+    // negative indices and indices past the last element in one check.
+    val valid = LLVMBuildICmp(
+        backend.builder, llvmIntUnsignedLessThan(), index, length, "dense.array.in.bounds"
+    )
+    val ready = LLVMAppendBasicBlockInContext(backend.context, function, "dense.array.checked")
+    val invalid = LLVMAppendBasicBlockInContext(backend.context, function, "dense.array.invalid")
+    LLVMBuildCondBr(backend.builder, valid, ready, invalid)
+    LLVMPositionBuilderAtEnd(backend.builder, invalid)
+    // Use the original runtime operation to diagnose the bounds error.
+    if (pointerIsNull(word)) {
+        bootstrapLlvmCallNamed(backend, "abla_array_get_i64", [array, index], "", false, [true, false])
+    } else {
+        bootstrapLlvmCallNamed(backend, "abla_array_set_word",
+            [address, index, word, LLVMConstInt(backend.i64Type, 1, 0)], "", false, [false, false, false, false])
+    }
+    LLVMBuildUnreachable(backend.builder)
+    LLVMPositionBuilderAtEnd(backend.builder, ready)
+    val dataField = LLVMBuildAdd(backend.builder, address, LLVMConstInt(backend.i64Type, 16, 0),
+        "dense.array.data.field")
+    val dataPointer = LLVMBuildIntToPtr(backend.builder, dataField, backend.pointerType, "dense.array.data.pointer")
+    val data = LLVMBuildLoad2(backend.builder, backend.i64Type, dataPointer, "dense.array.data")
+    val offset = LLVMBuildMul(backend.builder, index, LLVMConstInt(backend.i64Type, 8, 0), "dense.array.offset")
+    val slot = LLVMBuildAdd(backend.builder, data, offset, "dense.array.slot")
+    LLVMBuildIntToPtr(backend.builder, slot, backend.pointerType, "dense.array.element")
+}
+
 fun bootstrapLlvmEmitScalarOperation(
     backend: BootstrapLlvmBackend,
     llvmFunction: i64*,
@@ -2180,19 +2285,26 @@ fun bootstrapLlvmEmitScalarOperation(
             instruction.opcode == "array.get.bool" ||
             instruction.opcode == "array.get.f64" ||
             instruction.opcode == "array.get.f32") {
-            native = bootstrapLlvmCallNamed(
-                backend,
-                if (arrayTake == "bool") "abla_array_take_bool"
-                else if (arrayTake != "") "abla_array_take_i64"
-                else if (instruction.opcode == "array.get.bool") {
-                    "abla_array_get_bool"
-                } else "abla_array_get_i64",
-                [storage.values[instruction.left],
-                 bootstrapLlvmScalarOperand(
-                    backend, storage, instruction.right, "i64"
-                 )],
-                "scalar.array.get", false, [true, false]
-            )
+            val arrayValue = instruction.left
+            val array = storage.values[arrayValue]
+            val index = bootstrapLlvmScalarOperand(backend, storage, instruction.right, "i64")
+            if (instruction.opcode == "array.get.i64" && arrayValue < storage.denseIntegers.size &&
+                storage.denseIntegers[arrayValue] >= 0) {
+                val element = bootstrapLlvmDenseArrayElement(
+                    backend, llvmFunction, array, index, nativeNullPointer()
+                )
+                native = LLVMBuildLoad2(backend.builder, backend.i64Type, element, "dense.array.word")
+            } else {
+                native = bootstrapLlvmCallNamed(
+                    backend,
+                    if (arrayTake == "bool") "abla_array_take_bool"
+                    else if (arrayTake != "") "abla_array_take_i64"
+                    else if (instruction.opcode == "array.get.bool") {
+                        "abla_array_get_bool"
+                    } else "abla_array_get_i64",
+                    [array, index], "scalar.array.get", false, [true, false]
+                )
+            }
             if (arrayInteger != "" && arrayInteger != "i64") {
                 native = bootstrapLlvmCastNativeScalar(
                     backend, native, "i64", arrayInteger, "scalar.array.get.integer"
@@ -2233,21 +2345,31 @@ fun bootstrapLlvmEmitScalarOperation(
             ) else if (arraySetScalar == "bool") LLVMBuildZExt(
                 backend.builder, value, backend.i64Type, "scalar.array.set.bool"
             ) else value
-            val payload = LLVMBuildStructGEP2(
-                backend.builder, backend.valueType,
-                storage.values[instruction.operands[0]], 2, "scalar.array.set.payload"
-            )
-            val address = LLVMBuildStructGEP2(
-                backend.builder, backend.payloadType, payload, 0, "scalar.array.set.address"
-            )
-            bootstrapLlvmCallNamed(
-                backend, "abla_array_set_word",
-                [LLVMBuildLoad2(backend.builder, backend.i64Type, address,
-                    "scalar.array.set.array"),
-                 bootstrapLlvmScalarOperand(backend, storage, instruction.operands[1], "i64"),
-                 word, LLVMConstInt(backend.i64Type, if (arraySetScalar == "bool") 2 else 1, 0)],
-                "", false, [false, false, false, false]
-            )
+            val arrayValue = instruction.operands[0]
+            if (arraySetScalar == "i64" && arrayValue < storage.denseIntegers.size &&
+                storage.denseIntegers[arrayValue] >= 0) {
+                val index = bootstrapLlvmScalarOperand(backend, storage, instruction.operands[1], "i64")
+                val element = bootstrapLlvmDenseArrayElement(
+                    backend, llvmFunction, storage.values[arrayValue], index, word
+                )
+                LLVMBuildStore(backend.builder, word, element)
+            } else {
+                val payload = LLVMBuildStructGEP2(
+                    backend.builder, backend.valueType,
+                    storage.values[instruction.operands[0]], 2, "scalar.array.set.payload"
+                )
+                val address = LLVMBuildStructGEP2(
+                    backend.builder, backend.payloadType, payload, 0, "scalar.array.set.address"
+                )
+                bootstrapLlvmCallNamed(
+                    backend, "abla_array_set_word",
+                    [LLVMBuildLoad2(backend.builder, backend.i64Type, address,
+                        "scalar.array.set.array"),
+                     bootstrapLlvmScalarOperand(backend, storage, instruction.operands[1], "i64"),
+                     word, LLVMConstInt(backend.i64Type, if (arraySetScalar == "bool") 2 else 1, 0)],
+                    "", false, [false, false, false, false]
+                )
+            }
             // Assignment expressions retain the already-native assigned value.
             native = value
         }
