@@ -7,6 +7,8 @@ if [[ $# -ne 1 ]]; then
 fi
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=tools/lib/project-c-platform-symbols.sh
+. "$project_root/tools/lib/project-c-platform-symbols.sh"
 compiler=$1
 output_directory="$project_root/build/linux-arguments-test"
 program="$output_directory/program"
@@ -16,8 +18,7 @@ mkdir -p "$output_directory"
     "$project_root/tests/cases/modules/linux-arguments.ab" \
     -o "$program"
 
-if nm --defined-only "$program" | awk '{print $3}' |
-    rg '^ablaHost|^abla_host_|^abla_platform_' >/dev/null; then
+if has_project_c_platform_symbol "$program"; then
     echo 'raw Linux arguments linked a project C platform symbol' >&2
     exit 1
 fi

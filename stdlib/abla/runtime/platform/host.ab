@@ -87,6 +87,8 @@ trusted fun __ablaRuntimePlatformMutexBytes(): int = 64
 private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
 private noescape extern:"intrinsic" fun ablaHostIsIOS(): bool
 private noescape extern:"intrinsic" fun ablaHostOwnsRuntime(): bool
+// The stack wipe of abla/ct/scrub (4096 bytes below the caller's stack pointer), for the collection's own frames.
+private noescape extern:"intrinsic" fun ablaCtScrubStack4096(): void
 
 // x86-64 Linux locks and waits on futexes, not libpthread (#806). Each
 // function below tests `ablaHostOwnsRuntime()`
@@ -4063,21 +4065,44 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
 // drops the batch its parent was freeing. A program that doesn't opt in is built with
 // the collection above and none of this (nor its state: no global of its own).
 
-// The helper's state, static storage only a program that opts in has: +0 on (0/1),
-// +8 the helper's pthread_t, +16 a helper is freeing (0/1), +24 the process that
-// started it, +32 the batch the sweep is filling (chunks of [next chunk, count,
-// headers…], 65534 headers a chunk).
+// The helper's state, static storage: +0 whether the program asked (1 on, 2 off, 0 not: the default), +8 the helper's pthread_t, +16 a helper is freeing
+// (0/1), +24 the process that started it, +32 the batch the sweep is filling (chunks of [next chunk, count, headers…], 65534 headers a chunk).
 trusted fun __ablaRuntimeHostFreeState(): int = nativeStaticAllocate(48)
 
-/// Sets whether unreachable blocks may be released by the background sweeper.
+/// Whether the environment turns background freeing off: ABLA_GC_BACKGROUND=0 (any other value, or none, leaves the program's own choice or the default).
+@noinline
+trusted fun __ablaRuntimeHostBackgroundOptOutConfigured(): bool {
+    val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
+        __ablaRuntimeWord0("ABLA_GC_BACKGROUND")
+    )))
+    value != 0 && ablaRuntimeLoadU8(value) == 48 && ablaRuntimeLoadU8(value + 1) == 0
+}
+
+/// Whether ABLA_GC_BACKGROUND=0 was in the environment at start (read once).
+var __ablaRuntimeHostBackgroundOptOut: bool = __ablaRuntimeHostBackgroundOptOutConfigured()
+
+/// Whether this collection frees in the background: what the program chose with memorySetBackgroundFree, else (a build that gives programs the
+/// collection with background freeing, decision #107) yes unless ABLA_GC_BACKGROUND=0. The environment's 0 also overrides a program's own request,
+/// so a user can turn the helper thread off for any program. Never fails.
+trusted fun __ablaRuntimeHostBackgroundFreeOn(): bool {
+    if (__ablaRuntimeHostBackgroundOptOut) return false
+    // Under ABLA_GC_STRESS=1 (a collection at every safe point) only a program that asked for the helper has it: a default one would start
+    // its thread and workers at thousands of collections.
+    val state = ablaRuntimeLoadI64(__ablaRuntimeHostFreeState())
+    if (__ablaRuntimeHostGcStress) return state == 1
+    state != 2
+}
+
+/// Turns background freeing on or off for the program (memorySetBackgroundFree); ABLA_GC_BACKGROUND=0 in the environment still wins.
 trusted fun __ablaRuntimePlatformMemorySetBackgroundFree(enabled: bool): void {
-    ablaRuntimeStoreI64(__ablaRuntimeHostFreeState(), if (enabled) 1 else 0)
+    ablaRuntimeStoreI64(__ablaRuntimeHostFreeState(), if (enabled) 1 else 2)
     return
 }
 
 // The collection threads a program asks for (2 to 8; anything else leaves the serial collector), unless ABLA_GC_WORKERS is in
 // the environment: then the environment decides (also 0 and 1, which turn it off).
 trusted fun __ablaRuntimePlatformMemorySetGcWorkers(count: int): void {
+    __ablaRuntimeHostGcWorkersAsked = true
     val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
         __ablaRuntimeWord0("ABLA_GC_WORKERS")
     )))
@@ -4086,6 +4111,24 @@ trusted fun __ablaRuntimePlatformMemorySetGcWorkers(count: int): void {
     val cpus = __ablaRuntimeHostCpuCount()
     val wanted = if (count > cpus) cpus else count
     __ablaRuntimeHostGcWorkers = if (wanted < 2) 0 else if (wanted > 8) 8 else wanted
+    return
+}
+
+/// Set once the program has called memorySetGcWorkers (whatever the count): the default below leaves its choice alone.
+var __ablaRuntimeHostGcWorkersAsked: bool = false
+/// Set once the default number of collection threads has been applied (or left alone) at the first background collection.
+var __ablaRuntimeHostGcWorkersDefaulted: bool = false
+
+/// A program built with the collection with background freeing that never asked for collection threads gets four (fewer on a machine with fewer
+/// CPUs; used adaptively, see below), at its first collection: decision #107. ABLA_GC_WORKERS in the environment (0 included) and a call of
+/// memorySetGcWorkers (0 included) decide instead. Never fails.
+trusted fun __ablaRuntimeHostGcWorkersDefault(): void {
+    // The default threads are not for ABLA_GC_STRESS=1 runs (each collection would pay their start-up); a program or ABLA_GC_WORKERS that asks has them.
+    if (__ablaRuntimeHostGcStress) return
+    if (__ablaRuntimeHostGcWorkersDefaulted) return
+    __ablaRuntimeHostGcWorkersDefaulted = true
+    if (__ablaRuntimeHostGcWorkersAsked || __ablaRuntimeHostGcWorkersForced) return
+    __ablaRuntimePlatformMemorySetGcWorkers(4)
     return
 }
 
@@ -4399,6 +4442,53 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     freed
 }
 
+/// How the mark of a collection with background freeing finds the allocation a pointer names: serially, as the plain collection does (from the registry
+/// alone while /proc/self/maps lists the heap, the page directory when a pointer needs it, ABLA_GC_LOOKUP and the stress mode forcing the directory), or,
+/// for the parallel mark (`parallel`), always through the page directory. Builds the directory when the mode needs it. Never fails.
+trusted fun __ablaRuntimeHostCollectionLookupBegin(parallel: bool): void {
+    __ablaRuntimeHostCollectionMode = 0
+    if (!parallel && __ablaRuntimeHostCollectionNeedsDirectory) {
+        __ablaRuntimeHostCollectionDirectorySkips = __ablaRuntimeHostCollectionDirectorySkips + 1
+        if (__ablaRuntimeHostCollectionDirectorySkips >= 16) {
+            __ablaRuntimeHostCollectionDirectorySkips = 0
+            __ablaRuntimeHostCollectionNeedsDirectory = false
+        }
+    }
+    __ablaRuntimeHostCollectionDirectoryReason = 0
+    if (__ablaRuntimeHostGcStress) __ablaRuntimeHostCollectionMode = 2
+    else if (!parallel && __ablaRuntimeHostCollectionForce != 1 && !__ablaRuntimeHostCollectionNeedsDirectory &&
+        __ablaRuntimeHostCollectionMappingsLoad() && __ablaRuntimeHostCollectionRegistryMapped()) {
+        __ablaRuntimeHostCollectionMode = 1
+    }
+    if (__ablaRuntimeHostCollectionMode != 1) {
+        if (__ablaRuntimeHostGcTrace) {
+            __ablaRuntimeHostCollectionDirectoryReason = if (__ablaRuntimeHostGcStress) 1
+                else if (__ablaRuntimeHostCollectionForce == 1) 2
+                else if (parallel) 6
+                else if (__ablaRuntimeHostCollectionNeedsDirectory) 3
+                else if (__ablaRuntimeHostCollectionMapped == 0) 4
+                else 5
+        }
+        __ablaRuntimeHostCollectionPagesBuild()
+    }
+    return
+}
+
+/// The end of the mark begun by __ablaRuntimeHostCollectionLookupBegin: counts the collection under the way it went (memoryHeapStat 5 registry, 6
+/// directory) and frees the mapped-range lists the lazy lookup read. Never fails.
+trusted fun __ablaRuntimeHostCollectionLookupEnd(): void {
+    if (__ablaRuntimeHostCollectionMode == 1) {
+        __ablaRuntimeHostCollectionLazyCount = __ablaRuntimeHostCollectionLazyCount + 1
+    } else __ablaRuntimeHostCollectionDirectoryCount = __ablaRuntimeHostCollectionDirectoryCount + 1
+    __ablaRuntimeHostCollectionMode = 0
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionMapped))
+    __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionMappedBuffer))
+    __ablaRuntimeHostCollectionMappedBuffer = 0
+    __ablaRuntimeHostCollectionMapped = 0
+    __ablaRuntimeHostCollectionMappedCount = 0
+    return
+}
+
 // __ablaRuntimePlatformMemoryCollect with background freeing: what a program that turns
 // it on (memorySetBackgroundFree, anywhere in its own code) has as its collection in
 // place of the one above (bootstrapBackgroundFreeParse); a program that doesn't never
@@ -4435,21 +4525,26 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     // A helper still freeing is waited for even when background freeing has been
     // turned off since: its thread is joined.
     __ablaRuntimeHostFreeWait()
-    val background = ablaRuntimeLoadI64(__ablaRuntimeHostFreeState()) != 0
-    val useParallel = __ablaRuntimeHostGcUseParallel(allocationCount)
-    val timed = __ablaRuntimeHostGcWorkers >= 2 && !__ablaRuntimeHostGcStress && !__ablaRuntimeHostGcWorkersForced
+    val background = __ablaRuntimeHostBackgroundFreeOn()
+    // Without background freeing (the program or ABLA_GC_BACKGROUND=0 turned it off) this is the plain serial collection.
+    if (background) __ablaRuntimeHostGcWorkersDefault()
+    val useParallel = background && __ablaRuntimeHostGcUseParallel(allocationCount)
+    val timed = background && __ablaRuntimeHostGcWorkers >= 2 && !__ablaRuntimeHostGcStress && !__ablaRuntimeHostGcWorkersForced
     val phaseStart = if (__ablaRuntimeHostGcTrace || timed) __ablaRuntimeHostStwMicroseconds() else 0
-    __ablaRuntimeHostCollectionPagesBuild()
+    __ablaRuntimeHostCollectionLookupBegin(useParallel)
     val phasePages = if (__ablaRuntimeHostGcTrace) __ablaRuntimeHostStwMicroseconds() else 0
+    if (__ablaRuntimeHostGcTrace) __ablaRuntimeHostCollectionReadingRoots = true
     __ablaRuntimeHostMarkRootValues()
+    if (__ablaRuntimeHostGcTrace) __ablaRuntimeHostCollectionReadingRoots = false
     val phaseRoots = if (__ablaRuntimeHostGcTrace) __ablaRuntimeHostStwMicroseconds() else 0
     if (useParallel) __ablaRuntimeHostTraceParallel(__ablaRuntimeHostGcWorkers)
     else __ablaRuntimeHostTraceMarkedAllocations()
     val phaseMark = if (__ablaRuntimeHostGcTrace) __ablaRuntimeHostStwMicroseconds() else 0
     __ablaRuntimeHostFrozenReclaim()
+    __ablaRuntimeHostCollectionLookupEnd()
     __ablaRuntimeHostSmallListsSettle()
     val phaseSettle = if (__ablaRuntimeHostGcTrace) __ablaRuntimeHostStwMicroseconds() else 0
-    if (__ablaRuntimeHostGcTrace) {
+    if (__ablaRuntimeHostGcTrace && background) {
         // Microseconds of each phase of the pause (the sweep's own phases are on its line): page directory, roots, mark, frozen and small-list settle.
         __ablaRuntimeHostStwTrace("gc: phases us, pages ", 22, phasePages - phaseStart, " roots ", 7)
         __ablaRuntimeHostStwTrace("", 0, phaseRoots - phasePages, " mark ", 6)
@@ -5088,16 +5183,26 @@ trusted fun __ablaRuntimeMemoryPressureLoop(): int {
     __ablaRuntimeMemoryPressure()
 }
 
+/// Zeroes the 4096 bytes below this call: the frames a collection used (mark, sweep, the stop protocol) lie there when the safe point returns,
+/// below the frame of the entry that allocated (a constant-time entry's own wipe, ctScrubStack, reaches its own work but not a collection's
+/// deeper frames, which hold words of the heap it walked). A function of its own, as in abla/ct/scrub, so the caller keeps nothing in a red zone.
+@noinline
+trusted fun __ablaRuntimeHostScrubCollectorStack(): void = ablaCtScrubStack4096()
+
 /// Runs a collection at a pressure safe point and updates the threshold before returning zero.
 @noinline
 trusted fun __ablaRuntimeHostPressureCollect(): int {
     __ablaRuntimeHostStwPressureBegin()
     __ablaRuntimePlatformMemoryCollect()
     // Parked for another thread's collection: that one sets the threshold, and this thread's safe point goes on.
-    if (__ablaRuntimeHostStwPressureEnd()) return 0
+    if (__ablaRuntimeHostStwPressureEnd()) {
+        __ablaRuntimeHostScrubCollectorStack()
+        return 0
+    }
     if (__ablaRuntimeHostCollectionGrowth == 0) {
         if (__ablaRuntimeHostForkNoCollect) __ablaRuntimeHostCollectionThreshold = __ablaRuntimeHostLimit
         __ablaRuntimeHostStwRelease(false)
+        __ablaRuntimeHostScrubCollectorStack()
         return 0
     }
     val reserve = 67108864
@@ -5125,6 +5230,7 @@ trusted fun __ablaRuntimeHostPressureCollect(): int {
     }
     __ablaRuntimeHostCollectionThreshold = if (__ablaRuntimeHostGcStress) 0 else next
     __ablaRuntimeHostStwRelease(false)
+    __ablaRuntimeHostScrubCollectorStack()
     0
 }
 

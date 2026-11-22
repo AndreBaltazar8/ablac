@@ -94,6 +94,7 @@ test-serial: ablac
 	tools/test-readiness.sh
 	tools/test-repo-language-guard.sh
 	tools/test-repo-language-guard-selftest.sh
+	tools/test-project-c-platform-symbols.sh
 	tools/test-repo-shebang-guard.sh
 	tools/test-repo-shebang-guard-selftest.sh
 	tools/test-shell-pipefail-guard.sh
@@ -521,6 +522,7 @@ test-serial: ablac
 	tools/test-aarch64-linux.sh $(COMPILER)
 	tools/test-memmove.sh $(COMPILER)
 	tools/test-fork-heap.sh $(COMPILER)
+	tools/test-gc-default.sh $(COMPILER)
 	tools/test-fork-stop.sh $(COMPILER)
 	tools/test-frozen.sh $(COMPILER)
 	tools/test-gc-spin.sh $(COMPILER)

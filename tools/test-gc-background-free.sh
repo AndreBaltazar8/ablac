@@ -4,8 +4,7 @@
 # too), starts a child process while the helper may be freeing, and what the
 # helper frees goes back to the allocator (macOS: out of use in malloc;
 # elsewhere: filling as much again reuses it).
-# Only such a program is built with the helper: one without it has no helper's
-# code at all.
+# (A release-built hosted Linux program has it without asking since decision #107: tests/cases/gc-background-free/inline.ab turns it off itself.)
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -49,9 +48,15 @@ wait "$inline_pid"
 # program defines its clone routine whether it has a helper or not, and a hosted one that has any thread imports
 # pthread_create.)
 helper='"abla.source"="__ablaRuntimeHostFreeWorker"'
-! grep -q "$helper" "$output_directory/inline.ll" ||
-    fail "a program without background freeing has the helper"
 grep -q "$helper" "$output_directory/background.ll" ||
     fail "a program with background freeing has no helper"
+# A release-built hosted Linux program has the helper without asking (decision #107); only a program with manual collection, which has no collection to
+# free after, is built without it.
+ABLA_KEEP_LLVM_TEXT=1 "$compiler" build "$project_root/tests/cases/gc-default/manual.ab" -o "$output_directory/manual" --no-cache
+! grep -q "$helper" "$output_directory/manual.ll" ||
+    fail "a program with manual collection has the helper"
+ABLA_KEEP_LLVM_TEXT=1 "$compiler" build "$project_root/tests/cases/gc-default/plain.ab" -o "$output_directory/plain" --no-cache
+grep -q "$helper" "$output_directory/plain.ll" ||
+    fail "a release-built hosted program that says nothing about the collector has no helper by default"
 
-echo "gc background free: same output (and under stress), a child process meanwhile, freed memory returned to the allocator; only the program asking for it has the helper"
+echo "gc background free: same output (and under stress), a child process meanwhile, freed memory returned to the allocator; the helper is in a program that asks for background freeing or says nothing, not in one with manual collection"

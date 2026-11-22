@@ -396,14 +396,24 @@ Collection has two modes:
   call anywhere `main` can reach compiles it without pressure safe points, and
   at run time the call stops pressure collection.
 
-`memorySetBackgroundFree(true)` (hosted native targets; elsewhere a no-op) moves
+`memorySetBackgroundFree(enabled)` (hosted native targets; a no-op elsewhere) moves
 returning unreachable blocks to the system allocator out of the collection: the
 sweep hands them to a helper thread of the runtime's own, which frees them while
-the program goes on, and the next collection waits for it first. It is off by
-default, so a program has no helper thread unless it asks; results are the same
-either way, and the memory is back with the system allocator before the next
-collection. A forked child drops the batch its parent's helper was freeing. The
-compiler turns it on.
+the program goes on, and the next collection waits for it first. **A release
+(not `--fast`) hosted Linux executable has it by default** (decision #107; the helper thread starts at
+the first collection that has something to free, with the adaptive collection
+threads below, four by default and fewer on fewer CPUs): `memorySetBackgroundFree(false)`
+in the program gives the plain collection back, `memorySetGcWorkers(0)` keeps
+background freeing with the serial mark and sweep, and in the environment
+`ABLA_GC_BACKGROUND=0` turns background freeing off for any program (also one
+that asked for it) and `ABLA_GC_WORKERS=0` the threads. A program that calls
+`memorySetManualCollection()`, a `--fast` build (which keeps its plain collection unless the program asks), a Wasm module,
+a shared or static library, an object and a macOS program are built as before (no helper, no threads, unless the program asks:
+macOS keeps its libSystem imports). Results are the same either way, and the memory is
+back with the system allocator before the next collection. A forked child drops the
+batch its parent's helper was freeing. The default costs a release hosted program, measured on a
+hello world: 17 KB more code (32.0 to 49.3 KB) and a compile 0.13 s longer (0.37 to 0.50 s), and one more
+thread once a collection has garbage to free; a `--fast` build is unchanged. tools/test-gc-default.sh covers the default and the opt-outs. The compiler turns it on itself.
 
 `memorySetLimit(bytes)` and `memorySetCollectionGrowth(bytes)` select pressure
 collection in either mode: a program that can reach either is compiled with

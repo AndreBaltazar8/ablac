@@ -6,14 +6,15 @@ if [[ $# -ne 1 ]]; then
     exit 2
 fi
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=tools/lib/project-c-platform-symbols.sh
+. "$project_root/tools/lib/project-c-platform-symbols.sh"
 compiler=$1
 directory="$project_root/build/linux-process-test"
 program="$directory/program"
 mkdir -p "$directory"
 "$compiler" build "$project_root/tests/cases/modules/linux-process.ab" \
     -o "$program"
-if nm --defined-only "$program" | awk '{print $3}' |
-    rg '^ablaHost|^abla_host_|^abla_platform_' >/dev/null; then
+if has_project_c_platform_symbol "$program"; then
     echo 'raw Linux process linked a project C platform symbol' >&2
     exit 1
 fi
