@@ -302,7 +302,7 @@ fun bootstrapPackageDependencyFromValue(
         identityValue.kind != "string" || selectorValue.kind != "string" ||
         !bootstrapPackageNameValid(name) ||
         !bootstrapPackageStringSafe(identity) ||
-        !bootstrapPackageStringSafe(selector) ||
+        !bootstrapPackageSelectorValid(selector) ||
         (provider != "git" && provider != "content")) {
         errors = 1
         diagnostic =
@@ -311,7 +311,7 @@ fun bootstrapPackageDependencyFromValue(
     if (errors == 0 && provider == "git" &&
         (sourceValue.kind != "string" ||
          selectorKindValue.kind != "string" ||
-         !bootstrapPackageStringSafe(source) ||
+         !bootstrapPackageSourceValid(source) ||
          (selectorKind != "rev" && selectorKind != "tag" &&
           selectorKind != "branch" && selectorKind != "head"))) {
         errors = 1
@@ -403,6 +403,56 @@ fun bootstrapPackageRelativePathValid(path: string): bool {
             }
             begin = index + 1
         }
+        index = index + 1
+    }
+    valid
+}
+
+// A git source is a place to fetch from, never an option for git: an allow-list of the forms a dependency can
+// use (https://, ssh://, git://, file://, an absolute or relative path, scp-style user@host:path). A leading `-` would be read
+// by git as an option (`--upload-pack=<command>` runs the command), and `<transport>::<address>` selects a
+// remote helper.
+fun bootstrapPackageSourceValid(value: string): bool {
+    var valid = bootstrapPackageStringSafe(value) && value[0] != 45
+    var index = 0
+    while (valid && index < value.size) {
+        // control characters and spaces have no place in a repository address
+        if (value[index] < 33 || value[index] == 127) valid = false
+        index = index + 1
+    }
+    if (valid) {
+        val form = value.startsWith("https://") || value.startsWith("ssh://") ||
+            value.startsWith("git://") || value.startsWith("file://") || value[0] == 47
+        var scp = false
+        if (!form) {
+            // user@host:path: a colon after an `@`, before any slash
+            var at = -1
+            var colon = -1
+            var cursor = 0
+            while (cursor < value.size && value[cursor] != 47) {
+                if (value[cursor] == 64 && at < 0) at = cursor
+                if (value[cursor] == 58 && colon < 0) colon = cursor
+                cursor = cursor + 1
+            }
+            scp = at > 0 && colon > at + 1 && colon + 1 < value.size && value[colon + 1] != 58
+        }
+        // a relative path (no colon) names a local repository, as in a lock written by a test
+        valid = form || scp || !value.contains(":")
+        if (valid && value.contains("::")) valid = false
+    }
+    valid
+}
+
+// A selector names a revision, tag or branch inside a repository: no leading `-`, no `..`, no characters git
+// treats as a pattern, a revision expression or an option separator.
+fun bootstrapPackageSelectorValid(value: string): bool {
+    var valid = bootstrapPackageStringSafe(value) && value[0] != 45 &&
+        !value.contains("..")
+    var index = 0
+    while (valid && index < value.size) {
+        val byte = value[index]
+        if (byte < 33 || byte == 127 || byte == 58 || byte == 63 || byte == 42 || byte == 91 ||
+            byte == 92 || byte == 94 || byte == 126 || byte == 64 && index + 1 < value.size && value[index + 1] == 123) valid = false
         index = index + 1
     }
     valid
@@ -503,8 +553,8 @@ fun bootstrapPackageManifestDependencies(
                 selector = branch
             }
             var valid = equals < line.size && bootstrapPackageNameValid(name) &&
-                bootstrapPackageStringSafe(git) && selectorCount == 1 &&
-                bootstrapPackageStringSafe(selector)
+                bootstrapPackageSourceValid(git) && selectorCount == 1 &&
+                bootstrapPackageSelectorValid(selector)
             var duplicate = false
             var dependency = 0
             while (dependency < dependencies.size) {
@@ -565,12 +615,13 @@ fun bootstrapPackageAppendLockRecord(
     val valid = bootstrapPackageNameValid(name) &&
         (provider == "git" || provider == "content") &&
         bootstrapPackageStringSafe(identity) &&
-        (provider != "git" || bootstrapPackageStringSafe(source)) &&
+        (provider != "git" || bootstrapPackageSourceValid(source)) &&
         (provider != "git" || selectorKind == "rev" ||
          selectorKind == "tag" || selectorKind == "branch" ||
          selectorKind == "head") &&
-        bootstrapPackageStringSafe(selector) &&
+        bootstrapPackageSelectorValid(selector) &&
         bootstrapPackageStringSafe(revision) &&
+        (provider != "git" || bootstrapPackageHexRevision(revision)) &&
         bootstrapPackageHexRevision(digest) &&
         bootstrapPackageRelativePathValid(entry)
     if (valid) packages.append(BootstrapLockedPackage(
@@ -746,6 +797,24 @@ fun bootstrapPackageCachePath(package: BootstrapLockedPackage): string {
     "${bootstrapPackageCacheRoot()}/${package.provider}/${package.name}/$key"
 }
 
+// Every git call of the package layer starts here: nothing a caller exported (GIT_DIR and the like) selects another
+// repository, git never prompts, hooks do not run, and only the transports a dependency source can name are allowed
+// (a `<transport>::` remote helper such as ext is refused).
+fun bootstrapPackageGit(): LinuxCommand {
+    val command = linuxCommand("git")
+    for (name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"]) {
+        command.removeEnvironment(name)
+    }
+    command.environment("GIT_TERMINAL_PROMPT", "0")
+    command.environment("GIT_ALLOW_PROTOCOL", "https:ssh:git:file")
+    command.argument("-c")
+    command.argument("core.hooksPath=/dev/null")
+    command.argument("-c")
+    command.argument("protocol.ext.allow=never")
+    command
+}
+
 fun bootstrapPackageHexRevision(value: string): bool {
     var valid = value.size == 40
     var index = 0
@@ -786,8 +855,9 @@ fun bootstrapPackageResolveRevision(
         result = dependency.selector
     }
     if (dependency.selectorKind == "tag") {
-        val command = linuxCommand("git")
+        val command = bootstrapPackageGit()
         command.argument("ls-remote")
+        command.argument("--")
         command.argument(dependency.source)
         command.argument("refs/tags/${dependency.selector}")
         command.argument("refs/tags/${dependency.selector}^{}")
@@ -797,8 +867,9 @@ fun bootstrapPackageResolveRevision(
         }
     }
     if (dependency.selectorKind == "branch") {
-        val command = linuxCommand("git")
+        val command = bootstrapPackageGit()
         command.argument("ls-remote")
+        command.argument("--")
         command.argument(dependency.source)
         command.argument("refs/heads/${dependency.selector}")
         val resolved = command.capture()
@@ -807,8 +878,9 @@ fun bootstrapPackageResolveRevision(
         }
     }
     if (dependency.selectorKind == "head") {
-        val command = linuxCommand("git")
+        val command = bootstrapPackageGit()
         command.argument("ls-remote")
+        command.argument("--")
         command.argument(dependency.source)
         command.argument("HEAD")
         val resolved = command.capture()
@@ -860,7 +932,7 @@ fun bootstrapPackageCopyTree(source: string, destination: string): bool {
 }
 
 fun bootstrapPackageGitValue(directory: string, value: string): string {
-    val command = linuxCommand("git")
+    val command = bootstrapPackageGit()
     command.argument("-C")
     command.argument(directory)
     command.argument("rev-parse")
@@ -872,7 +944,7 @@ fun bootstrapPackageGitValue(directory: string, value: string): string {
 }
 
 fun bootstrapPackageGitWriteTree(directory: string): string {
-    val command = linuxCommand("git")
+    val command = bootstrapPackageGit()
     command.argument("-C")
     command.argument(directory)
     command.argument("write-tree")
@@ -898,7 +970,7 @@ fun bootstrapPackageCacheValid(package: BootstrapLockedPackage): bool {
             bootstrapPackageGitValue(source, "HEAD^{tree}") == package.digest
     }
     if (valid && package.provider == "git") {
-        val command = linuxCommand("git")
+        val command = bootstrapPackageGit()
         command.argument("-C")
         command.argument(source)
         command.argument("status")
@@ -907,7 +979,7 @@ fun bootstrapPackageCacheValid(package: BootstrapLockedPackage): bool {
         valid = status.status == 0 && bootstrapPackageTrim(status.output) == ""
     }
     if (valid && package.provider == "content") {
-        val changed = linuxCommand("git")
+        val changed = bootstrapPackageGit()
         changed.argument("-C")
         changed.argument(source)
         changed.argument("diff-files")
@@ -918,7 +990,7 @@ fun bootstrapPackageCacheValid(package: BootstrapLockedPackage): bool {
             valid = tree == package.digest
         }
         if (valid) {
-            val untracked = linuxCommand("git")
+            val untracked = bootstrapPackageGit()
             untracked.argument("-C")
             untracked.argument(source)
             untracked.argument("ls-files")
@@ -948,7 +1020,7 @@ fun bootstrapPackageFetch(
     var diagnostic = ""
     if (!Path(temporary).parent().createDirectories()) status = 1
     if (status == 0) {
-        val init = linuxCommand("git")
+        val init = bootstrapPackageGit()
         init.argument("init")
         init.argument("--quiet")
         init.argument("--object-format=sha1")
@@ -956,17 +1028,18 @@ fun bootstrapPackageFetch(
         if (init.run() != 0) status = 1
     }
     if (status == 0) {
-        val remote = linuxCommand("git")
+        val remote = bootstrapPackageGit()
         remote.argument("-C")
         remote.argument("$temporary/source")
         remote.argument("remote")
         remote.argument("add")
+        remote.argument("--")
         remote.argument("origin")
         remote.argument(dependency.source)
         if (remote.run() != 0) status = 1
     }
     if (status == 0) {
-        val fetch = linuxCommand("git")
+        val fetch = bootstrapPackageGit()
         fetch.argument("-C")
         fetch.argument("$temporary/source")
         fetch.argument("fetch")
@@ -974,12 +1047,13 @@ fun bootstrapPackageFetch(
         fetch.argument("--depth")
         fetch.argument("1")
         fetch.argument("--no-tags")
+        fetch.argument("--")
         fetch.argument("origin")
         fetch.argument(revision)
         if (fetch.run() != 0) status = 1
     }
     if (status == 0) {
-        val checkout = linuxCommand("git")
+        val checkout = bootstrapPackageGit()
         checkout.argument("-C")
         checkout.argument("$temporary/source")
         checkout.argument("checkout")
@@ -1054,7 +1128,7 @@ fun bootstrapPackagePublishContent(
     if (!entryFound || !manifestFound ||
         dependency.resolvedFiles.size == 0) status = 1
     if (status == 0) {
-        val init = linuxCommand("git")
+        val init = bootstrapPackageGit()
         init.argument("init")
         init.argument("--quiet")
         init.argument("--object-format=sha1")
@@ -1062,7 +1136,7 @@ fun bootstrapPackagePublishContent(
         if (init.run() != 0) status = 1
     }
     if (status == 0) {
-        val add = linuxCommand("git")
+        val add = bootstrapPackageGit()
         add.argument("-C")
         add.argument("$temporary/source")
         add.argument("add")
@@ -1193,7 +1267,7 @@ fun bootstrapPackageCheckoutValid(
             bootstrapPackageGitValue(source, "HEAD^{tree}") == package.digest
     }
     if (valid && package.provider == "git") {
-        val command = linuxCommand("git")
+        val command = bootstrapPackageGit()
         command.argument("-C")
         command.argument(source)
         command.argument("status")
@@ -1203,7 +1277,7 @@ fun bootstrapPackageCheckoutValid(
             bootstrapPackageTrim(observed.output) == ""
     }
     if (valid && package.provider == "content") {
-        val changed = linuxCommand("git")
+        val changed = bootstrapPackageGit()
         changed.argument("-C")
         changed.argument(source)
         changed.argument("diff-files")
@@ -1211,7 +1285,7 @@ fun bootstrapPackageCheckoutValid(
         valid = changed.run() == 0 &&
             bootstrapPackageGitWriteTree(source) == package.digest
         if (valid) {
-            val untracked = linuxCommand("git")
+            val untracked = bootstrapPackageGit()
             untracked.argument("-C")
             untracked.argument(source)
             untracked.argument("ls-files")
