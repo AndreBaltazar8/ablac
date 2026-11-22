@@ -362,8 +362,11 @@ Collection has two modes:
   claims an object by a compare-and-swap of its state word, keeps its own stack of claimed objects and trades work
   with the others through a shared pool, so a graph of many objects divides well, and a large array's elements are scanned in chunks of 4,096 by several threads (an array of fewer than 8,192 elements, or
   one long chain of objects, is still scanned by one thread). The sweep (the pass that frees what the mark did not reach
-  and compacts the allocation registry) is still serial, and so is the root scan. The parallel mark needs the
-  page directory for every pointer, so it does not use the lazy registry lookup a serial collection tries first. It is part of the collector that frees in the background, so a program gets it only when it turns that on (`memorySetBackgroundFree(true)`; the compiler and the editor server do). A program can name a default with `runtimeMemorySetGcWorkers(n)`, which `ABLA_GC_WORKERS` (any value, `0` included) overrides: the editor service (`ablac analyze --stdio`) asks for 4, which halves its collection pauses over an edit loop on the compiler's own source (6.2 s to 3.1 s in total, 4 cores' worth of extra CPU time only while a collection runs, peak memory unchanged); the batch compiler asks for none.
+  and compacts the allocation registry) runs on threads too, as many as the process may use CPUs (at most 8, never fewer than the mark's:
+  the program's own threads are stopped, and the pass waits on memory, one header read per registry slot): four passes over slices of the
+  registry (clear the marks and count the kept and the unreachable entries; place the kept entries and the unreachable headers, which the
+  helper frees, at their final places through the collection's dead worklist; copy the kept entries back), with no serial walk of the registry. Only the root scan is serial. The parallel mark needs the
+  page directory for every pointer, so it does not use the lazy registry lookup a serial collection tries first. It is part of the collector that frees in the background, so a program gets it only when it turns that on (`memorySetBackgroundFree(true)`; the compiler and the editor server do). A program can name a default with `runtimeMemorySetGcWorkers(n)`, which `ABLA_GC_WORKERS` (any value, `0` included) overrides: the editor service (`ablac analyze --stdio`) asks for 4, which halves its collection pauses over an edit loop on the compiler's own source (6.2 s to 3.1 s in total, 4 cores' worth of extra CPU time only while a collection runs, peak memory unchanged); the batch compiler asks for 4 as well (a one-stage self build on 6 cores: its 30 collections pause 1.68 s serial, 0.94 s on 4 threads always, 1.28 s adaptive, wall time 61.8 s serial and 59 to 61 s with threads, user CPU 134 s to 131 to 135 s). A program's request is clamped to the CPUs the process may use (one CPU stays serial) and is adaptive: a collection of fewer than 262,144 registry slots is serial, and a larger one parallel unless measured worse (the collector compares the cost per slot of consecutive collections run in the two modes, probing the other mode from the 2nd larger collection, then every 4th, 8th, ... up to 128th while a probe changes nothing; `ABLA_GC_TRACE=1` prints `gc: adaptive, parallel 0 or 1 ratio parallel/serial (thousandths) R probe every E`). ABLA_GC_WORKERS=n in the environment always uses the threads
   Measured on the editor's edit loop over the compiler's own source (16 collections, 3 to 6 runs each, a machine
   under load): the collections' total pause 3.9 s serial, 3.1 s at 2 threads, 2.7 s at 4 and 2.5 s at 8
   (the mark itself about 2.1 s, 0.9 s at 4 threads), the loop's wall time 22.9 s, 22.1, 21.4 and 21.0, its user
@@ -372,6 +375,9 @@ Collection has two modes:
   `ABLA_GC_TRACE=1` adds, to each parallel collection, lines with how
   many objects each thread traced, how often it took from and gave to the shared pool and how often it slept
   waiting for work.
+  Each collection also prints `gc: phases us, pages P roots R mark M settle S` (the page directory, the root scan, the mark and the frozen-group settle,
+  in microseconds), `gc: parallel sweep, slots N kept K us, mark-clear A place B copy C batch (serial) D` and `gc: phases us, sweep S free start F`: where its
+  pause went.
 - **Manual collection** (the default for wasm and freestanding targets, and
   for modules entered through their exports). Only an explicit
   `memoryCollect()` frees cyclic garbage. The compiler roots only the
