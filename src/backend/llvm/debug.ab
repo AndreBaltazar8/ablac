@@ -1206,13 +1206,16 @@ fun bootstrapLlvmBacktraceNameFunction(backend: BootstrapLlvmBackend): i64* {
     val chosen = LLVMBuildLoad2(backend.builder, i64, best, "")
     // Nor past the program's code (the C library's frames below main, in a program that links it): the end of its
     // text, which the linker defines (0 when it did not: no bound).
-    val endName = if (backend.macOS) "\x01section\$end\$__TEXT\$__text" else "etext"
-    var textEnd = LLVMGetNamedGlobal(backend.module, endName)
-    if (pointerIsNull(textEnd)) {
-        textEnd = LLVMAddGlobal(backend.module, backend.i8Type, endName)
-        LLVMSetLinkage(textEnd, llvmExternalWeakLinkage())
+    // (On Windows, the end of the image: kernel32's and ntdll's frames lie above it.)
+    val end = if (bootstrapLlvmFaultWindows(backend)) bootstrapLlvmWindowsImageEnd(backend) else {
+        val endName = if (backend.macOS) "\x01section\$end\$__TEXT\$__text" else "etext"
+        var textEnd = LLVMGetNamedGlobal(backend.module, endName)
+        if (pointerIsNull(textEnd)) {
+            textEnd = LLVMAddGlobal(backend.module, backend.i8Type, endName)
+            LLVMSetLinkage(textEnd, llvmExternalWeakLinkage())
+        }
+        LLVMBuildPtrToInt(backend.builder, textEnd, i64, "")
     }
-    val end = LLVMBuildPtrToInt(backend.builder, textEnd, i64, "")
     // SLT (40), NE (33), UGE (35).
     val outside = LLVMBuildAnd(backend.builder, LLVMBuildICmp(backend.builder, 33, end, LLVMConstInt(i64, 0, 0), ""),
         LLVMBuildICmp(backend.builder, 35, address, end, ""), "")
@@ -1238,7 +1241,7 @@ fun bootstrapLlvmBacktraceNameFunction(backend: BootstrapLlvmBackend): i64* {
 fun bootstrapLlvmDebugHostedRuntime(backend: BootstrapLlvmBackend): bool =
     (bootstrapLlvmDebugInfo || bootstrapLlvmBacktrace) &&
     !bootstrapTextContains(backend.targetTriple, "wasm") &&
-    (backend.macOS || bootstrapTextContains(backend.targetTriple, "linux"))
+    (backend.macOS || bootstrapTextContains(backend.targetTriple, "linux") || bootstrapLlvmFaultWindows(backend))
 
 // SIGILL, SIGTRAP, SIGABRT, SIGFPE, SIGBUS, SIGSEGV.
 fun bootstrapLlvmDebugFaultSignals(backend: BootstrapLlvmBackend): array<int> =
@@ -1277,7 +1280,8 @@ fun bootstrapLlvmDebugCall(
 fun bootstrapLlvmDebugInstallFaultHandlers(
     backend: BootstrapLlvmBackend
 ): void {
-    if (!bootstrapLlvmDebugHostedRuntime(backend)) return
+    // (Windows has no signals: the stack guard's exception handler reports every fault, bootstrapLlvmInstallStackGuard.)
+    if (!bootstrapLlvmDebugHostedRuntime(backend) || bootstrapLlvmFaultWindows(backend)) return
     val fault = bootstrapLlvmDeclare(
         backend, "abla_runtime_fault", backend.voidType, [backend.i64Type],
         false, []
@@ -1363,7 +1367,7 @@ fun bootstrapLlvmStackGuardCall(
 fun bootstrapLlvmStackGuardRuntime(backend: BootstrapLlvmBackend): bool =
     bootstrapLlvmStackGuard &&
     !bootstrapTextContains(backend.targetTriple, "wasm") &&
-    (backend.macOS || bootstrapTextContains(backend.targetTriple, "linux"))
+    (backend.macOS || bootstrapTextContains(backend.targetTriple, "linux") || bootstrapLlvmFaultWindows(backend))
 
 fun bootstrapLlvmSignalStackBytes(): int = 65536
 
@@ -1461,6 +1465,15 @@ fun bootstrapLlvmRuntimeWrite(
         bootstrapLlvmLinuxX64Syscall(backend, 1, [fd, text, size])
     } else if (bootstrapLlvmFaultDarwin(backend)) {
         bootstrapLlvmDarwinSyscallBy(backend, 4, [fd, text, size])
+    } else if (bootstrapLlvmFaultWindows(backend)) {
+        // kernel32's WriteFile on the standard handle (-12 error, -11 output), the count written to a word of its own
+        // (an exception handler need not be reentrant with the program's writes).
+        val handle = bootstrapLlvmWindowsCall(backend, "GetStdHandle",
+            [LLVMConstInt(backend.i64Type, if (descriptor == 2) -12 else -11, 1)])
+        val i64 = backend.i64Type
+        bootstrapLlvmWindowsCall(backend, "WriteFile", [handle, LLVMBuildPtrToInt(backend.builder, text, i64, ""), size,
+            LLVMBuildPtrToInt(backend.builder, bootstrapLlvmFaultWord(backend, "abla_runtime_windows_written"), i64, ""),
+            LLVMConstInt(i64, 0, 0)])
     } else {
         bootstrapLlvmDebugCall(
             backend, "write", backend.i64Type,
@@ -1616,6 +1629,16 @@ fun bootstrapLlvmStackGuardGlobal(
 // abla_runtime_stack_fault (defined after every other body).
 fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
     if (!bootstrapLlvmStackGuardRuntime(backend)) return
+    if (bootstrapLlvmFaultWindows(backend)) {
+        // AddVectoredExceptionHandler(1: first in the chain, abla_runtime_windows_fault).
+        val handler = bootstrapLlvmDeclare(
+            backend, "abla_runtime_windows_fault", backend.i32Type, [backend.pointerType], false, []
+        )
+        LLVMSetLinkage(handler, llvmInternalLinkage())
+        bootstrapLlvmWindowsCall(backend, "AddVectoredExceptionHandler", [LLVMConstInt(backend.i64Type, 1, 0),
+            LLVMBuildPtrToInt(backend.builder, handler, backend.i64Type, "")])
+        return
+    }
     val mac = backend.macOS
     val top = bootstrapLlvmStackGuardGlobal(
         backend, "abla_runtime_stack_top", backend.i64Type
@@ -1718,6 +1741,258 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
     return
 }
 
+// --- Windows (x86_64-windows-hosted, W1c) -------------------------------------------------------------------------
+// A Windows executable has no signals. Main installs a vectored exception handler first in the chain
+// (bootstrapLlvmInstallStackGuard), abla_runtime_windows_fault, which reports an exception the program's own code
+// raised: its address (ExceptionAddress) inside the image, from __ImageBase to the image's SizeOfImage, and its code an
+// error or a warning (bit 31). Any other exception (one a system library raises and handles itself, a debugger's
+// breakpoint in its code) continues the search. The report is Linux's:
+//   - a stack overflow (STATUS_STACK_OVERFLOW, 0xC00000FD): "panic: stack overflow", exit status 101 (without the
+//     stack: the handler runs on what is left of the overflowed one);
+//   - an access violation (0xC0000005): "fatal signal: a bad memory access at 0x...", the address its
+//     ExceptionInformation[1] names;
+//   - any other: "fatal signal: Windows exception 0x..." with its code;
+// then, in a -g or --backtrace build, the stack from the interrupted context (bootstrapLlvmEmitWindowsStackWalk). The
+// process ends by TerminateProcess with the exception's code as its status, as Windows' default action would end it,
+// without the system's error reporting (or, under Wine, winedbg).
+
+fun bootstrapLlvmFaultWindows(backend: BootstrapLlvmBackend): bool = bootstrapLlvmTargetIsWindows(backend.targetTriple)
+
+// A kernel32 function taking and returning integers (a pointer as its address), declared on first use, as the
+// runtime's own declarations (platform/windows/entry.ab) have them.
+fun bootstrapLlvmWindowsCall(backend: BootstrapLlvmBackend, name: string, arguments: array<i64*>): i64* {
+    val parameters: array<i64*> = []
+    for (argument in arguments) parameters.append(backend.i64Type)
+    bootstrapLlvmStackGuardCall(backend, name, backend.i64Type, parameters, arguments)
+}
+
+// The value of `type` at `address` (an integer).
+fun bootstrapLlvmLoadAddress(backend: BootstrapLlvmBackend, type: i64*, address: i64*): i64* =
+    LLVMBuildLoad2(backend.builder, type, LLVMBuildIntToPtr(backend.builder, address, backend.pointerType, ""), "")
+
+// The image's load address: the linker's __ImageBase (its DOS header).
+fun bootstrapLlvmWindowsImageBase(backend: BootstrapLlvmBackend): i64* {
+    var base = LLVMGetNamedGlobal(backend.module, "__ImageBase")
+    if (pointerIsNull(base)) {
+        base = LLVMAddGlobal(backend.module, backend.i8Type, "__ImageBase")
+        // Hidden: in this image, reached directly (dso_local).
+        LLVMSetVisibility(base, llvmHiddenVisibility())
+    }
+    LLVMBuildPtrToInt(backend.builder, base, backend.i64Type, "image.base")
+}
+
+// The address just past the image: __ImageBase + SizeOfImage, the optional header's (at 0x50 in the NT headers, which
+// e_lfanew at 0x3C places).
+fun bootstrapLlvmWindowsImageEnd(backend: BootstrapLlvmBackend): i64* {
+    val i64 = backend.i64Type
+    val builder = backend.builder
+    val base = bootstrapLlvmWindowsImageBase(backend)
+    val headers = LLVMBuildAdd(builder, base, LLVMBuildZExt(builder, bootstrapLlvmLoadAddress(backend, backend.i32Type,
+        LLVMBuildAdd(builder, base, LLVMConstInt(i64, 60, 0), "")), i64, ""), "")
+    val size = LLVMBuildZExt(builder, bootstrapLlvmLoadAddress(backend, backend.i32Type,
+        LLVMBuildAdd(builder, headers, LLVMConstInt(i64, 80, 0), "")), i64, "")
+    LLVMBuildAdd(builder, base, size, "image.end")
+}
+
+// A word of the thread's TEB, by the gs segment (address space 256): the stack's base (highest address) at 8, its
+// limit at 16.
+fun bootstrapLlvmWindowsThreadWord(backend: BootstrapLlvmBackend, offset: int): i64* {
+    val segment = LLVMPointerTypeInContext(backend.context, i32(256))
+    LLVMBuildLoad2(backend.builder, backend.i64Type,
+        LLVMBuildIntToPtr(backend.builder, LLVMConstInt(backend.i64Type, offset, 0), segment, ""), "")
+}
+
+// abla_runtime_windows_fault(EXCEPTION_POINTERS*), when main installed it: EXCEPTION_POINTERS {ExceptionRecord,
+// ContextRecord}, EXCEPTION_RECORD {ExceptionCode (32 bits) at 0, ExceptionAddress at 16, NumberParameters (32 bits) at
+// 24, ExceptionInformation at 32}. Returns 0 (EXCEPTION_CONTINUE_SEARCH) for an exception it does not report.
+fun bootstrapLlvmEmitWindowsFaultHandler(backend: BootstrapLlvmBackend): void {
+    val handler = LLVMGetNamedFunction(backend.module, "abla_runtime_windows_fault")
+    if (pointerIsNull(handler) || LLVMIsDeclaration(handler) == 0) return
+    val i64 = backend.i64Type
+    val i32 = backend.i32Type
+    val builder = backend.builder
+    LLVMPositionBuilderAtEnd(builder, LLVMAppendBasicBlockInContext(backend.context, handler, "entry"))
+    val pointers = LLVMGetParam(handler, 0)
+    val record = LLVMBuildLoad2(builder, backend.pointerType, pointers, "record")
+    val context = LLVMBuildLoad2(builder, backend.pointerType, bootstrapLlvmByteAt(backend, pointers, 16, 8), "context")
+    val code = LLVMBuildZExt(builder, LLVMBuildLoad2(builder, i32, record, "code"), i64, "")
+    val at = LLVMBuildLoad2(builder, i64, bootstrapLlvmByteAt(backend, record, 152, 16), "at")
+    val base = bootstrapLlvmWindowsImageBase(backend)
+    // ULT (36), NE (33), EQ (32), UGE (35).
+    val inImage = LLVMBuildICmp(builder, 36, LLVMBuildSub(builder, at, base, ""),
+        LLVMBuildSub(builder, bootstrapLlvmWindowsImageEnd(backend), base, ""), "in.image")
+    val severe = LLVMBuildICmp(builder, 33, LLVMBuildAnd(builder, code, LLVMConstInt(i64, 2147483648, 0), ""),
+        LLVMConstInt(i64, 0, 0), "severe")
+    val report = LLVMAppendBasicBlockInContext(backend.context, handler, "report")
+    val pass = LLVMAppendBasicBlockInContext(backend.context, handler, "pass")
+    LLVMBuildCondBr(builder, LLVMBuildAnd(builder, inImage, severe, ""), report, pass)
+    LLVMPositionBuilderAtEnd(builder, pass)
+    LLVMBuildRet(builder, LLVMConstInt(i32, 0, 0))
+    LLVMPositionBuilderAtEnd(builder, report)
+    val overflowed = LLVMAppendBasicBlockInContext(backend.context, handler, "overflow")
+    val fault = LLVMAppendBasicBlockInContext(backend.context, handler, "fault")
+    // The current process (the pseudo-handle -1).
+    val process = LLVMConstInt(i64, -1, 1)
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 32, code, LLVMConstInt(i64, 3221225725, 0), ""), overflowed, fault)
+    LLVMPositionBuilderAtEnd(builder, overflowed)
+    bootstrapLlvmDebugWrite(backend, "panic: stack overflow\n", "abla.stack.overflow.windows")
+    bootstrapLlvmWindowsCall(backend, "TerminateProcess", [process, LLVMConstInt(i64, 101, 0)])
+    LLVMBuildUnreachable(builder)
+    LLVMPositionBuilderAtEnd(builder, fault)
+    val hosted = bootstrapLlvmDebugHostedRuntime(backend)
+    // A debug report starts on a line of its own, as Linux's (abla_runtime_fault).
+    val lead = if (hosted) "\n" else ""
+    val named = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.access")
+    val generic = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.generic")
+    val stack = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.stack")
+    val parameterCount = LLVMBuildZExt(builder,
+        LLVMBuildLoad2(builder, i32, bootstrapLlvmByteAt(backend, record, 152, 24), ""), i64, "")
+    val access = LLVMBuildAnd(builder, LLVMBuildICmp(builder, 32, code, LLVMConstInt(i64, 3221225477, 0), ""),
+        LLVMBuildICmp(builder, 35, parameterCount, LLVMConstInt(i64, 2, 0), ""), "access")
+    LLVMBuildCondBr(builder, access, named, generic)
+    LLVMPositionBuilderAtEnd(builder, named)
+    bootstrapLlvmDebugWrite(backend, "${lead}fatal signal: a bad memory access at ", "abla.fault.access.windows")
+    bootstrapLlvmWriteHexCompact(backend, LLVMBuildLoad2(builder, i64, bootstrapLlvmByteAt(backend, record, 152, 40), ""))
+    LLVMBuildBr(builder, stack)
+    LLVMPositionBuilderAtEnd(builder, generic)
+    bootstrapLlvmDebugWrite(backend, "${lead}fatal signal: Windows exception ", "abla.fault.exception.windows")
+    bootstrapLlvmWriteHexCompact(backend, code)
+    LLVMBuildBr(builder, stack)
+    LLVMPositionBuilderAtEnd(builder, stack)
+    if (hosted) {
+        // The walk starts at the faulting instruction (abla_runtime_fault_pc, printed first) and unwinds from the
+        // interrupted context (abla_runtime_fault_context).
+        LLVMBuildStore(builder, at, bootstrapLlvmFaultPcGlobal(backend))
+        LLVMBuildStore(builder, LLVMBuildPtrToInt(builder, context, i64, ""),
+            bootstrapLlvmFaultWord(backend, "abla_runtime_fault_context"))
+        bootstrapLlvmStackGuardCall(backend, "abla_runtime_print_stack", backend.voidType, [], [])
+    }
+    bootstrapLlvmWindowsCall(backend, "TerminateProcess", [process, code])
+    LLVMBuildRet(builder, LLVMConstInt(i32, 0, 0))
+    return
+}
+
+// The stack on Windows, by the system's unwinder over the image's unwind data (.pdata: every function of a -g or
+// --backtrace image has it, bootstrapLlvmWindowsUnwindTables): a CONTEXT (1232 bytes, 16-aligned; Rsp at 152, Rip at
+// 248), the fault's (abla_runtime_fault_context) or this function's own (RtlCaptureContext), is stepped a frame at a
+// time by RtlLookupFunctionEntry and RtlVirtualUnwind, and each return address is printed less one, so it falls inside
+// the call, as Linux's walk prints them. (Win64 code does not keep a frame-pointer chain: LLVM's rbp points into the
+// frame, not at the saved rbp.) A function without unwind data is a leaf, its return address at the stack pointer,
+// read only within this thread's stack (the TEB's bounds). The walk skips the context's own frame (the faulting
+// instruction, printed first, or this function), and ends at a null pc, a stack pointer that does not rise, or after 64
+// frames.
+fun bootstrapLlvmEmitWindowsStackWalk(backend: BootstrapLlvmBackend, printStack: i64*): void {
+    val i64 = backend.i64Type
+    val builder = backend.builder
+    bootstrapLlvmDebugWrite(
+        backend,
+        "stack (return addresses: subtract the load address, then llvm-symbolizer on the program gives file:line):\n",
+        "abla.stack.header"
+    )
+    bootstrapLlvmWalkFaultPc(backend, printStack)
+    val context = LLVMBuildAlloca(builder, LLVMArrayType2(backend.i8Type, 1232), "context")
+    LLVMSetAlignment(context, 16)
+    val contextAddress = LLVMBuildPtrToInt(builder, context, i64, "")
+    val imageBase = LLVMBuildAlloca(builder, i64, "unwind.base")
+    val handlerData = LLVMBuildAlloca(builder, i64, "unwind.data")
+    val establisher = LLVMBuildAlloca(builder, i64, "unwind.frame")
+    val skip = LLVMBuildAlloca(builder, i64, "skip")
+    LLVMBuildStore(builder, LLVMConstInt(i64, 1, 0), skip)
+    val counter = LLVMBuildAlloca(builder, i64, "n")
+    LLVMBuildStore(builder, LLVMConstInt(i64, 0, 0), counter)
+    val faultContext = LLVMBuildLoad2(builder, i64, bootstrapLlvmFaultWord(backend, "abla_runtime_fault_context"), "")
+    val copy = LLVMAppendBasicBlockInContext(backend.context, printStack, "context.copy")
+    val capture = LLVMAppendBasicBlockInContext(backend.context, printStack, "context.capture")
+    val loop = LLVMAppendBasicBlockInContext(backend.context, printStack, "walk")
+    val body = LLVMAppendBasicBlockInContext(backend.context, printStack, "frame")
+    val show = LLVMAppendBasicBlockInContext(backend.context, printStack, "show")
+    val step = LLVMAppendBasicBlockInContext(backend.context, printStack, "step")
+    val unwind = LLVMAppendBasicBlockInContext(backend.context, printStack, "unwind")
+    val leaf = LLVMAppendBasicBlockInContext(backend.context, printStack, "leaf")
+    val leafRead = LLVMAppendBasicBlockInContext(backend.context, printStack, "leaf.read")
+    val moved = LLVMAppendBasicBlockInContext(backend.context, printStack, "moved")
+    val stop = LLVMAppendBasicBlockInContext(backend.context, printStack, "stop")
+    val done = LLVMAppendBasicBlockInContext(backend.context, printStack, "walked")
+    // NE (33), ULT (36), ULE (37).
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 33, faultContext, LLVMConstInt(i64, 0, 0), ""), copy, capture)
+    LLVMPositionBuilderAtEnd(builder, copy)
+    LLVMBuildMemCpy(builder, context, i32(16), LLVMBuildIntToPtr(builder, faultContext, backend.pointerType, ""), i32(16),
+        LLVMConstInt(i64, 1232, 0))
+    LLVMBuildBr(builder, loop)
+    LLVMPositionBuilderAtEnd(builder, capture)
+    bootstrapLlvmWindowsCall(backend, "RtlCaptureContext", [contextAddress])
+    LLVMBuildBr(builder, loop)
+    LLVMPositionBuilderAtEnd(builder, loop)
+    val pc = LLVMBuildLoad2(builder, i64, bootstrapLlvmByteAt(backend, context, 1232, 248), "pc")
+    val count = LLVMBuildLoad2(builder, i64, counter, "")
+    LLVMBuildCondBr(builder, LLVMBuildAnd(builder,
+        LLVMBuildICmp(builder, 33, pc, LLVMConstInt(i64, 0, 0), ""),
+        LLVMBuildICmp(builder, 36, count, LLVMConstInt(i64, 64, 0), ""), ""), body, done)
+    LLVMPositionBuilderAtEnd(builder, body)
+    val skipping = LLVMBuildLoad2(builder, i64, skip, "")
+    LLVMBuildStore(builder, LLVMConstInt(i64, 0, 0), skip)
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 33, skipping, LLVMConstInt(i64, 0, 0), ""), step, show)
+    LLVMPositionBuilderAtEnd(builder, show)
+    val inCall = LLVMBuildSub(builder, pc, LLVMConstInt(i64, 1, 0), "")
+    bootstrapLlvmDebugWriteHex(backend, inCall)
+    if (bootstrapLlvmBacktrace) {
+        bootstrapLlvmCall(backend, bootstrapLlvmBacktraceNameFunction(backend), [inCall], "", false, [])
+    }
+    bootstrapLlvmDebugWrite(backend, "\n", "abla.stack.end")
+    LLVMBuildStore(builder, LLVMBuildAdd(builder, count, LLVMConstInt(i64, 1, 0), ""), counter)
+    LLVMBuildBr(builder, step)
+    LLVMPositionBuilderAtEnd(builder, step)
+    val stackPointerAt = bootstrapLlvmByteAt(backend, context, 1232, 152)
+    val pcAt = bootstrapLlvmByteAt(backend, context, 1232, 248)
+    val stackPointer = LLVMBuildLoad2(builder, i64, stackPointerAt, "sp")
+    val entry = bootstrapLlvmWindowsCall(backend, "RtlLookupFunctionEntry",
+        [pc, LLVMBuildPtrToInt(builder, imageBase, i64, ""), LLVMConstInt(i64, 0, 0)])
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 33, entry, LLVMConstInt(i64, 0, 0), ""), unwind, leaf)
+    LLVMPositionBuilderAtEnd(builder, unwind)
+    // RtlVirtualUnwind(UNW_FLAG_NHANDLER, image base, pc, entry, context, &handler data, &establisher frame, NULL).
+    bootstrapLlvmWindowsCall(backend, "RtlVirtualUnwind", [LLVMConstInt(i64, 0, 0),
+        LLVMBuildLoad2(builder, i64, imageBase, ""), pc, entry, contextAddress,
+        LLVMBuildPtrToInt(builder, handlerData, i64, ""), LLVMBuildPtrToInt(builder, establisher, i64, ""),
+        LLVMConstInt(i64, 0, 0)])
+    LLVMBuildBr(builder, moved)
+    LLVMPositionBuilderAtEnd(builder, leaf)
+    val limit = bootstrapLlvmWindowsThreadWord(backend, 16)
+    val inside = LLVMBuildICmp(builder, 36, LLVMBuildSub(builder, stackPointer, limit, ""),
+        LLVMBuildSub(builder, LLVMBuildSub(builder, bootstrapLlvmWindowsThreadWord(backend, 8), limit, ""),
+            LLVMConstInt(i64, 8, 0), ""), "")
+    LLVMBuildCondBr(builder, inside, leafRead, stop)
+    LLVMPositionBuilderAtEnd(builder, leafRead)
+    LLVMBuildStore(builder, bootstrapLlvmLoadAddress(backend, i64, stackPointer), pcAt)
+    LLVMBuildStore(builder, LLVMBuildAdd(builder, stackPointer, LLVMConstInt(i64, 8, 0), ""), stackPointerAt)
+    LLVMBuildBr(builder, moved)
+    LLVMPositionBuilderAtEnd(builder, moved)
+    // Only upward: a stack pointer that did not rise ends the walk.
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 37, LLVMBuildLoad2(builder, i64, stackPointerAt, ""), stackPointer, ""),
+        stop, loop)
+    LLVMPositionBuilderAtEnd(builder, stop)
+    LLVMBuildStore(builder, LLVMConstInt(i64, 0, 0), pcAt)
+    LLVMBuildBr(builder, loop)
+    LLVMPositionBuilderAtEnd(builder, done)
+    bootstrapLlvmDebugWrite(backend, "load address ", "abla.stack.load")
+    bootstrapLlvmDebugWriteHex(backend, bootstrapLlvmWindowsImageBase(backend))
+    bootstrapLlvmDebugWrite(backend, "\n", "abla.stack.end")
+    return
+}
+
+// Unwind data (.pdata, .xdata) for every function the module defines (uwtable, asynchronous): what the walk steps
+// through frames by. Code without it is taken for a leaf.
+fun bootstrapLlvmWindowsUnwindTables(backend: BootstrapLlvmBackend): void {
+    val kind = bootstrapLlvmAttributeKind("uwtable")
+    var function = LLVMGetFirstFunction(backend.module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == 0) {
+            LLVMAddAttributeAtIndex(function, -1, LLVMCreateEnumAttribute(backend.context, kind, 2))
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    return
+}
+
 // abla_runtime_stack_fault(signal, siginfo, context), when main installed it.
 // Whether the kernel raised the fault the stack guard's handler is in (true: its si_addr is the bad address), not a
 // process sending it (raise, kill): si_code (at 8 in `info`, Linux and macOS) a fault's own code, 1 to 15 (SEGV_MAPERR
@@ -1743,6 +2018,7 @@ fun bootstrapLlvmFaultRaised(backend: BootstrapLlvmBackend, info: i64*, machine:
 }
 
 fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
+    bootstrapLlvmEmitWindowsFaultHandler(backend)
     val handler = LLVMGetNamedFunction(
         backend.module, "abla_runtime_stack_fault"
     )
@@ -2381,6 +2657,8 @@ fun bootstrapLlvmEmitDebugRuntime(backend: BootstrapLlvmBackend): void {
             bootstrapLlvmEmitFramePointerWalk(backend, printStack)
         } else if (hosted && bootstrapLlvmFaultDarwin(backend)) {
             bootstrapLlvmEmitDarwinFramePointerWalk(backend, printStack)
+        } else if (hosted && bootstrapLlvmFaultWindows(backend)) {
+            bootstrapLlvmEmitWindowsStackWalk(backend, printStack)
         } else if (hosted) {
             val framesType = LLVMArrayType2(backend.pointerType, 64)
             val frames = LLVMBuildAlloca(backend.builder, framesType, "frames")
@@ -2521,5 +2799,6 @@ fun bootstrapLlvmEmitDebugRuntime(backend: BootstrapLlvmBackend): void {
         }
         LLVMBuildRetVoid(backend.builder)
     }
+    if (hosted && bootstrapLlvmFaultWindows(backend)) bootstrapLlvmWindowsUnwindTables(backend)
     return
 }

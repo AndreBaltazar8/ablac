@@ -19,6 +19,11 @@ export WINEPREFIX=${ABLA_WINE_PREFIX:-$root/build/wine-prefix}
 export WINEARCH=win64 WINEDEBUG=-all
 export WINEDLLOVERRIDES='mscoree,mshtml='
 stop() { [[ -z $wineserver ]] || "$wineserver" -k > /dev/null 2>&1 || true; }
+# One run at a time per prefix: the suite runs several Wine tests at once, and a run that ended killed the shared
+# wineserver, with it another test's program (empty output, status 0). The lock outlives the trap's kill.
+mkdir -p "$(dirname -- "$WINEPREFIX")"
+exec 9> "$WINEPREFIX.lock"
+flock -w 900 9 || { echo "wine-run: another run held $WINEPREFIX for 15 minutes" >&2; exit 124; }
 trap stop EXIT
 if [[ ! -f $WINEPREFIX/system.reg ]]; then
     mkdir -p "$WINEPREFIX"

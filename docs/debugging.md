@@ -199,6 +199,37 @@ RuntimeError: unreachable
     at crash.wasm.crash.crash (wasm://wasm/crash.wasm-948bddf2:wasm-function[8]:0x1c1e)
 ```
 
+### Windows
+
+A hosted Windows program (`--target x86_64-windows-hosted`) reports how it
+died as a Linux one does, through a vectored exception handler its `main`
+installs. Every build says what ended it: a panic its message (status 101), a
+stack overflow `panic: stack overflow` (status 101), a bad memory access
+`fatal signal: a bad memory access at 0x…` and any other exception its code.
+The process then ends with the exception's code as its status (0xC0000005 for
+an access violation), as Windows would end it, without the error-reporting
+dialog. A `--backtrace` build prints the stack too, named as on Linux; a `-g`
+or `--fast` build prints it unnamed:
+
+```text
+fatal signal: a bad memory access at 0x0000000000000010
+stack (return addresses: subtract the load address, then llvm-symbolizer on the program gives file:line):
+0x0000000140001f1e in crash.main.boxed (the faulting instruction)
+0x0000000140009b74 in main
+0x0000000140009eb5 in abla_windows_start
+0x00006fffffec48ac
+load address 0x0000000140000000
+```
+
+The stack is unwound by the system (`RtlVirtualUnwind`) over the unwind
+tables that a `-g` or `--backtrace` build gives every function; a release
+build imports neither the unwinder nor those tables. The frames past
+`abla_windows_start` are the system's. An exception that a system library
+raises and handles itself never reaches the report, since only an exception
+raised by the program's own code is reported. A stack overflow prints no
+stack, because the handler runs on what is left of the overflowed one.
+tools/test-windows-crash.sh checks all of this under Wine.
+
 ## WebAssembly: browser developer tools
 
 A debug module (`artifact = "module"` on a WebAssembly target) is published with
