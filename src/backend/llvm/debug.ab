@@ -1058,6 +1058,17 @@ fun bootstrapLlvmFaultFrameGlobal(backend: BootstrapLlvmBackend): i64* {
     global
 }
 
+// A word the stack guard's handler records for the fault report (internal, 0 until a fault).
+fun bootstrapLlvmFaultWord(backend: BootstrapLlvmBackend, name: string): i64* {
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        global = LLVMAddGlobal(backend.module, backend.i64Type, name)
+        LLVMSetInitializer(global, LLVMConstInt(backend.i64Type, 0, 0))
+        LLVMSetLinkage(global, llvmInternalLinkage())
+    }
+    global
+}
+
 // The pc a fault interrupted, which the stack guard's handler records for the walk to print first (0: none).
 fun bootstrapLlvmFaultPcGlobal(backend: BootstrapLlvmBackend): i64* {
     var global = LLVMGetNamedGlobal(backend.module, "abla_runtime_fault_pc")
@@ -1858,6 +1869,18 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
             else if (bootstrapTextContains(backend.targetTriple, "aarch64")) 416 else 120
         LLVMBuildStore(backend.builder, LLVMBuildLoad2(backend.builder, i64,
             bootstrapLlvmByteAt(backend, machine, 512, frameAt), "interrupted.frame"), bootstrapLlvmFaultFrameGlobal(backend))
+        // A bad access the kernel raised (SIGSEGV or SIGBUS with si_code above 0, as a release build reports it): the
+        // report names its address (abla_runtime_fault_access 1; si_addr in abla_runtime_fault_address, 0 included).
+        val code = LLVMBuildLoad2(backend.builder, backend.i32Type, bootstrapLlvmByteAt(backend, info, 32, 8),
+            "fault.code")
+        // SGT (38), EQ (32).
+        val access = LLVMBuildAnd(backend.builder,
+            LLVMBuildICmp(backend.builder, 38, code, LLVMConstInt(backend.i32Type, 0, 0), ""),
+            LLVMBuildOr(backend.builder, LLVMBuildICmp(backend.builder, 32, signal, LLVMConstInt(i64, 11, 0), ""),
+                LLVMBuildICmp(backend.builder, 32, signal, LLVMConstInt(i64, if (mac) 10 else 7, 0), ""), ""), "")
+        LLVMBuildStore(backend.builder, LLVMBuildZExt(backend.builder, access, i64, ""),
+            bootstrapLlvmFaultWord(backend, "abla_runtime_fault_access"))
+        LLVMBuildStore(backend.builder, address, bootstrapLlvmFaultWord(backend, "abla_runtime_fault_address"))
         // The debug report, which restores the default action.
         val fault = bootstrapLlvmDeclare(
             backend, "abla_runtime_fault", backend.voidType, [i64], false, []
@@ -2415,10 +2438,27 @@ fun bootstrapLlvmEmitDebugRuntime(backend: BootstrapLlvmBackend): void {
             backend.builder,
             LLVMAppendBasicBlockInContext(backend.context, fault, "entry")
         )
+        // A bad access names its address, as a release build does; any other fault says what it may be.
+        val i64 = backend.i64Type
+        val named = LLVMAppendBasicBlockInContext(backend.context, fault, "fault.access")
+        val generic = LLVMAppendBasicBlockInContext(backend.context, fault, "fault.generic")
+        val stack = LLVMAppendBasicBlockInContext(backend.context, fault, "fault.stack")
+        val access = LLVMBuildLoad2(backend.builder, i64, bootstrapLlvmFaultWord(backend, "abla_runtime_fault_access"), "")
+        // NE (33).
+        LLVMBuildCondBr(backend.builder, LLVMBuildICmp(backend.builder, 33, access, LLVMConstInt(i64, 0, 0), ""),
+            named, generic)
+        LLVMPositionBuilderAtEnd(backend.builder, named)
+        bootstrapLlvmDebugWrite(backend, "\nfatal signal: a bad memory access at ", "abla.fault.access.header")
+        bootstrapLlvmWriteHexCompact(backend, LLVMBuildLoad2(backend.builder, i64,
+            bootstrapLlvmFaultWord(backend, "abla_runtime_fault_address"), ""))
+        LLVMBuildBr(backend.builder, stack)
+        LLVMPositionBuilderAtEnd(backend.builder, generic)
         bootstrapLlvmDebugWrite(
             backend, "\nfatal signal: a trap, a bad memory access or an abort\n",
             "abla.fault.header"
         )
+        LLVMBuildBr(backend.builder, stack)
+        LLVMPositionBuilderAtEnd(backend.builder, stack)
         bootstrapLlvmCall(backend, printStack, [], "", false, [])
         // Back to the default action: returning re-runs the faulting
         // instruction (or abort raises again), which now ends the process.

@@ -158,7 +158,12 @@ for flags in "" "-g" "--backtrace"; do
             fail "a bad store in a release build: $(head -3 "$out/stack-store.err")"
         ! grep -q 'bad memory access' "$out/stack-segv.err" || fail "a sent SIGSEGV named an address"
     else
-        grep -q '^fatal signal' "$out/stack-store.err" || fail "a bad store$flags: $(head -3 "$out/stack-store.err")"
+        # Its fault report names the address too, then prints the stack; a sent SIGSEGV's says what it may be.
+        grep -qx 'fatal signal: a bad memory access at 0x0000000000000010' "$out/stack-store.err" ||
+            fail "a bad store$flags: $(head -3 "$out/stack-store.err")"
+        grep -q '^stack ' "$out/stack-store.err" || fail "a bad store$flags printed no stack"
+        grep -qx 'fatal signal: a trap, a bad memory access or an abort' "$out/stack-segv.err" ||
+            fail "a sent SIGSEGV$flags: $(head -3 "$out/stack-segv.err")"
     fi
     # Its stack starts at the faulting instruction, named, not in the handler that prints it.
     if [[ $flags == --backtrace ]]; then
