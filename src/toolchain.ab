@@ -14,6 +14,8 @@ import "sourcemap.ab"
 import "abla/sys/linux/fs"
 import "elf_relocations.ab"
 import "runtime_prune.ab"
+import "fast_runtime.ab"
+import "abla/array"
 import "abla/bytes"
 import "abla/json"
 import "abla/text"
@@ -4214,6 +4216,244 @@ fun bootstrapValidateCompileInputs(serialized: string): bool {
     valid && cursor[0] == serialized.size
 }
 
+private class BootstrapFastRuntimeArtifact(
+    val objectPath: string = "",
+    val source: string = "",
+    val key: string = "",
+    val error: string = "",
+    val descriptor: int = -1
+)
+
+private fun bootstrapFastRuntimeEligible(
+    target: BootstrapTargetDescriptor, artifact: string, profile: string,
+    producer: bool, graph: BootstrapModuleGraph
+): bool {
+    if (producer || profile != "inprocess-fast" || artifact != "executable" ||
+        target.objectFormat != "elf" || !target.hosted ||
+        !bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) || ablaHostIsMacOS() ||
+        linuxEnvironment("ABLA_FAST_RUNTIME_OBJECT").value != "1") return false
+    // Compile-time code uses the compiler's own runtime, and its staged
+    // operators may depend on the unsplit module. Background freeing swaps
+    // in a collector body by name, which is a separate object variant.
+    for (snapshot in graph.orderedSnapshots) {
+        val standard = bootstrapStandardLibraryModuleSource(snapshot.path)
+        val declaresBackgroundFree = standard &&
+            (snapshot.path.endsWith("abla/memory/entry.ab") ||
+                snapshot.path.endsWith("abla/runtime/memory/entry.ab") ||
+                snapshot.path.endsWith("abla/runtime/platform/host.ab"))
+        if (!declaresBackgroundFree &&
+            (snapshot.source.contains("memorySetBackgroundFree") ||
+                snapshot.source.contains("runtimeMemorySetBackgroundFree") ||
+                snapshot.source.contains("httpEventServerCollector"))) return false
+        if (!standard && (snapshot.mayUseRawProvider ||
+            bootstrapProgramRunsCompileTimeCode(snapshot.discovery))) return false
+        if (!standard && (snapshot.source.contains("#") || snapshot.source.contains("\$"))) {
+            for (token in bootstrapModuleTokens(snapshot)) {
+                if (token.kind == BOOTSTRAP_TOKEN_HASH || token.kind == BOOTSTRAP_TOKEN_DOLLAR) return false
+            }
+        }
+    }
+    true
+}
+
+private fun bootstrapFastRuntimeDigest(bytes: string): string =
+    "${bytes.size}-${bootstrapNativeCacheHash(bytes, 17, 257, 1000000007)}-${bootstrapNativeCacheHash(bytes, 31, 263, 1000000009)}"
+
+private fun bootstrapFastRuntimePrepare(
+    target: BootstrapTargetDescriptor,
+    hostPath: string,
+    selfPath: string,
+    emitObject: (string, string) -> int,
+    var state: BootstrapModuleState
+): BootstrapFastRuntimeArtifact {
+    bootstrapReadRunningImageIdentity()
+    if (bootstrapRunningImageSize == 0) return bootstrapFastRuntimeUnavailable("compiler identity unavailable")
+    val snapshots: array<BootstrapModuleSnapshot> = []
+    val runtime = BootstrapModuleGraph([], 0, state, snapshots, [], "", [], bootstrapModuleGraphIndex())
+    runtime.index.runtimeSimdScan = true
+    runtime.load(hostPath)
+    runtime.load(selfPath)
+    if (runtime.errors != 0) return BootstrapFastRuntimeArtifact(error = "cannot resolve standard runtime inputs")
+    val root = bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
+    var identity = "abla-fast-runtime-v1\n${bootstrapRunningImageSize}:${bootstrapRunningImageFirst}:${bootstrapRunningImageSecond}:${bootstrapRunningImageTail}"
+    identity = "$identity\n${target.name}:${target.llvmTriple}:${target.objectFormat}:${llvmLibraryVersion()}"
+    identity = "$identity\n${bootstrapFastInlineThreshold()}:${bootstrapLlvmDebugInfo}:${bootstrapLlvmBacktrace}:${bootstrapLlvmOutOfProcess()}:${bootstrapKeepLlvmText()}"
+    if (bootstrapLlvmDebugInfo) {
+        for (prefix in bootstrapLlvmDebugPrefixMap) {
+            identity = "$identity\nprefix:${prefix.size}:$prefix"
+        }
+    }
+    if (bootstrapLlvmOutOfProcess() || bootstrapKeepLlvmText()) {
+        identity = "$identity\n${bootstrapToolIdentity(bootstrapHostLlvmTool("opt"))}"
+        identity = "$identity\n${bootstrapToolIdentity(bootstrapHostLlvmTool("llc"))}"
+    }
+    for (snapshot in snapshots) {
+        if (!snapshot.path.startsWith("$root/")) return BootstrapFastRuntimeArtifact(error = "unexpected runtime input path")
+        val relative = snapshot.path.slice(root.size + 1, snapshot.path.size)
+        identity = "$identity\n$relative:${snapshot.size}:${snapshot.firstFingerprint}:${snapshot.secondFingerprint}"
+    }
+    val key = bootstrapFastRuntimeDigest(identity)
+    bootstrapFastRuntimeCached(target, hostPath, state.acquire(hostPath).source, emitObject,
+        Path("${bootstrapCacheDirectory()}/fast-runtime-v1"), key)
+}
+
+private fun bootstrapFastRuntimeCacheRead(path: Path, key: string, descriptor: int): BootstrapFastRuntimeArtifact {
+    val expected = path.child("record").readText()
+    if (expected == "") return BootstrapFastRuntimeArtifact()
+    val objectFile = path.child("runtime.o")
+    val source = path.child("host.ab").readText()
+    val bytes = objectFile.readText()
+    if (source == "" || bytes == "" ||
+        expected != "$key\n${bootstrapFastRuntimeDigest(bytes)}\n${bootstrapFastRuntimeDigest(source)}\n") {
+        return BootstrapFastRuntimeArtifact()
+    }
+    BootstrapFastRuntimeArtifact(objectFile.text, source, key, descriptor = descriptor)
+}
+
+private fun bootstrapFastRuntimeUnavailable(reason: string): BootstrapFastRuntimeArtifact {
+    if (bootstrapBuildVerbose) linuxPrintStandardError("note: using the ordinary fast runtime ($reason)\n")
+    BootstrapFastRuntimeArtifact()
+}
+
+private fun bootstrapFastRuntimeSharedLock(descriptor: int): bool {
+    var status = -4
+    while (status == -4 && descriptor >= 0) status = linuxSyscall2(73, descriptor, 1)
+    status == 0
+}
+
+// Keep a shared lease until the executable and the sidecar are linked. Only
+// cache misses take an exclusive lease, including repairs and eviction.
+private fun bootstrapFastRuntimeCached(
+    target: BootstrapTargetDescriptor, hostPath: string, original: string,
+    emitObject: (string, string) -> int, directory: Path, key: string
+): BootstrapFastRuntimeArtifact {
+    if (!directory.createDirectories()) return bootstrapFastRuntimeUnavailable("runtime cache unavailable")
+    val lock = directory.child("$key.lock").fileLock()
+    if (!bootstrapFastRuntimeSharedLock(lock.descriptor)) {
+        if (lock.descriptor >= 0) linuxSyscall1(3, lock.descriptor)
+        return bootstrapFastRuntimeUnavailable("runtime cache lock unavailable")
+    }
+    val path = directory.child(key)
+    val cached = bootstrapFastRuntimeCacheRead(path, key, lock.descriptor)
+    if (cached.objectPath != "") return cached
+    lock.release()
+    if (!lock.hold()) {
+        linuxSyscall1(3, lock.descriptor)
+        return bootstrapFastRuntimeUnavailable("runtime cache lock unavailable")
+    }
+    // Another producer may have published while this build waited.
+    val winner = bootstrapFastRuntimeCacheRead(path, key, lock.descriptor)
+    if (winner.objectPath == "") {
+        val failure = bootstrapFastRuntimePublish(target, hostPath, original, emitObject, directory, path, key)
+        if (failure != "") {
+            linuxSyscall1(3, lock.descriptor)
+            return BootstrapFastRuntimeArtifact(error = failure)
+        }
+        bootstrapFastRuntimeSweep(directory, key)
+    }
+    if (bootstrapFastRuntimeSharedLock(lock.descriptor)) {
+        val artifact = bootstrapFastRuntimeCacheRead(path, key, lock.descriptor)
+        if (artifact.objectPath != "") return artifact
+    }
+    linuxSyscall1(3, lock.descriptor)
+    bootstrapFastRuntimeUnavailable("runtime cache could not publish an entry")
+}
+
+private fun bootstrapFastRuntimePublish(
+    target: BootstrapTargetDescriptor, hostPath: string, original: string,
+    emitObject: (string, string) -> int, directory: Path, destination: Path, key: string
+): string {
+    val objectView = bootstrapFastRuntimeView(original, true)
+    if (objectView.error != "") return objectView.error
+    val programView = bootstrapFastRuntimeView(original, false)
+    if (programView.error != "") return programView.error
+    val scratch = directory.child("$key.tmp.${linuxProcessId()}")
+    scratch.removeTree()
+    if (!scratch.createDirectories()) return ""
+    val product = bootstrapFastRuntimeProduce(target, hostPath, objectView, emitObject, scratch)
+    if (product == "") {
+        val bytes = scratch.child("runtime.o").readText()
+        val record = "$key\n${bootstrapFastRuntimeDigest(bytes)}\n${bootstrapFastRuntimeDigest(programView.source)}\n"
+        if (bytes != "" && scratch.child("host.ab").writeText(programView.source) &&
+            scratch.child("record").writeText(record)) {
+            destination.removeTree()
+            scratch.moveTo(destination)
+        }
+    }
+    scratch.removeTree()
+    product
+}
+
+// The cache is small and per compiler/configuration. A producer sweeps old
+// entries beyond the cap, skipping any held by another build. Lock files
+// remain so every process synchronizes on the same inode.
+private fun bootstrapFastRuntimeSweep(directory: Path, current: string): void {
+    val entries: array<Path> = []
+    for (entry in directory.entries()) {
+        if (entry.name() != current && !entry.name().contains(".") &&
+            entry.child("record").info().isFile()) entries.append(entry)
+    }
+    while (entries.size > 63) {
+        var oldest = 0
+        var oldestTime = entries[0].info().revision
+        for (index in 1 until entries.size) {
+            val time = entries[index].info().revision
+            if (time < oldestTime) {
+                oldest = index
+                oldestTime = time
+            }
+        }
+        val entry = entries[oldest]
+        entries[oldest] = entries[entries.size - 1]
+        entries.removeLast()
+        val lock = directory.child("${entry.name()}.lock").fileLock()
+        if (lock.tryHold()) entry.removeTree()
+        if (lock.descriptor >= 0) linuxSyscall1(3, lock.descriptor)
+    }
+}
+
+private fun bootstrapFastRuntimeProduce(
+    target: BootstrapTargetDescriptor,
+    hostPath: string,
+    view: BootstrapFastRuntimeView,
+    emitObject: (string, string) -> int,
+    scratch: Path
+): string {
+    val state = bootstrapModuleState()
+    // An empty input supplies a graph root. The producer emits an object
+    // without standalone startup, using executable TLS for its final link.
+    val root = Path(bootstrapStandardLibraryRoot()).child("abla/runtime/__fast_runtime.ab").text
+    state.overlays = [
+        BootstrapModuleOverlay(root, "", 0),
+        BootstrapModuleOverlay(hostPath, view.source, 0)
+    ]
+    val output = scratch.child("runtime.o")
+    val compiled = bootstrapNativeBuildWithEmitterStateCache(
+        root, output.text, emitObject, "inprocess-fast", state, bootstrapIrCacheState(),
+        false, target, "object", fastRuntimeExports = view.exports
+    )
+    for (entry in scratch.entries()) if (entry.text != output.text) entry.remove()
+    if (compiled.status == 0) "" else "cannot compile the prebuilt runtime"
+}
+
+private fun bootstrapFastRuntimeApply(
+    var snapshots: array<BootstrapModuleSnapshot>, hostPath: string, source: string,
+    var state: BootstrapModuleState
+): void {
+    for (index in 0 until snapshots.size) {
+        val original = snapshots[index]
+        if (original.path != hostPath) continue
+        val first = bootstrapModuleFingerprint(source, 17, 257, 1000000007)
+        val second = bootstrapModuleFingerprint(source, 97, 263, 1000000009)
+        snapshots[index] = BootstrapModuleSnapshot(
+            original.path, source, original.importEdges, original.importErrors, true,
+            source.size, original.revision, first, second,
+            state.discover(source, original.path, original.importErrors, first, second, false)
+        )
+        return
+    }
+}
+
 fun bootstrapNativeBuildWithEmitterStateCache(
     sourcePath: string,
     outputPath: string,
@@ -4224,7 +4464,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     allowCache: bool,
     target: BootstrapTargetDescriptor,
     artifact: string,
-    targetToolsIdentity: string = ""
+    targetToolsIdentity: string = "",
+    fastRuntimeExports: array<string> = []
 ): BootstrapNativeBuild {
     val enclosingDemandPath = bootstrapRuntimeDemandPath
     val enclosingPruneOff = bootstrapRuntimePruneOff
@@ -4331,6 +4572,18 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         "frontend.graph-load.platform:${orderedSnapshots.size}"
     )
     if (selfHostedRuntime != "") graph.load(selfHostedRuntime)
+    var fastRuntime = BootstrapFastRuntimeArtifact()
+    if (bootstrapFastRuntimeEligible(target, artifact, cacheProfile, fastRuntimeExports.size > 0, graph)) {
+        fastRuntime = bootstrapFastRuntimePrepare(
+            target, bootstrapNormalizeModulePath(runtimePlatform),
+            bootstrapNormalizeModulePath(selfHostedRuntime), emitObject, moduleState
+        )
+        if (fastRuntime.error != "") {
+            linuxPrintStandardError("error[E_FAST_RUNTIME_OBJECT]: ${fastRuntime.error}\n")
+            bootstrapDiscardCompileOutputs()
+            return BootstrapNativeBuild(1, [], false, 0, 0, 0, 0, 0, 0, 0, 0)
+        }
+    }
     bootstrapFloatBridgeAvailable = compilerRuntime && bootstrapFloatBridgeMustPreload(graph)
     bootstrapFloatFormattingRequested = false
     if (bootstrapFloatBridgeAvailable) graph.load(bootstrapFloatBridgeSource(graph, sourcePath))
@@ -4425,8 +4678,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // working directory is part of what its object holds; a native object's isn't.
     val debugDirectory = if (bootstrapLlvmDebugInfo && target.objectFormat == "wasm")
         "\nabla-debug-directory:${currentDirectory().text}" else ""
+    val runtimeIdentity = if (fastRuntime.key == "") "" else "\nabla-fast-runtime:${fastRuntime.key}"
     val sourceIdentity =
-        "$graphIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact\nabla-debug:$bootstrapLlvmDebugInfo$debugDirectory\nabla-backtrace:$bootstrapLlvmBacktrace\nabla-prune:$bootstrapLlvmPruneRuntime\nabla-compile-eval:${bootstrapCtCacheTier()}"
+        "$graphIdentity$runtimeIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact\nabla-debug:$bootstrapLlvmDebugInfo$debugDirectory\nabla-backtrace:$bootstrapLlvmBacktrace\nabla-prune:$bootstrapLlvmPruneRuntime\nabla-compile-eval:${bootstrapCtCacheTier()}"
     // Release hosted executables may keep their ordinary relocatable sidecar
     // (on request), but the executable itself is optimized across the
     // generated program and runtime boundary. LLVM-backed compiler programs
@@ -4679,6 +4933,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (status != 0) failureKind = "io"
     }
     if (!cached) {
+        // The runtime key identifies the transformed source. A program
+        // object cache hit needs neither its parser nor its discovery view.
+        if (fastRuntime.objectPath != "") bootstrapFastRuntimeApply(
+            orderedSnapshots, bootstrapNormalizeModulePath(runtimePlatform), fastRuntime.source, moduleState
+        )
         bootstrapLlvmTraceMemory("frontend.parse.begin")
         var parsedGraph = graph.parse()
         bootstrapLlvmTraceMemory(
@@ -4688,6 +4947,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         val enclosingInlineThreshold = bootstrapLlvmFastInlineThreshold
         val enclosingHoldModule = bootstrapLlvmHoldModule
         val enclosingSmallLoopNests = bootstrapLlvmDetectSmallLoopNests
+        val enclosingRuntimeObjectProducer = bootstrapLlvmFastRuntimeExports
+        bootstrapLlvmFastRuntimeExports = fastRuntimeExports
         val enclosingInitializerChunk = bootstrapLlvmInitializerChunk
         val enclosingStackGuard = bootstrapLlvmStackGuard
         val enclosingOwnMemoryRoutines = bootstrapLlvmOwnMemoryRoutines
@@ -4787,6 +5048,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmFastInlineThreshold = enclosingInlineThreshold
         bootstrapLlvmHoldModule = enclosingHoldModule
         bootstrapLlvmDetectSmallLoopNests = enclosingSmallLoopNests
+        bootstrapLlvmFastRuntimeExports = enclosingRuntimeObjectProducer
         bootstrapLlvmInitializerChunk = enclosingInitializerChunk
         bootstrapLlvmStackGuard = enclosingStackGuard
         bootstrapLlvmOwnMemoryRoutines = enclosingOwnMemoryRoutines
@@ -5463,6 +5725,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 link.argument("-Wl,--no-whole-archive")
             }
             else link.argument(linkedObject)
+            if (fastRuntime.objectPath != "") link.argument(fastRuntime.objectPath)
             if (macTarget) link.argument(hostPath)
             if (staticLlvm) {
                 // LLVM's static archives (the three targets the compiler initialises and the core), libstdc++, libz and libgcc, after the
@@ -5614,6 +5877,32 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // object is already the complete packageable sidecar.
     if (status == 0 && target.hosted && artifact == "executable") {
         Path(ltoObjectPath).remove()
+    }
+    // Keep the fast build's relocatable sidecar self-contained. The program
+    // cache still stores the program-only object and the final link receives
+    // the runtime as a separate input, regardless of sidecar publication.
+    if (status == 0 && fastRuntime.objectPath != "") {
+        val cachedSidecar = if (cacheEnabled && compileInputsCacheable) {
+            val linker = if (bootstrapInProcessLinkerInstalled &&
+                linuxEnvironment("ABLA_LINK_INPROCESS").value != "0") "in-process"
+                else bootstrapToolIdentity("ld.lld")
+            bootstrapToolObjectCachePath("$cacheStem.runtime-sidecar", linker)
+        } else ""
+        if (cachedSidecar == "" || !Path(cachedSidecar).info().isFile() ||
+            bootstrapPublishCacheFile(cachedSidecar, combinedObjectPath) != 0) {
+            val merge = linuxCommand("ld.lld")
+            merge.argument("--threads=1").argument("-r").argument("-o").argument(combinedObjectPath)
+            merge.argument("--whole-archive").argument(objectPath).argument("--no-whole-archive")
+            merge.argument(fastRuntime.objectPath)
+            status = bootstrapRunLinker(merge)
+            if (status == 0 && cachedSidecar != "") {
+                bootstrapPublishCacheFile(combinedObjectPath, cachedSidecar)
+            }
+        }
+        if (status == 0 && !Path(combinedObjectPath).moveTo(Path(objectPath))) {
+            status = 145
+            failureKind = "io"
+        }
     }
     Path(ltoPreparedPath).remove()
     if (status == 0 && !rawTarget && artifact == "object") {
@@ -5921,6 +6210,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "error[E_NATIVE_TOOLCHAIN]: native toolchain failed with status $status\n"
         )
     }
+    if (fastRuntime.descriptor >= 0) linuxSyscall1(3, fastRuntime.descriptor)
     bootstrapFloatFormattingRequested = enclosingFloatFormatting
     bootstrapFloatBridgeProbe = enclosingFloatProbe
     bootstrapFloatBridgeAvailable = enclosingFloatAvailable

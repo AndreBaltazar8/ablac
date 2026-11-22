@@ -48,6 +48,13 @@ ablac repl
 ablac serve app.ab
 ```
 
+Set `ABLA_FAST_RUNTIME_OBJECT=1` to try the prebuilt runtime on native x86-64
+Linux `ablac build --fast` executables. The compiler builds and caches the
+runtime object for the installed compiler, runtime sources and build options.
+Editing the runtime selects a new cache entry. `--no-cache` still skips the
+program cache. Builds with an unavailable runtime cache, compile-time code,
+or the background collector use the regular runtime build.
+
 `ablac run` compiles the program in process, runs the `--o1` IR pipeline on it
 (`--fast`: the fast one; `--jit` names this default) and calls it through LLVM
 ORC; its `argv[0]` is the source path. The object LLJIT generated is kept in

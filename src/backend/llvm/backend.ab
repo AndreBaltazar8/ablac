@@ -160,6 +160,38 @@ fun bootstrapEmitLlvmProgram(
     targetTriple, requireMain
 )
 
+// A standalone runtime object publishes only its private link ABI. Keep
+// declarations and LLVM's appending metadata intact for code generation.
+trusted fun bootstrapLlvmLocalizeFastRuntime(module: i64*): void {
+    val exported: Map<string, bool> = Map()
+    for (name in bootstrapLlvmFastRuntimeExports) exported.set(name, true)
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == 0) bootstrapLlvmFastRuntimeLinkage(function, exported)
+        function = LLVMGetNextFunction(function)
+    }
+    var global = LLVMGetFirstGlobal(module)
+    while (!pointerIsNull(global)) {
+        if (LLVMIsDeclaration(global) == 0) bootstrapLlvmFastRuntimeLinkage(global, exported)
+        global = LLVMGetNextGlobal(global)
+    }
+    var alias = LLVMGetFirstGlobalAlias(module)
+    while (!pointerIsNull(alias)) {
+        bootstrapLlvmFastRuntimeLinkage(alias, exported)
+        alias = LLVMGetNextGlobalAlias(alias)
+    }
+}
+
+trusted fun bootstrapLlvmFastRuntimeLinkage(value: i64*, exported: Map<string, bool>): void {
+    val name = bootstrapLlvmDebugValueName(value)
+    if (name.startsWith("llvm.")) return
+    if (exported.has(name)) LLVMSetVisibility(value, llvmHiddenVisibility())
+    else {
+        LLVMSetVisibility(value, 0)
+        LLVMSetLinkage(value, llvmInternalLinkage())
+    }
+}
+
 fun bootstrapEmitLlvmProgramPrepared(
     given: BootstrapIrProgram,
     targetTriple: string,
@@ -355,9 +387,9 @@ fun bootstrapEmitLlvmProgramPrepared(
         bootstrapLlvmTargetIsX8664Linux(targetTriple) && bootstrapLlvmStackGuardKernel(backend) &&
         bootstrapLlvmLoopGlobalsClosed(program, emittedFunctions, functionIndex,
             addressTaken, nativeFunctionRoots)
-    backend.executableTls = requireMain && !backend.macOS &&
-        bootstrapTextContains(targetTriple, "linux") &&
-        functionIndex.find("main") >= 0
+    backend.executableTls = bootstrapLlvmFastRuntimeExports.size > 0 ||
+        (requireMain && !backend.macOS && bootstrapTextContains(targetTriple, "linux") &&
+            functionIndex.find("main") >= 0)
     // Foreign-callable and freestanding firmware artifacts benefit from
     // static scalar-var initialization because it can eliminate their lazy
     // export guard. Keep ordinary main executables on their established code
@@ -762,6 +794,9 @@ fun bootstrapEmitLlvmProgramPrepared(
                 bootstrapLlvmLiveGlobalsEntry(backend, program, identities, bootstrapLlvmLiveGeneration)
                 for (refusal in bootstrapLlvmLiveGlobalRefusals) bootstrapLlvmLiveRefusals.append(refusal)
             }
+        }
+        if (bootstrapLlvmFastRuntimeExports.size > 0) {
+            bootstrapLlvmLocalizeFastRuntime(backend.module)
         }
     }
     LLVMDisposeBuilder(backend.builder)
