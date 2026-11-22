@@ -43,6 +43,7 @@ tools/windows/wine-run.sh "$out/self.exe" > "$out/self.out" 2> "$out/self.err" |
 expect() { grep -qxE "$1" "$out/self.out" || fail "self.exe printed no line matching '$1': $(cat "$out/self.out" "$out/self.err")"; }
 expect 'remainder 1\.5'
 expect 'trim 0 key 38'
+expect 'fchmod 0:292 0:420'
 expect 'stack 8388608 8388608'
 expect 'descriptors 4096'
 expect 'affinity 8 bytes, some CPUs'
