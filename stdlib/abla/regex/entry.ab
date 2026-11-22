@@ -29,15 +29,25 @@ class Regex(
     val classes: array<array<int>>,
     // 256 bytes, one per byte value: 1 when a match can start with that byte (every byte of 128 and over is 1),
     // or "" when a match can start anywhere (an empty match, an assertion or `.` is reachable at the start).
-    val first: string
+    val first: string,
+    // Optional frozen plans for small capture-free literals. The public
+    // program and classes retain their normal representation.
+    val literalChoices: array<string>? = null,
+    val literalDfa: string = ""
 ) {
     /** True when the whole text matches. */
     fun matches(text: string): bool {
+        val choices = this.literalChoices
+        if (choices != null) return regexLiteralWhole(choices, text)
+        if (this.literalDfa != "") return regexLiteralEnd(this.literalDfa, text, true) >= 0
         var vm = regexVm(this, text)
         regexRun(this, vm, 0, true, true, false).size > 0
     }
     /** The match of the whole text with its groups, or null. */
     fun matchFull(text: string): RegexMatch? {
+        if (this.literalChoices != null || this.literalDfa != "") {
+            return if (this.matches(text)) RegexMatch(text, [0, text.size]) else null
+        }
         var vm = regexVm(this, text)
         val spans = regexRun(this, vm, 0, true, true, false)
         if (spans.size == 0) null else RegexMatch(text, spans)
@@ -45,12 +55,45 @@ class Regex(
     /** The leftmost match starting at or after byte offset `start`, or null. */
     fun find(text: string, start: int = 0): RegexMatch? {
         if (start < 0 || start > text.size) return null
+        val choices = this.literalChoices
+        if (choices != null) return regexLiteralFind(choices, text, start)
+        val table = this.literalDfa
+        if (table.size >= 2 && table[1] == 1) {
+            if (start != 0) return null
+            val end = regexLiteralEnd(table, text, false)
+            return if (end >= 0) RegexMatch(text, [0, end]) else null
+        }
         var vm = regexVm(this, text)
         val spans = regexRun(this, vm, start, false, false, false)
         if (spans.size == 0) null else RegexMatch(text, spans)
     }
+    /** Byte offset of the first match at or after start, or -1. */
+    fun findStart(text: string, start: int = 0): int {
+        if (start < 0 || start > text.size) return -1
+        val choices = this.literalChoices
+        if (choices != null) return regexLiteralFindStart(choices, text, start)
+        val table = this.literalDfa
+        if (table.size >= 2 && table[1] == 1)
+            return if (start == 0 && regexLiteralEnd(table, text, false) >= 0) 0 else -1
+        var vm = regexVm(this, text)
+        val spans = regexRun(this, vm, start, false, false, false)
+        if (spans.size == 0) -1 else spans[0]
+    }
+    /** Exclusive byte offset of a match starting at byte zero, or -1. */
+    fun matchPrefixEnd(text: string): int {
+        val choices = this.literalChoices
+        if (choices != null) {
+            for (choice in choices) if (text.startsWith(choice)) return choice.size
+            return -1
+        }
+        val table = this.literalDfa
+        if (table.size >= 2 && table[1] == 1) return regexLiteralEnd(table, text, false)
+        var vm = regexVm(this, text)
+        val spans = regexRun(this, vm, 0, true, false, false)
+        if (spans.size == 0) -1 else spans[1]
+    }
     /**
-     * A diagnostic: the VM steps (instructions added to a thread list, threads advanced) that `find(text)` takes.
+     * The general VM work for `find(text)` (instructions added to a thread list and threads advanced).
      * Never more than 2 * (text.size + 1) * program size, whatever the pattern.
      */
     fun findWork(text: string): int {
@@ -1096,8 +1139,236 @@ private fun regexExpand(m: RegexMatch, replacement: string): string {
     out
 }
 
-// Literal compilation shares the runtime parser, limits and VM. Only the
-// resulting program is emitted; no pattern parser runs in the target program.
+// Recognize up to four ordered, nonempty ASCII string alternatives. Exiting
+// immediately on loops, assertions or classes keeps this work bounded.
+private fun regexLiteralGather(program: array<int>, pc: int, prefix: string,
+    var choices: array<string>): bool {
+    if (pc >= program.size / 3 || prefix.size > 64 || choices.size >= 4) return false
+    val at = pc * 3
+    val op = program[at]
+    val x = program[at + 1]
+    val y = program[at + 2]
+    if (op == 0 && x < 128)
+        return regexLiteralGather(program, pc + 1, prefix + byteEncode(x), choices)
+    if (op == 3 && x > pc && y > pc)
+        return regexLiteralGather(program, x, prefix, choices) &&
+            regexLiteralGather(program, y, prefix, choices)
+    if (op == 4 && x > pc) return regexLiteralGather(program, x, prefix, choices)
+    if (op == 5) return regexLiteralGather(program, pc + 1, prefix, choices)
+    if (op != 7 || prefix == "") return false
+    choices.append(prefix)
+    true
+}
+
+private fun regexLiteralChoices(program: array<int>): array<string> {
+    if (program.size > 3 * 64) return []
+    val choices: array<string> = []
+    if (regexLiteralGather(program, 0, "", choices)) choices else []
+}
+
+private fun regexLiteralWhole(choices: array<string>, text: string): bool {
+    for (choice in choices) if (text == choice) return true
+    false
+}
+
+private fun regexLiteralFind(choices: array<string>, text: string, start: int): RegexMatch? {
+    if (start == 0) {
+        for (choice in choices) {
+            if (text.startsWith(choice)) return RegexMatch(text, [0, choice.size])
+        }
+    }
+    var begin = -1
+    var end = 0
+    for (choice in choices) {
+        val at = text.indexOf(choice, start)
+        if (at == start) return RegexMatch(text, [start, start + choice.size])
+        if (at >= 0 && (begin < 0 || at < begin)) {
+            begin = at
+            end = at + choice.size
+        }
+    }
+    if (begin >= 0) RegexMatch(text, [begin, end]) else null
+}
+
+private @inline fun regexLiteralFindStart(choices: array<string>, text: string, start: int): int {
+    if (choices.size == 1) return text.indexOf(choices[0], start)
+    if (start == 0) {
+        if (text.size == 0) return -1
+        val first = text[0]
+        for (choice in choices) if (choice[0] == first && text.startsWith(choice)) return 0
+    }
+    var begin = -1
+    for (choice in choices) {
+        val at = text.indexOf(choice, start)
+        if (at == start) return start
+        if (at >= 0 && (begin < 0 || at < begin)) begin = at
+    }
+    begin
+}
+
+// Compile small capture-free literals to a deterministic transition table.
+// Bit sets represent consuming program counters and the final match. Groups,
+// positional assertions beyond the initial ^, and large automata use the VM.
+private fun regexLiteralClosure(program: array<int>, start: int): int {
+    val work = [start]
+    var cursor = 0
+    var seen = 0
+    var result = 0
+    while (cursor < work.size) {
+        val pc = work[cursor]
+        cursor += 1
+        val bit = 1 << pc
+        if ((seen & bit) != 0) continue
+        seen = seen | bit
+        val at = pc * 3
+        val op = program[at]
+        if (op == 3) {
+            work.append(program[at + 1])
+            work.append(program[at + 2])
+        } else if (op == 4) work.append(program[at + 1])
+        else if (op == 5 || op == 6) work.append(pc + 1)
+        else result = result | bit
+    }
+    result
+}
+
+private fun regexLiteralAcceptsScalar(program: array<int>, classes: array<array<int>>,
+    pc: int, scalar: int): bool {
+    val at = pc * 3
+    val op = program[at]
+    val x = program[at + 1]
+    if (op == 0) return scalar == x
+    if (op == 1) return scalar != 10
+    op == 2 && regexClassHolds(classes, x, scalar) != (program[at + 2] == 1)
+}
+
+// Only collapse non-ASCII input to one column when every non-ASCII scalar
+// has identical transitions. A range can change membership at either end.
+private fun regexLiteralUniformUnicode(re: Regex): bool {
+    val program = re.program
+    for (pc in 0 until program.size / 3) {
+        val at = pc * 3
+        val op = program[at]
+        val x = program[at + 1]
+        if (op == 0 && x >= 128) return false
+        if (op != 2) continue
+        val ranges = re.classes[x]
+        if (ranges.size > 64) return false
+        val expected = regexClassHolds(re.classes, x, 128)
+        for (i in 0 until ranges.size) {
+            val boundary = ranges[i] + (i & 1)
+            if (boundary > 128 && boundary <= 1114111 &&
+                regexClassHolds(re.classes, x, boundary) != expected) return false
+        }
+    }
+    true
+}
+
+private fun regexLiteralDfa(re: Regex): string {
+    val program = re.program
+    val n = program.size / 3
+    if (n < 3 || n > 32 || !regexLiteralUniformUnicode(re)) return ""
+    val startsAtZero = program[3] == 6 && program[4] == 0
+    for (pc in 0 until n) {
+        if (program[pc * 3] == 6 && !(pc == 1 && startsAtZero)) return ""
+    }
+    val accepting = 1 << (n - 1)
+    val closures: array<int> = []
+    for (pc in 0 until n) closures.append(regexLiteralClosure(program, pc))
+
+    val maskForByte: array<int> = []
+    for (byte in 0..128) {
+        var mask = 0
+        for (pc in 0 until n) {
+            if (regexLiteralAcceptsScalar(program, re.classes, pc, byte)) mask = mask | (1 << pc)
+        }
+        maskForByte.append(mask)
+    }
+
+    val first = closures[0]
+    val states = [0, first]
+    val ids: Map<int, int> = Map()
+    ids.set(0, 0)
+    ids.set(first, 1)
+    val rows = byteBuffer()
+    var prefixFree = startsAtZero
+    var id = 1
+    while (id < states.size) {
+        val state = states[id]
+        val nextIds: Map<int, int> = Map()
+        for (mask in maskForByte) {
+            val active = mask & state
+            var target = nextIds.get(active) ?? -1
+            if (target < 0) {
+                var reached = 0
+                for (pc in 0 until n - 1) {
+                    if ((active & (1 << pc)) != 0) reached = reached | closures[pc + 1]
+                }
+                var next = ids.get(reached) ?? -1
+                if (next < 0) {
+                    if (states.size > 32) return ""
+                    next = states.size
+                    states.append(reached)
+                    ids.set(reached, next)
+                }
+                target = next | (if ((reached & accepting) != 0) 64 else 0)
+                nextIds.set(active, target)
+            }
+            // An early accepting transition is safe for find only if there
+            // is no alternative consuming path from the accepting state.
+            if ((state & accepting) != 0 && active != 0) prefixFree = false
+            rows.appendByteValue(target)
+        }
+        id += 1
+    }
+    val header = byteBuffer()
+    header.appendByteValue(if ((first & accepting) != 0) 65 else 1)
+    header.appendByteValue(if (prefixFree) 1 else 0)
+    header.appendText(rows.toText())
+    header.toText()
+}
+
+private @inline fun regexLiteralEnd(table: string, text: string, needEnd: bool): int {
+    if (ablaCompileTimeNativeHost()) return regexLiteralNativeEnd(table, text, needEnd)
+    if (ablaAtCompileTime()) return regexLiteralInterpretedEnd(table, text, needEnd)
+    return regexLiteralNativeEnd(table, text, needEnd)
+}
+
+private @inline trusted fun regexLiteralNativeEnd(table: string, text: string, needEnd: bool): int {
+    val tableSize = table.size
+    if (tableSize < 2) return -1
+    val data = ablaUnsafeStringAddress(text)
+    val transitions = ablaUnsafeStringAddress(table)
+    val length = text.size
+    var state = ablaUnsafeLoadU8(nativePointerFromAddress(transitions))
+    var cursor = 0
+    while (cursor < length && (needEnd || state < 64)) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(data + cursor))
+        val column = if (byte < 128) byte else 128
+        val index = 2 + ((state & 63) - 1) * 129 + column
+        if (index < 2 || index >= tableSize) return -1
+        state = ablaUnsafeLoadU8(nativePointerFromAddress(transitions + index))
+        if (state == 0) return -1
+        cursor += if (byte < 128) 1 else regexWidth(text, cursor)
+    }
+    if (state >= 64) cursor else -1
+}
+
+private fun regexLiteralInterpretedEnd(table: string, text: string, needEnd: bool): int {
+    var state = table[0]
+    var cursor = 0
+    while (cursor < text.size && (needEnd || state < 64)) {
+        val byte = text[cursor]
+        val column = if (byte < 128) byte else 128
+        state = table[2 + ((state & 63) - 1) * 129 + column]
+        if (state == 0) return -1
+        cursor += if (byte < 128) 1 else regexWidth(text, cursor)
+    }
+    if (state >= 64) cursor else -1
+}
+
+// Literal compilation shares the runtime parser and limits. The frozen
+// matcher carries the program and any bounded specialization.
 compile fun ablaRegexSyntaxIntegers(values: array<int>): SyntaxExpression {
     val items: array<SyntaxExpression> = []
     for (value in values) items.append(syntaxInteger(value))
@@ -1180,6 +1451,13 @@ compile fun ablaRegexParseLiteral(cursor: ParserCursor): SyntaxExpression {
         syntaxString(re.pattern), syntaxInteger(re.groupCount),
         ablaRegexSyntaxIntegers(re.program), syntaxArray(classes), syntaxString(re.first)
     ]
+    if (re.groupCount == 0) {
+        val choices = regexLiteralChoices(re.program)
+        val expressions: array<SyntaxExpression> = []
+        for (choice in choices) expressions.append(syntaxString(choice))
+        arguments.append(if (choices.size == 0) syntaxNull() else syntaxArray(expressions))
+        arguments.append(syntaxString(if (choices.size == 0) regexLiteralDfa(re) else ""))
+    }
     val constructor = syntaxCall("Regex", arguments)
     if (compiled.captureNames.size == 0) syntaxCompile(constructor, pattern)
     else ablaRegexNamedMatcher(cursor, pattern, compiled, constructor)

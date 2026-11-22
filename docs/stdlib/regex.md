@@ -54,9 +54,11 @@ expressions are rejected. Invalid patterns produce `E_SUBPARSER_FAILURE` at
 the literal site, for example `invalid $regex at pattern byte 0: missing ]`.
 The byte offset refers to the decoded pattern, starting at zero. Pattern
 syntax, size limits and numbered capture slots are identical to `regexCompile`.
-Use `regexCompile` for patterns known only at run time. Matching uses the same Pike VM as a previously compiled runtime
-pattern; the literal saves pattern compilation and its allocations. Literal
-compilation also follows the compiler's normal compile-time evaluation limits.
+Use `regexCompile` for patterns known only at run time. Small capture-free
+literals can use direct byte searches and deterministic transition tables.
+The Pike VM handles captures and other general patterns. Literal compilation
+follows the compiler's normal compile-time evaluation limits. A module-level
+`val` lets repeated calls share a matcher and its compiled tables.
 
 The manual `tools/bench-regex-literals.sh` compares repeated compile-and-match,
 literal reuse and reuse of a runtime-compiled matcher, checking identical match
@@ -70,6 +72,8 @@ compiler identity and individual timings.
 | `re.matches(text)` | `bool`: the whole text matches |
 | `re.matchFull(text)` | `RegexMatch?` for a whole-text match, with groups |
 | `re.find(text, start = 0)` | `RegexMatch?`: the leftmost match starting at or after byte `start` |
+| `re.findStart(text, start = 0)` | Byte offset of the leftmost match, or `-1` |
+| `re.matchPrefixEnd(text)` | Exclusive end byte offset of a match starting at byte zero, or `-1` |
 | `re.findAll(text)` | `array<RegexMatch>`, non-overlapping, left to right |
 | `re.replace(text, replacement)` | `string` with every match replaced |
 | `re.groupCount` | number of capturing groups |
