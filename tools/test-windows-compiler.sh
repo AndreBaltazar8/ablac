@@ -41,7 +41,7 @@ done
 { echo .text; grep '^LLVM' "$out/undefined.txt" | while read -r symbol; do printf '.globl %s\n%s:\n    xorl %%eax, %%eax\n    ret\n' "$symbol" "$symbol"; done; } > "$out/stub.s"
 llvm-mc -triple x86_64-pc-windows-msvc -filetype=obj "$out/stub.s" -o "$out/stub.o"
 mkdir -p "$out/package/bin" "$out/package/share/abla" "$out/work"
-lld-link /nologo /subsystem:console /entry:abla_windows_start /nodefaultlib /machine:x64 /brepro /stack:8388608 \
+lld-link /nologo /subsystem:console /entry:abla_windows_start /nodefaultlib /machine:x64 /brepro /stack:134217728 \
     "/out:$out/package/bin/ablac.exe" "$out/ablac.exe.o" "$out/stub.o" "$out"/libs/*.lib > "$out/link.log" 2>&1 ||
     { cat "$out/link.log" >&2; fail "ablac.exe did not link against the stub LLVM"; }
 ln -s "$root/stdlib" "$out/package/share/abla/stdlib"
