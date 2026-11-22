@@ -16,8 +16,10 @@ export import "abla/crypto/result"
 // --- Memory: raw words, aligned because this module allocates them --------------------------
 @inline trusted fun aesPointer(address: int): i64* =
     ablaUnsafePointerOffset(ablaUnsafeNullPointer(), address)
+// Returns a secret 32-bit word from readable native storage.
 @inline trusted fun aesLoad(address: int): secretU32 =
     secretU32(u32(ablaUnsafeLoadU32(aesPointer(address))))
+// Stores a secret 32-bit word at a writable native address.
 @inline trusted fun aesStore(address: int, value: secretU32): void =
     ablaUnsafeStoreU32(aesPointer(address), int(value.declassify()))
 
@@ -30,6 +32,7 @@ export import "abla/crypto/result"
     secretU32(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
 }
 
+// Stores the secret word as four little-endian bytes, allowing unaligned storage.
 @inline trusted fun aesStoreBytes(address: int, value: secretU32): void {
     val bits = value.declassify()
     ablaUnsafeStoreU8(aesPointer(address), int(bits & u32(255)))
@@ -38,6 +41,7 @@ export import "abla/crypto/result"
     ablaUnsafeStoreU8(aesPointer(address + 3), int(bits >> 24))
 }
 
+// Overwrites the writable byte range using volatile stores so the wipe is retained.
 trusted fun aesWipe(address: int, size: int): void {
     // Volatile stores retain the wipe even when it immediately precedes free.
     for (at in 0 until size) ablaUnsafeVolatileStoreU8(address + at, 0)
@@ -202,12 +206,14 @@ trusted fun aesWipe(address: int, size: int): void {
     aesStore(q, q2 ^ q5 ^ q7)
 }
 
+// Applies the inverse AES byte substitution to the bitsliced state in place.
 @inline trusted fun aesInvSubBytes(q: int): void {
     aesInvAffine(q)
     aesSubBytes(q)
     aesInvAffine(q)
 }
 
+// Returns one half of the bit exchange between two orthogonalized AES words.
 @inline fun aesSwap(a: secretU32, b: secretU32, low: u32, high: u32, shift: int,
     first: bool): secretU32 {
     val cl = secretU32(low)
@@ -237,13 +243,16 @@ trusted fun aesWipe(address: int, size: int): void {
     }
 }
 
+// XORs the round-key words into the bitsliced AES state.
 @inline trusted fun aesAddRoundKey(q: int, key: int): void {
     for (i in 0 until 8) aesStore(q + i * 4, aesLoad(q + i * 4) ^ aesLoad(key + i * 4))
 }
 
+// Returns the masked word shifted in the selected direction.
 @inline fun aesMaskShift(x: secretU32, mask: u32, count: int, left: bool): secretU32 =
     if (left) (x & secretU32(mask)) << count else (x & secretU32(mask)) >> count
 
+// Applies the AES row permutation to the bitsliced state in place.
 @inline trusted fun aesShiftRows(q: int): void {
     for (i in 0 until 8) {
         val x = aesLoad(q + i * 4)
@@ -254,6 +263,7 @@ trusted fun aesWipe(address: int, size: int): void {
     }
 }
 
+// Applies the inverse AES row permutation to the bitsliced state in place.
 @inline trusted fun aesInvShiftRows(q: int): void {
     for (i in 0 until 8) {
         val x = aesLoad(q + i * 4)
@@ -264,6 +274,7 @@ trusted fun aesWipe(address: int, size: int): void {
     }
 }
 
+// Applies the AES column mixing step to the bitsliced state in place.
 @inline trusted fun aesMixColumns(q: int): void {
     val q0 = aesLoad(q)
     val q1 = aesLoad(q + 4)
@@ -312,9 +323,11 @@ trusted fun aesWipe(address: int, size: int): void {
     aesMixColumns(q)
 }
 
+// Encrypts the valid bitsliced state in place with the supplied round schedule.
 @noinline trusted fun aesSoftEncryptCore(q: int, keys: int, rounds: int): void =
     aesSoftEncryptBody(q, keys, rounds)
 
+// Decrypts the valid bitsliced state in place with the supplied round schedule.
 @noinline trusted fun aesSoftDecryptCore(q: int, keys: int, rounds: int): void =
     aesSoftDecryptBody(q, keys, rounds)
 
@@ -332,6 +345,7 @@ trusted fun aesWipe(address: int, size: int): void {
     aesAddRoundKey(q, keys + rounds * 32)
 }
 
+// Runs the inverse AES rounds on a bitsliced state using the expanded keys.
 @inline trusted fun aesSoftDecryptBody(q: int, keys: int, rounds: int): void {
     aesAddRoundKey(q, keys + rounds * 32)
     var round = rounds - 1
@@ -352,14 +366,17 @@ trusted fun aesWipe(address: int, size: int): void {
 /** An AES key's expanded form, in memory this module owns. `words` is the schedule (little-endian
  *  words, 4 a round); `sliced` the bitsliced round keys, or 0 if hardware rounds take over. */
 resource class AesKey(val memory: int, val size: int, val rounds: int, val hardware: bool) {
+    // Wipes and frees the owned expanded key and scratch memory.
     trusted fun drop(): void {
         aesWipe(this.memory, this.size)
         ablaUnsafeFree(aesPointer(this.memory))
     }
 }
 
+// Returns the address of the expanded round-key schedule owned by the key.
 @inline fun AesKey.schedule(): int = this.memory + AES_SCRATCH_BYTES
 
+// Returns an owned expanded AES key from a valid 16-, 24-, or 32-byte key.
 @noinline trusted fun aesExpand(key: string, hardware: bool): AesKey =
     aesExpandBytes(0, key.size, hardware, key)
 
@@ -485,12 +502,15 @@ private @target("aes") @noinline trusted fun aesHardwareDecryptAt(keys: int, rou
 }
 // END AES KEY EXPANSION
 
+// Returns the address of the hardware decryption round-key schedule.
 @inline fun AesKey.decryption(): int = aesDecryptionAt(this.schedule(), this.rounds)
 
+// Encrypts the requested number of complete blocks using an AES-capable CPU and valid buffers.
 @target("aes")
 @noinline trusted fun aesHardwareEncrypt(key: AesKey, input: int, output: int, count: int): void =
     aesHardwareEncryptAt(key.schedule(), key.rounds, input, output, count)
 
+// Decrypts the requested number of complete blocks using an AES-capable CPU and valid buffers.
 @target("aes")
 @noinline trusted fun aesHardwareDecrypt(key: AesKey, input: int, output: int, count: int): void =
     aesHardwareDecryptAt(key.decryption(), key.rounds, input, output, count)
@@ -520,6 +540,7 @@ trusted fun aesSoftBlocks(key: AesKey, encrypt: bool, input: int, output: int, c
     aesWipe(q, 32)
 }
 
+// Encrypts or decrypts the requested complete blocks using the key's selected implementation and valid buffers.
 trusted fun aesBlocks(key: AesKey, encrypt: bool, input: int, output: int, count: int): void {
     if (key.hardware) {
         if (encrypt) aesHardwareEncrypt(key, input, output, count)
@@ -532,15 +553,19 @@ trusted fun aesBlocks(key: AesKey, encrypt: bool, input: int, output: int, count
 // them, 1 the bitsliced ones.
 private trusted fun aesSoftwareOnlyCell(): i64* = nativePointerFromAddress(nativeStaticAllocate(4))
 
+// Enables or disables selection of hardware acceleration for newly prepared AES operations.
 trusted fun aesSetHardware(enabled: bool): void {
     ablaUnsafeStoreU32(aesSoftwareOnlyCell(), if (enabled) 0 else 1)
     return
 }
 
+// Returns true when AES hardware acceleration has not been disabled.
 trusted fun aesHardwareEnabled(): bool = ablaUnsafeLoadU32(aesSoftwareOnlyCell()) == 0
 
+// Returns true when AES hardware acceleration is enabled and available on this CPU.
 fun aesHardwareAvailable(): bool = cpuHas("aes") && aesHardwareEnabled()
 
+// Returns empty text for a 16-, 24-, or 32-byte key, or a key-size error otherwise.
 fun aesKeySizeError(key: string): string =
     if (key.size == 16 || key.size == 24 || key.size ==
         32) "" else "an AES key has 16, 24 or 32 bytes"
@@ -560,11 +585,13 @@ fun aesKeySizeError(key: string): string =
     bad
 }
 
+// Returns the byte count from a valid padded final block, or -1 for invalid padding.
 trusted fun aesPaddingLength(address: int): int {
     if (aesPaddingBad(address).declassify() != u32(0)) return -1
     ablaUnsafeLoadU8(aesPointer(address + 15))
 }
 
+// Returns a native buffer containing the plaintext and enough padding to fill complete AES blocks.
 trusted fun aesPadded(plaintext: string): NativeByteBuffer {
     val padding = 16 - plaintext.size % 16
     val total = plaintext.size + padding
@@ -575,6 +602,7 @@ trusted fun aesPadded(plaintext: string): NativeByteBuffer {
     buffer
 }
 
+// Returns padded AES-ECB ciphertext or an error for an unsupported key length.
 trusted fun aesEcbEncryptPkcs5(key: string, plaintext: string): CryptoResult {
     val result = aesEcbEncryptPkcs5Work(key, plaintext)
     ctScrubStack2048()
@@ -592,6 +620,7 @@ private @noinline trusted fun aesEcbEncryptPkcs5Work(key: string, plaintext: str
     CryptoResult(buffer.adoptString(total), true, "")
 }
 
+// Returns unpadded AES-ECB plaintext or an error for an invalid key, ciphertext length, or padding.
 trusted fun aesEcbDecryptPkcs5(key: string, ciphertext: string): CryptoResult {
     val result = aesEcbDecryptPkcs5Work(key, ciphertext)
     ctScrubStack2048()
@@ -612,6 +641,7 @@ private @noinline trusted fun aesEcbDecryptPkcs5Work(key: string,
     aesFinishDecrypt(buffer, address, ciphertext.size)
 }
 
+// Returns the plaintext with valid padding removed, or wipes the buffer and reports invalid padding.
 trusted fun aesFinishDecrypt(var buffer: NativeByteBuffer, address: int, size: int): CryptoResult {
     val padding = aesPaddingLength(address + size - 16)
     if (padding < 0) {
@@ -622,6 +652,7 @@ trusted fun aesFinishDecrypt(var buffer: NativeByteBuffer, address: int, size: i
     CryptoResult(buffer.adoptString(size - padding), true, "")
 }
 
+// Returns padded AES-CBC ciphertext or an error for an invalid key or IV.
 trusted fun aesCbcEncryptPkcs7(key: string, iv: string, plaintext: string): CryptoResult {
     val result = aesCbcEncryptPkcs7Work(key, iv, plaintext)
     ctScrubStack2048()
@@ -655,6 +686,7 @@ private @noinline trusted fun aesCbcEncryptPkcs7Work(key: string, iv: string,
     CryptoResult(buffer.adoptString(total), true, "")
 }
 
+// Returns unpadded AES-CBC plaintext or an error for an invalid key, IV, ciphertext length, or padding.
 trusted fun aesCbcDecryptPkcs7(key: string, iv: string, ciphertext: string): CryptoResult {
     val result = aesCbcDecryptPkcs7Work(key, iv, ciphertext)
     ctScrubStack2048()
@@ -713,6 +745,7 @@ private trusted fun aesCbcDecryptExpanded(key: AesKey, iv: string,
 // GHASH multiplies in GF(2^128). Software shifts through H with masks, 128 steps for each block with
 // no table; hardware uses carry-less multiply.
 
+// Returns the secret word encoded by four big-endian bytes from readable storage.
 @inline trusted fun aesLoadBig(address: int): secretU32 {
     val b0 = u32(ablaUnsafeLoadU8(aesPointer(address)))
     val b1 = u32(ablaUnsafeLoadU8(aesPointer(address + 1)))
@@ -721,6 +754,7 @@ private trusted fun aesCbcDecryptExpanded(key: AesKey, iv: string,
     secretU32((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
 }
 
+// Stores a secret word as four big-endian bytes at a writable address.
 @inline trusted fun aesStoreBig(address: int, value: secretU32): void {
     val bits = value.declassify()
     ablaUnsafeStoreU8(aesPointer(address), int(bits >> 24))
@@ -729,6 +763,7 @@ private trusted fun aesCbcDecryptExpanded(key: AesKey, iv: string,
     ablaUnsafeStoreU8(aesPointer(address + 3), int(bits & u32(255)))
 }
 
+// Multiplies the GHASH accumulator by the hash subkey in software and stores the product in place.
 @noinline trusted fun ghashSoftMultiply(y: int, h: int): void = ghashSoftMultiplyBody(y, h)
 
 /** `y` = `y` * `h`, both 16 big-endian bytes, in GCM's bit order. */
@@ -762,13 +797,20 @@ private trusted fun aesCbcDecryptExpanded(key: AesKey, iv: string,
     aesStoreBig(y + 12, z3)
 }
 
+// Returns the bytes of the GHASH vector in reverse order.
 @inline fun ghashReverse(a: u8x16): u8x16 = u8x16Shuffle(a, a, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6,
     5, 4, 3, 2, 1, 0)
+// Returns the vector shifted left eight bytes with zeros filling the low half.
 @inline fun ghashBytesLeft8(a: u64x2): u64x2 = u64x2Shuffle(a, u64x2Splat(u64(0)), 2, 0)
+// Returns the vector shifted right eight bytes with zeros filling the high half.
 @inline fun ghashBytesRight8(a: u64x2): u64x2 = u64x2Shuffle(a, u64x2Splat(u64(0)), 1, 2)
+// Returns the vector shifted left one 32-bit lane with a zero low lane.
 @inline fun ghashWordsLeft1(a: u32x4): u32x4 = u32x4Shuffle(a, u32x4Splat(u32(0)), 4, 0, 1, 2)
+// Returns the vector shifted left three 32-bit lanes with zeros filling the low lanes.
 @inline fun ghashWordsLeft3(a: u32x4): u32x4 = u32x4Shuffle(a, u32x4Splat(u32(0)), 4, 4, 4, 0)
+// Returns the vector shifted right one 32-bit lane with a zero high lane.
 @inline fun ghashWordsRight1(a: u32x4): u32x4 = u32x4Shuffle(a, u32x4Splat(u32(0)), 1, 2, 3, 4)
+// Returns the vector shifted right three 32-bit lanes with zeros filling the high lanes.
 @inline fun ghashWordsRight3(a: u32x4): u32x4 = u32x4Shuffle(a, u32x4Splat(u32(0)), 3, 4, 4, 4)
 
 /** As ghashSoftMultiply, with carry-less multiply (Gueron and Kounavis's reduction). */
@@ -823,6 +865,7 @@ private trusted fun aesCbcDecryptExpanded(key: AesKey, iv: string,
     ghashReverse(result.asU8x16()).storeAddress(y)
 }
 
+// Folds the input bytes into the GHASH accumulator, padding the final partial block with zeros.
 trusted fun ghashUpdate(y: int, h: int, input: int, size: int, hardware: bool): void {
     var at = 0
     if (hardware && size >= 64) {
@@ -947,6 +990,7 @@ trusted fun aesGcmCrypt(key: AesKey, counter: int, input: int, output: int, size
     }
 }
 
+// Encodes the byte count as a big-endian bit length in a writable GCM length field.
 trusted fun aesGcmStoreLength(address: int, count: int): void {
     val bits = count * 8
     ablaUnsafeStoreU8(aesPointer(address), 0)
@@ -956,15 +1000,23 @@ trusted fun aesGcmStoreLength(address: int, count: int): void {
     aesStoreBig(address + 4, secretU32(u32(bits)))
 }
 
+// Holds native working storage for a GCM counter, hash accumulator, and tag calculation.
 class AesGcmState(val memory: int) {
+    // Returns the native address of the GCM counter block.
     fun counter(): int = this.memory
+    // Returns the native address of the GCM block scratch area.
     fun batch(): int = this.memory + 16
+    // Returns the native address of the GHASH accumulator.
     fun y(): int = this.memory + 32
+    // Returns the native address of the GHASH subkey.
     fun h(): int = this.memory + 48
+    // Returns the native address of the encrypted initial counter used to mask the tag.
     fun tagMask(): int = this.memory + 64
+    // Returns the native address of the final GHASH length block.
     fun lengths(): int = this.memory + 80
 }
 
+// Allocates and returns GCM state for a valid 12-byte nonce and incorporates the associated data.
 trusted fun aesGcmStart(key: AesKey, nonce: string, associatedData: string,
     hardware: bool): AesGcmState {
     val memory = ablaUnsafePointerAddress(ablaUnsafeAllocate(96))
@@ -980,6 +1032,7 @@ trusted fun aesGcmStart(key: AesKey, nonce: string, associatedData: string,
     state
 }
 
+// Writes a 16-byte tag using the accumulated hash and lengths, then clears and frees the state.
 trusted fun aesGcmTag(state: AesGcmState, associatedSize: int, textSize: int, hardware: bool,
     output: int): void {
     aesGcmStoreLength(state.lengths(), associatedSize)
@@ -1004,8 +1057,10 @@ trusted fun aesGcmTag(state: AesGcmState, associatedSize: int, textSize: int, ha
     ablaUnsafeFree(aesPointer(state.memory))
 }
 
+// Returns true when enabled hardware carries out the GHASH carry-less multiply.
 fun aesGcmHardware(): bool = cpuHas("clmul") && aesHardwareEnabled()
 
+// Returns ciphertext followed by its authentication tag, or an error for an invalid key or nonce size.
 trusted fun aesGcmEncrypt(key: string, nonce: string, plaintext: string,
     associatedData: string = ""): CryptoResult {
     val result = aesGcmEncryptWork(key, nonce, plaintext, associatedData)
@@ -1030,6 +1085,7 @@ private @noinline trusted fun aesGcmEncryptWork(key: string, nonce: string, plai
     CryptoResult(buffer.adoptString(plaintext.size + 16), true, "")
 }
 
+// Returns authenticated plaintext or an error for invalid sizes or failed authentication.
 trusted fun aesGcmDecrypt(key: string, nonce: string, ciphertext: string,
     associatedData: string = ""): CryptoResult {
     val result = aesGcmDecryptWork(key, nonce, ciphertext, associatedData)
@@ -1160,6 +1216,7 @@ private @noinline trusted fun aesGcmOpenHw(schedule: int, rounds: int, nonce: st
 
 /** The kept hardware key of aesGcmKeyNew as an owner: dropped, the memory is wiped and freed, so a connection that holds one needs no release call. A single owner (move it). */
 resource class AesGcmKey(val memory: int, val keySize: int) {
+    // Wipes and frees the retained GCM key material.
     trusted fun drop(): void {
         aesGcmKeyFree(this.memory, this.keySize)
     }
@@ -1171,8 +1228,10 @@ fun aesGcmKeyOwner(key: string): AesGcmKey? {
     if (memory == 0) null else AesGcmKey(memory, key.size)
 }
 
+// Returns ciphertext and its tag using the retained key, or an error for invalid inputs.
 fun AesGcmKey.seal(nonce: string, plaintext: string, associatedData: string = ""): CryptoResult =
     aesGcmSealWithKey(this.memory, this.keySize, nonce, plaintext, associatedData)
 
+// Returns plaintext using the retained key, or an error for invalid inputs or failed authentication.
 fun AesGcmKey.open(nonce: string, ciphertext: string, associatedData: string = ""): CryptoResult =
     aesGcmOpenWithKey(this.memory, this.keySize, nonce, ciphertext, associatedData)
