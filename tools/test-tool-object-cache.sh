@@ -65,7 +65,8 @@ fail() {
     exit 1
 }
 build() { # build arguments
-    PATH="$work/shims:$PATH" ABLA_LLVM_TOOLS="$work/shims" ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 \
+    # This test observes the external llc shim even when the compiler can emit objects itself.
+    PATH="$work/shims:$PATH" ABLA_LLVM_TOOLS="$work/shims" ABLA_CODEGEN_INPROCESS=0 ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 \
         "$project_root/tools/run-limited.sh" "$payload" build main.ab "$@" \
         >build.log 2>&1 || { cat build.log >&2; fail "build $* failed"; }
 }
