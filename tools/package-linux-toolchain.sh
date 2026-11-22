@@ -20,8 +20,11 @@ for directory in "$abla_root/runtime" "$abla_root/stdlib"; do
         exit 1
     }
 done
-for tool in clang ld.lld llc lld llvm-ar llvm-as llvm-config llvm-extract llvm-readelf llvm-split \
-    opt patchelf wasm-ld wasm-opt; do
+tools_to_copy=(clang ld.lld llc lld llvm-ar llvm-as llvm-config llvm-extract llvm-readelf llvm-split opt wasm-ld wasm-opt)
+if [[ -n ${ABLA_PORTABLE_LLVM_ROOT:-} ]]; then
+    tools_to_copy+=(llvm-dwarfdump)
+fi
+for tool in "${tools_to_copy[@]}" patchelf; do
     command -v "$tool" >/dev/null 2>&1 || {
         printf 'missing packaging tool: %s\n' "$tool" >&2
         exit 1
@@ -44,8 +47,7 @@ mkdir -p "$bundle/bin" "$bundle/lib" "$bundle/libexec" \
     "$bundle/share/abla" "$bundle/share/licenses"
 
 cp "$compiler_binary" "$bundle/libexec/ablac.bin"
-for tool in clang ld.lld llc lld llvm-ar llvm-as llvm-config llvm-extract llvm-readelf llvm-split \
-    opt wasm-ld wasm-opt; do
+for tool in "${tools_to_copy[@]}"; do
     cp "$(realpath "$(command -v "$tool")")" "$bundle/libexec/$tool"
     ln -s "../libexec/$tool" "$bundle/bin/$tool"
 done

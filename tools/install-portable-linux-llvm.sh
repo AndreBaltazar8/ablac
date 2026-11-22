@@ -23,7 +23,8 @@ test "$(head -n 1 "$prefix/SOURCE")" = "$name"
 grep -Fxq "$patch_sha  nix/llvm-instcombine-fdiv-zero.patch" "$prefix/SOURCE"
 grep -Fxq 'glibc 2.35' "$prefix/SOURCE"
 test -f "$prefix/lib/libLLVM.so.23.1"
-for tool in clang ld.lld llc lld llvm-ar llvm-as llvm-config llvm-extract llvm-readelf llvm-split opt wasm-ld; do
+test -f "$prefix/lib/libclang-cpp.so.23.1"
+for tool in clang ld.lld llc lld llvm-ar llvm-as llvm-config llvm-dwarfdump llvm-extract llvm-readelf llvm-split opt wasm-ld; do
     test -x "$prefix/bin/$tool"
 done
 printf '%s\n' "$prefix"
