@@ -3,7 +3,7 @@
 # its source file's directory, inside its project, in both tiers alike (a native slice's file operations reach the
 # same providers through the bridge). The same site, built from the
 # repository root, from its own directory and from a decoy's (with a data.txt of its own), in ABLA_COMPILE_EVAL=interp
-# and =jit: the same program and the same files. A write above the package is refused (E_BUILD_PATH_OUTSIDE); the
+# and =jit: the same program and the same files. A write above the package is refused (E_BUILD_PATH_OUTSIDE), an absolute read is as given; the
 # working-directory reading builds with W_BUILD_PATH_CWD and fails under ABLA_BUILD_PATH_CWD=error.
 # A library's writes for a transform or a subparser go where the file using them says, not beside the library.
 set -euo pipefail
@@ -66,6 +66,18 @@ for tier in interp jit; do
     fi
     grep -q 'E_BUILD_PATH_OUTSIDE' "$out/escape-$tier.log" || fail "$tier: no E_BUILD_PATH_OUTSIDE" "$out/escape-$tier.log"
     [[ ! -e $out/compile-paths-escape.txt ]] || fail "$tier: the escaping write happened"
+
+    # An absolute path outside the project: read as given, written never.
+    (cd "$project_root" && ABLA_COMPILE_EVAL=$tier "$compiler" build "$relative/sub/absolute.ab" -o "$out/absolute" \
+        --no-cache) > "$out/absolute-$tier.log" 2>&1 || fail "$tier: an absolute read outside the project didn't build" "$out/absolute-$tier.log"
+    set +e; "$out/absolute"; status=$?; set -e
+    [[ $status == 1 ]] || fail "$tier: the absolute read gave $status" "$out/absolute-$tier.log"
+    if (cd "$project_root" && ABLA_COMPILE_EVAL=$tier "$compiler" build "$relative/sub/absolute-write.ab" \
+        -o "$out/absolute-write" --no-cache) > "$out/absolute-write-$tier.log" 2>&1; then
+        fail "$tier: an absolute write outside the project built" "$out/absolute-write-$tier.log"
+    fi
+    grep -q 'E_BUILD_PATH_OUTSIDE' "$out/absolute-write-$tier.log" ||
+        fail "$tier: the absolute write gave no E_BUILD_PATH_OUTSIDE" "$out/absolute-write-$tier.log"
 
     (cd "$package" && ABLA_COMPILE_EVAL=$tier "$compiler" build sub/legacy.ab -o "$out/legacy" --no-cache) \
         > "$out/legacy-$tier.log" 2>&1 || fail "$tier: the working-directory reading didn't build" "$out/legacy-$tier.log"

@@ -404,10 +404,12 @@ runs for: a `#` site's own file, the file that uses a `$subparser`, or the file 
 `#compiler.transform`'s handler. A library function any of them calls (a build helper, the subparser's handler)
 reads and writes where that file says, not beside the library.
 
-Paths stay inside the source file's project: the nearest directory above it whose `abla.toml` names a package
-(`name = ...`; a manifest that only grants capabilities bounds nothing), else the repository root (`.git`), else the
-working directory. A path that leaves it, relative or absolute, is `E_BUILD_PATH_OUTSIDE` and the operation fails:
-a library's compile-time code, called for a program, reads and writes only inside that program's project. A `trusted.native`
+Relative paths stay inside the source file's project: the nearest directory above it whose `abla.toml` names a
+package (`name = ...`; a manifest that only grants capabilities bounds nothing), else the repository root (`.git`),
+else the working directory. A relative path that leaves it, and a write, move or removal of an absolute path outside
+it, is `E_BUILD_PATH_OUTSIDE` and the operation fails: a library's compile-time code, called for a program, writes
+only inside that program's project. An absolute path is read as given, wherever it is (an SDK in `/nix/store`, a
+toolchain, `/proc/self/exe`): `filesystem.read` is what grants that. A `trusted.native`
 site's own raw system calls (`linuxOpen` and the like) are not resolved, as nothing else of its native access is
 checked.
 
@@ -499,9 +501,10 @@ Under `#`, the `abla/fs` writes, moves and removals, and `compilerWriteFile`,
 are real writes, as at run time: each one is on disk when the call returns, so
 what the site does next sees it. That holds for its reads, its own system calls
 (`linkTo`, `permissions`, raw `openat`) and the processes it starts
-(`compilerRunProcess`, `compilerCaptureProcess`), in both tiers. The paths it
-names stay inside its source file's project
-([paths at compile time](#paths-at-compile-time)); the processes it starts are
+(`compilerRunProcess`, `compilerCaptureProcess`), in both tiers. What it
+writes stays inside its source file's project, and relative paths are read
+there too; absolute ones are read as given
+([paths at compile time](#paths-at-compile-time)). The processes it starts are
 not held to that. `removeTree()` asks what
 a path is without following links, which is native code (`trusted.native`);
 so are `linkTo`, `linkTarget` and `linkInfo`.
