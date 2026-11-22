@@ -94,6 +94,45 @@ trusted noescape extern:"c" fun FindClose(search: int): int
 trusted noescape extern:"c" fun GetFileAttributesW(path: int): int
 /** bcryptprimitives ProcessPrng: fills size bytes at buffer with cryptographically secure random bytes; returns non-zero (it cannot fail on Windows 10 and later). */
 trusted noescape extern:"c" fun ProcessPrng(buffer: int, size: int): int
+/** ws2_32 WSAStartup: initialises Winsock for version (0x0202 is 2.2), filling the 408-byte WSADATA at data; returns 0 on success. */
+trusted noescape extern:"c" fun WSAStartup(version: int, data: int): int
+/** ws2_32 WSAGetLastError: the calling thread's last Winsock error code. */
+trusted noescape extern:"c" fun WSAGetLastError(): int
+/** ws2_32 socket: creates a socket of the address family, type and protocol; returns it, or -1 (INVALID_SOCKET) when it fails. */
+trusted noescape extern:"c" fun socket(family: int, kind: int, protocol: int): int
+/** ws2_32 closesocket: closes a socket; returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun closesocket(socket: int): int
+/** ws2_32 connect: connects a socket to the address (a sockaddr of length bytes); returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun connect(socket: int, address: int, length: int): int
+/** ws2_32 bind: binds a socket to the address (a sockaddr of length bytes); returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun bind(socket: int, address: int, length: int): int
+/** ws2_32 listen: puts a socket in the listening state with the backlog; returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun listen(socket: int, backlog: int): int
+/** ws2_32 accept: takes a pending connection of a listening socket, storing the peer's address and its length; returns the new socket, or -1 when it fails. */
+trusted noescape extern:"c" fun accept(socket: int, address: int, length: int): int
+/** ws2_32 send: sends count bytes at buffer; returns the bytes sent, or -1 on failure. */
+trusted noescape extern:"c" fun send(socket: int, buffer: int, count: int, flags: int): int
+/** ws2_32 recv: receives up to count bytes into buffer; returns the bytes received, 0 when the peer closed, or -1 on failure. */
+trusted noescape extern:"c" fun recv(socket: int, buffer: int, count: int, flags: int): int
+/** ws2_32 sendto: sends count bytes at buffer to the address; returns the bytes sent, or -1 on failure. */
+trusted noescape extern:"c" fun sendto(socket: int, buffer: int, count: int, flags: int, address: int, length: int): int
+/** ws2_32 recvfrom: receives up to count bytes into buffer, storing the sender's address and its length; returns the bytes received, or -1 on failure. */
+trusted noescape extern:"c" fun recvfrom(socket: int, buffer: int, count: int, flags: int, address: int, length: int): int
+/** ws2_32 shutdown: disables sending (1), receiving (0) or both (2) on a socket; returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun shutdown(socket: int, how: int): int
+/** ws2_32 setsockopt: sets a socket option (level and option as Windows numbers them) from length bytes at value; returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun setsockopt(socket: int, level: int, option: int, value: int, length: int): int
+/** ws2_32 getsockopt: reads a socket option into value, its length at length; returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun getsockopt(socket: int, level: int, option: int, value: int, length: int): int
+/** ws2_32 getsockname: stores the local address of a socket and its length; returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun getsockname(socket: int, address: int, length: int): int
+/** ws2_32 getpeername: stores the peer address of a connected socket and its length; returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun getpeername(socket: int, address: int, length: int): int
+/** ws2_32 ioctlsocket: runs a control command on a socket (FIONBIO sets non-blocking mode from the word at argument, FIONREAD stores the bytes pending); returns 0 on success, -1 on failure. */
+trusted noescape extern:"c" fun ioctlsocket(socket: int, command: int, argument: int): int
+/** ws2_32 WSAPoll: waits up to milliseconds (-1: for ever) for events on count WSAPOLLFD entries (16 bytes: socket, events, revents); returns the number of ready entries, 0 on timeout, -1 on failure. */
+trusted noescape extern:"c" fun WSAPoll(entries: int, count: int, milliseconds: int): int
+
 
 
 // A thread's own 64 bytes for out-parameters (a written count, a clock reading): the loader gives each thread a copy of the
@@ -400,7 +439,7 @@ private trusted fun __ablaRuntimeWindowsClose(fd: int): int {
         val page = ablaRuntimeLoadI64(entry + 16)
         if (page != 0) VirtualFree(page, 0, 32768)
     }
-    CloseHandle(handle)
+    if (ablaRuntimeLoadI64(entry + 8) == 3) closesocket(handle) else CloseHandle(handle)
     ablaRuntimeAtomicStoreI64(entry, 0)
     0
 }
@@ -496,6 +535,12 @@ private trusted fun __ablaRuntimeWindowsWorkingDirectory(buffer: int, size: int)
 private trusted fun __ablaRuntimeWindowsFileCall(number: int, a0: int, a1: int, a2: int, a3: int): int {
     // read(fd, buffer, count)
     if (number == 0) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket != 0) {
+            val received = recv(socket, a1, a2, 0)
+            if (received < 0) return __ablaRuntimeWindowsSocketErrno()
+            return received
+        }
         val handle = __ablaRuntimeWindowsHandle(a0)
         if (handle == 0) return -9
         val scratch = __ablaRuntimeWindowsScratch()
@@ -619,10 +664,318 @@ private trusted fun __ablaRuntimeWindowsFileCall(number: int, a0: int, a1: int, 
     -1000
 }
 
+// ---- sockets: Winsock behind the same descriptors ----
+// A socket is a descriptor of kind 3 whose handle word is the SOCKET; read, write and close on it are recv, send and closesocket.
+// Numbers that differ between Linux and Windows are translated both ways: the address family (AF_INET6 is 10 and 23), socket levels
+// and options, flags, poll events and errors (WSAEWOULDBLOCK is EAGAIN, and EINPROGRESS for a connect). Winsock is started on the first
+// socket. A poll covers sockets; any other descriptor (a file, standard input) is reported ready.
+
+private trusted fun __ablaRuntimeWindowsWinsockCell(): int = nativeStaticAllocate(8)
+
+// Starts Winsock once; true when it is up.
+private trusted fun __ablaRuntimeWindowsWinsock(): bool {
+    val cell = __ablaRuntimeWindowsWinsockCell()
+    if (ablaRuntimeAtomicLoadI64(cell) == 2) return true
+    if (ablaRuntimeAtomicCompareExchangeI64(cell, 0, 1) == 0) {
+        val data = VirtualAlloc(0, 4096, 12288, 4)
+        val started = data != 0 && WSAStartup(514, data) == 0
+        if (data != 0) VirtualFree(data, 0, 32768)
+        ablaRuntimeAtomicStoreI64(cell, if (started) 2 else 3)
+        return started
+    }
+    while (ablaRuntimeAtomicLoadI64(cell) == 1) Sleep(1)
+    ablaRuntimeAtomicLoadI64(cell) == 2
+}
+
+// The errno of the last Winsock failure.
+private trusted fun __ablaRuntimeWindowsSocketErrno(): int {
+    val code = WSAGetLastError() & 4294967295
+    if (code == 10035) return -11
+    if (code == 10036 || code == 10037) return -115
+    if (code == 10004) return -4
+    if (code == 10009) return -9
+    if (code == 10013) return -13
+    if (code == 10014) return -14
+    if (code == 10022) return -22
+    if (code == 10024) return -24
+    if (code == 10038) return -88
+    if (code == 10040) return -90
+    if (code == 10043) return -93
+    if (code == 10047) return -97
+    if (code == 10048) return -98
+    if (code == 10049) return -99
+    if (code == 10050 || code == 10051) return -101
+    if (code == 10053) return -103
+    if (code == 10054) return -104
+    if (code == 10055) return -105
+    if (code == 10056) return -106
+    if (code == 10057) return -107
+    if (code == 10058) return -108
+    if (code == 10060) return -110
+    if (code == 10061) return -111
+    if (code == 10064 || code == 10065) return -113
+    -5
+}
+
+// The SOCKET of descriptor `fd`, or 0 when it is not an open socket.
+private trusted fun __ablaRuntimeWindowsSocketOf(fd: int): int {
+    if (fd < 3 || fd >= __ablaRuntimeWindowsFdCount) return 0
+    val table = __ablaRuntimeWindowsFds()
+    if (table == 0) return 0
+    val entry = table + fd * 64
+    if (ablaRuntimeLoadI64(entry + 8) != 3) return 0
+    ablaRuntimeAtomicLoadI64(entry)
+}
+
+// The address family of the sockaddr at `address` between Linux's and Windows's numbering (in place; the layouts match).
+private trusted fun __ablaRuntimeWindowsFamily(address: int, toWindows: bool): void {
+    if (address == 0) return
+    val family = ablaRuntimeLoadU8(address) + ablaRuntimeLoadU8(address + 1) * 256
+    if (toWindows && family == 10) ablaRuntimeStoreU8(address, 23)
+    if (!toWindows && family == 23) ablaRuntimeStoreU8(address, 10)
+    return
+}
+
+// SOL_SOCKET and its options, from Linux's numbers to Windows's: -1 for one with no counterpart.
+private trusted fun __ablaRuntimeWindowsSocketOption(level: int, option: int): int {
+    if (level != 1) return option
+    if (option == 2) return 4
+    if (option == 3) return 4104
+    if (option == 4) return 4103
+    if (option == 6) return 32
+    if (option == 7) return 4097
+    if (option == 8) return 4098
+    if (option == 9) return 8
+    if (option == 13) return 128
+    if (option == 20) return 4102
+    if (option == 21) return 4101
+    -1
+}
+
+private trusted fun __ablaRuntimeWindowsSocketLevel(level: int): int = if (level == 1) 65535 else level
+
+// poll(fds, count, milliseconds): Linux pollfd entries (descriptor, events, revents) as WSAPOLLFD for the sockets among them.
+private trusted fun __ablaRuntimeWindowsPoll(fds: int, count: int, timeout: int): int {
+    if (count < 0 || count > 3000) return -22
+    val buffer = __ablaRuntimeWindowsPathBuffer()
+    if (buffer == 0) return -12
+    var sockets = 0
+    var ready = 0
+    var index = 0
+    while (index < count) {
+        val entry = fds + index * 8
+        val fd = ablaRuntimeLoadI32(entry)
+        val events = ablaRuntimeLoadU8(entry + 4) + ablaRuntimeLoadU8(entry + 5) * 256
+        val socket = __ablaRuntimeWindowsSocketOf(fd)
+        if (socket != 0) {
+            var windows = 0
+            if ((events & 1) != 0) windows = windows + 768
+            if ((events & 2) != 0) windows = windows + 1024
+            if ((events & 4) != 0) windows = windows + 16
+            val slot = buffer + sockets * 16
+            ablaRuntimeStoreI64(slot, socket)
+            ablaRuntimeStoreU8(slot + 8, windows & 255)
+            ablaRuntimeStoreU8(slot + 9, windows / 256)
+            ablaRuntimeStoreU8(slot + 10, 0)
+            ablaRuntimeStoreU8(slot + 11, 0)
+            sockets = sockets + 1
+            ablaRuntimeStoreU8(entry + 6, 0)
+            ablaRuntimeStoreU8(entry + 7, 0)
+        } else {
+            // a file or a standard stream: ready for what was asked (input, output)
+            val answer = events & 5
+            ablaRuntimeStoreU8(entry + 6, answer)
+            ablaRuntimeStoreU8(entry + 7, 0)
+            if (answer != 0) ready = ready + 1
+        }
+        index = index + 1
+    }
+    if (sockets > 0) {
+        // with nothing else ready the wait is the caller's; with something ready, none
+        val result = WSAPoll(buffer, sockets, if (ready > 0) 0 else timeout)
+        if (result < 0) return __ablaRuntimeWindowsSocketErrno()
+        var seen = 0
+        var at = 0
+        index = 0
+        while (index < count) {
+            val entry = fds + index * 8
+            if (__ablaRuntimeWindowsSocketOf(ablaRuntimeLoadI32(entry)) != 0) {
+                val slot = buffer + at * 16
+                val revents = ablaRuntimeLoadU8(slot + 10) + ablaRuntimeLoadU8(slot + 11) * 256
+                var linux = 0
+                if ((revents & 768) != 0) linux = linux + 1
+                if ((revents & 1024) != 0) linux = linux + 2
+                if ((revents & 16) != 0) linux = linux + 4
+                if ((revents & 1) != 0) linux = linux + 8
+                if ((revents & 2) != 0) linux = linux + 16
+                if ((revents & 4) != 0) linux = linux + 32
+                ablaRuntimeStoreU8(entry + 6, linux & 255)
+                ablaRuntimeStoreU8(entry + 7, 0)
+                if (linux != 0) seen = seen + 1
+                at = at + 1
+            }
+            index = index + 1
+        }
+        return seen + ready
+    }
+    if (ready > 0) return ready
+    // nothing to wait on but time
+    if (timeout > 0) Sleep(timeout)
+    0
+}
+
+// The socket calls: -1000 when `number` is none of them.
+private trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int): int {
+    // poll(fds, count, milliseconds)
+    if (number == 7) return __ablaRuntimeWindowsPoll(a0, a1, a2)
+    // ioctl(fd, request, argument): FIONREAD (0x541B) and FIONBIO (0x5421) on a socket; the terminal queries are ENOTTY
+    if (number == 16) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket == 0) return -25
+        if (a1 == 21531) {
+            if (ioctlsocket(socket, 1074030207, a2) != 0) return __ablaRuntimeWindowsSocketErrno()
+            return 0
+        }
+        if (a1 == 21537) {
+            if (ioctlsocket(socket, 2147772030, a2) != 0) return __ablaRuntimeWindowsSocketErrno()
+            return 0
+        }
+        return -22
+    }
+    // socket(domain, type, protocol): the type's SOCK_NONBLOCK (2048) and SOCK_CLOEXEC (524288) are flags
+    if (number == 41) {
+        if (!__ablaRuntimeWindowsWinsock()) return -97
+        val family = if (a0 == 10) 23 else a0
+        val sock = socket(family, a1 & 15, a2)
+        if (sock == -1) return __ablaRuntimeWindowsSocketErrno()
+        if ((a1 & 2048) != 0) {
+            val scratch = __ablaRuntimeWindowsScratch()
+            ablaRuntimeStoreI32(scratch, 1)
+            ioctlsocket(sock, 2147772030, scratch)
+        }
+        val fd = __ablaRuntimeWindowsOpenFd(sock, 3, 0)
+        if (fd < 0) closesocket(sock)
+        return fd
+    }
+    // connect(fd, address, length), bind, getsockname, getpeername
+    if (number == 42 || number == 49 || number == 51 || number == 52) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket == 0) return -88
+        __ablaRuntimeWindowsFamily(a1, true)
+        var result = 0
+        if (number == 42) result = connect(socket, a1, a2)
+        else if (number == 49) result = bind(socket, a1, a2)
+        else if (number == 51) result = getsockname(socket, a1, a2)
+        else result = getpeername(socket, a1, a2)
+        // the length of getsockname and getpeername is a pointer, of connect and bind a value
+        __ablaRuntimeWindowsFamily(a1, false)
+        if (result != 0) {
+            // a non-blocking connect that has not finished is WSAEWOULDBLOCK on Windows, EINPROGRESS on Linux
+            val error = __ablaRuntimeWindowsSocketErrno()
+            if (number == 42 && error == -11) return -115
+            return error
+        }
+        return 0
+    }
+    // accept(fd, address, lengthPointer), accept4(fd, address, lengthPointer, flags)
+    if (number == 43 || number == 288) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket == 0) return -88
+        val accepted = accept(socket, a1, a2)
+        if (accepted == -1) return __ablaRuntimeWindowsSocketErrno()
+        __ablaRuntimeWindowsFamily(a1, false)
+        if (number == 288 && (a3 & 2048) != 0) {
+            val scratch = __ablaRuntimeWindowsScratch()
+            ablaRuntimeStoreI32(scratch, 1)
+            ioctlsocket(accepted, 2147772030, scratch)
+        }
+        val fd = __ablaRuntimeWindowsOpenFd(accepted, 3, 0)
+        if (fd < 0) closesocket(accepted)
+        return fd
+    }
+    // sendto(fd, buffer, count, flags, address, length): without an address it is send
+    if (number == 44) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket == 0) return -88
+        var sent = 0
+        if (a4 == 0) sent = send(socket, a1, a2, a3 & 3)
+        else {
+            __ablaRuntimeWindowsFamily(a4, true)
+            sent = sendto(socket, a1, a2, a3 & 3, a4, a5)
+            __ablaRuntimeWindowsFamily(a4, false)
+        }
+        if (sent < 0) return __ablaRuntimeWindowsSocketErrno()
+        return sent
+    }
+    // recvfrom(fd, buffer, count, flags, address, lengthPointer)
+    if (number == 45) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket == 0) return -88
+        var received = 0
+        if (a4 == 0) received = recv(socket, a1, a2, a3 & 3)
+        else {
+            received = recvfrom(socket, a1, a2, a3 & 3, a4, a5)
+            __ablaRuntimeWindowsFamily(a4, false)
+        }
+        if (received < 0) return __ablaRuntimeWindowsSocketErrno()
+        return received
+    }
+    // shutdown(fd, how)
+    if (number == 48) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket == 0) return -88
+        if (shutdown(socket, a1) != 0) return __ablaRuntimeWindowsSocketErrno()
+        return 0
+    }
+    // listen(fd, backlog)
+    if (number == 50) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket == 0) return -88
+        if (listen(socket, a1) != 0) return __ablaRuntimeWindowsSocketErrno()
+        return 0
+    }
+    // setsockopt(fd, level, option, value, length), getsockopt(fd, level, option, value, lengthPointer): options with no Windows
+    // counterpart (SO_REUSEPORT, SO_PRIORITY) are accepted and ignored (set) or EINVAL (get)
+    if (number == 54 || number == 55) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket == 0) return -88
+        val option = __ablaRuntimeWindowsSocketOption(a1, a2)
+        if (option == -1) return if (number == 54) 0 else -92
+        // SO_REUSEADDR on Windows lets another process take a bound port: set nothing for it (the Linux meaning is the default there)
+        if (number == 54 && a1 == 1 && a2 == 2) return 0
+        var result = 0
+        if (number == 54) result = setsockopt(socket, __ablaRuntimeWindowsSocketLevel(a1), option, a3, a4)
+        else result = getsockopt(socket, __ablaRuntimeWindowsSocketLevel(a1), option, a3, a4)
+        if (result != 0) return __ablaRuntimeWindowsSocketErrno()
+        return 0
+    }
+    // fcntl(fd, command, argument): F_GETFD/F_SETFD succeed, F_SETFL sets O_NONBLOCK (2048) on a socket, F_GETFL says 2 (O_RDWR)
+    if (number == 72) {
+        if (a1 == 1 || a1 == 2) return 0
+        if (a1 == 3) return 2
+        if (a1 == 4) {
+            val socket = __ablaRuntimeWindowsSocketOf(a0)
+            if (socket == 0) return 0
+            val scratch = __ablaRuntimeWindowsScratch()
+            ablaRuntimeStoreI32(scratch, if ((a2 & 2048) != 0) 1 else 0)
+            if (ioctlsocket(socket, 2147772030, scratch) != 0) return __ablaRuntimeWindowsSocketErrno()
+            return 0
+        }
+        return -22
+    }
+    -1000
+}
+
 /** The Linux system call number with six arguments, answered with kernel32: the result, or -errno; a number the translation does not handle ends the process with status 70 after naming it on standard error. */
 trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int): int {
     // write(fd, buffer, count)
     if (number == 1) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket != 0) {
+            val sent = send(socket, a1, a2, 0)
+            if (sent < 0) return __ablaRuntimeWindowsSocketErrno()
+            return sent
+        }
         val handle = __ablaRuntimeWindowsHandle(a0)
         if (handle == 0) return __ablaRuntimeWindowsEBADF
         val scratch = __ablaRuntimeWindowsScratch()
@@ -697,6 +1050,8 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
     }
     // the file calls: read, close, stat, lseek, fsync, getcwd, rename, mkdir, unlink, getdents64, openat, newfstatat, getrandom ... (the process's own
     // /proc entries do not exist: an openat of one is ENOENT, and the callers fall back)
+    val network = __ablaRuntimeWindowsSocketCall(number, a0, a1, a2, a3, a4, a5)
+    if (network != -1000) return network
     val file = __ablaRuntimeWindowsFileCall(number, a0, a1, a2, a3)
     if (file != -1000) return file
     __ablaRuntimeWindowsRefuse(number)
@@ -704,7 +1059,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 8 9 10 11 21 25 28 35 39 60 74 77 79 80 82 83 84 87 131 186 202 217 228 231 257 262 263 318"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 60 72 74 77 79 80 82 83 84 87 131 186 202 217 228 231 257 262 263 288 318"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;
