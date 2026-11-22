@@ -179,8 +179,12 @@ load address 0x000055718b500000
 ```
 
 A frame is named by the function its address is in, so a function inlined
-into another shows as the one it was inlined into; `ablac symbolize` on the
-same text adds file:line and the inlined calls. Frames outside the program
+into another shows as the one it was inlined into. On Linux the build also
+writes `<output>.debug` beside the program: the same build's line tables,
+which the program itself doesn't carry, tied to it by its build id and a
+debug link. Keep it with the program (it needn't ship): `ablac symbolize`
+(and gdb) find it there and add file:line and the inlined calls to the
+stack the program printed. Frames outside the program
 (the C library's, in a program that links it) are left unnamed. Without
 `--backtrace` a release build is byte for byte what it was.
 
@@ -303,8 +307,9 @@ skips all of it. A native development build's variables and types add about
 KB to 220 KB for tests/cases/action-journal/queries.ab) and 2% to 11% to its
 build time.
 
-`--backtrace` adds the walk and the table to a release executable: 8 KB to
-hello (30 KB to 39 KB) and binary-trees (36 KB to 45 KB); to the compiler
+`--backtrace` adds the walk and the table to a release executable: 9 KB to
+hello (30 KB to 39.5 KB) and binary-trees (36 KB to 45.6 KB), with a
+57 KB and 65 KB `.debug` file beside them; to the compiler
 itself (about 3,250 functions) 116 KB of names and 52 KB of table, offset by
 smaller code. Its frame pointers cost up to 7% in speed (binary-trees +6.9%,
 fannkuch +1.8%, fasta +1.2%, mandelbrot and spectral-norm unchanged) and

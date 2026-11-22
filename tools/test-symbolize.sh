@@ -2,6 +2,7 @@
 # `ablac symbolize`: the stack a crashed program with debug information printed (here a release build with -g, an
 # index out of bounds, 8 of 3, two calls deep) comes back with its frames' functions and file:line, the inlined ones
 # included: the runtime's panic and the program's own line. Skipped without llvm-symbolizer (or atos on macOS).
+# A --backtrace build (Linux) answers the same from the <output>.debug the build wrote beside it.
 set -euo pipefail
 compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -32,6 +33,28 @@ for expected in '#0 ' '__ablaRuntimePanicArrayIndex' 'crash.ab:7'; do
     [[ $symbolized == *"$expected"* ]] ||
         { echo "symbolize: no \"$expected\" in the symbolized stack" >&2; cat "$out/crash.txt" "$out/symbolized.txt" >&2; exit 1; }
 done
+# A --backtrace build (ELF) ships without DWARF: its line tables are in <output>.debug beside it, under the same build
+# id, which symbolize follows (the program's debug link); without that file the same stack has no file:line.
+if [[ $(uname -s) == Linux ]]; then
+    "$compiler" build "$project_root/tests/cases/symbolize/crash.ab" -o "$out/release" --backtrace --no-cache
+    [[ -s $out/release.debug ]] || { echo 'symbolize: --backtrace wrote no release.debug' >&2; exit 1; }
+    ! llvm-readelf -S "$out/release" | grep debug_line > /dev/null ||
+        { echo 'symbolize: the --backtrace program kept its DWARF' >&2; exit 1; }
+    program_id=$(llvm-readelf -n "$out/release" | grep 'Build ID')
+    debug_id=$(llvm-readelf -n "$out/release.debug" 2> /dev/null | grep 'Build ID')
+    [[ -n $program_id && $program_id == "$debug_id" ]] ||
+        { echo "symbolize: build ids differ: '$program_id' and '$debug_id'" >&2; exit 1; }
+    set +e
+    "$out/release" > /dev/null 2> "$out/release.txt"
+    set -e
+    "$compiler" symbolize "$out/release" "$out/release.txt" > "$out/release-symbolized.txt"
+    [[ $(< "$out/release-symbolized.txt") == *'crash.ab:7'* ]] ||
+        { echo 'symbolize: no crash.ab:7 from release.debug' >&2; cat "$out/release.txt" "$out/release-symbolized.txt" >&2; exit 1; }
+    mv "$out/release.debug" "$out/release.moved"
+    "$compiler" symbolize "$out/release" "$out/release.txt" > "$out/release-without.txt"
+    [[ $(< "$out/release-without.txt") != *'crash.ab:7'* ]] ||
+        { echo 'symbolize: file:line without release.debug' >&2; exit 1; }
+fi
 # A text with no stack says so.
 if printf 'panic: boom\n' | "$compiler" symbolize "$out/crash" > /dev/null 2> "$out/none.err"; then
     echo 'symbolize: a text without a stack was accepted' >&2
