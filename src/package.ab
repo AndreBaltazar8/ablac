@@ -1809,6 +1809,57 @@ fun bootstrapPackageValidateDependencies(
     BootstrapPackageResult(status, diagnostic)
 }
 
+// The tree hash of a vendored copy with its two marker files left out: what `git write-tree` gives for the same
+// files, so it is the digest abla.lock records. The markers say which revision a copy claims to be; this says
+// whether the files are the ones the lock was made from.
+fun bootstrapPackageVendorDigest(projectRoot: string, vendorRoot: string): string {
+    // git runs inside the vendored directory, so every path it is given must not depend on the working directory. The
+    // scratch repository lives in the package cache: a build of a vendored project creates nothing in the project.
+    val cacheRoot = bootstrapPackageCacheRoot()
+    val scratchName = "$cacheRoot/vendor-check.${linuxProcessId()}"
+    val scratch = if (Path(cacheRoot).isAbsolute()) scratchName else currentDirectory().child(scratchName).text
+    bootstrapPackageRemoveTree(scratch)
+    var result = ""
+    if (Path(scratch).parent().createDirectories()) {
+        val init = bootstrapPackageGit()
+        init.argument("init")
+        init.argument("--quiet")
+        init.argument("--bare")
+        init.argument("--object-format=sha1")
+        init.argument(scratch)
+        if (init.run() == 0) {
+            val add = bootstrapPackageGit()
+            add.workingDirectory = vendorRoot
+            add.argument("--git-dir=$scratch")
+            add.argument("--work-tree=.")
+            add.argument("add")
+            add.argument("--all")
+            add.argument("--force")
+            add.argument("--")
+            add.argument(".")
+            add.argument(":(exclude).abla-revision")
+            add.argument(":(exclude).abla-digest")
+            if (add.run() == 0) {
+                val write = bootstrapPackageGit()
+                write.argument("--git-dir=$scratch")
+                write.argument("write-tree")
+                val captured = write.capture()
+                if (captured.status == 0) result = bootstrapPackageTrim(captured.output)
+            }
+        }
+    }
+    bootstrapPackageRemoveTree(scratch)
+    result
+}
+
+fun bootstrapPackageVendorMarked(vendorRoot: string, package: BootstrapLockedPackage): bool =
+    Path("$vendorRoot/.abla-revision").readText() == package.revision &&
+        Path("$vendorRoot/.abla-digest").readText() == package.digest &&
+        Path(vendorRoot).info().isDirectory()
+
+fun bootstrapPackageVendorMismatch(package: BootstrapLockedPackage): string =
+    "error[E_PACKAGE_VENDOR_DIGEST_MISMATCH]: the vendored copy of dependency '${package.name}' (vendor/${package.name}) does not match the digest '${package.digest}' in abla.lock: its files differ from the locked revision; restore them or run 'ablac package vendor' again\n"
+
 fun bootstrapPackageMaterialize(
     projectRoot: string,
     package: BootstrapLockedPackage,
@@ -1816,11 +1867,15 @@ fun bootstrapPackageMaterialize(
 ): BootstrapPackageResult {
     val cacheRoot = bootstrapPackageCachePath(package)
     val vendorRoot = "$projectRoot/vendor/${package.name}"
-    val vendorValid = Path("$vendorRoot/.abla-revision").readText() ==
-        package.revision && Path("$vendorRoot/.abla-digest").readText() ==
-        package.digest && Path(vendorRoot).info().isDirectory()
+    val vendorMarked = bootstrapPackageVendorMarked(vendorRoot, package)
     var status = 0
     var diagnostic = ""
+    // A vendored copy that claims the locked revision must also hold the locked files: a mismatch is an error, not
+    // a reason to fall back to another copy.
+    if (vendorMarked && bootstrapPackageVendorDigest(projectRoot, vendorRoot) != package.digest) {
+        return BootstrapPackageResult(1, bootstrapPackageVendorMismatch(package))
+    }
+    val vendorValid = vendorMarked
     if (!vendorValid && !bootstrapPackageCacheValid(package)) {
         if (offline) {
             status = 1
@@ -1957,8 +2012,12 @@ fun bootstrapPackageInstallLocked(projectRoot: string, offline: bool): Bootstrap
     for (package in lock.packages) {
         // A checked-in vendor copy at the locked revision is what a build resolves to: nothing to install.
         val vendor = "$projectRoot/vendor/${package.name}"
-        if (Path("$vendor/.abla-revision").readText() == package.revision &&
-            Path("$vendor/.abla-digest").readText() == package.digest) continue
+        if (bootstrapPackageVendorMarked(vendor, package)) {
+            if (bootstrapPackageVendorDigest(projectRoot, vendor) != package.digest) {
+                return BootstrapPackageResult(1, bootstrapPackageVendorMismatch(package))
+            }
+            continue
+        }
         val root = "$projectRoot/.abla/packages/${package.name}"
         if (Path("$root/revision").readText() == package.revision &&
             Path("$root/digest").readText() == package.digest &&
