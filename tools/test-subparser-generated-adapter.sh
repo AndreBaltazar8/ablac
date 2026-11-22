@@ -11,6 +11,7 @@ mkdir -p "$missing_toolchain_path"
 ln -sf "$(command -v bash)" "$missing_toolchain_path/bash"
 ln -sf "$(command -v readlink)" "$missing_toolchain_path/readlink"
 ln -sf "$(command -v dirname)" "$missing_toolchain_path/dirname"
+ln -sf "$(command -v basename)" "$missing_toolchain_path/basename"
 ln -sf "$(command -v timeout)" "$missing_toolchain_path/timeout"
 ln -sf "$(command -v prlimit)" "$missing_toolchain_path/prlimit"
 ln -sf "$(command -v opt)" "$missing_toolchain_path/opt"
@@ -309,7 +310,8 @@ grep -q 'error\[E_EXT_FUNCTION_HANDLE_OUT_OF_RANGE\]:' \
     "$output_directory/invalid-function-handle-states.err"
 
 set +e
-PATH="$missing_toolchain_path" "$compiler" build \
+# Exercise toolchain failure even when lld is built into the compiler.
+ABLA_LINK_INPROCESS=0 PATH="$missing_toolchain_path" "$compiler" build \
     "$project_root/tests/cases/bootstrap/block.ab" \
     -o "$output_directory/invalid-native-toolchain" --no-cache \
     > "$output_directory/invalid-native-toolchain.out" \
