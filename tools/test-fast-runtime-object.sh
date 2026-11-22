@@ -56,6 +56,8 @@ unset ABLA_FAST_RUNTIME_OBJECT
 cmp "$scratch/expected" "$scratch/actual"
 ABLA_GC_STRESS=1 "$program" > "$scratch/stress"
 cmp "$scratch/expected" "$scratch/stress"
+ABLA_GC_STRESS=1 ABLA_COMPACT_HEADERS=0 "$program" > "$scratch/legacy-stress"
+cmp "$scratch/expected" "$scratch/legacy-stress"
 records=("$ABLA_CACHE_DIR"/fast-runtime-v1/*/record)
 [[ ${#records[@]} == 1 && -s ${records[0]} ]]
 cp "$program" "$scratch/cold"
