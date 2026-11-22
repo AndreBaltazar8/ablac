@@ -104,8 +104,27 @@ grep -qx 'panic: index 5 out of bounds for array of size 3' "$out/bounds-debug.e
     fail "debug build message"
 grep -q '^stack ' "$out/bounds-debug.err" || fail "debug build printed no stack"
 
+# A --backtrace build is a release build that prints the stack too, each frame named from its table.
+"$compiler" build "$cases/bounds.ab" -o "$out/bounds-backtrace" --backtrace
+set +e
+"$out/bounds-backtrace" array-read > /dev/null 2> "$out/bounds-backtrace.err"
+status=$?
+set -e
+[[ $status -eq 101 ]] || fail "--backtrace build exited $status"
+grep -qx 'panic: index 5 out of bounds for array of size 3' "$out/bounds-backtrace.err" ||
+    fail "--backtrace build message"
+grep -q '^0x[0-9a-f]* in main$' "$out/bounds-backtrace.err" ||
+    fail "--backtrace build named no main: $(head -12 "$out/bounds-backtrace.err")"
+# Under the suite (ABLA_TEST_FAST_BUILDS=1) the line above is still a release build; --fast names its frames too.
+"$compiler" build "$cases/bounds.ab" -o "$out/bounds-backtrace-fast" --fast --backtrace --no-debug
+set +e
+"$out/bounds-backtrace-fast" array-read > /dev/null 2> "$out/bounds-backtrace-fast.err"
+set -e
+grep -q '^0x[0-9a-f]* in main$' "$out/bounds-backtrace-fast.err" ||
+    fail "--fast --backtrace build named no main: $(head -12 "$out/bounds-backtrace-fast.err")"
+
 # A stack overflow panics; another SIGSEGV still ends the process by the signal.
-for flags in "" "-g"; do
+for flags in "" "-g" "--backtrace"; do
     "$compiler" build "$cases/stack.ab" -o "$out/stack" $flags
     set +e
     "$out/stack" overflow > /dev/null 2> "$out/stack-overflow.err"
@@ -140,6 +159,13 @@ for flags in "" "-g"; do
         ! grep -q 'bad memory access' "$out/stack-segv.err" || fail "a sent SIGSEGV named an address"
     else
         grep -q '^fatal signal' "$out/stack-store.err" || fail "a bad store$flags: $(head -3 "$out/stack-store.err")"
+    fi
+    # Its stack starts at the faulting instruction, named, not in the handler that prints it.
+    if [[ $flags == --backtrace ]]; then
+        grep -A1 '^stack ' "$out/stack-store.err" | grep '^0x[0-9a-f]* in [^ ]* (the faulting instruction)$' > /dev/null ||
+            fail "a bad store$flags named no faulting function: $(head -8 "$out/stack-store.err")"
+        ! grep -q ' in abla_runtime_stack_fault$' "$out/stack-store.err" ||
+            fail "a bad store$flags walked the signal handler's frame"
     fi
     [[ $("$out/stack") == "ok 500" ]] || fail "stack$flags without an overflow"
 done

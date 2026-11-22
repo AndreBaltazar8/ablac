@@ -959,8 +959,250 @@ fun bootstrapLlvmDebugFinish(
 // atos map them to file:line through the debug information. Other builds keep
 // abla_runtime_print_stack as an empty function, so code can always call it.
 
+// `build --backtrace` (crash reports, step 2): a build without debug information that still prints a named stack
+// when it dies, as a debug build prints one: the fault handlers, the frame-pointer walk and a frame pointer in every
+// function, and a table of the functions' start addresses and names (abla_backtrace_entries, defined once the
+// module is optimized: bootstrapLlvmDefineBacktraceTable) that the walk names each frame by.
+var bootstrapLlvmBacktrace: bool = false
+
+private noescape extern:"c" fun LLVMDeleteGlobal(global: i64*): void
+
+// The readable name of each function's symbol (its body's, and with ".boxed" its value-ABI wrapper's), set as the
+// module is emitted (backend.ab) for the table made after optimization.
+var bootstrapLlvmBacktraceNames: Map<string, string> = Map()
+
+// Defines the table the walk names frames by, from the functions the optimized `module` still has: each one's
+// address and readable name (bootstrapLlvmBacktraceNames; a name without the hashed prefix is its own, as a debug
+// build renames bodies), the names stored once. Replaces the declarations the walk was emitted against.
+trusted fun bootstrapLlvmDefineBacktraceTable(module: i64*, context: i64*): void {
+    if (!bootstrapLlvmBacktrace) return
+    val declaredEntries = LLVMGetNamedGlobal(module, "abla_backtrace_entries")
+    if (pointerIsNull(declaredEntries)) return
+    val i8 = LLVMInt8TypeInContext(context)
+    val i32 = LLVMInt32TypeInContext(context)
+    val i64 = LLVMInt64TypeInContext(context)
+    val pointer = LLVMPointerTypeInContext(context, i32(0))
+    val fields = llvmPointerVector(3)
+    fields.set(0, pointer)
+    fields.set(1, i32)
+    fields.set(2, i32)
+    val entryType = LLVMStructTypeInContext(context, fields.pointer(), i32(3), 0)
+    fields.drop()
+    val functions: array<i64*> = []
+    val offsets: array<int> = []
+    val lengths: array<int> = []
+    val stored: Map<string, int> = Map()
+    var blob = ""
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == 0) {
+            val symbol = bootstrapLlvmDebugValueName(function)
+            val known = bootstrapLlvmBacktraceNames.get(symbol)
+            val name = if (known != null) known else if (symbol.startsWith("abla_fn_")) "" else symbol
+            if (name != "") {
+                var offset = stored.get(name) ?? -1
+                if (offset < 0) {
+                    offset = blob.size
+                    stored.set(name, offset)
+                    blob = "$blob$name"
+                }
+                functions.append(function)
+                offsets.append(offset)
+                lengths.append(name.size)
+            }
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    val entries = llvmPointerVector(functions.size + 1)
+    for (index in 0 until functions.size) {
+        val values = llvmPointerVector(3)
+        values.set(0, functions[index])
+        values.set(1, LLVMConstInt(i32, offsets[index], 0))
+        values.set(2, LLVMConstInt(i32, lengths[index], 0))
+        entries.set(index, LLVMConstStructInContext(context, values.pointer(), i32(3), 0))
+        values.drop()
+    }
+    val entriesType = LLVMArrayType2(entryType, functions.size)
+    val table = LLVMAddGlobal(module, entriesType, "abla_backtrace_entries.table")
+    LLVMSetInitializer(table, LLVMConstArray2(entryType, entries.pointer(), functions.size))
+    entries.drop()
+    val namesValue = LLVMConstStringInContext2(context, blob, blob.size, 1)
+    val names = LLVMAddGlobal(module, LLVMArrayType2(i8, blob.size), "abla_backtrace_names.table")
+    LLVMSetInitializer(names, namesValue)
+    val count = LLVMAddGlobal(module, i64, "abla_backtrace_count.table")
+    LLVMSetInitializer(count, LLVMConstInt(i64, functions.size, 0))
+    for (made in [table, names, count]) {
+        LLVMSetGlobalConstant(made, 1)
+        LLVMSetLinkage(made, llvmInternalLinkage())
+    }
+    val replaced = [declaredEntries, LLVMGetNamedGlobal(module, "abla_backtrace_names"),
+        LLVMGetNamedGlobal(module, "abla_backtrace_count")]
+    val by = [table, names, count]
+    for (index in 0 until 3) {
+        if (!pointerIsNull(replaced[index])) {
+            LLVMReplaceAllUsesWith(replaced[index], by[index])
+            LLVMDeleteGlobal(replaced[index])
+        }
+    }
+    return
+}
+
+// The frame pointer a fault interrupted, where the walk starts instead of its own frame (0: none).
+fun bootstrapLlvmFaultFrameGlobal(backend: BootstrapLlvmBackend): i64* {
+    var global = LLVMGetNamedGlobal(backend.module, "abla_runtime_fault_frame")
+    if (pointerIsNull(global)) {
+        global = LLVMAddGlobal(backend.module, backend.i64Type, "abla_runtime_fault_frame")
+        LLVMSetInitializer(global, LLVMConstInt(backend.i64Type, 0, 0))
+        LLVMSetLinkage(global, llvmInternalLinkage())
+    }
+    global
+}
+
+// The pc a fault interrupted, which the stack guard's handler records for the walk to print first (0: none).
+fun bootstrapLlvmFaultPcGlobal(backend: BootstrapLlvmBackend): i64* {
+    var global = LLVMGetNamedGlobal(backend.module, "abla_runtime_fault_pc")
+    if (pointerIsNull(global)) {
+        global = LLVMAddGlobal(backend.module, backend.i64Type, "abla_runtime_fault_pc")
+        LLVMSetInitializer(global, LLVMConstInt(backend.i64Type, 0, 0))
+        LLVMSetLinkage(global, llvmInternalLinkage())
+    }
+    global
+}
+
+// Where the walk starts: the interrupted frame when a fault interrupted the program (abla_runtime_fault_frame, set by
+// the stack guard's handler, so the walk skips the handler and the signal frame), else the walker's own frame.
+fun bootstrapLlvmWalkStart(backend: BootstrapLlvmBackend, own: i64*): i64* {
+    val i64 = backend.i64Type
+    val start = LLVMBuildPtrToInt(backend.builder, own, i64, "")
+    val faultFrame = LLVMGetNamedGlobal(backend.module, "abla_runtime_fault_frame")
+    if (pointerIsNull(faultFrame)) return start
+    val interrupted = LLVMBuildLoad2(backend.builder, i64, faultFrame, "fault.frame")
+    // NE (33).
+    LLVMBuildSelect(backend.builder,
+        LLVMBuildICmp(backend.builder, 33, interrupted, LLVMConstInt(i64, 0, 0), ""), interrupted, start, "walk.start")
+}
+
+// The walk's first line when a fault interrupted the program (abla_runtime_fault_pc set by the stack guard's
+// handler): the faulting instruction itself, which no frame's return address names; named as the frames are.
+fun bootstrapLlvmWalkFaultPc(backend: BootstrapLlvmBackend, printStack: i64*): void {
+    val faultPc = LLVMGetNamedGlobal(backend.module, "abla_runtime_fault_pc")
+    if (pointerIsNull(faultPc)) return
+    val i64 = backend.i64Type
+    val pc = LLVMBuildLoad2(backend.builder, i64, faultPc, "fault.pc")
+    val print = LLVMAppendBasicBlockInContext(backend.context, printStack, "fault.pc.print")
+    val after = LLVMAppendBasicBlockInContext(backend.context, printStack, "fault.pc.after")
+    // NE (33).
+    LLVMBuildCondBr(backend.builder, LLVMBuildICmp(backend.builder, 33, pc, LLVMConstInt(i64, 0, 0), ""), print, after)
+    LLVMPositionBuilderAtEnd(backend.builder, print)
+    bootstrapLlvmDebugWriteHex(backend, pc)
+    if (bootstrapLlvmBacktrace) {
+        bootstrapLlvmCall(backend, bootstrapLlvmBacktraceNameFunction(backend), [pc], "", false, [])
+    }
+    bootstrapLlvmDebugWrite(backend, " (the faulting instruction)\n", "abla.stack.fault.pc")
+    LLVMBuildBr(backend.builder, after)
+    LLVMPositionBuilderAtEnd(backend.builder, after)
+    return
+}
+
+// The table's three symbols, declared for the walk and defined after optimization: the entries (16 bytes each: the
+// function's address, its name's offset and length in the names), their count, and the names.
+// Weak and empty (no entries) until then: the optimizer cannot fold a weak value, and a build that defines no table
+// (a pipeline other than the release one) links with these and prints its addresses unnamed.
+fun bootstrapLlvmBacktraceGlobal(backend: BootstrapLlvmBackend, name: string, type: i64*): i64* {
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        global = LLVMAddGlobal(backend.module, type, name)
+        LLVMSetInitializer(global, LLVMConstNull(type))
+        // WeakAny (5).
+        LLVMSetLinkage(global, i32(5))
+    }
+    global
+}
+
+// abla_backtrace_name(address): writes " in <name>" for the function the table says `address` (a return address,
+// one byte back) is in, the one with the greatest start at or below it; nothing when none is.
+fun bootstrapLlvmBacktraceNameFunction(backend: BootstrapLlvmBackend): i64* {
+    val existing = LLVMGetNamedFunction(backend.module, "abla_backtrace_name")
+    if (!pointerIsNull(existing)) return existing
+    val i64 = backend.i64Type
+    val i32 = backend.i32Type
+    val function = bootstrapLlvmDeclare(backend, "abla_backtrace_name", backend.voidType, [i64], false, [])
+    LLVMSetLinkage(function, llvmInternalLinkage())
+    val saved = LLVMGetInsertBlock(backend.builder)
+    LLVMPositionBuilderAtEnd(backend.builder, LLVMAppendBasicBlockInContext(backend.context, function, "entry"))
+    val entries = bootstrapLlvmBacktraceGlobal(backend, "abla_backtrace_entries", LLVMArrayType2(backend.i8Type, 0))
+    val names = bootstrapLlvmBacktraceGlobal(backend, "abla_backtrace_names", LLVMArrayType2(backend.i8Type, 0))
+    val countGlobal = bootstrapLlvmBacktraceGlobal(backend, "abla_backtrace_count", i64)
+    val address = LLVMGetParam(function, 0)
+    val count = LLVMBuildLoad2(backend.builder, i64, countGlobal, "count")
+    val base = LLVMBuildPtrToInt(backend.builder, entries, i64, "")
+    val index = LLVMBuildAlloca(backend.builder, i64, "i")
+    val best = LLVMBuildAlloca(backend.builder, i64, "best")
+    val bestStart = LLVMBuildAlloca(backend.builder, i64, "best.start")
+    LLVMBuildStore(backend.builder, LLVMConstInt(i64, 0, 0), index)
+    LLVMBuildStore(backend.builder, LLVMConstInt(i64, -1, 1), best)
+    LLVMBuildStore(backend.builder, LLVMConstInt(i64, 0, 0), bestStart)
+    val loop = LLVMAppendBasicBlockInContext(backend.context, function, "scan")
+    val body = LLVMAppendBasicBlockInContext(backend.context, function, "entry.read")
+    val better = LLVMAppendBasicBlockInContext(backend.context, function, "entry.better")
+    val next = LLVMAppendBasicBlockInContext(backend.context, function, "entry.next")
+    val found = LLVMAppendBasicBlockInContext(backend.context, function, "found")
+    val write = LLVMAppendBasicBlockInContext(backend.context, function, "write")
+    val done = LLVMAppendBasicBlockInContext(backend.context, function, "done")
+    LLVMBuildBr(backend.builder, loop)
+    LLVMPositionBuilderAtEnd(backend.builder, loop)
+    val at = LLVMBuildLoad2(backend.builder, i64, index, "")
+    // ULT (36), ULE (37), UGE (35).
+    LLVMBuildCondBr(backend.builder, LLVMBuildICmp(backend.builder, 36, at, count, ""), body, found)
+    LLVMPositionBuilderAtEnd(backend.builder, body)
+    val entry = LLVMBuildAdd(backend.builder, base, LLVMBuildShl(backend.builder, at, LLVMConstInt(i64, 4, 0), ""), "")
+    val start = LLVMBuildLoad2(backend.builder, i64, LLVMBuildIntToPtr(backend.builder, entry, backend.pointerType, ""), "")
+    val current = LLVMBuildLoad2(backend.builder, i64, bestStart, "")
+    LLVMBuildCondBr(backend.builder, LLVMBuildAnd(backend.builder,
+        LLVMBuildICmp(backend.builder, 37, start, address, ""),
+        LLVMBuildICmp(backend.builder, 35, start, current, ""), ""), better, next)
+    LLVMPositionBuilderAtEnd(backend.builder, better)
+    LLVMBuildStore(backend.builder, at, best)
+    LLVMBuildStore(backend.builder, start, bestStart)
+    LLVMBuildBr(backend.builder, next)
+    LLVMPositionBuilderAtEnd(backend.builder, next)
+    LLVMBuildStore(backend.builder, LLVMBuildAdd(backend.builder, at, LLVMConstInt(i64, 1, 0), ""), index)
+    LLVMBuildBr(backend.builder, loop)
+    LLVMPositionBuilderAtEnd(backend.builder, found)
+    val chosen = LLVMBuildLoad2(backend.builder, i64, best, "")
+    // Nor past the program's code (the C library's frames below main, in a program that links it): the end of its
+    // text, which the linker defines (0 when it did not: no bound).
+    val endName = if (backend.macOS) "\x01section\$end\$__TEXT\$__text" else "etext"
+    var textEnd = LLVMGetNamedGlobal(backend.module, endName)
+    if (pointerIsNull(textEnd)) {
+        textEnd = LLVMAddGlobal(backend.module, backend.i8Type, endName)
+        LLVMSetLinkage(textEnd, llvmExternalWeakLinkage())
+    }
+    val end = LLVMBuildPtrToInt(backend.builder, textEnd, i64, "")
+    // SLT (40), NE (33), UGE (35).
+    val outside = LLVMBuildAnd(backend.builder, LLVMBuildICmp(backend.builder, 33, end, LLVMConstInt(i64, 0, 0), ""),
+        LLVMBuildICmp(backend.builder, 35, address, end, ""), "")
+    LLVMBuildCondBr(backend.builder, LLVMBuildOr(backend.builder,
+        LLVMBuildICmp(backend.builder, 40, chosen, LLVMConstInt(i64, 0, 0), ""), outside, ""), done, write)
+    LLVMPositionBuilderAtEnd(backend.builder, write)
+    val record = LLVMBuildAdd(backend.builder, base, LLVMBuildShl(backend.builder, chosen, LLVMConstInt(i64, 4, 0), ""), "")
+    val offset = LLVMBuildZExt(backend.builder, LLVMBuildLoad2(backend.builder, i32, LLVMBuildIntToPtr(backend.builder,
+        LLVMBuildAdd(backend.builder, record, LLVMConstInt(i64, 8, 0), ""), backend.pointerType, ""), ""), i64, "")
+    val length = LLVMBuildZExt(backend.builder, LLVMBuildLoad2(backend.builder, i32, LLVMBuildIntToPtr(backend.builder,
+        LLVMBuildAdd(backend.builder, record, LLVMConstInt(i64, 12, 0), ""), backend.pointerType, ""), ""), i64, "")
+    bootstrapLlvmDebugWrite(backend, " in ", "abla.backtrace.in")
+    bootstrapLlvmRuntimeWrite(backend, 2, LLVMBuildIntToPtr(backend.builder,
+        LLVMBuildAdd(backend.builder, LLVMBuildPtrToInt(backend.builder, names, i64, ""), offset, ""),
+        backend.pointerType, ""), length)
+    LLVMBuildBr(backend.builder, done)
+    LLVMPositionBuilderAtEnd(backend.builder, done)
+    LLVMBuildRetVoid(backend.builder)
+    LLVMPositionBuilderAtEnd(backend.builder, saved)
+    function
+}
+
 fun bootstrapLlvmDebugHostedRuntime(backend: BootstrapLlvmBackend): bool =
-    bootstrapLlvmDebugInfo &&
+    (bootstrapLlvmDebugInfo || bootstrapLlvmBacktrace) &&
     !bootstrapTextContains(backend.targetTriple, "wasm") &&
     (backend.macOS || bootstrapTextContains(backend.targetTriple, "linux"))
 
@@ -1601,6 +1843,21 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         LLVMPositionBuilderAtEnd(backend.builder, quiet)
     }
     if (bootstrapLlvmDebugHostedRuntime(backend)) {
+        // The faulting instruction, which no frame's return address names: the stack starts at it
+        // (abla_runtime_fault_pc, read by the walk). The interrupted pc in the ucontext: on Linux gregs[REG_RIP] at
+        // 168 on x86-64, sigcontext.pc at 440 on AArch64; on macOS through the mcontext, __ss.__rip at 144 on x86-64
+        // and __ss.__pc at 272 on arm64 (beside the stack pointers read above).
+        val pcAt = if (mac) (if (bootstrapLlvmMachOIsArm(backend.targetTriple)) 272 else 144)
+            else if (bootstrapTextContains(backend.targetTriple, "aarch64")) 440 else 168
+        val faultPc = bootstrapLlvmFaultPcGlobal(backend)
+        LLVMBuildStore(backend.builder, LLVMBuildLoad2(backend.builder, i64,
+            bootstrapLlvmByteAt(backend, machine, 512, pcAt), "interrupted.pc"), faultPc)
+        // And its frame pointer, where the walk starts (not this handler's frame, on the signal stack): gregs[REG_RBP]
+        // at 120 and x29 at 416 on Linux, __rbp at 64 and __fp at 248 on macOS.
+        val frameAt = if (mac) (if (bootstrapLlvmMachOIsArm(backend.targetTriple)) 248 else 64)
+            else if (bootstrapTextContains(backend.targetTriple, "aarch64")) 416 else 120
+        LLVMBuildStore(backend.builder, LLVMBuildLoad2(backend.builder, i64,
+            bootstrapLlvmByteAt(backend, machine, 512, frameAt), "interrupted.frame"), bootstrapLlvmFaultFrameGlobal(backend))
         // The debug report, which restores the default action.
         val fault = bootstrapLlvmDeclare(
             backend, "abla_runtime_fault", backend.voidType, [i64], false, []
@@ -1777,13 +2034,14 @@ fun bootstrapLlvmEmitFramePointerWalk(
         "stack (return addresses: subtract the load address, then addr2line or gdb on the program gives file:line):\n",
         "abla.stack.header"
     )
+    bootstrapLlvmWalkFaultPc(backend, printStack)
     val frame = bootstrapLlvmStackGuardCall(
         backend, "llvm.frameaddress.p0", backend.pointerType,
         [backend.i32Type], [LLVMConstInt(backend.i32Type, 0, 0)]
     )
     val cursor = LLVMBuildAlloca(backend.builder, i64, "fp")
     LLVMBuildStore(
-        backend.builder, LLVMBuildPtrToInt(backend.builder, frame, i64, ""), cursor
+        backend.builder, bootstrapLlvmWalkStart(backend, frame), cursor
     )
     val counter = LLVMBuildAlloca(backend.builder, i64, "n")
     LLVMBuildStore(backend.builder, LLVMConstInt(i64, 0, 0), counter)
@@ -1885,9 +2143,12 @@ fun bootstrapLlvmEmitFramePointerWalk(
         show, done
     )
     LLVMPositionBuilderAtEnd(backend.builder, show)
-    bootstrapLlvmDebugWriteHex(
-        backend, LLVMBuildSub(backend.builder, returnAddress, LLVMConstInt(i64, 1, 0), "")
-    )
+    val inCall = LLVMBuildSub(backend.builder, returnAddress, LLVMConstInt(i64, 1, 0), "")
+    bootstrapLlvmDebugWriteHex(backend, inCall)
+    // A --backtrace build names the frame from its table (a debug build's are named by ablac symbolize).
+    if (bootstrapLlvmBacktrace) {
+        bootstrapLlvmCall(backend, bootstrapLlvmBacktraceNameFunction(backend), [inCall], "", false, [])
+    }
     bootstrapLlvmDebugWrite(backend, "\n", "abla.stack.end")
     LLVMBuildStore(
         backend.builder, LLVMBuildAdd(backend.builder, count, LLVMConstInt(i64, 1, 0), ""),
@@ -1926,11 +2187,12 @@ fun bootstrapLlvmEmitDarwinFramePointerWalk(
         "stack (return addresses: atos -o <program> -l <load address> gives file:line):\n",
         "abla.stack.header"
     )
+    bootstrapLlvmWalkFaultPc(backend, printStack)
     val frame = bootstrapLlvmStackGuardCall(
         backend, "llvm.frameaddress.p0", backend.pointerType,
         [backend.i32Type], [LLVMConstInt(backend.i32Type, 0, 0)]
     )
-    val first = LLVMBuildPtrToInt(backend.builder, frame, i64, "")
+    val first = bootstrapLlvmWalkStart(backend, frame)
     val stackTop = LLVMGetNamedGlobal(backend.module, "abla_runtime_stack_top")
     val cursor = LLVMBuildAlloca(backend.builder, i64, "fp")
     LLVMBuildStore(backend.builder, first, cursor)
@@ -1996,9 +2258,11 @@ fun bootstrapLlvmEmitDarwinFramePointerWalk(
     )
     LLVMPositionBuilderAtEnd(backend.builder, show)
     // The return address less one falls inside the call.
-    bootstrapLlvmDebugWriteHex(
-        backend, LLVMBuildSub(backend.builder, returnAddress, LLVMConstInt(i64, 1, 0), "")
-    )
+    val inCall = LLVMBuildSub(backend.builder, returnAddress, LLVMConstInt(i64, 1, 0), "")
+    bootstrapLlvmDebugWriteHex(backend, inCall)
+    if (bootstrapLlvmBacktrace) {
+        bootstrapLlvmCall(backend, bootstrapLlvmBacktraceNameFunction(backend), [inCall], "", false, [])
+    }
     bootstrapLlvmDebugWrite(backend, "\n", "abla.stack.end")
     LLVMBuildStore(
         backend.builder, LLVMBuildAdd(backend.builder, count, LLVMConstInt(i64, 1, 0), ""),

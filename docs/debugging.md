@@ -159,6 +159,30 @@ same.
 macOS crash reports (`~/Library/Logs/DiagnosticReports`) show the readable
 names for every frame thanks to the frame-pointer chain.
 
+### A release build that names its stack: `--backtrace`
+
+`ablac build --backtrace` makes a release build (optimized as usual, no debug
+information, no symbol table) that prints the stack on a panic or a fault, as
+a debug build does, each frame named by a table of the program's functions
+built into it. A fault's stack starts at the faulting instruction:
+
+```text
+fatal signal: a trap, a bad memory access or an abort
+stack (return addresses: subtract the load address, then addr2line or gdb on the program gives file:line):
+0x000055718bd589d9 in sema.BootstrapStringSet.slotOf (the faulting instruction)
+0x000055718b770b5e in sema.BootstrapStringSet.add
+0x000055718bb55645 in overload.bootstrapOverloadAddNames
+…
+0x000055718b7aa8f3 in main
+load address 0x000055718b500000
+```
+
+A frame is named by the function its address is in, so a function inlined
+into another shows as the one it was inlined into; `ablac symbolize` on the
+same text adds file:line and the inlined calls. Frames outside the program
+(the C library's, in a program that links it) are left unnamed. Without
+`--backtrace` a release build is byte for byte what it was.
+
 ## WebAssembly: browser developer tools
 
 A debug module (`artifact = "module"` on a WebAssembly target) is published with
@@ -266,6 +290,13 @@ skips all of it. A native development build's variables and types add about
 40% to its executable (168 KB to 240 KB for tests/cases/debug-variables, 154
 KB to 220 KB for tests/cases/action-journal/queries.ab) and 2% to 11% to its
 build time.
+
+`--backtrace` adds the walk and the table to a release executable: 8 KB to
+hello (30 KB to 39 KB) and binary-trees (36 KB to 45 KB); to the compiler
+itself (about 3,250 functions) 116 KB of names and 52 KB of table, offset by
+smaller code. Its frame pointers cost up to 7% in speed (binary-trees +6.9%,
+fannkuch +1.8%, fasta +1.2%, mandelbrot and spectral-norm unchanged) and
+nothing measurable in the compiler's build time.
 
 ## Collector trace: `ABLA_GC_TRACE=1`
 

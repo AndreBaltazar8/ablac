@@ -259,7 +259,9 @@ catch (error) {
 Development (`--fast`) builds carry debug information: DWARF line tables,
 readable function symbols and, natively, frame pointers and a printed stack on
 a crash. Release builds don't; `-g`/`--debug`, `--no-debug` and
-`ABLA_DEBUG=1|0` override either. See [debugging.md](debugging.md).
+`ABLA_DEBUG=1|0` override either. `--backtrace` gives a native release build
+frame pointers and a table of its functions' names, so it prints a named stack
+on a panic or a fault. See [debugging.md](debugging.md).
 
 A development (`--fast`) WebAssembly build optimizes its module and writes its object
 in the compiler's own process, with the passes and options `opt` and `llc -O0` would

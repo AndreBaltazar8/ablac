@@ -1583,6 +1583,8 @@ trusted fun bootstrapEmitHeldNativeObject(
             LLVMRunPasses(module, llvmPassesFast(), machine, options), 167
         )
     }
+    // `--fast --backtrace`: the table, before the module is cut into units.
+    if (status == 0) bootstrapLlvmDefineBacktraceTable(module, bootstrapLlvmHeldContext)
     // A large module is generated as units, by child compilers at once.
     val units = status == 0 && unitsAllowed && bootstrapCodegenUnitsFor(module)
     if (units) {
@@ -2905,6 +2907,9 @@ trusted fun bootstrapOptimizeHeldWholeProgram(
         bootstrapLlvmAssemblyNamesIn(assembly, 0, assembly.size, assembled)
     }
     for (name in assembled) visible.set(name, true)
+    // The --backtrace table's weak stand-ins stay as they are until bootstrapLlvmDefineBacktraceTable replaces them:
+    // internal, the optimizer would take their empty values for the table's.
+    for (name in ["abla_backtrace_entries", "abla_backtrace_names", "abla_backtrace_count"]) visible.set(name, true)
     if (status == 0) {
         val nounwind = LLVMCreateEnumAttribute(
             bootstrapLlvmHeldContext, bootstrapLlvmAttributeKind("nounwind"), 0
@@ -2955,6 +2960,8 @@ trusted fun bootstrapOptimizeHeldWholeProgram(
             )
         }
     }
+    // --backtrace: the table of the functions the optimizer left (debug.ab).
+    if (status == 0) bootstrapLlvmDefineBacktraceTable(module, bootstrapLlvmHeldContext)
     val parts = if (status == 0 &&
         bootstrapCodegenModuleSize(module) >= BOOTSTRAP_RELEASE_PARTS_MINIMUM) {
         BOOTSTRAP_RELEASE_PARTS
@@ -3126,6 +3133,33 @@ trusted fun bootstrapPrepareCompilerParts(inputPath: string, parts: int): int {
     message.close()
     module.close()
     bootstrapCollectAndRelease()
+    status
+}
+
+// A --backtrace build's table, defined in a prepared module that is then cut into parts (which cannot each name
+// the whole program's functions): after the parent's preparation, so it names what that kept, and keeps each one.
+trusted fun bootstrapDefineBacktraceTableInBitcode(path: string): int {
+    if (!bootstrapLlvmBacktrace) return 0
+    val buffer = nativePointerCell(nativeNullPointer())
+    val message = nativePointerCell(nativeNullPointer())
+    val module = nativePointerCell(nativeNullPointer())
+    val context = LLVMContextCreate()
+    var status = 0
+    if (LLVMCreateMemoryBufferWithContentsOfFile(path, buffer.address, message.address) != 0) status = 145
+    if (status == 0 && LLVMParseBitcodeInContext2(context, buffer.load(), module.address) != 0) status = 145
+    // (Written beside it and moved over: the buffer may map the file.)
+    if (status == 0) {
+        bootstrapLlvmDefineBacktraceTable(module.load(), context)
+        if (LLVMWriteBitcodeToFile(module.load(), "$path.backtrace") != 0) status = 145
+    }
+    if (!pointerIsNull(module.load())) LLVMDisposeModule(module.load())
+    if (!pointerIsNull(buffer.load())) LLVMDisposeMemoryBuffer(buffer.load())
+    LLVMContextDispose(context)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    buffer.close()
+    message.close()
+    module.close()
+    if (status == 0 && !Path("$path.backtrace").moveTo(Path(path))) status = 145
     status
 }
 
@@ -3317,6 +3351,9 @@ trusted fun bootstrapInternalizeLlvmUserFunctionWrapperBitcode(
             }
             function = LLVMGetNextFunction(function)
         }
+        // The --backtrace table, before clang's link-time optimization (which this compiler cannot follow), so it
+        // names every function the module defines and keeps each one out of line.
+        bootstrapLlvmDefineBacktraceTable(module.load(), context)
         if (LLVMWriteBitcodeToFile(module.load(), outputPath) != 0) status = 145
     }
     if (!pointerIsNull(module.load())) LLVMDisposeModule(module.load())
@@ -3342,6 +3379,7 @@ fun bootstrapEmitParallelObject(
 ): int {
     val preparedPath = "$objectPath.prepartition.bc"
     var status = bootstrapPrepareSplitLlvm(llvmPath, preparedPath)
+    if (status == 0) status = bootstrapDefineBacktraceTableInBitcode(preparedPath)
     if (status == 0) {
         val plan = linuxCommand("/proc/self/exe")
         plan.argument("--aot-plan")
@@ -4256,7 +4294,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val debugDirectory = if (bootstrapLlvmDebugInfo && target.objectFormat == "wasm")
         "\nabla-debug-directory:${currentDirectory().text}" else ""
     val sourceIdentity =
-        "$graphIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact\nabla-debug:$bootstrapLlvmDebugInfo$debugDirectory\nabla-prune:$bootstrapLlvmPruneRuntime\nabla-compile-eval:${bootstrapCtCacheTier()}"
+        "$graphIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact\nabla-debug:$bootstrapLlvmDebugInfo$debugDirectory\nabla-backtrace:$bootstrapLlvmBacktrace\nabla-prune:$bootstrapLlvmPruneRuntime\nabla-compile-eval:${bootstrapCtCacheTier()}"
     // Release hosted executables may keep their ordinary relocatable sidecar
     // (on request), but the executable itself is optimized across the
     // generated program and runtime boundary. LLVM-backed compiler programs
@@ -4406,7 +4444,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     ) else 0
     val cacheDirectory = bootstrapCacheDirectory()
     val partitionCacheNamespace =
-        "$cacheDirectory/native-partition-${target.name}-llvm21-v5-$cacheProfile${if (bootstrapLlvmDebugInfo) "-g" else ""}-$compilerImageSize-$compilerFirstHash-$compilerSecondHash"
+        "$cacheDirectory/native-partition-${target.name}-llvm21-v5-$cacheProfile${if (bootstrapLlvmDebugInfo) "-g" else ""}${if (bootstrapLlvmBacktrace) "-backtrace" else ""}-$compilerImageSize-$compilerFirstHash-$compilerSecondHash"
     // A program that built flat may not build with --strict-imports.
     // A held object and the text fallback can have different section layouts.
     // Unit count/threshold also select one object versus an archive and its
@@ -4575,7 +4613,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         var ownDemandPath = ""
         val pruneRequested = linuxEnvironment("ABLA_PRUNE_RUNTIME")
         if (cacheEnabled && pruneRequested.found && pruneRequested.value == "1") {
-            val demandKey = "abla-runtime-demand 1\n$compilerSuffix-$compilerFirstHash-$compilerSecondHash\n${target.llvmTriple}\n$artifact\n$cacheProfile\n${bootstrapLlvmDebugInfo}\n${bootstrapAbsoluteModulePath(sourcePath)}"
+            val demandKey = "abla-runtime-demand 1\n$compilerSuffix-$compilerFirstHash-$compilerSecondHash\n${target.llvmTriple}\n$artifact\n$cacheProfile\n${bootstrapLlvmDebugInfo}\n${bootstrapLlvmBacktrace}\n${bootstrapAbsoluteModulePath(sourcePath)}"
             ownDemandPath =
                 "$cacheDirectory/runtime-demand/${bootstrapNativeCacheHash(demandKey, 17, 257, 1000000007)}-${bootstrapNativeCacheHash(demandKey, 31, 263, 1000000009)}"
         }
