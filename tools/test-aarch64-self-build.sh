@@ -15,7 +15,7 @@ deps=${3:?deps directory}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 read -r host _ <<< "$ABLA_AARCH64_HOSTS"
 dir=abla-self-build-$$
-cleanup() { ssh -q "$host" "rm -rf ~/$dir" || :; }
+cleanup() { ssh -q "$host" "chmod -R u+w ~/$dir; rm -rf ~/$dir" || :; }
 trap cleanup EXIT
 ssh -q "$host" "mkdir -p ~/$dir/tree ~/$dir/empty ~/$dir/deps"
 git -C "$root" archive HEAD | ssh -q "$host" "tar -x -C ~/$dir/tree"
@@ -23,7 +23,7 @@ tar -C "$deps" -c llvm lld libs | ssh -q "$host" "tar -x -C ~/$dir/deps"
 scp -q "$artifact" "$host:$dir/pass1"
 scp -q "$shim" "$host:$dir/shim.o"
 # The whole run in one ssh session: a board without lingering ends its background jobs with the session.
-ssh -q "$host" "bash -s" "$dir" <<'REMOTE' | tee /dev/stderr | grep '^SELF-BUILD OK$' > /dev/null
+remote_output=$(mktemp); ssh -q "$host" "bash -s" "$dir" <<'REMOTE' > "$remote_output" || :
 set -u
 dir=$HOME/$1
 export ABLA_SYSROOT=$dir/tree ABLA_MAX_MEMORY_MB=7000 ABLA_NATIVE_JOBS=1 ABLA_CODEGEN_JOBS=1
@@ -48,4 +48,6 @@ cmp "$dir/pass2" "$dir/pass3" || { echo 'pass 2 and pass 3 differ'; exit 1; }
 echo "pass 2 == pass 3 ($(wc -c < "$dir/pass2") bytes)"
 echo 'SELF-BUILD OK'
 REMOTE
+cat "$remote_output"; ok=0; grep -q "^SELF-BUILD OK$" "$remote_output" && ok=1; rm -f -- "$remote_output"
+((ok)) || { echo "aarch64 self-build: failed (see above)" >&2; exit 1; }
 echo 'aarch64 self-build: the compiler builds itself on an empty PATH on hardware, pass 2 == pass 3'
