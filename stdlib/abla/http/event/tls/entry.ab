@@ -22,6 +22,7 @@ import "abla/text"
 import "abla/tls/pure"
 import "abla/tls/pure/server"
 
+/// Configures supported HTTP versions, connection limits and TLS handshake timeouts.
 class HttpsEventServerOptions(
     val base: HttpEventServerOptions = httpEventServerOptions(),
     // Serve HTTP/2 (ALPN h2, and h2c on plain connections).
@@ -60,13 +61,17 @@ class HttpStreamExchange(
     var requestEnded: bool = false
 )
 
+/// Leaves the current request-body flow control unchanged.
 val HTTP_STREAM_NO_CHANGE = 0
+/// Pauses request-body credit until the handler resumes it.
 val HTTP_STREAM_PAUSE = 1
+/// Resumes request-body credit after a pause.
 val HTTP_STREAM_RESUME = 2
 // Pause the request body only if what this step wrote did not fit in the response (the server kept the rest): it is resumed by itself once that is all out. The pattern of an echo or a proxy;
 // deciding from `exchange.room` instead races with the room that opens while the step is applied.
 val HTTP_STREAM_PAUSE_FOR_ROOM = 3
 
+/// Describes the response headers, output, flow control or abort to apply to a streaming exchange.
 class HttpStreamStep(
     val respond: bool = false,
     val status: int = 200,
@@ -83,14 +88,21 @@ class HttpStreamStep(
     val wantWritable: bool = false
 )
 
+/// Receives streaming HTTP callbacks on the event-loop thread and returns the next step without blocking.
 interface HttpStreamHandler {
+    /// Returns the first step when request headers arrive.
     fun onRequest(exchange: HttpStreamExchange): HttpStreamStep
+    /// Returns the next step after receiving a nonempty request-body chunk.
     fun onData(exchange: HttpStreamExchange, chunk: string): HttpStreamStep
+    /// Returns the next step when the request body ends and any trailers are available.
     fun onEnd(exchange: HttpStreamExchange, trailers: array<HttpHeader>): HttpStreamStep
+    /// Returns the next step when previously blocked response output has room again.
     fun onWritable(exchange: HttpStreamExchange): HttpStreamStep
+    /// Notifies the handler that the exchange ended before completing.
     fun onAbort(exchange: HttpStreamExchange, reason: string): void
 }
 
+/// Binds a method and path to a streaming handler and a request-body limit.
 class HttpsStreamRoute(val method: string, val path: string, val handler: HttpStreamHandler, val maximumBodyBytes: int)
 
 // One live exchange: where it runs, what is held back for it.
@@ -132,6 +144,7 @@ private val httpsSniffing = 2
 private val httpsHttp1 = 3
 private val httpsHttp2 = 4
 
+/// Owns the listener, poller and per-connection state for an HTTP event server with optional TLS.
 resource class HttpsEventServer(
     val handler: (HttpRequest) -> HttpResponse,
     val listener: TcpListener,
@@ -161,6 +174,7 @@ resource class HttpsEventServer(
     val exchanges: array<HttpsExchange> = [],
     var nextExchange: int = 1
 ) {
+    /// Closes the active sockets, poller and listener when the server is dropped.
     fun drop(): void {
         var index = 0
         while (index < this.descriptors.size) {
@@ -182,6 +196,7 @@ resource class HttpsEventServer(
 fun httpsEventServerTls(certificatePath: string, privateKeyPath: string, http2: bool = true): TlsServerConfig? =
     httpsEventServerTlsPem(linuxReadFile(certificatePath, 1048576), linuxReadFile(privateKeyPath, 1048576), http2)
 
+/// Loads TLS configuration from PEM bytes and returns null if the certificate or key is invalid.
 fun httpsEventServerTlsPem(certificatePem: string, privateKeyPem: string, http2: bool = true): TlsServerConfig? {
     val config = tlsServerConfigFromPem(certificatePem, privateKeyPem)
     if (config == null) return null
@@ -199,6 +214,7 @@ fun httpsEventServerTlsPems(entries: array<TlsServerPem>, http2: bool = true): T
 private fun httpsRouterHandler(router: HttpRouter): (HttpRequest) -> HttpResponse =
     { request: HttpRequest -> router.dispatch(request) }
 
+/// Creates an event server for router dispatch, with startup errors available through the returned server.
 fun httpsEventServer(
     router: HttpRouter,
     address: Ipv4SocketAddress,
@@ -207,6 +223,7 @@ fun httpsEventServer(
     reusePort: bool = false
 ): HttpsEventServer = httpsEventServerHandler(httpsRouterHandler(router), address, tls, options, reusePort)
 
+/// Creates an event server with a request callback, with listener and poller errors available through the returned server.
 fun httpsEventServerHandler(
     handler: (HttpRequest) -> HttpResponse,
     address: Ipv4SocketAddress,
@@ -522,6 +539,7 @@ private fun HttpsEventServer.streamEvent(slot: int, event: H2ServerEvent): void 
     val handler = this.streamRoutes[this.exchanges[index].route].handler
     if (event.kind == H2_SERVER_EVENT_DATA) {
         this.exchanges[index].exchange.requestBytes = this.exchanges[index].exchange.requestBytes + event.data.size
+        /// Polls once for up to the supplied timeout and returns the number of readiness events handled.
         val step = handler.onData(this.exchanges[index].exchange, event.data)
         this.applyStep(id, step)
         index = this.exchangeById(id)
@@ -817,8 +835,10 @@ private fun HttpsEventServer.abortExchanges(slot: int, reason: string): void {
     return
 }
 
+/// Returns the listener's bound port or -1 if the host cannot report it.
 fun HttpsEventServer.port(): int = this.listener.localPort()
 
+/// Returns the number of occupied connection slots.
 fun HttpsEventServer.activeConnections(): int {
     var active = 0
     for (index in 0 until this.descriptors.size) {
@@ -872,6 +892,7 @@ private fun HttpsEventServer.allocate(descriptor: int): int {
     slot
 }
 
+/// Closes the socket for a connection slot and releases its server state.
 fun HttpsEventServer.closeSlot(slot: int): void {
     if (slot >= 0 && slot < this.descriptors.size && this.descriptors[slot] >= 0) {
         // (the protocol is read before the slot is marked free: an HTTP/2 connection's state, with the request bodies it buffered, is dropped now, not when the slot is reused)
@@ -1164,6 +1185,7 @@ private fun HttpsEventServer.handshake(slot: int): void {
     return
 }
 
+/// Processes available bytes for one connection and closes it if reading or protocol handling fails.
 fun HttpsEventServer.readSlot(slot: int): void {
     var reading = slot >= 0 && this.descriptors[slot] >= 0
     var result = HttpsRead("", 0)
@@ -1188,6 +1210,7 @@ fun HttpsEventServer.readSlot(slot: int): void {
     return
 }
 
+/// Attempts to flush pending output and updates the connection's write interest.
 fun HttpsEventServer.writeSlot(slot: int): void {
     if (slot >= 0 && this.descriptors[slot] >= 0) {
         if (this.states[slot] == httpsHandshaking) {
@@ -1206,6 +1229,7 @@ fun HttpsEventServer.writeSlot(slot: int): void {
     return
 }
 
+/// Accepts pending connections until the listener would block and assigns each accepted connection a slot.
 fun HttpsEventServer.acceptReady(): void {
     var accepting = !this.draining && this.activeConnections() < this.options.base.maximumConnections
     while (accepting) {
@@ -1237,6 +1261,7 @@ private fun HttpsEventServer.buffered(slot: int): bool =
     this.tls != null && this.descriptors[slot] >= 0 && this.outputs[slot].size == 0 && !this.h1Paused(slot) &&
     (this.states[slot] == httpsHttp1 || this.states[slot] == httpsHttp2) && this.sessions[slot].hasPending()
 
+/// Polls once for up to the supplied timeout and returns the number of readiness events handled.
 fun HttpsEventServer.step(timeoutMilliseconds: int = 1000): int {
     var handled = 0
     var maximumEvents = this.options.base.maximumConnections + 1
@@ -1350,17 +1375,20 @@ fun HttpsEventServer.beginDrain(): void {
     return
 }
 
+/// Begins graceful shutdown, closing the listener and letting active exchanges drain.
 fun HttpsEventServer.stop(): void {
     this.beginDrain()
     return
 }
 
+/// Closes all connection slots immediately and marks the server stopped.
 fun HttpsEventServer.forceStop(): void {
     for (slot in 0 until this.descriptors.size) this.closeSlot(slot)
     this.stopped = true
     return
 }
 
+/// Stops accepting and services active connections to completion or the drain deadline, then returns zero.
 fun HttpsEventServer.drain(): int {
     this.beginDrain()
     while (this.activeConnections() > 0 && linuxMonotonicMilliseconds() < this.drainDeadline) this.step(50)
@@ -1375,6 +1403,7 @@ fun HttpsEventServer.listenError(): int =
     else if (this.poller.descriptor < 0) 0 - this.poller.descriptor
     else 0
 
+/// Services the event loop until shutdown, returning 1 if listener or poller startup failed and zero on normal shutdown.
 fun HttpsEventServer.run(): int {
     if (!this.stopped && this.listenError() != 0) return 1
     this.poller.watchGracefulShutdown()
