@@ -413,6 +413,11 @@ toolchain, `/proc/self/exe`): `filesystem.read` is what grants that. A `trusted.
 site's own raw system calls (`linuxOpen` and the like) are not resolved, as nothing else of its native access is
 checked.
 
+A tree built without its `.git` (a `git archive` export, a release tarball, a copy) has no repository root to find, so
+it is bounded by its working directory: built from a subdirectory, a read of `../assets` that works in the checkout
+fails there. A project that is built from such a copy names itself in a root `abla.toml` (`name = "my-game"`); it is
+then bounded the same way in both (#1141, tools/test-compile-path-export.sh).
+
 The working-directory reading that v0.2.65 (build calls) and v0.2.66 (the rest) kept with `W_BUILD_PATH_CWD` is gone
 (#1044): a path found only from the working directory is not found at all.
 
