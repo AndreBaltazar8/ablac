@@ -44,6 +44,10 @@ test -e "$prefix/lib/libLLVM.dylib"
 for tool in opt llc clang ld.lld ld64.lld wasm-ld; do
     test -x "$prefix/bin/$tool"
 done
+# The unpacked clang has no Xcode SDK configured. Check the same header used
+# by the native test drivers, then give later CI steps that SDK by default.
+sdk=$(xcrun --sdk macosx --show-sdk-path)
+printf '#include <dlfcn.h>\n' | SDKROOT="$sdk" "$prefix/bin/clang" -x c -fsyntax-only -
 # OpenSSL and Binaryen keep their existing Homebrew installation path. LLVM
 # itself always comes from the immutable archive above, on both Mac hosts.
 export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
@@ -58,6 +62,7 @@ done
     echo "ABLA_LLD=$prefix"
     echo "ABLA_LLVM_TOOLS=$prefix/bin"
     echo "ABLA_MACOS_CLANG=$prefix/bin/clang"
+    echo "SDKROOT=$sdk"
 } >> "$GITHUB_ENV"
 {
     echo "$prefix/bin"

@@ -102,6 +102,9 @@ llvm=${ABLA_LLVM:-$root/llvm}
 lld=${ABLA_LLD:-$llvm}
 export ABLA_LLVM="$llvm" ABLA_LLD="$lld"
 export ABLA_LLVM_TOOLS="$llvm/bin" ABLA_MACOS_CLANG="$llvm/bin/clang"
+if [ -z "${SDKROOT:-}" ] && sdk=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null); then
+    export SDKROOT="$sdk"
+fi
 SH
     fi
     cat <<'SH'
