@@ -12666,6 +12666,72 @@ class BootstrapLoopStringBuild(
     val body: BootstrapExpression, val builder: string, val accumulator: string
 )
 
+fun bootstrapStringBuildFixedWidth(piece: BootstrapExpression, counter: string): int {
+    if (piece.kind == "string") return piece.text.size
+    if (piece.kind != "if" || piece.children.size != 3) return 0
+    val yes = piece.children[1]
+    val no = piece.children[2]
+    if (yes.kind != "string" || no.kind != "string" || yes.text.size != no.text.size) return 0
+    val test = piece.children[0]
+    if (test.children.size != 2 || test.children[1].kind != "integer") return 0
+    if (test.kind != "==" && test.kind != "!=" && test.kind != "<" && test.kind != "<=" &&
+        test.kind != ">" && test.kind != ">=") return 0
+    var index = test.children[0]
+    if (index.kind == "%" && index.children.size == 2) {
+        val divisor = index.children[1]
+        if (divisor.kind != "integer" || divisor.text.size == 0 || divisor.text.size > 9 ||
+            divisor.text[0] < 49 || divisor.text[0] > 57) return 0
+        index = index.children[0]
+    }
+    if (index.kind == "identifier" && index.text == counter) yes.text.size else 0
+}
+
+// Exact size for two-statement while loops (append, unit increment), with an
+// optional immutable literal selection before the append. The bound is a
+// separate scalar local and the choice cannot change it or leave the loop.
+@noinline
+fun bootstrapReserveLoopStringBuild(
+    var lowerer: BootstrapLowerer, loop: BootstrapExpression, body: BootstrapExpression,
+    piece: BootstrapExpression, append: int, cell: int
+): void {
+    if (loop.kind != "while" || append > 1 || body.children.size != append + 2) return
+    val test = loop.children[0]
+    if (test.kind != "<" || test.children.size != 2) return
+    val counter = test.children[0]
+    val bound = test.children[1]
+    if (counter.kind != "identifier" || bound.kind != "identifier" ||
+        counter.text == bound.text) return
+    val first = lowerer.visibleLocal(counter.text, false)
+    val limit = lowerer.visibleLocal(bound.text, false)
+    if (first < 0 || limit < 0 || first >= lowerer.localTypes.size ||
+        limit >= lowerer.localTypes.size || lowerer.localTypes[first] != "i64" ||
+        lowerer.localTypes[limit] != "i64") return
+    val update = body.children[append + 1]
+    if (update.kind != "assign" || update.text != counter.text || update.children.size != 1)
+        return
+    val next = update.children[0]
+    if (next.kind != "+" || next.children.size != 2) return
+    val previous = next.children[0]
+    val step = next.children[1]
+    if (previous.kind != "identifier" || previous.text != counter.text ||
+        step.kind != "integer" || step.text != "1") return
+    var source = piece
+    if (append == 1) {
+        val binding = body.children[0]
+        if (binding.kind != "local.val" || binding.children.size == 0 ||
+            piece.kind != "identifier" || binding.text != piece.text ||
+            binding.text == counter.text || binding.text == bound.text) return
+        source = binding.children[0]
+    }
+    val width = bootstrapStringBuildFixedWidth(source, counter.text)
+    if (width == 0) return
+    val begin = lowerer.emit("local.load", -1, -1, lowerer.localStorage[first])
+    val end = lowerer.emit("local.load", -1, -1, lowerer.localStorage[limit])
+    val bytes = lowerer.emit("const.i64", -1, -1, "$width")
+    lowerer.emitMany("call", [cell, begin, end, bytes], "__ablaRuntimeStringBuildReserve")
+    return
+}
+
 @noinline
 fun bootstrapPrepareLoopStringBuild(
     var lowerer: BootstrapLowerer, loop: BootstrapExpression
@@ -12724,6 +12790,7 @@ fun bootstrapPrepareLoopStringBuild(
         val cell = lowerer.emitMany("cell.create", [original], "")
         val builder = "string_builder_${lowerer.nextValue}"
         lowerer.emit("local.declare", cell, -1, builder)
+        bootstrapReserveLoopStringBuild(lowerer, loop, body, piece, append, cell)
         val statements: array<BootstrapExpression> = []
         var at = 0
         for (step in body.children) {
