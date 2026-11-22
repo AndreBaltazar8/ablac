@@ -1,4 +1,5 @@
 import "abla/array"
+import "abla/text"
 import "eval.ab"
 import "subparser.ab"
 import "source_rewrite.ab"
@@ -1134,7 +1135,7 @@ fun bootstrapApplyGeneratedModules(
             finalized.value.text.size <= BOOTSTRAP_GENERATED_MODULE_LIMIT) {
             namespaces.append(extensionRequest.namespace)
             val generated = bootstrapParseWithIdentity(
-                finalized.value.text,
+                bootstrapRewriteGeneratedNames(finalized.value.text, extensionRequest.finalizer, handlerDeclarations),
                 "<generated:${extensionRequest.namespace}>"
             )
             bootstrapMergeCompileInputs(
@@ -1388,6 +1389,51 @@ fun bootstrapSubparserSiteKey(
     "${rewrite.original(offset)}"
 }
 
+/** The directory of the module a prefixed name belongs to (`abla/sql` for a name of abla/sql/runtime.ab), "" for an unprefixed name. */
+fun bootstrapModuleDirectoryOf(name: string): string {
+    val identity = bootstrapCanonicalDeclarationModuleIdentity(name)
+    val slash = identity.lastIndexOf("/")
+    if (slash < 0) "" else identity.slice(0, slash)
+}
+
+/** `source` with each use of a name of the module directory `finalizer` belongs to written as that module's declaration (see bootstrapModuleDirectoryOf):
+ *  generated text names its library's helpers unqualified, and under an alias or for a private name those carry a prefix. Declaration
+ *  positions (after `.`, `val`, `var`, `fun`, `class`, before `:`) are left alone. */
+fun bootstrapRewriteGeneratedNames(
+    source: string, finalizer: string, declarations: array<BootstrapDeclaration>
+): string {
+    val directory = bootstrapModuleDirectoryOf(finalizer)
+    if (directory == "") return source
+    val names: array<string> = []
+    val replacements: array<string> = []
+    for (declaration in declarations) {
+        if (declaration.extensionOwner == "" && bootstrapModuleDirectoryOf(declaration.name) == directory) {
+            val visible = bootstrapCanonicalDeclarationSourceName(declaration.name)
+            if (visible != "" && !bootstrapAffineNamesContain(names, visible)) {
+                names.append(visible)
+                replacements.append(declaration.name)
+            }
+        }
+    }
+    if (names.size == 0) return source
+    val tokens = bootstrapLexShared(source)
+    var output = ""
+    var cursor = 0
+    for (index in 0 until tokens.size) {
+        if (tokens[index].kind != BOOTSTRAP_TOKEN_IDENTIFIER) continue
+        val text = bootstrapTokenText(source, tokens[index])
+        var slot = -1
+        for (candidate in 0 until names.size) if (names[candidate] == text) slot = candidate
+        if (slot < 0) continue
+        val before = if (index > 0) bootstrapTokenText(source, tokens[index - 1]) else ""
+        val after = if (index + 1 < tokens.size) bootstrapTokenText(source, tokens[index + 1]) else ""
+        if (before == "." || before == "val" || before == "var" || before == "fun" || before == "class" || after == ":") continue
+        output = "$output${source.slice(cursor, tokens[index].begin)}${replacements[slot]}"
+        cursor = tokens[index].end
+    }
+    "$output${source.slice(cursor, source.size)}"
+}
+
 fun bootstrapParseStagedRegistered(
     source: string,
     sourceIdentity: string,
@@ -1423,6 +1469,12 @@ fun bootstrapParseStagedRegistered(
     val outerVisibleReplacements = bootstrapSubparserVisibleReplacements
     val visibleNames: array<string> = []
     val visibleReplacements: array<string> = []
+    // Per handler directory (bootstrapModuleDirectoryOf): the prefixed declarations of its modules, as slices of two flat arrays.
+    val directoryKeys: array<string> = []
+    val directoryStarts: array<int> = []
+    val directoryEnds: array<int> = []
+    val directoryNames: array<string> = []
+    val directoryReplacements: array<string> = []
     var visibleDeclaration = currentDeclarationBegin
     while (visibleDeclaration < currentDeclarationBegin + currentDeclarationCount &&
         visibleDeclaration < handlerDeclarations.size) {
@@ -1482,8 +1534,40 @@ fun bootstrapParseStagedRegistered(
                         limit
                     )
                     evalContext = bootstrapEvalContextFor(evalContext, handlerDeclarations)
-                    bootstrapSubparserVisibleNames = visibleNames
-                    bootstrapSubparserVisibleReplacements = visibleReplacements
+                    // A handler in a module imported under an alias or kept private names its own helpers
+                    // unqualified; those helpers carry the module's prefix here, so map each to it.
+                    val siteNames: array<string> = []
+                    val siteReplacements: array<string> = []
+                    for (index in 0 until visibleNames.size) {
+                        siteNames.append(visibleNames[index])
+                        siteReplacements.append(visibleReplacements[index])
+                    }
+                    val handlerName = registry.registrations[registrationIndex].handler
+                    val handlerDirectory = bootstrapModuleDirectoryOf(handlerName)
+                    if (handlerDirectory != "") {
+                        var cached = -1
+                        for (key in 0 until directoryKeys.size) if (directoryKeys[key] == handlerDirectory) cached = key
+                        if (cached < 0) {
+                            cached = directoryKeys.size
+                            directoryKeys.append(handlerDirectory)
+                            directoryStarts.append(directoryNames.size)
+                            for (declaration in handlerDeclarations) {
+                                if (declaration.extensionOwner == "" && bootstrapModuleDirectoryOf(declaration.name) == handlerDirectory) {
+                                    directoryNames.append(bootstrapCanonicalDeclarationSourceName(declaration.name))
+                                    directoryReplacements.append(declaration.name)
+                                }
+                            }
+                            directoryEnds.append(directoryNames.size)
+                        }
+                        for (entry in directoryStarts[cached] until directoryEnds[cached]) {
+                            if (directoryNames[entry] != "" && !bootstrapAffineNamesContain(siteNames, directoryNames[entry])) {
+                                siteNames.append(directoryNames[entry])
+                                siteReplacements.append(directoryReplacements[entry])
+                            }
+                        }
+                    }
+                    bootstrapSubparserVisibleNames = siteNames
+                    bootstrapSubparserVisibleReplacements = siteReplacements
                     val invocation = bootstrapInvokeSubparserHandlerIn(
                         evalContext,
                         handlerDeclarations,
