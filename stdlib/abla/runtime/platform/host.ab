@@ -2270,8 +2270,8 @@ trusted fun __ablaRuntimeHostRegistryGrow(): void {
 // The registry names payload starts. Its bit 0 marks a large block, bit 1 is
 // the parallel sweep's garbage tag, and bit 2 marks a compact native block.
 // A region has no registry slot: state 63 names its owner at payload - 24.
-/// Enables compact headers for eligible small class allocations.
-var __ablaRuntimeHostCompactHeaders: bool = __ablaRuntimeHostCompactHeadersConfigured()
+/// The native header width for small class allocations, or zero before configuration.
+var __ablaRuntimeHostSmallClassHeaderWidth: int = 0
 
 private trusted fun __ablaRuntimeHostCompactHeadersConfigured(): bool {
     // Enable the compact lane only for runtime-owned x86-64 processes with an
@@ -2282,6 +2282,14 @@ private trusted fun __ablaRuntimeHostCompactHeadersConfigured(): bool {
         __ablaRuntimeWord0("ABLA_COMPACT_HEADERS")
     )))
     value == 0 || ablaRuntimeLoadU8(value) != 48 || ablaRuntimeLoadU8(value + 1) != 0
+}
+
+// Called under the heap lock on the first eligible allocation. A static
+// initializer keeps the allocator out of the lazy export initialization path.
+private @noinline trusted fun __ablaRuntimeHostConfigureSmallClassHeaderWidth(): int {
+    val width = if (__ablaRuntimeHostCompactHeadersConfigured()) 16 else 32
+    __ablaRuntimeHostSmallClassHeaderWidth = width
+    width
 }
 
 /// Returns the native header size of a registry entry, even if its garbage bit is set.
@@ -2568,7 +2576,11 @@ trusted fun __ablaRuntimeHostBlockFree(header: int, size: int, width: int): void
 @inline
 trusted fun __ablaRuntimeHostTrackedAllocate(size: int, layout: int): int {
     if (size > 4611686018427387871) ablaRuntimeTrap()
-    val width: int = if (layout == 5 && size <= 480 && __ablaRuntimeHostCompactHeaders) 16 else 32
+    var width = 32
+    if (layout == 5 && size <= 480) {
+        width = __ablaRuntimeHostSmallClassHeaderWidth
+        if (width == 0) width = __ablaRuntimeHostConfigureSmallClassHeaderWidth()
+    }
     val payload = __ablaRuntimeHostBlockAllocate(size, width) + width
     __ablaRuntimeHostRegister(payload, size, layout, width)
     __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
@@ -2623,7 +2635,7 @@ trusted fun __ablaRuntimePlatformAllocateLayout(
     if (layout == 5) {
         val size: int = if (requested <= 0) 1 else requested
         if (__ablaRuntimeHostHeapMutex == 0 && size <= 480) {
-            val width: int = if (__ablaRuntimeHostCompactHeaders) 16 else 32
+            val width = __ablaRuntimeHostSmallClassHeaderWidth
             val total = (size + width + 7) & -8
             val list = __ablaRuntimeHostSmallLists() + total
             /// Releases a C allocator pointer.
@@ -2632,7 +2644,7 @@ trusted fun __ablaRuntimePlatformAllocateLayout(
             val limit: int = if (__ablaRuntimeHostLimit == 0) {
                 4611686018427387903
             } else __ablaRuntimeHostLimit
-            if (free != 0 && slots != __ablaRuntimeHostRegistryCapacity &&
+            if (free != 0 && width != 0 && slots != __ablaRuntimeHostRegistryCapacity &&
                 size <= limit - __ablaRuntimeHostLiveBytes &&
                 __ablaRuntimeHostRegionLoad() == 0) {
                 ablaRuntimeStoreI64(list, ablaRuntimeLoadI64(free))
