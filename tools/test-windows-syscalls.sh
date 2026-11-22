@@ -33,13 +33,16 @@ fi
 grep -q 'unsupported Linux system call 999' "$out/refuse.out" "$out/refuse.err" || fail "the refusal does not name the call"
 
 # What the compiler asks before it reaches LLVM (self.ab): the stack limit is the 8 MiB the image is linked with, the descriptor
-# limit the table's 4096, the affinity mask 8 bytes with a CPU in it, and /proc/self/exe the program itself ("/" for "\").
+# limit the table's 4096, the affinity mask 8 bytes with a CPU in it, and /proc/self/exe the program itself ("/" for "\"). And
+# what it links: a float `%` (the runtime's remainder: no fmod to import), malloc_trim (0) and pthread_key_create (ENOSYS).
 "$compiler" build tests/cases/windows/self.ab --target x86_64-windows-hosted -o "$out/self.exe" --fast --no-cache > "$out/self.log" 2>&1 ||
     { cat "$out/self.log" >&2; fail "self.ab did not build for Windows"; }
 status=0
 tools/windows/wine-run.sh "$out/self.exe" > "$out/self.out" 2> "$out/self.err" || status=$?
 [[ $status == 0 ]] || fail "self.exe exited $status: $(head -3 "$out/self.err")"
 expect() { grep -qxE "$1" "$out/self.out" || fail "self.exe printed no line matching '$1': $(cat "$out/self.out" "$out/self.err")"; }
+expect 'remainder 1\.5'
+expect 'trim 0 key 38'
 expect 'stack 8388608 8388608'
 expect 'descriptors 4096'
 expect 'affinity 8 bytes, some CPUs'
