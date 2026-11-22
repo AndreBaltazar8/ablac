@@ -4595,7 +4595,8 @@ compile class JsonObjectSyntaxKeys(
     val guards: array<string>,
     val keys: array<string>,
     var valid: SyntaxExpression,
-    var nextKey: int
+    var nextKey: int,
+    var checked: bool = false
 )
 
 // Evaluate guards and selected computed keys once, before any values. A false
@@ -4617,11 +4618,13 @@ compile fun ablaJsonGuardedKeys(expression: SyntaxExpression, prefix: string, fi
         if (syntaxKind(key) == "string") {
             prepared.keys.append("")
             if (!syntaxText(key).isValidUtf8()) {
+                prepared.checked = true
                 val valid = if (guard == "") syntaxBoolean(false)
                     else syntaxBinary("==", syntaxIdentifier(guard), syntaxBoolean(false))
                 prepared.valid = syntaxBinary("&&", prepared.valid, valid)
             }
         } else {
+            prepared.checked = true
             val name = "${prefix}_key${prepared.nextKey}"
             prepared.nextKey = prepared.nextKey + 1
             prepared.keys.append(name)
@@ -4662,15 +4665,21 @@ compile class JsonWriteSyntaxPlan(
     val prefix: string,
     val statements: array<SyntaxExpression>,
     var pending: string,
-    var nextKey: int
+    var nextKey: int,
+    var textTarget: int = -1
 )
+
+// Emit the buffer operation itself: a forwarding function adds a GC frame
+// whose unlink survives LLVM inlining at every static append.
+compile fun ablaJsonWriteTextCall(var plan: JsonWriteSyntaxPlan, text: string): SyntaxExpression {
+    if (plan.textTarget < 0) plan.textTarget = compilerFindFunction("ByteBuffer.appendText")
+    syntaxMethodCallTarget(plan.textTarget, ablaJsonWriteSink(plan.sink), [syntaxString(text)])
+}
 
 // Coalesces pending literal bytes into one append statement and clears the pending text.
 compile fun ablaJsonWriteFlush(var plan: JsonWriteSyntaxPlan): void {
     if (plan.pending != "") {
-        plan.statements.append(syntaxCall("ablaJsonWriteText", [
-            ablaJsonWriteSink(plan.sink), syntaxString(plan.pending)
-        ]))
+        plan.statements.append(ablaJsonWriteTextCall(plan, plan.pending))
         plan.pending = ""
     }
     return
@@ -4762,7 +4771,7 @@ compile fun ablaJsonWriteObject(
             }
         }
     }
-    val body = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], plan.pending, plan.nextKey)
+    val body = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], plan.pending, plan.nextKey, plan.textTarget)
     plan.pending = ""
     body.pending = body.pending + "{"
     for (index in 0 until count) {
@@ -4781,7 +4790,7 @@ compile fun ablaJsonWriteObject(
         ablaJsonWriteFlush(body)
         plan.nextKey = body.nextKey
         plan.statements.append(syntaxIf(valid, syntaxBlock(body.statements),
-            syntaxCall("ablaJsonWriteText", [ablaJsonWriteSink(plan.sink), syntaxString("null")])) )
+            ablaJsonWriteTextCall(plan, "null")))
     } else {
         for (statement in body.statements) plan.statements.append(statement)
         plan.pending = body.pending
@@ -4798,7 +4807,7 @@ compile fun ablaJsonWriteGuardedObject(var plan: JsonWriteSyntaxPlan, expression
     ablaJsonWriteFlush(plan)
     val prepared = ablaJsonGuardedKeys(expression, plan.prefix, plan.nextKey)
     for (statement in prepared.statements) plan.statements.append(statement)
-    val body = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], "{", prepared.nextKey)
+    val body = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], "{", prepared.nextKey, plan.textTarget)
     val keys = syntaxChild(expression, 0)
     val values = syntaxChild(expression, 1)
     val comma = "${plan.prefix}_comma${body.nextKey}"
@@ -4811,11 +4820,11 @@ compile fun ablaJsonWriteGuardedObject(var plan: JsonWriteSyntaxPlan, expression
     for (index in 0 until syntaxChildCount(keys)) {
         val guarded = prepared.guards[index] != ""
         if (guarded) ablaJsonWriteFlush(body)
-        val member = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], body.pending, body.nextKey)
+        val member = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], body.pending, body.nextKey, plan.textTarget)
         body.pending = ""
         if (alwaysMember) member.pending = member.pending + ","
         else if (possibleMember) member.statements.append(syntaxIf(syntaxIdentifier(comma),
-            syntaxCall("ablaJsonWriteText", [ablaJsonWriteSink(plan.sink), syntaxString(",")]), syntaxBlock([])))
+            ablaJsonWriteTextCall(plan, ","), syntaxBlock([])))
         val key = syntaxChild(keys, index)
         if (syntaxKind(key) == "string") member.pending = member.pending + jsonQuote(syntaxText(key)) + ":"
         else {
@@ -4839,8 +4848,9 @@ compile fun ablaJsonWriteGuardedObject(var plan: JsonWriteSyntaxPlan, expression
     body.pending = body.pending + "}"
     ablaJsonWriteFlush(body)
     plan.nextKey = body.nextKey
-    plan.statements.append(syntaxIf(prepared.valid, syntaxBlock(body.statements),
-        syntaxCall("ablaJsonWriteText", [ablaJsonWriteSink(plan.sink), syntaxString("null")])))
+    if (prepared.checked) plan.statements.append(syntaxIf(prepared.valid, syntaxBlock(body.statements),
+        ablaJsonWriteTextCall(plan, "null")))
+    else for (statement in body.statements) plan.statements.append(statement)
     return
 }
 
@@ -4852,7 +4862,8 @@ compile fun ablaJsonParseWrittenValue(cursor: ParserCursor): SyntaxExpression {
     val sink = parserParseAblaExpression(cursor)
     parserExpect(cursor, ")")
     val name = "ablaJsonSink_${parserSiteKey(cursor)}"
-    val plan = JsonWriteSyntaxPlan(syntaxIdentifier(name), name, [], "", 0)
+    val plan = JsonWriteSyntaxPlan(syntaxIdentifier(name), name, [], "", 0,
+        compilerFindFunction("ByteBuffer.appendText"))
     if (syntaxKind(sink) == "identifier" || syntaxKind(sink) == "member" || syntaxKind(sink) == "index") {
         if (!ablaJsonWriteStablePlace(sink)) {
             parserFail(cursor, "a \$jsonw sink must be a stable buffer place or a fresh buffer expression")
