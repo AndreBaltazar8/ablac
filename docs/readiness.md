@@ -126,7 +126,6 @@ Heuristic scan of open TODO list items for wrong code, miscompiles, wrong result
     TODO.md:421 - [ ] **`tools/fuzz-differential` findings** (2026-11-08; branch `fuzz-differential`). The fuzzer builds
     TODO.md:863 - [ ] **`--fast` builds are read on every target; the Xtensa one is partly unplaced.** `tools/test-ct.sh` builds the fixture
     TODO.md:3305 - [ ] **instcombine: `0.0 / (0.0 * v)` becomes a signed zero (LLVM 23.1.x; found by the differential fuzzer, seed 100097, 2026-11-21).** `%v = sitofp i64 %n
-    TODO.md:3314 - [ ] **fdlibm-exact `sinh`, `cosh`, `tanh`, `asin`, `acos`, `erf`, `log1p`, `log2`, `log10`, `expm1` (static libc, src/static_libc/math2.ab and math3.ab).**
 
 ## Security
 
