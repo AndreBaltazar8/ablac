@@ -3,7 +3,7 @@
 // caller's supplied byte range. Scalar callers finish partial blocks.
 
 import "../../simd/byte-lanes.ab"
-import "./entry.ab"
+import "abla/unsafe/memory/raw"
 
 // A lane mask from a 16-byte block, known to contain a match.
 private @inline fun __ablaRuntimeFirstByteLane(mask: int): int {
@@ -23,7 +23,9 @@ private @inline fun __ablaRuntimeFirstByteLane(mask: int): int {
     val space = u8x16Splat(32)
     while (end - offset >= 16) {
         val bytes = u8x16LoadAddress(data + offset)
-        val special = (bytes | bytes.lt(space) | bytes.eq(quote) | bytes.eq(slash)).bitmask()
+        val control = ablaSimd_or_u8x16(bytes, bytes.lt(space))
+        val syntax = ablaSimd_or_u8x16(bytes.eq(quote), bytes.eq(slash))
+        val special = ablaSimd_or_u8x16(control, syntax).bitmask()
         if (special != 0) return ~(offset + __ablaRuntimeFirstByteLane(special))
         offset += 16
     }
@@ -34,21 +36,21 @@ private @inline fun __ablaRuntimeFirstByteLane(mask: int): int {
 /** Searches complete blocks of candidate start positions up to the inclusive last position. Returns the first match or the complement of the first remaining position. Both buffers must cover the tested ranges. */
 @inline trusted fun __ablaRuntimeScanSequence(data: int, sequence: int, begin: int, last: int, size: int): int {
     var index = begin
-    val head = u8x16Splat(u8(ablaRuntimeLoadU8(sequence)))
+    val head = u8x16Splat(u8(ablaUnsafeLoadU8(nativePointerFromAddress(sequence))))
     val tailOffset = size - 1
-    val tail = u8x16Splat(u8(ablaRuntimeLoadU8(sequence + tailOffset)))
+    val tail = u8x16Splat(u8(ablaUnsafeLoadU8(nativePointerFromAddress(sequence + tailOffset))))
     while (last - index >= 15) {
         val heads = u8x16LoadAddress(data + index).eq(head)
         var matches = if (tailOffset == 0) heads.bitmask()
-            else (heads & u8x16LoadAddress(data + index + tailOffset).eq(tail)).bitmask()
+            else ablaSimd_and_u8x16(heads, u8x16LoadAddress(data + index + tailOffset).eq(tail)).bitmask()
         // On a dense range the anchor check has not narrowed the candidates.
         if (matches == 65535 && tailOffset > 1) return ~index
         while (matches != 0) {
             val start = index + __ablaRuntimeFirstByteLane(matches)
             var offset = 1
             while (offset < tailOffset &&
-                ablaRuntimeLoadU8(data + start + offset) ==
-                ablaRuntimeLoadU8(sequence + offset)) offset += 1
+                ablaUnsafeLoadU8(nativePointerFromAddress(data + start + offset)) ==
+                ablaUnsafeLoadU8(nativePointerFromAddress(sequence + offset))) offset += 1
             if (offset >= tailOffset) return start
             matches = matches & (matches - 1)
         }
@@ -90,15 +92,18 @@ private @inline trusted fun __ablaRuntimeBase64EncodeBlock(input: int, output: i
     val words = u8x16Shuffle(bytes, zero, 2, 1, 0, 16, 5, 4, 3, 16,
         8, 7, 6, 16, 11, 10, 9, 16).asU32x4()
     // Put one six-bit digit in each byte of each 32-bit lane.
-    val digits = (((words >> 18) & u32x4Splat(0x0000003f)) |
-        ((words >> 4) & u32x4Splat(0x00003f00)) |
-        ((words << 10) & u32x4Splat(0x003f0000)) |
-        ((words << 24) & u32x4Splat(0x3f000000))).asU8x16()
-    val alphabet = digits + u8x16Splat(65) +
-        (digits.ge(u8x16Splat(26)) & u8x16Splat(6)) -
-        (digits.ge(u8x16Splat(52)) & u8x16Splat(75)) -
-        (digits.ge(u8x16Splat(62)) & u8x16Splat(15)) +
-        (digits.eq(u8x16Splat(63)) & u8x16Splat(3))
+    val first = ablaSimd_and_u32x4(ablaSimd_shr_u32x4(words, 18), u32x4Splat(0x0000003f))
+    val second = ablaSimd_and_u32x4(ablaSimd_shr_u32x4(words, 4), u32x4Splat(0x00003f00))
+    val third = ablaSimd_and_u32x4(ablaSimd_shl_u32x4(words, 10), u32x4Splat(0x003f0000))
+    val fourth = ablaSimd_and_u32x4(ablaSimd_shl_u32x4(words, 24), u32x4Splat(0x3f000000))
+    val digits = ablaSimd_or_u32x4(ablaSimd_or_u32x4(first, second),
+        ablaSimd_or_u32x4(third, fourth)).asU8x16()
+    val lower = ablaSimd_and_u8x16(digits.ge(u8x16Splat(26)), u8x16Splat(6))
+    val number = ablaSimd_and_u8x16(digits.ge(u8x16Splat(52)), u8x16Splat(75))
+    val plus = ablaSimd_and_u8x16(digits.ge(u8x16Splat(62)), u8x16Splat(15))
+    val slash = ablaSimd_and_u8x16(digits.eq(u8x16Splat(63)), u8x16Splat(3))
+    val letters = ablaSimd_add_u8x16(ablaSimd_add_u8x16(digits, u8x16Splat(65)), lower)
+    val alphabet = ablaSimd_add_u8x16(ablaSimd_sub_u8x16(ablaSimd_sub_u8x16(letters, number), plus), slash)
     alphabet.storeAddress(output)
 }
 
@@ -116,23 +121,33 @@ private @inline trusted fun __ablaRuntimeBase64EncodeBlock(input: int, output: i
 
 private @inline trusted fun __ablaRuntimeBase64DecodeBlock(input: int, output: int): bool {
     val bytes = u8x16LoadAddress(input)
-    val upper = bytes.ge(u8x16Splat(65)) & bytes.le(u8x16Splat(90))
-    val lower = bytes.ge(u8x16Splat(97)) & bytes.le(u8x16Splat(122))
-    val numbers = bytes.ge(u8x16Splat(48)) & bytes.le(u8x16Splat(57))
+    val upper = ablaSimd_and_u8x16(bytes.ge(u8x16Splat(65)), bytes.le(u8x16Splat(90)))
+    val lower = ablaSimd_and_u8x16(bytes.ge(u8x16Splat(97)), bytes.le(u8x16Splat(122)))
+    val numbers = ablaSimd_and_u8x16(bytes.ge(u8x16Splat(48)), bytes.le(u8x16Splat(57)))
     val plus = bytes.eq(u8x16Splat(43))
     val slash = bytes.eq(u8x16Splat(47))
-    if (!(upper | lower | numbers | plus | slash).all()) return false
-    val digits = (((bytes - u8x16Splat(65)) & upper) |
-        ((bytes - u8x16Splat(71)) & lower) |
-        ((bytes + u8x16Splat(4)) & numbers) |
-        (plus & u8x16Splat(62)) | (slash & u8x16Splat(63))).asU32x4()
+    val letters = ablaSimd_or_u8x16(upper, lower)
+    val symbols = ablaSimd_or_u8x16(plus, slash)
+    if (!ablaSimd_or_u8x16(ablaSimd_or_u8x16(letters, numbers), symbols).all()) return false
+    val upperDigits = ablaSimd_and_u8x16(ablaSimd_sub_u8x16(bytes, u8x16Splat(65)), upper)
+    val lowerDigits = ablaSimd_and_u8x16(ablaSimd_sub_u8x16(bytes, u8x16Splat(71)), lower)
+    val numberDigits = ablaSimd_and_u8x16(ablaSimd_add_u8x16(bytes, u8x16Splat(4)), numbers)
+    val plusDigits = ablaSimd_and_u8x16(plus, u8x16Splat(62))
+    val slashDigits = ablaSimd_and_u8x16(slash, u8x16Splat(63))
+    val letterDigits = ablaSimd_or_u8x16(upperDigits, lowerDigits)
+    val symbolDigits = ablaSimd_or_u8x16(plusDigits, slashDigits)
+    val digits = ablaSimd_or_u8x16(ablaSimd_or_u8x16(letterDigits, numberDigits), symbolDigits).asU32x4()
     // Turn four six-bit digits back into three bytes per 32-bit lane.
-    val packed = (((digits & u32x4Splat(0x0000003f)) << 2) |
-        ((digits >> 12) & u32x4Splat(0x00000003)) |
-        ((digits & u32x4Splat(0x00000f00)) << 4) |
-        ((digits >> 10) & u32x4Splat(0x00000f00)) |
-        ((digits & u32x4Splat(0x00030000)) << 6) |
-        ((digits >> 8) & u32x4Splat(0x003f0000))).asU8x16()
+    val first = ablaSimd_or_u32x4(
+        ablaSimd_shl_u32x4(ablaSimd_and_u32x4(digits, u32x4Splat(0x0000003f)), 2),
+        ablaSimd_and_u32x4(ablaSimd_shr_u32x4(digits, 12), u32x4Splat(0x00000003)))
+    val second = ablaSimd_or_u32x4(
+        ablaSimd_shl_u32x4(ablaSimd_and_u32x4(digits, u32x4Splat(0x00000f00)), 4),
+        ablaSimd_and_u32x4(ablaSimd_shr_u32x4(digits, 10), u32x4Splat(0x00000f00)))
+    val third = ablaSimd_or_u32x4(
+        ablaSimd_shl_u32x4(ablaSimd_and_u32x4(digits, u32x4Splat(0x00030000)), 6),
+        ablaSimd_and_u32x4(ablaSimd_shr_u32x4(digits, 8), u32x4Splat(0x003f0000)))
+    val packed = ablaSimd_or_u32x4(ablaSimd_or_u32x4(first, second), third).asU8x16()
     // A 16-byte store writes a 12-byte result. The caller reserves the
     // remaining four bytes for the next block or scalar tail.
     u8x16Shuffle(packed, u8x16Splat(0), 0, 1, 2, 4, 5, 6, 8, 9,

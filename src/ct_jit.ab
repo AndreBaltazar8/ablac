@@ -1955,8 +1955,8 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     ctBridgeHostSlice = !crossTarget
     var implicitReason = if (crossTarget && !targetTriple.startsWith("wasm32-"))
         "cross-target triple $targetTriple is not in the portable JIT target allow-list" else ""
+    val runtimeRoot = "${bootstrapCompileProviderStandardLibrary()}/abla/runtime/"
     if (crossTarget) {
-        val runtimeRoot = "${bootstrapCompileProviderStandardLibrary()}/abla/runtime/"
         for (declaration in parsed.declarations) {
             if (implicitReason == "" && bootstrapCtRuntimeDeclaration(declaration) &&
                 !declaration.sourceIdentity.startsWith(runtimeRoot)) {
@@ -2041,8 +2041,11 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
             snapshotIndex = snapshotIndex + 1
         }
     }
+    val nativeScanner = "${runtimeRoot}self/simd-scan-x86.ab"
+    var replaceScanner = false
     for (declaration in parsed.declarations) {
-        if (bootstrapCtRuntimeDeclaration(declaration)) {
+        if (declaration.sourceIdentity == nativeScanner) replaceScanner = true
+        else if (bootstrapCtRuntimeDeclaration(declaration)) {
             reach.keepFrom(declaration.expression, declaration.sourceIdentity)
             // An extension field is kept in every slice, so its owner type is too: without it the
             // slice is refused (field.extension-owner), as jwt's was by CryptoPassword's fields (#828).
@@ -2345,15 +2348,26 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         bootstrapCtFailReady("the compiler bridge's helpers (abla/compiler/bridge) could not be read")
         return
     }
+    // Compile-time slices use the portable scanner hooks, even if the final
+    // executable has a native x86 scanner. Do not retain its vector helpers.
+    val scalarScanners = if (replaceScanner) {
+        val scalarScanner = "${runtimeRoot}self/simd-scan.ab"
+        val fallback = bootstrapParseWithIdentity(Path(scalarScanner).readText(), scalarScanner)
+        if (fallback.errors > 0 || fallback.declarations.size == 0) {
+            bootstrapCtFailReady("portable scanner runtime is unavailable")
+            return
+        }
+        fallback.declarations
+    } else []
     // The support declares the intrinsics it needs unless the slice keeps them.
     val kept: array<BootstrapDeclaration> = []
+    for (declaration in scalarScanners) kept.append(declaration)
     for (helper in helpers) kept.append(helper)
     var keptIndex = 0
     while (keptIndex < parsed.declarations.size) {
-        if (reach.kept[keptIndex] ||
-            bootstrapCtRuntimeDeclaration(parsed.declarations[keptIndex])) {
-            kept.append(parsed.declarations[keptIndex])
-        }
+        val declaration = parsed.declarations[keptIndex]
+        if (declaration.sourceIdentity != nativeScanner &&
+            (reach.kept[keptIndex] || bootstrapCtRuntimeDeclaration(declaration))) kept.append(declaration)
         keptIndex = keptIndex + 1
     }
     var source = bootstrapCtSupportSource(generation, kept)
@@ -2390,10 +2404,12 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     // The program's declarations as they are (analysis sees the phases it knows),
     // then the support declarations and one entry per site.
     val sliceDeclarations: array<BootstrapDeclaration> = []
+    for (declaration in scalarScanners) sliceDeclarations.append(declaration)
     var declarationIndex = 0
     while (declarationIndex < parsed.declarations.size) {
         val declaration = parsed.declarations[declarationIndex]
-        if (reach.kept[declarationIndex] || bootstrapCtRuntimeDeclaration(declaration)) {
+        if (declaration.sourceIdentity != nativeScanner &&
+            (reach.kept[declarationIndex] || bootstrapCtRuntimeDeclaration(declaration))) {
             val shims = if (bootstrapCtBridged(declaration))
                 bootstrapCtSliceShims(declaration) else []
             // (A once site's `#` node calls its accessor: bootstrapCtOnceSource.)
