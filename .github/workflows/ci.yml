@@ -222,11 +222,16 @@ jobs:
         run: |
           mkdir -p build/windows-programs
           nix-shell shell.nix --run 'build/ablac build tests/cases/windows/exit7.ab --target x86_64-windows -o build/windows-programs/exit7.exe'
+          nix-shell shell.nix --run 'build/ablac build tests/cases/windows/crash/crash.ab --target x86_64-windows-hosted -o build/windows-programs/crash.exe'
+          nix-shell shell.nix --run 'build/ablac build tests/cases/windows/crash/crash.ab --target x86_64-windows-hosted --backtrace -o build/windows-programs/crash-backtrace.exe'
           nix-shell shell.nix --run 'tools/test-windows-link.sh build/ablac'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-programs
-          path: build/windows-programs/exit7.exe
+          path: |
+            build/windows-programs/exit7.exe
+            build/windows-programs/crash.exe
+            build/windows-programs/crash-backtrace.exe
           retention-days: 3
 
   windows-run:
@@ -262,6 +267,34 @@ jobs:
             Write-Output "exit7.exe exited with $code, not 7"
             exit 1
           }
+          exit 0
+      # The crash report (tools/test-windows-crash.sh checks it under Wine; this is the truth): a bad store at address 16
+      # ends the program with the access violation's status, 0xC0000005, after its vectored exception handler printed the
+      # fault line; the --backtrace build's stack names main through the system's unwinder.
+      - name: crash.exe store reports the access violation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $failed = $false
+          foreach ($name in 'crash', 'crash-backtrace') {
+            $exe = Join-Path $PWD "$name.exe"
+            $process = Start-Process -FilePath $exe -ArgumentList 'store' -Wait -PassThru -NoNewWindow `
+              -RedirectStandardError "$name.err" -RedirectStandardOutput "$name.out"
+            $code = $process.ExitCode
+            $report = Get-Content "$name.err"
+            "${name}: exit code $code ($('0x{0:X8}' -f $code))"
+            $report | ForEach-Object { "  $_" }
+            # ExitCode is the 32-bit status, signed: 0xC0000005 reads -1073741819.
+            if ($code -ne -1073741819) { "${name}: not 0xC0000005"; $failed = $true }
+            if (-not ($report -contains 'fatal signal: a bad memory access at 0x0000000000000010')) {
+              "${name}: no fault line"; $failed = $true
+            }
+            if ($name -eq 'crash-backtrace' -and -not ($report -match '^0x[0-9a-f]+ in main$')) {
+              "${name}: the stack names no main"; $failed = $true
+            }
+          }
+          $global:LASTEXITCODE = 0
+          if ($failed) { exit 1 }
           exit 0
 
   macos:
