@@ -3,6 +3,7 @@
 // module its identity. Kept apart so semantic analysis can use them without
 // the module graph (sema.ab is compiled alone by some tools and tests).
 import "abla/sys/linux/fs"
+import "abla/fs/path"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "generic_types.ab"
@@ -31,10 +32,17 @@ fun bootstrapStandardLibraryRoot(): string {
 // Module identity is lexical and deterministic: it does not consult the host
 // filesystem or resolve symlinks. This keeps absent generated inputs, caches,
 // and watched builds reproducible while collapsing path aliases.
-fun bootstrapNormalizeModulePath(value: string): string {
-    val absolute = value.size > 0 && value[0] == 47
-    var output = if (absolute) "/" else ""
-    var index = 0
+// The root is the host's (abla/fs/path): `/` on POSIX; on Windows a drive (`C:/`), a UNC share (`//server/share/`) or `/`,
+// the path read in its `/`-separated canonical form, so `C:\a\..\b` and `C:/b` are one module.
+fun bootstrapNormalizeModulePath(original: string): string = bootstrapNormalizeModulePathIn(original, pathHostIsWindows())
+
+// bootstrapNormalizeModulePath by the POSIX (`windows` false) or the Windows syntax, whatever the host.
+fun bootstrapNormalizeModulePathIn(original: string, windows: bool): string {
+    val value = if (windows) pathToCanonical(original, true) else original
+    val root = pathRootLength(value, windows)
+    val absolute = root > 0
+    var output = value.slice(0, root)
+    var index = root
     while (index < value.size) {
         while (index < value.size && value[index] == 47) index = index + 1
         val begin = index
@@ -43,21 +51,21 @@ fun bootstrapNormalizeModulePath(value: string): string {
             val segment = value.slice(begin, index)
             if (segment == "..") {
                 var lastBegin = output.size
-                while (lastBegin > 0 && output[lastBegin - 1] != 47) {
+                while (lastBegin > root && output[lastBegin - 1] != 47) {
                     lastBegin = lastBegin - 1
                 }
                 val last = output.slice(lastBegin, output.size)
                 if (last != "" && last != "..") {
                     var end = lastBegin
-                    if (end > 1 && output[end - 1] == 47) end = end - 1
-                    if (absolute && end == 0) end = 1
+                    if (end > root && end > 1 && output[end - 1] == 47) end = end - 1
+                    if (end < root) end = root
                     output = output.slice(0, end)
                 } else if (!absolute) {
                     if (output != "") output = "$output/"
                     output = "${output}.."
                 }
             } else if (segment != ".") {
-                if (output != "" && output != "/") output = "$output/"
+                if (output.size > root && output[output.size - 1] != 47) output = "$output/"
                 output = "$output$segment"
             }
         }
@@ -120,7 +128,7 @@ fun bootstrapModuleIdentityProjectRoot(entry: string): string {
     // The path a module was reached through determines its sibling imports
     // and package. Resolve only lexical dots, never filesystem symlinks.
     val absolute = bootstrapNormalizeModulePath(
-        if (entry.startsWith("/")) entry else "${currentDirectory().text}/$entry"
+        if (Path(entry).isAbsolute()) entry else "${currentDirectory().text}/$entry"
     )
     val start = Path(absolute).parent()
     var directory = start
@@ -166,7 +174,7 @@ fun bootstrapModuleCanonicalPrefix(modulePath: string): string {
     val known = bootstrapModuleIdentityPrefixes.get(modulePath)
     if (known != null) return known
     val absolute = bootstrapNormalizeModulePath(
-        if (modulePath.startsWith("/")) modulePath
+        if (Path(modulePath).isAbsolute()) modulePath
         else "${currentDirectory().text}/$modulePath"
     )
     // Keep a dependency's lexical path within the project, even when a package
