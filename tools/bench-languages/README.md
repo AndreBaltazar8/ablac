@@ -44,7 +44,7 @@ allowed; target-native flags, fast-math and explicit parallelism are not used.
 | fasta | 1,000,000 | Repeat ALU 2n, LCG seed 42/modulus 139968 with cumulative IUB and human probabilities for 3n/5n; 60-column output. |
 | json | 100 iterations | Read fixed 2048-object input once, parse generic DOM and serialize on every iteration; output final full JSON. Escaped strings, arrays, nulls, booleans and integers; sorted-key canonical comparison against original fixture. |
 | regex-redux | fixed 500k-base FASTA | Compile strip expression, nine alternative 8-mer expressions, five sequential replacement expressions; exact counts and lengths. Independent deterministic fixture includes all IUB symbols. |
-| http-echo | 10,000 requests | One blocking server worker, fresh HTTP/1.1 connection, fixed 256-byte POST body, no keepalive, pinned oha concurrency 1. |
+| http-echo | 10,000 requests | One blocking server worker, fresh HTTP/1.1 connection, fixed 256-byte POST body, no keepalive, pinned oha concurrency 1 and at most 15,000 requests/s. |
 | hello | 100 starts/sample | Print hello and exit; measure batch time per process without GNU-time wrapper. |
 
 JSON and regex are **library-dependent**, not pure language/codegen comparisons.
@@ -86,6 +86,9 @@ resolution, not a zero-memory claim; ratios with a zero C denominator are null.
 `programs[task].languages[language]`. Each verified row has wallSeconds, rssBytes,
 compileSeconds `{median,min,max}`, rawBytes, strippedBytes and ratiosToC. Hello adds
 startupSeconds; HTTP adds requestsPerSecond, with corresponding ratiosToC fields.
+HTTP runtime samples also record the offered load cap as `requestRateLimit`.
+The cap applies to warmup and timed load and protects the host's connection
+tracking table. Throughput near the cap is a load-limit result.
 Raw samples, source/binary hashes,
 compiler version/hash, Nix pin, tool paths, CPU details and pre-acquisition load
 are retained. Min/max ranges and raw data matter more than a single ratio on this
