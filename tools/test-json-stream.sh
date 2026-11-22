@@ -13,6 +13,31 @@ for mode in release fast; do
     "$compiler" build tests/cases/modules/json-stream.ab -o "$out/test.$mode" "${flags[@]}"
     "$out/test.$mode"
 done
+# The provider and buffer can both arrive through aliases. Resolved method
+# targets must retain the original receiver's identity in runtime and staging.
+cat > "$out/aliases.ab" <<'ABLA'
+import "abla/bytes" as buffers
+import "abla/json" as json
+
+fun aliased(selected: bool): string {
+    val out = buffers.byteBuffer()
+    $jsonw(out) {"text": "quote\"", if (selected) "number": 42,}
+    out.toText()
+}
+val staged = #aliased(true)
+fun main: int {
+    val expected = json.jsonStringify($json {"text": "quote\"", "number": 42})
+    if (aliased(true) != expected || staged != expected) return 1
+    if (aliased(false) != json.jsonStringify($json {"text": "quote\""})) return 1
+    0
+}
+ABLA
+for mode in release fast; do
+    flags=(--no-cache)
+    [[ $mode == fast ]] && flags+=(--fast)
+    "$compiler" build "$out/aliases.ab" -o "$out/aliases.$mode" "${flags[@]}"
+    "$out/aliases.$mode"
+done
 # These errors must come from the shared JSON parser or ordinary typing.
 rejected() {
     local name=$1 pattern=$2 value=$3
