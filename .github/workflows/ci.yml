@@ -232,6 +232,7 @@ jobs:
             build/windows-programs/exit7.exe
             build/windows-programs/crash.exe
             build/windows-programs/crash-backtrace.exe
+            build/windows-programs/crash-backtrace.exe.debug
           retention-days: 3
 
   windows-run:
@@ -295,6 +296,33 @@ jobs:
           }
           $global:LASTEXITCODE = 0
           if ($failed) { exit 1 }
+          exit 0
+      # file:line for that crash, as `ablac symbolize` gives it: the --backtrace program carries no DWARF or symbol
+      # table; llvm-symbolizer (the runner's LLVM) follows its debug link to crash-backtrace.exe.debug beside it, at
+      # each address less the load address the stack printed, plus the image's preferred base. The bad store is
+      # crash.ab line 11.
+      - name: crash-backtrace.exe's stack symbolizes to file:line
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $symbolizer = (Get-Command llvm-symbolizer -ErrorAction SilentlyContinue).Source
+          if (-not $symbolizer) { $symbolizer = 'C:\Program Files\LLVM\bin\llvm-symbolizer.exe' }
+          if (-not (Test-Path $symbolizer)) { 'no llvm-symbolizer on the runner'; exit 1 }
+          $exe = Join-Path $PWD 'crash-backtrace.exe'
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $header = [BitConverter]::ToInt32($bytes, 60)
+          $base = [BitConverter]::ToUInt64($bytes, $header + 48)
+          $report = Get-Content 'crash-backtrace.err'
+          $load = [Convert]::ToUInt64((($report | Where-Object { $_ -match '^load address 0x' }) -replace '^load address 0x', ''), 16)
+          $addresses = $report | Where-Object { $_ -match '^0x[0-9a-f]+ in ' } | ForEach-Object {
+            $address = [Convert]::ToUInt64(($_ -split ' ')[0].Substring(2), 16)
+            '0x{0:x}' -f ($address - $load + $base)
+          }
+          "image base $('0x{0:x}' -f $base), load address $('0x{0:x}' -f $load)"
+          $symbolized = & $symbolizer "--obj=$exe" --inlining --pretty-print @addresses
+          $symbolized | ForEach-Object { "  $_" }
+          $global:LASTEXITCODE = 0
+          if (-not ($symbolized -match 'crash\.ab:11:')) { 'no crash.ab:11 in the symbolized stack'; exit 1 }
           exit 0
 
   macos:

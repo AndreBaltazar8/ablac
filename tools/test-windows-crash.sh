@@ -7,7 +7,9 @@
 #     handler, then the stack from the faulting instruction (--backtrace: named, the handler's own frame not among them),
 #     and the access violation's status (0xC0000005, whose low byte Wine's exit status is), not winedbg;
 #   - unbounded recursion: "panic: stack overflow", status 101;
-#   - a panic on a thread: a --backtrace stack through the thread's entry.
+#   - a panic on a thread: a --backtrace stack through the thread's entry;
+#   - `ablac symbolize` on the stacks: file:line from the DWARF a --fast -g program keeps and a --backtrace one leaves in
+#     <program>.debug.
 # A release build imports only the handler's two functions beyond what the runtime does (not the unwinder's). Wine runs
 # are skipped with a message when Wine is not installed (tools/windows/wine-run.sh runs it headless).
 set -euo pipefail
@@ -19,7 +21,7 @@ out=build/windows-crash
 rm -rf "$out"
 mkdir -p "$out"
 fail() { echo "windows-crash: $1" >&2; exit 1; }
-for tool in lld-link llvm-readobj; do
+for tool in lld-link llvm-readobj llvm-symbolizer; do
     command -v "$tool" > /dev/null || { echo "windows-crash: skipped ($tool is not installed)"; exit 0; }
 done
 source=tests/cases/windows/crash/crash.ab
@@ -82,4 +84,39 @@ run backtrace thread-panic
 [[ $status == 101 ]] || fail "a panic on a thread exited $status"
 stack_of backtrace thread-panic | grep '^0x[0-9a-f]* in abla_runtime_thread_entry$' > /dev/null ||
     fail "a --backtrace panic on a thread named no thread entry: $(head -12 "$out/backtrace-thread-panic.err")"
-echo "windows-crash: panics, a bad store and a stack overflow report as on Linux under Wine (release, --backtrace, --fast)"
+
+# file:line: a --backtrace program ships without its DWARF or a symbol table, which are in crash-backtrace.exe.debug beside
+# it (its debug link); `ablac symbolize` reads that for the stack the program printed, and without it has no file:line.
+# A --fast -g program keeps its DWARF.
+[[ -s $out/crash-backtrace.exe.debug ]] || fail "--backtrace wrote no crash-backtrace.exe.debug"
+! llvm-readobj --sections "$out/crash-backtrace.exe" | grep -E 'Name: \.debug_(info|line)' > /dev/null ||
+    fail "the --backtrace program kept its DWARF"
+[[ $(llvm-readobj --file-headers "$out/crash-backtrace.exe" | awk '/SymbolCount:/ { print $2 }') == 0 ]] ||
+    fail "the --backtrace program kept a symbol table"
+symbolized() { "$compiler" symbolize "$out/crash-$1.exe" "$out/$1-$2.err" > "$out/$1-$2.symbolized" 2>&1 || true; }
+for mode in backtrace fast; do
+    symbolized "$mode" store
+    grep 'crash\.ab:11:' "$out/$mode-store.symbolized" > /dev/null ||
+        fail "symbolize: no crash.ab:11 for the --$mode bad store: $(cat "$out/$mode-store.symbolized")"
+    # (The index is line 17, in pick; optimized, pick is inlined and the frame is main's call of it, line 22.)
+    symbolized "$mode" panic
+    grep -E 'crash\.ab:(17|22):' "$out/$mode-panic.symbolized" > /dev/null ||
+        fail "symbolize: no crash.ab:17 or :22 for the --$mode panic: $(cat "$out/$mode-panic.symbolized")"
+done
+# Wine loads the program at its preferred base; Windows moves it (ASLR). The same stack, as if loaded at 0x7ff6a0000000:
+# symbolize takes each address less the load address at the image's base, so file:line is the same.
+moved=$((0x7ff6a0000000 - 0x140000000))
+while read -r first rest; do
+    if [[ $first =~ ^0x[0-9a-f]{16}$ && $first != 0x00006f* ]]; then printf '0x%016x %s\n' $((first + moved)) "$rest"
+    elif [[ $first == load ]]; then printf 'load address 0x%016x\n' $((0x140000000 + moved))
+    else printf '%s %s\n' "$first" "$rest"; fi
+done < "$out/backtrace-store.err" > "$out/aslr-store.err"
+grep '^load address 0x00007ff6a0000000$' "$out/aslr-store.err" > /dev/null || fail "the moved stack: $(cat "$out/aslr-store.err")"
+"$compiler" symbolize "$out/crash-backtrace.exe" "$out/aslr-store.err" > "$out/aslr-store.symbolized" 2>&1 || true
+grep 'crash\.ab:11:' "$out/aslr-store.symbolized" > /dev/null ||
+    fail "symbolize: no crash.ab:11 for a stack loaded at 0x7ff6a0000000: $(cat "$out/aslr-store.symbolized")"
+mv "$out/crash-backtrace.exe.debug" "$out/crash-backtrace.exe.moved"
+symbolized backtrace store
+! grep 'crash\.ab:' "$out/backtrace-store.symbolized" > /dev/null || fail "symbolize: file:line without crash-backtrace.exe.debug"
+mv "$out/crash-backtrace.exe.moved" "$out/crash-backtrace.exe.debug"
+echo "windows-crash: panics, a bad store and a stack overflow report as on Linux under Wine (release, --backtrace, --fast), and symbolize gives their file:line"

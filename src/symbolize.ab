@@ -2,7 +2,8 @@
 // (a panic or a fatal signal: docs/debugging.md), with each frame's function and file:line:column, the functions
 // inlined into it included. It reads the text (a file, or standard input) for its return addresses (lines that are
 // a 0x... address first) and the program's load address (`load address 0x...`), and asks llvm-symbolizer, the toolchain's,
-// about the program at each address less the load address; on macOS, atos, which takes the load address itself.
+// about the program at each address less the load address (a Windows program's at its preferred base); on macOS, atos,
+// which takes the load address itself. A --backtrace program's line tables are in the <program>.debug its build wrote.
 // The program must be the one that printed the stack, built with debug information (`--fast`, or `-g`).
 import "abla/fs"
 import "abla/text"
@@ -64,6 +65,29 @@ fun bootstrapSymbolizeMachO(path: string): bool {
         (head[0] == 254 && head[1] == 237 && head[2] == 250 && head[3] == 207))
 }
 
+// The preferred base (ImageBase) of a 64-bit Windows image (PE32+) at `path`, -1 for another file. llvm-symbolizer
+// takes a PE's addresses at that base, where an ELF program's are its own (from 0).
+fun bootstrapSymbolizePeImageBase(path: string): int {
+    val image = Path(path).readText()
+    if (image.size < 64 || image[0] != 77 || image[1] != 90) return -1
+    var header = 0
+    for (index in 0 until 4) header = header + image[60 + index] * bootstrapSymbolizeByteWeight(index)
+    // "PE\0\0", the 20-byte file header, then the optional header: its magic (0x20b, PE32+) and at 24 the base.
+    val optional = header + 24
+    if (image.size < optional + 32 || image[header] != 80 || image[header + 1] != 69 || image[header + 2] != 0 ||
+        image[header + 3] != 0 || image[optional] != 11 || image[optional + 1] != 2) return -1
+    var base = 0
+    for (index in 0 until 8) base = base + image[optional + 24 + index] * bootstrapSymbolizeByteWeight(index)
+    base
+}
+
+// 256 to the power `index`: the weight of a little-endian byte.
+fun bootstrapSymbolizeByteWeight(index: int): int {
+    var weight = 1
+    for (step in 0 until index) weight = weight * 256
+    weight
+}
+
 // Standard input to its end.
 fun bootstrapSymbolizeStandardInput(): string {
     var text = ""
@@ -107,10 +131,13 @@ fun bootstrapSymbolizeCommand(): int {
         command.argument("--inlining")
         command.argument("--pretty-print")
     }
+    // (A Windows program's, at its preferred base.)
+    val peBase = if (macho) -1 else bootstrapSymbolizePeImageBase(program)
     for (address in stack.addresses) {
         // A position-independent executable's addresses less where it was loaded are its own (atos does this itself).
-        val own = if (!macho && stack.load >= 0) address - stack.load else address
-        command.argument(bootstrapSymbolizeHexText(own))
+        val own = if (!macho && stack.load >= 0) address - stack.load + (if (peBase > 0) peBase else 0) else address
+        // A frame below the program (a system library's, loaded lower) is asked as 0: it keeps its number, unnamed.
+        command.argument(bootstrapSymbolizeHexText(if (own < 0) 0 else own))
     }
     val result = command.capture()
     if (result.status == 127) {

@@ -179,7 +179,8 @@ load address 0x000055718b500000
 ```
 
 A frame is named by the function its address is in, so a function inlined
-into another shows as the one it was inlined into. On Linux the build also
+into another shows as the one it was inlined into. On Linux (and Windows:
+below) the build also
 writes `<output>.debug` beside the program: the same build's line tables,
 which the program itself doesn't carry, tied to it by its build id and a
 debug link. Keep it with the program (it needn't ship): `ablac symbolize`
@@ -223,7 +224,21 @@ load address 0x0000000140000000
 
 The stack is unwound by the system (`RtlVirtualUnwind`) over the unwind
 tables that a `-g` or `--backtrace` build gives every function; a release
-build imports neither the unwinder nor those tables. The frames past
+build imports neither the unwinder nor those tables.
+
+`ablac symbolize` gives the stack's file:line as on Linux. A `-g` or
+`--fast` program carries its DWARF. A `--backtrace` program carries neither
+DWARF nor a symbol table: the build writes `<output>.debug` beside it (the
+same build's line tables, named by the program's debug link), which
+`ablac symbolize` and llvm-symbolizer find there:
+
+```sh
+crash.exe store 2> crash.txt        # on Windows
+ablac symbolize crash.exe crash.txt
+```
+
+By hand, llvm-symbolizer takes each address less the load address plus the
+image's preferred base (0x140000000). The frames past
 `abla_windows_start` are the system's. An exception that a system library
 raises and handles itself never reaches the report, since only an exception
 raised by the program's own code is reported. A stack overflow prints no

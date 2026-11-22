@@ -382,6 +382,13 @@ fun bootstrapLinkWindowsExecutable(target: BootstrapTargetDescriptor, objectPath
         link.argument("/fixed")
         link.argument("/highentropyva:no")
     }
+    // A hosted program with debug information (-g, --fast, or --backtrace's line tables before they are split off) keeps its DWARF,
+    // which llvm-symbolizer and gdb read, with the code a release link gives (/debug alone would keep unreferenced and duplicate code).
+    if (target.hosted && bootstrapLlvmDebugInfo) {
+        link.argument("/debug:dwarf")
+        link.argument("/opt:ref")
+        link.argument("/opt:icf")
+    }
     link.argument("/out:$publishPath")
     link.argument(objectPath)
     for (list in lists) {
@@ -3492,8 +3499,9 @@ trusted fun bootstrapInternalizeLlvmUserFunctionWrapperBitcode(
 
 // A --backtrace executable's DWARF (bootstrapLlvmBacktraceSplit): copied out to `<output>.debug` (with the build-id
 // note, which both keep), then dropped from the linked program at `linkedPath`, which gets a .gnu_debuglink naming
-// that file and its checksum. llvm-symbolizer and gdb follow the link to the file beside the program.
-fun bootstrapSplitBacktraceDebug(linkedPath: string, outputPath: string): int {
+// that file and its checksum. llvm-symbolizer and gdb follow the link to the file beside the program. A Windows
+// program (PE) has no build id; it loses its symbol table too, which only the DWARF link (/debug:dwarf) gave it.
+fun bootstrapSplitBacktraceDebug(linkedPath: string, outputPath: string, windows: bool): int {
     val debugPath = "$outputPath.debug"
     val keep = linuxCommand(bootstrapHostLlvmTool("llvm-objcopy"))
     keep.argument("--only-keep-debug")
@@ -3502,7 +3510,7 @@ fun bootstrapSplitBacktraceDebug(linkedPath: string, outputPath: string): int {
     var status = keep.run()
     if (status == 0) {
         val strip = linuxCommand(bootstrapHostLlvmTool("llvm-objcopy"))
-        strip.argument("--strip-debug")
+        strip.argument(if (windows) "--strip-all" else "--strip-debug")
         strip.argument("--add-gnu-debuglink=$debugPath")
         strip.argument(linkedPath)
         status = strip.run()
@@ -5643,6 +5651,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status == 0 && windowsTarget && artifact == "executable") {
         status = bootstrapLinkWindowsExecutable(target, objectPath, publishPath)
         if (status != 0) failureKind = "reported"
+        if (status == 0 && bootstrapLlvmBacktraceSplit) {
+            status = bootstrapSplitBacktraceDebug(publishPath, outputPath, true)
+            if (status != 0) failureKind = "io"
+        }
     }
     if (status == 0 && target.hosted && !windowsTarget && artifact == "executable") {
         // An x86-64 Linux program links without libc (#806): a static-pie image
@@ -5948,7 +5960,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             linuxPrintStandardError("note: $outputPath links libc: $libcReason\n")
         }
         if (status == 0 && bootstrapLlvmBacktraceSplit) {
-            status = bootstrapSplitBacktraceDebug(publishPath, outputPath)
+            status = bootstrapSplitBacktraceDebug(publishPath, outputPath, false)
             if (status != 0) failureKind = "io"
         }
     }
