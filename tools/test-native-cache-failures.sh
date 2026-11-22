@@ -21,8 +21,9 @@ export ABLA_SYSROOT="$work/sysroot"
 program="$project_root/tests/cases/sysroot-path-symbols/main.ab"
 fail() { echo "native cache failures: $1" >&2; exit 1; }
 
-# Both modes must use the original frontend text emission for a small client
-# without LLVM. The sidecar request prevents whole-program holding in both.
+# Both modes must write the original frontend text for a small client without
+# LLVM: out of process the frontend's own, and with a held module (whose
+# executable is optimized from it) the module's text with the same sections.
 ABLA_SIDECAR=1 "$compiler" build "$program" -o "$work/requested" --no-cache
 ABLA_SIDECAR=1 ABLA_LLVM_OUT_OF_PROCESS=1 "$compiler" build "$program" \
     -o "$work/disabled" --no-cache
