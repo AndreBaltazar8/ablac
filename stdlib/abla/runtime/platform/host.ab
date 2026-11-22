@@ -2052,6 +2052,9 @@ trusted fun __ablaRuntimeHostNativePressure(): int = nativeStaticAllocate(8)
 @inline
 trusted fun __ablaRuntimeHostTrackedPressure(): int =
     __ablaRuntimeHostLiveBytes + __ablaRuntimeHostRegistrySlots * 48
+/// The smoothed working-set estimate for the next adaptive growth budget.
+var __ablaRuntimeHostGrowthEstimate: int = 0
+
 // The live bytes the last collection kept (memoryHeapStat(13)); 0 before the first.
 var __ablaRuntimeHostCollectionKept: int = 0
 // ABLA_GC_STRESS=1 (read once, at startup): every safe point collects, which
@@ -3504,13 +3507,14 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
             val values = ablaRuntimeLoadI64(payload + 16)
             // A dense array (a nonzero kind byte) holds no references.
             val dense = (ablaRuntimeLoadI64(payload + 8) >> 56) != 0
-            if (values == payload + 24) {
+            if (values != payload + 24) __ablaRuntimeHostMarkPointer(values)
+            if (!dense) {
                 var index: int = 0
-                while (!dense && index < count) {
+                while (index < count) {
                     __ablaRuntimeHostMarkValue(values + index * 24)
                     index = index + 1
                 }
-            } else __ablaRuntimeHostMarkPointer(values)
+            }
         }
         if (layout == 5 && size >= 16) {
             // An instance: the fields its class's descriptor lists as traced
@@ -3834,13 +3838,8 @@ private trusted fun __ablaRuntimeHostMarkTraceParallel(context: int, header: int
         val count = ablaRuntimeLoadI64(payload)
         val values = ablaRuntimeLoadI64(payload + 16)
         val dense = (ablaRuntimeLoadI64(payload + 8) >> 56) != 0
-        if (values == payload + 24) {
-            var index: int = 0
-            while (!dense && index < count) {
-                __ablaRuntimeHostMarkValueParallel(context, values + index * 24)
-                index = index + 1
-            }
-        } else __ablaRuntimeHostMarkPointerParallel(context, values)
+        if (values != payload + 24) __ablaRuntimeHostMarkPointerParallel(context, values)
+        if (!dense && count > 0) __ablaRuntimeHostMarkScan(context, values, count * 24, 2)
     }
     if (layout == 5 && size >= 16) {
         val descriptor = ablaRuntimeLoadI64(payload) - 4611686018427387904
@@ -4228,9 +4227,15 @@ trusted fun __ablaRuntimeHostFinishAdaptiveGc(stopped: int): int {
     } else 0
     ablaRuntimeAtomicStoreI64(__ablaRuntimeHostNativePressure(), 0)
     val working = __ablaRuntimeHostTrackedPressure()
-    var growth = if (working >= __ablaRuntimeHostGcCap / 3) {
-        __ablaRuntimeHostGcCap
-    } else working * 3
+    // A collection can sample a transient peak or trough in a periodic workload.
+    // Smooth the growth budget without delaying a large working-set change.
+    val maxEstimate = __ablaRuntimeHostGcCap / 3
+    val observed = if (working >= maxEstimate) maxEstimate else working
+    val previous = __ablaRuntimeHostGrowthEstimate
+    val estimate = if (previous == 0 || observed > previous * 2 || previous > observed * 2) observed
+        else previous + (observed - previous) / 4
+    __ablaRuntimeHostGrowthEstimate = estimate
+    var growth = if (estimate == maxEstimate) __ablaRuntimeHostGcCap else estimate * 3
     if (growth < __ablaRuntimeHostGcFloor) growth = __ablaRuntimeHostGcFloor
     val limit = __ablaRuntimeHostLimit
     val reserve = if (limit / 4 < 67108864) limit / 4 else 67108864
@@ -5547,7 +5552,7 @@ trusted fun __ablaRuntimeHostFreezeNote(candidate: int, mode: int): void {
     }
     val layout = ablaRuntimeLoadI64(header + 24)
     // Layouts 0 to 5 are copied; a raw block is checked when it is scanned.
-    if (layout > 5 && !((mode & 15) == 2 && layout == 6) || (mode & 15) == 2 && layout != 6) {
+    if (layout > 5 && !(layout == 8 && mode >> 4 > 0) && !((mode & 15) == 2 && layout == 6) || (mode & 15) == 2 && layout != 6) {
         if (ablaRuntimeLoadI64(context + 80) == 0) ablaRuntimeStoreI64(context + 80, 100 + layout)
         return
     }
@@ -5617,8 +5622,8 @@ trusted fun __ablaRuntimeHostFreezeScan(header: int, copy: int, mode: int): void
             offset = offset + 8
         }
     }
-    if (layout == 2) {
-        // A backing store the array header counts (its live prefix): the slack past it may hold stale values.
+    if (layout == 2 || layout == 8) {
+        // An array backing store's owner supplies the live prefix in the mode.
         val limit = (mode >> 4) - 1
         var bound = size
         if (limit >= 0 && limit * 24 < size) bound = limit * 24

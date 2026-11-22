@@ -1,0 +1,57 @@
+import "abla/io"
+import "abla/memory"
+import "abla/process/arguments"
+import "abla/runtime/scalar"
+import "abla/runtime/self"
+import "../../platform/host.ab"
+
+class BoxedArrayMarker(val number: int)
+
+// Plant an otherwise unreachable object in an inactive backing slot.
+trusted fun seedSpare(value: any, length: int): int {
+    val marker = BoxedArrayMarker(73)
+    val address = ablaRuntimeLoadI64(ablaRuntimeValueAddress(marker) + 8)
+    val registryKey = __ablaRuntimeHostRegistryLast()
+    if (registryKey != address && registryKey != address - 32) ablaRuntimeTrap()
+    val array = __ablaRuntimeArrayAddress(value)
+    val values = ablaRuntimeLoadI64(array + 16)
+    val spare = values + length * 24
+    ablaRuntimeStoreI32(spare, 8)
+    ablaRuntimeStoreI32(spare + 4, 0)
+    ablaRuntimeStoreI64(spare + 8, address)
+    ablaRuntimeStoreI64(spare + 16, 0)
+    registryKey
+}
+
+trusted fun isTracked(registryKey: int): bool {
+    var slot = 0
+    while (slot < __ablaRuntimeHostRegistrySlots) {
+        val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8) & -16
+        if (entry == registryKey) return true
+        slot = slot + 1
+    }
+    false
+}
+
+fun main: int {
+    memorySetManualCollection()
+    val parallel = processArgument(0) == "parallel"
+    if (parallel) {
+        val joined = thread { 1 }
+        if (await joined != 1) return 1
+    }
+    val kept: array<BoxedArrayMarker> = []
+    val count = if (parallel) 18001 else 1
+    for (index in 0 until count) { kept.append(BoxedArrayMarker(index)) }
+    val boxed: array<any> = []
+    boxed.append(1)
+    boxed.append("boxed")
+    val staleGrowth = seedSpare(kept, count)
+    val staleBox = seedSpare(boxed, 2)
+    memoryCollect()
+    if (kept[count - 1].number != count - 1 || boxed[0] != 1 || boxed[1] != "boxed") return 2
+    val growth = isTracked(staleGrowth)
+    val boxing = isTracked(staleBox)
+    println("stale growth $growth stale boxing $boxing")
+    if (growth || boxing) 3 else 0
+}

@@ -153,5 +153,34 @@ near_limit_status=$?
 set -e
 [[ $near_limit_status -eq 101 ]] || exit 1
 rg -q 'memory limit exceeded' "$directory/near-limit.err"
+if [[ $(uname -sm) == 'Linux x86_64' ]]; then
+    fixture=$("$project_root/tools/runtime-fixture.sh" \
+        "$project_root/tests/cases/runtime-memory-array-prefix.ab" "$directory/array-prefix")
+    # Background freeing is selected from calls in the program, outside the copied runtime module.
+    cat >"$fixture" <<'ABLA'
+import "abla/memory"
+import "abla/process/arguments"
+import "abla/runtime/fixtures/runtime-memory-array-prefix"
+
+fun main: int {
+    if (processArgument(0) == "parallel") memorySetBackgroundFree(true)
+    runtimeFixtureMain()
+}
+ABLA
+    program="$directory/array-prefix/program"
+    ABLA_STDLIB="$directory/array-prefix/stdlib" "$compiler" build "$fixture" \
+        -o "$program" --fast --no-cache
+    for workers in 1 4; do
+        mode=serial
+        if (( workers > 1 )); then mode=parallel; fi
+        for stress in 0 1; do
+            trace="$directory/array-prefix/$workers-$stress.trace"
+            ABLA_GC_WORKERS=$workers ABLA_GC_STRESS=$stress ABLA_GC_TRACE=1 ABLA_MAX_SECONDS=60 \
+                "$project_root/tools/run-limited.sh" "$program" "$mode" 2>"$trace"
+            if (( workers > 1 )); then rg -a '^gc: parallel mark, objects by thread:' "$trace" >/dev/null; fi
+        done
+    done
+fi
+
 printf '%s\n' \
     'portable memory runtime: direct declarations + pressure safe points + limits + pure/host collection + census + bootstrapped global containers passed'
