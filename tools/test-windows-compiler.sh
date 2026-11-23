@@ -42,7 +42,8 @@ done
 # (docs/design/windows-jit.md §2). The stub ablac.exe is linked with them and a stub for every LLVM-C function.
 kept="$out/ablac.exe.imports"
 [[ -s $kept/exports.def ]] || { tail -5 "$out/build.log" >&2; fail "the compiler's link wrote no exports.def"; }
-for symbol in __emutls_get_address main abla_windows_start; do
+# (__chkstk, write and _exit are weak externals, and functions: listed without DATA.)
+for symbol in __emutls_get_address main abla_windows_start __chkstk write _exit; do
     grep -q "^    $symbol\$" "$kept/exports.def" || fail "exports.def does not export $symbol"
 done
 defined=$(llvm-nm --defined-only --extern-only "$out/ablac.exe.o" | wc -l)
