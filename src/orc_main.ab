@@ -4,6 +4,7 @@ import "json_construction.ab"
 import "xtensa_tools.ab"
 import "apple_build.ab"
 import "backend/llvm/backend.ab"
+import "backend/llvm/bindings.ab"
 import "backend/llvm/coverage.ab"
 import "module.ab"
 import "sema.ab"
@@ -96,7 +97,12 @@ fun bootstrapCompilerCollectionGrowth(): int {
 fun bootstrapOrcEmit(sourcePath: string): int {
     bootstrapBeginCompileOutputs()
     var status = 1
-    val compilation = bootstrapCompileHostEmit(sourcePath)
+    // Keep the verified module private until the CLI accepts the compilation and its side effects.
+    val enclosingModule = bootstrapLlvmHeldModule
+    val enclosingContext = bootstrapLlvmHeldContext
+    bootstrapLlvmHeldModule = nativeNullPointer()
+    bootstrapLlvmHeldContext = nativeNullPointer()
+    val compilation = bootstrapCompileHostEmit(sourcePath, holdTextModule = true)
     // Only after a front end without errors: one that stopped early never recorded every use (toolchain.ab).
     if (bootstrapUnusedImportsWanted() &&
         compilation.parserErrors + compilation.extensionErrors + compilation.semanticErrors == 0) {
@@ -128,8 +134,17 @@ fun bootstrapOrcEmit(sourcePath: string): int {
     val packages = bootstrapTakeApplePackages()
     if (compilation.errors == 0 && requestedPrograms.size == 0 &&
         definedTargets.size == 0 && artifactRoots.size == 0 && packages.size == 0) {
-        linuxPrintStandardOutput(compilation.output)
-        status = 0
+        if (pointerIsNull(bootstrapLlvmHeldModule)) {
+            linuxPrintStandardOutput(compilation.output)
+            status = 0
+        } else {
+            var module = LlvmOwnedModule(bootstrapLlvmHeldContext, bootstrapLlvmHeldModule, 0, false)
+            bootstrapLlvmHeldModule = nativeNullPointer()
+            bootstrapLlvmHeldContext = nativeNullPointer()
+            if (module.writeText("-") == 0) status = 0
+            else linuxPrintStandardError("error[E_BUILD_IO]: could not write LLVM IR to standard output\n")
+            module.drop()
+        }
     }
     if (requestedPrograms.size > 0 || definedTargets.size > 0 ||
         artifactRoots.size > 0 || packages.size > 0) {
@@ -145,6 +160,9 @@ fun bootstrapOrcEmit(sourcePath: string): int {
             bootstrapCompilationFailedLine(compilation.parserErrors, compilation.extensionErrors, compilation.semanticErrors, compilation.irErrors, compilation.errors)
         )
     }
+    bootstrapDisposeHeldModule()
+    bootstrapLlvmHeldModule = enclosingModule
+    bootstrapLlvmHeldContext = enclosingContext
     if (status == 0 && !bootstrapCommitCompileOutputs()) status = 144
     if (status != 0) bootstrapDiscardCompileOutputs()
     status

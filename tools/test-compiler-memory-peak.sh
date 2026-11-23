@@ -69,11 +69,12 @@ for round in 1 2 3 4 5; do
         break
     fi
 done
-# The ordinary trace can count the rendered LLVM text and garbage awaiting collection in one sample.
-# A cadence shift made the optimized compiler measure 71.11 B/B against the earlier compiler's 64.54.
-# In retained mode the compiler collects at major phase boundaries. The optimized compiler measured
-# 49.42–49.45 B/B across three inputs. A limit of 54 leaves about 9% margin. The RSS runs keep default GC.
-retained_per_source_byte_hundredths=5400
+# In retained mode the compiler collects at major phase boundaries so changes in
+# collection cadence cannot turn pending garbage into a memory regression.
+# With native LLVM text streamed to stdout, the peak moved from render.end
+# (49.41–49.44 B/B) to frontend.lowering.end (43.22–43.25 B/B) across three inputs.
+# A limit of 47 leaves about 9% margin. The RSS runs keep default GC.
+retained_per_source_byte_hundredths=4700
 traced="$output_directory/traced.err"
 (
     cd "$project_root"
