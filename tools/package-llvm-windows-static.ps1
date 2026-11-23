@@ -47,10 +47,11 @@ git -C $root cat-file blob 'HEAD:nix/llvm-instcombine-fdiv-zero.patch' > $patch
 $sourceArchive = Join-Path $work 'source.tar.gz'
 $prefix = "llvm-project-$commit"
 Invoke-WebRequest "https://codeload.github.com/AndreBaltazar8/llvm-project/tar.gz/$commit" -OutFile $sourceArchive
-# LLVM uses common utility headers from libc/. The unused MLGO scripts have symlinks.
+# LLVM needs libc headers and lld Mach-O needs libunwind headers.
+# The unused MLGO scripts have symlinks.
 & "$env:SystemRoot/System32/tar.exe" -xf $sourceArchive -C $source --strip-components 1 `
     --exclude "$prefix/llvm/utils/mlgo-utils" `
-    "$prefix/cmake" "$prefix/libc" "$prefix/llvm" "$prefix/lld" "$prefix/third-party"
+    "$prefix/cmake" "$prefix/libc" "$prefix/libunwind/include" "$prefix/llvm" "$prefix/lld" "$prefix/third-party"
 Remove-Item $sourceArchive
 Push-Location (Join-Path $source 'llvm')
 try {
