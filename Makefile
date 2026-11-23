@@ -418,6 +418,7 @@ test-serial: ablac
 	tools/test-path-syntax.sh $(COMPILER)
 	tools/test-windows-link.sh $(COMPILER)
 	tools/test-pe-info.sh $(COMPILER)
+	tools/test-package-windows-toolchain.sh $(COMPILER)
 	tools/test-windows-hosted.sh $(COMPILER)
 	tools/test-windows-syscalls.sh $(COMPILER)
 	tools/test-windows-crash.sh $(COMPILER)
