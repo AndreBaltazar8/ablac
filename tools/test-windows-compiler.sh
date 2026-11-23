@@ -20,7 +20,11 @@ rm -rf "$out"
 mkdir -p "$out"
 fail() { echo "windows-compiler: $1" >&2; exit 1; }
 command -v llvm-nm > /dev/null || { echo "windows-compiler: skipped (llvm-nm is not installed)"; exit 0; }
-ABLA_WINDOWS_LINK_KEEP=1 "$compiler" build src/orc_main.ab --target x86_64-windows-hosted -o "$out/ablac.exe" > "$out/build.log" 2>&1 || true
+# The whole compiler, built for release: the launcher's 240 s for an orc_main build (tools/run-limited-compiler.sh) is
+# its time alone, and beside the suite's other jobs it went past that (since the compiler collects with background freeing
+# and collection threads, 2ece0285c). This build has its own limit.
+ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-600} ABLA_WINDOWS_LINK_KEEP=1 \
+    "$compiler" build src/orc_main.ab --target x86_64-windows-hosted -o "$out/ablac.exe" > "$out/build.log" 2>&1 || true
 [[ -s $out/ablac.exe.o ]] || { tail -20 "$out/build.log" >&2; fail "src/orc_main.ab gave no object for Windows"; }
 
 # What the object needs beyond LLVM is what the runtime imports (runtime/windows/imports), nothing of a C library.
