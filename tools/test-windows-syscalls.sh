@@ -65,4 +65,15 @@ status=0
 tools/windows/wine-run.sh "$out/fault-jump.exe" > "$out/fault-jump.out" 2> "$out/fault-jump.err" || status=$?
 [[ $status == 0 ]] || fail "fault-jump.exe exited $status: $(head -3 "$out/fault-jump.out" "$out/fault-jump.err")"
 [[ "$(cat "$out/fault-jump.out")" == $'armed\nback with 4' ]] || fail "fault-jump.exe printed: $(cat "$out/fault-jump.out" "$out/fault-jump.err")"
-echo "windows-syscalls: the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame; a fault redirected with abla_windows_redirect jumps back too"
+# An interrupt word (interrupt.ab, §5): with the thread's word set, each wait returns EINTR (-4) within a slice: a 30-second
+# nanosleep, poll with nothing to wait on, poll on a socket, a futex wait and wait4 on a child sleeping 30 s; cleared, the killed
+# child is collected and a 50 ms sleep returns 0. The whole program takes seconds, not the minutes a missed interrupt would.
+"$compiler" build tests/cases/windows/interrupt.ab --target x86_64-windows-hosted -o "$out/interrupt.exe" --fast --no-cache \
+    > "$out/interrupt.log" 2>&1 || { cat "$out/interrupt.log" >&2; fail "interrupt.ab did not build for Windows"; }
+status=0
+started=$SECONDS
+tools/windows/wine-run.sh "$out/interrupt.exe" > "$out/interrupt.out" 2> "$out/interrupt.err" || status=$?
+[[ $status == 0 ]] || fail "interrupt.exe exited $status: $(head -3 "$out/interrupt.out" "$out/interrupt.err")"
+[[ "$(cat "$out/interrupt.out")" == $'interrupted sleep -4\ninterrupted poll -4\ninterrupted socket poll -4\ninterrupted futex wait -4\ninterrupted wait4 -4\ncollected true\nplain sleep 0' ]] || fail "interrupt.exe printed: $(cat "$out/interrupt.out" "$out/interrupt.err")"
+(( SECONDS - started < 25 )) || fail "interrupt.exe took $((SECONDS - started)) s: the interrupted sleep ran its time"
+echo "windows-syscalls: the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame; a fault redirected with abla_windows_redirect jumps back too; a thread's interrupt word ends its wait with EINTR"

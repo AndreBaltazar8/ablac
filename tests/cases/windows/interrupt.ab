@@ -1,0 +1,61 @@
+// A thread's interrupt word (docs/design/windows-jit.md §5): with it set, every wait the runtime makes returns EINTR (-4) within a
+// slice, not when its time is up: nanosleep, poll with nothing to wait on (a sleep), poll on a socket (WSAPoll), a futex wait on a
+// word that does not change (WaitOnAddress) and wait4 on a child that runs on. Cleared, the child is collected after a kill and a
+// 50 ms sleep runs its time and returns 0. The compile-time watchdog sets another thread's word; the waits look at it the same way.
+// Started with the argument "child", the program is that child: it sleeps 30 seconds.
+import "abla/io"
+import "abla/text"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/runtime/platform/windows"
+import "abla/unsafe/memory/raw"
+
+trusted fun storeI64(address: int, value: int): void = ablaUnsafeStoreI64(nativePointerFromAddress(address), value)
+
+// nanosleep(request, 0) for `seconds` and `nanoseconds`.
+trusted fun sleepFor(request: int, seconds: int, nanoseconds: int): int {
+    storeI64(request, seconds)
+    storeI64(request + 8, nanoseconds)
+    linuxSyscall2(35, request, 0)
+}
+
+// poll(fds, 1, 30 s) on a UDP socket bound to 127.0.0.1 with nothing sent to it: it waits for input (POLLIN) that never comes.
+trusted fun pollSocket(memory: int): int {
+    val socket = linuxSyscall3(41, 2, 2, 0)
+    if (socket < 0) return 1000 + socket
+    // sockaddr_in: AF_INET, port 0 (any), 127.0.0.1.
+    storeI64(memory, 2 + 127 * 4294967296 + 16777216 * 4294967296)
+    storeI64(memory + 8, 0)
+    val bound = linuxSyscall3(49, socket, memory, 16)
+    if (bound < 0) return 2000 + bound
+    // pollfd: the descriptor, events POLLIN (1), revents 0.
+    storeI64(memory + 16, socket + 4294967296)
+    val polled = linuxSyscall3(7, memory + 16, 1, 30000)
+    linuxSyscall1(3, socket)
+    polled
+}
+
+trusted fun main: int {
+    val storage = "0123456789abcdef".repeat(8)
+    val memory = nativeStringAddress(storage)
+    if (linuxArgument(0) == "child") return sleepFor(memory, 30, 0)
+    val cell = __ablaRuntimeWindowsInterruptCell()
+    val child = linuxStartConfiguredProcess(".", ["/proc/self/exe", "child"]).process
+    if (child < 0) {
+        println("no child: $child")
+        return 1
+    }
+    storeI64(cell, 1)
+    println("interrupted sleep ${sleepFor(memory, 30, 0)}")
+    println("interrupted poll ${linuxSyscall3(7, 0, 0, 30000)}")
+    println("interrupted socket poll ${pollSocket(memory)}")
+    // futex(word, FUTEX_WAIT, 5): the word holds 5 and nothing changes it.
+    storeI64(memory, 5)
+    println("interrupted futex wait ${linuxSyscall4(202, memory, 0, 5, 0)}")
+    println("interrupted wait4 ${linuxSyscall3(61, child, memory, 0)}")
+    storeI64(cell, 0)
+    linuxSyscall2(62, child, 9)
+    println("collected ${linuxSyscall3(61, child, memory, 0) == child}")
+    println("plain sleep ${sleepFor(memory, 0, 50000000)}")
+    0
+}

@@ -166,6 +166,33 @@ trusted noescape extern:"c" fun WaitForSingleObject(handle: int, milliseconds: i
 private trusted fun __ablaRuntimeWindowsScratch(): int =
     nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 
+/**
+ * The address of this thread's interrupt word (docs/design/windows-jit.md §5): 0, or 1 once another thread asked this one to
+ * stop what it waits for. Windows has no signal that would make a blocked call return EINTR, so every wait the runtime makes
+ * waits in slices of at most __ablaRuntimeWindowsWaitSlice milliseconds and returns -4 (EINTR) when it finds the word set. The
+ * compile-time guard records the address while a call runs and clears the word after it; its watchdog writes 1 through it at
+ * the deadline. The word is the thread's own, so the compiler's other threads never see an EINTR meant for one.
+ */
+trusted fun __ablaRuntimeWindowsInterruptCell(): int = nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00")
+
+// The longest a wait sleeps before it looks at the interrupt word.
+private val __ablaRuntimeWindowsWaitSlice = 20
+
+private trusted fun __ablaRuntimeWindowsInterrupted(): bool =
+    ablaRuntimeAtomicLoadI64(__ablaRuntimeWindowsInterruptCell()) != 0
+
+// Sleeps `milliseconds` (negative: for ever) in slices: 0, or -4 (EINTR) as soon as the thread's interrupt word is set.
+private trusted fun __ablaRuntimeWindowsSleep(milliseconds: int): int {
+    var left = milliseconds
+    while (left != 0) {
+        if (__ablaRuntimeWindowsInterrupted()) return -4
+        val slice = if (left < 0 || left > __ablaRuntimeWindowsWaitSlice) __ablaRuntimeWindowsWaitSlice else left
+        Sleep(slice)
+        if (left > 0) left = left - slice
+    }
+    if (__ablaRuntimeWindowsInterrupted()) -4 else 0
+}
+
 // The errno a Linux caller expects.
 private val __ablaRuntimeWindowsENOMEM = -12
 private val __ablaRuntimeWindowsEINVAL = -22
@@ -310,6 +337,8 @@ private trusted fun __ablaRuntimeWindowsErrno(): int {
     if (code == 87 || code == 123 || code == 161) return -22
     if (code == 6) return -9
     if (code == 8 || code == 14) return -12
+    // ERROR_OPERATION_ABORTED: a read or write CancelSynchronousIo ended (the compile-time watchdog, §5) is EINTR.
+    if (code == 995) return -4
     -5
 }
 
@@ -907,8 +936,17 @@ private trusted fun __ablaRuntimeWindowsPoll(fds: int, count: int, timeout: int)
         index = index + 1
     }
     if (sockets > 0) {
-        // with nothing else ready the wait is the caller's; with something ready, none
-        val result = WSAPoll(buffer, sockets, if (ready > 0) 0 else timeout)
+        // with nothing else ready the wait is the caller's (in slices: an interrupted thread returns EINTR); with something
+        // ready, none
+        var left = if (ready > 0) 0 else timeout
+        var result = 0
+        while (true) {
+            val slice = if (left < 0 || left > __ablaRuntimeWindowsWaitSlice) __ablaRuntimeWindowsWaitSlice else left
+            result = WSAPoll(buffer, sockets, slice)
+            if (result != 0 || left == 0) break
+            if (left > 0) left = left - slice
+            if (__ablaRuntimeWindowsInterrupted()) return -4
+        }
         if (result < 0) return __ablaRuntimeWindowsSocketErrno()
         var seen = 0
         var at = 0
@@ -936,7 +974,7 @@ private trusted fun __ablaRuntimeWindowsPoll(fds: int, count: int, timeout: int)
     }
     if (ready > 0) return ready
     // nothing to wait on but time
-    if (timeout > 0) Sleep(timeout)
+    if (timeout > 0) return __ablaRuntimeWindowsSleep(timeout)
     0
 }
 
@@ -1333,7 +1371,12 @@ private trusted fun __ablaRuntimeWindowsWait(pid: int, status: int, options: int
     val entry = __ablaRuntimeWindowsProcessEntry(pid)
     if (entry == 0) return -10
     val handle = ablaRuntimeLoadI64(entry + 8)
-    val waited = WaitForSingleObject(handle, if ((options & 1) != 0) 0 else 4294967295) & 4294967295
+    // Without WNOHANG the wait is in slices, so an interrupted thread returns EINTR (§5).
+    var waited = WaitForSingleObject(handle, if ((options & 1) != 0) 0 else __ablaRuntimeWindowsWaitSlice) & 4294967295
+    while (waited == 258 && (options & 1) == 0) {
+        if (__ablaRuntimeWindowsInterrupted()) return -4
+        waited = WaitForSingleObject(handle, __ablaRuntimeWindowsWaitSlice) & 4294967295
+    }
     if (waited == 258) return 0
     if (waited != 0) return -10
     val scratch = __ablaRuntimeWindowsScratch()
@@ -1471,8 +1514,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
     if (number == 35) {
         val seconds = ablaRuntimeLoadI64(a0)
         val nanoseconds = ablaRuntimeLoadI64(a0 + 8)
-        Sleep(seconds * 1000 + (nanoseconds + 999999) / 1000000)
-        return 0
+        return __ablaRuntimeWindowsSleep(seconds * 1000 + (nanoseconds + 999999) / 1000000)
     }
     // getpid, gettid
     if (number == 39) return GetCurrentProcessId() & 4294967295
@@ -1518,7 +1560,12 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
         if (operation == 0) {
             val scratch = __ablaRuntimeWindowsScratch()
             ablaRuntimeStoreI32(scratch, a2 & 4294967295)
-            WaitOnAddress(a0, scratch, 4, 4294967295)
+            // In slices (WaitOnAddress is not alertable): an interrupted thread returns EINTR (§5), which callers treat as the
+            // early return they already allow.
+            while (WaitOnAddress(a0, scratch, 4, __ablaRuntimeWindowsWaitSlice) == 0 &&
+                ablaRuntimeLoadI32(a0) == ablaRuntimeLoadI32(scratch)) {
+                if (__ablaRuntimeWindowsInterrupted()) return -4
+            }
             return 0
         }
         return __ablaRuntimeWindowsRefuse(number)
