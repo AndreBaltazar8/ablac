@@ -27,6 +27,11 @@ for mode in interp jit auto; do
         > "$out/implicit-$mode.log" 2>&1
     "$out/implicit-builder-$mode"
     ABLA_COMPILE_EVAL=$mode ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build \
+        tests/cases/compile-eval-cross-target/build-implicit-portable.ab \
+        -o "$out/implicit-portable-builder-$mode" --fast --no-cache > "$out/implicit-portable-$mode.log" 2>&1
+    "$out/implicit-portable-builder-$mode"
+    cp "$out/implicit-portable.wasm" "$out/implicit-portable-$mode.wasm"
+    ABLA_COMPILE_EVAL=$mode ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build \
         tests/cases/compile-eval-cross-target/build-collision.ab -o "$out/collision-builder-$mode" --fast --no-cache \
         > "$out/collision-$mode.log" 2>&1
     "$out/collision-builder-$mode"
@@ -78,10 +83,11 @@ for mode in jit auto; do
     cmp "$out/portable-interp.wasm" "$out/portable-$mode.wasm"
     cmp "$out/fallback-interp.wasm" "$out/fallback-$mode.wasm"
     cmp "$out/implicit-interp.wasm" "$out/implicit-$mode.wasm"
+    cmp "$out/implicit-portable-interp.wasm" "$out/implicit-portable-$mode.wasm"
     cmp "$out/collision-interp.wasm" "$out/collision-$mode.wasm"
     cmp "$out/floats-interp.wasm" "$out/floats-$mode.wasm"
     if [[ $mode == auto ]]; then
-        for log in "" floats- collision- implicit-; do
+        for log in "" floats- collision- implicit- implicit-portable-; do
             ct_auto_follows_jit "$out/${log}auto.log" "$out/${log}jit.log" ||
                 { echo "cross-target: ${log}auto.log: not the jit choices" >&2; exit 1; }
         done
@@ -91,6 +97,12 @@ for mode in jit auto; do
     ! grep -q 'native at .*[/]floats.ab:' "$out/floats-$mode.log"
     grep -q 'interpreted at .*cross-target host runtime declaration collision: write' "$out/collision-$mode.log"
     grep -q 'interpreted at .*cross-target implicit runtime dependency' "$out/implicit-$mode.log"
+    marker=$(( $(grep -boa 'val RESULT = #' tests/cases/compile-eval-cross-target/implicit-portable.ab | cut -d: -f1) + 13 ))
+    if ! grep -Eq "native at .*/implicit-portable[.]ab:$marker$" "$out/implicit-portable-$mode.log"; then
+        cat "$out/implicit-portable-$mode.log" >&2
+        echo "cross-target: portable extension default did not run natively" >&2
+        exit 1
+    fi
     # The probe, indirect call, builtin-looking user method, selected native
     # arm and raw pointer operation fall back. The skipped native arm, file
     # read and SHA remain native.
@@ -123,7 +135,7 @@ grep -q 'interpreted at .*cross-target host runtime file unavailable' "$out/miss
 node - "$out" <<'JS'
 const fs = require('fs');
 (async () => {
-  for (const [name, expected] of [['portable', 42n], ['fallback', 42n], ['implicit', 42n], ['collision', 42n], ['floats', 42n], ['heavy', 12810n]]) {
+  for (const [name, expected] of [['portable', 42n], ['fallback', 42n], ['implicit', 42n], ['implicit-portable', 42n], ['collision', 42n], ['floats', 42n], ['heavy', 12810n]]) {
     const module = new WebAssembly.Module(fs.readFileSync(`${process.argv[2]}/${name}.wasm`));
     const imports = {};
     for (const entry of WebAssembly.Module.imports(module)) {
