@@ -6341,6 +6341,58 @@ fun bootstrapRegionExpressionRetainsReceiver(
     retaining
 }
 
+// Whether the place `this`, `this.field` (an extension's receiver) holds heap values: by the declared type of the field or, for
+// `this` itself, of the owner (an array's or map's element). A type that is not known counts as heap.
+fun bootstrapRegionReceiverPlaceHoldsHeap(
+    place: BootstrapExpression,
+    owner: string,
+    summary: BootstrapRegionCallSummary
+): bool {
+    var type = ""
+    if (place.kind == "identifier" && place.text == "this") type = owner
+    else if (place.kind == "member" && place.children.size == 1 &&
+        place.children[0].kind == "identifier" && place.children[0].text == "this") {
+        type = summary.fieldTypes.get("$owner.${place.text}") ?? ""
+    }
+    if (type == "") return true
+    type = bootstrapNormalizeType(type)
+    if (bootstrapIsArrayType(type)) return !bootstrapRegionResultIsIndependent(bootstrapArrayElementType(type))
+    if (bootstrapIsMapType(type)) return !bootstrapRegionResultIsIndependent(bootstrapMapValueType(type)) ||
+        !bootstrapRegionResultIsIndependent(bootstrapMapKeyType(type))
+    !bootstrapRegionResultIsIndependent(type)
+}
+
+// An extension function's receiver, as a method's (bootstrapRegionExpressionRetainsReceiver) but by what is stored: a
+// store of a scalar into a field or an array of scalars keeps nothing of a region, so only a heap field (by its declared
+// type), an append or set into a heap element, and a call that retains its receiver count.
+fun bootstrapRegionExtensionRetainsReceiver(
+    expression: BootstrapExpression,
+    owner: string,
+    declarations: array<BootstrapDeclaration>,
+    summary: BootstrapRegionCallSummary
+): bool {
+    var retaining = false
+    if (expression.kind == "member.assign" &&
+        bootstrapPlaceRootName(expression.children[0]) == "this" &&
+        bootstrapRegionFieldIsHeap(summary, owner, expression.text)) retaining = true
+    if (expression.kind == "index.assign" &&
+        bootstrapPlaceRootName(expression.children[0]) == "this" &&
+        bootstrapRegionReceiverPlaceHoldsHeap(expression.children[0], owner, summary)) retaining = true
+    if (expression.kind == "member.call" &&
+        bootstrapPlaceRootName(expression.children[0]) == "this") {
+        if ((expression.text == "append" || expression.text == "set") &&
+            bootstrapRegionReceiverPlaceHoldsHeap(expression.children[0], owner, summary)) retaining = true
+        if (bootstrapRegionReceiverCallIsRetaining(summary, owner, expression.text) ||
+            summary.retainingReceivers.contains("ext:$owner.${expression.text}")) retaining = true
+    }
+    var child = 0
+    while (!retaining && child < expression.children.size) {
+        retaining = bootstrapRegionExtensionRetainsReceiver(expression.children[child], owner, declarations, summary)
+        child = child + 1
+    }
+    retaining
+}
+
 fun bootstrapRegionExtensionOwner(declaration: BootstrapDeclaration): string =
     if (declaration.extensionOwner == "") "" else bootstrapNormalizeType(declaration.extensionOwner)
 
@@ -6710,6 +6762,22 @@ fun bootstrapBuildRegionCallSummary(
                     declarations,
                     summary
                 )) changed = true
+                // An extension function keeps what it is given in its receiver as a method does: `fun Box.keep(s) { this.text = s }`
+                // and `fun ByteBuffer.appendChunk(text) { this.chunks.append(text) }` were not summarized, so a region could
+                // pass a region-built value to one on an outer receiver, which kept it past the region.
+                if (declaration.extensionOwner != "" &&
+                    !summary.retainingReceivers.contains("ext:" + bodyName) &&
+                    bootstrapRegionExtensionRetainsReceiver(
+                        declaration.expression,
+                        bootstrapRegionExtensionOwner(declaration),
+                        declarations,
+                        summary
+                    )) {
+                    // Keyed apart from a method's ("Owner.name"): the standard library's own extensions keep outer state inside regions
+                    // by promoting what they store (memoryPromoteString), so only code outside the library is held to it.
+                    bootstrapRegionAddRetainingReceiver(summary, "ext:" + bodyName)
+                    changed = true
+                }
                 if ((declaration.kind == "fun" ||
                      declaration.kind == "compile.fun") &&
                     !bootstrapRegionCallIsUnsafe(summary, bodyName) &&
@@ -15580,11 +15648,12 @@ fun bootstrapInferMemberCall(
         analyzer.fail("region.call-retention:${expression.text}")
     }
     if (analyzer.regionDepth > 0 &&
-        bootstrapRegionReceiverCallIsRetaining(
+        (bootstrapRegionReceiverCallIsRetaining(
             analyzer.regionCalls,
             receiver,
             expression.text
-        ) &&
+        ) || (analyzer.regionCalls.retainingReceivers.contains("ext:$receiver.${expression.text}") &&
+            !bootstrapStandardLibraryModuleSource(analyzer.currentSourceIdentity))) &&
         !analyzer.regionExpressionIsOwned(expression.children[0])) {
         analyzer.fail(
             "region.receiver-retention:${receiver}.${expression.text}"

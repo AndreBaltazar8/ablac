@@ -76,6 +76,20 @@ fun main {
 
 A `TVar` outside the region is the same: its `setValue` keeps the value.
 
+The same holds for what a function or an extension keeps in its receiver: `buffer.appendChunk(text)` on a `ByteBuffer`
+outside the region keeps `text` itself (a chunk of 256 bytes or more is kept by reference), and an extension that stores
+its argument in `this` is a retaining call like a method. The check is conservative, as an append's is: a string literal
+(not region memory, but not told apart from a built one) stored into a map or an array outside the region is refused too,
+and so is any `ByteBuffer` append on an outer buffer. Build the value outside the region, or keep the container inside it.
+`tools/test-region-stores.sh` lists one program per kind of store.
+
+**Trust rule for the standard library.** The extension check is not applied to calls made from the standard library's own
+modules. `abla/http/event` keeps connection state in the server object from inside a `region`, and that is safe only
+because it promotes what it stores (`memoryPromoteString`) before the store; the compiler does not
+verify this. The rule is: a standard library extension that stores into its receiver while a caller's region may be open
+must promote the value first. Known gap: nothing checks it (a lint that finds a store into `this` of a value that did not
+come from a promote call, in a function a region can reach, is not written).
+
 ```abla error
 import "abla/stm"
 

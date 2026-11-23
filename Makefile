@@ -323,6 +323,7 @@ test-serial: ablac
 	tools/test-compile-time-parity-guard.sh
 	tools/test-eval-scopes-guard.sh
 	tools/test-scoped-region.sh $(COMPILER)
+	tools/test-region-stores.sh $(COMPILER)
 	tools/test-memory-promote.sh $(COMPILER)
 	tools/test-rope-region.sh $(COMPILER)
 	tools/test-region-extension-names.sh $(COMPILER)
