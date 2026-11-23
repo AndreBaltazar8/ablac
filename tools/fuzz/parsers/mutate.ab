@@ -1,0 +1,58 @@
+// Input mutation for the parser harnesses (#1139 area 4): a seeded mutator that turns a corpus entry into the bytes a hostile peer
+// might send. The tokens are the ones that break framing and nesting (bare CR and LF, NUL, folded lines, huge and negative numbers,
+// bytes that are not UTF-8); the operations are the usual (insert, delete, duplicate, overwrite, truncate).
+import "abla/text"
+import "abla/bytes"
+import "../prng.ab"
+
+val MUTATE_TOKENS: array<string> = ["\r", "\n", "\r\n", "\r\n\r\n", "\x00", " ", "\t", ":", " :", ": ", "\r\n ", "\r\n\t", "0", "-1",
+    "99999999999999999999", "4294967296", "chunked", "Content-Length: ", "Transfer-Encoding: chunked\r\n", ",", ";", "=", "\"", "\\",
+    "..", "%", "%00", "\x7f", "\x1b", "{", "}", "[", "]", "<", ">", "&", "<!", "--"]
+
+/** A string of `count` bytes drawn from the whole range 0-255 (not valid UTF-8 in general). */
+fun mutateBytes(var r: Prng, count: int): string {
+    val buffer = byteBuffer()
+    for (i in 0 until count) buffer.appendByteValue(r.below(256))
+    buffer.toText()
+}
+
+/** One mutation of `input`: insert a token, delete a range, duplicate a range, overwrite a byte, truncate or append random bytes. */
+fun mutateOnce(var r: Prng, input: string): string {
+    val size = input.size
+    val at = if (size == 0) 0 else r.below(size + 1)
+    val kind = r.below(7)
+    if (kind == 0 || size == 0) return input.slice(0, at) + r.pick(MUTATE_TOKENS) + input.slice(at, size)
+    val end = at + r.below(size - at + 1)
+    if (kind == 1) return input.slice(0, at) + input.slice(end, size)
+    if (kind == 2) return input.slice(0, end) + input.slice(at, end) + input.slice(end, size)
+    if (kind == 3) {
+        val position = r.below(size)
+        return input.slice(0, position) + mutateBytes(r, 1) + input.slice(position + 1, size)
+    }
+    if (kind == 4) return input.slice(0, at)
+    if (kind == 5) return input + mutateBytes(r, 1 + r.below(8))
+    // Swap two halves around `at`: moves a header line to where only the body or the request line belongs.
+    input.slice(at, size) + input.slice(0, at)
+}
+
+/** `input` after one to four mutations. */
+fun mutate(var r: Prng, input: string): string {
+    var text = input
+    val rounds = 1 + r.below(4)
+    for (i in 0 until rounds) text = mutateOnce(r, text)
+    text
+}
+
+/** The text with every byte outside printable ASCII as a \xNN escape, so a finding can be pasted into a reproducer. */
+fun mutateEscape(text: string): string {
+    var out = ""
+    for (i in 0 until text.size) {
+        val byte = text[i]
+        if (byte >= 32 && byte < 127 && byte != 92 && byte != 34 && byte != 36) out = out + text.slice(i, i + 1)
+        else {
+            val hex = "0123456789abcdef"
+            out = out + "\\x" + hex.slice(byte >>> 4, (byte >>> 4) + 1) + hex.slice(byte & 15, (byte & 15) + 1)
+        }
+    }
+    out
+}

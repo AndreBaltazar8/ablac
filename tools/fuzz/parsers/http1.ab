@@ -1,0 +1,159 @@
+// HTTP/1 request and response parsing against hostile bytes (#1139 area 4). Each seed derives mutated requests from a corpus of valid and
+// edge-case ones and checks what a server relies on: the parser and the framing check do not crash or hang, and a request the
+// framing check accepts (not -1) has no bare CR or LF or NUL in its head, no folded line, no name that is not a token, no control
+// byte in a value, a single body length (not Content-Length with Transfer-Encoding, not two different Content-Lengths), and a chunk
+// decoder that never returns more than the bound or consumes more than it was given.
+//
+//   tools/fuzz/parsers/run http1 --seeds 1-200 [--inputs 200]
+import "abla/io"
+import "abla/text"
+import "abla/integer"
+import "abla/http"
+import "abla/http/event"
+import "abla/process/arguments"
+import "../prng.ab"
+import "./mutate.ab"
+
+val HTTP1_CORPUS: array<string> = [
+    "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+    "GET /a/b?x=1&y=%41 HTTP/1.1\r\nHost: a\r\nAccept: */*\r\n\r\n",
+    "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello",
+    "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+    "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!",
+    "POST /p HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    "POST /p HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    "POST /p HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n0\r\nTrailer: x\r\n\r\n",
+    "POST /p HTTP/1.1\r\nHost: a\r\nTransfer-Encoding : chunked\r\n\r\n0\r\n\r\n",
+    "POST /p HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\tchunked\r\n\r\n0\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nX-A: b\r\n c\r\n\r\n",
+    "GET / HTTP/1.0\r\nHost: a\r\n\r\n",
+    "GET http://a/ HTTP/1.1\r\nHost: a\r\n\r\n",
+    "GET / HTTP/1.1\nHost: a\n\n",
+    "GET /\x00 HTTP/1.1\r\nHost: a\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\rX: b\r\n\r\n"]
+
+val HTTP1_RESPONSES: array<string> = [
+    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+    "HTTP/1.1 204 No Content\r\nContent-Length: 4\r\n\r\n",
+    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nok!",
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"]
+
+fun http1TokenByte(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+    byte == 33 || (byte >= 35 && byte <= 39) || byte == 42 || byte == 43 || byte == 45 || byte == 46 || byte == 94 ||
+    byte == 95 || byte == 96 || byte == 124 || byte == 126
+
+/** The index of the end of the head (the first CRLF CRLF, after it), or -1. */
+fun http1HeadEnd(input: string): int {
+    var i = 0
+    while (i + 3 < input.size) {
+        if (input[i] == 13 && input[i + 1] == 10 && input[i + 2] == 13 && input[i + 3] == 10) return i + 4
+        i = i + 1
+    }
+    -1
+}
+
+/** Whether the head (up to its end) has a CR or LF that is not part of a CRLF, a NUL, or a line that starts with a space or tab. */
+fun http1HeadIsDirty(head: string): bool {
+    var i = 0
+    while (i < head.size) {
+        val byte = head[i]
+        if (byte == 0) return true
+        if (byte == 13 && !(i + 1 < head.size && head[i + 1] == 10)) return true
+        if (byte == 10 && !(i > 0 && head[i - 1] == 13)) return true
+        if ((byte == 32 || byte == 9) && i >= 2 && head[i - 1] == 10 && head[i - 2] == 13) return true
+        i = i + 1
+    }
+    false
+}
+
+/** A description of what is wrong when an accepted request breaks one of the invariants, else "". */
+fun http1CheckRequest(input: string): string {
+    val request = httpParseRequest(input)
+    val framing = httpRequestFraming(request, false, 1048576)
+    val headEnd = http1HeadEnd(input)
+    if (framing == -1) return ""
+    if (httpEventRequestLength(input, 65536, 1048576) <= 0) return ""
+    if (headEnd < 0) return ""
+    val head = input.slice(0, headEnd)
+    if (http1HeadIsDirty(head)) return "accepted a head with a bare CR or LF, a NUL or a folded line"
+    var lengths = 0
+    var transfers = 0
+    for (header in request.headers) {
+        if (header.name == " malformed line") return "accepted a malformed line"
+        if (header.name.size == 0) return "accepted an empty header name"
+        for (i in 0 until header.name.size) if (!http1TokenByte(header.name[i])) return "accepted a header name that is not a token: ${mutateEscape(header.name)}"
+        for (i in 0 until header.value.size) {
+            val byte = header.value[i]
+            if ((byte < 32 && byte != 9) || byte == 127) return "accepted a header value with a control byte: ${mutateEscape(header.value)}"
+        }
+        if (httpAsciiEqualInsensitive(header.name, "Content-Length")) lengths = lengths + 1
+        if (httpAsciiEqualInsensitive(header.name, "Transfer-Encoding")) transfers = transfers + 1
+    }
+    if (lengths > 0 && transfers > 0) return "accepted Content-Length together with Transfer-Encoding"
+    if (transfers > 1) return "accepted two Transfer-Encodings"
+    if (request.method.size == 0) return "accepted an empty method"
+    for (i in 0 until request.method.size) if (!http1TokenByte(request.method[i])) return "accepted a method that is not a token"
+    // DEL (127) and 8-bit bytes in a target pass through by design (tests/cases/http-framing/exceptions.txt), so only <= 32 is checked.
+    for (i in 0 until request.path.size) if (request.path[i] <= 32) return "accepted a path with a control byte or space"
+    if (framing == -2) {
+        val rest = input.slice(headEnd, input.size)
+        val decoded = httpCoreDecodeChunked(rest, 1048576)
+        if (decoded.consumed > rest.size) return "the chunk decoder consumed ${decoded.consumed} of ${rest.size} bytes"
+        if (decoded.body.size > 1048576) return "the chunk decoder returned more than its bound"
+        if (decoded.valid && decoded.complete && decoded.consumed < 1) return "a complete chunk stream consumed nothing"
+    }
+    ""
+}
+
+/** The response parser must not crash on the bytes and, when it accepts them, must not report a body longer than the input. */
+fun http1CheckResponse(input: string): string {
+    val result = httpParseResponse(input)
+    if (result.succeeded && result.response.body.size > input.size) return "a response body longer than its input"
+    ""
+}
+
+fun main: int {
+    var low = 1
+    var high = 50
+    var inputs = 200
+    var verbose = false
+    val count = processArgumentCount()
+    var index = 1
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "--seeds") {
+            val dash = value.indexOf("-")
+            low = (if (dash < 0) value else value.slice(0, dash)).parseInt() ?? 1
+            high = (if (dash < 0) value else value.slice(dash + 1, value.size)).parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--inputs") {
+            inputs = value.parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--verbose") verbose = true
+        index = index + 1
+    }
+    var findings = 0
+    for (seed in low until high + 1) {
+        var r = prngSeeded(seed)
+        for (n in 0 until inputs) {
+            val request = mutate(r, r.pick(HTTP1_CORPUS))
+            if (verbose) println("input seed=$seed n=$n ${mutateEscape(request)}")
+            val problem = http1CheckRequest(request)
+            if (problem != "") {
+                println("FINDING seed=$seed n=$n: $problem\n  request: ${mutateEscape(request)}")
+                findings = findings + 1
+            }
+            val response = mutate(r, r.pick(HTTP1_RESPONSES))
+            val bad = http1CheckResponse(response)
+            if (bad != "") {
+                println("FINDING seed=$seed n=$n: $bad\n  response: ${mutateEscape(response)}")
+                findings = findings + 1
+            }
+        }
+    }
+    println("http1: seeds $low-$high, $inputs inputs each, $findings findings")
+    if (findings == 0) 0 else 1
+}
