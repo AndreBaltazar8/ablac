@@ -6,6 +6,7 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"os"
@@ -19,23 +20,36 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "server":
-		server(os.Args[2], os.Args[3], os.Args[4], len(os.Args) > 5 && os.Args[5] == "hold")
+		server(os.Args[2], os.Args[3], os.Args[4], len(os.Args) > 5 && os.Args[5] == "hold", clientCAArgument())
 	case "client":
 		client(os.Args[2], os.Args[3:])
 	case "flight":
-		flightClient(os.Args[2], os.Args[3:])
+		flightClient(os.Args[2], os.Args[3:], tls.VersionTLS13)
+	case "flight12":
+		flightClient(os.Args[2], os.Args[3:], tls.VersionTLS12)
 	default:
 		os.Exit(2)
 	}
 }
 
-func server(port, certFile, keyFile string, hold bool) {
+func server(port, certFile, keyFile string, hold bool, clientCA string) {
 	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "peer:", err)
 		os.Exit(2)
 	}
 	config := &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	if clientCA != "" {
+		pem, err := os.ReadFile(clientCA)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "peer:", err)
+			os.Exit(2)
+		}
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(pem)
+		config.ClientCAs = pool
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:"+port)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "peer:", err)
@@ -60,4 +74,12 @@ func server(port, certFile, keyFile string, hold bool) {
 		}
 		connection.Close()
 	}
+}
+
+// The client CA file of `peer server PORT CERT KEY hold CLIENT_CA`: clients must present a certificate it issued.
+func clientCAArgument() string {
+	if len(os.Args) > 6 {
+		return os.Args[6]
+	}
+	return ""
 }

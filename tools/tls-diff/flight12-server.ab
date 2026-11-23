@@ -1,0 +1,410 @@
+// The TLS 1.2 flight side of the TLS handshake differential (#1139 area 3, TLS round 3): a hostile TLS 1.2 server that does a real handshake (ECDHE-ECDSA,
+// AES-128-GCM, P-256, extended master secret). It listens on 127.0.0.1:PORT and serves COUNT connections one after the other; for connection i it reads the client's
+// ClientHello and answers with a flight (ServerHello, Certificate, ServerKeyExchange, ServerHelloDone) changed structurally by a generator seeded by (SEED, i): the
+// ServerHello (an extension added or doubled, the extended master secret left out, a bad renegotiation_info, a suite that was not offered, compression, a long session
+// id, another version, bytes after it), the Certificate (an empty chain, a garbage or a duplicate certificate, wrong lengths), an unsolicited CertificateStatus or
+// CertificateRequest, the ServerKeyExchange (the curve type, a curve that was not offered, an empty / short / off-curve / compressed point, a signature scheme that was
+// not offered or does not fit the key, a flipped / cut / extended / empty signature, a wrong length, omitted, twice, trailing bytes), the ServerHelloDone (a body, omitted,
+// twice), a header length or type that does not match, the way the messages are cut into records, and records that may not be there (plaintext alerts, change_cipher_spec
+// early or malformed, application data, an empty handshake record). After a client Finished that verifies, the server's own: its change_cipher_spec (left out, twice,
+// malformed) and Finished (wrong, short, long, empty, in plaintext, a wrong sequence number), and what comes after (HelloRequest, a NewSessionTicket the client did not ask
+// for, an unknown type, application data, alerts).
+// What the client does is read off the wire (it is decrypted): F (a Finished that verifies: it took the flight), A<n> (an alert), C (it closed), W (silence). After an F
+// the server's last flight is sent and the next reaction is read: F/A<n>, F/C, F/W. One line per connection, "CASE i tags class", for cflight.sh to join.
+//
+//   flight12-server PORT SEED COUNT CERT.PEM KEY.PEM
+import "abla/io"
+import "abla/text"
+import "abla/array"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/crypto/hkdf"
+import "abla/integer"
+import "abla/net"
+import "abla/sys/linux"
+import "abla/process/arguments"
+import "abla/tls/pure"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/record"
+import "abla/tls/pure/client"
+import "abla/tls/pure/tls12"
+import "abla/tls/pure/keysched"
+import "../fuzz/prng.ab"
+import "./common.ab"
+
+var f12Generator: Prng = prngSeeded(1)
+
+fun f12Random(count: int): string = diffBytes(f12Generator, count)
+
+fun f12Header(type: int, body: string, delta: int): string =
+    cryptoByteString([type, ((body.size + delta) >> 16) & 255, ((body.size + delta) >> 8) & 255, (body.size + delta) & 255]) + body
+
+fun f12Pick(var r: Prng, values: array<string>): string = values[r.below(values.size)]
+
+fun f12Split(var r: Prng, data: string, mode: int): array<string> {
+    val out: array<string> = []
+    if (mode == 0 || data.size == 0) {
+        out.append(data)
+        return out
+    }
+    var at = 0
+    while (at < data.size) {
+        var size = 1
+        if (mode == 2) size = 1 + r.below(data.size - at)
+        if (at + size > data.size) size = data.size - at
+        out.append(data.slice(at, at + size))
+        at = at + size
+    }
+    out
+}
+
+/** The client's reaction: records are read for at most `milliseconds`; a record under `protection` (after its change_cipher_spec) is opened. */
+fun f12Reaction(var connection: TcpConnection, var protection: Tls12Protection, decrypt: bool, expectedFinished: string, milliseconds: int): string {
+    var got = ""
+    var closed = false
+    var rounds = 0
+    while (rounds < 3) {
+        val incoming = connection.readWithTimeoutResult(65536, milliseconds)
+        if (incoming.hasData()) got = got + incoming.bytes
+        else {
+            if (!incoming.timedOut()) closed = true
+            rounds = 3
+        }
+        rounds = rounds + 1
+        var at = 0
+        var verdict = ""
+        var sawCcs = false
+        while (verdict == "" && at + 5 <= got.size) {
+            val length = diffRd16(got, at + 3)
+            if (at + 5 + length > got.size) break
+            val type = got[at]
+            if (type == 21 && !(sawCcs && decrypt)) verdict = if (length >= 2) "A${got[at + 6]}" else "A?"
+            else if (type == 20) sawCcs = true
+            else if (decrypt && sawCcs) {
+                val opened = tls12Open(protection, got.slice(at, at + 5 + length))
+                if (!opened.ok) verdict = "BAD"
+                else if (opened.type == 21) verdict = if (opened.content.size >= 2) "A${opened.content[1]}" else "A?"
+                else if (opened.type == 22 && opened.content.size >= 4 && opened.content[0] == 20) verdict = if (expectedFinished == "" || opened.content.slice(4, opened.content.size) == expectedFinished) "F" else "Fbad"
+                else verdict = "T${opened.type}"
+            }
+            at = at + 5 + length
+        }
+        if (verdict != "") return verdict
+    }
+    if (closed) "C" else "W"
+}
+
+fun f12Ext(type: int, body: string): string = tlsExtension(type, body)
+
+fun main: int {
+    if (processArgumentCount() < 5) {
+        println("usage: flight12-server PORT SEED COUNT CERT.PEM KEY.PEM")
+        return 2
+    }
+    val port = processArgument(0).parseInt() ?? 0
+    val seed = processArgument(1).parseInt() ?? 1
+    val count = processArgument(2).parseInt() ?? 1
+    val identity = tlsClientIdentityFromPem(linuxReadFile(processArgument(3), 65536), linuxReadFile(processArgument(4), 65536))
+    if (!identity.ok()) {
+        println("FAIL identity: ${identity.error}")
+        return 1
+    }
+    val suite = tls12Suite(TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256) ?? tls12Placeholder()
+    val hash = HKDF_SHA256
+    var listener = tcpListenAddress(ipv4Loopback(port))
+    println("listening $port")
+    for (i in 0 until count) {
+        var connection = listener.accept()
+        var got = ""
+        var wanted = 0
+        var tries = 0
+        while (tries < 20 && (got.size < 5 || got.size < 5 + wanted)) {
+            val incoming = connection.readWithTimeoutResult(65536, 500)
+            if (incoming.hasData()) {
+                got = got + incoming.bytes
+                if (got.size >= 5) wanted = diffRd16(got, 3)
+            } else tries = 20
+            tries = tries + 1
+        }
+        if (got.size < 9 || got[0] != 22 || got[5] != 1) {
+            println("CASE $i noclienthello W")
+            connection.close()
+            continue
+        }
+        val helloMessage = got.slice(5, if (got.size > 5 + wanted) 5 + wanted else got.size)
+        val hello = tlsParseClientHello(helloMessage.slice(4, helloMessage.size))
+        if (!hello.ok) {
+            println("CASE $i badclienthello W")
+            connection.close()
+            continue
+        }
+        var r = prngSeeded(seed * 100003 + i)
+        f12Generator = prngSeeded(seed * 7919 + i)
+        val pair = tlsGenerateKeyPair(23, f12Random) ?? continue
+        val serverRandom = diffBytes(r, 32)
+        // The parts of the flight, then the mutation.
+        var tags = ""
+        var helloExtras = ""
+        var suiteField = TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256
+        var compression = 0
+        var sessionId = ""
+        var version = 771
+        var helloTrailing = ""
+        var emsOn = true
+        var renegotiation = "\x00"
+        var chainMode = 0
+        var certListDelta = 0
+        var certEntryDelta = 0
+        var statusMessage = false
+        var requestMessage = 0
+        var curveType = 3
+        var group = 23
+        var pointMode = 0
+        var scheme = 0x0403
+        var sigMode = 0
+        var skeDelta = 0
+        var skeMode = 0
+        var skeTrailing = ""
+        var doneBody = ""
+        var doneMode = 0
+        var lengthDelta = ""
+        var typeChange = ""
+        var packing = 0
+        var before = ""
+        var beforeAt = 0
+        var recordVersion = 771
+        var ccsMode = 0
+        var finMode = 0
+        var after = 0
+        var sequenceSkip = false
+        val rounds = 1 + (if (r.below(5) == 0) 1 else 0)
+        for (k in 0 until rounds) {
+            val kind = r.below(36)
+            var tag = "?"
+            if (kind == 0) { val type = diffPickInt(r, [0, 10, 11, 13, 16, 35, 43, 51, 5, 4660, 23, 65281, 21, 42]); helloExtras = helloExtras + f12Ext(type, f12Pick(r, ["", "\x00", "\x01\x00", "\x00\x00"])); tag = "sh-ext-$type" }
+            else if (kind == 1) { helloExtras = helloExtras + f12Ext(4660, "") + f12Ext(4660, ""); tag = "sh-ext-twice" }
+            else if (kind == 2) { emsOn = false; tag = "sh-no-ems" }
+            else if (kind == 3) { renegotiation = f12Pick(r, ["", "\x01\x00", "\x01", "\x00\x00"]); tag = "sh-reneg" }
+            else if (kind == 4) { suiteField = diffPickInt(r, [0xc02f, 0xc02c, 0x1301, 0x0000, 0x00ff, 0xcca9, 0xc030, 0x009c]); tag = "sh-suite-$suiteField" }
+            else if (kind == 5) { compression = diffPickInt(r, [1, 255]); tag = "sh-compression" }
+            else if (kind == 6) { sessionId = diffBytes(r, diffPickInt(r, [1, 8, 32, 33])); tag = "sh-session-id" }
+            else if (kind == 7) { version = diffPickInt(r, [770, 772, 512, 768, 0]); tag = "sh-version-$version" }
+            else if (kind == 8) { helloTrailing = diffBytes(r, 1 + r.below(3)); tag = "sh-trailing" }
+            else if (kind == 9) { chainMode = 1 + r.below(4); tag = "cert-chain-$chainMode" }
+            else if (kind == 10) { certListDelta = diffPickInt(r, [-1, 1, 3]); tag = "cert-list-length" }
+            else if (kind == 11) { certEntryDelta = diffPickInt(r, [-1, 1, 3]); tag = "cert-entry-length" }
+            else if (kind == 12) { statusMessage = true; tag = "cert-status" }
+            else if (kind == 13) { requestMessage = 1 + r.below(2); tag = "cert-request-$requestMessage" }
+            else if (kind == 14) { curveType = diffPickInt(r, [1, 2, 0, 255]); tag = "ske-curve-type-$curveType" }
+            else if (kind == 15) { group = diffPickInt(r, [0, 1, 19, 24, 25, 29, 30, 0xffff, 21, 256]); tag = "ske-group-$group" }
+            else if (kind == 16) { pointMode = 1 + r.below(8); tag = "ske-point-$pointMode" }
+            else if (kind == 17) { scheme = diffPickInt(r, [0x0804, 0x0401, 0x0201, 0, 0xffff, 0x0503, 0x0807, 0x0403 + 1]); tag = "ske-scheme-$scheme" }
+            else if (kind == 18) { sigMode = 1 + r.below(5); tag = "ske-signature-$sigMode" }
+            else if (kind == 19) { skeDelta = diffPickInt(r, [-1, 1, 2]); tag = "ske-length" }
+            else if (kind == 20) { skeMode = 1 + r.below(2); tag = "ske-omitted-twice-$skeMode" }
+            else if (kind == 21) { skeTrailing = diffBytes(r, 1 + r.below(3)); tag = "ske-trailing" }
+            else if (kind == 22) { doneBody = diffBytes(r, 1 + r.below(3)); tag = "done-body" }
+            else if (kind == 23) { doneMode = 1 + r.below(2); tag = "done-omitted-twice-$doneMode" }
+            else if (kind == 24) { lengthDelta = f12Pick(r, ["SH", "CT", "SKE", "SHD"]) + ":${diffPickInt(r, [-1, 1, 2, 3, 70000])}"; tag = "header-length" }
+            else if (kind == 25) { typeChange = f12Pick(r, ["SH", "CT", "SKE", "SHD"]) + ":${diffPickInt(r, [0, 1, 2, 4, 11, 12, 13, 14, 15, 16, 20, 22, 99, 255])}"; tag = "header-type" }
+            else if (kind == 26) { packing = 1 + r.below(3); tag = "packing-$packing" }
+            else if (kind == 27) { before = f12Pick(r, ["alert-warning", "alert-fatal", "alert-warning-other", "ccs", "ccs-bad", "app", "empty-handshake", "hello-request", "alert-short"]); beforeAt = r.below(3); tag = "before-$before-$beforeAt" }
+            else if (kind == 28) { recordVersion = diffPickInt(r, [768, 769, 770, 772, 0]); tag = "record-version-$recordVersion" }
+            else if (kind == 29) { ccsMode = 1 + r.below(4); tag = "server-ccs-$ccsMode" }
+            else if (kind == 30) { finMode = 1 + r.below(7); tag = "server-fin-$finMode" }
+            else if (kind == 31) { sequenceSkip = true; tag = "server-fin-sequence" }
+            else { after = 1 + r.below(10); tag = "after-$after" }
+            tags = tags + (if (k > 0) "+" else "") + tag
+        }
+        // The flight: each message from the transcript so far.
+        var transcript = helloMessage
+        val serverHelloBody = tlsU16(version) + serverRandom + cryptoByteString([sessionId.size]) + sessionId + tlsU16(suiteField) + tlsU8(compression)
+        var shExtensions = f12Ext(65281, renegotiation) + (if (emsOn) f12Ext(23, "") else "") + helloExtras
+        var serverHello = f12Header(2, serverHelloBody + diffU16(shExtensions.size) + shExtensions + helloTrailing, 0)
+        // Certificate.
+        var chain: array<string> = []
+        for (der in identity.chain) chain.append(der)
+        if (chainMode == 1) chain = []
+        if (chainMode == 2) chain = [diffBytes(r, 200)]
+        if (chainMode == 3) chain = [chain[0], chain[0]]
+        if (chainMode == 4) chain = [chain[0].slice(0, chain[0].size / 2)]
+        var entries = ""
+        for (der in chain) entries = entries + cryptoByteString([((der.size + certEntryDelta) >> 16) & 255, ((der.size + certEntryDelta) >> 8) & 255, (der.size + certEntryDelta) & 255]) + der
+        val listSize = entries.size + certListDelta
+        var certificate = f12Header(11, cryptoByteString([(listSize >> 16) & 255, (listSize >> 8) & 255, listSize & 255]) + entries, 0)
+        // ServerKeyExchange.
+        var point = pair.publicKey
+        if (pointMode == 1) point = ""
+        if (pointMode == 2) point = point.slice(0, point.size - 1)
+        if (pointMode == 3) point = point + "\x00"
+        if (pointMode == 4) point = point.slice(0, 1) + diffBytes(r, point.size - 1)
+        if (pointMode == 5) point = "\x02" + point.slice(1, 33)
+        if (pointMode == 6) point = "\x04" + "\x00".repeat(64)
+        if (pointMode == 7) point = "\x00"
+        if (pointMode == 8) point = "\x03" + point.slice(1, 33)
+        val params = tlsU8(curveType) + tlsU16(group) + cryptoByteString([point.size]) + point
+        var signature = identity.sign(0x0403, tls12SignedParams(hello.random, serverRandom, tls12EcdheParams(23, pair.publicKey)))
+        if (sigMode == 1 && signature.size > 1) signature = signature.slice(0, signature.size - 1)
+        if (sigMode == 2) signature = signature + "\x00"
+        if (sigMode == 3 && signature.size > 10) signature = signature.slice(0, 5) + cryptoByteString([signature[5] ^ 1]) + signature.slice(6, signature.size)
+        if (sigMode == 4) signature = ""
+        if (sigMode == 5) signature = diffBytes(r, signature.size)
+        var ske = f12Header(12, params + diffU16(scheme) + diffU16(signature.size) + signature + skeTrailing, skeDelta)
+        var done = f12Header(14, doneBody, 0)
+        var status = f12Header(22, "\x01\x00\x00\x03abc", 0)
+        var request = if (requestMessage == 2) f12Header(13, diffBytes(r, 6), 0) else tls12BuildCertificateRequest([0x0403])
+        val messages: array<string> = []
+        val names: array<string> = []
+        messages.append(serverHello); names.append("SH")
+        messages.append(certificate); names.append("CT")
+        if (statusMessage) { messages.append(status); names.append("ST") }
+        if (skeMode != 1) { messages.append(ske); names.append("SKE") }
+        if (skeMode == 2) { messages.append(ske); names.append("SKE") }
+        if (requestMessage > 0) { messages.append(request); names.append("CR") }
+        if (doneMode != 1) { messages.append(done); names.append("SHD") }
+        if (doneMode == 2) { messages.append(done); names.append("SHD") }
+        for (k in 0 until messages.size) {
+            if (lengthDelta != "") {
+                val cut = lengthDelta.indexOf(":")
+                if (lengthDelta.slice(0, cut) == names[k] && messages[k].size >= 4) {
+                    messages[k] = f12Header(messages[k][0], messages[k].slice(4, messages[k].size), lengthDelta.slice(cut + 1, lengthDelta.size).parseInt() ?? 0)
+                }
+            }
+            if (typeChange != "") {
+                val cut = typeChange.indexOf(":")
+                if (typeChange.slice(0, cut) == names[k] && messages[k].size >= 4) {
+                    messages[k] = cryptoByteString([typeChange.slice(cut + 1, typeChange.size).parseInt() ?? 0]) + messages[k].slice(1, messages[k].size)
+                }
+            }
+            transcript = transcript + messages[k]
+        }
+        // The wire: records.
+        var all = ""
+        for (message in messages) all = all + message
+        val pieces: array<string> = []
+        if (packing == 1) for (message in messages) pieces.append(message)
+        else if (packing == 0) pieces.append(all)
+        else for (piece in f12Split(r, all, packing)) pieces.append(piece)
+        var wire = ""
+        var index = 0
+        for (piece in pieces) {
+            if (before != "" && index == beforeAt) {
+                if (before == "alert-warning") wire = wire + tlsPlaintextRecord(21, 771, "\x01\x00")
+                else if (before == "alert-fatal") wire = wire + tlsPlaintextRecord(21, 771, "\x02\x28")
+                else if (before == "alert-warning-other") wire = wire + tlsPlaintextRecord(21, 771, "\x01\x28")
+                else if (before == "alert-short") wire = wire + tlsPlaintextRecord(21, 771, "\x01")
+                else if (before == "ccs") wire = wire + tlsPlaintextRecord(20, 771, "\x01")
+                else if (before == "ccs-bad") wire = wire + tlsPlaintextRecord(20, 771, "\x02")
+                else if (before == "app") wire = wire + tlsPlaintextRecord(23, 771, "hello")
+                else if (before == "empty-handshake") wire = wire + tlsPlaintextRecord(22, 771, "")
+                else if (before == "hello-request") wire = wire + tlsPlaintextRecord(22, 771, f12Header(0, "", 0))
+            }
+            wire = wire + tlsPlaintextRecord(22, 771, piece)
+            index = index + 1
+        }
+        if (recordVersion != 771) wire = wire.slice(0, 1) + diffU16(recordVersion) + wire.slice(3, wire.size)
+        connection.write(wire)
+        // The client's flight: ClientKeyExchange (plaintext), change_cipher_spec, the encrypted Finished.
+        var buffer = ""
+        var verdict = ""
+        var clientKey = ""
+        var cke = ""
+        var protectionRead = Tls12Protection(TLS_AEAD_AES_128_GCM, "", "", 0)
+        var master = ""
+        var keys = Tls12Keys("", "", "", "")
+        var sawCcs = false
+        var clientFinished = ""
+        var waits = 0
+        var pendingHandshake = ""
+        while (verdict == "" && waits < 6) {
+            waits = waits + 1
+            val incoming = connection.readWithTimeoutResult(65536, if (waits == 1) 1500 else 250)
+            if (!incoming.hasData()) {
+                verdict = if (incoming.timedOut()) "W" else "C"
+                break
+            }
+            buffer = buffer + incoming.bytes
+            while (buffer.size >= 5 && verdict == "") {
+                val length = diffRd16(buffer, 3)
+                if (buffer.size < 5 + length) break
+                val record = buffer.slice(0, 5 + length)
+                buffer = buffer.slice(5 + length, buffer.size)
+                if (record[0] == 21) {
+                    verdict = if (length >= 2) "A${record[6]}" else "A?"
+                } else if (record[0] == 22 && !sawCcs) {
+                    pendingHandshake = pendingHandshake + record.slice(5, record.size)
+                    while (pendingHandshake.size >= 4 && 4 + (pendingHandshake[1] * 65536 + pendingHandshake[2] * 256 + pendingHandshake[3]) <= pendingHandshake.size && cke == "") {
+                        val size = 4 + (pendingHandshake[1] * 65536 + pendingHandshake[2] * 256 + pendingHandshake[3])
+                        val message = pendingHandshake.slice(0, size)
+                        pendingHandshake = pendingHandshake.slice(size, pendingHandshake.size)
+                        transcript = transcript + message
+                        if (message[0] == 16) cke = message
+                    }
+                } else if (record[0] == 20) {
+                    sawCcs = true
+                    if (cke == "") {
+                        verdict = "noCKE"
+                    } else {
+                        val point = tls12ParseClientKeyExchange(cke.slice(4, cke.size))
+                        val shared = tlsAgree(pair, point)
+                        if (!shared.ok) { verdict = "badCKE"; break }
+                        master = if (emsOn) tls12MasterSecret(hash, shared.bytes, tlsHashOf(hash, transcript)) else tls12Prf(hash, shared.bytes, "master secret", hello.random + serverRandom, 48)
+                        keys = tls12DeriveKeys(suite, master, serverRandom, hello.random)
+                        protectionRead = tls12Protection(suite, keys.clientKey, keys.clientIv)
+                    }
+                } else if (record[0] == 22 && sawCcs) {
+                    val opened = tls12Open(protectionRead, record)
+                    if (!opened.ok) verdict = "BAD"
+                    else if (opened.type == 22 && opened.content.size >= 4 && opened.content[0] == 20) {
+                        clientFinished = opened.content
+                        verdict = if (opened.content.slice(4, opened.content.size) == tls12FinishedData(hash, master, "client finished", tlsHashOf(hash, transcript))) "F" else "Fbad"
+                    } else verdict = "T${opened.type}"
+                } else verdict = "?"
+            }
+        }
+        var reaction = verdict
+        if (verdict == "F") {
+            transcript = transcript + clientFinished
+            var protectionWrite = tls12Protection(suite, keys.serverKey, keys.serverIv)
+            if (sequenceSkip) protectionWrite.sequence = protectionWrite.sequence + 1
+            var verify = tls12FinishedData(hash, master, "server finished", tlsHashOf(hash, transcript))
+            if (finMode == 1 && verify.size > 1) verify = verify.slice(0, verify.size - 1)
+            if (finMode == 2) verify = verify + "\x00"
+            if (finMode == 3) verify = cryptoByteString([verify[0] ^ 1]) + verify.slice(1, verify.size)
+            if (finMode == 4) verify = ""
+            if (finMode == 5) verify = diffBytes(r, 12)
+            val finished = f12Header(20, verify, 0)
+            var out = ""
+            if (ccsMode != 1) out = out + tlsPlaintextRecord(20, 771, "\x01")
+            if (ccsMode == 2) out = out + tlsPlaintextRecord(20, 771, "\x01")
+            if (ccsMode == 3) out = tlsPlaintextRecord(20, 771, "\x02")
+            if (ccsMode == 4) out = tlsPlaintextRecord(20, 771, "\x01\x01")
+            if (finMode == 6) out = out + tlsPlaintextRecord(22, 771, finished)
+            else {
+                val sealed = tls12Protect(protectionWrite, 22, finished)
+                if (sealed.ok) out = out + sealed.bytes
+            }
+            if (finMode == 7) {
+                val sealed = tls12Protect(protectionWrite, 22, finished)
+                if (sealed.ok) out = out + sealed.bytes
+            }
+            if (after == 1) { val s = tls12Protect(protectionWrite, 22, f12Header(0, "", 0)); if (s.ok) out = out + s.bytes }
+            if (after == 2) { val s = tls12Protect(protectionWrite, 22, f12Header(4, "\x00\x00\x1c\x20\x00\x04tick", 0)); if (s.ok) out = out + s.bytes }
+            if (after == 3) { val s = tls12Protect(protectionWrite, 22, f12Header(99, "x", 0)); if (s.ok) out = out + s.bytes }
+            if (after == 4) { val s = tls12Protect(protectionWrite, 23, "hello"); if (s.ok) out = out + s.bytes }
+            if (after == 5) { val s = tls12Protect(protectionWrite, 21, "\x01\x00"); if (s.ok) out = out + s.bytes }
+            if (after == 6) { val s = tls12Protect(protectionWrite, 21, "\x01\x28"); if (s.ok) out = out + s.bytes }
+            if (after == 7) { val s = tls12Protect(protectionWrite, 22, f12Header(20, diffBytes(r, 12), 0)); if (s.ok) out = out + s.bytes }
+            if (after == 8) { val s = tls12Protect(protectionWrite, 22, ""); if (s.ok) out = out + s.bytes }
+            if (after == 9) { val s = tls12Protect(protectionWrite, 20, "\x01"); if (s.ok) out = out + s.bytes }
+            if (after == 10) { val s = tls12Protect(protectionWrite, 22, f12Header(1, "x", 0)); if (s.ok) out = out + s.bytes }
+            connection.write(out)
+            val second = f12Reaction(connection, protectionRead, false, "", 250)
+            reaction = "F/" + second
+            if (after > 0) tags = tags + "[after-$after]"
+        }
+        println("CASE $i $tags $reaction")
+        connection.close()
+    }
+    0
+}

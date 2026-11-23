@@ -5,10 +5,12 @@
 // type / empty handshake record / a record with no content type), the Finished cut over records or padded, a record with a flipped byte, a wrong sequence number, and,
 // after a valid Finished, post-handshake messages under the application keys (KeyUpdate with every value, a NewSessionTicket, CertificateRequest, Certificate, unknown
 // types, a Finished again, alerts, change_cipher_spec, empty and large application data, a message cut over records).
+// With a client certificate the servers require one: its context, chain (empty, twice, garbage, cut, entry extensions, list length), the CertificateVerify scheme and
+// signature (wrong, empty, extended, cut, over the server context string), either message left out or sent in the other order.
 // What the server does is read off the wire by decrypting its records: A<n> (an alert, description n: it refused), C (it closed), ok (nothing refused within the
 // window, after a probe of valid application data). One line per connection, "CASE i tags class", for tools/tls-diff to join across the servers.
 //
-//   cflight PORT SEED COUNT [DUMP_INDEX]
+//   cflight PORT SEED COUNT [CLIENT_CERT.PEM CLIENT_KEY.PEM]   (with a client certificate: the server is asked to require one, and Certificate, CertificateVerify are changed too)
 import "abla/io"
 import "abla/text"
 import "abla/array"
@@ -22,6 +24,8 @@ import "abla/tls/pure/handshake"
 import "abla/tls/pure/keysched"
 import "abla/tls/pure/record"
 import "abla/tls/pure/client"
+import "abla/tls/pure"
+import "abla/sys/linux"
 import "../fuzz/prng.ab"
 import "./common.ab"
 
@@ -92,6 +96,8 @@ fun main: int {
     val port = processArgument(0).parseInt() ?? 0
     val seed = processArgument(1).parseInt() ?? 1
     val count = processArgument(2).parseInt() ?? 1
+    var identity: TlsIdentity? = null
+    if (processArgumentCount() > 4) identity = tlsClientIdentityFromPem(linuxReadFile(processArgument(3), 65536), linuxReadFile(processArgument(4), 65536))
     val hash = HKDF_SHA256
     for (i in 0 until count) {
         var r = prngSeeded(seed * 100003 + i)
@@ -115,6 +121,8 @@ fun main: int {
         var secrets = TlsHandshakeSecrets("", "", "")
         var pending = ""
         var finishedSeen = false
+        var requested = false
+        var requestContext = ""
         var tries = 0
         var failed = ""
         while (!finishedSeen && failed == "" && tries < 20) {
@@ -162,6 +170,10 @@ fun main: int {
                         val size = 4 + (pending[1] * 65536 + pending[2] * 256 + pending[3])
                         val message = pending.slice(0, size)
                         pending = pending.slice(size, pending.size)
+                        if (message[0] == 13) {
+                            requested = true
+                            requestContext = if (message.size > 4) message.slice(5, 5 + message[4]) else ""
+                        }
                         if (message[0] == 20) {
                             finishedSeen = true
                             break
@@ -188,7 +200,7 @@ fun main: int {
         val application = tlsDeriveApplicationSecrets(hash, secrets.handshakeSecret, transcript.hash(hash))
         var applicationRead = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, application.serverTraffic, 16), tlsTrafficIv(hash, application.serverTraffic))
         var applicationWrite = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, application.clientTraffic, 16), tlsTrafficIv(hash, application.clientTraffic))
-        val verify = tlsFinishedVerifyData(hash, secrets.clientTraffic, transcript.hash(hash))
+        var verify = tlsFinishedVerifyData(hash, secrets.clientTraffic, transcript.hash(hash))
         // The mutation.
         var tags = ""
         var finishedMode = 0
@@ -203,10 +215,11 @@ fun main: int {
         var typeChange = -1
         var lengthDelta = 0
         var trailing = ""
+        var authMode = 0
         var legacyVersion = 771
         val rounds = 1 + (if (r.below(5) == 0) 1 else 0)
         for (k in 0 until rounds) {
-            val kind = r.below(28)
+            val kind = r.below(if (identity != null && requested) 44 else 28)
             var tag = "?"
             if (kind == 0) { finishedMode = 1 + r.below(5); tag = "fin-$finishedMode" }
             else if (kind == 1) { omit = true; tag = "fin-omitted" }
@@ -222,6 +235,7 @@ fun main: int {
             else if (kind == 11) { sequenceSkip = true; tag = "sequence-skip" }
             else if (kind == 12) { trailing = diffBytes(r, 1 + r.below(3)); tag = "fin-trailing" }
             else if (kind == 13) { legacyVersion = diffPickInt(r, [768, 769, 770, 772, 0, 65535]); tag = "record-version-$legacyVersion" }
+            else if (kind >= 28) { authMode = kind - 27; tag = "auth-$authMode" }
             else { postMode = 1 + r.below(34); tag = "post-$postMode" }
             tags = tags + (if (k > 0) "+" else "") + tag
         }
@@ -258,6 +272,40 @@ fun main: int {
                 if (sealed.ok) wire = wire + sealed.bytes
             }
         }
+        // With a client identity the server asked for a certificate: Certificate, CertificateVerify, then the Finished over all of them (in the order sent).
+        var authData = ""
+        if (identity != null && requested) {
+            val me = identity ?? tlsClientIdentityFromPem("", "")
+            var context = requestContext
+            if (authMode == 1) context = diffBytes(r, 1 + r.below(4))
+            var chain: array<string> = []
+            for (der in me.chain) chain.append(der)
+            if (authMode == 2) chain = []
+            if (authMode == 3) chain = [chain[0], chain[0]]
+            if (authMode == 4) chain = [diffBytes(r, 300)]
+            if (authMode == 5) chain = [chain[0].slice(0, chain[0].size / 2)]
+            var entries = ""
+            for (der in chain) entries = entries + cryptoByteString([(der.size >> 16) & 255, (der.size >> 8) & 255, der.size & 255]) + der + (if (authMode == 6) diffU16(4) + diffU16(4660) + diffU16(0) else diffU16(0))
+            val listSize = entries.size + (if (authMode == 7) diffPickInt(r, [-1, 1, 3]) else 0)
+            var certificateMessage = cfHeader(11, cryptoByteString([context.size]) + context + cryptoByteString([(listSize >> 16) & 255, (listSize >> 8) & 255, listSize & 255]) + entries, 0)
+            if (authMode == 8) certificateMessage = ""
+            // The signature covers the transcript through the Certificate (through the server's Finished when the Certificate comes after).
+            val covered = if (authMode == 16) transcript.hash(hash) else tlsHashOf(hash, transcript.messages + certificateMessage)
+            var scheme = 0x0403
+            if (authMode == 9) scheme = diffPickInt(r, [0x0804, 0x0807, 0x0401, 0x0503, 0x0000, 0xffff])
+            var content = tlsCertificateVerifyContent(false, covered)
+            if (authMode == 10) content = tlsCertificateVerifyContent(true, covered)
+            var signature = me.sign(0x0403, content)
+            if (authMode == 11 && signature.size > 10) signature = signature.slice(0, 5) + cryptoByteString([signature[5] ^ 1]) + signature.slice(6, signature.size)
+            if (authMode == 12) signature = ""
+            if (authMode == 13) signature = signature + "\x00"
+            if (authMode == 14 && signature.size > 1) signature = signature.slice(0, signature.size - 1)
+            var verifyMessage = cfHeader(15, diffU16(scheme) + diffU16(signature.size) + signature, 0)
+            if (authMode == 15) verifyMessage = ""
+            authData = if (authMode == 16) verifyMessage + certificateMessage else certificateMessage + verifyMessage
+            transcript.add(authData)
+            verify = tlsFinishedVerifyData(hash, secrets.clientTraffic, transcript.hash(hash))
+        }
         var finishedBody = verify
         if (finishedMode == 1 && finishedBody.size > 1) finishedBody = finishedBody.slice(0, finishedBody.size - 1)
         if (finishedMode == 2) finishedBody = finishedBody + "\x00"
@@ -266,7 +314,7 @@ fun main: int {
         if (finishedMode == 5) finishedBody = diffBytes(r, 32)
         var finished = cfHeader(20, finishedBody, lengthDelta)
         if (typeChange >= 0) finished = cryptoByteString([typeChange]) + finished.slice(1, finished.size)
-        var data = if (omit) "" else finished
+        var data = authData + (if (omit) "" else finished)
         if (duplicate) data = data + finished
         data = data + trailing
         if (sequenceSkip) write.sequence = write.sequence + 1

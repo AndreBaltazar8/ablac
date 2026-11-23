@@ -12,13 +12,28 @@ if [[ ! -f $cert ]]; then
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$key" -out "$cert" -subj /CN=localhost -addext subjectAltName=DNS:localhost -days 2 2> /dev/null
 fi
 base=${CFLIGHT_PORT:-29500}
+auth=${CFLIGHT_AUTH:-}   # CFLIGHT_AUTH=1: the servers require a client certificate (a CA and a client certificate are made in OUTDIR)
+openssl_auth=()
+ours_auth=()
+go_auth=()
+client_auth=()
+if [[ -n $auth ]]; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$out/ca-k.pem" -out "$out/ca.pem" -subj /CN=clientca -days 2 2> /dev/null
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$out/cl-k.pem" -out "$out/cl.csr" -subj /CN=client 2> /dev/null
+    printf "keyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n" > "$out/cl.ext"
+    openssl x509 -req -in "$out/cl.csr" -CA "$out/ca.pem" -CAkey "$out/ca-k.pem" -CAcreateserial -out "$out/cl.pem" -days 2 -extfile "$out/cl.ext" 2> /dev/null
+    openssl_auth=(-Verify 1 -CAfile "$out/ca.pem")
+    ours_auth=("$out/ca.pem")
+    go_auth=("$out/ca.pem")
+    client_auth=("$out/cl.pem" "$out/cl-k.pem")
+fi
 pids=()
 trap 'for p in "${pids[@]}"; do kill "$p" 2> /dev/null || true; done' EXIT
-"$programs/server" "$cert" "$key" "$base" hold > "$out/ours.log" 2>&1 &
+"$programs/server" "$cert" "$key" "$base" hold "${ours_auth[@]}" > "$out/ours.log" 2>&1 &
 pids+=("$!")
-(sleep 3000 | openssl s_server -accept 127.0.0.1:$((base + 1)) -cert "$cert" -key "$key" -quiet -www) > "$out/openssl.log" 2>&1 &
+(sleep 3000 | openssl s_server -accept 127.0.0.1:$((base + 1)) -cert "$cert" -key "$key" -quiet -www "${openssl_auth[@]}") > "$out/openssl.log" 2>&1 &
 pids+=("$!")
-"$programs/peer" server $((base + 2)) "$cert" "$key" hold > "$out/go.log" 2>&1 &
+"$programs/peer" server $((base + 2)) "$cert" "$key" hold "${go_auth[@]}" > "$out/go.log" 2>&1 &
 pids+=("$!")
 for ((w = 0; w < 100; w++)); do
     grep -q listening "$out/ours.log" 2> /dev/null && grep -q listening "$out/go.log" 2> /dev/null && break
@@ -26,7 +41,7 @@ for ((w = 0; w < 100; w++)); do
 done
 sleep 1
 for index in 0 1 2; do
-    "$programs/cflight" $((base + index)) "$seed" "$count" > "$out/cf-$index.out" 2>&1 &
+    "$programs/cflight" $((base + index)) "$seed" "$count" "${client_auth[@]}" > "$out/cf-$index.out" 2>&1 &
     pids+=("$!")
 done
 wait "${pids[@]:3}" || true

@@ -12,10 +12,18 @@ if [[ ! -f $cert ]]; then
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$key" -out "$cert" -subj /CN=localhost -addext subjectAltName=DNS:localhost -days 2 2> /dev/null
 fi
 base=${FLIGHT_PORT:-29000}
+server_program=flight-server
+client_mode=flight
+openssl_version=-tls1_3
+if [[ -n ${FLIGHT_TLS12:-} ]]; then
+    server_program=flight12-server
+    client_mode=flight12
+    openssl_version=-tls1_2
+fi
 pids=()
 trap 'for p in "${pids[@]}"; do kill "$p" 2> /dev/null || true; done' EXIT
 for index in 0 1 2; do
-    "$programs/flight-server" $((base + index)) "$seed" "$count" "$cert" "$key" > "$out/fs-$index.out" 2>&1 &
+    "$programs/$server_program" $((base + index)) "$seed" "$count" "$cert" "$key" > "$out/fs-$index.out" 2>&1 &
     pids+=("$!")
 done
 for ((w = 0; w < 100; w++)); do
@@ -24,9 +32,9 @@ for ((w = 0; w < 100; w++)); do
 done
 "$programs/flight-client" "$base" "$count" "$cert" > /dev/null 2>&1 &
 ours=$!
-"$programs/peer" flight $((base + 2)) "$count" > /dev/null 2>&1 &
+"$programs/peer" $client_mode $((base + 2)) "$count" > /dev/null 2>&1 &
 go_client=$!
-(for ((i = 0; i < count; i++)); do timeout 1 openssl s_client -connect 127.0.0.1:$((base + 1)) -tls1_3 -ign_eof < /dev/null > /dev/null 2>&1 || true; done) > /dev/null 2>&1 &
+(for ((i = 0; i < count; i++)); do timeout 1 openssl s_client -connect 127.0.0.1:$((base + 1)) $openssl_version -ign_eof < /dev/null > /dev/null 2>&1 || true; done) > /dev/null 2>&1 &
 ossl=$!
 wait "$ours" "$go_client" "$ossl" || true
 sleep 1
