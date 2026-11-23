@@ -21,7 +21,7 @@ args=("$compiler" "$root" "$out/package.tar.gz")
 report=$(tools/package-linux-static-toolchain.sh "${args[@]}" 2> "$out/package.log") || { tail -5 "$out/package.log" >&2; fail "the package did not build"; }
 tar -C "$out/unpacked" -xzf "$out/package.tar.gz"
 pkg=$out/unpacked/${ABLA_PACKAGE_NAME:-abla-toolchain-static-x86_64-linux}
-for part in bin/ablac libexec/ablac.bin libexec/abla-install-xtensa-native share/abla/stdlib share/abla/runtime lib/clang/23/lib/linux/libclang_rt.builtins-x86_64.a share/licenses/abla.txt; do
+for part in bin/ablac libexec/ablac.bin libexec/abla-install-xtensa-native share/abla/stdlib share/abla/stdlib-discovery-v1 share/abla/runtime lib/clang/23/lib/linux/libclang_rt.builtins-x86_64.a share/licenses/abla.txt; do
     [[ -e $pkg/$part ]] || fail "the package lacks $part"
 done
 # no shared library, no libLLVM, no tool of an LLVM install
@@ -33,12 +33,13 @@ for executable in "$pkg/libexec/ablac.bin" "$pkg/libexec/abla-install-xtensa-nat
 done
 # an empty PATH: the launcher and the compiler run on their own
 hello() { # output name, cache name
-    env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/$2" "$PWD/$pkg/bin/ablac" build tests/cases/libc-imports/hello.ab -o "$out/$1" \
+    env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/$2" ABLA_COMPILER_MEMORY_TRACE=1 "$PWD/$pkg/bin/ablac" build tests/cases/libc-imports/hello.ab -o "$out/$1" \
         > "$out/$1.log" 2>&1 || { tail -5 "$out/$1.log" >&2; fail "hello did not build with an empty PATH"; }
 }
 env -i PATH="$PWD/$out/empty" "$PWD/$pkg/bin/ablac" --version > "$out/version.txt" 2>&1 || fail "ablac --version failed with an empty PATH"
 grep "^ablac " "$out/version.txt" > /dev/null || fail "ablac --version printed: $(cat "$out/version.txt")"
 hello hello1 cache1
+grep -Fq 'discovery.shipped-hit:' "$out/hello1.log" || fail 'hello did not use the packaged stdlib records'
 [[ $("$out/hello1") == hello ]] || fail "hello did not print hello"
 hello hello2 cache2
 cmp -s "$out/hello1" "$out/hello2" || fail "two builds of hello differ"

@@ -610,6 +610,56 @@ fun bootstrapModuleDiscovery(
     )
 }
 
+fun bootstrapDiscoveryRecordPath(
+    directory: string, sourceSize: int, first: int, second: int, sourceIdentity: string
+): string {
+    val identity = bootstrapDiscoveryHashes(sourceIdentity)
+    "$directory/$sourceSize-$first-$second-${identity.first}-${identity.second}.discovery"
+}
+
+fun bootstrapReadDiscoveryRecord(
+    path: string, source: string, identity: string, compilerIdentity: string,
+    relocatedIdentity: string = ""
+): BootstrapDiscoveryDecoded {
+    val info = Path(path).info()
+    if (!info.isFile() || info.size <= 0 || info.size > BOOTSTRAP_DISCOVERY_CODEC_LIMIT) {
+        return bootstrapDiscoveryInvalid()
+    }
+    // Bound the read if the record is replaced or grows after the stat.
+    val record = linuxReadFile(path, info.size + 1)
+    bootstrapDiscoveryDecode(source, identity, record, compilerIdentity, relocatedIdentity)
+}
+
+// Use only the raw discovery parser. Provider execution and staged parsing
+// still happen in the importer with the same inputs and paths as before.
+fun bootstrapSeedDiscoveryFiles(
+    root: Path, relative: string, directory: string, compilerIdentity: string
+): bool {
+    val path = if (relative == "") root else root.child(relative)
+    if (path.isSymbolicLink()) return true
+    val info = path.info()
+    if (info.isDirectory()) {
+        for (entry in path.entries()) {
+            val child = if (relative == "") entry.name() else "$relative/${entry.name()}"
+            if (!bootstrapSeedDiscoveryFiles(root, child, directory, compilerIdentity)) return false
+        }
+        return true
+    }
+    if (!info.isFile() || path.extension() != "ab" || info.size <= 0 ||
+        info.size > 4194304) return true
+    val source = linuxReadFile(path.text, info.size + 1)
+    if (source.size != info.size || bootstrapMayUseRawProvider(source) ||
+        bootstrapScanImports(source).errors != 0) return true
+    val parsed = bootstrapModuleDiscovery(source, relative)
+    if (!bootstrapDiscoveryEligible(parsed)) return true
+    val record = bootstrapDiscoveryRecord(source, relative, parsed, compilerIdentity)
+    if (record == "") return true
+    val first = bootstrapModuleFingerprint(source, 17, 257, 1000000007)
+    val second = bootstrapModuleFingerprint(source, 97, 263, 1000000009)
+    val output = bootstrapDiscoveryRecordPath(directory, source.size, first, second, relative)
+    Path(output).writeTextAtomic(record)
+}
+
 // A snapshot is the reusable, module-local part of graph loading. Keeping the
 // source and import scan together is important: publishing a new source with
 // stale dependency edges would make incremental invalidation unsound.
@@ -749,6 +799,8 @@ class BootstrapModuleState(
     // Explicit per-build policy; ordinary parser/module APIs stay cache-free.
     var discoveryDirectory: string = "",
     var discoveryIdentity: string = "",
+    var shippedDiscoveryDirectory: string = "",
+    var shippedDiscoveryPrefix: string = "",
     var overlays: array<BootstrapModuleOverlay> = [],
     val overlaySnapshots: Map<string, bool> = Map(),
     var syntaxOnly: bool = false,
@@ -806,18 +858,27 @@ class BootstrapModuleState(
         first: int, second: int, mayUseRawProvider: bool
     ): BootstrapParseResult {
         var recordPath = ""
-        if (this.discoveryDirectory != "" && source.size <= 4194304 && importErrors == 0 &&
-            !mayUseRawProvider) {
-            val identity = bootstrapDiscoveryHashes(modulePath)
-            recordPath =
-                "${this.discoveryDirectory}/${source.size}-$first-$second-${identity.first}-${identity.second}.discovery"
-            val info = Path(recordPath).info()
-            if (info.isFile() && info.size > 0 && info.size <= BOOTSTRAP_DISCOVERY_CODEC_LIMIT) {
-                // Read at most the observed size plus one byte. A growing or
-                // replaced cache file must not trigger an unbounded allocation.
-                val record = linuxReadFile(recordPath, info.size + 1)
-                val decoded = bootstrapDiscoveryDecode(
-                    source, modulePath, record, this.discoveryIdentity
+        if (source.size <= 4194304 && importErrors == 0 && !mayUseRawProvider) {
+            if (this.shippedDiscoveryDirectory != "" &&
+                modulePath.startsWith(this.shippedDiscoveryPrefix)) {
+                val relative = modulePath.slice(this.shippedDiscoveryPrefix.size, modulePath.size)
+                val shipped = bootstrapDiscoveryRecordPath(
+                    this.shippedDiscoveryDirectory, source.size, first, second, relative
+                )
+                val decoded = bootstrapReadDiscoveryRecord(
+                    shipped, source, relative, this.discoveryIdentity, modulePath
+                )
+                if (decoded.valid && bootstrapDiscoveryEligible(decoded.parsed)) {
+                    bootstrapFrontendTraceMemory("discovery.shipped-hit:$modulePath")
+                    return decoded.parsed
+                }
+            }
+            if (this.discoveryDirectory != "") {
+                recordPath = bootstrapDiscoveryRecordPath(
+                    this.discoveryDirectory, source.size, first, second, modulePath
+                )
+                val decoded = bootstrapReadDiscoveryRecord(
+                    recordPath, source, modulePath, this.discoveryIdentity
                 )
                 if (decoded.valid && bootstrapDiscoveryEligible(decoded.parsed)) {
                     bootstrapFrontendTraceMemory("discovery.hit:$modulePath")

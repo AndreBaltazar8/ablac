@@ -118,6 +118,8 @@ chmod 0755 "$bundle/libexec/abla-install-xtensa-native"
 ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa"
 
 mkdir -p "$(dirname "$output")"
+"$bundle/bin/ablac" --seed-stdlib-discovery
+
 tar -C "$working" -czf "$output" "$name"
 (
     cd "$(dirname "$output")"

@@ -178,6 +178,8 @@ done
 "$(dirname -- "${BASH_SOURCE[0]}")/package-xtensa-installer.sh" "$bundle"
 ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa"
 
+"$bundle/bin/ablac" --seed-stdlib-discovery
+
 mkdir -p "$(dirname "$output")"
 tar -C "$working" -czf "$output" abla-toolchain-x86_64-linux
 (

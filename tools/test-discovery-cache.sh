@@ -117,7 +117,53 @@ build --no-cache > "$work/invalid-direct.out" 2> "$work/invalid-direct.err"; dir
 set -e
 [[ $cached_status -ne 0 && $cached_status -eq $direct_status ]] || fail 'invalid parse status'
 cmp "$work/invalid.err" "$work/invalid-direct.err"
+
+# Generate with the package's compiler and move its sysroot before first use.
+# Changing an exported default changes the discovery summary as well as the
+# eventual program. Keep the bytes' length and the file's mtime the same.
+mkdir -p "$work/package/stdlib/abla/discovery-fixture"
+cp -a stdlib/. "$work/package/stdlib/"
+cp -a runtime "$work/package/"
+printf '%s\n' 'fun answer(value: int = 42): int = value' \
+    > "$work/package/stdlib/abla/discovery-fixture/entry.ab"
+env -u ABLA_STDLIB ABLA_SYSROOT="$work/package" "$compiler" --seed-stdlib-discovery
+mv "$work/package" "$work/relocated"
+cat > "$work/main.ab" <<'AB'
+import "abla/discovery-fixture"
+fun main: int = answer()
+AB
+module="$work/relocated/stdlib/abla/discovery-fixture/entry.ab"
+relocated_build() {
+    env -u ABLA_STDLIB ABLA_SYSROOT="$work/relocated" ABLA_CACHE_DIR="$work/$1-cache" \
+        ABLA_COMPILER_MEMORY_TRACE=1 "$compiler" build "$work/main.ab" -o "$work/program" --o1 "${@:2}"
+}
+relocated_build seeded > "$work/seeded.out" 2> "$work/seeded.err"
+grep -Fq "discovery.shipped-hit:$module" "$work/seeded.err" || fail 'no relocated summary hit'
+cp "$work/program" "$work/seeded-program"
+cp "$work/program.ll" "$work/seeded.ll"
+mv "$work/relocated/stdlib-discovery-v1" "$work/shipped"
+relocated_build unseeded > "$work/unseeded.out" 2> "$work/unseeded.err"
+cmp "$work/program" "$work/seeded-program"
+cmp "$work/program.ll" "$work/seeded.ll"
+mv "$work/shipped" "$work/relocated/stdlib-discovery-v1"
+relocated_build seeded-direct --no-cache > "$work/seeded-direct.out" 2> "$work/seeded-direct.err"
+if grep -Fq 'discovery.shipped-hit:' "$work/seeded-direct.err"; then fail 'no-cache hit a shipped record'; fi
+cmp "$work/program.ll" "$work/seeded.ll"
+touch -r "$module" "$work/module.stamp"
+size=$(wc -c < "$module")
+printf '%s\n' 'fun answer(value: int = 43): int = value' > "$module"
+touch -r "$work/module.stamp" "$module"
+[[ $(wc -c < "$module") -eq $size && $(stat -c %y "$module") == "$(stat -c %y "$work/module.stamp")" ]] ||
+    fail 'the packaged stdlib edit changed the size or mtime'
+relocated_build seeded-edit > "$work/seeded-edit.out" 2> "$work/seeded-edit.err"
+if grep -Fq "discovery.shipped-hit:$module" "$work/seeded-edit.err"; then fail 'hit for changed stdlib'; fi
+grep -Fq 'discovery.shipped-hit:' "$work/seeded-edit.err" || fail 'no hits for unchanged stdlib after edit'
+set +e
+"$work/program"; status=$?
+set -e
+[[ $status -eq 43 ]] || fail "changed stdlib returned $status"
+
 "$compiler" build tests/cases/bootstrap/discovery-codec.ab -o "$work/codec" --fast --no-cache
 "$work/codec"
 ABLA_GC_STRESS=1 ABLA_MAX_SECONDS=120 tools/run-limited.sh "$work/codec"
-echo 'discovery cache: exact hits, corruption/version/image/size fallback, preserved-mtime edits, no-cache and parser diagnostics'
+echo 'discovery cache: exact and relocated hits, preserved-mtime edits, corruption fallback, no-cache and parser diagnostics'

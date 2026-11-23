@@ -154,6 +154,8 @@ cp "$working/native-build/installer" "$bundle/libexec/abla-install-xtensa-native
 "$(dirname -- "${BASH_SOURCE[0]}")/package-xtensa-installer.sh" "$bundle"
 ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa"
 
+"$bundle/bin/ablac" --seed-stdlib-discovery
+
 tar -C "$working" -czf "$output" "abla-toolchain-$architecture-macos"
 (
     cd "$output_directory"
