@@ -17,6 +17,8 @@
 #               runs a smoke program and, with ABLA_STATIC_LLVM_LIB set, reaches the fixpoint (tools/test-static-artifact.sh)
 #   toolchain   (when the run ships abla-toolchain-dynamic-x86_64-linux.tar.gz beside the default) abla-toolchain-x86_64-linux.tar.gz is the static package: no
 #               PT_INTERP or DT_NEEDED, no shared library or external LLVM tool, at most 60 MB (150 MB unpacked), its launcher runs with an empty PATH
+#   playground  (when the run ships abla-playground-<version>.tar.gz, the browser compiler of tools/build-playground.sh) its manifest names this
+#               version, its module matches the manifest's hash and is at most 8 MB, and its stdlib bundle carries its hash in its name
 #   siblings    (with --siblings) the downstream repositories build and pass their tests with the candidate
 #               (tools/test-siblings.sh over tools/siblings.txt)
 #
@@ -165,11 +167,14 @@ switched=0
 static_names=$(grep -E "^ablac-static-(x86_64|aarch64)-linux(\.sha256)?\$" "$actual" || true)
 toolchain_switched=0
 ! grep -qxF abla-toolchain-dynamic-x86_64-linux.tar.gz "$actual" || toolchain_switched=1
+# The browser compiler (tools/build-playground.sh) is an optional extra with a name that holds the version: neither expected nor an extra; check 10 judges it.
+playground_present=0
+! grep -qxF "abla-playground-$version.tar.gz" "$actual" || playground_present=1
 # The publish job adds SHA256SUMS, its signature and the SBOM: they are not build artifacts, so they are neither expected here
 # nor counted as extras (check 9, signature, judges them where they exist).
 grep -vE "^(SHA256SUMS(\.sig)?|ablac-[0-9.]+\.spdx\.json)\$" "$actual" > "$actual.generated" || true
 mv -f "$actual.generated" "$actual"
-grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz)(\.sha256)?\$" "$actual" > "$actual.filtered" || true
+grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz|abla-playground-[0-9.]+\.tar\.gz)(\.sha256)?\$" "$actual" > "$actual.filtered" || true
 mv -f "$actual.filtered" "$actual"
 if [[ -n $assets_from ]]; then
     sort "$assets_from" >"$expected"
@@ -191,7 +196,7 @@ else
 fi
 grep -vE "^(SHA256SUMS(\.sig)?|ablac-[0-9.]+\.spdx\.json)\$" "$expected" > "$expected.generated" || true
 mv -f "$expected.generated" "$expected"
-grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz)(\.sha256)?\$" "$expected" > "$expected.filtered" || true
+grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz|abla-playground-[0-9.]+\.tar\.gz)(\.sha256)?\$" "$expected" > "$expected.filtered" || true
 mv -f "$expected.filtered" "$expected"
 if ((count == 0)); then
     report FAIL assets "no files in the artifacts"
@@ -393,6 +398,39 @@ if ((toolchain_switched)); then
         fi
         rm -rf -- "$unpack"
     fi
+fi
+
+# 10. playground: when the run ships the browser compiler (tools/build-playground.sh): the manifest names this version, the module is the one the
+# manifest hashes and at most 8 MB, and the stdlib bundle's name carries its hash.
+if ((playground_present)); then
+    tarball=$out/abla-playground-$version.tar.gz
+    unpack=$(mktemp -d)
+    bad=
+    if ! tar -xzf "$tarball" -C "$unpack" --strip-components=1 || [[ ! -f $unpack/manifest.json ]]; then
+        bad="the archive does not unpack to a manifest;"
+    else
+        manifest=$unpack/manifest.json
+        [[ $(sed -n 's/^  "version": "\(.*\)",$/\1/p' "$manifest") == "$version" ]] || bad="$bad the manifest does not name version $version;"
+        compiler_file=$(sed -n '/^  "compiler": {/,/^  },/s/^    "file": "\(.*\)",$/\1/p' "$manifest")
+        compiler_hash=$(sed -n '/^  "compiler": {/,/^  },/s/^    "sha256": "\(.*\)"$/\1/p' "$manifest")
+        stdlib_file=$(sed -n '/^  "stdlib": {/,/^  },/s/^    "file": "\(.*\)",$/\1/p' "$manifest")
+        stdlib_hash=$(sed -n '/^  "stdlib": {/,/^  },/s/^    "sha256": "\(.*\)"$/\1/p' "$manifest")
+        if [[ -z $compiler_file || ! -f $unpack/$compiler_file ]]; then
+            bad="$bad the manifest names no module in the archive;"
+        else
+            [[ $(sha256sum "$unpack/$compiler_file" | cut -d' ' -f1) == "$compiler_hash" ]] || bad="$bad the module does not match its hash;"
+            size=$(wc -c < "$unpack/$compiler_file" | tr -d " ")
+            ((size <= 8 * 1048576)) || bad="$bad the module is $((size / 1048576)) MB (cap 8);"
+        fi
+        [[ -n $stdlib_file && -f $unpack/$stdlib_file && $stdlib_file == *"$stdlib_hash"* && $(sha256sum "$unpack/$stdlib_file" | cut -d' ' -f1) == "$stdlib_hash" ]] ||
+            bad="$bad the stdlib bundle is missing or does not carry its hash;"
+    fi
+    if [[ -z $bad ]]; then
+        report PASS playground "version $version, the module matches its hash ($((size / 1048576)) MB), the stdlib bundle carries its hash"
+    else
+        report FAIL playground "${bad# }"
+    fi
+    rm -rf -- "$unpack"
 fi
 
 printf 'release-check %s  run %s  %s\n' "$tag" "$run_id" "$out"
