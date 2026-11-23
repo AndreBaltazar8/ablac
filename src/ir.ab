@@ -1852,6 +1852,11 @@ fun bootstrapIrNeedsNativeArithmetic(type: string): bool =
     type == "i32" || type == "u32" || type == "u64" ||
     type == "f32" || type == "f64"
 
+fun bootstrapIrLeftTypedOperator(kind: string): bool =
+    kind == "+" || kind == "-" || kind == "*" || kind == "/" || kind == "%" ||
+    kind == "&" || kind == "|" || kind == "^" || kind == "<<" ||
+    kind == ">>" || kind == ">>>"
+
 // The type both sides of a comparison are cast to, or "" to compare boxed:
 // a float's bits compare wrongly below zero, and a u64 compares signed.
 fun bootstrapIrNativeComparisonType(
@@ -7039,25 +7044,22 @@ class BootstrapLowerer(
             expression.kind == "&&" || expression.kind == "||") {
             result = "bool"
         }
-        // An operator's result is a new value: a view operand (a field read
-        // through Shared.get(), say) gives its element type, not a view.
-        if (expression.kind == "+" || expression.kind == "-" ||
-            expression.kind == "*" || expression.kind == "/" ||
-            expression.kind == "%") {
-            val operand = bootstrapBorrowElementType(
-                this.lowerExpressionType(expression.children[0])
-            )
-            val underlying = this.scalarTypeUnderlying(operand)
-            result = if (underlying == "") operand else underlying
-        }
-        if (expression.kind == "&" || expression.kind == "|" ||
-            expression.kind == "^" || expression.kind == "<<" ||
-            expression.kind == ">>" || expression.kind == ">>>") {
-            val operand = bootstrapBorrowElementType(
-                this.lowerExpressionType(expression.children[0])
-            )
-            val underlying = this.scalarTypeUnderlying(operand)
-            result = if (underlying == "") operand else underlying
+        // These operators get their type from the left operand. Walk the
+        // left spine without keeping a full type-query frame for each node.
+        if (bootstrapIrLeftTypedOperator(expression.kind)) {
+            var left = expression.children[0]
+            var operations = 1
+            while (bootstrapIrLeftTypedOperator(left.kind)) {
+                left = left.children[0]
+                operations = operations + 1
+            }
+            result = this.lowerExpressionType(left)
+            while (operations > 0) {
+                val next = this.lowerArithmeticResultType(result)
+                if (next == result) break
+                result = next
+                operations = operations - 1
+            }
         }
         if (expression.kind == "block" && expression.children.size > 0) {
             val tail = expression.children[expression.children.size - 1]
@@ -8109,6 +8111,13 @@ class BootstrapLowerer(
         if (underlying == normalized) normalized else underlying
     }
 
+    // An operator's result is a new value, even when the left operand is a view.
+    fun lowerArithmeticResultType(left: string): string {
+        val operand = bootstrapBorrowElementType(left)
+        val underlying = this.scalarTypeUnderlying(operand)
+        if (underlying == "") operand else underlying
+    }
+
     // Preserve float identity only at an explicit typed-to-any boundary.
     fun lowerEraseFloat(value: int, source: string, destination: string): int {
         if (!bootstrapIrIsErasedType(destination)) return value
@@ -8800,6 +8809,11 @@ class BootstrapLowerer(
         // Reject kinds with another initial byte before the general string
         // comparison; the expression and its kind stay immutable throughout.
         val kindHead = if (kind.size > 0) kind[0] else -1
+        if (kindHead == 43 && kind == "+" && expression.children[0].kind == "+" &&
+            this.projectionOwnerLeaves.size == 0 && this.generatorSourceLeaves.size == 0) {
+            val chain = bootstrapLowerLongAddition(this, expression)
+            if (chain >= 0) return chain
+        }
         // Each larger case is a @noinline function of its own, so an expression
         // nested N deep holds N frames of this dispatch rather than of every
         // case's locals.
@@ -12427,6 +12441,53 @@ fun bootstrapIrWideComparison(kind: string): string =
     else if (kind == ">") "Greater"
     else if (kind == ">=") "GreaterEqual"
     else ""
+
+@noinline
+fun bootstrapLowerLongAddition(
+    var lowerer: BootstrapLowerer, expression: BootstrapExpression
+): int {
+    // Retain the ordinary path for short and nonnumeric expressions.
+    var left = expression
+    var depth = 0
+    while (depth < 64 && left.kind == "+") {
+        left = left.children[0]
+        depth = depth + 1
+    }
+    if (depth < 64) return -1
+    val operands: array<BootstrapExpression> = []
+    left = expression
+    while (left.kind == "+") {
+        val right = left.children[1]
+        if (!bootstrapIsNumericScalarType(lowerer.lowerRuntimeType(
+            bootstrapBorrowElementType(lowerer.lowerExpressionType(right))
+        ))) return -1
+        operands.append(left)
+        left = left.children[0]
+    }
+    var leftType = lowerer.lowerExpressionType(left)
+    if (!bootstrapIsNumericScalarType(lowerer.lowerRuntimeType(
+        bootstrapBorrowElementType(leftType)
+    ))) return -1
+    val savedPosition = bootstrapIrSourcePosition
+    var result = lowerer.lowerExpression(left)
+    var index = operands.size - 1
+    while (index >= 0) {
+        val step = operands[index]
+        bootstrapIrSourcePosition = if (bootstrapIrSourceFile >= 0 && step.begin >= 0 &&
+            step.end > step.begin) bootstrapIrSourcePositionOf(bootstrapIrSourceFile, step.begin)
+            else savedPosition
+        val nativeType = lowerer.lowerRuntimeType(leftType)
+        if (bootstrapIrNeedsNativeArithmetic(nativeType)) {
+            result = lowerer.emit("scalar.cast", result, -1, nativeType)
+        }
+        val right = lowerer.lowerArithmeticOperand(step.children[1])
+        result = lowerer.emit("+", result, right, "")
+        leftType = lowerer.lowerArithmeticResultType(leftType)
+        index = index - 1
+    }
+    bootstrapIrSourcePosition = savedPosition
+    result
+}
 
 @noinline
 fun bootstrapLowerArithmetic(

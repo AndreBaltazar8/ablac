@@ -683,6 +683,7 @@ test-serial: ablac
 	tools/test-native-cstring.sh $(COMPILER)
 	tools/test-frontend-scaling.sh $(COMPILER)
 	tools/test-frontend-locals-scaling.sh $(COMPILER)
+	tools/test-native-locals-scaling.sh $(COMPILER)
 	tools/test-stm-wasm-unwinding.sh $(COMPILER)
 	tools/test-sysroot-path-symbols.sh $(COMPILER)
 	tools/test-project-path-symbols.sh $(COMPILER)
