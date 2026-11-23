@@ -30,7 +30,7 @@ noescape extern:"intrinsic" fun ablaLinuxEnvironmentPointer(): i64*
 class LinuxEnvironmentValue(val value: string, val found: bool)
 
 // Holds the child process status and its captured output, if any.
-class LinuxProcessResult(val status: int, val output: string)
+class LinuxProcessResult(val status: int, val output: string, val timedOut: bool = false)
 
 // Describes the arguments, environment changes, working directory, and stream redirections for one command.
 class LinuxCommand(
@@ -157,13 +157,9 @@ fun linuxWaitProcess(process: int, noHang: bool = false): LinuxProcessResult {
     val statusBuffer = nativeByteBuffer(8)
     statusBuffer.storeI64(0, 0)
     val options = if (noHang) 1 else 0
-    val waited = linuxSyscall4(
-        61,
-        process,
-        nativePointerAddress(statusBuffer.address),
-        options,
-        0
-    )
+    val address = nativePointerAddress(statusBuffer.address)
+    var waited = linuxSyscall4(61, process, address, options, 0)
+    while (waited == -4) waited = linuxSyscall4(61, process, address, options, 0)
     var status = -1
     if (waited == process) {
         status = linuxDecodeWaitStatus(statusBuffer.loadI64(0))
@@ -583,8 +579,71 @@ fun LinuxCommand.execute(): int {
     result
 }
 
-// Runs the configured command and returns its status and captured stdout. Launch failure returns status 127 and empty output. A read error can end capture early.
-fun LinuxCommand.capture(): LinuxProcessResult {
+private fun linuxCaptureWithin(
+    process: int, descriptor: int, milliseconds: int, interruptDescriptor: int
+): LinuxProcessResult {
+    val started = linuxMonotonicMilliseconds()
+    val polling = nativeByteBuffer(144)
+    polling.storeI64(0, descriptor | (1 << 32)) // pollfd { fd, POLLIN, 0 }.
+    polling.storeI64(8, (interruptDescriptor & 4294967295) | (1 << 32))
+    val address = nativePointerAddress(polling.address)
+    var output = ""
+    var reading = true
+    var expired = false
+    var interrupted = 0
+    while (true) {
+        if (!reading) {
+            val observed = linuxWaitProcess(process, true)
+            if (observed.output != "pending") {
+                polling.close()
+                return LinuxProcessResult(observed.status, output)
+            }
+        }
+        val now = linuxMonotonicMilliseconds()
+        if (started == 0 || now < started) break
+        val remaining = milliseconds - (now - started)
+        if (remaining <= 0) {
+            expired = true
+            break
+        }
+        val maximumWait = if (reading) 2147483647 else 10
+        val ready = linuxSyscall3(7, address, 2, if (remaining < maximumWait) remaining else maximumWait)
+        if (ready < 0 && ready != -4) break
+        if (ready > 0) {
+            if ((polling.load(14) & 1) != 0 &&
+                linuxSyscall3(0, interruptDescriptor, address + 16, 128) == 128) {
+                interrupted = polling.load(16)
+                break
+            }
+            if (reading && (polling.load(6) != 0 || polling.load(7) != 0)) {
+                // We are the sole reader. Once poll reports data or EOF, read returns
+                // without waiting for the writer to fill the buffer or exit.
+                val buffer = nativeByteBuffer(65537)
+                val amount = linuxSyscall3(0, descriptor, nativePointerAddress(buffer.address), 65536)
+                if (amount > 0) output = "$output${linuxExactString(buffer, amount, 65537)}"
+                else {
+                    buffer.close()
+                    if (amount == 0) {
+                        reading = false
+                        polling.storeI64(0, -1)
+                    }
+                    else if (amount != -4) break
+                }
+            }
+        }
+    }
+    polling.close()
+    // Git and similar commands may delegate I/O to helper children. Kill the group
+    // before waiting or closing the pipe so a helper can't keep the capture alive.
+    linuxSyscall2(62, 0 - process, 9)
+    linuxWaitProcess(process)
+    LinuxProcessResult(if (interrupted > 0) 128 + interrupted else -1, "", expired)
+}
+
+// Runs the configured command and returns its status and captured stdout. Launch failure returns 127 and empty output.
+// On Linux and macOS a positive timeoutMilliseconds bounds the capture and child wait. Expiry kills the process group and returns timedOut with empty output.
+// For a bounded capture, a nonnegative interruptDescriptor reads signal records. An interrupt kills the group and returns 128 plus the signal.
+fun LinuxCommand.capture(timeoutMilliseconds: int = 0, interruptDescriptor: int = -1): LinuxProcessResult {
     var result = LinuxProcessResult(127, "")
     if (this.arguments.size > 0) {
         val strings = this.execStrings(linuxExecutablePath(this.arguments[0]))
@@ -608,29 +667,37 @@ fun LinuxCommand.capture(): LinuxProcessResult {
                 descriptors.load(6) * 65536 +
                 descriptors.load(7) * 16777216
             val windows = linuxIsWindows()
+            val timed = timeoutMilliseconds > 0 && !windows
             val process = if (windows) linuxWindowsSpawn(addresses, vector, environment, -1, writeDescriptor, -1, 0) else linuxFork()
             if (process == 0 && !windows) {
                 linuxSyscall1(3, readDescriptor)
-                linuxSyscall2(33, writeDescriptor, 1)
-                linuxSyscall1(3, writeDescriptor)
+                if (timed && linuxChildSetProcessGroup(0) < 0) linuxSyscall1(60, 127)
+                if (writeDescriptor == 1) {
+                    if (linuxSyscall3(72, 1, 2, 0) < 0) linuxSyscall1(60, 127)
+                } else {
+                    if (linuxSyscall2(33, writeDescriptor, 1) < 0) linuxSyscall1(60, 127)
+                    linuxSyscall1(3, writeDescriptor)
+                }
                 this.execPrepared(addresses, vector, environment)
                 linuxSyscall1(60, 127)
             }
+            linuxSyscall1(3, writeDescriptor)
             if (process > 0) {
-                linuxSyscall1(3, writeDescriptor)
-                var output = ""
-                var reading = true
-                while (reading) {
-                    val chunk = LinuxFileDescriptor(readDescriptor).read(65536)
-                    if (chunk.size > 0) output = "$output$chunk"
-                    if (chunk.size == 0) reading = false
+                if (timed) {
+                    linuxSyscall2(109, process, process)
+                    result = linuxCaptureWithin(process, readDescriptor, timeoutMilliseconds, interruptDescriptor)
+                } else {
+                    var output = ""
+                    var reading = true
+                    while (reading) {
+                        val chunk = LinuxFileDescriptor(readDescriptor).read(65536)
+                        if (chunk.size > 0) output = "$output$chunk"
+                        if (chunk.size == 0) reading = false
+                    }
+                    result = LinuxProcessResult(linuxWaitProcess(process).status, output)
                 }
-                linuxSyscall1(3, readDescriptor)
-                result = LinuxProcessResult(
-                    linuxWaitProcess(process).status,
-                    output
-                )
             }
+            linuxSyscall1(3, readDescriptor)
         }
         descriptors.close()
         environment.close()

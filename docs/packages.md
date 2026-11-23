@@ -326,6 +326,11 @@ bounded to 128 MiB, indexed by a deterministic tree digest, validated against
 the lock, and published by rename only after validation. Project-local
 materialization under ignored `.abla/` is also transactional.
 
+On Linux and macOS, Git reference lookups for `package update` and Git
+fetches for locked checkouts each have a 120-second process deadline. Set
+`ABLA_PACKAGE_GIT_TIMEOUT_SECONDS` to an integer from 1 to 3600 to override
+it. `E_PACKAGE_GIT_TIMEOUT` identifies the operation, source and limit.
+
 Use `--offline` to prohibit a Git cache fill:
 
 ```sh

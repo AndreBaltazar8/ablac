@@ -22,11 +22,12 @@ const scratch = mkdtempSync(join(tmpdir(), "abla-git-timeout-"));
 const gitConfig = join(scratch, "gitconfig");
 writeFileSync(gitConfig, "[http]\n\tlowSpeedLimit = 1\n\tlowSpeedTime = 1\n");
 try {
-    for (const [selector, value, operation] of [
-        ["branch", "main", "ls-remote"],
-        ["rev", "0123456789abcdef0123456789abcdef01234567", "fetch"],
+    for (const [selector, value, operation, interrupt] of [
+        ["branch", "main", "ls-remote", false],
+        ["rev", "0123456789abcdef0123456789abcdef01234567", "fetch", false],
+        ["branch", "main", "ls-remote", true],
     ]) {
-        const app = join(scratch, selector);
+        const app = join(scratch, interrupt ? "interrupt" : selector);
         const cache = join(app, "cache");
         mkdirSync(app);
         writeFileSync(join(app, "main.ab"), "fun main: int = 0\n");
@@ -35,7 +36,11 @@ try {
         let received = false;
         const server = createServer(socket => {
             sockets.add(socket);
-            socket.on("data", bytes => { if (bytes[0] === 22) received = true; });
+            socket.on("data", bytes => {
+                if (received || bytes[0] !== 22) return;
+                received = true;
+                if (interrupt) child.kill("SIGINT");
+            });
             socket.on("error", () => {});
             socket.once("close", () => sockets.delete(socket));
         });
@@ -54,7 +59,7 @@ try {
             env: {
                 ...process.env,
                 ABLA_PACKAGE_CACHE: cache,
-                ABLA_PACKAGE_GIT_TIMEOUT_SECONDS: "2",
+                ABLA_PACKAGE_GIT_TIMEOUT_SECONDS: interrupt ? "60" : "2",
                 GIT_CONFIG_GLOBAL: gitConfig,
                 GIT_CONFIG_NOSYSTEM: "1",
                 NO_PROXY: "127.0.0.1",
@@ -74,9 +79,12 @@ try {
             assert.ok(received, operation + " did not send a TLS ClientHello:\n" + diagnostic);
             assert.ok(!expired, operation + " hung until the test watchdog");
             assert.notEqual(status, 0, operation + " unexpectedly succeeded");
-            assert.ok(diagnostic.includes("error[E_PACKAGE_GIT_TIMEOUT]"), diagnostic);
-            assert.ok(diagnostic.includes(operation) && diagnostic.includes(source) &&
-                diagnostic.includes("2 seconds"), diagnostic);
+            if (interrupt) assert.ok(!diagnostic.includes("E_PACKAGE_GIT_TIMEOUT"), diagnostic);
+            else {
+                assert.ok(diagnostic.includes("error[E_PACKAGE_GIT_TIMEOUT]"), diagnostic);
+                assert.ok(diagnostic.includes(operation) && diagnostic.includes(source) &&
+                    diagnostic.includes("2 seconds"), diagnostic);
+            }
             assert.ok(!existsSync(join(app, "abla.lock")), "failed update published a lock");
             const fetchCache = join(cache, "git", "silent");
             if (existsSync(fetchCache)) assert.deepEqual(readdirSync(fetchCache), [], "partial fetch cache");
@@ -91,5 +99,5 @@ try {
 } finally {
     rmSync(scratch, { recursive: true, force: true });
 }
-console.log("package Git deadline: silent TLS during ls-remote and fetch, both helpers stopped");
+console.log("package Git deadline: silent TLS during ls-remote and fetch; timeout and interrupt stop helpers");
 JS

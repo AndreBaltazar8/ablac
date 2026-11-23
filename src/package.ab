@@ -5,6 +5,8 @@ import "module_paths.ab"
 import "module.ab"
 import "parser.ab"
 import "abla/sys/linux"
+import "abla/integer"
+import "abla/process/signal"
 import "sema.ab"
 import "abla/text"
 
@@ -846,49 +848,51 @@ fun bootstrapPackageFirstRevision(output: string): string {
     result
 }
 
+private fun bootstrapPackageGitTimeoutSeconds(): int {
+    val configured = linuxEnvironment("ABLA_PACKAGE_GIT_TIMEOUT_SECONDS").value.parseInt() ?? 0
+    if (configured >= 1 && configured <= 3600) configured else 120
+}
+
+private fun bootstrapPackageCaptureGit(command: LinuxCommand, seconds: int): LinuxProcessResult {
+    if (linuxHostIsWindows()) return command.capture()
+    val watch = watchSignals([signalInterrupt, signalTerminate, signalHangup])
+    val captured = command.capture(seconds * 1000, watch.descriptor)
+    watch.close()
+    captured
+}
+
+private fun bootstrapPackageGitTimeout(
+    dependency: BootstrapPackageDependency, operation: string, seconds: int
+): string =
+    "error[E_PACKAGE_GIT_TIMEOUT]: git $operation for dependency '${dependency.name}', source '${dependency.source}', timed out after $seconds seconds\n"
+
+class BootstrapPackageRevision(val revision: string, val diagnostic: string = "")
+
 fun bootstrapPackageResolveRevision(
     dependency: BootstrapPackageDependency
-): string {
-    var result = ""
+): BootstrapPackageRevision {
     if (dependency.selectorKind == "rev" &&
         bootstrapPackageHexRevision(dependency.selector)) {
-        result = dependency.selector
+        return BootstrapPackageRevision(dependency.selector)
     }
+    val command = bootstrapPackageGit()
+    command.argument("ls-remote")
+    command.argument("--")
+    command.argument(dependency.source)
     if (dependency.selectorKind == "tag") {
-        val command = bootstrapPackageGit()
-        command.argument("ls-remote")
-        command.argument("--")
-        command.argument(dependency.source)
         command.argument("refs/tags/${dependency.selector}")
         command.argument("refs/tags/${dependency.selector}^{}")
-        val resolved = command.capture()
-        if (resolved.status == 0) {
-            result = bootstrapPackageFirstRevision(resolved.output)
-        }
-    }
-    if (dependency.selectorKind == "branch") {
-        val command = bootstrapPackageGit()
-        command.argument("ls-remote")
-        command.argument("--")
-        command.argument(dependency.source)
+    } else if (dependency.selectorKind == "branch") {
         command.argument("refs/heads/${dependency.selector}")
-        val resolved = command.capture()
-        if (resolved.status == 0) {
-            result = bootstrapPackageFirstRevision(resolved.output)
-        }
-    }
-    if (dependency.selectorKind == "head") {
-        val command = bootstrapPackageGit()
-        command.argument("ls-remote")
-        command.argument("--")
-        command.argument(dependency.source)
+    } else if (dependency.selectorKind == "head") {
         command.argument("HEAD")
-        val resolved = command.capture()
-        if (resolved.status == 0) {
-            result = bootstrapPackageFirstRevision(resolved.output)
-        }
-    }
-    result
+    } else return BootstrapPackageRevision("")
+    val seconds = bootstrapPackageGitTimeoutSeconds()
+    val resolved = bootstrapPackageCaptureGit(command, seconds)
+    if (resolved.timedOut) return BootstrapPackageRevision(
+        "", bootstrapPackageGitTimeout(dependency, "ls-remote", seconds)
+    )
+    BootstrapPackageRevision(if (resolved.status == 0) bootstrapPackageFirstRevision(resolved.output) else "")
 }
 
 // A checkout's own bytes: a symbolic link counts as itself and is not followed,
@@ -1117,7 +1121,11 @@ fun bootstrapPackageFetch(
         fetch.argument("--")
         fetch.argument("origin")
         fetch.argument(revision)
-        if (fetch.run() != 0) status = 1
+        val seconds = bootstrapPackageGitTimeoutSeconds()
+        val fetched = if (linuxHostIsWindows()) LinuxProcessResult(fetch.run(), "")
+            else bootstrapPackageCaptureGit(fetch, seconds)
+        if (fetched.status != 0) status = 1
+        if (fetched.timedOut) diagnostic = bootstrapPackageGitTimeout(dependency, "fetch", seconds)
     }
     if (status == 0) {
         val checkout = bootstrapPackageGit()
@@ -1129,9 +1137,11 @@ fun bootstrapPackageFetch(
         checkout.argument(revision)
         if (checkout.run() != 0) status = 1
     }
-    val actual = bootstrapPackageGitValue("$temporary/source", "HEAD")
-    val digest = bootstrapPackageGitValue("$temporary/source", "HEAD^{tree}")
-    if (status == 0 && actual != revision) status = 1
+    var digest = ""
+    if (status == 0) {
+        if (bootstrapPackageGitValue("$temporary/source", "HEAD") != revision) status = 1
+        else digest = bootstrapPackageGitValue("$temporary/source", "HEAD^{tree}")
+    }
     if (status == 0 && bootstrapPackageDirectorySize(
         Path("$temporary/source"), 134217728
     ) > 134217728) {
@@ -1602,10 +1612,15 @@ fun bootstrapPackageResolveOne(
         var cacheSource = ""
         var entry = dependency.resolvedEntry
         if (dependency.provider == "git") {
-            revision = if (gitRevision != "") gitRevision else bootstrapPackageResolveRevision(dependency)
+            if (gitRevision != "") revision = gitRevision
+            else {
+                val resolved = bootstrapPackageResolveRevision(dependency)
+                revision = resolved.revision
+                diagnostic = resolved.diagnostic
+            }
             if (revision == "") {
                 status = 1
-                diagnostic =
+                if (diagnostic == "") diagnostic =
                     "error[E_PACKAGE_RESOLVE]: dependency '${dependency.name}', selector ${dependency.selectorKind}='${dependency.selector}', source '${dependency.source}' did not resolve to an immutable revision\n"
             }
         }
@@ -1628,7 +1643,7 @@ fun bootstrapPackageResolveOne(
                 status = fetched.status
                 diagnostic = fetched.diagnostic
             }
-            digest = bootstrapPackageGitValue(cacheSource, "HEAD^{tree}")
+            if (status == 0) digest = bootstrapPackageGitValue(cacheSource, "HEAD^{tree}")
         }
         if (status == 0 && dependency.provider == "content") {
             if (revision == "" || entry == "" ||
