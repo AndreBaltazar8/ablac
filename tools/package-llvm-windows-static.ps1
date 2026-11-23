@@ -154,7 +154,8 @@ int main(void) {
     return isnan(f(5)) && isnan(f(-5)) && isnan(f(0)) ? 0 : 1;
 }
 '@ | Set-Content -Encoding ascii $probeSource
-& $clang /nologo /MT /fp:precise "/Fo$probeObject" "/Fe$probe" $probeSource $coff -fuse-ld=lld
+& $clang /nologo /MT /fp:precise /c "/Fo$probeObject" $probeSource
+& $clang /nologo "/Fe$probe" $probeObject $coff -fuse-ld=lld
 & $probe
 Write-Host 'llc: the x64 COFF fixture returns NaN for positive, negative and zero inputs'
 
