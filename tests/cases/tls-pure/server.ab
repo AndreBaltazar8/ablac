@@ -4,7 +4,7 @@
 // suite x a client that has an X25519 share and a server that wants X25519 or only P-256 (a HelloRetryRequest);
 // application data both ways in many records; ALPN; client certificates (accepted, absent and optional, absent and
 // required, rejected by the verifier); a client without TLS 1.3, no suite or group in common; close_notify;
-// KeyUpdate; damaged input to the server. Prints "tls-pure server ok".
+// KeyUpdate; early data that is skipped; damaged input to the server. Prints "tls-pure server ok".
 import "abla/io"
 import "abla/crypto"
 import "abla/crypto/x509"
@@ -174,6 +174,34 @@ fun main: int {
     dgNewClient.takeOutput()
     dgNewClient.feed(dgFlight)
     if (!dgNewClient.failed() || !dgNewClient.error.contains("downgrade")) fail("a downgrade was not detected: [${dgNewClient.error}]")
+    // Early data (RFC 8446 section 4.2.10): a server that does not accept it skips the records the client sends under the early traffic key (they do not
+    // deprotect under the handshake key), up to a limit; without the early_data extension the same records are a bad_record_mac.
+    val earlyPair = tlsGenerateKeyPair(TLS_GROUP_X25519, random)
+    if (earlyPair == null) {
+        fail("no key pair for the early data test")
+    } else {
+        val plainHello = tlsBuildClientHello(random(32), random(32), [TLS_SUITE_AES_128_GCM_SHA256], "localhost", [TLS_GROUP_X25519],
+            [TlsKeyShare(TLS_GROUP_X25519, earlyPair.publicKey)], [TLS_SIG_ED25519], [], "")
+        // The same hello with an empty early_data extension appended to its extensions.
+        val extensionsAt = 4 + 2 + 32 + (1 + 32) + (2 + 2) + (1 + 1)
+        val extensionsLength = plainHello[extensionsAt] * 256 + plainHello[extensionsAt + 1]
+        val earlyBody = plainHello.slice(4, extensionsAt) + tlsU16(extensionsLength + 4) + plainHello.slice(extensionsAt + 2, plainHello.size) + tlsExtension(42, "")
+        val earlyHello = tlsHandshakeMessage(TLS_CLIENT_HELLO, earlyBody)
+        val junk = tlsPlaintextRecord(TLS_CHANGE_CIPHER_SPEC, 771, tlsU8(1)) + tlsPlaintextRecord(23, 771, random(60)) + tlsPlaintextRecord(23, 771, random(100))
+        var earlyServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+        earlyServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, earlyHello))
+        if (earlyServer.failed() || earlyServer.takeOutput().size == 0) fail("the server did not answer a ClientHello with early_data: ${earlyServer.error}")
+        earlyServer.feed(junk)
+        if (earlyServer.failed()) fail("early data records were not skipped: ${earlyServer.error}")
+        // Past the limit they are not skipped any more.
+        for (i in 0 until 4) earlyServer.feed(tlsPlaintextRecord(23, 771, random(12000)))
+        if (!earlyServer.failed()) fail("early data without a limit was skipped")
+        var lateServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+        lateServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, plainHello))
+        lateServer.takeOutput()
+        lateServer.feed(junk)
+        if (!lateServer.failed()) fail("records that do not deprotect were skipped without an early_data extension")
+    }
     // A ClientHello that declares more than 2^17 bytes is refused at its header; twenty thousand one-byte records of
     // handshake data (no quadratic copying) end in the refusal of the whole message too.
     var bigServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))

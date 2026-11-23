@@ -32,6 +32,8 @@ val TLS_SERVER_WAIT_CERTIFICATE = 2
 val TLS_SERVER_WAIT_CERTIFICATE_VERIFY = 3
 // Server state awaiting the client's Finished authenticator.
 val TLS_SERVER_WAIT_FINISHED = 4
+/** The most ciphertext a server that does not accept early data skips before the client's Finished (RFC 8446 section 4.2.10: a configured maximum). */
+val TLS_EARLY_SKIP_LIMIT = 32768
 // Server state after completion of the TLS handshake.
 val TLS_SERVER_CONNECTED = 5
 // Server state after the TLS connection closes.
@@ -142,7 +144,11 @@ class TlsServer(
     /** The tls-exporter channel binding (RFC 9266), made when the TLS 1.3 handshake completes; "" before, and on TLS 1.2. */
     var channelExporter: string = "",
     /** The identity picked for this connection from `config.identities` by its ClientHello (null: `config.identity`). */
-    var chosenIdentity: TlsIdentity? = null
+    var chosenIdentity: TlsIdentity? = null,
+    /** The ClientHello offered early_data, which this server does not accept: the records the client sends under the early traffic key are skipped (RFC 8446
+     *  section 4.2.10), up to `TLS_EARLY_SKIP_LIMIT` bytes of them, until the client's Finished. */
+    var earlyOffered: bool = false,
+    var earlySkipped: int = 0
 )
 
 private fun tlsServerEmptyProtection(): TlsRecordProtection = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
@@ -543,6 +549,7 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
         this.clientRandom = hello.random
         this.sessionId = hello.sessionId
         this.retried = true
+        if (hello.earlyData) this.earlyOffered = true
         this.retryGroup = retryGroup
         this.retrySuite = suite
         this.transcript.messages = tlsHandshakeMessage(TLS_MESSAGE_HASH, tlsHashOf(this.hash, message))
@@ -598,6 +605,7 @@ private fun TlsServer.handleClientHello(message: string, body: string): void {
     this.sessionId = hello.sessionId
     this.serverName = hello.serverName
     this.negotiatedAlpn = alpn
+    if (hello.earlyData) this.earlyOffered = true
     this.transcript.add(message)
     // ServerHello (plaintext), then the key schedule and the encrypted flight.
     val serverRandom13 = this.config.random(32)
@@ -902,6 +910,12 @@ private fun TlsServer.handleRecord(record: string, header: TlsRecordHeader): voi
         }
         val opened = tlsOpenRecord(this.read, record)
         if (!opened.ok) {
+            // RFC 8446 section 4.2.10: a server that ignores early_data skips the records the client sent under the early traffic key (they do not deprotect under the
+            // handshake key), up to a limit, until the client's Finished is in.
+            if (this.earlyOffered && this.state != TLS_SERVER_CONNECTED && this.earlySkipped + record.size <= TLS_EARLY_SKIP_LIMIT) {
+                this.earlySkipped = this.earlySkipped + record.size
+                return
+            }
             this.fail(if (opened.error == "tls: record overflow") TLS_ALERT_RECORD_OVERFLOW else TLS_ALERT_BAD_RECORD_MAC,
                 opened.error)
             return
@@ -909,6 +923,12 @@ private fun TlsServer.handleRecord(record: string, header: TlsRecordHeader): voi
         type = opened.type
         content = opened.content
     } else {
+        // After a HelloRetryRequest the early data of the first flight is skipped too (section 4.2.10), by its outer type.
+        if (header.type == TLS_APPLICATION_DATA && this.earlyOffered && this.retried && this.state == TLS_SERVER_WAIT_CLIENT_HELLO &&
+            this.earlySkipped + record.size <= TLS_EARLY_SKIP_LIMIT) {
+            this.earlySkipped = this.earlySkipped + record.size
+            return
+        }
         if (header.length > TLS_MAX_PLAINTEXT) {
             this.fail(TLS_ALERT_RECORD_OVERFLOW, "tls: record overflow")
             return
