@@ -536,18 +536,68 @@ fun HttpEventChunkState.assemble(input: string, maximumHeader: int, maximumBody:
     return HttpEventFrame(0, null, http10, if (decoded.need > 0) decoded.need - decoded.resume else 0, null, "", decoded.resume)
 }
 
-// Frames one request from a slot's input inside the caller's region, runs the no-escape handler on it and queues the response; returns the bytes consumed, 0 when more input is needed, or a negative value for a malformed request (answered with 400, then closed).
+// Hands a framed request to the no-escape handler and writes (or queues) its response. Runs inside the region the no-escape server reads in, and
+// from `processNoEscapeChunked` outside one: it stores only ints and promoted strings into the server.
+fun HttpEventServer.dispatchNoEscape(slot: int, request: HttpRequest, http10: bool): void {
+    val eventHandler = this.noEscapeHandler
+    val response = eventHandler(request)
+    this.requestCounts[slot] = this.requestCounts[slot] + 1
+    val keepAlive = httpEventKeepAlive(request, http10) &&
+        !this.draining &&
+        this.requestCounts[slot] <
+            this.options.maximumRequestsPerConnection
+    val framedResponse = httpEventResponse(
+        request, response, keepAlive,
+        this.options.gzipMinimumBytes
+    )
+    this.closing[slot] = !keepAlive
+    if (framedResponse.size > this.options.maximumPendingBytes) {
+        this.closeSlot(slot)
+    } else if (this.descriptors[slot] >= 0) {
+        val connection = TcpConnection(this.descriptors[slot])
+        // Scatter/gather avoids copying large segmented bodies, while
+        // the contiguous writer remains cheaper for small responses.
+        val written = if (framedResponse.size >= 4096) {
+            connection.writeCompact(framedResponse)
+        } else connection.writeResult(framedResponse)
+        connection.descriptor = -1
+        if (written.written > 0 &&
+            written.written < framedResponse.size) {
+            this.lastActivityMilliseconds[slot] =
+                this.passMilliseconds
+        }
+        if (written.failed() && written.errorCode != 11) {
+            this.closeSlot(slot)
+        } else if (written.written >= framedResponse.size) {
+            this.outputOffsets[slot] = 0
+            if (this.closing[slot]) this.closeSlot(slot)
+        } else {
+            this.outputs[slot] = memoryPromoteString(framedResponse)
+            this.outputOffsets[slot] = written.written
+            if (!this.writeWatching[slot] &&
+                this.poller.modifyDescriptor(
+                    this.descriptors[slot], false, true
+                )) this.writeWatching[slot] = true
+        }
+    }
+    return
+}
+
+// Frames one request from a slot's input inside the caller's region, runs the no-escape handler on it and queues the response; returns the bytes consumed, 0 when more input is needed, -3 (nothing consumed) when a chunked request is being assembled and the caller must continue with processNoEscapeChunked outside the region, or another negative value for a malformed request (answered with 400, then closed).
 fun HttpEventServer.processNoEscapeInputInRegion(
     slot: int,
     input: string
 ): int {
     var readyToWrite = false
-    // The stateless framing: this runs in a region, and what the chunked-request state keeps (a parsed head, a buffer that grows) must not
-    // be allocated in one. A chunked body is decoded again whole on each read here, as before.
+    // A chunked request is being assembled: its state lives in the server, so it is framed outside the region (-3, nothing consumed).
+    if (this.chunkStates[slot].head != null) return -3
+    // The stateless framing: what the chunked-request state keeps (a parsed head, a buffer that grows) must not be allocated in a region.
     val frame = httpEventFrame(
         input, this.options.maximumHeaderBytes, this.options.maximumBodyBytes, this.peerAddresses[slot]
     )
     val length = frame.length
+    // A chunked request that is not complete yet starts to be assembled outside the region.
+    if (length == 0 && frame.head != null) return -3
     this.needs[slot] = if (length == 0) frame.need else 0
     if (length < 0) {
         this.outputs[slot] = memoryPromoteString(
@@ -567,47 +617,7 @@ fun HttpEventServer.processNoEscapeInputInRegion(
                 httpEventRequest(framed, this.options.maximumBodyBytes),
                 this.peerAddresses[slot]
             )
-        val eventHandler = this.noEscapeHandler
-        val response = eventHandler(request)
-        this.requestCounts[slot] = this.requestCounts[slot] + 1
-        val keepAlive = httpEventKeepAlive(request, frame.http10) &&
-            !this.draining &&
-            this.requestCounts[slot] <
-                this.options.maximumRequestsPerConnection
-        val framedResponse = httpEventResponse(
-            request, response, keepAlive,
-            this.options.gzipMinimumBytes
-        )
-        this.closing[slot] = !keepAlive
-        if (framedResponse.size > this.options.maximumPendingBytes) {
-            this.closeSlot(slot)
-        } else if (this.descriptors[slot] >= 0) {
-            val connection = TcpConnection(this.descriptors[slot])
-            // Scatter/gather avoids copying large segmented bodies, while
-            // the contiguous writer remains cheaper for small responses.
-            val written = if (framedResponse.size >= 4096) {
-                connection.writeCompact(framedResponse)
-            } else connection.writeResult(framedResponse)
-            connection.descriptor = -1
-            if (written.written > 0 &&
-                written.written < framedResponse.size) {
-                this.lastActivityMilliseconds[slot] =
-                    this.passMilliseconds
-            }
-            if (written.failed() && written.errorCode != 11) {
-                this.closeSlot(slot)
-            } else if (written.written >= framedResponse.size) {
-                this.outputOffsets[slot] = 0
-                if (this.closing[slot]) this.closeSlot(slot)
-            } else {
-                this.outputs[slot] = memoryPromoteString(framedResponse)
-                this.outputOffsets[slot] = written.written
-                if (!this.writeWatching[slot] &&
-                    this.poller.modifyDescriptor(
-                        this.descriptors[slot], false, true
-                    )) this.writeWatching[slot] = true
-            }
-        }
+        this.dispatchNoEscape(slot, request, frame.http10)
     }
     if (readyToWrite) {
         if (this.outputs[slot].size > this.options.maximumPendingBytes) {
@@ -615,6 +625,45 @@ fun HttpEventServer.processNoEscapeInputInRegion(
         } else if (this.descriptors[slot] >= 0) this.writeReady(slot)
     }
     length
+}
+
+// Frames and dispatches what a no-escape connection holds once a chunked request is being assembled: outside any region, where the
+// chunk state (a parsed head, a buffer that grows) can be kept in the server. The region path hands over to this when it sees a
+// chunked request that is not complete (it returns -3, nothing consumed) and until the connection holds no such request.
+fun HttpEventServer.processNoEscapeChunked(slot: int): void {
+    var processing = slot >= 0 && slot < this.descriptors.size &&
+        this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
+    while (processing) {
+        val frame = this.chunkStates[slot].assemble(
+            this.inputs[slot], this.options.maximumHeaderBytes, this.options.maximumBodyBytes, this.peerAddresses[slot]
+        )
+        val length = frame.length
+        this.needs[slot] = if (length == 0) frame.need else 0
+        if (length == 0 && frame.trim > 0) {
+            this.inputs[slot] = this.inputs[slot].slice(frame.trim, this.inputs[slot].size)
+        }
+        if (length < 0) {
+            this.outputs[slot] = httpText("bad request", 400).render()
+            this.outputOffsets[slot] = 0
+            this.closing[slot] = true
+            processing = false
+            this.writeReady(slot)
+        } else if (length == 0) processing = false
+        else {
+            val request = frame.request
+            if (request == null) {
+                this.closeSlot(slot)
+                return
+            }
+            if (length < this.inputs[slot].size) {
+                this.inputs[slot] = this.inputs[slot].slice(length, this.inputs[slot].size)
+            } else this.inputs[slot] = ""
+            this.dispatchNoEscape(slot, request, frame.http10)
+            processing = this.inputs[slot].size > 0 &&
+                this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
+        }
+    }
+    return
 }
 
 // Dispatches complete requests in a connection slot through the no-escape handler and queues their responses.
@@ -627,7 +676,9 @@ fun HttpEventServer.processNoEscapeSlot(slot: int): void {
         region {
             val input = this.inputs[slot]
             consumed = this.processNoEscapeInputInRegion(slot, input)
-            if (consumed < 0 || consumed >= input.size) {
+            if (consumed == -3) {
+                // Nothing consumed: a chunked request is framed outside the region (inputs[slot] is already in the heap).
+            } else if (consumed < 0 || consumed >= input.size) {
                 clearInput = true
             } else if (consumed > 0) {
                 this.inputs[slot] = memoryPromoteString(
@@ -637,7 +688,10 @@ fun HttpEventServer.processNoEscapeSlot(slot: int): void {
             0
         }
         if (clearInput) this.inputs[slot] = ""
-        processing = consumed > 0 &&
+        if (consumed == -3) {
+            this.processNoEscapeChunked(slot)
+            processing = false
+        } else processing = consumed > 0 &&
             this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
     }
     return
@@ -747,6 +801,9 @@ fun HttpEventServer.readReady(slot: int): void {
             // region, as nothing allocated in it may be kept by the server.
             var heldPiece = ""
             var tailsTaken = false
+            // A chunked request met in the region: the rest of the input, promoted, to be assembled after it (see processNoEscapeChunked).
+            var handoff = false
+            var handoffInput = ""
             reading = region {
                 var pending = this.inputs[slot]
                 var accumulating = true
@@ -794,13 +851,17 @@ fun HttpEventServer.readReady(slot: int): void {
                                 consumed = this.processNoEscapeInputInRegion(
                                     slot, input.slice(offset, input.size)
                                 )
+                                if (consumed == -3) {
+                                    handoffInput = memoryPromoteString(input.slice(offset, input.size))
+                                    handoff = true
+                                }
                                 if (consumed > 0) offset = offset + consumed
                                 processing = consumed > 0 &&
                                     offset < input.size &&
                                     this.descriptors[slot] >= 0 &&
                                     this.outputs[slot].size == 0
                             }
-                            pending = if (this.descriptors[slot] >= 0 && offset < input.size) {
+                            pending = if (!handoff && this.descriptors[slot] >= 0 && offset < input.size) {
                                 input.slice(offset, input.size)
                             } else ""
                             accumulating = offset == 0 && consumed == 0 &&
@@ -821,6 +882,11 @@ fun HttpEventServer.readReady(slot: int): void {
             if (clearInput) this.inputs[slot] = ""
             if (tailsTaken && this.descriptors[slot] >= 0) this.tails[slot] = byteBuffer()
             if (heldPiece.size > 0 && this.descriptors[slot] >= 0) this.tails[slot].appendText(heldPiece)
+            if (handoff && this.descriptors[slot] >= 0) {
+                this.inputs[slot] = handoffInput
+                this.processNoEscapeChunked(slot)
+                if (this.descriptors[slot] < 0 || this.outputs[slot].size > 0) reading = false
+            }
         } else {
             val connection = TcpConnection(this.descriptors[slot])
             // Read a typical API body and its headers in one receive

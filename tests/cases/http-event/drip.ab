@@ -7,7 +7,7 @@
 //   - a chunked request with extensions and trailers, followed by another request in the same stream, gives the same bodies however
 //     the bytes are split (at every position, and one byte at a time);
 //   - the server for handlers that cannot retain their request (it reads in a region) answers the same chunked request at every split, and a
-//     body sent a byte at a time;
+//     body sent a byte at a time, and its time for many small chunks is in proportion to their number too;
 //   - the time grows in proportion: a 1 MiB body in 16-byte pieces (the default body limit) takes at most 12 times what 128 KiB takes
 //     (8 times the bytes), and 12000 one-byte chunks in 6-byte pieces at most 10 times what 3000 take (4 times the bytes), the best of
 //     two runs each, so a shared machine's noise does not matter.
@@ -32,7 +32,11 @@ fun reply(client: TcpConnection): string {
     client.readCompact(65536)
 }
 
+// Whether newServer makes the server for handlers that cannot retain their request (which reads in a region).
+var useNoEscape = false
+
 fun newServer(): HttpEventServer {
+    if (useNoEscape) return httpEventServerNoEscapeHandler(echoNoEscape, ipv4Loopback(0))
     val router = httpRouter()
     router.post("/", answer)
     router.post("/echo", echo)
@@ -77,7 +81,8 @@ fun best(start: string, data: string, piece: int, expected: string): int {
 fun bodyDrip(total: int): int = best(head(total), "x".repeat(total), 16, "got ${total}")
 
 fun chunkDrip(chunks: int): int = best(
-    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", "1\r\nx\r\n".repeat(chunks) + "0\r\n\r\n", 6, "got ${chunks}"
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", "1\r\nx\r\n".repeat(chunks) + "0\r\n\r\n", 6,
+    if (useNoEscape) "[${"x".repeat(chunks)}]" else "got ${chunks}"
 )
 
 fun main: int {
@@ -163,6 +168,16 @@ fun main: int {
     val chunkFloor = if (fewChunks < 40) 40 else fewChunks
     if (manyChunks > 10 * chunkFloor) {
         println("FAIL the time is not in proportion to the number of chunks: 3000 took ${fewChunks} ms, 12000 took ${manyChunks} ms")
+        return 1
+    }
+    // The same for the server whose handlers cannot retain their request: a chunked body in small pieces is assembled outside its region.
+    useNoEscape = true
+    val neFew = chunkDrip(3000)
+    val neMany = chunkDrip(12000)
+    if (neFew < 0 || neMany < 0) return 1
+    val neFloor = if (neFew < 40) 40 else neFew
+    if (neMany > 10 * neFloor) {
+        println("FAIL the no-escape server's time is not in proportion to the number of chunks: 3000 took ${neFew} ms, 12000 took ${neMany} ms")
         return 1
     }
     println("http-event drip ok")
