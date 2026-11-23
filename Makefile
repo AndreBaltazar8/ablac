@@ -534,6 +534,7 @@ test-serial: ablac
 	tools/test-tls-handles.sh $(COMPILER)
 	tools/test-tls-chains.sh $(COMPILER)
 	tools/test-x509.sh $(COMPILER)
+	tools/test-ocsp.sh $(COMPILER)
 	tools/test-import-aliases.sh $(COMPILER)
 	tools/test-linux-arguments.sh $(COMPILER)
 	tools/test-linux-io.sh $(COMPILER)

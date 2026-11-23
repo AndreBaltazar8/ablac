@@ -90,7 +90,9 @@ class X509Certificate(
     val subjectKeyId: string,
     val authorityKeyId: string,
     /** The OID of the first critical extension this code does not know, or "". */
-    val unknownCritical: string
+    val unknownCritical: string,
+    /** The leaf promises an OCSP staple (the TLS Feature extension of RFC 7633 lists status_request): a client that checks revocation refuses it without one. */
+    val mustStaple: bool = false
 ) {
     // Returns true if the canonical subject and issuer names match.
     fun selfIssued(): bool = this.subject.canonical == this.issuer.canonical
@@ -469,6 +471,7 @@ fun x509ParseDer(der: string): X509Certificate {
     var pathLength = -1
     var keyUsage = -1
     var hasEku = false
+    var mustStaple = false
     val eku: array<string> = []
     var hasAlt = false
     var altCritical = false
@@ -587,6 +590,16 @@ fun x509ParseDer(der: string): X509Certificate {
                 if (!body.ok || body.tag != DER_SEQUENCE || body.end != valueItem.end) return x509Failed("bad authorityKeyIdentifier")
                 val id = derItem(der, body.start, body.end)
                 if (id.ok && id.tag == 128) authorityKeyId = der.slice(id.start, id.end)
+            } else if (oid == "1.3.6.1.5.5.7.1.24") {
+                // TLS Feature (RFC 7633): a SEQUENCE OF INTEGER; status_request (5) among them is "must staple".
+                if (!body.ok || body.tag != DER_SEQUENCE || body.end != valueItem.end) return x509Failed("bad tlsfeature")
+                var feature = body.start
+                while (feature < body.end) {
+                    val number = derItem(der, feature, body.end)
+                    if (!number.ok || number.tag != DER_INTEGER) return x509Failed("bad tlsfeature")
+                    if (x509SmallInteger(der, number) == 5) mustStaple = true
+                    feature = number.end
+                }
             } else if (critical && !x509KnownIgnorable(oid) && unknownCritical == "") {
                 unknownCritical = oid
             }
@@ -598,7 +611,7 @@ fun x509ParseDer(der: string): X509Certificate {
         der.slice(signatureItem.start + 1, signatureItem.end), issuer.name, subject.name, notBefore, notAfter,
         keyOid, x509AlgorithmParameters(der, keyAlgorithm), der.slice(keyBitsItem.start + 1, keyBitsItem.end), spki,
         hasBasic, isCa, pathLength, keyUsage, hasEku, eku, hasAlt, altCritical, alt, hasConstraints, permitted, excluded,
-        subjectKeyId, authorityKeyId, unknownCritical
+        subjectKeyId, authorityKeyId, unknownCritical, mustStaple
     )
 }
 
@@ -692,10 +705,10 @@ private fun x509PssHash(der: string, item: DerItem): int {
 }
 
 /** RSASSA-PSS (RFC 4055): SHA-2 with MGF1 of the same hash and an explicit salt length; the SHA-1 defaults are refused. */
-private fun x509CheckPss(cert: X509Certificate, issuer: X509Certificate): string {
+private fun x509CheckPss(parameters: string, tbs: string, signature: string, issuer: X509Certificate): string {
     val bad = "unsupported RSASSA-PSS parameters"
-    if (cert.signatureParameters.size < 3) return bad
-    val der = cert.signatureParameters.slice(1, cert.signatureParameters.size)
+    if (parameters.size < 3) return bad
+    val der = parameters.slice(1, parameters.size)
     val outer = derItem(der, 0, der.size)
     if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != der.size) return bad
     var at = outer.start
@@ -731,12 +744,11 @@ private fun x509CheckPss(cert: X509Certificate, issuer: X509Certificate): string
     if (issuer.keyOid != "1.2.840.113549.1.1.1") return "the issuer's key is not an RSA key"
     val key = rsaPublicKeyFromDer(issuer.spki)
     if (!key.ok()) return "the issuer's RSA key is unreadable"
-    if (rsaPssVerify(key, hash, cert.tbs, cert.signature, salt)) "" else "the signature is not valid"
+    if (rsaPssVerify(key, hash, tbs, signature, salt)) "" else "the signature is not valid"
 }
 
-/** The reason `cert`'s signature does not verify under the public key of `issuer`, or "" if it does. */
-fun x509CheckSignature(cert: X509Certificate, issuer: X509Certificate): string {
-    val oid = cert.signatureOid
+/** The reason a signature does not verify under the public key of `issuer` (the algorithm, its parameters, the signed bytes and the signature as the callers read them), or "" if it does. */
+private fun x509CheckSignatureOver(oid: string, parameters: string, tbs: string, signature: string, issuer: X509Certificate): string {
     var hash = 0
     var rsa = false
     var ecdsa = false
@@ -748,34 +760,46 @@ fun x509CheckSignature(cert: X509Certificate, issuer: X509Certificate): string {
     else if (oid == "1.2.840.10045.4.3.4") { ecdsa = true; hash = 512 }
     else if (oid == "1.2.840.113549.1.1.5" || oid == "1.2.840.10045.4.1" || oid == "1.2.840.113549.1.1.4") {
         return "the signature uses SHA-1 or MD5, which is not accepted"
-    } else if (oid == "1.2.840.113549.1.1.10") return x509CheckPss(cert, issuer)
+    } else if (oid == "1.2.840.113549.1.1.10") return x509CheckPss(parameters, tbs, signature, issuer)
     else if (oid == "1.3.101.112") {
-        if (cert.signatureParameters != "") return "bad signature algorithm parameters"
+        if (parameters != "") return "bad signature algorithm parameters"
         if (issuer.keyOid != "1.3.101.112" || issuer.keyBits.size != 32) return "the issuer's key is not an Ed25519 key"
-        return if (ed25519Verify(issuer.keyBits, cert.tbs, cert.signature)) "" else "the signature is not valid"
+        return if (ed25519Verify(issuer.keyBits, tbs, signature)) "" else "the signature is not valid"
     } else return "unsupported signature algorithm $oid"
-    val digest = if (hash == 256) sha256(cert.tbs) else if (hash == 384) sha384(cert.tbs) else sha512(cert.tbs)
+    val digest = if (hash == 256) sha256(tbs) else if (hash == 384) sha384(tbs) else sha512(tbs)
     if (rsa) {
-        if (cert.signatureParameters != "" && cert.signatureParameters != "x\x05\x00") return "bad signature algorithm parameters"
+        if (parameters != "" && parameters != "x\x05\x00") return "bad signature algorithm parameters"
         if (issuer.keyOid != "1.2.840.113549.1.1.1") return "the issuer's key is not an RSA key"
         val key = rsaPublicKeyFromDer(issuer.spki)
         if (!key.ok()) return "the issuer's RSA key is unreadable"
         val info = if (hash == 256) X509_DIGEST_INFO_SHA256 else if (hash == 384) X509_DIGEST_INFO_SHA384 else X509_DIGEST_INFO_SHA512
-        return if (rsaVerifyWith(key, info, digest, cert.signature)) "" else "the signature is not valid"
+        return if (rsaVerifyWith(key, info, digest, signature)) "" else "the signature is not valid"
     }
-    if (cert.signatureParameters != "") return "bad signature algorithm parameters"
+    if (parameters != "") return "bad signature algorithm parameters"
     if (issuer.keyOid != "1.2.840.10045.2.1") return "the issuer's key is not an EC key"
     if (issuer.keyParameters == X509_CURVE_P256) {
-        val raw = p256SignatureFromDer(cert.signature)
+        val raw = p256SignatureFromDer(signature)
         if (raw == "") return "the signature is not valid"
         return if (p256EcdsaVerifyDigestRaw(issuer.keyBits, digest, raw)) "" else "the signature is not valid"
     }
     if (issuer.keyParameters == X509_CURVE_P384) {
-        val raw = p384SignatureFromDer(cert.signature)
+        val raw = p384SignatureFromDer(signature)
         if (raw == "") return "the signature is not valid"
         return if (p384EcdsaVerifyDigestRaw(issuer.keyBits, digest, raw)) "" else "the signature is not valid"
     }
     "the issuer's EC curve is not supported"
+}
+
+/** The reason `cert`'s signature does not verify under the public key of `issuer`, or "" if it does. */
+fun x509CheckSignature(cert: X509Certificate, issuer: X509Certificate): string =
+    x509CheckSignatureOver(cert.signatureOid, cert.signatureParameters, cert.tbs, cert.signature, issuer)
+
+/** The reason a `signature` over the bytes `signed` does not verify under the public key of `issuer`, or "" if it does; the algorithm is the AlgorithmIdentifier
+ *  `algorithm` of `der` (as in a certificate's or an OCSP response's signatureAlgorithm), and the same algorithms are accepted as for a certificate (SHA-2 RSA PKCS#1 and PSS,
+ *  ECDSA P-256 and P-384, Ed25519; SHA-1 and MD5 are not). */
+fun x509VerifySignedBytes(der: string, algorithm: DerItem, signed: string, signature: string, issuer: X509Certificate): string {
+    if (!algorithm.ok || algorithm.tag != DER_SEQUENCE) return "bad signature algorithm"
+    x509CheckSignatureOver(x509AlgorithmOid(der, algorithm), x509AlgorithmParameters(der, algorithm), signed, signature, issuer)
 }
 
 // --- Host names (RFC 6125) -------------------------------------------------------------------------------------------

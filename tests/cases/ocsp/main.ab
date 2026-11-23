@@ -1,0 +1,125 @@
+// abla/crypto/ocsp: the responses `openssl ocsp` made for a test CA (tests/cases/ocsp, tools/gen-ocsp-fixtures.sh) judged for the certificates they are about: good, revoked
+// with its reason, unknown, signed by a delegate with and without the OCSPSigning extended key usage, signed by another CA, expired, from the future (with and without the clock skew),
+// good for more than seven days, without nextUpdate, about another certificate, tampered, damaged in every way a byte or a truncation can (never good), and not successful; the policy
+// of ocspCheckPath (off, staple, require; must-staple); and the request ocspRequestDer makes against the one openssl made. The times come from the responses. Argument 0 is the directory.
+// Prints "ocsp ok".
+import "abla/io"
+import "abla/bytes"
+import "abla/crypto/ocsp"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    println("FAIL $what")
+    return
+}
+
+fun check(ok: bool, what: string): void {
+    if (!ok) fail(what)
+    return
+}
+
+fun certificate(directory: string, name: string): X509Certificate {
+    val parsed = x509ParsePem(linuxReadFile("$directory/$name", 65536))
+    if (parsed.certificates.size != 1) {
+        fail("$name does not parse")
+        return x509Failed("missing")
+    }
+    parsed.certificates[0]
+}
+
+fun response(directory: string, name: string): string = linuxReadFile("$directory/$name", 65536)
+
+fun kind(result: OcspResult): string =
+    if (result.status == OCSP_GOOD) "good" else if (result.status == OCSP_REVOKED) "revoked" else if (result.status == OCSP_UNKNOWN) "unknown" else "invalid"
+
+fun main: int {
+    val directory = processArgument(0)
+    val ca = certificate(directory, "ca.pem")
+    val leaf = certificate(directory, "leaf.pem")
+    val must = certificate(directory, "leafmust.pem")
+    val revokedLeaf = certificate(directory, "leafrevoked.pem")
+    val unknownLeaf = certificate(directory, "leafunknown.pem")
+    val good = response(directory, "good.der")
+    // The response's own thisUpdate, from a check at time 0 (it is from the future then, and says when it is from).
+    val first = ocspCheck(good, leaf, ca, 0)
+    val thisUpdate = first.thisUpdate
+    check(thisUpdate > 1700000000, "the thisUpdate of the good response is read ($thisUpdate)")
+    val now = thisUpdate + 3600
+    val ok = ocspCheck(good, leaf, ca, now)
+    check(kind(ok) == "good" && ok.error == "", "a good response: ${kind(ok)} ${ok.error}")
+    check(ok.nextUpdate - ok.thisUpdate == 5 * 86400, "a good response for five days: ${ok.nextUpdate - ok.thisUpdate}")
+    check(kind(ocspCheck(response(directory, "good-delegated.der"), leaf, ca, now)) == "good", "a good response signed by a delegated responder")
+    val noEku = ocspCheck(response(directory, "good-delegated-noeku.der"), leaf, ca, now)
+    check(kind(noEku) == "invalid" && noEku.error.indexOf("neither the issuer") >= 0, "a delegate without the OCSPSigning key usage is refused: ${noEku.error}")
+    val wrongEku = ocspCheck(response(directory, "good-delegated-servereku.der"), leaf, ca, now)
+    check(kind(wrongEku) == "invalid" && wrongEku.error.indexOf("neither the issuer") >= 0, "a delegate with another extended key usage is refused: ${wrongEku.error}")
+    val other = ocspCheck(response(directory, "good-other-signer.der"), leaf, ca, now)
+    check(kind(other) == "invalid" && other.error.indexOf("neither the issuer") >= 0, "a response signed by another CA is refused: ${other.error}")
+    val revoked = ocspCheck(response(directory, "revoked.der"), revokedLeaf, ca, now)
+    check(kind(revoked) == "revoked" && revoked.reason == 1 && revoked.revokedAt > 1700000000, "a revoked certificate: ${kind(revoked)} reason ${revoked.reason}")
+    check(kind(ocspCheck(response(directory, "revoked.der"), revokedLeaf, ca, now + 90 * 86400)) == "revoked", "a revoked response long after it expired is still revoked")
+    check(kind(ocspCheck(response(directory, "unknown.der"), unknownLeaf, ca, now)) == "unknown", "an unknown certificate")
+    val about = ocspCheck(good, revokedLeaf, ca, now)
+    check(kind(about) == "invalid" && about.error.indexOf("not about this certificate") >= 0, "a response about another certificate is refused: ${about.error}")
+    check(kind(ocspCheck(good, leaf, certificate(directory, "other.pem"), now)) == "invalid", "a response is refused for another issuer")
+    val expired = ocspCheck(good, leaf, ca, thisUpdate + 6 * 86400)
+    check(kind(expired) == "invalid" && expired.error.indexOf("expired") >= 0, "an expired response is refused: ${expired.error}")
+    check(kind(ocspCheck(good, leaf, ca, thisUpdate + 5 * 86400)) == "good", "a response is good until nextUpdate")
+    val future = ocspCheck(good, leaf, ca, thisUpdate - 600)
+    check(kind(future) == "invalid" && future.error.indexOf("future") >= 0, "a response from the future is refused: ${future.error}")
+    check(kind(ocspCheck(good, leaf, ca, thisUpdate - 100)) == "good", "five minutes of clock skew are allowed")
+    val long = ocspCheck(response(directory, "good-long.der"), leaf, ca, now)
+    check(kind(long) == "invalid" && long.error.indexOf("seven days") >= 0, "a response good for 30 days is refused: ${long.error}")
+    val noNext = ocspCheck(response(directory, "good-no-next.der"), leaf, ca, now)
+    check(kind(noNext) == "invalid" && noNext.error.indexOf("nextUpdate") >= 0, "a response without nextUpdate is refused: ${noNext.error}")
+    // Tampered: the year in the signed data changed (the signature no longer covers it).
+    val at = good.indexOf("2026")
+    check(at > 0, "the response holds a 2026 time")
+    val tampered = good.slice(0, at) + "2027" + good.slice(at + 4, good.size)
+    val forged = ocspCheck(tampered, leaf, ca, now)
+    check(kind(forged) == "invalid" && forged.error.indexOf("signature") >= 0, "a tampered response is refused: ${forged.error}")
+    val tryLater = ocspCheck("\x30\x03\x0a\x01\x03", leaf, ca, now)
+    check(kind(tryLater) == "invalid" && tryLater.error.indexOf("not successful") >= 0, "an unsuccessful status is refused: ${tryLater.error}")
+    check(kind(ocspCheck("", leaf, ca, now)) == "invalid" && kind(ocspCheck("\x00\x01\x02", leaf, ca, now)) == "invalid", "garbage is refused")
+    // Every truncation and every one-byte change is refused, except changes in the certificates the response carries (the issuer signed it, they are not used).
+    var wrongly = 0
+    for (size in 0 until good.size) if (kind(ocspCheck(good.slice(0, size), leaf, ca, now)) == "good") wrongly = wrongly + 1
+    check(wrongly == 0, "$wrongly truncations of a good response are good")
+    val embedded = good.size - ca.der.size - 8
+    var flipped = 0
+    for (position in 0 until embedded) {
+        val damaged = good.slice(0, position) + byteEncode(int(good[position]) ^ 1) + good.slice(position + 1, good.size)
+        if (kind(ocspCheck(damaged, leaf, ca, now)) == "good") flipped = flipped + 1
+    }
+    check(flipped == 0, "$flipped one-byte changes of a good response before its certificates are still good")
+    // The request.
+    check(ocspRequestDer(leaf, ca) == response(directory, "request-good.der"), "ocspRequestDer is what openssl makes")
+    // The policy over a path.
+    val path: array<X509Certificate> = [leaf, ca]
+    val mustPath: array<X509Certificate> = [must, ca]
+    val none: array<string> = []
+    check(!leaf.mustStaple && must.mustStaple, "the must-staple flag is read (${leaf.mustStaple}, ${must.mustStaple})")
+    check(ocspCheckPath(path, none, OCSP_POLICY_OFF, now) == "", "policy off: no check")
+    check(ocspCheckPath(path, [response(directory, "revoked.der")], OCSP_POLICY_OFF, now) == "", "policy off ignores a staple")
+    check(ocspCheckPath(path, none, OCSP_POLICY_STAPLE, now) == "", "policy staple: no staple is accepted")
+    check(ocspCheckPath(path, [good], OCSP_POLICY_STAPLE, now) == "", "policy staple: a good staple")
+    check(ocspCheckPath(path, [response(directory, "revoked.der")], OCSP_POLICY_STAPLE, now).indexOf("not acceptable") >= 0, "policy staple: a staple about another certificate is refused")
+    check(ocspCheckPath([revokedLeaf, ca], [response(directory, "revoked.der")], OCSP_POLICY_STAPLE, now).indexOf("revoked") >= 0, "policy staple: a revoked staple is refused")
+    check(ocspCheckPath(path, [good], OCSP_POLICY_STAPLE, thisUpdate + 7 * 86400).indexOf("not acceptable") >= 0, "policy staple: an expired staple is refused")
+    check(ocspCheckPath([unknownLeaf, ca], [response(directory, "unknown.der")], OCSP_POLICY_STAPLE, now) == "", "policy staple: an unknown status is accepted")
+    check(ocspCheckPath([unknownLeaf, ca], [response(directory, "unknown.der")], OCSP_POLICY_REQUIRE, now).indexOf("does not know") >= 0, "policy require: an unknown status is refused")
+    check(ocspCheckPath(path, none, OCSP_POLICY_REQUIRE, now).indexOf("no OCSP staple") >= 0, "policy require: no staple is refused")
+    check(ocspCheckPath(path, [good], OCSP_POLICY_REQUIRE, now) == "", "policy require: a good staple")
+    check(ocspCheckPath(mustPath, none, OCSP_POLICY_STAPLE, now).indexOf("must-staple") >= 0, "must-staple without a staple is refused under policy staple")
+    check(ocspCheckPath(mustPath, [response(directory, "good-must.der")], OCSP_POLICY_STAPLE, now) == "", "must-staple with a good staple")
+    check(ocspCheckPath(mustPath, none, OCSP_POLICY_OFF, now) == "", "must-staple is not looked at with the policy off")
+    check(ocspCheckPath([leaf], none, OCSP_POLICY_REQUIRE, now) == "", "a path of one certificate (a trusted leaf) has no issuer to ask")
+    if (failures == 0) println("ocsp ok")
+    if (failures == 0) 0 else 1
+}

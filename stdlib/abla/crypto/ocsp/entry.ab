@@ -1,0 +1,263 @@
+// OCSP responses (RFC 6960), as a TLS client checks a stapled one (RFC 6066 section 8; abla/tls/pure asks for the staple, this module judges it) and as an application
+// builds a request for one it fetches itself. There is no fetching here: the response comes from the handshake or from the application.
+//
+//   val result = ocspCheck(response, leaf, issuer, now)          // good, revoked, unknown, or invalid with the reason
+//   val problem = ocspCheckPath(path, staples, OCSP_POLICY_STAPLE, now)   // "" or why the path is refused
+//
+// A response is accepted for a certificate only when: it is a successful basic response; a SingleResponse names the certificate (the hash of the issuer's name, the hash of the
+// issuer's key and the serial number, SHA-1 or SHA-256); it is signed by the issuer or by a certificate the issuer signed that is valid now, may sign OCSP responses
+// (extended key usage id-kp-OCSPSigning) and, with a key usage, may make digital signatures, and whose name or key hash is the responder ID; and, for a "good" status,
+// it is fresh: thisUpdate not in the future (five minutes of clock skew allowed), a nextUpdate that has not passed and not more than seven days after thisUpdate. A
+// revoked or unknown status is reported as it is, whatever the times.
+import "abla/bytes"
+import "abla/crypto"
+import "abla/crypto/der"
+import "abla/crypto/x509"
+import "abla/date"
+import "abla/text"
+
+/** The certificate is not revoked, as of the response. */
+val OCSP_GOOD = 0
+/** The certificate is revoked (`revokedAt`, `reason` say when and why). */
+val OCSP_REVOKED = 1
+/** The responder does not know the certificate. */
+val OCSP_UNKNOWN = 2
+/** The response is not acceptable for the certificate: `error` says why. */
+val OCSP_INVALID = 3
+
+/** No revocation check. */
+val OCSP_POLICY_OFF = 0
+/** Use a staple when there is one (a revoked or invalid one refuses the path) and accept the lack of one, unless the leaf is must-staple (RFC 7633). */
+val OCSP_POLICY_STAPLE = 1
+/** Require a good staple for the leaf. */
+val OCSP_POLICY_REQUIRE = 2
+
+/** The longest a response may say it is good for (nextUpdate - thisUpdate), in seconds: seven days. */
+val OCSP_MAXIMUM_VALIDITY = 604800
+/** The clock skew allowed for thisUpdate, in seconds. */
+val OCSP_CLOCK_SKEW = 300
+
+/** What a response says about one certificate: `status` is one of OCSP_GOOD, OCSP_REVOKED, OCSP_UNKNOWN, OCSP_INVALID (then `error` is the reason; a response refused for its times still reports them); the times are seconds since 1970
+ *  (nextUpdate is 0 without one; `revokedAt` and `reason` are for a revoked status, the reason -1 when none was given). */
+class OcspResult(val status: int, val error: string, val thisUpdate: int, val nextUpdate: int, val revokedAt: int, val reason: int)
+
+private val OCSP_BASIC = "1.3.6.1.5.5.7.48.1.1"
+private val OCSP_SIGNING = "1.3.6.1.5.5.7.3.9"
+private val OCSP_SHA1 = "1.3.14.3.2.26"
+private val OCSP_SHA256 = "2.16.840.1.101.3.4.2.1"
+
+private fun ocspInvalid(error: string): OcspResult = OcspResult(OCSP_INVALID, error, 0, 0, 0, -1)
+
+/** Seconds since 1970 of a GeneralizedTime `YYYYMMDDHHMMSSZ`, or -1. */
+private fun ocspTime(text: string): int {
+    if (text.size != 15 || text[14] != 90) return -1
+    for (i in 0 until 14) if (text[i] < 48 || text[i] > 57) return -1
+    val iso = text.slice(0, 4) + "-" + text.slice(4, 6) + "-" + text.slice(6, 8) + "T" + text.slice(8, 10) + ":" + text.slice(10, 12) + ":" + text.slice(12, 14) + "Z"
+    val milliseconds = utcIso8601Parse(iso)
+    if (milliseconds == null) -1 else milliseconds / 1000
+}
+
+private fun ocspHash(algorithm: string, data: string): string = if (algorithm == OCSP_SHA1) sha1(data) else sha256(data)
+
+/** Whether the CertID `certId` (a SEQUENCE of `response`) is the one of `leaf` under `issuer`. */
+private fun ocspCertIdMatches(response: string, certId: DerItem, leaf: X509Certificate, issuer: X509Certificate): bool {
+    val algorithm = derItem(response, certId.start, certId.end)
+    if (!algorithm.ok || algorithm.tag != DER_SEQUENCE) return false
+    val oid = derItem(response, algorithm.start, algorithm.end)
+    val text = x509OidText(response, oid)
+    if (text != OCSP_SHA1 && text != OCSP_SHA256) return false
+    val nameHash = derItem(response, algorithm.end, certId.end)
+    if (!nameHash.ok || nameHash.tag != DER_OCTET_STRING) return false
+    val keyHash = derItem(response, nameHash.end, certId.end)
+    if (!keyHash.ok || keyHash.tag != DER_OCTET_STRING) return false
+    val serial = derItem(response, keyHash.end, certId.end)
+    if (!serial.ok || serial.tag != DER_INTEGER || serial.end != certId.end) return false
+    response.slice(nameHash.start, nameHash.end) == ocspHash(text, leaf.issuer.der) &&
+        response.slice(keyHash.start, keyHash.end) == ocspHash(text, issuer.keyBits) &&
+        response.slice(serial.start, serial.end) == leaf.serial
+}
+
+/** Whether the responder ID (byName [1] or byKey [2], `item` of `response`) is `candidate`. */
+private fun ocspResponderIs(response: string, item: DerItem, candidate: X509Certificate): bool {
+    if (item.tag == 161) return response.slice(item.start, item.end) == candidate.subject.der
+    if (item.tag == 162) {
+        val key = derItem(response, item.start, item.end)
+        return key.ok && key.tag == DER_OCTET_STRING && key.end == item.end && response.slice(key.start, key.end) == sha1(candidate.keyBits)
+    }
+    false
+}
+
+/** The signer of the response among the issuer and the certificates it carries ([0] of the BasicOCSPResponse, `certs`), or a failed certificate. */
+private fun ocspSigner(response: string, responder: DerItem, certs: DerItem, issuer: X509Certificate, now: int): X509Certificate {
+    if (ocspResponderIs(response, responder, issuer)) return issuer
+    if (certs.ok && certs.tag == 160) {
+        val list = derItem(response, certs.start, certs.end)
+        if (list.ok && list.tag == DER_SEQUENCE && list.end == certs.end) {
+            var at = list.start
+            while (at < list.end) {
+                val item = derItem(response, at, list.end)
+                if (!item.ok) break
+                val candidate = x509ParseDer(response.slice(at, item.end))
+                at = item.end
+                if (!candidate.ok || !ocspResponderIs(response, responder, candidate)) continue
+                if (x509CheckSignature(candidate, issuer) != "") continue
+                if (now < candidate.notBefore || now > candidate.notAfter) continue
+                if (!candidate.hasExtendedKeyUsage || !ocspHasPurpose(candidate, OCSP_SIGNING)) continue
+                if (candidate.keyUsage != -1 && (candidate.keyUsage & X509_KEY_DIGITAL_SIGNATURE) == 0) continue
+                return candidate
+            }
+        }
+    }
+    x509Failed("no signer")
+}
+
+/** What the OCSP response `response` (DER) says about `leaf`, whose issuer is `issuer`, at `now` (seconds since 1970). */
+fun ocspCheck(response: string, leaf: X509Certificate, issuer: X509Certificate, now: int): OcspResult {
+    if (!leaf.ok || !issuer.ok) return ocspInvalid("a certificate that does not parse")
+    val outer = derItem(response, 0, response.size)
+    if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != response.size) return ocspInvalid("not an OCSPResponse")
+    val statusItem = derItem(response, outer.start, outer.end)
+    if (!statusItem.ok || statusItem.tag != 10 || statusItem.end != statusItem.start + 1) return ocspInvalid("a malformed responseStatus")
+    if (int(response[statusItem.start]) != 0) return ocspInvalid("the responder's status is ${int(response[statusItem.start])}, not successful")
+    val wrapper = derItem(response, statusItem.end, outer.end)
+    if (!wrapper.ok || wrapper.tag != 160 || wrapper.end != outer.end) return ocspInvalid("no responseBytes")
+    val responseBytes = derItem(response, wrapper.start, wrapper.end)
+    if (!responseBytes.ok || responseBytes.tag != DER_SEQUENCE || responseBytes.end != wrapper.end) return ocspInvalid("malformed responseBytes")
+    val kind = derItem(response, responseBytes.start, responseBytes.end)
+    if (x509OidText(response, kind) != OCSP_BASIC) return ocspInvalid("not a basic OCSP response")
+    val octets = derItem(response, kind.end, responseBytes.end)
+    if (!octets.ok || octets.tag != DER_OCTET_STRING || octets.end != responseBytes.end) return ocspInvalid("malformed response")
+    val basic = derItem(response, octets.start, octets.end)
+    if (!basic.ok || basic.tag != DER_SEQUENCE || basic.end != octets.end) return ocspInvalid("malformed BasicOCSPResponse")
+    val tbs = derItem(response, basic.start, basic.end)
+    if (!tbs.ok || tbs.tag != DER_SEQUENCE) return ocspInvalid("malformed tbsResponseData")
+    val algorithm = derItem(response, tbs.end, basic.end)
+    if (!algorithm.ok || algorithm.tag != DER_SEQUENCE) return ocspInvalid("malformed signatureAlgorithm")
+    val signature = derItem(response, algorithm.end, basic.end)
+    if (!signature.ok || signature.tag != DER_BIT_STRING || signature.end == signature.start || int(response[signature.start]) != 0) return ocspInvalid("malformed signature")
+    var certs = derFailed()
+    if (signature.end < basic.end) {
+        certs = derItem(response, signature.end, basic.end)
+        if (!certs.ok || certs.tag != 160 || certs.end != basic.end) return ocspInvalid("malformed certs")
+    }
+    // ResponseData: [0] version, responderID, producedAt, responses.
+    var at = tbs.start
+    var item = derItem(response, at, tbs.end)
+    if (item.ok && item.tag == 160) {
+        val version = derItem(response, item.start, item.end)
+        if (!version.ok || version.tag != DER_INTEGER || version.end != item.end || version.end != version.start + 1 || response[version.start] != 0) return ocspInvalid("an OCSP version that is not 1")
+        at = item.end
+        item = derItem(response, at, tbs.end)
+    }
+    if (!item.ok || (item.tag != 161 && item.tag != 162)) return ocspInvalid("malformed responderID")
+    val responder = item
+    at = item.end
+    val produced = derItem(response, at, tbs.end)
+    if (!produced.ok || produced.tag != 24) return ocspInvalid("malformed producedAt")
+    at = produced.end
+    val responses = derItem(response, at, tbs.end)
+    if (!responses.ok || responses.tag != DER_SEQUENCE) return ocspInvalid("malformed responses")
+    // The SingleResponse for the certificate.
+    var found = false
+    var status = OCSP_INVALID
+    var thisUpdate = 0
+    var nextUpdate = 0
+    var revokedAt = 0
+    var reason = -1
+    var cursor = responses.start
+    while (cursor < responses.end && !found) {
+        val single = derItem(response, cursor, responses.end)
+        if (!single.ok || single.tag != DER_SEQUENCE) return ocspInvalid("malformed SingleResponse")
+        cursor = single.end
+        val certId = derItem(response, single.start, single.end)
+        if (!certId.ok || certId.tag != DER_SEQUENCE) return ocspInvalid("malformed CertID")
+        if (!ocspCertIdMatches(response, certId, leaf, issuer)) continue
+        val certStatus = derItem(response, certId.end, single.end)
+        if (!certStatus.ok) return ocspInvalid("malformed certStatus")
+        val updated = derItem(response, certStatus.end, single.end)
+        if (!updated.ok || updated.tag != 24) return ocspInvalid("malformed thisUpdate")
+        thisUpdate = ocspTime(response.slice(updated.start, updated.end))
+        if (thisUpdate < 0) return ocspInvalid("an unreadable thisUpdate")
+        val next = derItem(response, updated.end, single.end)
+        if (next.ok && next.tag == 160) {
+            val nextTime = derItem(response, next.start, next.end)
+            if (!nextTime.ok || nextTime.tag != 24 || nextTime.end != next.end) return ocspInvalid("malformed nextUpdate")
+            nextUpdate = ocspTime(response.slice(nextTime.start, nextTime.end))
+            if (nextUpdate < 0) return ocspInvalid("an unreadable nextUpdate")
+        }
+        if (certStatus.tag == 128 && certStatus.end == certStatus.start) status = OCSP_GOOD
+        else if (certStatus.tag == 130 && certStatus.end == certStatus.start) status = OCSP_UNKNOWN
+        else if (certStatus.tag == 161) {
+            status = OCSP_REVOKED
+            val timeItem = derItem(response, certStatus.start, certStatus.end)
+            if (!timeItem.ok || timeItem.tag != 24) return ocspInvalid("malformed revocationTime")
+            revokedAt = ocspTime(response.slice(timeItem.start, timeItem.end))
+            val why = derItem(response, timeItem.end, certStatus.end)
+            if (why.ok && why.tag == 160) {
+                val code = derItem(response, why.start, why.end)
+                if (code.ok && code.tag == 10 && code.end == code.start + 1) reason = int(response[code.start])
+            }
+        } else return ocspInvalid("malformed certStatus")
+        found = true
+    }
+    if (!found) return ocspInvalid("the response is not about this certificate")
+    // The signature: by the issuer or by a delegate it authorized.
+    val signer = ocspSigner(response, responder, certs, issuer, now)
+    if (!signer.ok) return ocspInvalid("the responder is neither the issuer nor a certificate the issuer authorized to sign OCSP responses")
+    val bad = x509VerifySignedBytes(response, algorithm, response.slice(basic.start, tbs.end), response.slice(signature.start + 1, signature.end), signer)
+    if (bad != "") return ocspInvalid("the response's signature: $bad")
+    if (status != OCSP_GOOD) return OcspResult(status, "", thisUpdate, nextUpdate, revokedAt, reason)
+    if (thisUpdate > now + OCSP_CLOCK_SKEW) return OcspResult(OCSP_INVALID, "the response is from the future", thisUpdate, nextUpdate, 0, -1)
+    if (nextUpdate == 0) return OcspResult(OCSP_INVALID, "the response has no nextUpdate", thisUpdate, 0, 0, -1)
+    if (nextUpdate < now) return OcspResult(OCSP_INVALID, "the response has expired", thisUpdate, nextUpdate, 0, -1)
+    if (nextUpdate < thisUpdate || nextUpdate - thisUpdate > OCSP_MAXIMUM_VALIDITY) {
+        return OcspResult(OCSP_INVALID, "the response claims to be good for more than seven days", thisUpdate, nextUpdate, 0, -1)
+    }
+    OcspResult(OCSP_GOOD, "", thisUpdate, nextUpdate, 0, -1)
+}
+
+/** "" when the path may be used under `policy` and the staples (one OCSP response per certificate of the path in the same order, "" for none; `path` is the verified
+ *  chain, the leaf first and the trust anchor last), else why not. A staple that is present is always judged (revoked, invalid and expired ones refuse the path;
+ *  an unknown status refuses it under OCSP_POLICY_REQUIRE); a leaf without a good staple is refused under OCSP_POLICY_REQUIRE and when it is must-staple. */
+fun ocspCheckPath(path: array<X509Certificate>, staples: array<string>, policy: int, now: int): string {
+    if (policy == OCSP_POLICY_OFF || path.size < 2) return ""
+    for (i in 0 until path.size - 1) {
+        val staple = if (i < staples.size) staples[i] else ""
+        if (staple == "") continue
+        val result = ocspCheck(staple, path[i], path[i + 1], now)
+        if (result.status == OCSP_REVOKED) {
+            val why = if (result.reason >= 0) " (reason ${result.reason})" else ""
+            return "certificate $i of the path is revoked$why"
+        }
+        if (result.status == OCSP_INVALID) return "the OCSP response for certificate $i is not acceptable: ${result.error}"
+        if (result.status == OCSP_UNKNOWN && policy == OCSP_POLICY_REQUIRE) return "the OCSP responder does not know certificate $i"
+    }
+    val leafStaple = if (staples.size > 0) staples[0] else ""
+    if (leafStaple == "" && (policy == OCSP_POLICY_REQUIRE || path[0].mustStaple)) {
+        if (path[0].mustStaple) return "the certificate requires an OCSP staple (must-staple) and the server sent none"
+        return "no OCSP staple for the certificate"
+    }
+    ""
+}
+
+private fun ocspLength(size: int): string {
+    if (size < 128) return byteEncode(size)
+    if (size < 256) return byteEncode(128 + 1) + byteEncode(size)
+    byteEncode(128 + 2) + byteEncode(size / 256) + byteEncode(size % 256)
+}
+
+private fun ocspWrap(tag: int, content: string): string = byteEncode(tag) + ocspLength(content.size) + content
+
+/** The DER of an OCSPRequest for `leaf` under `issuer` (one CertID with SHA-1, as responders expect, and no extensions): what an application POSTs to the responder of the
+ *  certificate's authorityInfoAccess. Fetching it is the application's business; the answer is checked with ocspCheck. */
+fun ocspRequestDer(leaf: X509Certificate, issuer: X509Certificate): string {
+    val algorithm = ocspWrap(DER_SEQUENCE, ocspWrap(DER_OID, "\x2b\x0e\x03\x02\x1a") + "\x05\x00")
+    val certId = ocspWrap(DER_SEQUENCE, algorithm + ocspWrap(DER_OCTET_STRING, sha1(leaf.issuer.der)) + ocspWrap(DER_OCTET_STRING, sha1(issuer.keyBits)) +
+        ocspWrap(DER_INTEGER, leaf.serial))
+    ocspWrap(DER_SEQUENCE, ocspWrap(DER_SEQUENCE, ocspWrap(DER_SEQUENCE, ocspWrap(DER_SEQUENCE, certId))))
+}
+
+private fun ocspHasPurpose(certificate: X509Certificate, purpose: string): bool {
+    for (listed in certificate.extendedKeyUsage) if (listed == purpose) return true
+    false
+}
