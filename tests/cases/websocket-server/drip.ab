@@ -1,0 +1,104 @@
+// The WebSocket server (abla/websocket/server) reads a frame that arrives in small pieces in time proportional to its size (#1139 area 4). It
+// keeps reads that cannot complete the frame being received unjoined until the frame can be complete. One program: the server and a client in
+// one thread; the client writes and the server takes three steps after every write, so every read is one piece. It checks that
+//   - a fragmented message of three frames, then a ping, gives the same messages however the bytes are split (at every position, and one
+//     byte at a time): the message is delivered whole, once;
+//   - the time grows in proportion: a 256 KiB message in one-byte pieces takes at most 10 times what 64 KiB takes (4 times the bytes), the best
+//     of two runs each, so a shared machine's noise does not matter.
+// Prints "websocket-server drip ok".
+import "abla/io"
+import "abla/text"
+import "abla/net"
+import "abla/websocket"
+import "abla/websocket/server"
+import "abla/sys/linux/process"
+
+val UPGRADE = "GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+val KEY = "\u0001\u0002\u0003\u0004"
+
+// The sizes of the messages the server delivered, as text: "[12,3]".
+fun delivered(events: array<WebSocketServerEvent>): string {
+    var out = "["
+    for (e in events) {
+        if (e.isMessage()) out = out + (if (out.size > 1) "," else "") + "${e.payload.size}"
+    }
+    out + "]"
+}
+
+// Sends `data` after the upgrade in pieces of `piece`, the server stepping three times after each; the milliseconds, or -1 when the messages
+// the server delivered are not `expected`.
+fun drip(data: string, piece: int, expected: string): int {
+    val server = webSocketServer(ipv4Loopback(0))
+    if (server.listener.descriptor < 0) return -1
+    val client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
+    client.write(UPGRADE)
+    for (i in 0 until 3) server.step(20)
+    client.setNonblocking()
+    client.readCompact(4096)
+    var seen = ""
+    var events: array<WebSocketServerEvent> = []
+    val started = linuxMonotonicMilliseconds()
+    var sent = 0
+    while (sent < data.size) {
+        val n = if (sent + piece <= data.size) piece else data.size - sent
+        client.write(data.slice(sent, sent + n))
+        sent = sent + n
+        for (k in 0 until 3) server.step(0)
+    }
+    val elapsed = linuxMonotonicMilliseconds() - started
+    for (i in 0 until 3) server.step(20)
+    seen = delivered(server.takeEvents())
+    client.close()
+    if (seen != expected) {
+        println("FAIL a message sent in pieces of ${piece} was delivered as ${seen}, not ${expected}")
+        return -1
+    }
+    elapsed
+}
+
+fun best(data: string, expected: string): int {
+    val first = drip(data, 1, expected)
+    if (first < 0) return -1
+    val second = drip(data, 1, expected)
+    if (second < 0) return -1
+    if (second < first) second else first
+}
+
+fun messageDrip(size: int): int = best(webSocketEncodeFrame("x".repeat(size), 2, true, KEY), "[${size}]")
+
+fun main: int {
+    // Text 3 bytes (not final) + continuation 4 bytes + continuation 5 bytes (final), then a ping: one message of 12 bytes.
+    val wire = webSocketEncodeFrame("abc", 1, false, KEY) + webSocketEncodeFrame("defg", 0, false, KEY) +
+        webSocketEncodeFrame("hijkl", 0, true, KEY) + webSocketEncodeFrame("p", 9, true, KEY)
+    for (cut in 1 until wire.size) {
+        val server = webSocketServer(ipv4Loopback(0))
+        if (server.listener.descriptor < 0) return 1
+        val client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
+        client.write(UPGRADE)
+        for (i in 0 until 3) server.step(20)
+        client.setNonblocking()
+        client.readCompact(4096)
+        client.write(wire.slice(0, cut))
+        for (i in 0 until 3) server.step(10)
+        client.write(wire.slice(cut, wire.size))
+        for (i in 0 until 4) server.step(10)
+        val got = delivered(server.takeEvents())
+        client.close()
+        if (got != "[12]") {
+            println("FAIL a fragmented message split at ${cut} was delivered as ${got}")
+            return 1
+        }
+    }
+    if (drip(wire, 1, "[12]") < 0) return 1
+    val small = messageDrip(65536)
+    val large = messageDrip(262144)
+    if (small < 0 || large < 0) return 1
+    // A tiny small-time is noise; the quadratic cost would show as 17 times.
+    val floor = if (small < 50) 50 else small
+    if (large > 10 * floor) {
+        println("FAIL the time is not in proportion to the size: 64 KiB took ${small} ms, 256 KiB took ${large} ms in one-byte pieces")
+        return 1
+    }
+    println("websocket-server drip ok")
+    0
+}

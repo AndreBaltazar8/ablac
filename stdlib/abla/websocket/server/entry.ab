@@ -230,7 +230,11 @@ resource class WebSocketServer(
     val tls: WebSocketServerTls?,
     val tlsSessions: array<int>,
     val tlsHandshaking: array<bool>,
-    val tlsFlags: array<int>
+    val tlsFlags: array<int>,
+    // Reads that cannot complete the frame being received wait in `tails[slot]`, unjoined, until `needs[slot]` bytes are held:
+    // joining the whole buffer on every read made a large frame sent in small pieces cost time growing with the square of its size.
+    val needs: array<int> = [],
+    val tails: array<ByteBuffer> = []
 ) {
     // Frees TLS sessions and closes remaining client descriptors when the server is released.
     fun drop(): void {
@@ -533,6 +537,8 @@ fun WebSocketServer.allocateSlot(descriptor: int, now: int): int {
         this.tlsSessions[slot] = 0
         this.tlsHandshaking[slot] = false
         this.tlsFlags[slot] = 0
+        this.needs[slot] = 0
+        this.tails[slot] = byteBuffer()
     } else {
         slot = this.descriptors.size
         this.descriptors.append(descriptor)
@@ -556,6 +562,8 @@ fun WebSocketServer.allocateSlot(descriptor: int, now: int): int {
         this.tlsSessions.append(0)
         this.tlsHandshaking.append(false)
         this.tlsFlags.append(0)
+        this.needs.append(0)
+        this.tails.append(byteBuffer())
     }
     this.ids[slot] = this.nextSerial * webSocketServerSlotBits + slot
     this.nextSerial = this.nextSerial + 1
@@ -606,6 +614,8 @@ fun WebSocketServer.release(slot: int, code: int, reason: string): void {
         this.descriptors[slot] = -1
         this.states[slot] = webSocketServerFree
         this.inputs[slot] = ""
+        this.needs[slot] = 0
+        this.tails[slot] = byteBuffer()
         this.outputs[slot] = ""
         this.outputOffsets[slot] = 0
         this.fragmentPayloads[slot] = ""
@@ -756,6 +766,7 @@ private fun webSocketServerClosePayloadCode(payload: string): int =
 // the first unconsumed offset.
 fun WebSocketServer.processFrames(slot: int, data: string, begin: int): int {
     var offset = begin
+    this.needs[slot] = 0
     var processing = true
     val limit = this.options.maximumMessageBytes
     while (processing && this.states[slot] >= webSocketServerOpen &&
@@ -808,6 +819,8 @@ fun WebSocketServer.processFrames(slot: int, data: string, begin: int): int {
                 offset = data.size
             } else if (length < 0 || remaining < header + 4 + length) {
                 processing = false
+                // The frame's whole size is known once its header is: reads that cannot complete it are held (see `needs`).
+                this.needs[slot] = if (length >= 0) header + 4 + length else 0
             } else {
                 val payload = webSocketServerUnmask(
                     data, offset + header, offset + header + 4, length
@@ -987,18 +1000,30 @@ fun WebSocketServer.readSlot(slot: int): void {
         reads = reads + 1
         if (measured > 0) {
             this.lastReceived[slot] = linuxMonotonicMilliseconds()
-            val data = if (this.inputs[slot] == "") chunk
-                else webSocketServerJoin(this.inputs[slot], 0, chunk)
-            this.inputs[slot] = ""
-            val consumed = this.processInput(slot, data)
-            if (this.states[slot] != 0 && consumed < data.size) {
-                val leftover = if (consumed == 0) data
-                    else webSocketServerJoin(data, consumed, "")
-                if (leftover.size > this.options.maximumMessageBytes +
-                    this.options.maximumHeaderBytes +
-                    this.options.maximumBodyBytes + 14) {
-                    this.release(slot, 1009, "input limit exceeded")
-                } else this.inputs[slot] = leftover
+            val held = this.tails[slot].size()
+            if (this.needs[slot] > 0 &&
+                this.inputs[slot].size + held + chunk.size < this.needs[slot]) {
+                // The frame being received cannot be complete yet: keep the piece, parse and join nothing.
+                this.tails[slot].appendText(chunk)
+            } else {
+                var buffered = this.inputs[slot]
+                if (held > 0) {
+                    buffered = webSocketServerJoin(buffered, 0, this.tails[slot].toText())
+                    this.tails[slot] = byteBuffer()
+                }
+                val data = if (buffered == "") chunk
+                    else webSocketServerJoin(buffered, 0, chunk)
+                this.inputs[slot] = ""
+                val consumed = this.processInput(slot, data)
+                if (this.states[slot] != 0 && consumed < data.size) {
+                    val leftover = if (consumed == 0) data
+                        else webSocketServerJoin(data, consumed, "")
+                    if (leftover.size > this.options.maximumMessageBytes +
+                        this.options.maximumHeaderBytes +
+                        this.options.maximumBodyBytes + 14) {
+                        this.release(slot, 1009, "input limit exceeded")
+                    } else this.inputs[slot] = leftover
+                }
             }
             // OpenSSL returns at most one record per read and may hold
             // decrypted bytes that never wake the poller, so a TLS
