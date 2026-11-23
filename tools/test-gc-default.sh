@@ -17,7 +17,7 @@ for mode in release fast; do
     flags=(--no-cache)
     [[ $mode == fast ]] && flags+=(--fast)
     # Option B of decision #107: a --fast build keeps its plain collection; a release build has the default.
-    programs=(plain off serial manual)
+    programs=(plain off serial manual scoped)
     [[ $mode == fast ]] && programs=(plain)
     for program in "${programs[@]}"; do
         "$compiler" build "tests/cases/gc-default/$program.ab" -o "$out/$program.$mode" "${flags[@]}" > "$out/$program.$mode.build" 2>&1 ||
@@ -48,6 +48,17 @@ for mode in release fast; do
     # Under ABLA_GC_STRESS=1 a default program stays serial and synchronous (thousands of collections would each pay the helper and the workers).
     stressed=$(run "ABLA_GC_STRESS=1" env ABLA_GC_STRESS=1 "$root/tools/run-limited.sh" "$out/plain.$mode")
     [[ $stressed != *"gc: phases us"* && $stressed != *"gc: parallel"* ]] || fail "ABLA_GC_STRESS=1 ($mode): the default background collector ran"
+    scoped=$(run "scoped stress" "$root/tools/run-limited.sh" "$out/scoped.$mode")
+    [[ $scoped == *"gc: phases us"* && $scoped != *"gc: parallel"* &&
+        $scoped == *"default gc ok: scoped"* ]] ||
+        fail "scoped stress ($mode): a small heap used parallel collection"
+    scoped_wide=$(run "wide scoped stress" "$root/tools/run-limited.sh" "$out/scoped.$mode" wide)
+    [[ $scoped_wide == *"gc: adaptive, parallel 1"* &&
+        $scoped_wide != *"gc: parallel sweep"* && $scoped_wide == *"default gc ok: scoped"* ]] ||
+        fail "wide scoped stress ($mode): expected adaptive marking and serial sweeping"
+    scoped_forced=$(run "scoped stress with forced workers" env ABLA_GC_WORKERS=2 "$root/tools/run-limited.sh" "$out/scoped.$mode")
+    [[ $scoped_forced == *"gc: parallel mark"* && $scoped_forced == *"default gc ok: scoped"* ]] ||
+        fail "scoped stress ($mode): the explicit worker override was ignored"
     off=$(run "ABLA_GC_BACKGROUND=0" env ABLA_GC_BACKGROUND=0 "$root/tools/run-limited.sh" "$out/plain.$mode")
     [[ $off != *"gc: phases us"* && $off != *"gc: parallel"* ]] || fail "ABLA_GC_BACKGROUND=0 ($mode): the background collector ran"
     workers=$(run "ABLA_GC_WORKERS=0" env ABLA_GC_WORKERS=0 "$root/tools/run-limited.sh" "$out/plain.$mode")
