@@ -443,6 +443,7 @@ test-serial: ablac
 	tools/test-stack-guard.sh $(COMPILER)
 	tools/test-probe-stack-targets.sh $(COMPILER)
 	tools/test-native-twins.sh $(COMPILER)
+	tools/test-trusted-raw-addresses.sh
 	tools/test-float-integer-saturation.sh $(COMPILER)
 	tools/test-named-method-arguments.sh $(COMPILER)
 	tools/test-named-overloads.sh $(COMPILER)
