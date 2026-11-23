@@ -42,9 +42,14 @@ done
 # (docs/design/windows-jit.md §2). The stub ablac.exe is linked with them and a stub for every LLVM-C function.
 kept="$out/ablac.exe.imports"
 [[ -s $kept/exports.def ]] || { tail -5 "$out/build.log" >&2; fail "the compiler's link wrote no exports.def"; }
-# (__chkstk, write and _exit are weak externals, and functions: listed without DATA.)
-for symbol in __emutls_get_address main abla_windows_start __chkstk write _exit; do
+# (__chkstk and the runtime's abla_windows_write and abla_windows_exit are weak externals, and functions: listed without DATA.)
+for symbol in __emutls_get_address main abla_windows_start __chkstk abla_windows_write abla_windows_exit; do
     grep -q "^    $symbol\$" "$kept/exports.def" || fail "exports.def does not export $symbol"
+done
+# write and _exit stay the C library's: LLVM's raw_fd_ostream writes the CRT's descriptors with them, which the runtime's write
+# (over its own descriptor table) would lose, leaving the objects the embedded llc writes empty.
+for symbol in write _exit; do
+    ! grep -q "^    $symbol\$" "$kept/exports.def" || fail "exports.def exports $symbol: the runtime's definition would take the CRT's place"
 done
 defined=$(llvm-nm --defined-only --extern-only "$out/ablac.exe.o" | wc -l)
 listed=$(grep -c '^    ' "$kept/exports.def")
