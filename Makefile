@@ -647,6 +647,7 @@ test-serial: ablac
 	tools/test-package-add.sh $(COMPILER)
 	tools/test-package-git-source.sh $(COMPILER)
 	tools/test-package-git-timeout.sh $(COMPILER)
+	tools/test-package-case-fold.sh $(COMPILER)
 	tools/test-package-info.sh $(COMPILER)
 	tools/test-package-outdated.sh $(COMPILER)
 	tools/test-package-search.sh $(COMPILER)
