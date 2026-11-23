@@ -83,7 +83,7 @@ tools/windows/wine-run.sh "$out/interrupt.exe" > "$out/interrupt.out" 2> "$out/i
 status=0
 timeout 60 tools/windows/wine-run.sh "$out/fault-guard.exe" > "$out/fault-guard.out" 2> "$out/fault-guard.err" || status=$?
 [[ $status == 0 ]] || fail "fault-guard.exe exited $status: $(head -5 "$out/fault-guard.out" "$out/fault-guard.err")"
-[[ "$(cat "$out/fault-guard.out")" == $'armed 0, JIT fault back with 4, signal 11, address 16\nown fault back with 4, address 24' ]] || fail "fault-guard.exe printed: $(cat "$out/fault-guard.out" "$out/fault-guard.err")"
+[[ "$(cat "$out/fault-guard.out")" == $'armed 0, JIT fault back with 4, signal 11, address 16\nown fault back with 4, address 24\noverflow back with 4, signal 11\nsecond overflow back with 4, signal 11' ]] || fail "fault-guard.exe printed: $(cat "$out/fault-guard.out" "$out/fault-guard.err")"
 # The runtime's watchdog (watchdog.ab, call 4002): armed for the calling thread, it redirects it out of executable memory from
 # VirtualAlloc, never out of a loaded image (a runtime sleep gets EINTR instead), interrupts a deferred stop's sleep and an
 # interpreted site's pipe read with EINTR, and does nothing once disarmed. The whole program takes seconds, not the 30-second

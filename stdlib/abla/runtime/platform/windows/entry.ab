@@ -1616,9 +1616,10 @@ private trusted noescape extern:"c" fun SetThreadStackGuarantee(size: int): int
 /** kernel32 GetModuleHandleW: the base of a loaded module by name (0: the process's executable), or 0 when none is loaded. */
 private trusted noescape extern:"c" fun GetModuleHandleW(name: int): int
 
-// The calling thread's fault target (0: none armed) and its info block, and RtlPcToFileHeader's out parameter.
+// The calling thread's fault target (0: none armed) and its info block, RtlPcToFileHeader's out parameter, and whether a
+// stack overflow was taken since the guard page was last put back (1).
 private trusted fun __ablaRuntimeWindowsFaultCell(): int =
-    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 
 // Whether the process's vectored handler is installed (0: not yet).
 private trusted fun __ablaRuntimeWindowsFaultInstalled(): int = nativeStaticAllocate(8)
@@ -1642,15 +1643,39 @@ private trusted fun __ablaRuntimeWindowsFault(pointers: int): int {
     if (image != 0 && image != GetModuleHandleW(0)) return 0
     val info = ablaRuntimeLoadI64(cell + 8)
     ablaRuntimeStoreI64(info + 16, ablaRuntimeLoadI64(record + 40))
+    if (code == 3221225725) ablaRuntimeStoreI64(cell + 24, 1)
     ablaRuntimeStoreI64(cell, 0)
     abla_windows_redirect(context, target, 11, info)
     -1
 }
 
-// faults(request): request = {the target (0: disarm), its info block (24 bytes or more)}, for the calling thread. Returns 0,
-// or -errno.
+/** The Abla Windows routine (src/backend/llvm/windows.ab): the caller's stack pointer. */
+private trusted noescape extern:"c" fun abla_windows_stack_pointer(): int
+
+// Puts the calling thread's stack guard back after an overflow, as the C runtime's _resetstkoflw does: Windows takes the
+// guard page away when it raises STATUS_STACK_OVERFLOW, and without one the next overflow is an access violation with no
+// stack left for a handler, which ends the process. The pages below the stack pointer are committed by then (the overflow
+// went through them), so the guard is set on them again: 64 KiB for the handler and a page (PAGE_READWRITE | PAGE_GUARD),
+// a page below the caller's.
+private trusted fun __ablaRuntimeWindowsRestoreStackGuard(): void {
+    val page = 4096
+    val scratch = __ablaRuntimeWindowsScratch()
+    GetCurrentThreadStackLimits(scratch, scratch + 8)
+    val low = ablaRuntimeLoadI64(scratch)
+    val size = 65536 + page
+    val base = abla_windows_stack_pointer() / page * page - page - size
+    if (base >= low + 2 * page) VirtualProtect(base, size, 260, scratch + 16)
+    return
+}
+
+// faults(request): request = {the target (0: disarm), its info block (24 bytes or more)}, for the calling thread; a stack
+// overflow taken since the last call has its guard put back first. Returns 0, or -errno.
 private trusted fun __ablaRuntimeWindowsFaults(request: int): int {
     val cell = __ablaRuntimeWindowsFaultCell()
+    if (ablaRuntimeLoadI64(cell + 24) != 0) {
+        __ablaRuntimeWindowsRestoreStackGuard()
+        ablaRuntimeStoreI64(cell + 24, 0)
+    }
     val target = ablaRuntimeLoadI64(request)
     ablaRuntimeStoreI64(cell, 0)
     if (target == 0) return 0

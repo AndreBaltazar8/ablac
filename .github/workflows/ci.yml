@@ -234,6 +234,9 @@ jobs:
           nix-shell shell.nix --run 'build/ablac build tests/cases/windows/crash/crash.ab --target x86_64-windows-hosted -o build/windows-programs/crash.exe'
           nix-shell shell.nix --run 'build/ablac build tests/cases/windows/crash/crash.ab --target x86_64-windows-hosted --backtrace -o build/windows-programs/crash-backtrace.exe'
           nix-shell shell.nix --run 'build/ablac build tests/cases/windows/self.ab --target x86_64-windows-hosted -o build/windows-programs/self.exe'
+          for program in fault-guard watchdog preempt; do
+            nix-shell shell.nix --run "build/ablac build tests/cases/windows/$program.ab --target x86_64-windows-hosted -o build/windows-programs/$program.exe"
+          done
           nix-shell shell.nix --run 'tools/test-windows-link.sh build/ablac'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -244,6 +247,9 @@ jobs:
             build/windows-programs/crash-backtrace.exe
             build/windows-programs/crash-backtrace.exe.debug
             build/windows-programs/self.exe
+            build/windows-programs/fault-guard.exe
+            build/windows-programs/watchdog.exe
+            build/windows-programs/preempt.exe
           retention-days: 3
 
   windows-run:
@@ -354,6 +360,40 @@ jobs:
             if (-not ($lines -contains $expected)) { "missing: $expected"; $failed = $true }
           }
           if (-not ($lines -match '^image [A-Za-z]:/([^\\]*/)?self\.exe$')) { 'missing: image <drive>:/.../self.exe'; $failed = $true }
+          $global:LASTEXITCODE = 0
+          if ($failed) { exit 1 }
+          exit 0
+
+      # The compile-time guard's Windows half (docs/design/windows-jit.md §4, §5; tools/test-windows-syscalls.sh checks the same
+      # under Wine, whose guard pages, thread suspension and I/O cancellation work differently): fault-guard.exe sends two
+      # bad accesses and two stack overflows back to their guard, the second overflow only if the first one's guard page was
+      # put back; watchdog.exe stops a thread spinning in executable memory and interrupts its waits; preempt.exe redirects a
+      # spinning thread from another and ends a pipe read with CancelSynchronousIo.
+      - name: The compile-time guard catches faults, stack overflows and a time limit on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $expected = @{
+            'fault-guard' = @('armed 0, JIT fault back with 4, signal 11, address 16', 'own fault back with 4, address 24',
+                              'overflow back with 4, signal 11', 'second overflow back with 4, signal 11')
+            'watchdog' = @('armed 0', 'spin back with 3', 'runtime sleep -4', 'deferred sleep -4, asked true', 'interpreted read -4',
+                           'disarmed sleep 0')
+            'preempt' = @('spinning', 'back with 3, watchdog 1', 'interrupted pipe read -4', 'cancelled true')
+          }
+          $failed = $false
+          foreach ($name in 'fault-guard', 'watchdog', 'preempt') {
+            $process = Start-Process -FilePath (Join-Path $PWD "$name.exe") -PassThru -NoNewWindow `
+              -RedirectStandardOutput "$name.out" -RedirectStandardError "$name.err"
+            $null = $process.Handle  # (so ExitCode is kept: Start-Process without -Wait drops it otherwise)
+            # A missed stop would wait 30 s sleeps out, or for ever: a minute each, then it counts as failed.
+            if (-not $process.WaitForExit(60000)) { $process.Kill(); "${name}: still running after 60 s"; $failed = $true; continue }
+            $lines = @(Get-Content "$name.out")
+            "${name}: exit code $($process.ExitCode)"
+            $lines | ForEach-Object { "  $_" }
+            Get-Content "$name.err" | ForEach-Object { "  stderr: $_" }
+            if ($process.ExitCode -ne 0) { $failed = $true }
+            if (($lines -join "`n") -ne ($expected[$name] -join "`n")) { "${name}: not the expected lines"; $failed = $true }
+          }
           $global:LASTEXITCODE = 0
           if ($failed) { exit 1 }
           exit 0

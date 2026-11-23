@@ -96,8 +96,11 @@ ct_eval.ab's bootstrapCtArmFaults uses it in place of sigaction: its own vectore
 the crash report's) sends an access violation or stack overflow in JIT'd code or the compiler's image to the slice's fault
 handler with (11, info) and the touched address at info + 16, where the handler reads si_addr; an exception in a system DLL
 goes on to the next handler. It reserves 64 KiB with SetThreadStackGuarantee at arming. tests/cases/windows/fault-guard.ab
-checks it under Wine **[checked]**; a stack overflow, and putting the guard page back after one, are not tested yet
-**[confirm]**. The illegal-instruction code is not taken (the slice turns `llvm.trap` into its own jump with 2), nor yet the
+checks it under Wine **[checked]**, and the CI windows-run job runs it on windows-latest **[confirm]** until that job
+has passed. A stack overflow is taken the same way, and the next arming puts the guard page back (Windows removes it when
+it raises the overflow; as the C runtime's `_resetstkoflw` does, PAGE_GUARD on 64 KiB and a page below the stack pointer),
+so a second overflow on the same stack is caught too; fault-guard.ab overflows twice.
+The illegal-instruction code is not taken (the slice turns `llvm.trap` into its own jump with 2), nor yet the
 integer-division ones **[confirm]**.
 
 ## 5. Interrupting a running compile-time call (the time limit)
