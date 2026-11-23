@@ -51,6 +51,50 @@ All three JSON forms accept guarded object members, `if (condition) "key": value
 A false guard skips that member's key and value; the writer emits the necessary
 commas directly, including for objects whose members are all optional.
 
+### HTML attributes and serialization
+
+`$html` accepts a single element with paired tags and nested children.
+Use quoted literal values for static attributes, `name={value}` for Abla string
+expressions, and a bare name for a boolean attribute. To add an ordered group
+of conditional or computed attributes, put an `array<HtmlAttribute>` expression
+in braces between the attributes. Construct these values with
+`ablaHtmlAttribute(name, value)` and `ablaHtmlBooleanAttribute(name)`.
+
+```abla
+import "abla/html"
+import "abla/io"
+
+fun main {
+    val url = "/search?q=a&b"
+    val attributes = [ablaHtmlAttribute("title", "Open the search page")]
+    val anchor = $html <a href={url} {attributes}>Search</a>
+    println(anchor.render())
+}
+// output:
+// <a href="/search?q=a&amp;b" title="Open the search page">Search</a>
+```
+
+`Html.render()` emits the tree as HTML. It escapes ordinary text and dynamic
+attribute values. Literal text and quoted attributes retain authored character
+references. A child expression of type `Html` inserts its subtree. Use
+`ablaHtmlRaw(markup)` to insert a trusted, already-rendered fragment verbatim.
+Void elements such as `img` and `meta` have no closing tag. SVG and MathML elements
+can use the self-closing syntax inside their corresponding roots.
+
+Use trusted template structure for tag and computed attribute names. The
+serializer escapes HTML syntax and leaves URL, CSS and JavaScript policies to
+the application. Supply trusted script and style bodies as explicit raw
+markup.
+
+An unquoted literal attribute value is a compile error.
+
+```abla error
+import "abla/html"
+
+fun invalid(): Html = $html <img src=logo.svg>
+// error: expected a quoted HTML attribute or an Abla expression in braces
+```
+
 ## Writing a subparser
 
 A subparser is a `compile fun` that takes a `ParserCursor` and returns a

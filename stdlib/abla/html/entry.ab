@@ -1,91 +1,257 @@
-// Phase-safe tree and compile-time `$html` parser provider.
-// Kinds: 0 missing, 1 element, 2 dynamic/text node.
+// Phase-safe tree and compile-time $html parser provider.
 
+import "abla/bytes"
 import "abla/compiler/parser"
+import "abla/text"
 
-// A phase-safe tree node. Kind 0 denotes a missing node, 1 an element with `tag` and `children`, and 2 a text node with `text`.
+/// An attribute in rendering order. A null value represents a bare attribute.
+class HtmlAttribute(val name: string, val value: string?, val sourceQuote: string = "")
+
+/// A phase-safe node. Kind 0 is missing, 1 is an element, 2 is text, and 3 is explicit raw markup.
 class Html(
     val kind: int,
     val tag: string,
     val text: string,
-    val children: array<Html>
+    val children: array<Html>,
+    val attributes: array<HtmlAttribute> = [],
+    val selfClosing: bool = false,
+    val literalText: bool = false
 )
 
-/// Builds an Abla call expression with the supplied name and one argument.
-compile fun ablaHtmlUnarySyntaxCall(
-    name: string,
-    value: SyntaxExpression
-): SyntaxExpression {
-    val arguments: array<SyntaxExpression> = []
-    arguments.append(value)
-    syntaxCall(name, arguments)
+private fun ablaHtmlNameValid(name: string, attribute: bool): bool {
+    if (name == "") return false
+    val first = name[0]
+    if (!attribute && !(first >= 65 && first <= 90) && !(first >= 97 && first <= 122)) return false
+    for (b in name) {
+        if (!(b >= 65 && b <= 90) && !(b >= 97 && b <= 122) &&
+            !(b >= 48 && b <= 57) && b != 45 && b != 46 && b != 58 && b != 95) return false
+    }
+    true
 }
 
-/// Lowers a literal element and its children to HTML construction syntax, reporting missing or mismatched tags.
+private fun ablaHtmlVoid(tag: string): bool = when (tag) {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr" -> true
+    else -> false
+}
+
+private fun ablaHtmlRawText(tag: string): bool = when (tag) {
+    "script", "style", "xmp", "iframe", "noembed", "noframes", "noscript", "plaintext" -> true
+    else -> false
+}
+
+/// Builds an Abla call expression with the supplied name and one argument.
+compile fun ablaHtmlUnarySyntaxCall(name: string, value: SyntaxExpression): SyntaxExpression =
+    syntaxCall(name, [value])
+
+private compile fun ablaHtmlSkipSpace(cursor: ParserCursor): bool {
+    val start = parserRawPosition(cursor)
+    parserRawSkipWhitespace(cursor)
+    parserRawPosition(cursor) > start
+}
+
+private compile fun ablaHtmlTakeName(cursor: ParserCursor): string =
+    parserRawTakeUntil(cursor, " \t\r\n=/>{}<\"'")
+
+private compile fun ablaHtmlReadHole(cursor: ParserCursor): SyntaxExpression {
+    val value = parserParseAblaExpression(cursor)
+    parserRawExpect(cursor, "}")
+    value
+}
+
+private compile fun ablaHtmlReject(cursor: ParserCursor, message: string): SyntaxExpression {
+    parserFail(cursor, message)
+    syntaxCall("ablaHtmlEmpty", [])
+}
+
+/// Lowers a literal element and reports malformed attributes, tags and children.
 compile fun ablaHtmlParse(cursor: ParserCursor): SyntaxExpression {
     parserRawSkipWhitespace(cursor)
-    parserRawExpect(cursor, "<")
-    val tag = parserRawTakeName(cursor)
-    parserRawSkipWhitespace(cursor)
-    parserRawExpect(cursor, ">")
+    ablaHtmlParseElement(cursor, 0, false)
+}
 
-    val children: array<SyntaxExpression> = []
-    var closed = false
-    while (!closed) {
-        if (parserRawEnd(cursor)) {
-            closed = true
-            parserFail(cursor, "unterminated HTML element")
-        } else if (parserRawAt(cursor, "</")) {
-            closed = true
-            parserRawSkipWhitespace(cursor)
-        } else if (parserRawAt(cursor, "<")) {
-            children.append(ablaHtmlParse(cursor))
-        } else if (parserRawAt(cursor, "{")) {
-            parserRawExpect(cursor, "{")
-            val value = parserParseAblaExpression(cursor)
-            parserRawExpect(cursor, "}")
-            children.append(ablaHtmlUnarySyntaxCall("ablaHtmlDynamic", value))
+private compile fun ablaHtmlParseElement(cursor: ParserCursor, depth: int, insideForeign: bool): SyntaxExpression {
+    if (depth >= 256) return ablaHtmlReject(cursor, "HTML literal exceeds 256 nested elements")
+    parserRawExpect(cursor, "<")
+    val tag = ablaHtmlTakeName(cursor)
+    if (!ablaHtmlNameValid(tag, false)) return ablaHtmlReject(cursor, "expected an HTML tag name")
+    val lower = tag.lowercase()
+    val foreign = insideForeign || lower == "svg" || lower == "math"
+    val voidElement = !foreign && ablaHtmlVoid(lower)
+
+    val groups: array<SyntaxExpression> = []
+    val names: array<string> = []
+    var separated = ablaHtmlSkipSpace(cursor)
+    while (!parserRawAt(cursor, ">") && !parserRawAt(cursor, "/>")) {
+        if (!separated || parserRawEnd(cursor)) return ablaHtmlReject(cursor, "expected a space or the end of an HTML start tag")
+        if (parserRawConsume(cursor, "{")) {
+            groups.append(ablaHtmlReadHole(cursor))
+            separated = ablaHtmlSkipSpace(cursor)
         } else {
-            val value = parserRawTakeUntil(cursor, "<{")
-            if (value != "") {
-                children.append(
-                    ablaHtmlUnarySyntaxCall("ablaHtmlText", syntaxString(value))
-                )
+            val name = ablaHtmlTakeName(cursor)
+            if (!ablaHtmlNameValid(name, true)) return ablaHtmlReject(cursor, "expected an HTML attribute name")
+            val key = name.lowercase()
+            for (previous in names) if (key == previous) return ablaHtmlReject(cursor, "duplicate HTML attribute")
+            names.append(key)
+            separated = ablaHtmlSkipSpace(cursor)
+            val attrName = syntaxString(name)
+            val attribute = if (!parserRawConsume(cursor, "=")) {
+                ablaHtmlUnarySyntaxCall("ablaHtmlBooleanAttribute", attrName)
+            } else {
+                parserRawSkipWhitespace(cursor)
+                val value = if (parserRawConsume(cursor, "{")) {
+                    syntaxCall("ablaHtmlAttribute", [attrName, ablaHtmlReadHole(cursor)])
+                } else {
+                    val quote = if (parserRawConsume(cursor, "\"")) "\"" else if (parserRawConsume(cursor, "'")) "'" else ""
+                    if (quote == "") return ablaHtmlReject(cursor, "expected a quoted HTML attribute or an Abla expression in braces")
+                    val value = parserRawTakeUntil(cursor, quote)
+                    if (!parserRawConsume(cursor, quote)) return ablaHtmlReject(cursor, "unterminated HTML attribute")
+                    syntaxCall("ablaHtmlLiteralAttribute", [attrName, syntaxString(value), syntaxString(quote)])
+                }
+                separated = ablaHtmlSkipSpace(cursor)
+                value
             }
+            groups.append(syntaxArray([attribute]))
         }
     }
 
-    parserRawExpect(cursor, "</")
-    val closingTag = parserRawTakeName(cursor)
-    if (closingTag != tag) {
-        parserFail(cursor, "closing HTML tag does not match opening tag")
+    val selfClosing = parserRawConsume(cursor, "/>")
+    if (!selfClosing) parserRawExpect(cursor, ">")
+    if (selfClosing && !voidElement && !foreign) return ablaHtmlReject(cursor, "only void and foreign HTML elements can self-close")
+    val children: array<SyntaxExpression> = []
+    if (!voidElement && !selfClosing) {
+        while (!parserRawAt(cursor, "</")) {
+            if (parserRawEnd(cursor)) return ablaHtmlReject(cursor, "unterminated HTML element")
+            if (parserRawAt(cursor, "<")) {
+                val begin = parserRawPosition(cursor)
+                children.append(ablaHtmlParseElement(cursor, depth + 1, foreign))
+                if (parserRawPosition(cursor) == begin) return syntaxCall("ablaHtmlEmpty", [])
+            } else if (parserRawConsume(cursor, "{")) {
+                children.append(ablaHtmlUnarySyntaxCall("ablaHtmlDynamic", ablaHtmlReadHole(cursor)))
+            } else {
+                val value = parserRawTakeUntil(cursor, "<{")
+                children.append(ablaHtmlUnarySyntaxCall("ablaHtmlLiteralText", syntaxString(value)))
+            }
+        }
+        parserRawExpect(cursor, "</")
+        val closingTag = ablaHtmlTakeName(cursor)
+        if (closingTag.lowercase() != lower) return ablaHtmlReject(cursor, "closing HTML tag does not match opening tag")
+        parserRawSkipWhitespace(cursor)
+        parserRawExpect(cursor, ">")
     }
-    parserRawSkipWhitespace(cursor)
-    parserRawExpect(cursor, ">")
-
-    val arguments: array<SyntaxExpression> = []
-    arguments.append(syntaxString(tag))
-    arguments.append(syntaxArray(children))
-    syntaxCall("ablaHtmlElement", arguments)
+    if (groups.size == 0 && !selfClosing) return syntaxCall("ablaHtmlElement", [syntaxString(tag), syntaxArray(children)])
+    syntaxCall("ablaHtmlElementWithAttributes", [syntaxString(tag), syntaxArray(children), syntaxArray(groups), syntaxBoolean(selfClosing)])
 }
 
-// Builds an Html tree from a single element with nested tags, literal text, and braced Abla expressions as children. Invalid syntax or mismatched closing tags produce a compile-time error.
+/// Builds an Html tree from one element, with checked attributes and Abla expression holes.
 #compilerRegisterSubparser("html", ablaHtmlParse)
 
-// Returns the kind 0 sentinel for a missing HTML node.
+/// Returns the kind 0 sentinel for a missing HTML node.
 fun ablaHtmlEmpty(): Html = Html(0, "", "", [])
 
-// Creates an element node with `tag` and the supplied `children` in order. The constructor stores the inputs as given.
-fun ablaHtmlElement(tag: string, children: array<Html>): Html =
-    Html(1, tag, "", children)
+/// Creates an element node with the supplied children in order.
+fun ablaHtmlElement(tag: string, children: array<Html>): Html = Html(1, tag, "", children)
 
-// Returns a text node containing `value` as supplied.
+/// Creates an element node and copies its attribute groups into one ordered list.
+fun ablaHtmlElementWithAttributes(tag: string, children: array<Html>, groups: array<array<HtmlAttribute>>, selfClosing: bool = false): Html {
+    val attributes: array<HtmlAttribute> = []
+    for (group in groups) for (attribute in group) attributes.append(attribute)
+    Html(1, tag, "", children, attributes, selfClosing)
+}
+
+/// Returns an attribute whose value is escaped on serialization. Invalid names are omitted when rendered.
+fun ablaHtmlAttribute(name: string, value: string): HtmlAttribute = HtmlAttribute(name, value)
+
+/// Returns a bare attribute. Invalid names are omitted when rendered.
+fun ablaHtmlBooleanAttribute(name: string): HtmlAttribute = HtmlAttribute(name, null)
+
+/// Returns an authored attribute, retaining valid source quotes and character references on serialization.
+fun ablaHtmlLiteralAttribute(name: string, value: string, quote: string): HtmlAttribute = HtmlAttribute(name, value, quote)
+
+/// Returns a text node whose contents are escaped on serialization.
 fun ablaHtmlText(value: string): Html = Html(2, "", value, [])
 
-// Converts `value` with Abla string interpolation and wraps it in a text node.
-fun ablaHtmlDynamic(value: any): Html = Html(2, "", "$value", [])
+/// Returns authored text with character references retained and opening angle brackets escaped.
+fun ablaHtmlLiteralText(value: string): Html = Html(2, "", value, [], [], false, true)
 
-// Searches this tree in preorder for the first element whose tag exactly equals nonempty `tag`. Returns the missing-node sentinel if none matches. The selector is a tag name.
+/// Returns trusted markup for verbatim insertion. Supply markup generated by a trusted renderer or authored in source.
+fun ablaHtmlRaw(value: string): Html = Html(3, "", value, [])
+
+/// Converts an Abla value to escaped HTML text through the normal interpolation conversion.
+fun ablaHtmlDynamic(value: any): Html = ablaHtmlText("$value")
+
+/// Returns an existing HTML subtree for insertion without converting it to text.
+fun ablaHtmlDynamic(value: Html): Html = value
+
+private fun ablaHtmlWriteEscaped(var output: ByteBuffer, value: string, preserveReferences: bool, sourceQuote: string): void {
+    var start = 0
+    for (i in 0 until value.size) {
+        val byte = value[i]
+        val replacement = if (byte == 60) "&lt;"
+            else if (byte == 34 && (!preserveReferences || sourceQuote == "\"")) "&quot;"
+            else if (byte == 39 && (!preserveReferences || sourceQuote == "'")) "&#39;"
+            else if (byte == 38 && !preserveReferences) "&amp;"
+            else if (byte == 62 && !preserveReferences) "&gt;"
+            else ""
+        if (replacement == "") continue
+        if (i > start) output.appendText(value.slice(start, i))
+        output.appendText(replacement)
+        start = i + 1
+    }
+    if (start < value.size) output.appendText(value.slice(start, value.size))
+    return
+}
+
+private fun ablaHtmlWriteAttribute(var output: ByteBuffer, attribute: HtmlAttribute): void {
+    if (!ablaHtmlNameValid(attribute.name, true)) return
+    output.appendText(" ")
+    output.appendText(attribute.name)
+    val value = attribute.value
+    if (value == null) return
+    val quote = if (attribute.sourceQuote == "'") "'" else "\""
+    val preserve = attribute.sourceQuote == "'" || attribute.sourceQuote == "\""
+    output.appendText("=")
+    output.appendText(quote)
+    ablaHtmlWriteEscaped(output, value, preserve, quote)
+    output.appendText(quote)
+    return
+}
+
+private fun ablaHtmlWriteNode(var output: ByteBuffer, node: Html, insideForeign: bool): void {
+    if (node.kind == 2) {
+        ablaHtmlWriteEscaped(output, node.text, node.literalText, "")
+    } else if (node.kind == 3) output.appendText(node.text)
+    else if (node.kind == 1 && ablaHtmlNameValid(node.tag, false)) {
+        val lower = node.tag.lowercase()
+        val foreign = insideForeign || lower == "svg" || lower == "math"
+        output.appendText("<")
+        output.appendText(node.tag)
+        for (attribute in node.attributes) ablaHtmlWriteAttribute(output, attribute)
+        if (foreign && node.selfClosing && node.children.size == 0) output.appendText("/>")
+        else {
+            output.appendText(">")
+            if (foreign || !ablaHtmlVoid(lower)) {
+                val rawText = !foreign && ablaHtmlRawText(lower)
+                for (child in node.children) {
+                    if (!rawText || child.kind == 3) ablaHtmlWriteNode(output, child, foreign)
+                }
+                output.appendText("</")
+                output.appendText(node.tag)
+                output.appendText(">")
+            }
+        }
+    }
+    return
+}
+
+/// Serializes this tree as HTML text, escaping text and dynamic attribute values. Missing nodes and invalid element names render as empty text.
+fun Html.render(): string {
+    val output = byteBuffer()
+    ablaHtmlWriteNode(output, this, false)
+    output.toText()
+}
+
+/// Searches this tree in preorder for the first element whose tag exactly equals nonempty tag. Returns the missing-node sentinel if none matches.
 fun Html.querySelector(tag: string): Html {
     var result = ablaHtmlEmpty()
     if (this.tag == tag) result = this
