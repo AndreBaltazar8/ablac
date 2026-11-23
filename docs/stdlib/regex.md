@@ -37,7 +37,9 @@ import "abla/io"
 import "abla/regex"
 
 fun main {
-    val pages = $regex("(\\d+)-(\\d+)")
+    val pages = $regex(
+        "(\\d+)-(\\d+)"
+    )
     val match = pages.find("pages 12-48")
     if (match != null) println(match.group(1) ?? "")
     val matched = $regex("[a-z]+").matches("hello")
