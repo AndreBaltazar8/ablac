@@ -252,6 +252,7 @@ test-serial: ablac
 	tools/test-arrays-dense.sh $(COMPILER)
 	tools/test-table-search-bound.sh $(COMPILER)
 	tools/test-json-limits.sh $(COMPILER)
+	tools/test-json-small-objects.sh $(COMPILER)
 	tools/test-yaml.sh $(COMPILER)
 	tools/test-yaml-diff.sh $(COMPILER)
 	tools/test-workflow-syntax.sh $(COMPILER)

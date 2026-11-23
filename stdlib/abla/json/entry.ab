@@ -1006,6 +1006,131 @@ private fun jsonParseArrayItems(var state: JsonParserState, depth: int): array<J
     values
 }
 
+private fun jsonParseObjectKey(var state: JsonParserState, count: int): string {
+    val offset = state.offset
+    if (offset >= state.source.size) {
+        state.fail("unexpected_end", "unterminated JSON object", offset)
+        return ""
+    }
+    if (state.source[offset] != 34) {
+        state.fail("unexpected_token", "JSON object key must be a string", offset)
+        return ""
+    }
+    val key = jsonParseQuoted(state)
+    if (state.errorCode.size == 0 && count >= state.limits.maximumObjectMembers) {
+        state.fail("node_limit", "JSON object member count exceeds configured limit", state.offset)
+    }
+    key
+}
+
+private fun jsonParseObjectValue(
+    var state: JsonParserState, depth: int, duplicate: bool
+): Json {
+    if (state.errorCode.size != 0) return jsonNull()
+    if (duplicate) {
+        state.fail("duplicate_key", "duplicate JSON object key", state.offset)
+        return jsonNull()
+    }
+    val source = state.source
+    val offset = jsonWhitespaceAfter(source, state.offset)
+    if (offset >= source.size || source[offset] != 58) {
+        state.fail("unexpected_token", "expected colon after JSON object key", offset)
+        return jsonNull()
+    }
+    state.offset = offset + 1
+    jsonParseValue(state, depth)
+}
+
+// Advance to the next member or past the closing brace. Let errors from a
+// member take precedence over errors at its delimiter.
+private fun jsonParseObjectEnd(var state: JsonParserState): bool {
+    if (state.errorCode.size != 0) return true
+    val source = state.source
+    var offset = jsonWhitespaceAfter(source, state.offset)
+    var closed = false
+    if (offset >= source.size) {
+        state.fail("unexpected_end", "unterminated JSON object", offset)
+    } else if (source[offset] == 125) {
+        offset += 1
+        closed = true
+    } else if (source[offset] == 44) {
+        offset = jsonWhitespaceAfter(source, offset + 1)
+        if (offset < source.size && source[offset] == 125) {
+            state.fail("unexpected_token", "trailing comma in JSON object", offset)
+        }
+    } else state.fail("unexpected_token", "expected comma or closing brace", offset)
+    state.offset = offset
+    closed || state.errorCode.size != 0
+}
+
+private fun jsonParseObjectTail(
+    var state: JsonParserState, depth: int, var keys: array<string>, var values: array<Json>
+): Json {
+    var keyIndex: JsonKeyTable? = null
+    val reject = state.limits.rejectDuplicateKeys
+    val merge = state.limits.mergeDuplicateKeys
+    var closed = false
+    while (state.errorCode.size == 0 && !closed) {
+        val key = jsonParseObjectKey(state, keys.size)
+        if (state.errorCode.size != 0) break
+        var duplicate = false
+        var earlier = -1
+        if (reject) {
+            if (keyIndex == null && keys.size >= jsonKeyIndexMembers) keyIndex = jsonKeyTable()
+            duplicate = jsonKeyRepeats(keys, keyIndex, key)
+        } else if (merge) {
+            if (keyIndex == null && keys.size >= jsonKeyIndexMembers) keyIndex = jsonKeyTable()
+            earlier = jsonKeyPosition(keys, keyIndex, key)
+        }
+        val value = jsonParseObjectValue(state, depth, duplicate)
+        if (state.errorCode.size == 0 && earlier >= 0) values[earlier] = value
+        else if (state.errorCode.size == 0) {
+            keys.append(key)
+            values.append(value)
+        }
+        closed = jsonParseObjectEnd(state)
+    }
+    Json(5, jsonKeyIndexFrom(keyIndex, keys), 0, false, keys, values, jsonNoNumber)
+}
+
+private fun jsonParsedSmallObject(keys: array<string>, values: array<Json>): Json =
+    Json(5, "", 0, false, keys, values, jsonNoNumber)
+
+private fun jsonParseObject(var state: JsonParserState, depth: int): Json {
+    val source = state.source
+    val offset = jsonWhitespaceAfter(source, state.offset + 1)
+    state.offset = offset
+    if (offset < source.size && source[offset] == 125) {
+        state.offset = offset + 1
+        return jsonParsedSmallObject([], [])
+    }
+
+    val reject = state.limits.rejectDuplicateKeys
+    if (!reject && state.limits.mergeDuplicateKeys) return jsonParseObjectTail(state, depth, [], [])
+
+    // Keep small objects' members in local roots until we know the size.
+    // Each literal then allocates its array header and backing space together.
+    val key0 = jsonParseObjectKey(state, 0)
+    val value0 = jsonParseObjectValue(state, depth, false)
+    if (jsonParseObjectEnd(state)) return jsonParsedSmallObject([key0], [value0])
+
+    val key1 = jsonParseObjectKey(state, 1)
+    val value1 = jsonParseObjectValue(state, depth, reject && key1 == key0)
+    if (jsonParseObjectEnd(state)) return jsonParsedSmallObject([key0, key1], [value0, value1])
+
+    val key2 = jsonParseObjectKey(state, 2)
+    val value2 = jsonParseObjectValue(state, depth, reject && (key2 == key0 || key2 == key1))
+    if (jsonParseObjectEnd(state)) return jsonParsedSmallObject([key0, key1, key2], [value0, value1, value2])
+
+    val key3 = jsonParseObjectKey(state, 3)
+    val value3 = jsonParseObjectValue(state, depth, reject && (key3 == key0 || key3 == key1 || key3 == key2))
+    val closed = jsonParseObjectEnd(state)
+    val keys = [key0, key1, key2, key3]
+    val values = [value0, value1, value2, value3]
+    if (closed) return jsonParsedSmallObject(keys, values)
+    jsonParseObjectTail(state, depth, keys, values)
+}
+
 // The value at the cursor, built, and the cursor after it: jsonParse's walk. Its
 // checks come in this order at these offsets (jsonValidateAt makes the same ones
 // without building). The cursor is a local within each value; what a string
@@ -1043,83 +1168,8 @@ private fun jsonParseValue(var state: JsonParserState, depth: int): Json {
         return Json(4, "", 0, false, jsonNoKeys, values, jsonNoNumber)
     }
     if (byte == 123) {
-        val keys: array<string> = []
-        var keyIndex: JsonKeyTable? = null
-        val values: array<Json> = []
-        offset = jsonWhitespaceAfter(source, offset + 1)
-        var closed = false
-        if (offset < size && source[offset] == 125) {
-            offset = offset + 1
-            closed = true
-        }
-        while (state.errorCode.size == 0 && !closed) {
-            if (offset >= size) {
-                state.fail("unexpected_end", "unterminated JSON object", offset)
-            } else if (source[offset] != 34) {
-                state.fail("unexpected_token", "JSON object key must be a string", offset)
-            }
-            var key = ""
-            if (state.errorCode.size == 0) {
-                state.offset = offset
-                key = jsonParseQuoted(state)
-                offset = state.offset
-            }
-            if (state.errorCode.size == 0 &&
-                keys.size >= state.limits.maximumObjectMembers) {
-                state.fail(
-                    "node_limit", "JSON object member count exceeds configured limit", offset
-                )
-            }
-            var duplicate = false
-            // A merged duplicate's earlier position, or -1.
-            var earlier = -1
-            if (state.limits.rejectDuplicateKeys) {
-                if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
-                    keyIndex = jsonKeyTable()
-                }
-                duplicate = jsonKeyRepeats(keys, keyIndex, key)
-            } else if (state.limits.mergeDuplicateKeys && state.errorCode.size == 0) {
-                if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
-                    keyIndex = jsonKeyTable()
-                }
-                earlier = jsonKeyPosition(keys, keyIndex, key)
-            }
-            if (state.errorCode.size == 0 && duplicate) {
-                state.fail("duplicate_key", "duplicate JSON object key", offset)
-            }
-            offset = jsonWhitespaceAfter(source, offset)
-            if (state.errorCode.size == 0 && (offset >= size || source[offset] != 58)) {
-                state.fail("unexpected_token", "expected colon after JSON object key", offset)
-            }
-            if (state.errorCode.size == 0) offset = offset + 1
-            if (state.errorCode.size == 0) {
-                state.offset = offset
-                val value = jsonParseValue(state, depth + 1)
-                offset = state.offset
-                if (state.errorCode.size == 0 && earlier >= 0) {
-                    values[earlier] = value
-                } else if (state.errorCode.size == 0) {
-                    keys.append(key)
-                    values.append(value)
-                }
-            }
-            offset = jsonWhitespaceAfter(source, offset)
-            if (state.errorCode.size == 0 && offset >= size) {
-                state.fail("unexpected_end", "unterminated JSON object", offset)
-            } else if (state.errorCode.size == 0 && source[offset] == 125) {
-                offset = offset + 1
-                closed = true
-            } else if (state.errorCode.size == 0 && source[offset] == 44) {
-                offset = jsonWhitespaceAfter(source, offset + 1)
-                if (offset < size && source[offset] == 125) {
-                    state.fail("unexpected_token", "trailing comma in JSON object", offset)
-                }
-            } else if (state.errorCode.size == 0) state.fail(
-                "unexpected_token", "expected comma or closing brace", offset
-            )
-        }
         state.offset = offset
-        return Json(5, jsonKeyIndexFrom(keyIndex, keys), 0, false, keys, values, jsonNoNumber)
+        return jsonParseObject(state, depth + 1)
     }
     if ((byte >= 48 && byte <= 57) || byte == 45 || byte == 43) {
         val begin = offset
