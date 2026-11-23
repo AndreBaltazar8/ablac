@@ -9,6 +9,8 @@ cd "$root"
 export ABLA_SYSROOT="$root"
 out="$root/build/xtensa-catalog-check"
 mkdir -p "$out"
+"$compiler" build tests/cases/xtensa-catalog/formatted-json.ab -o "$out/format" --fast --no-cache
+"$out/format"
 "$compiler" build tools/xtensa-catalog-check/main.ab -o "$out/check" --fast --no-cache
 catalog=tools/xtensa-companions.json
 fixtures=tests/cases/xtensa-catalog/metadata
