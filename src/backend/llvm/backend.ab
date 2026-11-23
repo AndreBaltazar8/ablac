@@ -1166,23 +1166,39 @@ fun bootstrapNewCompileEdits(
     fresh
 }
 
-fun bootstrapCompileLlvmParsedCached(
+private class BootstrapLlvmPreparation(
+    val finished: BootstrapLlvmCompilation? = null,
+    val program: BootstrapIrProgram? = null,
+    val emit: bool = false,
+    val requireMain: bool = false,
+    val floatKinds: bool = true,
+    val parserErrors: int = 0,
+    val extensionErrors: int = 0,
+    val semanticErrors: int = 0,
+    val analysisErrors: int = 0,
+    val actionErrors: int = 0,
+    val diagnosedLowering: int = 0,
+    val annotationErrors: int = 0,
+    val diagnostics: string = "",
+    val verificationOrigins: array<BootstrapIrVerificationOrigin> = []
+)
+
+// Retire the normalized AST and semantic roots before LLVM starts. The
+// finalizer uses only the diagnostic text, counts, and failed-function origins.
+private @noinline fun bootstrapPrepareLlvmCompilation(
     written: BootstrapParseResult,
     var cache: BootstrapIrCacheState,
     targetTriple: string,
-    pruneUnused: bool = false,
-    requireMain: bool = true,
+    pruneUnused: bool,
+    requireMain: bool,
     // The round of lowering (0: the first), and the edits compile-time code
     // made in the rounds before, committed to `written` already.
-    round: int = 0,
-    committed: array<BootstrapDeclarationEdit> = [],
+    round: int,
+    committed: array<BootstrapDeclarationEdit>,
     // The compile globals before the first round's `#` sites ran: each round
     // starts from them, as a single lowering would.
-    globalsBefore: array<string> = [],
-    // A release driver can request a bitcode handoff for LLVM clients. Decide
-    // after lowering, without changing ordinary programs or nested CT emits.
-    holdLlvmClient: bool = false
-): BootstrapLlvmCompilation {
+    globalsBefore: array<string>
+): BootstrapLlvmPreparation {
     val bridgeProbe = bootstrapFloatBridgeProbe
     val originProbe = bootstrapFloatOriginProbe
     val floatProbe = bridgeProbe || originProbe
@@ -1199,7 +1215,7 @@ fun bootstrapCompileLlvmParsedCached(
         val _discardedExports = bootstrapTakeExportRequests()
         val discardedNamed = bootstrapTakeNamedArgumentErrors()
         val _discardedLowering = bootstrapTakeDiagnosedLoweringErrors()
-        return BootstrapLlvmCompilation(
+        return BootstrapLlvmPreparation(finished = BootstrapLlvmCompilation(
             "",
             written.errors,
             parserOnlyErrors,
@@ -1214,7 +1230,7 @@ fun bootstrapCompileLlvmParsedCached(
             [],
             [],
             ""
-        )
+        ))
     }
     // Generics are replaced by their instances (generics.ab), and overloads
     // get distinct names and their calls name them (overload.ab).
@@ -1267,8 +1283,9 @@ fun bootstrapCompileLlvmParsedCached(
                 bootstrapSemanticWasmUnwinds = false
                 bootstrapCtFinishPassHook(true)
                 val _discardedExports = bootstrapTakeExportRequests()
-                return BootstrapLlvmCompilation("", 0, 0, 0, 0, 0, "", false, false, [], [], "",
-                    true)
+                return BootstrapLlvmPreparation(finished = BootstrapLlvmCompilation(
+                    "", 0, 0, 0, 0, 0, "", false, false, [], [], "", true
+                ))
             }
             bootstrapFloatFormattingRequested = demanded
         }
@@ -1293,8 +1310,8 @@ fun bootstrapCompileLlvmParsedCached(
         bootstrapRuntimePruneOff = true
         bootstrapFloatBridgeProbe = bridgeProbe
         bootstrapFloatOriginProbe = originProbe
-        return bootstrapCompileLlvmParsedCached(
-            written, cache, targetTriple, pruneUnused, requireMain, round, committed, globalsBefore, holdLlvmClient
+        return bootstrapPrepareLlvmCompilation(
+            written, cache, targetTriple, pruneUnused, requireMain, round, committed, globalsBefore
         )
     }
     val actionInputPaths: array<string> = []
@@ -1377,8 +1394,8 @@ fun bootstrapCompileLlvmParsedCached(
         bootstrapRuntimePruneOff = true
         bootstrapFloatBridgeProbe = bridgeProbe
         bootstrapFloatOriginProbe = originProbe
-        return bootstrapCompileLlvmParsedCached(
-            written, cache, targetTriple, pruneUnused, requireMain, round, committed, globalsBefore, holdLlvmClient
+        return bootstrapPrepareLlvmCompilation(
+            written, cache, targetTriple, pruneUnused, requireMain, round, committed, globalsBefore
         )
     }
     val roundEdits = bootstrapNewCompileEdits(bootstrapTakeCompileRoundEdits(), committed)
@@ -1395,20 +1412,20 @@ fun bootstrapCompileLlvmParsedCached(
                 asked =
                     "$asked\n  ${edit.kind} `${bootstrapEditTargetText(edit)}` (${edit.originChain})"
             }
-            return BootstrapLlvmCompilation(
+            return BootstrapLlvmPreparation(finished = BootstrapLlvmCompilation(
                 "", 1, 0, 0, 1, 0,
                 "error[E_COMPILE_EDIT_FIXPOINT]: compile.edit-fixpoint: compile-time code changed the program in each of $BOOTSTRAP_COMPILE_EDIT_ROUNDS rounds of lowering; the last round asked for:$asked\n",
                 false, false, [], [], ""
-            )
+            ))
         }
         val sofar: array<BootstrapDeclarationEdit> = []
         for (edit in committed) sofar.append(edit)
         for (edit in roundEdits) sofar.append(edit)
         bootstrapFloatBridgeProbe = bootstrapFloatBridgeAvailable
         bootstrapFloatOriginProbe = originProbe
-        return bootstrapCompileLlvmParsedCached(
+        return bootstrapPrepareLlvmCompilation(
             bootstrapCommitEdits(written, roundEdits), cache, targetTriple,
-            pruneUnused, requireMain, round + 1, sofar, globals, holdLlvmClient
+            pruneUnused, requireMain, round + 1, sofar, globals
         )
     }
     // Lowering errors whose diagnostics are already staged (a compile-time
@@ -1437,46 +1454,85 @@ fun bootstrapCompileLlvmParsedCached(
     val semanticErrors = analyzed.errors - parsed.errors - analyzed.extensionErrors +
         overloadErrors + namedArgumentErrors
     val extensionErrors = parsed.extensionErrors + analyzed.extensionErrors
+    val emit = !bootstrapParsedHasContractCall(parsed) &&
+        actionErrors == 0 && extensionErrors == 0 &&
+        diagnosedLowering == 0 &&
+        !(semanticErrors > 0 && written.errors - namedArgumentErrors == 0)
+    val verificationOrigins: array<BootstrapIrVerificationOrigin> = if (emit && program.errors > 0)
+        bootstrapIrVerificationOrigins(program, parsed) else []
+    BootstrapLlvmPreparation(
+        program = program,
+        emit = emit,
+        // After a parse error, a `main` the parser skipped isn't missing.
+        requireMain = requireMain && written.errors == 0,
+        floatKinds = floatKinds,
+        parserErrors = written.errors - parsed.extensionErrors - namedArgumentErrors,
+        extensionErrors = extensionErrors,
+        semanticErrors = semanticErrors + annotationErrors + actionErrors + diagnosedLowering,
+        analysisErrors = analyzed.errors,
+        actionErrors = actionErrors,
+        diagnosedLowering = diagnosedLowering,
+        annotationErrors = annotationErrors,
+        diagnostics = "${analyzed.diagnostics}$actionDiagnostics",
+        verificationOrigins = verificationOrigins
+    )
+}
+
+fun bootstrapCompileLlvmParsedCached(
+    written: BootstrapParseResult,
+    var cache: BootstrapIrCacheState,
+    targetTriple: string,
+    pruneUnused: bool = false,
+    requireMain: bool = true,
+    round: int = 0,
+    committed: array<BootstrapDeclarationEdit> = [],
+    globalsBefore: array<string> = [],
+    // Release builds decide whether to hold the module after lowering.
+    holdLlvmClient: bool = false
+): BootstrapLlvmCompilation {
+    val prepared = bootstrapPrepareLlvmCompilation(
+        written, cache, targetTriple, pruneUnused, requireMain, round, committed, globalsBefore
+    )
+    val finished = prepared.finished
+    if (finished != null) return finished
+    val program = prepared.program
+    if (program == null) return BootstrapLlvmCompilation(
+        "", 1, 0, 0, 0, 1, "error[E_COMPILER_UNCLASSIFIED]: LLVM preparation returned no program\n",
+        false, false, [], [], ""
+    )
     val enclosingHold = bootstrapLlvmHoldModule
     if (!enclosingHold && holdLlvmClient && bootstrapLlvmNeedsLlvm(program)) {
         bootstrapLlvmHoldModule = true
     }
-    val emitted = if (bootstrapParsedHasContractCall(parsed) ||
-                      actionErrors > 0 || extensionErrors > 0 ||
-                      diagnosedLowering > 0 ||
-                      (semanticErrors > 0 &&
-                       written.errors - namedArgumentErrors == 0)) {
+    val previousErrors = prepared.analysisErrors + prepared.diagnosedLowering
+    val frontendErrors = previousErrors + prepared.actionErrors
+    val emitted = if (!prepared.emit) {
         val _discardedExports = bootstrapTakeExportRequests()
-        BootstrapLlvmEmission(
-            "", analyzed.errors + actionErrors + diagnosedLowering, ""
-        )
-        // After a parse error, a `main` the parser skipped isn't missing.
+        BootstrapLlvmEmission("", frontendErrors, "")
     } else {
         val enclosingFloatKinds = bootstrapLlvmFloatKindEquality
-        bootstrapLlvmFloatKindEquality = floatKinds
-        val result = bootstrapEmitProgram(
-            program, targetTriple, requireMain && written.errors == 0
-        )
+        bootstrapLlvmFloatKindEquality = prepared.floatKinds
+        val result = bootstrapEmitProgram(program, targetTriple, prepared.requireMain)
         bootstrapLlvmFloatKindEquality = enclosingFloatKinds
         result
     }
     bootstrapLlvmHoldModule = enclosingHold
     // Code generation's own diagnosed errors (E_NO_MAIN) are named already.
     val emissionErrors = bootstrapTakeDiagnosedLoweringErrors()
-    val irErrors = emitted.errors - analyzed.errors - actionErrors - diagnosedLowering
-    val totalErrors = emitted.errors + annotationErrors
+    val irErrors = emitted.errors - frontendErrors
+    val totalErrors = emitted.errors + prepared.annotationErrors
     var diagnostics = bootstrapEnsurePrimaryDiagnostics(
-        "${analyzed.diagnostics}$actionDiagnostics",
-        analyzed.errors + actionErrors,
+        prepared.diagnostics,
+        prepared.analysisErrors + prepared.actionErrors,
         "E_COMPILER_UNCLASSIFIED",
         "parser, extension, or semantic analysis"
     )
     diagnostics = "${diagnostics}${bootstrapTakeDriverDiagnostics()}"
     if (irErrors > emissionErrors) {
-        diagnostics = "$diagnostics${bootstrapIrVerificationDiagnostics(
+        diagnostics = "$diagnostics${bootstrapIrVerificationDiagnosticsWithOrigins(
             program,
-            parsed,
-            analyzed.errors + diagnosedLowering,
+            prepared.verificationOrigins,
+            previousErrors,
             irErrors - emissionErrors
         )}"
     }
@@ -1493,9 +1549,9 @@ fun bootstrapCompileLlvmParsedCached(
     BootstrapLlvmCompilation(
         emitted.output,
         totalErrors,
-        written.errors - parsed.extensionErrors - namedArgumentErrors,
-        parsed.extensionErrors + analyzed.extensionErrors,
-        semanticErrors + annotationErrors + actionErrors + diagnosedLowering,
+        prepared.parserErrors,
+        prepared.extensionErrors,
+        prepared.semanticErrors,
         irErrors,
         diagnostics,
         // iOS rejects reachable LLVM calls before emission. Unused native
