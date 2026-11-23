@@ -55,12 +55,38 @@ private fun tarPath(path: string): string {
     if (parts.size == 0) "." else parts.join("/")
 }
 
+// The entries seen so far, for the duplicate and containment check in constant time per entry (a scan of every earlier entry costs the square of the
+// entry count: 16,000 entries took 13 s). `kinds` holds each path (1 a file, 2 a directory), `ancestors` every proper prefix of a path.
+private fun tarConflicts(kinds: Map<string, int>, ancestors: Map<string, int>, path: string, kind: string): bool {
+    if (kinds.has(path)) return true
+    var i = 0
+    while (i < path.size) {
+        // An earlier file is a parent of this path.
+        if (path[i] == 47 && kinds.has(path.slice(0, i)) && kinds.get(path.slice(0, i)) == 1) return true
+        i += 1
+    }
+    // This file is a parent of an earlier path.
+    kind == "file" && ancestors.has(path)
+}
+
+private fun tarIndexAdd(var kinds: Map<string, int>, var ancestors: Map<string, int>, path: string, kind: string): void {
+    kinds.set(path, if (kind == "file") 1 else 2)
+    var i = 0
+    while (i < path.size) {
+        if (path[i] == 47) ancestors.set(path.slice(0, i), 1)
+        i += 1
+    }
+    return
+}
+
 /// Returns bounded ustar entries, or an error for invalid archives, unsupported entries or exceeded limits.
 fun tarRead(input: string, limits: TarLimits): TarReadResult {
     if (limits.maxArchiveBytes < 0 || limits.maxEntries < 0 || limits.maxFileBytes < 0 ||
         limits.maxTotalFileBytes < 0) return tarError("invalid")
     if (input.size > limits.maxArchiveBytes) return tarError("limit")
     val entries: array<TarEntry> = []
+    val kinds: Map<string, int> = Map()
+    val ancestors: Map<string, int> = Map()
     var total = 0
     var pos = 0
     while (true) {
@@ -101,11 +127,7 @@ fun tarRead(input: string, limits: TarLimits): TarReadResult {
         val rawPath = if (prefix == "") name else "$prefix/$name"
         val path = tarPath(rawPath)
         if (path == "" || (path == "." && kind != "directory")) return tarError("invalid")
-        for (entry in entries) {
-            if (entry.path == path ||
-                (entry.kind == "file" && path.startsWith("${entry.path}/")) ||
-                (kind == "file" && entry.path.startsWith("$path/"))) return tarError("invalid")
-        }
+        if (tarConflicts(kinds, ancestors, path, kind)) return tarError("invalid")
         if (entries.size >= limits.maxEntries || size > limits.maxFileBytes ||
             size > limits.maxTotalFileBytes - total) return tarError("limit")
         pos += 512
@@ -115,6 +137,7 @@ fun tarRead(input: string, limits: TarLimits): TarReadResult {
         i = pos + size
         while (i < pos + size + padding) { if (input[i] != 0) return tarError("invalid"); i += 1 }
         entries.append(TarEntry(path, kind, mode, pos, size, rawPath))
+        tarIndexAdd(kinds, ancestors, path, kind)
         total += size
         pos += size + padding
     }
@@ -143,7 +166,10 @@ class TarStream(
     var padding: int = 0,
     var sourceEof: bool = false,
     var finished: bool = false,
-    var error: string = ""
+    var error: string = "",
+    // The paths seen so far (see tarConflicts).
+    val kinds: Map<string, int> = Map(),
+    val ancestors: Map<string, int> = Map()
 )
 
 /// Returns an empty streaming tar reader with an error already set if any limit is negative.
@@ -243,11 +269,8 @@ fun TarStream.next(var source: TarSource): TarStreamNext {
     if (path == "" || (path == "." && kind != "directory")) {
         this.error = "invalid"; return this.nextError()
     }
-    for (entry in this.entries) {
-        if (entry.path == path || (entry.kind == "file" && path.startsWith("${entry.path}/")) ||
-            (kind == "file" && entry.path.startsWith("$path/"))) {
-            this.error = "invalid"; return this.nextError()
-        }
+    if (tarConflicts(this.kinds, this.ancestors, path, kind)) {
+        this.error = "invalid"; return this.nextError()
     }
     if (this.entries.size >= this.limits.maxEntries || size > this.limits.maxFileBytes ||
         size > this.limits.maxTotalFileBytes - this.totalFileBytes) {
@@ -255,6 +278,7 @@ fun TarStream.next(var source: TarSource): TarStreamNext {
     }
     val entry = TarEntry(path, kind, mode, 0, size, rawPath)
     this.entries.append(entry)
+    tarIndexAdd(this.kinds, this.ancestors, path, kind)
     this.totalFileBytes += size
     this.remaining = size
     this.padding = (512 - size % 512) % 512

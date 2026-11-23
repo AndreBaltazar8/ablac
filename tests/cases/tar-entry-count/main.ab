@@ -1,0 +1,106 @@
+// The tar readers' duplicate and containment check costs the same for every entry (#1139 area 4): the scan of every earlier entry made 16,000 entries
+// (an 8 MB archive) take 13 s, so an archive of empty files was a CPU bomb for any reader that allows a large entry count. Both readers (tarRead and
+// the stream reader) take 16,000 entries within a few seconds here, and the conflicts they refuse are the same as before: a path twice, a file under an
+// earlier file, an earlier file under a new file; a directory over a file's parent, and a directory then a file under it, are allowed.
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "abla/archive/tar"
+import "abla/process/time"
+
+fun octal(value: int, width: int): string {
+    var digits = ""
+    var v = value
+    if (v == 0) digits = "0"
+    while (v > 0) {
+        digits = byteString(48 + v % 8) + digits
+        v = v / 8
+    }
+    "0".repeat(width - 1 - digits.size) + digits + "\x00"
+}
+
+fun byteString(c: int): string {
+    val buffer = byteBuffer()
+    buffer.appendByteValue(c)
+    buffer.toText()
+}
+
+/** One header block of a ustar member of size 0: a regular file, or a directory when `directory`. */
+fun header(name: string, directory: bool): string {
+    var block = name + "\x00".repeat(100 - name.size)
+    block = block + octal(420, 8) + octal(0, 8) + octal(0, 8) + octal(0, 12) + octal(0, 12)
+    block = block + "        " + (if (directory) "5" else "0") + "\x00".repeat(100) + "ustar\x00" + "00" + "\x00".repeat(512 - 265)
+    var sum = 0
+    for (i in 0 until 512) sum = sum + block[i]
+    block.slice(0, 148) + octal(sum, 7) + " " + block.slice(156, 512)
+}
+
+resource class TarFuzzSource(val data: string, var pos: int = 0): TarSource {
+    fun readChunk(maxBytes: int): TarInputChunk {
+        val available = this.data.size - this.pos
+        val size = if (available < maxBytes) available else maxBytes
+        val text = this.data.slice(this.pos, this.pos + size)
+        this.pos += size
+        TarInputChunk(text, this.pos == this.data.size)
+    }
+}
+
+fun streamError(archive: string): string {
+    val limits = TarLimits(archive.size, 1000000000, 1000000, 1000000000)
+    val stream = tarStream(limits)
+    val source = TarFuzzSource(archive)
+    var count = 0
+    while (true) {
+        val next = stream.next(source)
+        if (next.error != "") return next.error
+        if (next.done) return "ok:$count"
+        count = count + 1
+    }
+    "never"
+}
+
+fun readError(archive: string): string {
+    val result = tarRead(archive, TarLimits(archive.size, 1000000000, 1000000, 1000000000))
+    if (result.error != "") result.error else "ok:${result.entries.size}"
+}
+
+fun main: int {
+    var bad = 0
+    val end = "\x00".repeat(1024)
+    val cases: array<string> = [
+        header("a", false) + header("a/b", false) + end,
+        header("a/b", false) + header("a", false) + end,
+        header("a/b", false) + header("a", true) + end,
+        header("a", true) + header("a", true) + end,
+        header("a", true) + header("a/b", false) + end,
+        header("a/b/c", false) + header("a/b", false) + end,
+        header("a", false) + header("a", false) + end]
+    val expected: array<string> = ["invalid", "invalid", "ok:2", "invalid", "ok:2", "invalid", "invalid"]
+    for (i in 0 until cases.size) {
+        val one = readError(cases[i])
+        val two = streamError(cases[i])
+        if (one != expected[i] || two != expected[i]) {
+            println("case $i: tarRead '$one', stream '$two', expected '${expected[i]}'")
+            bad = bad + 1
+        }
+    }
+    val parts = byteBuffer()
+    for (i in 0 until 16000) parts.appendText(header("dir/file$i", false))
+    parts.appendText(end)
+    val archive = parts.toText()
+    var start = monotonicMilliseconds()
+    val one = readError(archive)
+    val readMs = monotonicMilliseconds() - start
+    start = monotonicMilliseconds()
+    val two = streamError(archive)
+    val streamMs = monotonicMilliseconds() - start
+    if (one != "ok:16000" || two != "ok:16000") {
+        println("16000 entries: tarRead '$one', stream '$two'")
+        bad = bad + 1
+    }
+    if (readMs > 6000 || streamMs > 6000) {
+        println("16000 entries took $readMs ms (tarRead) and $streamMs ms (stream)")
+        bad = bad + 1
+    }
+    if (bad == 0) 42 else 1
+}
