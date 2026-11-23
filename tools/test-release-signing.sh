@@ -62,6 +62,30 @@ echo 'extra and missing assets refused'
 fresh; rm "$work/rel/SHA256SUMS" "$work/rel/SHA256SUMS.sig"
 if "$root/tools/sign-release.sh" "$work/rel" "$work/good" > "$work/out" 2>&1; then fail "sign-release.sh accepted a key that is not release-signing.pub"; fi
 grep -q REFUSED "$work/out" || fail "sign-release.sh: no refusal for a foreign key"
+# The local flow: sign-release.sh with a key file (argument, or ABLA_RELEASE_SIGNING_KEY_FILE) and --tag writes the SBOM,
+# SHA256SUMS and the signature into the directory; with the repository's own public key the throwaway key is refused (the
+# wrong-key guard), and a directory with the static-suite marker is refused. The positive local case uses a copy of the
+# tooling whose release-signing.pub is the test key.
+local_root="$work/local-root"; mkdir -p "$local_root/tools" "$local_root/nix"
+cp "$root/tools/sign-release.sh" "$root/tools/verify-release.sh" "$root/tools/release-sbom.sh" "$local_root/tools/"
+cp "$work/good.pub" "$local_root/release-signing.pub"
+if command -v git >/dev/null 2>&1; then
+    mkdir -p "$local_root/tools" "$local_root/nix"
+    cp "$root/tools/bootstrap-compiler.sh" "$root/tools/xtensa-companions.json" "$root/tools/llvm-linux-portable-pins.sh" "$root/tools/llvm-macos-pins.sh" "$local_root/tools/"
+    cp "$root/nix/llvm-fork.nix" "$root/nix/nixpkgs.nix" "$root/nix/llvm-instcombine-fdiv-zero.patch" "$local_root/nix/"
+    git -C "$local_root" init -q -b master
+    git -C "$local_root" -c user.name=t -c user.email=t@t add -A
+    git -C "$local_root" -c user.name=t -c user.email=t@t commit -q -m start
+    fresh; rm -f "$work/rel/SHA256SUMS" "$work/rel/SHA256SUMS.sig"
+    (cd "$local_root" && ABLA_RELEASE_SIGNING_KEY_FILE="$work/good" tools/sign-release.sh "$work/rel" --tag v9.9.9) > "$work/out" 2>&1 || { cat "$work/out" >&2; fail 'sign-release.sh failed on a local directory'; }
+    [[ -f $work/rel/ablac-9.9.9.spdx.json && -f $work/rel/SHA256SUMS.sig ]] || fail 'sign-release.sh wrote no SBOM or signature'
+    grep -q 'ablac-9.9.9.spdx.json' "$work/rel/SHA256SUMS" || fail 'the SBOM is not in SHA256SUMS'
+    accepts "$work/rel"
+    printf 'x' > "$work/rel/static-suite-source.sha"
+    if "$root/tools/sign-release.sh" "$work/rel" "$work/good" > "$work/out" 2>&1; then fail 'sign-release.sh signed a directory with static-suite-source.sha'; fi
+    echo 'local signing: SBOM and signature written into the directory and verified; the marker file is refused'
+fi
+
 # tools/bootstrap-compiler.sh: a signed download is accepted, an unsigned, tampered or foreign-signed one refused, in a
 # copy of the tooling whose release-signing.pub is the test key.
 proj="$work/proj"; mkdir -p "$proj/tools" "$work/serve"

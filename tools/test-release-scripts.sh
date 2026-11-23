@@ -77,6 +77,17 @@ for name in assets sha256 version stage2 convergence; do
     grep -q "^PASS  $name" <<<"$output" || { echo "$output" >&2; fail "no PASS line for $name"; }
 done
 grep -q '^RESULT: PASS' <<<"$output" || fail "no RESULT: PASS"
+grep -q '^SKIP  signature' <<<"$output" || { echo "$output" >&2; fail "an unsigned run's artifacts: no SKIP for the signature check"; }
+grep -q 'tools/sign-release.sh' <<<"$output" || fail "a passing unsigned release names no next step (sign it)"
+# A directory signed by a key that is not release-signing.pub fails the signature check (a locally signed one with the
+# project key passes: tools/test-release-signing.sh covers the signer, the verifier is the same code).
+ssh-keygen -q -t ed25519 -N '' -C stranger -f "$work/stranger" >/dev/null
+signed_dir=$work/signed-by-stranger
+cp -r "$release" "$signed_dir"
+(cd "$signed_dir" && sha256sum -- * > SHA256SUMS)
+ssh-keygen -Y sign -f "$work/stranger" -n abla-release "$signed_dir/SHA256SUMS" >/dev/null 2>&1
+expect_fail "a release signed by a key that is not release-signing.pub" run_check "$signed_dir" v9.9.9 "$stage2"
+grep -q '^FAIL  signature' "$work/out.txt" || fail "a foreign signature did not fail the signature check"
 
 # Layout as `gh run download` leaves it (a folder per artifact) is flattened.
 nested=$work/nested

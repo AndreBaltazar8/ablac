@@ -1,17 +1,41 @@
 #!/usr/bin/env bash
-# Signs a release's assets: writes DIR/SHA256SUMS (every file in DIR, sorted, as `<sha256>  <name>`) and signs it with
-# ssh-keygen -Y sign (namespace abla-release) into DIR/SHA256SUMS.sig, then verifies the result against
-# release-signing.pub (tools/verify-release.sh) so a wrong key never ships.
+# Signs a release's assets, in CI (the publish job) or locally (the release flow that checks a publish-off run's
+# artifacts and uploads them with `gh release create`): writes the SBOM, then DIR/SHA256SUMS (every file in DIR, sorted,
+# as `<sha256>  <name>`) and signs it with ssh-keygen -Y sign (namespace abla-release) into DIR/SHA256SUMS.sig, and
+# verifies the result against release-signing.pub (tools/verify-release.sh) so a wrong key never ships.
 #
-#   tools/sign-release.sh DIR KEYFILE
+#   tools/sign-release.sh DIR [KEYFILE] [--tag vX.Y.Z]
 #
-# KEYFILE is the private key (the workflow writes it from the ABLA_RELEASE_SIGNING_KEY secret and deletes it after).
+# KEYFILE is the private key (default: the file named by ABLA_RELEASE_SIGNING_KEY_FILE). With --tag the SBOM
+# ablac-X.Y.Z.spdx.json is made in DIR first (tools/release-sbom.sh reads the checkout this script is run from, so run
+# it from the release commit's checkout). Run it on the directory release-check.sh checked, then run release-check.sh
+# again (its `signature` check must PASS) and upload every file of DIR. Needs bash, ssh-keygen and sha256sum or shasum.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-dir=${1:?usage: sign-release.sh DIR KEYFILE}
-key=${2:?usage: sign-release.sh DIR KEYFILE}
-[[ -d $dir && -f $key ]] || { echo "sign-release: need a directory and a key file" >&2; exit 2; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' >&2; exit 2; }
+dir=
+key=${ABLA_RELEASE_SIGNING_KEY_FILE:-}
+tag=
+while (($#)); do
+    case $1 in
+        --tag) tag=${2:?}; shift 2 ;;
+        -h | --help) usage ;;
+        -*) echo "sign-release: unknown option $1" >&2; usage ;;
+        *) if [[ -z $dir ]]; then dir=$1; else key=$1; fi; shift ;;
+    esac
+done
+[[ -n $dir && -n $key ]] || usage
+[[ -d $dir ]] || { echo "sign-release: $dir is not a directory" >&2; exit 2; }
+[[ -f $key ]] || { echo "sign-release: no key file $key" >&2; exit 2; }
+# The publish job removes this marker of the static suite before signing; a local directory must not keep it either
+# (it would be signed and uploaded as an asset).
+[[ ! -e $dir/static-suite-source.sha ]] || { echo "sign-release: remove $dir/static-suite-source.sha first (it is not an asset)" >&2; exit 2; }
 rm -f "$dir/SHA256SUMS" "$dir/SHA256SUMS.sig"
+if [[ -n $tag ]]; then
+    rm -f "$dir/ablac-${tag#v}.spdx.json"
+    "$here/release-sbom.sh" "$tag" "$dir" "$dir/.sbom.tmp"
+    mv "$dir/.sbom.tmp" "$dir/ablac-${tag#v}.spdx.json"
+fi
 (
     cd "$dir"
     find . -type f | LC_ALL=C sort | sed 's|^\./||' | while IFS= read -r name; do

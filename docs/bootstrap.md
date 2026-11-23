@@ -129,6 +129,12 @@ materials (`tools/release-sbom.sh`: the assets with their sha256, the LLVM fork 
 archives, the Xtensa companion, the nixpkgs commit and the bootstrap seed), and a GitHub build-provenance attestation
 for every asset (`gh attestation verify <asset> --repo AndreBaltazar8/ablac`).
 
+When a release is made locally (the publish-off run's artifacts are checked, then uploaded with `gh release create`),
+run `tools/sign-release.sh DIR KEYFILE --tag vX.Y.Z` from the release commit's checkout on the directory `release-check.sh`
+checked: it writes the SBOM, `SHA256SUMS` and `SHA256SUMS.sig` there and verifies them against `release-signing.pub`
+(`KEYFILE` may also be named by `ABLA_RELEASE_SIGNING_KEY_FILE`). Run `release-check.sh` on that directory again: its
+`signature` check passes, and every file of the directory is uploaded.
+
 To check a download by hand, put `SHA256SUMS`, `SHA256SUMS.sig` and the assets in one directory and run
 `tools/verify-release.sh DIR [ASSET...]`. It refuses a release without a signature, a signature that does not verify
 against `release-signing.pub`, and any asset that is not listed or does not match. The consumers verify the same way and
