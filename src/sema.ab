@@ -2530,7 +2530,9 @@ fun bootstrapLambdaInferredNoEscape(
             declarations,
             summary
         )
-        inferred = !bootstrapRegionExpressionCallsUnsafe(body, summary) &&
+        val bindings = BootstrapRegionBindings([], [])
+        bootstrapRegionBindParameters(bindings, parameters, parameterTypes)
+        inferred = !bootstrapRegionExpressionCallsUnsafe(body, summary, "", bindings) &&
             !bootstrapExpressionParameterStoredOutside(body, parameters) &&
             !bootstrapRegionExpressionCallsFunctionParameter(
                 body, parameters, parameterTypes
@@ -6033,10 +6035,22 @@ fun bootstrapRegionHeapFields(
 fun bootstrapRegionDeclaredMembers(
     declarations: array<BootstrapDeclaration>
 ): BootstrapStringSet {
+    val interfaceMembers = bootstrapStringSet()
+    for (declaration in declarations) {
+        if (declaration.kind == "interface") {
+            val owner = bootstrapNormalizeType(declaration.name)
+            val methods = if (declaration.conformances.size == 0) declaration.methods
+                else bootstrapInterfaceAllMembers(declarations, declaration.name)
+            for (method in methods) interfaceMembers.add("$owner.${method.name}")
+        }
+    }
     val members = bootstrapStringSet()
     for (declaration in declarations) {
         if (declaration.extensionOwner != "") {
-            members.add(bootstrapRegionBodyName(declaration))
+            val name = bootstrapRegionBodyName(declaration)
+            // An interface method may dispatch to an implementation even
+            // when an extension of the same name is also in scope.
+            if (!interfaceMembers.contains(name)) members.add(name)
         }
         if (declaration.kind == "class") {
             for (method in declaration.methods) members.add("${declaration.name}.${method.name}")
@@ -6079,22 +6093,54 @@ fun bootstrapRegionResolvedMemberIsUnsafe(
     summary.unsafeMembers.contains(name)
 }
 
-// The static type of a member call's receiver while the summary is built,
-// before inference. Follow declared fields and array elements rooted at
-// `this`. Other expressions leave the receiver unknown.
+class BootstrapRegionBindings(val names: array<string>, val types: array<string>)
+
+fun bootstrapRegionBind(var bindings: BootstrapRegionBindings, name: string, type: string): void {
+    bindings.names.append(name)
+    bindings.types.append(type)
+    return
+}
+
+fun bootstrapRegionBindParameters(var bindings: BootstrapRegionBindings,
+    names: array<string>, types: array<string>): void {
+    bindings.names.truncate(0)
+    bindings.types.truncate(0)
+    var index = 0
+    while (index < names.size) {
+        val type = if (index >= types.size || types[index] == "inferred") ""
+            else bootstrapNormalizeType(types[index])
+        bootstrapRegionBind(bindings, names[index], type)
+        index += 1
+    }
+    return
+}
+
+fun bootstrapRegionBindingType(bindings: BootstrapRegionBindings, name: string): string {
+    var index = bindings.names.size - 1
+    while (index >= 0) {
+        if (bindings.names[index] == name) return bootstrapBorrowElementType(bindings.types[index])
+        index -= 1
+    }
+    ""
+}
+
+// The static type of a member call's receiver before inference. Follow
+// declared fields and array elements rooted at `this` or a scoped binding.
 fun bootstrapRegionSummaryReceiverType(
     receiver: BootstrapExpression,
     owner: string,
-    summary: BootstrapRegionCallSummary
+    summary: BootstrapRegionCallSummary,
+    bindings: BootstrapRegionBindings
 ): string {
-    if (owner == "") return ""
-    if (receiver.kind == "identifier" && receiver.text == "this") return owner
+    if (receiver.kind == "identifier") {
+        return if (receiver.text == "this") owner else bootstrapRegionBindingType(bindings, receiver.text)
+    }
     if (receiver.kind == "member" && receiver.children.size == 1) {
-        val base = bootstrapRegionSummaryReceiverType(receiver.children[0], owner, summary)
-        if (base != "") return summary.fieldTypes.get("$base.${receiver.text}") ?? ""
+        val base = bootstrapRegionSummaryReceiverType(receiver.children[0], owner, summary, bindings)
+        if (base != "") return bootstrapBorrowElementType(summary.fieldTypes.get("$base.${receiver.text}") ?? "")
     }
     if (receiver.kind == "index" && receiver.children.size == 2) {
-        val base = bootstrapRegionSummaryReceiverType(receiver.children[0], owner, summary)
+        val base = bootstrapRegionSummaryReceiverType(receiver.children[0], owner, summary, bindings)
         if (bootstrapIsArrayType(base)) return bootstrapArrayElementType(base)
     }
     ""
@@ -6396,14 +6442,15 @@ fun bootstrapRegionExtensionOwner(declaration: BootstrapDeclaration): string =
 fun bootstrapRegionExpressionCallsUnsafe(
     expression: BootstrapExpression,
     summary: BootstrapRegionCallSummary,
-    owner: string = ""
+    owner: string,
+    var bindings: BootstrapRegionBindings
 ): bool {
     var unsafe = false
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared") {
         unsafe = bootstrapRegionCallIsUnsafe(summary, expression.text)
     }
-    if (expression.kind == "member.call" &&
+    if (expression.kind == "member.call" && summary.unsafeMembers.contains(expression.text) &&
         expression.text != "append" && expression.text != "slice" &&
         expression.text != "takeAt" && expression.text != "truncate" && expression.text !=
         "clear" &&
@@ -6412,23 +6459,62 @@ fun bootstrapRegionExpressionCallsUnsafe(
         expression.text != "upgrade" &&
         expression.text != "isAlive") {
         val receiverType = if (expression.children.size > 0)
-            bootstrapRegionSummaryReceiverType(expression.children[0], owner, summary) else ""
+            bootstrapRegionSummaryReceiverType(expression.children[0], owner, summary, bindings) else ""
         unsafe = bootstrapRegionResolvedMemberIsUnsafe(
             summary,
             receiverType,
             expression.text
         )
     }
+    // Each binding shadows the outer name even if its type is unknown.
+    val mark = bindings.names.size
     var child = 0
+    if (expression.kind == "lambda" || expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator") {
+        while (child + 1 < expression.children.size) {
+            val parameter = expression.children[child]
+            val type = if (parameter.children.size > 0 && parameter.children[0].text != "inferred")
+                bootstrapNormalizeType(parameter.children[0].text) else ""
+            bootstrapRegionBind(bindings, parameter.text, type)
+            child += 1
+        }
+    }
     while (!unsafe && child < expression.children.size) {
+        val statement = expression.children[child]
+        if (expression.kind == "for" && child == 1)
+            bootstrapRegionBind(bindings, bootstrapForName(expression), "")
         unsafe = bootstrapRegionExpressionCallsUnsafe(
-            expression.children[child],
+            statement,
             summary,
-            owner
+            owner,
+            bindings
         )
+        if (expression.kind == "block" &&
+            (statement.kind == "local.val" || statement.kind == "local.var")) {
+            val type = if (statement.children.size > 1 && statement.children[1].text != "inferred")
+                bootstrapNormalizeType(statement.children[1].text)
+                else if (statement.children.size > 0)
+                    bootstrapRegionSummaryReceiverType(statement.children[0], owner, summary, bindings)
+                else ""
+            bootstrapRegionBind(bindings, statement.text, type)
+        }
         child = child + 1
     }
+    if (bindings.names.size > mark) {
+        bindings.names.truncate(mark)
+        bindings.types.truncate(mark)
+    }
     unsafe
+}
+
+fun bootstrapRegionBodyCallsUnsafe(
+    declaration: BootstrapDeclaration,
+    owner: string,
+    summary: BootstrapRegionCallSummary,
+    var bindings: BootstrapRegionBindings
+): bool {
+    bootstrapRegionBindParameters(bindings, declaration.parameters, declaration.parameterTypes)
+    bootstrapRegionExpressionCallsUnsafe(declaration.expression, summary, owner, bindings)
 }
 
 // A body with no escaping function-valued parameter cannot call one. Check
@@ -6725,6 +6811,7 @@ fun bootstrapBuildRegionCallSummary(
     val declarationOf = bodies.declarationOf
     val methodOf = bodies.methodOf
     val callers = bodies.callers
+    val bindings = BootstrapRegionBindings([], [])
     var schedule = bootstrapBodySchedule(declarationOf.size)
     var round = true
     while (round) {
@@ -6776,10 +6863,11 @@ fun bootstrapBuildRegionCallSummary(
                 if ((declaration.kind == "fun" ||
                      declaration.kind == "compile.fun") &&
                     !bootstrapRegionCallIsUnsafe(summary, bodyName) &&
-                    bootstrapRegionExpressionCallsUnsafe(
-                        declaration.expression,
+                    bootstrapRegionBodyCallsUnsafe(
+                        declaration,
+                        bootstrapRegionExtensionOwner(declaration),
                         summary,
-                        bootstrapRegionExtensionOwner(declaration)
+                        bindings
                     )) {
                     bootstrapRegionAddUnsafe(summary, bodyName)
                     changed = true
@@ -6807,10 +6895,11 @@ fun bootstrapBuildRegionCallSummary(
                     changed = true
                 }
                 if (!bootstrapRegionCallIsUnsafe(summary, name) &&
-                    (bootstrapRegionExpressionCallsUnsafe(
-                        method.expression,
+                    (bootstrapRegionBodyCallsUnsafe(
+                        method,
+                        declaration.name,
                         summary,
-                        declaration.name
+                        bindings
                     ) || (moduleRecheck.contains(name) &&
                         bootstrapRegionExpressionStoresModuleValue(
                             method.expression,
