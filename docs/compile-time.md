@@ -471,6 +471,20 @@ Without the manifest entry, it stops with `compile.capability-not-authorized:fil
 In a package, a dependency's `compileCapabilities` must be a subset of the
 root project's (`E_PACKAGE_CAPABILITY_DENIED`).
 
+### Reading a locked dependency's files
+
+`compilerReadDependencyFile(name, relativePath)` (`abla/compiler`) returns one file of a dependency's locked tree, under
+the `filesystem.read` grant of the `#` site that calls it. `name` must be a dependency in the `abla.toml` of the package
+that site is in (the project's own for its code; a helper another package owns does not lend its manifest to the
+caller), and `abla.lock` must pin it by content digest. The bytes come from the tree the digest covers, from a
+checked-in `vendor/<name>` or the prepared copy alike, so the result does not depend on the working directory or on
+which copy is used; a vendored or prepared copy that differs from its lock is an error, never read. Nothing is fetched or
+installed. The path is slash-separated and package-relative: no absolute, empty, `.`, `..`, `.git` or `.abla*`
+component, backslash or drive. A symbolic link (the file, or a directory on the way), a directory and a nested
+repository are refused with `E_PACKAGE_FILE_INVALID`; an undeclared name is `E_PACKAGE_FILE_UNDECLARED`, a missing or
+different pin `E_PACKAGE_FILE_UNPINNED`, an unprepared copy `E_PACKAGE_FILE_UNAVAILABLE`. The build journals the pin and
+the bytes (or the failure), so a cached build is reused only while they are the same.
+
 ### Grants per package
 
 Capabilities are granted per package, not per program. A `#` site gets what its own package has:
