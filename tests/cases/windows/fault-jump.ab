@@ -1,0 +1,48 @@
+// A fault sent back to a guard (docs/design/windows-jit.md §4, the compile-time guard on Windows): a vectored exception handler,
+// ahead of the runtime's, changes the access violation's CONTEXT with abla_windows_redirect so the thread resumes in a jump back to
+// where abla_setjmp armed it, with 4 (a bad access, as the guard numbers it), and returns EXCEPTION_CONTINUE_EXECUTION.
+import "abla/io"
+import "abla/text"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/native/function-address"
+
+trusted noescape extern:"c" fun abla_setjmp(buffer: int): int
+trusted noescape extern:"c" fun abla_longjmp(buffer: int, value: int): void
+trusted noescape extern:"c" fun abla_windows_redirect(context: int, target: int, first: int, second: int): void
+trusted noescape extern:"c" fun AddVectoredExceptionHandler(first: int, handler: int): int
+
+// The armed buffer's address (0: none).
+var armed: int = 0
+
+trusted fun jumpBack(buffer: int, how: int): void {
+    abla_longjmp(buffer, how)
+}
+
+// EXCEPTION_POINTERS {ExceptionRecord, ContextRecord}; ExceptionCode, 32 bits, starts the record.
+trusted fun onException(pointers: int): int {
+    val record = ablaUnsafeLoadI64(nativePointerFromAddress(pointers))
+    val context = ablaUnsafeLoadI64(nativePointerFromAddress(pointers + 8))
+    val code = ablaUnsafeLoadU32(nativePointerFromAddress(record))
+    // 0xC0000005, an access violation, while a jump is armed: anything else goes on to the next handler.
+    if (code != 3221225477 || armed == 0) return 0
+    val buffer = armed
+    armed = 0
+    abla_windows_redirect(context, nativeFunctionAddress(jumpBack), buffer, 4)
+    -1
+}
+
+trusted fun main: int {
+    AddVectoredExceptionHandler(1, nativeFunctionAddress(onException))
+    val storage = "0123456789abcdef".repeat(40)
+    val buffer = nativeStringAddress(storage)
+    val how = abla_setjmp(buffer)
+    if (how == 0) {
+        armed = buffer
+        println("armed")
+        val value = ablaUnsafeLoadI64(nativePointerFromAddress(16))
+        println("not reached $value")
+        return 1
+    }
+    println("back with $how")
+    0
+}

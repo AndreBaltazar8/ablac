@@ -57,4 +57,12 @@ status=0
 tools/windows/wine-run.sh "$out/jump.exe" > "$out/jump.out" 2> "$out/jump.err" || status=$?
 [[ $status == 0 ]] || fail "jump.exe exited $status: $(head -3 "$out/jump.err")"
 [[ "$(cat "$out/jump.out")" == $'armed\njumped 7' ]] || fail "jump.exe printed: $(cat "$out/jump.out" "$out/jump.err")"
-echo "windows-syscalls: the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame"
+# A fault sent back (fault-jump.ab): a vectored handler ahead of the runtime's redirects an access violation with
+# abla_windows_redirect to abla_longjmp, and the thread is back where abla_setjmp armed it with 4, not ended by the fault.
+"$compiler" build tests/cases/windows/fault-jump.ab --target x86_64-windows-hosted -o "$out/fault-jump.exe" --fast --no-cache \
+    > "$out/fault-jump.log" 2>&1 || { cat "$out/fault-jump.log" >&2; fail "fault-jump.ab did not build for Windows"; }
+status=0
+tools/windows/wine-run.sh "$out/fault-jump.exe" > "$out/fault-jump.out" 2> "$out/fault-jump.err" || status=$?
+[[ $status == 0 ]] || fail "fault-jump.exe exited $status: $(head -3 "$out/fault-jump.out" "$out/fault-jump.err")"
+[[ "$(cat "$out/fault-jump.out")" == $'armed\nback with 4' ]] || fail "fault-jump.exe printed: $(cat "$out/fault-jump.out" "$out/fault-jump.err")"
+echo "windows-syscalls: the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame; a fault redirected with abla_windows_redirect jumps back too"
