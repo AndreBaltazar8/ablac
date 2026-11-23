@@ -95,6 +95,10 @@ trusted noescape extern:"c" fun FindNextFileW(search: int, data: int): int
 trusted noescape extern:"c" fun FindClose(search: int): int
 /** kernel32 GetFileAttributesW: the attributes of the file at the UTF-16 path, or 0xFFFFFFFF when it does not exist. */
 trusted noescape extern:"c" fun GetFileAttributesW(path: int): int
+/** kernel32 CreateSymbolicLinkW: makes a symbolic link at the UTF-16 path link to target (flags: 1 a directory, 2 without the privilege); returns a BOOLEAN, non-zero on success. */
+trusted noescape extern:"c" fun CreateSymbolicLinkW(link: int, target: int, flags: int): int
+/** kernel32 DeviceIoControl: sends control code to the device or file of handle, with input and output buffers; returns non-zero on success. */
+trusted noescape extern:"c" fun DeviceIoControl(handle: int, code: int, input: int, inputSize: int, output: int, outputSize: int, returned: int, overlapped: int): int
 /** bcryptprimitives ProcessPrng: fills size bytes at buffer with cryptographically secure random bytes; returns non-zero (it cannot fail on Windows 10 and later). */
 trusted noescape extern:"c" fun ProcessPrng(buffer: int, size: int): int
 /** kernel32 LoadLibraryExW: loads the DLL named by the UTF-16 string (file 0); with flags 0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32) only from System32; returns the module handle, or 0. */
@@ -415,20 +419,104 @@ private trusted fun __ablaRuntimeWindowsImagePath(): int {
     text
 }
 
-// readlink(path, buffer, size): the running image's path for "/proc/self/exe" (not terminated, cut to `size`, as Linux does);
-// any other path is not a link Windows programs make (EINVAL).
+// readlink(path, buffer, size): the running image's path for "/proc/self/exe", or a symbolic link's target as it was made (its
+// print name, "\" back to "/"); not terminated and cut to `size`, as Linux does. A path that is no symbolic link is EINVAL.
 private trusted fun __ablaRuntimeWindowsReadLink(path: int, buffer: int, size: int): int {
-    if (!__ablaRuntimeWindowsNamesImage(path)) return __ablaRuntimeWindowsEINVAL
-    val image = __ablaRuntimeWindowsImagePath()
-    if (image == 0) return -2
-    val length = ablaRuntimeLoadI64(__ablaRuntimeWindowsImageCell() + 8)
-    val count = if (length < size) length else size
+    if (__ablaRuntimeWindowsNamesImage(path)) {
+        val image = __ablaRuntimeWindowsImagePath()
+        if (image == 0) return -2
+        val length = ablaRuntimeLoadI64(__ablaRuntimeWindowsImageCell() + 8)
+        val count = if (length < size) length else size
+        var index = 0
+        while (index < count) {
+            ablaRuntimeStoreU8(buffer + index, ablaRuntimeLoadU8(image + index))
+            index = index + 1
+        }
+        return count
+    }
+    val wide = __ablaRuntimeWindowsWidePath(path, 0)
+    if (wide == 0) return -2
+    // backup semantics and the reparse point itself (0x02200000), no access needed to read its data
+    val handle = CreateFileW(wide, 0, 7, 0, 3, 35651584, 0)
+    if (handle == -1) return __ablaRuntimeWindowsErrno()
+    // FSCTL_GET_REPARSE_POINT into the second half of the path buffer (a reparse point's data is at most 16 KiB)
+    val data = __ablaRuntimeWindowsPathBuffer() + 65536
+    val returned = __ablaRuntimeWindowsScratch()
+    val read = DeviceIoControl(handle, 589992, 0, 0, data, 16384, returned, 0) != 0
+    val code = if (read) 0 else GetLastError() & 4294967295
+    CloseHandle(handle)
+    // ERROR_NOT_A_REPARSE_POINT: an ordinary file or directory
+    if (code == 4390) return __ablaRuntimeWindowsEINVAL
+    if (!read) return -5
+    // REPARSE_DATA_BUFFER: IO_REPARSE_TAG_SYMLINK, then the substitute and print names' offsets and lengths (bytes) into the
+    // path buffer at 20
+    if ((ablaRuntimeLoadI32(data) & 4294967295) != 2684354572) return __ablaRuntimeWindowsEINVAL
+    val printLength = ablaRuntimeLoadU8(data + 14) + ablaRuntimeLoadU8(data + 15) * 256
+    val offset = if (printLength > 0) ablaRuntimeLoadU8(data + 12) + ablaRuntimeLoadU8(data + 13) * 256
+        else ablaRuntimeLoadU8(data + 8) + ablaRuntimeLoadU8(data + 9) * 256
+    val length = if (printLength > 0) printLength else ablaRuntimeLoadU8(data + 10) + ablaRuntimeLoadU8(data + 11) * 256
+    // as UTF-8 in the first half, which the path no longer needs
+    val text = __ablaRuntimeWindowsPathBuffer()
+    val bytes = if (length > 0) WideCharToMultiByte(65001, 0, data + 20 + offset, length / 2, text, 65536, 0, 0) else 0
+    if (length > 0 && bytes <= 0) return -5
+    val count = if (bytes < size) bytes else size
     var index = 0
     while (index < count) {
-        ablaRuntimeStoreU8(buffer + index, ablaRuntimeLoadU8(image + index))
+        val byte = ablaRuntimeLoadU8(text + index)
+        ablaRuntimeStoreU8(buffer + index, if (byte == 92) 47 else byte)
         index = index + 1
     }
     count
+}
+
+// symlink(target, path): a symbolic link at `path` to `target`, as given ("/" to "\": Windows resolves a link's separators as its
+// own), made without the privilege the call once needed (SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, Developer Mode or an
+// administrator) and marked a directory link when `target`, taken from the link's directory as a relative link is, is a directory.
+// A Windows without the flag (before 10 1703) is asked again without it.
+private trusted fun __ablaRuntimeWindowsSymlink(target: int, path: int): int {
+    val wideTarget = __ablaRuntimeWindowsWidePath(target, 0)
+    val wideLink = __ablaRuntimeWindowsWidePath(path, 1)
+    if (wideTarget == 0 || wideLink == 0) return -2
+    var length = 0
+    while (ablaRuntimeLoadU8(wideTarget + length * 2) + ablaRuntimeLoadU8(wideTarget + length * 2 + 1) != 0) {
+        if (ablaRuntimeLoadU8(wideTarget + length * 2) == 47 && ablaRuntimeLoadU8(wideTarget + length * 2 + 1) == 0)
+            ablaRuntimeStoreU8(wideTarget + length * 2, 92)
+        length = length + 1
+    }
+    val first = ablaRuntimeLoadU8(wideTarget)
+    val absolute = first == 92 || (length > 1 && ablaRuntimeLoadU8(wideTarget + 2) == 58)
+    var attributes = 0
+    if (absolute) attributes = GetFileAttributesW(wideTarget) & 4294967295
+    else {
+        // the link's directory, then the target, in memory of its own
+        val joined = VirtualAlloc(0, 131072, 12288, 4)
+        if (joined == 0) return -12
+        var end = 0
+        var at = 0
+        while (ablaRuntimeLoadU8(wideLink + at * 2) + ablaRuntimeLoadU8(wideLink + at * 2 + 1) != 0) {
+            val unit = ablaRuntimeLoadU8(wideLink + at * 2)
+            if ((unit == 47 || unit == 92) && ablaRuntimeLoadU8(wideLink + at * 2 + 1) == 0) end = at + 1
+            at = at + 1
+        }
+        var index = 0
+        while (index < end * 2) {
+            ablaRuntimeStoreU8(joined + index, ablaRuntimeLoadU8(wideLink + index))
+            index = index + 1
+        }
+        index = 0
+        while (index < length * 2 + 2) {
+            ablaRuntimeStoreU8(joined + end * 2 + index, ablaRuntimeLoadU8(wideTarget + index))
+            index = index + 1
+        }
+        attributes = GetFileAttributesW(joined) & 4294967295
+        VirtualFree(joined, 0, 32768)
+    }
+    val directory = attributes != 4294967295 && (attributes & 16) != 0
+    val flags = if (directory) 3 else 2
+    // CreateSymbolicLinkW returns a BOOLEAN: only its low byte
+    if ((CreateSymbolicLinkW(wideLink, wideTarget, flags) & 255) != 0) return 0
+    if ((GetLastError() & 4294967295) == 87 && (CreateSymbolicLinkW(wideLink, wideTarget, flags - 2) & 255) != 0) return 0
+    __ablaRuntimeWindowsErrno()
 }
 
 // FILETIME (100 ns since 1601) at `at` as seconds and nanoseconds since 1970 stored at `seconds` and `seconds + 8`.
@@ -789,6 +877,8 @@ private trusted fun __ablaRuntimeWindowsFileCall(number: int, a0: int, a1: int, 
     }
     // readlink(path, buffer, size)
     if (number == 89) return __ablaRuntimeWindowsReadLink(a0, a1, a2)
+    // symlink(target, path)
+    if (number == 88) return __ablaRuntimeWindowsSymlink(a0, a1)
     // getdents64(fd, buffer, count)
     if (number == 217) return __ablaRuntimeWindowsDirectoryEntries(a0, a1, a2)
     // openat(directory, path, flags, mode): relative to the working directory (AT_FDCWD) only
@@ -1443,8 +1533,18 @@ private @noinline trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: in
         if (socket == 0) return -88
         val option = __ablaRuntimeWindowsSocketOption(a1, a2)
         if (option == -1) return if (number == 54) 0 else -92
-        // SO_REUSEADDR on Windows lets another process take a bound port: set nothing for it (the Linux meaning is the default there)
-        if (number == 54 && a1 == 1 && a2 == 2) return 0
+        // SO_REUSEADDR on Windows lets another process take a bound port. On a TCP socket set nothing for it: Linux's meaning (a port
+        // in TIME_WAIT can be bound again) is the default there. On a UDP socket Linux's option lets two sockets bind the same port,
+        // which Windows's does too: set it (SO_TYPE 0x1008 says SOCK_DGRAM, 2).
+        if (number == 54 && a1 == 1 && a2 == 2) {
+            val kind = __ablaRuntimeWindowsScratch()
+            val size = kind + 8
+            ablaRuntimeStoreI64(kind, 0)
+            ablaRuntimeStoreI64(size, 4)
+            if (getsockopt(socket, 65535, 4104, kind, size) != 0 || ablaRuntimeLoadI32(kind) != 2) return 0
+            if (setsockopt(socket, 65535, 4, a3, a4) != 0) return __ablaRuntimeWindowsSocketErrno()
+            return 0
+        }
         var result = 0
         if (number == 54) result = setsockopt(socket, __ablaRuntimeWindowsSocketLevel(a1), option, a3, a4)
         else result = getsockopt(socket, __ablaRuntimeWindowsSocketLevel(a1), option, a3, a4)
@@ -2040,6 +2140,51 @@ private trusted fun __ablaRuntimeWindowsFaults(request: int): int {
     0
 }
 
+/** kernel32 GetProcessTimes: stores a process's creation, exit, kernel and user times as FILETIMEs (100 ns); returns non-zero on success. */
+trusted noescape extern:"c" fun GetProcessTimes(process: int, creation: int, exit: int, kernel: int, user: int): int
+/** kernel32 GetThreadTimes: stores a thread's creation, exit, kernel and user times as FILETIMEs (100 ns); returns non-zero on success. */
+trusted noescape extern:"c" fun GetThreadTimes(target: int, creation: int, exit: int, kernel: int, user: int): int
+/** kernel32 GetCurrentThread: the pseudo-handle of the calling thread; never fails. */
+trusted noescape extern:"c" fun GetCurrentThread(): int
+/** kernel32 K32GetProcessMemoryInfo: stores a process's PROCESS_MEMORY_COUNTERS (cb bytes); returns non-zero on success. */
+trusted noescape extern:"c" fun K32GetProcessMemoryInfo(process: int, counters: int, size: int): int
+
+// getrusage(who, usage): a Linux struct rusage (144 bytes) for the process (RUSAGE_SELF, 0) or the calling thread (RUSAGE_THREAD,
+// 1): user and system time from GetProcessTimes or GetThreadTimes as timevals at 0 and 16, the peak working set in KiB as ru_maxrss
+// (32) and the page faults as ru_minflt (64), the rest 0, as for fields Linux leaves unset. Waited-for children (RUSAGE_CHILDREN,
+// -1) have nothing counted: zeroes.
+private trusted fun __ablaRuntimeWindowsResourceUsage(who: int, usage: int): int {
+    if (who != 0 && who != 1 && who != -1) return __ablaRuntimeWindowsEINVAL
+    var offset = 0
+    while (offset < 144) {
+        ablaRuntimeStoreI64(usage + offset, 0)
+        offset = offset + 8
+    }
+    if (who == -1) return 0
+    val times = __ablaRuntimeWindowsScratch()
+    val ok = if (who == 0) GetProcessTimes(GetCurrentProcess(), times, times + 8, times + 16, times + 24)
+        else GetThreadTimes(GetCurrentThread(), times, times + 8, times + 16, times + 24)
+    if (ok == 0) return __ablaRuntimeWindowsEINVAL
+    val kernel = ablaRuntimeLoadI64(times + 16)
+    val user = ablaRuntimeLoadI64(times + 24)
+    ablaRuntimeStoreI64(usage, user / 10000000)
+    ablaRuntimeStoreI64(usage + 8, user % 10000000 / 10)
+    ablaRuntimeStoreI64(usage + 16, kernel / 10000000)
+    ablaRuntimeStoreI64(usage + 24, kernel % 10000000 / 10)
+    // PROCESS_MEMORY_COUNTERS (72 bytes): cb, PageFaultCount (32 bits at 4), PeakWorkingSetSize (8)
+    if (who == 0) {
+        val counters = __ablaRuntimeWindowsPathBuffer()
+        if (counters != 0) {
+            ablaRuntimeStoreI64(counters, 72)
+            if (K32GetProcessMemoryInfo(GetCurrentProcess(), counters, 72) != 0) {
+                ablaRuntimeStoreI64(usage + 32, ablaRuntimeLoadI64(counters + 8) / 1024)
+                ablaRuntimeStoreI64(usage + 64, ablaRuntimeLoadI32(counters + 4) & 4294967295)
+            }
+        }
+    }
+    0
+}
+
 // The process calls: -1000 when `number` is none of them.
 private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: int, a2: int, a3: int): int {
     // wait4(pid, status, options, usage)
@@ -2053,6 +2198,8 @@ private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: in
         return 0
     }
     if (number == 121) return if (a0 == 0) GetCurrentProcessId() & 4294967295 else a0
+    // getrusage(who, usage)
+    if (number == 98) return __ablaRuntimeWindowsResourceUsage(a0, a1)
     // pipe2(descriptors, flags)
     if (number == 293) return __ablaRuntimeWindowsPipe(a0)
     // fork and exec are not translated: the standard library launches with spawn (4001)
@@ -2181,6 +2328,15 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
         }
         return __ablaRuntimeWindowsRefuse(number)
     }
+    // rt_sigprocmask(how, set, old, size): Windows has no POSIX signals to block, so the mask is empty and stays so; the old one
+    // (when asked for) is written as empty.
+    if (number == 14) {
+        if (a2 != 0 && a3 >= 8) ablaRuntimeStoreI64(a2, 0)
+        return 0
+    }
+    // getuid, getgid, geteuid, getegid: Windows has no POSIX user and group ids; every one is 0, the same answer each time (an
+    // id the standard library compares against /etc/passwd, which a Windows program reads only under Wine).
+    if (number == 102 || number == 104 || number == 107 || number == 108) return 0
     // clock_gettime(clock, timespec)
     if (number == 228) return __ablaRuntimeWindowsClock(a0, a1)
     // exit_group(status), exit(status)
@@ -2201,7 +2357,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 46 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 89 91 97 109 121 131 186 202 204 217 228 231 232 233 257 262 263 288 291 293 318 4001 4002 4003 4004 4005 4006 4007"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 14 16 21 25 28 35 39 41 42 43 44 45 46 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 88 89 91 97 98 102 104 107 108 109 121 131 186 202 204 217 228 231 232 233 257 262 263 288 291 293 318 4001 4002 4003 4004 4005 4006 4007"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;

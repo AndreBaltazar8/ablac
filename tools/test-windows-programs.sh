@@ -23,7 +23,8 @@ allowed=$(grep -v '^#' tools/windows-imports-allowlist.txt | grep -v '^$' || tru
 ran=0
 skipped=0
 count=0
-while read -r source status; do
+runner=0
+while read -r source status where; do
     [[ -z $source || $source == '#'* ]] && continue
     [[ -f $source ]] || fail "$source (tests/cases/windows/programs.txt) does not exist"
     count=$((count + 1))
@@ -44,6 +45,11 @@ while read -r source status; do
         [[ -z $dll ]] || grep -qxF "$dll $function" <<< "$allowed" ||
             fail "$name: import not in tools/windows-imports-allowlist.txt: $dll $function"
     done <<< "$imports"
+    # A program marked `runner` (one Wine cannot check) is built and left for the Windows runner only.
+    if [[ $where == runner ]]; then
+        runner=$((runner + 1))
+        continue
+    fi
     mkdir -p "$out/$name.wine"
     code=0
     (cd "$out/$name.wine" && "$root/tools/windows/wine-run.sh" "$root/$exe" > "../$name.actual" 2> "../$name.err" < /dev/null) || code=$?
@@ -61,5 +67,5 @@ done < tests/cases/windows/programs.txt
 if ((skipped > 0)); then
     echo "windows-programs: $count programs built, imports within the allowlist, no C runtime; $skipped runs skipped (Wine is not installed)"
 else
-    echo "windows-programs: $ran programs under Wine exit and print what the native Linux programs do; imports within the allowlist, no C runtime"
+    echo "windows-programs: $ran programs under Wine exit and print what the native Linux programs do ($runner more for the Windows runner only); imports within the allowlist, no C runtime"
 fi

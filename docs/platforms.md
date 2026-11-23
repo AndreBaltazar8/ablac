@@ -242,11 +242,12 @@ suite. The release compiler runs the COFF linker in process. Development
 compilers built without lld invoke the external `lld-link`. Of the
 standard library's test programs (`tests/abla-tests.json`), those in
 `programs.txt` run on Windows; the rest of the survey is blocked by:
-Linux system calls the Windows runtime does not translate (`symlink` in
-`filesystem.ab`, `sendmsg` in `linux-net.ab`, `getrusage` in
-`process-metrics.ab`, `rt_sigprocmask` in `signal-watch.ab`,
-`geteuid` in `path-home`, and raw `linuxSyscall` calls in
-`udp-ephemeral.ab`); the OpenSSL-backed `abla/tls/hosted` (`network-advanced.ab` fails to link
+signals (`signal-watch.ab` needs `signalfd`: the runtime answers `rt_sigprocmask`
+with an empty mask, and Windows has no POSIX signals to watch); `/bin/sh` for
+`ulimit -n` (`process-metrics.ab`, whose CPU times `getrusage` now gives); `HOME`
+from `/etc/passwd` (`path-home`: the runtime answers `geteuid` and the other ids
+with 0, and a Windows program has no `/etc/passwd` outside Wine); `linux-net.ab`,
+which times out under Wine (its `sendmsg` is translated now); the OpenSSL-backed `abla/tls/hosted` (`network-advanced.ab` fails to link
 `OpenSSL_version_num`; the pure TLS of `abla/tls/pure`, which the HTTPS client uses, runs on Windows: see below);
 tests that fork (the WebSocket server tests; `dns-async.ab` and `http-async.ab` have thread-based
 copies in `tests/cases/windows`); tests that run POSIX tools
@@ -254,7 +255,9 @@ copies in `tests/cases/windows`); tests that run POSIX tools
 `inferred-command`); POSIX path semantics (`path-syntax`: `Path` follows
 the host, see `module-path-identity`); and tests whose success depends on arguments, the environment or files a
 driver script sets up (`fs-tree`, `process-environment`, `path-file-mode`,
-`path-directory-mode`). The rest of the compiler's own tests (`tests/cases`
+`path-directory-mode`). `filesystem.ab` is in `programs.txt` for the Windows runner only: its symbolic link
+(`CreateSymbolicLinkW`) is one Wine reports made and does not make. `udp-ephemeral.ab` runs under Wine too
+(`SO_REUSEADDR` on a UDP socket now reaches Windows, which shares the port as Linux does). The rest of the compiler's own tests (`tests/cases`
 programs driven by shell scripts) build and run on Linux only.
 
 Sockets and TLS on a hosted Windows program: the poller (`epoll_create1`, `epoll_ctl`, `epoll_wait`) is emulated over `WSAPoll`

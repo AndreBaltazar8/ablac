@@ -50,6 +50,9 @@ expect 'descriptors 4096'
 expect 'affinity 8 bytes, some CPUs'
 expect 'image [A-Za-z]:/([^\\]*/)?self\.exe'
 expect 'image exists true'
+expect 'cpu time true'
+expect 'signal mask 0 0'
+expect 'ids 0 0 0 0'
 # The unwind-free jump pair (jump.ab): abla_setjmp returns 0 first, abla_longjmp from twenty frames down returns 7 to it.
 "$compiler" build tests/cases/windows/jump.ab --target x86_64-windows-hosted -o "$out/jump.exe" --fast --no-cache > "$out/jump.log" 2>&1 ||
     { cat "$out/jump.log" >&2; fail "jump.ab did not build for Windows"; }
