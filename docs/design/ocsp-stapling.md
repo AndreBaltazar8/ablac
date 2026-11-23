@@ -128,6 +128,6 @@ Answered by the security reviewer (7e) on 2026-11-24:
 The pieces above were built with these differences: the policy and the path check live in `abla/crypto/ocsp` (`ocspCheckPath`, which takes the verified path and one staple per
 certificate) and not on `X509Options` (x509 cannot import a module that imports it); the TLS client keeps its public `verifier` type and gets a second closure, `stapleVerifier`, set with
 `tlsClientConfigWithRevocation` (`tlsOcspVerifier` of abla/tls/pure/verify builds the standard one); the staples are read per Certificate entry in TLS 1.3 and from a CertificateStatus
-message in TLS 1.2 (only when the ServerHello promised one). `ocspRequestDer` is in the module. Not built: the server side (`TlsIdentity.staple`), the BoGo OCSP cases, the fuzz harness for the
-response parser, and the tlsfeature check at the TlsConnection level for a resumed session. Tests: tools/test-ocsp.sh (the module, with openssl-made responses) and tools/test-tls-ocsp.sh (the client
+message in TLS 1.2 (only when the ServerHello promised one). `ocspRequestDer` is in the module. Not built: the server side (`TlsIdentity.staple`), the BoGo OCSP cases, and the
+tlsfeature check at the TlsConnection level for a resumed session. The response parser has a fuzz harness (tools/fuzz/parsers/ocsp.ab: 1M damaged responses, none turned into another status when the signed part was touched; mutation-checked). Tests: tools/test-ocsp.sh (the module, with openssl-made responses) and tools/test-tls-ocsp.sh (the client
 against `openssl s_server -status_file` in TLS 1.3 and 1.2); both are mutation-checked (five and three mutants).

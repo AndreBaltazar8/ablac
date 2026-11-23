@@ -1,0 +1,128 @@
+// The OCSP response parser and verifier (abla/crypto/ocsp) against damaged responses (#1139 area 4 method, TLS round 2). The responses `openssl ocsp` made for a test CA
+// (tests/cases/ocsp, from the repository root: good, revoked, unknown, must-staple, and good ones signed by a delegated responder) are damaged in one to three places (a
+// random byte, a flipped bit, an inserted byte, a deleted byte, truncation, general byte mutation) and judged with ocspCheck. Per input: no crash or hang (over 2 s is a
+// finding); and when the damage is inside the signed part of a response the CA signed (everything before the certificates the response carries), the result is never a
+// status: a damaged good, revoked or unknown response is invalid, or it was not changed. A revoked response turning good is the finding that matters most.
+//
+//   tools/fuzz/parsers/run ocsp --seeds 1-200 [--inputs 200]
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "abla/integer"
+import "abla/crypto/ocsp"
+import "abla/crypto/x509"
+import "abla/sys/linux"
+import "abla/process/arguments"
+import "abla/process/time"
+import "../prng.ab"
+import "./mutate.ab"
+
+class OcspFuzzCase(val name: string, val response: string, val leaf: X509Certificate, val signedEnd: int, val status: int)
+
+fun ocspFuzzCertificate(name: string): X509Certificate {
+    val parsed = x509ParsePem(linuxReadFile("tests/cases/ocsp/$name", 65536))
+    if (parsed.certificates.size == 1) parsed.certificates[0] else x509Failed("missing $name")
+}
+
+fun ocspFuzzLoad(ca: X509Certificate): array<OcspFuzzCase> {
+    val directory = "tests/cases/ocsp"
+    val cases: array<OcspFuzzCase> = []
+    // name, leaf, status; signedEnd is the end of the part the CA signed (the response without the embedded certificates), 0 for the delegated ones (no status invariant).
+    // The clock: an hour after the thisUpdate of the CA-signed good response (they were all made within a minute; the check at time 0 says when it is from).
+    val base = ocspCheck(linuxReadFile("$directory/good.der", 65536), ocspFuzzCertificate("leaf.pem"), ca, 0).thisUpdate
+    val now = base + 3600
+    val names: array<string> = ["good.der", "good-must.der", "revoked.der", "unknown.der", "good-delegated.der"]
+    val leaves: array<string> = ["leaf.pem", "leafmust.pem", "leafrevoked.pem", "leafunknown.pem", "leaf.pem"]
+    for (i in 0 until names.size) {
+        val response = linuxReadFile("$directory/${names[i]}", 65536)
+        val leaf = ocspFuzzCertificate(leaves[i])
+        val checked = ocspCheck(response, leaf, ca, now)
+        val end = if (i == 4) 0 else response.size - ca.der.size - 8
+        cases.append(OcspFuzzCase("${names[i]}@$now", response, leaf, end, checked.status))
+    }
+    cases
+}
+
+fun ocspFuzzNow(c: OcspFuzzCase): int {
+    val at = c.name.indexOf("@")
+    (c.name.slice(at + 1, c.name.size)).parseInt() ?? 0
+}
+
+fun ocspFuzzDamage(var r: Prng, data: string): string {
+    var out = data
+    val rounds = 1 + r.below(3)
+    for (i in 0 until rounds) {
+        if (out.size == 0) return out
+        val at = r.below(out.size)
+        val kind = r.below(6)
+        if (kind == 0) out = out.slice(0, at) + mutateBytes(r, 1) + out.slice(at + 1, out.size)
+        else if (kind == 1) out = out.slice(0, at) + byteEncode(int(out[at]) ^ (1 << r.below(8))) + out.slice(at + 1, out.size)
+        else if (kind == 2) out = out.slice(0, at) + mutateBytes(r, 1) + out.slice(at, out.size)
+        else if (kind == 3) out = out.slice(0, at) + out.slice(at + 1, out.size)
+        else if (kind == 4) out = out.slice(0, at)
+        else out = mutate(r, out)
+    }
+    out
+}
+
+fun ocspFuzzCheck(var r: Prng, c: OcspFuzzCase, ca: X509Certificate): string {
+    val damaged = ocspFuzzDamage(r, c.response)
+    if (damaged == c.response) return ""
+    val start = monotonicMilliseconds()
+    val result = ocspCheck(damaged, c.leaf, ca, ocspFuzzNow(c))
+    if (monotonicMilliseconds() - start > 2000) return "judging a damaged response took over 2 s (${c.name})"
+    if (result.status == OCSP_INVALID && result.error == "") return "an invalid result with no reason (${c.name})"
+    if (c.signedEnd > 0 && result.status != OCSP_INVALID) {
+        val touched = damaged.size < c.signedEnd || damaged.slice(0, c.signedEnd) != c.response.slice(0, c.signedEnd)
+        if (touched) {
+            val what = if (result.status == OCSP_GOOD) "good" else if (result.status == OCSP_REVOKED) "revoked" else "unknown"
+            val was = if (c.status == OCSP_GOOD) "good" else if (c.status == OCSP_REVOKED) "revoked" else "unknown"
+            return "a response that was $was and was damaged in its signed part is $what (${c.name}): ${mutateEscape(damaged)}"
+        }
+    }
+    ""
+}
+
+fun main: int {
+    var low = 1
+    var high = 50
+    var inputs = 200
+    var verbose = false
+    val count = processArgumentCount()
+    var index = 0
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "--seeds") {
+            val dash = value.indexOf("-")
+            low = (if (dash < 0) value else value.slice(0, dash)).parseInt() ?? 1
+            high = (if (dash < 0) value else value.slice(dash + 1, value.size)).parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--inputs") {
+            inputs = value.parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--verbose") verbose = true
+        index = index + 1
+    }
+    val ca = ocspFuzzCertificate("ca.pem")
+    val cases = ocspFuzzLoad(ca)
+    for (c in cases) if (c.status == OCSP_INVALID) {
+        println("FINDING seed=0 n=0: the undamaged response ${c.name} is not accepted (run from the repository root)")
+        return 1
+    }
+    var findings = 0
+    for (seed in low until high + 1) {
+        var r = prngSeeded(seed)
+        for (n in 0 until inputs) {
+            val c = cases[r.below(cases.size)]
+            if (verbose) println("input seed=$seed n=$n ${c.name}")
+            val problem = ocspFuzzCheck(r, c, ca)
+            if (problem != "") {
+                println("FINDING seed=$seed n=$n: $problem")
+                findings = findings + 1
+            }
+        }
+    }
+    println("ocsp: seeds $low-$high, $inputs inputs each, $findings findings")
+    if (findings == 0) 0 else 1
+}
