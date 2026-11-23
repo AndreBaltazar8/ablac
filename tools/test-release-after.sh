@@ -28,6 +28,8 @@ make_root() { # directory
         tools/test-bootstrap-convergence-unit.mjs .github/workflows/bootstrap-convergence.yml README.md docs/bootstrap.md; do
         cp "$file" "$root/$file"
     done
+    # None of the fixture's releases is signed (release-pin.sh reads tools/first-signed-release).
+    printf 'v99.0.0\n' > "$root/tools/first-signed-release"
     git -C "$root" init -q -b master
     git -C "$root" add -A
     git -C "$root" -c user.name=t -c user.email=t@t commit -q -m start

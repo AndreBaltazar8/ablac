@@ -301,6 +301,8 @@ expect_fail "three positional arguments" "$gate" "$old_tree" 2 3 --dry-run
 # --- release-pin: a checkout pinned to v9.9.8 moves to v9.9.9.
 root=$work/root
 mkdir -p "$root/tools" "$root/docs"
+# No release of this fixture is signed yet (release-pin.sh reads tools/first-signed-release); the signed case is below.
+printf 'v99.0.0\n' >"$root/tools/first-signed-release"
 cat >"$root/tools/bootstrap-compiler.sh" <<'EOF'
 version=v9.9.8
 case "$platform/$machine" in
@@ -374,6 +376,7 @@ grep -q 'v9.9.7 bridge' "$root/docs/bootstrap.md" || fail "a mention of another 
 main=$work/main-checkout
 mkdir -p "$main/tools" "$main/docs"
 cp "$pin" "$main/tools/release-pin.sh"
+printf 'v99.0.0\n' >"$main/tools/first-signed-release"
 cp "$root/tools/bootstrap-compiler.sh" "$main/tools/bootstrap-compiler.sh"
 sed -i "s/^version=v9.9.9$/version=v9.9.8/" "$main/tools/bootstrap-compiler.sh"
 [[ $(grep -c "^version=v9.9.8$" "$main/tools/bootstrap-compiler.sh") -eq 1 ]] || fail "the main checkout fixture is not at v9.9.8"
@@ -387,4 +390,36 @@ grep -q "^version=v9.9.8$" "$main/tools/bootstrap-compiler.sh" || fail "the refu
 git -C "$main" worktree add -q -b pin "$work/linked"
 "$work/linked/tools/release-pin.sh" v9.9.9 --dir "$release" >/dev/null 2>&1 || fail "release-pin refused a linked worktree"
 grep -q '^version=v9.9.9$' "$work/linked/tools/bootstrap-compiler.sh" || fail "the linked worktree was not pinned"
+# --- release-pin of a signed release (from tools/first-signed-release on): the signature must verify against
+# release-signing.pub, and the files fetched must be the signed ones.
+signed_root=$work/signed-root
+mkdir -p "$signed_root/tools" "$signed_root/docs"
+cp "$root/tools/bootstrap-compiler.sh" "$signed_root/tools/bootstrap-compiler.sh"
+sed -i "s/^version=v9.9.9$/version=v9.9.8/" "$signed_root/tools/bootstrap-compiler.sh"
+cp "$project_root/tools/verify-release.sh" "$signed_root/tools/verify-release.sh"
+printf 'v9.9.9\n' >"$signed_root/tools/first-signed-release"
+printf 'compiler from `v9.9.8`\n' >"$signed_root/README.md"
+printf 'native `v9.9.8` artifact\n' >"$signed_root/docs/bootstrap.md"
+ssh-keygen -q -t ed25519 -N '' -C test -f "$work/sign-key" >/dev/null
+cp "$work/sign-key.pub" "$signed_root/release-signing.pub"
+signed_release() { # a copy of the made-up release with SHA256SUMS signed by the key given (default: the repository's test key)
+    rm -rf "$work/signed-release"; cp -r "$release" "$work/signed-release"
+    (cd "$work/signed-release" && sha256sum -- * >SHA256SUMS)
+    ssh-keygen -Y sign -f "${1:-$work/sign-key}" -n abla-release "$work/signed-release/SHA256SUMS" >/dev/null 2>&1
+}
+signed_snapshot() { cat "$signed_root/tools/bootstrap-compiler.sh" | sha256sum; }
+signed_before=$(signed_snapshot)
+rm -rf "$work/signed-release"; cp -r "$release" "$work/signed-release"
+expect_fail "an unsigned release (no SHA256SUMS) from the first signed release on" "$pin" v9.9.9 --dir "$work/signed-release" --root "$signed_root"
+grep -q 'not signed' "$work/out.txt" || fail "no explanation for refusing an unsigned release"
+ssh-keygen -q -t ed25519 -N '' -C other -f "$work/other-key" >/dev/null
+signed_release "$work/other-key"
+expect_fail "a release signed by another key" "$pin" v9.9.9 --dir "$work/signed-release" --root "$signed_root"
+signed_release; printf 'x' >>"$work/signed-release/ablac-x86_64-macos"
+expect_fail "a binary changed after signing" "$pin" v9.9.9 --dir "$work/signed-release" --root "$signed_root"
+[[ $(signed_snapshot) == "$signed_before" ]] || fail "a refused signed pin changed the checkout"
+signed_release
+"$pin" v9.9.9 --dir "$work/signed-release" --root "$signed_root" >"$work/out.txt" 2>&1 || { cat "$work/out.txt" >&2; fail "release-pin refused a good signed release"; }
+grep -q '^version=v9.9.9$' "$signed_root/tools/bootstrap-compiler.sh" || fail "the signed release was not pinned"
+
 echo "release scripts: a good release is accepted; a doctored sha256, a changed asset, a missing or extra asset, a wrong version and another stage 2 are refused; a pin moves the version and three sha256s and refuses a bad .sha256"

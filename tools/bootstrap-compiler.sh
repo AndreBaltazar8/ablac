@@ -35,6 +35,19 @@ sha256() {
     fi
 }
 
+# Releases from tools/first-signed-release on carry SHA256SUMS and SHA256SUMS.sig (ssh-keygen -Y sign with the key of
+# release-signing.pub). The download must verify against them, besides matching the pinned sha256 above: no signature, a
+# bad one or a different file is a refusal (tools/verify-release.sh). A custom ABLA_BOOTSTRAP_URL has no release to
+# check; the pinned (or ABLA_BOOTSTRAP_SHA256) checksum alone judges it, as for earlier releases, unless
+# ABLA_BOOTSTRAP_REQUIRE_SIGNATURE=1 asks for the signature beside the URL (the test uses it).
+signature_required() {
+    [[ ${ABLA_BOOTSTRAP_REQUIRE_SIGNATURE:-} == 1 ]] && return 0
+    [[ -z ${ABLA_BOOTSTRAP_URL:-} ]] || return 1
+    local first
+    first=$(head -n 1 "$project_root/tools/first-signed-release")
+    [[ $(printf '%s\n%s\n' "$first" "$version" | sort -V | head -n 1) == "$first" ]]
+}
+
 mkdir -p -- "$(dirname -- "$output")"
 temporary=$(mktemp "${output}.download.XXXXXX")
 cleanup() {
@@ -59,6 +72,17 @@ if [[ $actual_sha256 != "$expected_sha256" ]]; then
     printf 'bootstrap compiler checksum mismatch: expected %s, got %s\n' \
         "$expected_sha256" "$actual_sha256" >&2
     exit 1
+fi
+
+if signature_required; then
+    signed=$(mktemp -d)
+    trap 'rm -rf -- "$signed"; cleanup' EXIT
+    base=${url%/*}
+    curl --fail --location --retry 3 --output "$signed/SHA256SUMS" "$base/SHA256SUMS" &&
+        curl --fail --location --retry 3 --output "$signed/SHA256SUMS.sig" "$base/SHA256SUMS.sig" ||
+        { printf 'bootstrap compiler %s: no signed SHA256SUMS in its release; refusing it\n' "$version" >&2; exit 1; }
+    ln -f "$temporary" "$signed/$artifact" 2>/dev/null || cp "$temporary" "$signed/$artifact"
+    "$project_root/tools/verify-release.sh" "$signed" "$artifact" >&2 || exit 1
 fi
 
 chmod +x "$temporary"

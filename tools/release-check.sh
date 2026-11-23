@@ -165,6 +165,10 @@ switched=0
 static_names=$(grep -E "^ablac-static-(x86_64|aarch64)-linux(\.sha256)?\$" "$actual" || true)
 toolchain_switched=0
 ! grep -qxF abla-toolchain-dynamic-x86_64-linux.tar.gz "$actual" || toolchain_switched=1
+# The publish job adds SHA256SUMS, its signature and the SBOM: they are not build artifacts, so they are neither expected here
+# nor counted as extras (check 9, signature, judges them where they exist).
+grep -vE "^(SHA256SUMS(\.sig)?|ablac-[0-9.]+\.spdx\.json)\$" "$actual" > "$actual.generated" || true
+mv -f "$actual.generated" "$actual"
 grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz)(\.sha256)?\$" "$actual" > "$actual.filtered" || true
 mv -f "$actual.filtered" "$actual"
 if [[ -n $assets_from ]]; then
@@ -185,6 +189,8 @@ else
         basis="(no previous release found)"
     fi
 fi
+grep -vE "^(SHA256SUMS(\.sig)?|ablac-[0-9.]+\.spdx\.json)\$" "$expected" > "$expected.generated" || true
+mv -f "$expected.generated" "$expected"
 grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz)(\.sha256)?\$" "$expected" > "$expected.filtered" || true
 mv -f "$expected.filtered" "$expected"
 if ((count == 0)); then
@@ -221,6 +227,8 @@ for file in "$out"/*; do
         else
             checked=$((checked + 1))
         fi
+    elif [[ $name == SHA256SUMS || $name == SHA256SUMS.sig || $name == ablac-*.spdx.json ]]; then
+        : # made by the publish job, judged by check 2b
     elif [[ ! -f $out/$name.sha256 ]]; then
         bad="$bad $name(no .sha256)"
     fi
@@ -229,6 +237,18 @@ if [[ -z $bad ]]; then
     report PASS sha256 "$checked files match their .sha256"
 else
     report FAIL sha256 "${bad# }"
+fi
+
+# 2b. signature: SHA256SUMS is made and signed by the publish job, so a run's artifacts have none (SKIP); a directory that
+# has them (a published release downloaded with --artifacts) must verify against release-signing.pub, assets and all.
+if [[ -f $out/SHA256SUMS || -f $out/SHA256SUMS.sig ]]; then
+    if verification=$("$(dirname -- "${BASH_SOURCE[0]}")/verify-release.sh" "$out" 2>&1); then
+        report PASS signature "$verification"
+    else
+        report FAIL signature "$(tr '\n' ' ' <<< "$verification")"
+    fi
+else
+    report SKIP signature "unsigned before publish (the publish job signs SHA256SUMS)"
 fi
 
 # 3. version: the Linux binary prints the tag's version.

@@ -117,6 +117,27 @@ Abla source graph and fixed-point check define the maintained compiler. A
 future release can be bootstrapped by the previous Abla release without
 reintroducing a second compiler implementation.
 
+## Signed releases
+
+From the release named in `tools/first-signed-release`, every release carries `SHA256SUMS` (the sha256 of every
+asset, including the bill of materials) and `SHA256SUMS.sig`, an `ssh-keygen -Y sign` signature (namespace
+`abla-release`) by the project key whose public half is `release-signing.pub` at the repository root. The private key
+is the Actions secret `ABLA_RELEASE_SIGNING_KEY` (its backup is git-crypt encrypted in `secrets/`); the publish job of
+`.github/workflows/release.yml` signs with `tools/sign-release.sh`, which verifies the result against the committed
+public key before anything is published. The release also ships `ablac-<version>.spdx.json`, an SPDX 2.3 bill of
+materials (`tools/release-sbom.sh`: the assets with their sha256, the LLVM fork commit and patch, the prebuilt LLVM
+archives, the Xtensa companion, the nixpkgs commit and the bootstrap seed), and a GitHub build-provenance attestation
+for every asset (`gh attestation verify <asset> --repo AndreBaltazar8/ablac`).
+
+To check a download by hand, put `SHA256SUMS`, `SHA256SUMS.sig` and the assets in one directory and run
+`tools/verify-release.sh DIR [ASSET...]`. It refuses a release without a signature, a signature that does not verify
+against `release-signing.pub`, and any asset that is not listed or does not match. The consumers verify the same way and
+fail closed for a signed release: `setup-abla` (the toolchain archive), `tools/bootstrap-compiler.sh` (the seed, besides
+its pinned sha256), `tools/release-pin.sh` (the release it pins) and `tools/release-check.sh` (the `signature` check,
+a SKIP before publish: the publish job signs). Releases before the first signed one have only the checksum files; the
+bootstrap seed's pinned sha256 in the repository covers them. `tools/test-release-signing.sh` runs the accept and
+refuse cases with throwaway keys.
+
 ## Historical-seed convergence
 
 The manual **Historical bootstrap convergence** workflow

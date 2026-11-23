@@ -347,6 +347,7 @@ test-serial: ablac
 	tools/test-unused-declarations.sh $(COMPILER)
 	tools/test-json-construction.sh $(COMPILER)
 	tools/test-regex-construction.sh $(COMPILER)
+	tools/test-release-signing.sh
 	tools/test-compile-eval-tier.sh $(COMPILER)
 	tools/test-compile-eval-cache-tier.sh $(COMPILER)
 	tools/test-compile-eval-shared-state.sh $(COMPILER) host

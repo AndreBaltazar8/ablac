@@ -365,6 +365,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # The build provenance attestation (SLSA): GitHub's OIDC token and the attestations API.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -375,15 +378,37 @@ jobs:
           pattern: ablac-*
           path: release
           merge-multiple: true
-      - name: Publish the immutable release
+      - name: Check the build, make the bill of materials and sign the release
         env:
-          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
+          ABLA_RELEASE_SIGNING_KEY: ${{ secrets.ABLA_RELEASE_SIGNING_KEY }}
         run: |
           test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
           test "$(cat release/static-suite-source.sha)" = "$(git rev-parse HEAD)"
           (cd release && sha256sum -c ablac-x86_64-linux.sha256)
           rm release/static-suite-source.sha
+          # The bill of materials, then the signature (decision #110): SHA256SUMS lists every asset, the SBOM
+          # included, and ssh-keygen -Y sign (namespace abla-release) signs it with the project key from the
+          # Actions secret. sign-release.sh verifies the result against release-signing.pub, so a wrong secret
+          # fails here and nothing is published. setup-abla, tools/bootstrap-compiler.sh and tools/release-pin.sh
+          # verify the same way (tools/verify-release.sh). The key file is written 0600 and removed.
+          test -n "$ABLA_RELEASE_SIGNING_KEY"
+          tools/release-sbom.sh "$RELEASE_TAG" release "$RUNNER_TEMP/ablac-${RELEASE_TAG#v}.spdx.json"
+          mv "$RUNNER_TEMP/ablac-${RELEASE_TAG#v}.spdx.json" release/
+          signing_key=$(mktemp)
+          trap 'rm -f "$signing_key"' EXIT
+          (umask 077; printf '%s\n' "$ABLA_RELEASE_SIGNING_KEY" > "$signing_key")
+          tools/sign-release.sh release "$signing_key"
+      # Build provenance (SLSA) for every asset including SHA256SUMS and its signature, from this workflow run:
+      # `gh attestation verify <asset> --repo AndreBaltazar8/ablac` checks it.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*
+      - name: Publish the immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release/* --clobber
             for bridge in \

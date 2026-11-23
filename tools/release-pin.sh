@@ -121,6 +121,27 @@ for artifact in "${artifacts[@]}"; do
     fi
 done
 
+# A release from tools/first-signed-release on is signed: its SHA256SUMS must verify against release-signing.pub
+# (tools/verify-release.sh) and list the files fetched above, or nothing is pinned.
+first_signed=$(head -n 1 "$root/tools/first-signed-release")
+if [[ $(printf '%s\n%s\n' "$first_signed" "$tag" | sort -V | head -n 1) == "$first_signed" ]]; then
+    mkdir -p "$work/signed"
+    for name in SHA256SUMS SHA256SUMS.sig; do
+        fetch "$name" "$work/signed/$name" || { echo "release-pin: $tag has no $name: it is not signed, refusing to pin it" >&2; exit 1; }
+    done
+    names=()
+    for artifact in "${artifacts[@]}"; do
+        ln -f "$work/$artifact.sha256" "$work/signed/$artifact.sha256" 2>/dev/null || cp "$work/$artifact.sha256" "$work/signed/$artifact.sha256"
+        names+=("$artifact.sha256")
+        if [[ -f $work/$artifact ]]; then
+            ln -f "$work/$artifact" "$work/signed/$artifact" 2>/dev/null || cp "$work/$artifact" "$work/signed/$artifact"
+            names+=("$artifact")
+        fi
+    done
+    "$root/tools/verify-release.sh" --key "$root/release-signing.pub" "$work/signed" "${names[@]}" ||
+        { echo "release-pin: $tag's signature does not verify, refusing to pin it" >&2; exit 1; }
+fi
+
 # Rewrite bootstrap-compiler.sh: the version and, in each platform's case block, its sha256.
 pinned=$work/bootstrap-compiler.sh
 awk -v tag="$tag" -v linux="$sum_linux" -v intel="$sum_intel" -v arm="$sum_arm" '
