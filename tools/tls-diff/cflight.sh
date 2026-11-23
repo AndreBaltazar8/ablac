@@ -12,6 +12,8 @@ if [[ ! -f $cert ]]; then
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$key" -out "$cert" -subj /CN=localhost -addext subjectAltName=DNS:localhost -days 2 2> /dev/null
 fi
 base=${CFLIGHT_PORT:-29500}
+client_program=cflight
+[[ -n ${CFLIGHT_TLS12:-} ]] && client_program=cflight12   # CFLIGHT_TLS12=1: the TLS 1.2 client (tools/tls-diff/cflight12.ab); no client certificates
 auth=${CFLIGHT_AUTH:-}   # CFLIGHT_AUTH=1: the servers require a client certificate (a CA and a client certificate are made in OUTDIR)
 openssl_auth=()
 ours_auth=()
@@ -41,7 +43,7 @@ for ((w = 0; w < 100; w++)); do
 done
 sleep 1
 for index in 0 1 2; do
-    "$programs/cflight" $((base + index)) "$seed" "$count" "${client_auth[@]}" > "$out/cf-$index.out" 2>&1 &
+    "$programs/$client_program" $((base + index)) "$seed" "$count" "${client_auth[@]}" > "$out/cf-$index.out" 2>&1 &
     pids+=("$!")
 done
 wait "${pids[@]:3}" || true

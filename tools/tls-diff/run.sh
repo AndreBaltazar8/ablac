@@ -11,6 +11,14 @@
 #
 #   tools/tls-diff/run.sh COMPILER clienthello INSTANCES FIRST_SEED SEEDS_PER_INSTANCE INPUTS_PER_SEED
 #   tools/tls-diff/run.sh COMPILER serverhello INSTANCES FIRST_SEED CASES_PER_INSTANCE
+#   tools/tls-diff/run.sh COMPILER flight|flight12|cflight|cflightauth|cflight12 INSTANCES FIRST_SEED CASES_PER_INSTANCE   (round 3: see below)
+#
+# Round 3 (the encrypted part of the handshake, with a real handshake behind each case; flight.sh and cflight.sh print the combinations and the LENIENT and STRICT lines):
+#   flight      our client against a hostile TLS 1.3 server (flight-server.ab) that changes its encrypted flight and the post-handshake messages, against openssl s_client and Go
+#   flight12    the same for TLS 1.2 (flight12-server.ab)
+#   cflight     our server against a hostile TLS 1.3 client (cflight.ab) that changes its Finished flight and the post-handshake messages, against openssl s_server and Go
+#   cflightauth the same with client certificates required: the Certificate and CertificateVerify are changed too
+#   cflight12   the same for TLS 1.2 (cflight12.ab)
 #
 # The output goes to build/tls-diff/: clienthello.out (the COUNT and ODD lines), serverhello.txt (one joined line per case: instance:index tags ours openssl go) and
 # a summary on standard output. "Ours is lenient" (we accept what both others refuse) is the line to read first; "ours is stricter" is an interoperability risk
@@ -32,7 +40,7 @@ fi
 build() { "$compiler" build "tools/tls-diff/$1.ab" -o "$out/$1" --fast --no-cache > "$out/$1.build.log" 2>&1 || { cat "$out/$1.build.log" >&2; exit 2; }; }
 (cd tools/tls-diff && go build -o "../../$out/peer" peer.go client.go)
 pids=()
-cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2> /dev/null || true; done; pkill -f "s_server -accept 127.0.0.1:2[46]" 2> /dev/null || true; }
+cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2> /dev/null || true; done; pkill -f "s_server -accept 127.0.0.1:(2[46]|3[01])" 2> /dev/null || true; }
 trap cleanup EXIT
 if [[ $mode == clienthello ]]; then
     build server
@@ -56,6 +64,29 @@ if [[ $mode == clienthello ]]; then
     { grep '^ODD acc/rej/rej' "$out/clienthello.out" || true; } | sed 's/ODD acc\/rej\/rej seed [0-9]* n [0-9]* //' | { grep -v '+' || true; } | sort | uniq -c | sort -rn
     echo "ours is stricter (refuses what both accept), one change at a time:"
     { grep '^ODD rej/acc/acc' "$out/clienthello.out" || true; } | sed 's/ODD rej\/acc\/acc seed [0-9]* n [0-9]* //' | { grep -v '+' || true; } | sort | uniq -c | sort -rn
+elif [[ $mode == flight || $mode == flight12 || $mode == cflight || $mode == cflightauth || $mode == cflight12 ]]; then
+    # Round 3 (tools/tls-diff/flight.sh, cflight.sh): the encrypted flights. INSTANCES run at once, seeds FIRST_SEED+k, COUNT connections each, on ports 31000+100*k.
+    case $mode in
+        flight) programs=(flight-server flight-client) ;;
+        flight12) programs=(flight12-server flight-client) ;;
+        cflight | cflightauth) programs=(cflight server) ;;
+        cflight12) programs=(cflight12 server) ;;
+    esac
+    for program in "${programs[@]}"; do build "$program"; done
+    runs=()
+    for k in $(seq 0 $((instances - 1))); do
+        case $mode in
+            flight) FLIGHT_PORT=$((31000 + 100 * k)) tools/tls-diff/flight.sh "$out/$mode-$k" "$out" $((first + k)) "$count" "$PWD/$out/c.pem" "$PWD/$out/k.pem" > "$out/$mode-$k.sum" 2>&1 & runs+=($!) ;;
+            flight12) FLIGHT_TLS12=1 FLIGHT_PORT=$((31000 + 100 * k)) tools/tls-diff/flight.sh "$out/$mode-$k" "$out" $((first + k)) "$count" "$PWD/$out/c.pem" "$PWD/$out/k.pem" > "$out/$mode-$k.sum" 2>&1 & runs+=($!) ;;
+            cflight) CFLIGHT_PORT=$((31000 + 100 * k)) tools/tls-diff/cflight.sh "$out/$mode-$k" "$out" $((first + k)) "$count" "$PWD/$out/c.pem" "$PWD/$out/k.pem" > "$out/$mode-$k.sum" 2>&1 & runs+=($!) ;;
+            cflightauth) CFLIGHT_AUTH=1 CFLIGHT_PORT=$((31000 + 100 * k)) tools/tls-diff/cflight.sh "$out/$mode-$k" "$out" $((first + k)) "$count" "$PWD/$out/c.pem" "$PWD/$out/k.pem" > "$out/$mode-$k.sum" 2>&1 & runs+=($!) ;;
+            cflight12) CFLIGHT_TLS12=1 CFLIGHT_PORT=$((31000 + 100 * k)) tools/tls-diff/cflight.sh "$out/$mode-$k" "$out" $((first + k)) "$count" "$PWD/$out/c.pem" "$PWD/$out/k.pem" > "$out/$mode-$k.sum" 2>&1 & runs+=($!) ;;
+        esac
+    done
+    for pid in "${runs[@]}"; do wait "$pid" || true; done
+    echo "$mode: ours alone against both others, one change at a time (LENIENT: ours takes what both refuse; STRICT: ours refuses what both take):"
+    { cat "$out"/$mode-*.sum | grep -E '^(LENIENT|STRICT)' || true; } | awk '{ tags = $3; n[$1 " " tags " " $4 " " $5 " " $6]++ } END { for (k in n) print "  " n[k] " " k }' | sort -rn
+    echo "$mode: $(cat "$out"/$mode-*/*.txt | wc -l) cases joined (the lines are in $out/$mode-K/*.txt)"
 else
     build hello-server
     build client

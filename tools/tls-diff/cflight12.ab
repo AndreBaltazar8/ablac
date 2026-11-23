@@ -1,0 +1,266 @@
+// The TLS 1.2 client-flight side of the TLS handshake differential (#1139 area 3, TLS round 3): a hostile TLS 1.2 client that does a real handshake (ECDHE-ECDSA,
+// AES-128-GCM, P-256, extended master secret). It connects COUNT times in a row to 127.0.0.1:PORT, reads the server's flight (ServerHello, Certificate,
+// ServerKeyExchange, ServerHelloDone) and sends its own changed by a generator seeded by (SEED, i): the ClientKeyExchange (the point empty, short, long, off the curve,
+// all zeros, compressed, the point at infinity, one that is not a field element, a length byte that does not match, bytes after it, a header length or type that does
+// not match, twice, left out), messages that may not be there (a Certificate, CertificateVerify, HelloRequest, ClientHello, NewSessionTicket, an unknown type), the
+// change_cipher_spec (left out, twice, malformed, before the ClientKeyExchange), the Finished (wrong, short, long, empty, in plaintext, twice, a flipped bit, a wrong
+// sequence number, cut over records), and after a valid Finished: application data, alerts, a renegotiation ClientHello, a second change_cipher_spec, empty and large
+// records, an unknown record type, a handshake message of an unknown type.
+// What the server does is read off the wire by decrypting its records: A<n> (an alert, description n: it refused), C (it closed), ok (nothing refused within the
+// window, after a probe of valid application data); F/ prefixes the second phase. One line per connection, "CASE i tags class", for cflight.sh to join.
+//
+//   cflight12 PORT SEED COUNT
+import "abla/io"
+import "abla/text"
+import "abla/array"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/crypto/hkdf"
+import "abla/integer"
+import "abla/net"
+import "abla/process/arguments"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/keysched"
+import "abla/tls/pure/record"
+import "abla/tls/pure/client"
+import "abla/tls/pure/tls12"
+import "../fuzz/prng.ab"
+import "./common.ab"
+
+var c12Generator: Prng = prngSeeded(1)
+
+fun c12Random(count: int): string = diffBytes(c12Generator, count)
+
+fun c12Header(type: int, body: string, delta: int): string =
+    cryptoByteString([type, ((body.size + delta) >> 16) & 255, ((body.size + delta) >> 8) & 255, (body.size + delta) & 255]) + body
+
+fun c12Pick(var r: Prng, values: array<string>): string = values[r.below(values.size)]
+
+/** The server's reaction in the next `milliseconds`: records after its change_cipher_spec are opened under `protection`; a record before it is plaintext. */
+fun c12Reaction(var connection: TcpConnection, var protection: Tls12Protection, milliseconds: int): string {
+    var got = ""
+    var closed = false
+    var rounds = 0
+    while (rounds < 4) {
+        val incoming = connection.readWithTimeoutResult(65536, milliseconds)
+        if (incoming.hasData()) got = got + incoming.bytes
+        else {
+            if (!incoming.timedOut()) closed = true
+            rounds = 4
+        }
+        rounds = rounds + 1
+    }
+    var at = 0
+    var sawCcs = false
+    while (at + 5 <= got.size) {
+        val length = diffRd16(got, at + 3)
+        if (at + 5 + length > got.size) break
+        val type = got[at]
+        if (type == 21 && !sawCcs) return if (length >= 2) "A${got[at + 6]}" else "A?"
+        if (type == 20) sawCcs = true
+        else if (sawCcs) {
+            val opened = tls12Open(protection, got.slice(at, at + 5 + length))
+            if (!opened.ok) return "BAD"
+            if (opened.type == 21) return if (opened.content.size >= 2) "A${opened.content[1]}" else "A?"
+        }
+        at = at + 5 + length
+    }
+    if (closed) "C" else "ok"
+}
+
+fun main: int {
+    if (processArgumentCount() < 3) {
+        println("usage: cflight12 PORT SEED COUNT")
+        return 2
+    }
+    val port = processArgument(0).parseInt() ?? 0
+    val seed = processArgument(1).parseInt() ?? 1
+    val count = processArgument(2).parseInt() ?? 1
+    val hash = HKDF_SHA256
+    val suite = tls12Suite(TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256) ?? tls12Placeholder()
+    for (i in 0 until count) {
+        var r = prngSeeded(seed * 100003 + i)
+        c12Generator = prngSeeded(seed * 7919 + i)
+        var connection = tcpConnect(ipv4Loopback(port), 1000)
+        if (connection.descriptor < 0) {
+            println("CASE $i connect R")
+            continue
+        }
+        val pair = tlsGenerateKeyPair(23, c12Random) ?? continue
+        val clientRandom = c12Random(32)
+        val hello = tlsBuildClientHello(clientRandom, "", [], "localhost", [23], [], [0x0403, 0x0804], [], "", [TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256])
+        connection.write(tlsPlaintextRecord(22, 771, hello))
+        var transcript = hello
+        var got = ""
+        var pending = ""
+        var serverRandom = ""
+        var serverPoint = ""
+        var done = false
+        var failed = ""
+        var tries = 0
+        while (!done && failed == "" && tries < 20) {
+            tries = tries + 1
+            val incoming = connection.readWithTimeoutResult(65536, if (tries == 1) 2500 else 400)
+            if (!incoming.hasData()) {
+                failed = if (incoming.timedOut()) "W" else "C"
+                break
+            }
+            got = got + incoming.bytes
+            while (got.size >= 5 && !done && failed == "") {
+                val length = diffRd16(got, 3)
+                if (got.size < 5 + length) break
+                val record = got.slice(0, 5 + length)
+                got = got.slice(5 + length, got.size)
+                if (record[0] == 21) {
+                    failed = "A${if (record.size > 6) record[6] else 0}"
+                    break
+                }
+                if (record[0] != 22) {
+                    failed = "unexpected"
+                    break
+                }
+                pending = pending + record.slice(5, record.size)
+                while (pending.size >= 4 && 4 + (pending[1] * 65536 + pending[2] * 256 + pending[3]) <= pending.size && !done) {
+                    val size = 4 + (pending[1] * 65536 + pending[2] * 256 + pending[3])
+                    val message = pending.slice(0, size)
+                    pending = pending.slice(size, pending.size)
+                    transcript = transcript + message
+                    if (message[0] == 2) serverRandom = message.slice(6, 38)
+                    if (message[0] == 12) {
+                        val ske = tls12ParseServerKeyExchange(message.slice(4, message.size))
+                        if (ske.ok) serverPoint = ske.point
+                    }
+                    if (message[0] == 14) done = true
+                }
+            }
+        }
+        if (!done || serverPoint == "") {
+            println("CASE $i noflight($failed) W")
+            connection.close()
+            continue
+        }
+        // The mutation.
+        var tags = ""
+        var pointMode = 0
+        var ckeDelta = 0
+        var ckeType = -1
+        var ckeTrailing = ""
+        var ckeMode = 0
+        var extra = ""
+        var ccsMode = 0
+        var finMode = 0
+        var sequenceSkip = false
+        var flip = false
+        var split = false
+        var postMode = 0
+        val rounds = 1 + (if (r.below(5) == 0) 1 else 0)
+        for (k in 0 until rounds) {
+            val kind = r.below(22)
+            var tag = "?"
+            if (kind == 0) { pointMode = 1 + r.below(10); tag = "cke-point-$pointMode" }
+            else if (kind == 1) { ckeDelta = diffPickInt(r, [-1, 1, 2]); tag = "cke-length" }
+            else if (kind == 2) { ckeType = diffPickInt(r, [0, 1, 11, 12, 14, 15, 20, 99]); tag = "cke-type-$ckeType" }
+            else if (kind == 3) { ckeTrailing = diffBytes(r, 1 + r.below(3)); tag = "cke-trailing" }
+            else if (kind == 4) { ckeMode = 1 + r.below(2); tag = "cke-omitted-twice-$ckeMode" }
+            else if (kind == 5) { extra = c12Pick(r, ["certificate", "certificate-verify", "hello-request", "client-hello", "ticket", "unknown", "finished", "server-hello-done"]); tag = "extra-$extra" }
+            else if (kind == 6) { ccsMode = 1 + r.below(4); tag = "ccs-$ccsMode" }
+            else if (kind == 7) { finMode = 1 + r.below(7); tag = "fin-$finMode" }
+            else if (kind == 8) { sequenceSkip = true; tag = "fin-sequence" }
+            else if (kind == 9) { flip = true; tag = "fin-bit-flip" }
+            else if (kind == 10) { split = true; tag = "fin-split" }
+            else { postMode = 1 + r.below(16); tag = "post-$postMode" }
+            tags = tags + (if (k > 0) "+" else "") + tag
+        }
+        var point = pair.publicKey
+        if (pointMode == 1) point = ""
+        if (pointMode == 2) point = point.slice(0, point.size - 1)
+        if (pointMode == 3) point = point + "\x00"
+        if (pointMode == 4) point = point.slice(0, 1) + diffBytes(r, point.size - 1)
+        if (pointMode == 5) point = "\x04" + "\x00".repeat(64)
+        if (pointMode == 6) point = "\x02" + point.slice(1, 33)
+        if (pointMode == 7) point = "\x00"
+        if (pointMode == 8) point = "\x04" + "\xff".repeat(64)
+        if (pointMode == 9) point = serverPoint
+        if (pointMode == 10) point = "\x04" + point.slice(1, 33) + cryptoByteString([point[64] ^ 1]).repeat(32)
+        var cke = c12Header(if (ckeType >= 0) ckeType else 16, cryptoByteString([point.size]) + point + ckeTrailing, ckeDelta)
+        var wire = ""
+        var sent = ""
+        if (extra == "certificate") { val m = c12Header(11, "\x00\x00\x00", 0); wire = wire + tlsPlaintextRecord(22, 771, m); sent = sent + m }
+        if (extra == "certificate-verify") { val m = c12Header(15, "\x04\x03\x00\x00", 0); wire = wire + tlsPlaintextRecord(22, 771, m); sent = sent + m }
+        if (extra == "hello-request") { val m = c12Header(0, "", 0); wire = wire + tlsPlaintextRecord(22, 771, m); sent = sent + m }
+        if (extra == "client-hello") { val m = c12Header(1, "x", 0); wire = wire + tlsPlaintextRecord(22, 771, m); sent = sent + m }
+        if (extra == "ticket") { val m = c12Header(4, "\x00\x00\x1c\x20\x00\x04tick", 0); wire = wire + tlsPlaintextRecord(22, 771, m); sent = sent + m }
+        if (extra == "unknown") { val m = c12Header(99, "x", 0); wire = wire + tlsPlaintextRecord(22, 771, m); sent = sent + m }
+        if (extra == "finished") { val m = c12Header(20, "x".repeat(12), 0); wire = wire + tlsPlaintextRecord(22, 771, m); sent = sent + m }
+        if (extra == "server-hello-done") { val m = c12Header(14, "", 0); wire = wire + tlsPlaintextRecord(22, 771, m); sent = sent + m }
+        if (ckeMode != 1) { wire = wire + tlsPlaintextRecord(22, 771, cke); sent = sent + cke }
+        if (ckeMode == 2) { wire = wire + tlsPlaintextRecord(22, 771, cke); sent = sent + cke }
+        transcript = transcript + sent
+        val shared = tlsAgree(pair, serverPoint)
+        if (!shared.ok) {
+            println("CASE $i $tags noshare W")
+            connection.close()
+            continue
+        }
+        val master = tls12MasterSecret(hash, shared.bytes, tlsHashOf(hash, transcript))
+        val keys = tls12DeriveKeys(suite, master, serverRandom, clientRandom)
+        var write = tls12Protection(suite, keys.clientKey, keys.clientIv)
+        var read = tls12Protection(suite, keys.serverKey, keys.serverIv)
+        var verify = tls12FinishedData(hash, master, "client finished", tlsHashOf(hash, transcript))
+        if (finMode == 1 && verify.size > 1) verify = verify.slice(0, verify.size - 1)
+        if (finMode == 2) verify = verify + "\x00"
+        if (finMode == 3) verify = cryptoByteString([verify[0] ^ 1]) + verify.slice(1, verify.size)
+        if (finMode == 4) verify = ""
+        if (finMode == 5) verify = diffBytes(r, 12)
+        val finished = c12Header(20, verify, 0)
+        if (ccsMode != 1) wire = wire + tlsPlaintextRecord(20, 771, "\x01")
+        if (ccsMode == 2) wire = wire + tlsPlaintextRecord(20, 771, "\x01")
+        if (ccsMode == 3) wire = tlsPlaintextRecord(20, 771, "\x02") + wire
+        if (ccsMode == 4) wire = wire + tlsPlaintextRecord(20, 771, "\x01\x01")
+        if (finMode == 6) wire = wire + tlsPlaintextRecord(22, 771, finished)
+        else {
+            if (sequenceSkip) write.sequence = write.sequence + 1
+            val pieces: array<string> = []
+            if (split) { pieces.append(finished.slice(0, 5)); pieces.append(finished.slice(5, finished.size)) } else pieces.append(finished)
+            if (finMode == 7) pieces.append(finished)
+            for (piece in pieces) {
+                val sealed = tls12Protect(write, 22, piece)
+                if (sealed.ok) {
+                    var record = sealed.bytes
+                    if (flip && record.size > 14) record = record.slice(0, 13) + cryptoByteString([record[13] ^ 1]) + record.slice(14, record.size)
+                    wire = wire + record
+                }
+            }
+        }
+        connection.write(wire)
+        var reaction = c12Reaction(connection, read, 150)
+        if (reaction == "ok") {
+            var out = ""
+            var name = "probe"
+            if (postMode == 1) { name = "alert-close"; val s = tls12Protect(write, 21, "\x01\x00"); if (s.ok) out = s.bytes }
+            else if (postMode == 2) { name = "alert-warning-other"; val s = tls12Protect(write, 21, "\x01\x28"); if (s.ok) out = s.bytes }
+            else if (postMode == 3) { name = "alert-fatal"; val s = tls12Protect(write, 21, "\x02\x28"); if (s.ok) out = s.bytes }
+            else if (postMode == 4) { name = "alert-short"; val s = tls12Protect(write, 21, "\x01"); if (s.ok) out = s.bytes }
+            else if (postMode == 5) { name = "renegotiation"; val s = tls12Protect(write, 22, c12Header(1, "x", 0)); if (s.ok) out = s.bytes }
+            else if (postMode == 6) { name = "ccs"; val s = tls12Protect(write, 20, "\x01"); if (s.ok) out = s.bytes }
+            else if (postMode == 7) { name = "empty-app"; val s = tls12Protect(write, 23, ""); if (s.ok) out = s.bytes }
+            else if (postMode == 8) { name = "app-large"; val s = tls12Protect(write, 23, "a".repeat(16384)); if (s.ok) out = s.bytes }
+            else if (postMode == 9) { name = "unknown-type"; val s = tls12Protect(write, 99, "x"); if (s.ok) out = s.bytes }
+            else if (postMode == 10) { name = "unknown-handshake"; val s = tls12Protect(write, 22, c12Header(99, "x", 0)); if (s.ok) out = s.bytes }
+            else if (postMode == 11) { name = "hello-request"; val s = tls12Protect(write, 22, c12Header(0, "", 0)); if (s.ok) out = s.bytes }
+            else if (postMode == 12) { name = "finished-again"; val s = tls12Protect(write, 22, finished); if (s.ok) out = s.bytes }
+            else if (postMode == 13) { name = "empty-handshake"; val s = tls12Protect(write, 22, ""); if (s.ok) out = s.bytes }
+            else if (postMode == 14) { name = "key-update"; val s = tls12Protect(write, 22, c12Header(24, "\x00", 0)); if (s.ok) out = s.bytes }
+            else if (postMode == 15) { name = "plaintext-app"; out = tlsPlaintextRecord(23, 771, "hello") }
+            else if (postMode == 16) { name = "ticket"; val s = tls12Protect(write, 22, c12Header(4, "\x00\x00\x1c\x20\x00\x04tick", 0)); if (s.ok) out = s.bytes }
+            if (postMode > 0) tags = tags + "[" + name + "]"
+            val probe = tls12Protect(write, 23, "ping")
+            if (probe.ok) out = out + probe.bytes
+            connection.write(out)
+            reaction = "F/" + c12Reaction(connection, read, 150)
+        }
+        println("CASE $i $tags $reaction")
+        connection.close()
+    }
+    0
+}
