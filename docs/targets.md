@@ -92,6 +92,16 @@ suite. The local-suite checks below are registered in the [Makefile](../Makefile
 
 ## Toolchain and runtime boundaries
 
+Android arm64 shared libraries use 16 KiB ELF load-segment alignment. The
+generated JNI adapter requests the same alignment from the NDK linker.
+[The Android extension check](../tools/test-android-extension.sh) inspects
+the ELF segments. [The bionic execution check](../tools/test-android-run.sh)
+uses QEMU user mode with the host page size, so an Android device or system
+image running a 16 KiB kernel is needed for the corresponding runtime check.
+APK and App Bundle packaging also have their own alignment requirements.
+[Android's 16 KiB compatibility guide](https://developer.android.com/guide/practices/page-sizes)
+describes both checks.
+
 Linux-to-macOS linking requires an extracted SDK in `ABLA_MACOS_SDK` and suitable
 target libraries; [tools/build-macos-from-linux.sh](../tools/build-macos-from-linux.sh)
 checks that prerequisite. Being able to emit a Mach-O object without linking is

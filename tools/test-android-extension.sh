@@ -32,6 +32,16 @@ set -e
 
 grep -q 'AArch64' <<<"$(llvm-readelf -h "$library")"
 grep -q 'DYN (Shared object file)' <<<"$(llvm-readelf -h "$library")"
+llvm-readelf -lW "$library" | awk '
+    $1 == "LOAD" {
+        seen = 1
+        if ($NF != "0x4000") {
+            print "Android extension: expected 16 KiB PT_LOAD alignment: " $0 > "/dev/stderr"
+            bad = 1
+        }
+    }
+    END { exit (!seen || bad) }
+'
 grep -q ' abla_app_answer$' <<<"$(llvm-nm -D --defined-only "$library")"
 grep -q '"schema":"abla.abi.v1"' "$abi_manifest"
 grep -q '"name":"android-arm64"' "$abi_manifest"
@@ -52,6 +62,7 @@ grep -q 'Java_org_abla_generated_AblaApp_answer' "$jni"
 grep -q 'external fun answer(): Long' "$kotlin"
 grep -q 'IMPORTED_LOCATION.*ANDROID_ABI.*libabla_app.so' "$cmake"
 grep -q 'IMPORTED_NO_SONAME TRUE' "$cmake"
+grep -Fq 'target_link_options(abla_jni PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")' "$cmake"
 grep -q 'jniLibs.srcDir' "$gradle"
 
 set +e
