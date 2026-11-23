@@ -1,6 +1,6 @@
 # OCSP stapling: a minimal revocation check (design)
 
-Status: design only, nothing is implemented. Written for #1139 (TLS round 2), area 3's known gap "revocation: no CRL or OCSP at all".
+Status: the client side is implemented (abla/crypto/ocsp, tlsClientConfigWithRevocation, tlsOcspVerifier; docs/tls.md describes it); the server side and everything marked "not implemented" below are not. Written for #1139 (TLS round 2), area 3.s known gap "revocation: no CRL or OCSP at all".
 
 ## Where we are
 
@@ -122,3 +122,12 @@ Answered by the security reviewer (7e) on 2026-11-24:
 - The default for `revocation` stays 0 (today's behaviour). Flipping it to 1 changes what every client accepts, so it is the project owner's decision when the implementation is scheduled; the proposal above (0 until the interop is in, then 1 in a minor release, announced in the notes) is what is put to them then.
 - `ocspRequestDer` goes in the stdlib next to the response parser: it is pure encoding. Fetching a response stays with the application.
 - Per-entry staples in TLS 1.3 (intermediates) are verified when present and not requested specially, as designed.
+
+## As built (client side)
+
+The pieces above were built with these differences: the policy and the path check live in `abla/crypto/ocsp` (`ocspCheckPath`, which takes the verified path and one staple per
+certificate) and not on `X509Options` (x509 cannot import a module that imports it); the TLS client keeps its public `verifier` type and gets a second closure, `stapleVerifier`, set with
+`tlsClientConfigWithRevocation` (`tlsOcspVerifier` of abla/tls/pure/verify builds the standard one); the staples are read per Certificate entry in TLS 1.3 and from a CertificateStatus
+message in TLS 1.2 (only when the ServerHello promised one). `ocspRequestDer` is in the module. Not built: the server side (`TlsIdentity.staple`), the BoGo OCSP cases, the fuzz harness for the
+response parser, and the tlsfeature check at the TlsConnection level for a resumed session. Tests: tools/test-ocsp.sh (the module, with openssl-made responses) and tools/test-tls-ocsp.sh (the client
+against `openssl s_server -status_file` in TLS 1.3 and 1.2); both are mutation-checked (five and three mutants).

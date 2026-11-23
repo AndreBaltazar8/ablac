@@ -1,0 +1,66 @@
+// abla/tls/pure with revocation checking by OCSP stapling, against an `openssl s_server -status_file` (tools/test-tls-ocsp.sh makes the certificates and responses and runs one
+// server per case, TLS 1.3 and TLS 1.2): one connection. Arguments: the port, the trust anchor (PEM), the expectation ("ok", or the text the refusal must contain), the revocation policy
+// (0 off, 1 staple, 2 require) and the number of seconds added to the clock the OCSP check reads. Prints "tls-pure ocsp ok" or what went wrong.
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/tls/pure/client"
+import "abla/tls/pure/connection"
+import "abla/tls/pure/verify"
+import "abla/tls/pure/handshake"
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun now(): int = realtimeMilliseconds() / 1000
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    val store = x509TrustStoreFromPem(linuxReadFile(processArgument(1), 1048576))
+    val expectation = processArgument(2)
+    val policy = decimal(processArgument(3))
+    val offset = decimal(processArgument(4))
+    if (store.certificates.size != 1) {
+        println("FAIL the trust store has ${store.certificates.size} certificates")
+        return 1
+    }
+    var config = tlsClientConfig("localhost", tlsX509Verifier(store, now), tlsPureRandom)
+    if (policy > 0) config = tlsClientConfigWithRevocation(config, policy, tlsOcspVerifier(store, "localhost", { now() + offset }, policy))
+    var connection = tlsPureConnect(config, port, 5000, 5000)
+    if (expectation == "ok") {
+        if (!connection.ok()) {
+            println("FAIL the connection was refused: ${connection.lastError}")
+            return 1
+        }
+        if (connection.write("GET / HTTP/1.0\r\n\r\n") < 0) {
+            println("FAIL write: ${connection.lastError}")
+            return 1
+        }
+        var response = connection.read(4096)
+        if (response.size == 0) {
+            println("FAIL no response: ${connection.lastError}")
+            return 1
+        }
+        connection.close()
+    } else {
+        if (connection.ok()) {
+            println("FAIL the connection was accepted, expected a refusal with '$expectation'")
+            connection.close()
+            return 1
+        }
+        if (connection.lastError.indexOf(expectation) < 0) {
+            println("FAIL the refusal is '${connection.lastError}', expected it to contain '$expectation'")
+            return 1
+        }
+        connection.close()
+    }
+    println("tls-pure ocsp ok")
+    0
+}

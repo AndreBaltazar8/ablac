@@ -11,7 +11,9 @@ import "abla/crypto/p256"
 import "abla/crypto/p384"
 import "abla/crypto/rsa"
 import "abla/crypto/rsapss"
+import "abla/crypto/ocsp"
 import "abla/crypto/x509"
+import "abla/text"
 import "abla/tls/pure/handshake"
 import "abla/tls/pure/tls12"
 
@@ -184,3 +186,28 @@ fun tlsX509Scope(store: X509TrustStore): string {
     for (certificate in store.certificates) all = all + certificate.der
     "x509:" + hexEncode(sha256(all))
 }
+
+/** The staple verifier for TlsClientConfig.stapleVerifier (set both with tlsClientConfigWithRevocation): it builds the path of the chain the server sent against `store` for `host`
+ *  at the time from `now` (the chain verifier has accepted it already), maps each stapled response to its certificate of the path, and applies `policy` (OCSP_POLICY_STAPLE or
+ *  OCSP_POLICY_REQUIRE of abla/crypto/ocsp; see ocspCheckPath). A revoked certificate answers certificate_revoked, any other refusal bad_certificate_status_response (a must-staple
+ *  certificate without a staple: bad_certificate). */
+fun tlsOcspVerifier(store: X509TrustStore, host: string, now: () -> int, policy: int): (array<string>, array<string>) -> TlsVerdict =
+    { chain: array<string>, statuses: array<string> ->
+        val moment = now()
+        val verification = x509Verify(chain, store, X509Options(host, moment))
+        if (!verification.ok) {
+            tlsRefused(tlsChainVerdictAlert(verification.kind), "certificate: ${verification.error}")
+        } else {
+            val staples: array<string> = []
+            for (certificate in verification.path) {
+                var staple = ""
+                for (j in 0 until chain.size) if (chain[j] == certificate.der && j < statuses.size) staple = statuses[j]
+                staples.append(staple)
+            }
+            val problem = ocspCheckPath(verification.path, staples, policy, moment)
+            if (problem == "") tlsAccepted()
+            else if (problem.indexOf("is revoked") >= 0) tlsRefused(TLS_VERDICT_CERTIFICATE_REVOKED, "certificate: $problem")
+            else if (problem.indexOf("requires an OCSP staple") >= 0 || problem.indexOf("no OCSP staple") >= 0) tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: $problem")
+            else tlsRefused(TLS_VERDICT_BAD_STATUS_RESPONSE, "certificate: $problem")
+        }
+    }

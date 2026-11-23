@@ -124,6 +124,18 @@ RFC 6979 nonces: `p384EcdsaSign`; a server identity can be a P-384 key, in PKCS#
 the certificates a client accepts (RFC 8422 section 5.1.1): a client refuses an EC certificate whose curve it did not list (`bad_certificate`), and a
 server with a P-256 or P-384 key does not serve a TLS 1.2 client that lists no such curve (`handshake_failure`); TLS 1.3 has no such rule.
 
+## Revocation by OCSP stapling (client side, opt in)
+
+Off by default: a client accepts a certificate that is revoked until it expires, as before. `tlsClientConfigWithRevocation(config, policy, tlsOcspVerifier(store, host, now, policy))`
+turns it on. The ClientHello then offers `status_request`; a server that staples an OCSP response (TLS 1.3: in the Certificate entry; TLS 1.2: a CertificateStatus message the
+ServerHello promised) has it judged by `abla/crypto/ocsp` after the chain and the signature have verified: the response must be for that certificate, signed by its issuer or by a
+certificate the issuer authorized to sign OCSP responses, and fresh (a nextUpdate that has not passed and at most seven days after thisUpdate). `OCSP_POLICY_STAPLE` (1) uses a
+staple when there is one: a revoked certificate ends the handshake with `certificate_revoked`, an invalid or expired staple with `bad_certificate_status_response`, no staple is accepted,
+unless the certificate is must-staple (RFC 7633: the TLS Feature extension lists status_request), which is then refused. `OCSP_POLICY_REQUIRE` (2) refuses a certificate without a good staple.
+Nothing is fetched: a client that wants a response of its own gets one from the certificate's responder with `ocspRequestDer` and `ocspCheck`. Limits: a man in the middle can strip
+the staple, which policy 1 accepts (policy 2 and must-staple close that); a revoked certificate stays acceptable until the staple the server holds expires; a resumed TLS 1.3 session is not
+checked again (it skips the Certificate); CRLs are not read. The server side (sending a staple) is not implemented. The design is `docs/design/ocsp-stapling.md`.
+
 ## Session resumption (TLS 1.3 tickets)
 
 PSK resumption with tickets, `psk_dhe_ke` only (a fresh key exchange every time, so a resumed session keeps forward secrecy), no 0-RTT early data

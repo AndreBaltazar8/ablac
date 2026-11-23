@@ -102,7 +102,12 @@ class TlsClientConfig(
     val sessions: TlsSessionCache? = null,
     /** What authenticated the server, as a name: tickets are kept and offered only under the same scope, because a resumption skips the Certificate (RFC 8446 section 4.6.1): "" (the default) keeps and offers none.
      *  tlsClientConfigWithSessions sets it; abla/tls/pure derives it from the verify mode and trust file; for tlsX509Verifier use tlsX509Scope(store). */
-    val sessionScope: string = ""
+    val sessionScope: string = "",
+    /** Revocation checking by OCSP stapling (abla/crypto/ocsp): 0 asks for nothing and refuses what was not asked for (as before); above 0 the ClientHello offers status_request, a staple the server sends is
+     *  read (TLS 1.3 in the Certificate entry, TLS 1.2 in a CertificateStatus message) and `stapleVerifier` judges the chain and its staples after the certificate check. Set both with tlsClientConfigWithRevocation. */
+    val revocation: int = 0,
+    /** Called, when `revocation` is above 0, with the chain and the stapled response of each of its certificates ("" for none) once the chain and signature have verified; an answer that is not accepted ends the handshake. */
+    val stapleVerifier: ((array<string>, array<string>) -> TlsVerdict)? = null
 )
 
 /** An ephemeral key pair offered in the key_share extension. */
@@ -194,7 +199,11 @@ class TlsClient(
     var didResume: bool = false,
     var resumptionMaster: string = "",
     /** The tls-exporter channel binding (RFC 9266), made when the TLS 1.3 handshake completes; "" before, and on TLS 1.2. */
-    var channelExporter: string = ""
+    var channelExporter: string = "",
+    /** Revocation: the OCSP response stapled to each certificate of the chain ("" for none), whether a TLS 1.2 CertificateStatus came, and whether the TLS 1.2 ServerHello promised one. */
+    var statuses: array<string> = [],
+    var statusSeen: bool = false,
+    var statusPromised: bool = false
 )
 
 // Returns the record protection algorithm for the TLS 1.3 suite, or zero for an unsupported suite.
@@ -810,7 +819,7 @@ private fun TlsClient.handleEncryptedExtensions(message: string, body: string): 
 }
 
 private fun TlsClient.handleCertificate(message: string, body: string): void {
-    val parsed = tlsParseCertificate(body)
+    val parsed = tlsParseCertificate(body, this.config.revocation > 0)
     if (!parsed.ok) {
         this.fail(TLS_ALERT_DECODE_ERROR, parsed.error)
         return
@@ -824,9 +833,26 @@ private fun TlsClient.handleCertificate(message: string, body: string): void {
         return
     }
     this.chain = parsed.chain
+    this.statuses = parsed.statuses
     this.transcript.add(message)
     this.state = TLS_CLIENT_WAIT_CERTIFICATE_VERIFY
     return
+}
+
+/** Revocation (when the configuration asks for it): the stapled responses go to the configuration's staple verifier once the chain and signature have verified; true when the
+ *  handshake has been ended because they were not acceptable (or because the configuration asks for revocation checking without a staple verifier). */
+private fun TlsClient.stapleRefused(): bool {
+    if (this.config.revocation <= 0) return false
+    val verifier = this.config.stapleVerifier
+    if (verifier == null) {
+        this.fail(TLS_ALERT_INTERNAL_ERROR, "tls: revocation checking is on and there is no staple verifier")
+        return true
+    }
+    val verdict = verifier(this.chain, this.statuses)
+    if (verdict.accepted()) return false
+    this.certificateRejected = true
+    this.fail(verdict.alert, verdict.text)
+    true
 }
 
 private fun TlsClient.handleCertificateVerify(message: string, body: string): void {
@@ -852,6 +878,7 @@ private fun TlsClient.handleCertificateVerify(message: string, body: string): vo
         this.fail(verdict.alert, verdict.text)
         return
     }
+    if (this.stapleRefused()) return
     this.transcript.add(message)
     this.state = TLS_CLIENT_WAIT_FINISHED
     return
@@ -1245,6 +1272,8 @@ private fun TlsClient.startV12(message: string, body: string): void {
     val allowed12: array<int> = [23, 65281, 11, TLS_EXT_SUPPORTED_GROUPS]
     if (tlsIsDnsName(this.config.host)) allowed12.append(TLS_EXT_SERVER_NAME)
     if (this.config.alpn.size > 0) allowed12.append(TLS_EXT_ALPN)
+    // status_request in a TLS 1.2 ServerHello (empty: the server will send a CertificateStatus) answers the client's request for revocation checking.
+    if (this.config.revocation > 0) allowed12.append(5)
     var unlisted12 = -1
     for (type in hello.extensionTypes) {
         var known12 = false
@@ -1252,6 +1281,7 @@ private fun TlsClient.startV12(message: string, body: string): void {
             if (candidate == type) known12 = true
         }
         if (!known12 && unlisted12 == -1) unlisted12 = type
+        if (type == 5 && this.config.revocation > 0) this.statusPromised = true
     }
     if (unlisted12 != -1) {
         this.fail(TLS_ALERT_UNSUPPORTED_EXTENSION, "tls: the ServerHello carries an extension that was not asked for ($unlisted12)")
@@ -1385,6 +1415,7 @@ private fun TlsClient.handleServerKeyExchange12(message: string, body: string): 
         this.fail(verdict.alert, verdict.text)
         return
     }
+    if (this.stapleRefused()) return
     this.v12Group = parsed.group
     this.negotiatedGroup = parsed.group
     this.v12Point = parsed.point
@@ -1487,7 +1518,17 @@ private fun TlsClient.handleMessage12(type: int, message: string, body: string):
         if (type == TLS_CERTIFICATE) this.handleCertificate12(message, body)
         else this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: expected a Certificate")
     } else if (this.state == TLS_CLIENT12_WAIT_KEY_EXCHANGE) {
-        if (type == TLS12_SERVER_KEY_EXCHANGE) this.handleServerKeyExchange12(message, body)
+        if (type == TLS_CERTIFICATE_STATUS && this.config.revocation > 0 && this.statusPromised && !this.statusSeen) {
+            // The stapled OCSP response (RFC 6066 section 8), sent only when the ServerHello promised it; it is part of the transcript.
+            val response = tlsParseCertificateStatus(body)
+            if (response == "") {
+                this.fail(TLS_ALERT_DECODE_ERROR, "tls: a malformed CertificateStatus")
+                return
+            }
+            this.statuses = [response]
+            this.statusSeen = true
+            this.transcript.add(message)
+        } else if (type == TLS12_SERVER_KEY_EXCHANGE) this.handleServerKeyExchange12(message, body)
         else this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: expected a ServerKeyExchange")
     } else if (this.state == TLS_CLIENT12_WAIT_HELLO_DONE) {
         if (type == TLS_CERTIFICATE_REQUEST && !this.requested) {
@@ -1627,13 +1668,13 @@ fun TlsClient.channelBinding(kind: string): string =
  *  `tlsX509Verifier(store, now)`): a ticket resumes without a Certificate, so a ticket must never cross to a configuration that verifies differently. "" keeps and offers none. */
 fun tlsClientConfigWithSessions(config: TlsClientConfig, sessions: TlsSessionCache?, scope: string): TlsClientConfig =
     TlsClientConfig(config.host, config.suites, config.signatureAlgorithms, config.alpn, config.verifier, config.random, config.secondHello,
-        config.suites12, config.fallback, config.groups, sessions, scope)
+        config.suites12, config.fallback, config.groups, sessions, scope, config.revocation, config.stapleVerifier)
 
 /** `config` offering the application protocols `alpn` (in the client's order, for example ["h2", "http/1.1"]); the server's choice is `TlsClient.alpn()`
  *  once connected ("" when it chose none). Names are checked when the client starts. */
 fun tlsClientConfigWithAlpn(config: TlsClientConfig, alpn: array<string>): TlsClientConfig =
     TlsClientConfig(config.host, config.suites, config.signatureAlgorithms, alpn, config.verifier, config.random, config.secondHello,
-        config.suites12, config.fallback, config.groups, config.sessions, config.sessionScope)
+        config.suites12, config.fallback, config.groups, config.sessions, config.sessionScope, config.revocation, config.stapleVerifier)
 
 /** A ClientHello and the ticket it offers (null when it offers none). */
 class TlsBuiltHello(val message: string, val ticket: TlsStoredTicket?)
@@ -1660,7 +1701,7 @@ fun tlsClientBuildHello(config: TlsClientConfig, helloRandom: string, sessionId:
     }
     var hello = tlsBuildClientHello(helloRandom, sessionId, config.suites, config.host,
         offer.groups, offer.shares, config.signatureAlgorithms, config.alpn, "", config.suites12, config.fallback, offers, binderLength,
-        cache != null && config.suites.size > 0)
+        cache != null && config.suites.size > 0, config.revocation > 0)
     if (ticket != null) {
         // The binder covers the ClientHello up to the binders list (section 4.2.11.2).
         val partial = hello.slice(0, tlsBindersStart(hello))
@@ -1668,3 +1709,10 @@ fun tlsClientBuildHello(config: TlsClientConfig, helloRandom: string, sessionId:
     }
     TlsBuiltHello(hello, stored)
 }
+
+/** `config` with revocation checking by OCSP stapling (abla/crypto/ocsp): `policy` is OCSP_POLICY_STAPLE (use a staple when the server sends one, refuse a revoked or invalid one, accept
+ *  the lack of one unless the certificate is must-staple) or OCSP_POLICY_REQUIRE (a good staple is required); 0 is as before. The ClientHello then offers status_request, and after
+ *  the chain and the signature have verified `stapleVerifier` (tlsOcspVerifier of abla/tls/pure/verify) judges the stapled responses. Nothing is fetched. */
+fun tlsClientConfigWithRevocation(config: TlsClientConfig, policy: int, stapleVerifier: (array<string>, array<string>) -> TlsVerdict): TlsClientConfig =
+    TlsClientConfig(config.host, config.suites, config.signatureAlgorithms, config.alpn, config.verifier, config.random, config.secondHello,
+        config.suites12, config.fallback, config.groups, config.sessions, config.sessionScope, policy, stapleVerifier)
