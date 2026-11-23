@@ -17,7 +17,7 @@ bundle="$work/$name"
 sysroot="$bundle/sysroot"
 mkdir -p "$bundle/lib" "$bundle/include" "$sysroot/lib" "$sysroot/include/c++" "$work/bin"
 cp -L "$inputs/llvm-lib"/lib/libLLVM*.a "$inputs/lld-lib"/lib/liblld*.a "$bundle/lib/"
-cp -RL "$inputs/llvm-dev/include/llvm" "$inputs/llvm-dev/include/llvm-c" \
+cp -RL --no-preserve=mode "$inputs/llvm-dev/include/llvm" "$inputs/llvm-dev/include/llvm-c" \
     "$inputs/lld-dev/include/lld" "$bundle/include/"
 for component in LLVMOptDriver LLVMX86CodeGen LLVMAArch64CodeGen LLVMRISCVCodeGen LLVMWebAssemblyCodeGen LLVMXtensaCodeGen lldELF lldWasm lldCOFF lldCommon; do
     test -s "$bundle/lib/lib$component.a"
@@ -33,7 +33,7 @@ cp -L "$inputs/zlib-static/lib/libz.a" "$sysroot/lib/"
 cp -RL --no-preserve=mode "$inputs/linux-headers/include/." "$sysroot/include/"
 cp -RL --no-preserve=mode "$inputs/glibc-dev/include/." "$sysroot/include/"
 cp -L "$inputs/zlib-dev"/include/{zlib.h,zconf.h} "$sysroot/include/"
-cp -RL "$inputs/gcc/include/c++/$gcc_version" "$sysroot/include/c++/"
+cp -RL --no-preserve=mode "$inputs/gcc/include/c++/$gcc_version" "$sysroot/include/c++/"
 cxx_include="$sysroot/include/c++/$gcc_version"
 test -s "$cxx_include/$triple/bits/c++config.h"
 
