@@ -439,6 +439,8 @@ test-serial: ablac
 	tools/test-xtensa-http-stream.sh $(COMPILER)
 	tools/test-process-pipeline.sh $(COMPILER)
 	tools/test-runtime-checks.sh $(COMPILER)
+	tools/test-stack-guard.sh $(COMPILER)
+	tools/test-probe-stack-targets.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)
 	tools/test-named-method-arguments.sh $(COMPILER)
 	tools/test-named-overloads.sh $(COMPILER)

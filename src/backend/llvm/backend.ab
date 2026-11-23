@@ -823,6 +823,20 @@ fun bootstrapEmitLlvmProgramPrepared(
                 defined = LLVMGetNextFunction(defined)
             }
         }
+        // Stack probes: a frame larger than the guard of a thread's stack (one page) could be stepped over, its stores landing in the
+        // memory below the stack (another thread's TLS and stack: a 64 KiB read buffer on the stack, a frame of 48 KiB). With
+        // "probe-stack"="inline-asm" LLVM touches every page of such a frame, in order, so the guard is always hit. (Not WebAssembly,
+        // whose stack is the module's; Windows has its own probe, __chkstk; and not the freestanding and embedded targets: Xtensa, ESP32,
+        // bare-metal ARM and RISC-V have no guard page, and their backends take no "inline-asm" probe.) Only a hosted Linux or macOS target.
+        if (bootstrapLlvmTargetProbesStack(backend.targetTriple)) {
+            var probed = LLVMGetFirstFunction(backend.module)
+            while (!pointerIsNull(probed)) {
+                if (LLVMIsDeclaration(probed) == 0) {
+                    bootstrapLlvmAddStringFunctionAttribute(backend, probed, "probe-stack", "inline-asm")
+                }
+                probed = LLVMGetNextFunction(probed)
+            }
+        }
         // `ablac run --live`: the program's functions through the table (live.ab).
         if (bootstrapLlvmLiveRun && functionIndex.find("main") >= 0) {
             bootstrapLlvmLiveIndirect(backend, program, identities, emittedFunctions)
@@ -1609,4 +1623,14 @@ fun bootstrapLlvmTraceStackClosures(program: BootstrapIrProgram, emitted: array<
     linuxWriteStandardError("closures: $stack of $sites with captures keep them in the frame\n")
     linuxWriteStandardError("cells: $frameCells of $cells in the frame\n")
     return
+}
+
+// Whether the target is a hosted one (64-bit x86, ARM or RISC-V, Linux or macOS), whose threads' stacks have a guard page that a stack probe
+// can hit. A freestanding or embedded triple (Xtensa, bare-metal ARM or RISC-V) is not.
+fun bootstrapLlvmTargetProbesStack(targetTriple: string): bool {
+    val host64 = targetTriple.startsWith("x86_64-") || targetTriple.startsWith("aarch64-") ||
+        targetTriple.startsWith("arm64-") || targetTriple.startsWith("riscv64-")
+    val hostedOs = bootstrapTextContains(targetTriple, "-linux") || bootstrapTextContains(targetTriple, "apple-macos") ||
+        bootstrapTextContains(targetTriple, "apple-darwin")
+    host64 && hostedOs
 }
