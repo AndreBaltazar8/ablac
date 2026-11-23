@@ -492,30 +492,59 @@ private trusted fun p384DigestScalar(c: P384Curve, digest: string, out: int): vo
     bnConditionalSubtractBody(out, out, secretU32(u32(0)), c.order.value(), P384_WORDS, c.order.scratch())
 }
 
+// One HMAC of RFC 6979 whose message holds the private key (`v || separator || key || reduced`): the message is built in a buffer of its own and wiped
+// after the call, so no copy of the key is left in the managed heap.
+private trusted fun p384NonceHmac(k: string, v: string, separator: string, key: string, reduced: string): string {
+    val input = cryptoOwnedJoin([v, separator, key, reduced], v.size + separator.size + key.size + reduced.size)
+    val out = hmacSha384(k, input)
+    cryptoWipeString(input)
+    out
+}
+
 /** RFC 6979's nonce for SHA-384 and the private key `key` (48 bytes) for the message hash `h1`, or "" if no candidate falls in 1..n-1
  *  in 100 tries (it always does). `reduced` is h1 mod n as bytes. The qlen of P-384 is 384 bits, hlen of SHA-384 is 384: a candidate is one HMAC block. */
 private trusted fun p384Nonce(c: P384Curve, key: string, reduced: string): string {
-    var v = "\x01".repeat(48)
-    var k = "\x00".repeat(48)
-    k = hmacSha384(k, v + "\x00" + key + reduced)
-    v = hmacSha384(k, v)
-    k = hmacSha384(k, v + "\x01" + key + reduced)
-    v = hmacSha384(k, v)
+    // K and V are derived from the key: each is a buffer of its own, wiped when replaced and at the end. The nonce returned is a copy of its own, for the
+    // caller to wipe.
+    var v = cryptoOwnedCopy("\x01".repeat(48))
+    var k = cryptoOwnedCopy("\x00".repeat(48))
+    var next = p384NonceHmac(k, v, "\x00", key, reduced)
+    cryptoWipeString(k)
+    k = next
+    next = hmacSha384(k, v)
+    cryptoWipeString(v)
+    v = next
+    next = p384NonceHmac(k, v, "\x01", key, reduced)
+    cryptoWipeString(k)
+    k = next
+    next = hmacSha384(k, v)
+    cryptoWipeString(v)
+    v = next
     val candidate = bnAllocate(P384_WORDS)
     var found = ""
     var tries = 0
     while (tries < 100) {
-        v = hmacSha384(k, v)
+        next = hmacSha384(k, v)
+        cryptoWipeString(v)
+        v = next
         bnFromBytes(candidate, P384_WORDS, ablaUnsafeStringAddress(v), 48)
         if (p384InRange(c.order.value(), candidate) != u32(0)) {
-            found = v
+            found = cryptoOwnedCopy(v)
             break
         }
-        k = hmacSha384(k, v + "\x00")
-        v = hmacSha384(k, v)
+        val again = cryptoOwnedJoin([v, "\x00"], v.size + 1)
+        next = hmacSha384(k, again)
+        cryptoWipeString(again)
+        cryptoWipeString(k)
+        k = next
+        next = hmacSha384(k, v)
+        cryptoWipeString(v)
+        v = next
         tries = tries + 1
     }
     bnRelease(candidate, P384_WORDS)
+    cryptoWipeString(k)
+    cryptoWipeString(v)
     found
 }
 
@@ -566,6 +595,7 @@ private @noinline trusted fun p384EcdsaSignWork(privateKey: string, message: str
             bnRelease(y, P384_WORDS)
             bnRelease(inverse, P384_WORDS)
             bnRelease(product, P384_WORDS)
+            cryptoWipeString(nonce)
         }
         bnRelease(e, P384_WORDS)
     }

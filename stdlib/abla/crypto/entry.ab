@@ -132,10 +132,10 @@ private fun cryptoRotateRight64(value: int, count: int): int =
 
 // SHA-512 and SHA-384, which differ in their start and in how much is kept. Words are
 // whole ints, whose arithmetic wraps at 64 bits.
-private fun cryptoSha2Long(value: string, initial: array<int>, digestBytes: int): string =
-    if (ablaCompileTimeNativeHost()) cryptoSha2LongNative(value, initial, digestBytes)
+private fun cryptoSha2Long(value: string, initial: array<int>, digestBytes: int, secret: bool = false): string =
+    if (ablaCompileTimeNativeHost()) cryptoSha2LongNative(value, initial, digestBytes, secret)
     else if (ablaAtCompileTime()) cryptoSha2LongArray(value, initial, digestBytes)
-    else cryptoSha2LongNative(value, initial, digestBytes)
+    else cryptoSha2LongNative(value, initial, digestBytes, secret)
 
 private fun cryptoSha2LongArray(value: string, initial: array<int>, digestBytes: int): string {
     val input: array<int> = []
@@ -233,7 +233,7 @@ private fun cryptoSha2LongArray(value: string, initial: array<int>, digestBytes:
 
 // The run-time path: the whole blocks of the message are hashed where they are (no copy of the message into an array, a byte at a time), and only the last one or two, the pending
 // bytes with the padding, are built. The compile-time evaluator keeps the array version above.
-private trusted fun cryptoSha2LongNative(value: string, initial: array<int>, digestBytes: int): string {
+private trusted fun cryptoSha2LongNative(value: string, initial: array<int>, digestBytes: int, secret: bool): string {
     val state: array<int> = []
     for (index in 0 until 8) state.append(initial[index])
     val whole = value.size / 128
@@ -246,8 +246,14 @@ private trusted fun cryptoSha2LongNative(value: string, initial: array<int>, dig
     cryptoAppendU32Big(length, 0)
     cryptoAppendU32Big(length, (bitLength >>> 32) & 4294967295)
     cryptoAppendU32Big(length, bitLength & 4294967295)
-    val tail = "${value.slice(whole * 128, value.size)}\x80${(CRYPTO_ZERO_BYTES + CRYPTO_ZERO_BYTES).slice(0, zeros)}${cryptoByteString(length)}"
+    // The last block or two (the message's end, with the padding). Of a secret (sha512OfSecret, sha384OfSecret, HMAC's inputs): a buffer of its own, wiped after the
+    // compression. Of a plain message: a string, as it always was (no extra copy or wipe pass on the digest of public data).
+    val zeroText = (CRYPTO_ZERO_BYTES + CRYPTO_ZERO_BYTES).slice(0, zeros)
+    val lengthText = cryptoByteString(length)
+    val tail = if (secret) cryptoOwnedJoin([value.slice(whole * 128, value.size), "\x80", zeroText, lengthText], rest + 1 + zeros + lengthText.size)
+        else "${value.slice(whole * 128, value.size)}\x80${zeroText}${lengthText}"
     cryptoSha512RunAt(state, ablaUnsafeStringAddress(tail), tail.size / 128)
+    if (secret) cryptoWipeString(tail)
     val output: array<int> = []
     for (index in 0 until digestBytes / 8) {
         cryptoAppendU32Big(output, (state[index] >>> 32) & 4294967295)
@@ -261,6 +267,19 @@ fun sha512(value: string): string = cryptoSha2Long(value, [
     0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
     0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179
 ], 64)
+
+/** SHA-512 of a secret `value` (a key, a seed): as sha512, with the end of the message, which is copied to make the last block, in a buffer that is wiped. The caller still
+ *  owns `value`. */
+fun sha512OfSecret(value: string): string = cryptoSha2Long(value, [
+    0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+    0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179
+], 64, true)
+
+/** SHA-384 of a secret `value`: as sha384, with the copy of the message's end wiped (see sha512OfSecret). */
+fun sha384OfSecret(value: string): string = cryptoSha2Long(value, [
+    0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939,
+    0x67332667ffc00b31, 0x8eb44a8768581511, 0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4
+], 48, true)
 
 // Returns the 48 raw SHA-384 digest bytes of `value`.
 fun sha384(value: string): string = cryptoSha2Long(value, [
@@ -372,11 +391,13 @@ class Sha256Stream(
     val constants: array<int>,
     val schedule: array<int>,
     var pending: string,
-    var total: int
+    var total: int,
+    /** Whether the stream hashes a secret (an HMAC's key pad and message): its pending bytes are then a buffer of its own that is wiped. */
+    val secret: bool = false
 )
 
 // Creates an empty incremental SHA-256 state.
-fun sha256Stream(): Sha256Stream {
+fun sha256Stream(secret: bool = false): Sha256Stream {
     // The constants and the schedule are the compile-time evaluator's (runBlocks): a program that runs has a memory-based round and no use for them.
     val schedule: array<int> = []
     var constants: array<int> = []
@@ -387,7 +408,7 @@ fun sha256Stream(): Sha256Stream {
     Sha256Stream(
         [1779033703, 3144134277, 1013904242, 2773480762,
          1359893119, 2600822924, 528734635, 1541459225],
-        constants, schedule, "", 0
+        constants, schedule, "", 0, secret
     )
 }
 
@@ -700,17 +721,40 @@ fun Sha256Stream.update(value: string): void {
     if (this.pending.size > 0) {
         val wanted = 64 - this.pending.size
         val taken = if (value.size < wanted) value.size else wanted
-        this.pending = "${this.pending}${value.slice(0, taken)}"
+        this.pending = cryptoPendingAppend(this.pending, value.slice(0, taken), this.secret)
         offset = taken
         if (this.pending.size == 64) {
             this.runBlocks(this.pending, 0, 1)
+            cryptoPendingWipe(this.pending, this.secret)
             this.pending = ""
         }
     }
     val whole = (value.size - offset) / 64
     this.runBlocks(value, offset, whole)
     offset = offset + whole * 64
-    if (offset < value.size) this.pending = "${this.pending}${value.slice(offset, value.size)}"
+    if (offset < value.size) this.pending = cryptoPendingAppend(this.pending, value.slice(offset, value.size), this.secret)
+    return
+}
+
+// A stream's pending bytes (the end of the message so far) are a buffer of its own at run time, wiped when they are used up: a message can be a key
+// (an HMAC input, an RFC 6979 input). At compile time the evaluator has no native buffers: plain strings.
+private fun cryptoPendingAppend(old: string, more: string, secret: bool): string {
+    if (ablaAtCompileTime()) return "${old}${more}"
+    if (!secret) return "${old}${more}"
+    val joined = cryptoOwnedJoin([old, more], old.size + more.size)
+    cryptoPendingWipe(old, true)
+    joined
+}
+
+private fun cryptoPendingBlock(pending: string, zeros: string, length: string, secret: bool): string {
+    if (ablaAtCompileTime()) return "${pending}\x80${zeros}${length}"
+    if (!secret) return "${pending}\x80${zeros}${length}"
+    cryptoOwnedJoin([pending, "\x80", zeros, length], pending.size + 1 + zeros.size + length.size)
+}
+
+private fun cryptoPendingWipe(value: string, secret: bool): void {
+    if (ablaAtCompileTime()) return
+    if (secret) cryptoWipeString(value)
     return
 }
 
@@ -722,8 +766,11 @@ fun Sha256Stream.finish(): string {
     val length: array<int> = []
     cryptoAppendU32Big(length, bitLength >>> 32)
     cryptoAppendU32Big(length, bitLength & 4294967295)
-    val text = "${this.pending}\x80${CRYPTO_ZERO_BYTES.slice(0, zeros)}${cryptoByteString(length)}"
+    val text = cryptoPendingBlock(this.pending, CRYPTO_ZERO_BYTES.slice(0, zeros), cryptoByteString(length), this.secret)
     this.runBlocks(text, 0, text.size / 64)
+    cryptoPendingWipe(text, this.secret)
+    cryptoPendingWipe(this.pending, this.secret)
+    this.pending = ""
     val output: array<int> = []
     for (word in this.state) cryptoAppendU32Big(output, word)
     cryptoByteString(output)
@@ -732,34 +779,72 @@ fun Sha256Stream.finish(): string {
 // Returns the 32 raw HMAC-SHA-256 bytes for `message` with `key`.
 fun hmacSha256(key: string, message: string): string {
     var normalized = key
-    if (normalized.size > 64) normalized = sha256(normalized)
-    val inner = byteBuffer()
-    val outer = byteBuffer()
-    var index = 0
-    while (index < 64) {
-        val byte = if (index < normalized.size) normalized[index] else 0
-        inner.appendByteValue(byte ^ 54)
-        outer.appendByteValue(byte ^ 92)
-        index = index + 1
+    val hashedKey = key.size > 64
+    if (hashedKey) {
+        val keyHash = sha256Stream(true)
+        keyHash.update(key)
+        normalized = keyHash.finish()
     }
+    // The pads are the key with a constant xor-ed in: buffers of their own at run time, wiped when done.
+    val inner = cryptoHmacPad(normalized, 64, 54)
+    val outer = cryptoHmacPad(normalized, 64, 92)
     // Through streams: a pad block, then the message (or the inner digest) with its padding: two compressions each.
-    val first = sha256Stream()
-    first.update(inner.toText())
+    val first = sha256Stream(true)
+    first.update(inner)
     first.update(message)
-    val second = sha256Stream()
-    second.update(outer.toText())
+    val second = sha256Stream(true)
+    second.update(outer)
     second.update(first.finish())
-    second.finish()
+    val digest = second.finish()
+    cryptoPendingWipe(inner, true)
+    cryptoPendingWipe(outer, true)
+    if (hashedKey) cryptoPendingWipe(normalized, true)
+    digest
 }
 
+// The key padded to `blockBytes` with `mask` xor-ed in: a buffer of its own at run time (for the caller to wipe), a plain string at compile time.
 private fun cryptoHmacPad(key: string, blockBytes: int, mask: int): string {
-    val pad: array<int> = []
-    var index = 0
-    while (index < blockBytes) {
-        pad.append((if (index < key.size) key[index] else 0) ^ mask)
-        index = index + 1
+    if (ablaAtCompileTime()) {
+        val pad: array<int> = []
+        var index = 0
+        while (index < blockBytes) {
+            pad.append((if (index < key.size) key[index] else 0) ^ mask)
+            index = index + 1
+        }
+        return cryptoByteString(pad)
     }
-    cryptoByteString(pad)
+    cryptoHmacPadOwned(key, blockBytes, mask)
+}
+
+private trusted fun cryptoHmacPadOwned(key: string, blockBytes: int, mask: int): string {
+    val buffer = nativeByteBuffer(blockBytes + 1)
+    for (index in 0 until blockBytes) {
+        ablaUnsafeStoreU8(buffer.pointerAt(index), (if (index < key.size) int(key[index]) else 0) ^ mask)
+    }
+    ablaUnsafeStoreU8(buffer.pointerAt(blockBytes), 0)
+    buffer.adoptString(blockBytes)
+}
+
+private fun cryptoHmacLongHash(bits: int, value: string): string = if (bits == 384) sha384OfSecret(value) else sha512OfSecret(value)
+
+// HMAC over a hash of 128-byte blocks (SHA-384, SHA-512): at run time the inputs that hold the key's pad are buffers of their own, wiped after the call.
+private fun cryptoHmacLong(key: string, message: string, bits: int): string {
+    val hashedKey = key.size > 128
+    val normalized = if (hashedKey) cryptoHmacLongHash(bits, key) else key
+    if (ablaAtCompileTime()) return cryptoHmacLongHash(bits, cryptoHmacPad(normalized, 128, 92) + cryptoHmacLongHash(bits, cryptoHmacPad(normalized, 128, 54) + message))
+    val innerPad = cryptoHmacPad(normalized, 128, 54)
+    val outerPad = cryptoHmacPad(normalized, 128, 92)
+    val innerInput = cryptoOwnedJoin([innerPad, message], 128 + message.size)
+    val innerDigest = cryptoHmacLongHash(bits, innerInput)
+    cryptoWipeString(innerInput)
+    cryptoWipeString(innerPad)
+    val outerInput = cryptoOwnedJoin([outerPad, innerDigest], 128 + innerDigest.size)
+    val digest = cryptoHmacLongHash(bits, outerInput)
+    cryptoWipeString(outerInput)
+    cryptoWipeString(outerPad)
+    cryptoWipeString(innerDigest)
+    if (hashedKey) cryptoWipeString(normalized)
+    digest
 }
 
 // HMAC-SHA-1 stands: HMAC doesn't rest on SHA-1's collision resistance. It's here for
@@ -771,18 +856,10 @@ fun hmacSha1(key: string, message: string): string {
 }
 
 // Returns the 48 raw HMAC-SHA-384 bytes for `message` with `key`.
-fun hmacSha384(key: string, message: string): string {
-    val normalized = if (key.size > 128) sha384(key) else key
-    sha384(cryptoHmacPad(normalized, 128, 92) + sha384(cryptoHmacPad(normalized, 128,
-        54) + message))
-}
+fun hmacSha384(key: string, message: string): string = cryptoHmacLong(key, message, 384)
 
 // Returns the 64 raw HMAC-SHA-512 bytes for `message` with `key`.
-fun hmacSha512(key: string, message: string): string {
-    val normalized = if (key.size > 128) sha512(key) else key
-    sha512(cryptoHmacPad(normalized, 128, 92) + sha512(cryptoHmacPad(normalized, 128,
-        54) + message))
-}
+fun hmacSha512(key: string, message: string): string = cryptoHmacLong(key, message, 512)
 
 // Derives a 32-byte key from `password` and `salt` with PBKDF2-HMAC-SHA-256. Returns an empty string if `iterations` is outside 1–1000000.
 fun pbkdf2Sha256(password: string, salt: string, iterations: int): string {

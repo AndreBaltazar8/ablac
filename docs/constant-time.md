@@ -157,6 +157,11 @@ they don't stop you declassifying.
   stays in a string or an array until reused, and a spill the register allocator makes stays on the stack (see
   `abla/ct/scrub`, which the AES and RSA private entry points call to wipe the stack their work used). A boxed secret (in an array or a field) is copied in plain
   moves, which is fine for timing, and is one more copy.
+  The crypto entry points wipe the copies they make of a key in the managed heap: the end of a hashed message (the last block of sha384OfSecret and sha512OfSecret, and the pending bytes of a stream made for a secret: sha256Stream(true), used by HMAC; plain `sha256`, `sha384` and `sha512` of a key are not wiped, a caller hashing a secret uses the `OfSecret` ones), an HMAC's pads and
+  inputs, RFC 6979's HMAC inputs, V, K and nonce, Ed25519's expanded hash, scalar and nonce. `tests/cases/crypto-pure/heap-residue.ab` scans the process after 18 operations (AES-GCM,
+  ChaCha20-Poly1305, X25519, Ed25519, ECDSA P-256 and P-384, ECDH, HMAC-SHA-256/384/512, HKDF, SHA-2) for 16-byte windows of the key, wiped caller's copy aside, and finds none; a control
+  with nothing wiped is found. What is not covered: the caller's own string (it owns it and wipes it with `cryptoWipeString` when it made it for the purpose), the hash states and message
+  schedules held in managed arrays, and a key that is a slice or a rope of something else.
 - **Code outside the types.** A `string` or `u32` holding a secret has none of this. `.declassify()` ends it
   by design. The types are only as good as the code that puts a secret in them right away.
 - **Compile time.** Under `#` nothing is protected from timing: a secret computed at compile time is a constant of the build.

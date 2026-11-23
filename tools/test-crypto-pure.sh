@@ -28,7 +28,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more signatures sha3 mlkem p384 wipe-views)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more heap-residue signatures sha3 mlkem p384 wipe-views)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -64,6 +64,21 @@ if "$out/wycheproof-more" tests/vectors/crypto > "$out/wycheproof-more.log" 2>&1
     echo "ok   wycheproof (more): $(grep "_test.json" "$out/wycheproof-more.log" | awk '{ n += $2 } END { print n " cases" }')"
 else
     fail wycheproof-more; tail -20 "$out/wycheproof-more.log"
+fi
+
+# Key residue in the heap (tests/cases/crypto-pure/heap-residue.ab): after an operation with a key, the caller's own copy wiped and two collections, no window of the key (or of the
+# key xor an HMAC pad constant) is left in the process's writable memory. The control (nothing wiped) must be found, or the scan proves nothing.
+residue_failed=0
+for mode in aes256gcm aes256gcm-open chacha x25519 x25519-dh ed25519 ed25519-pub p256 p256-pub p256-ecdh p384 hmac hmac384 hmac512 hkdf sha256-stream sha384-secret sha512-secret; do
+    line=$("$out/heap-residue" "$mode" 2>&1) || true
+    if [[ $line != *"ok=true"*"after=0" ]]; then echo "residue: $line"; residue_failed=1; fi
+done
+control=$("$out/heap-residue" aes256gcm control 2>&1) || true
+if [[ ! $control =~ after=[1-9] ]]; then echo "residue control not found: $control"; residue_failed=1; fi
+if (( residue_failed == 0 )); then
+    echo "ok   key residue: 18 operations leave no window of their key in the heap (the control is found)"
+else
+    fail key-residue
 fi
 
 # Signatures a verifier must refuse: ECDSA r or s of 0, n and above, Ed25519 S + L, RSA PKCS#1 paddings that a lax parser takes.

@@ -1,0 +1,179 @@
+// Key residue in the managed heap after crypto operations. `heap-residue MODE [control]` makes a 32-byte key, keeps 16-byte windows of it (and of the key with the
+// HMAC pad constants xor-ed in) masked, so that they appear nowhere in this process but in what is searched for, runs one operation with the key, wipes the caller's own
+// copy (not in the control mode), collects twice and counts the windows in every readable and writable private mapping of /proc/self/maps. It prints
+// "MODE wiped|control: ok=<true|false> windows before=<n> after=<n>"; tools/test-crypto-pure.sh wants after=0 for every operation and at least 1 for the control, which
+// proves that the scan sees what it should. What a copy of the key is made of by an operation (a concatenation for an HMAC input, the last block of a hash, the
+// expanded hash of Ed25519, the pads of an HMAC, the V and K of RFC 6979) must be a buffer of its own that the operation wipes.
+import "abla/io"
+import "abla/memory"
+import "abla/crypto"
+import "abla/crypto/aes"
+import "abla/crypto/chacha20poly1305"
+import "abla/crypto/ed25519"
+import "abla/crypto/hkdf"
+import "abla/crypto/p256"
+import "abla/crypto/p384"
+import "abla/crypto/x25519"
+import "abla/bytes"
+import "abla/process/arguments"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/sys/linux"
+import "abla/text"
+
+val MASK = 6510615555426900570
+// Three windows of 16 bytes (two words each): the key, the key xor 0x36 (an HMAC's inner pad), the key xor 0x5c (its outer pad), masked.
+val needles = nativeByteBuffer(6 * 8)
+
+trusted fun hexValue(byte: int): int = if (byte >= 97) byte - 87 else if (byte >= 65) byte - 55 else byte - 48
+
+trusted fun hexNumber(text: string, from: int, to: int): int {
+    var value = 0
+    var i = from
+    while (i < to) {
+        value = (value << 4) | hexValue(text[i])
+        i = i + 1
+    }
+    value
+}
+
+trusted fun mapsText(): string {
+    val maps = linuxOpen("/proc/self/maps")
+    val text = byteBuffer()
+    var reading = true
+    while (reading) {
+        val chunk = maps.read(65536)
+        if (chunk.size == 0) reading = false else text.appendText(chunk)
+    }
+    maps.close()
+    text.toText()
+}
+
+trusted fun scan(): int {
+    var count = 0
+    val maps = mapsText()
+    val ranges = nativeByteBuffer(16 * 4096)
+    var regions = 0
+    var at = 0
+    while (at < maps.size && regions < 4096) {
+        var end = at
+        while (end < maps.size && maps[end] != 10) end = end + 1
+        var dash = at
+        while (maps[dash] != 45) dash = dash + 1
+        var space = dash
+        while (maps[space] != 32) space = space + 1
+        val readable = maps[space + 1] == 114 && maps[space + 2] == 119 && maps[space + 4] == 112
+        val line = maps.slice(at, end)
+        val special = line.contains("[vvar") || line.contains("[vsyscall]") || line.contains("[vdso]")
+        if (readable && !special) {
+            ranges.storeI64(regions * 16, hexNumber(maps, at, dash))
+            ranges.storeI64(regions * 16 + 8, hexNumber(maps, dash + 1, space))
+            regions = regions + 1
+        }
+        at = end + 1
+    }
+    var region = 0
+    while (region < regions) {
+        var address = ranges.loadI64(region * 16)
+        val end = ranges.loadI64(region * 16 + 8)
+        while (address + 16 <= end) {
+            val first = ablaUnsafeLoadI64(nativePointerFromAddress(address)) ^ MASK
+            var n = 0
+            while (n < 3) {
+                if (first == needles.loadI64(n * 16) && (ablaUnsafeLoadI64(nativePointerFromAddress(address + 8)) ^ MASK) == needles.loadI64(n * 16 + 8)) count = count + 1
+                n = n + 1
+            }
+            address = address + 1
+        }
+        region = region + 1
+    }
+    ranges.close()
+    count
+}
+
+trusted fun word(text: string, at: int, xor: int): int {
+    var value = 0
+    var i = 7
+    while (i >= 0) {
+        value = (value << 8) | (int(text[at + i]) ^ xor)
+        i = i - 1
+    }
+    value
+}
+
+val nonce12 = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b"
+val peer = "\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x01\x02"
+
+@noinline trusted fun operate(mode: string, key: string, wipe: bool): bool {
+    var ok = true
+    if (mode == "aes256gcm") ok = aesGcmEncrypt(key, nonce12, "hello world", "aad").ok
+    else if (mode == "aes256gcm-open") {
+        val sealed = aesGcmEncrypt(key, nonce12, "hello world", "aad").bytes
+        ok = aesGcmDecrypt(key, nonce12, sealed, "aad").ok
+    } else if (mode == "chacha") ok = chaCha20Poly1305Seal(key, nonce12, "hello world", "aad").ok
+    else if (mode == "x25519") ok = x25519PublicKey(key).ok
+    else if (mode == "x25519-dh") ok = x25519(key, x25519PublicKey(peer).bytes).ok
+    else if (mode == "ed25519") ok = ed25519Sign(key, "hello").ok
+    else if (mode == "ed25519-pub") ok = ed25519PublicKey(key).ok
+    else if (mode == "p256") ok = p256EcdsaSign(key, "hello").ok
+    else if (mode == "p256-pub") ok = p256PublicKey(key).ok
+    else if (mode == "p256-ecdh") ok = p256Ecdh(key, p256PublicKey(peer).bytes).ok
+    else if (mode == "p384") ok = p384EcdsaSign(key, "hello").ok
+    else if (mode == "hmac") ok = hmacSha256(key, "hello").size == 32
+    else if (mode == "hmac384") ok = hmacSha384(key, "hello").size == 48
+    else if (mode == "hmac512") ok = hmacSha512(key, "hello").size == 64
+    else if (mode == "hkdf") ok = hkdfExpand(HKDF_SHA256, key, "label", 16).ok
+    else if (mode == "sha256-stream") {
+        val stream = sha256Stream(true)
+        stream.update(key)
+        ok = stream.finish().size == 32
+    }
+    else if (mode == "sha384-secret") ok = sha384OfSecret(key).size == 48
+    else if (mode == "sha512-secret") ok = sha512OfSecret(key).size == 64
+    else if (mode == "sha512-plain") ok = sha512(key).size == 64
+    else ok = false
+    if (wipe) cryptoWipeString(key)
+    ok
+}
+
+// The key in a buffer of its own, made byte by byte: no other copy of it exists in the heap.
+@noinline trusted fun makeKey(size: int): string {
+    val buffer = nativeByteBuffer(size + 1)
+    var seed = 88172645463325252
+    for (i in 0 until size) {
+        seed = seed ^ (seed << 13)
+        seed = seed ^ (seed >>> 7)
+        seed = seed ^ (seed << 17)
+        ablaUnsafeStoreU8(buffer.pointerAt(i), ((seed >>> 8) & 255) | 1)
+    }
+    ablaUnsafeStoreU8(buffer.pointerAt(size), 0)
+    buffer.adoptString(size)
+}
+
+fun main: int {
+    val mode = processArgument(0)
+    val wipe = !(processArgumentCount() > 1 && processArgument(1) == "control")
+    var key = makeKey(if (mode == "p384") 48 else 32)
+    // P-256 wants a scalar below the order.
+    if (mode == "p256" || mode == "p256-ecdh" || mode == "p256-pub") setFirstByte(key, 127)
+    needles.storeI64(0, word(key, 0, 0) ^ MASK)
+    needles.storeI64(8, word(key, 8, 0) ^ MASK)
+    needles.storeI64(16, word(key, 0, 54) ^ MASK)
+    needles.storeI64(24, word(key, 8, 54) ^ MASK)
+    needles.storeI64(32, word(key, 0, 92) ^ MASK)
+    needles.storeI64(40, word(key, 8, 92) ^ MASK)
+    val before = scan()
+    val ok = operate(mode, key, wipe)
+    key = ""
+    memoryCollect()
+    memoryCollect()
+    val after = scan()
+    println("$mode ${if (wipe) "wiped" else "control"}: ok=$ok windows before=$before after=$after")
+    0
+}
+
+// The first byte of the key's own buffer (a P-256 scalar must be below the order).
+trusted fun setFirstByte(key: string, value: int): void {
+    ablaUnsafeStoreU8(nativePointerFromAddress(ablaUnsafeStringAddress(key)), value)
+    return
+}

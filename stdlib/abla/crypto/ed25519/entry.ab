@@ -369,18 +369,24 @@ private @noinline trusted fun ed25519MultiplyAdd(k: string, a: string, r: string
 }
 
 /** The clamped scalar of RFC 8032 section 5.1.5, from the first half of the seed's hash. */
-private fun ed25519Clamp(hash: string): string {
-    val bytes: array<int> = []
-    for (i in 0 until 32) bytes.append(hash[i])
-    bytes[0] = bytes[0] & 248
-    bytes[31] = (bytes[31] & 127) | 64
-    cryptoByteString(bytes)
+private trusted fun ed25519Clamp(hash: string): string {
+    // A buffer of its own (the secret scalar), for the caller to wipe: no array of boxed ints holds it.
+    val scalar = cryptoOwnedCopy(hash.slice(0, 32))
+    val address = ablaUnsafeStringAddress(scalar)
+    ablaUnsafeStoreU8(nativePointerFromAddress(address), ablaUnsafeLoadU8(nativePointerFromAddress(address)) & 248)
+    ablaUnsafeStoreU8(nativePointerFromAddress(address + 31), (ablaUnsafeLoadU8(nativePointerFromAddress(address + 31)) & 127) | 64)
+    scalar
 }
 
 /** The public key (32 bytes) of a private key (a 32-byte seed): RFC 8032 section 5.1.5. */
 fun ed25519PublicKey(seed: string): CryptoResult {
     if (seed.size != 32) return cryptoFailed("ed25519: the seed is 32 bytes")
-    val result = CryptoResult(ed25519MultiplyBase(ed25519Clamp(sha512(seed))), true, "")
+    val hash = sha512OfSecret(seed)
+    val scalar = ed25519Clamp(hash)
+    val result = CryptoResult(ed25519MultiplyBase(scalar), true, "")
+    // The hash and the scalar are secret: wiped (the seed is the caller's).
+    cryptoWipeString(scalar)
+    cryptoWipeString(hash)
     ctScrubStack2048()
     return result
 }
@@ -389,8 +395,11 @@ fun ed25519PublicKey(seed: string): CryptoResult {
  *  the same seed and message give the same signature. */
 fun ed25519Sign(seed: string, message: string): CryptoResult {
     if (seed.size != 32) return cryptoFailed("ed25519: the seed is 32 bytes")
-    val hash = sha512(seed)
-    val result = ed25519SignHashed(hash, ed25519MultiplyBase(ed25519Clamp(hash)), message)
+    val hash = sha512OfSecret(seed)
+    val scalar = ed25519Clamp(hash)
+    val result = ed25519SignHashed(hash, ed25519MultiplyBase(scalar), message)
+    cryptoWipeString(scalar)
+    cryptoWipeString(hash)
     ctScrubStack2048()
     return result
 }
@@ -401,17 +410,26 @@ fun ed25519Sign(seed: string, message: string): CryptoResult {
 fun ed25519SignWithPublicKey(seed: string, publicKey: string, message: string): CryptoResult {
     if (seed.size != 32) return cryptoFailed("ed25519: the seed is 32 bytes")
     if (publicKey.size != 32) return cryptoFailed("ed25519: the public key is 32 bytes")
-    val result = ed25519SignHashed(sha512(seed), publicKey, message)
+    val hash = sha512OfSecret(seed)
+    val result = ed25519SignHashed(hash, publicKey, message)
+    cryptoWipeString(hash)
     ctScrubStack2048()
     return result
 }
 
-private fun ed25519SignHashed(hash: string, publicKey: string, message: string): CryptoResult {
+private trusted fun ed25519SignHashed(hash: string, publicKey: string, message: string): CryptoResult {
+    // The secret scalar, the nonce prefix's hash and the nonce are buffers of their own, wiped after use.
     val scalar = ed25519Clamp(hash)
-    val nonce = ed25519ReduceHash(sha512(hash.slice(32, 64) + message))
+    val prefix = cryptoOwnedJoin([hash.slice(32, 64), message], 32 + message.size)
+    val nonceHash = sha512OfSecret(prefix)
+    cryptoWipeString(prefix)
+    val nonce = ed25519ReduceHash(nonceHash)
+    cryptoWipeString(nonceHash)
     val r = ed25519MultiplyBase(nonce)
     val k = ed25519ReduceHash(sha512(r + publicKey + message))
     val s = ed25519MultiplyAdd(k, scalar, nonce)
+    cryptoWipeString(nonce)
+    cryptoWipeString(scalar)
     CryptoResult(r + s, true, "")
 }
 
