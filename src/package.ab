@@ -1004,6 +1004,73 @@ fun bootstrapPackageCacheValid(package: BootstrapLockedPackage): bool {
     valid
 }
 
+// Whether a symbolic link at `linkPath` (relative to the package root) pointing at `target` leaves the package: an
+// absolute target, or `..` steps that climb above the root.
+fun bootstrapPackageSymlinkEscapes(linkPath: string, target: string): bool {
+    if (target.size == 0 || target[0] == 47) return true
+    var depth = 0
+    val directory = linkPath.split("/")
+    var index = 0
+    while (index + 1 < directory.size) {
+        depth = depth + 1
+        index = index + 1
+    }
+    var escapes = false
+    for (part in target.split("/")) {
+        if (part == "..") {
+            depth = depth - 1
+            if (depth < 0) escapes = true
+        } else if (part != "." && part != "") {
+            depth = depth + 1
+        }
+    }
+    escapes
+}
+
+// The root of the dependency copy (`.../.abla/packages/<name>/source` or a checked-in `.../vendor/<name>`) a module path
+// lies in, or "".
+fun bootstrapPackageCopyRootOf(path: string): string {
+    // `lead` makes a relative path (`.abla/packages/x/source/y.ab`, `vendor/x/y.ab`) look like an absolute one.
+    val lead = if (path.startsWith("/")) "" else "/"
+    val full = "$lead$path"
+    var root = ""
+    val prepared = full.indexOf("/.abla/packages/")
+    if (prepared >= 0) {
+        val nameBegin = prepared + 16
+        val nameEnd = full.indexOf("/", nameBegin)
+        if (nameEnd > nameBegin && full.slice(nameEnd, nameEnd + 8) == "/source/") root = full.slice(0, nameEnd + 7)
+    } else {
+        val vendor = full.indexOf("/vendor/")
+        if (vendor >= 0) {
+            val nameBegin = vendor + 8
+            val nameEnd = full.indexOf("/", nameBegin)
+            if (nameEnd > nameBegin && Path("${full.slice(lead.size, nameEnd)}/.abla-revision").exists()) root = full.slice(0, nameEnd)
+        }
+    }
+    if (root == "") "" else root.slice(lead.size, root.size)
+}
+
+// Whether the module at `path` is reached through a symbolic link of its dependency copy that leaves the package. An
+// import inside a dependency (`import "leak.ab"`, `leak.ab -> /home/me/.ssh/id`) would otherwise read the target as
+// source.
+fun bootstrapPackageImportThroughEscapingLink(path: string): bool {
+    val root = bootstrapPackageCopyRootOf(path)
+    var escapes = false
+    if (root != "") {
+        val relative = path.slice(root.size + 1, path.size)
+        var prefix = 0
+        while (prefix <= relative.size && !escapes) {
+            if (prefix == relative.size || relative[prefix] == 47) {
+                val part = relative.slice(0, prefix)
+                val link = Path("$root/$part")
+                if (part != "" && link.isSymbolicLink() && bootstrapPackageSymlinkEscapes(part, link.linkTarget())) escapes = true
+            }
+            prefix = prefix + 1
+        }
+    }
+    escapes
+}
+
 fun bootstrapPackageFetch(
     dependency: BootstrapPackageDependency,
     revision: string
