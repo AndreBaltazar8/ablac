@@ -1,0 +1,147 @@
+// The gzip/deflate decoder (abla/compression/gzip) against hostile streams (#1139 area 4). Valid members are made with gzipCompress from data of
+// several shapes (long zero runs, repeated text, random bytes, runs with changing lengths) at several search limits, and a part of them are
+// mutated (flips, inserted and deleted bytes, truncation, a corrupted header, trailer or block header). Each stream is decoded with different
+// input and output chunk sizes: the decoder has a general path and a fast path over whole chunks, and they must agree. The invariants: no crash
+// or hang (a decode over 3 s is a finding); the output never exceeds the limit (a bomb, a stream of a few hundred bytes that stands for megabytes,
+// must stop at the limit with the error "limit", fast); the error is "", "invalid", "limit" or "source"; the same stream gives the same result
+// (error and, when there is none, data) however the input and output are cut; and a stream that was not mutated gives back its data.
+//
+//   tools/fuzz/parsers/run gzip --seeds 1-200 [--inputs 200]
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "abla/integer"
+import "abla/compression/gzip"
+import "abla/process/arguments"
+import "abla/process/time"
+import "../prng.ab"
+import "./mutate.ab"
+
+resource class GzFuzzSource(val data: string, val piece: int, var pos: int = 0): GzipSource {
+    fun readChunk(request: int): GzipInputChunk {
+        val available = this.data.size - this.pos
+        var size = if (available < this.piece) available else this.piece
+        if (size > request) size = request
+        val text = this.data.slice(this.pos, this.pos + size)
+        this.pos += size
+        GzipInputChunk(text, this.pos == this.data.size)
+    }
+}
+
+class GzFuzzResult(val error: string, val data: string, val rounds: int)
+
+/** The whole decode of `packed` through the stream reader with the given input and output piece sizes and output limit. */
+fun gzFuzzDecode(packed: string, inPiece: int, outPiece: int, limit: int): GzFuzzResult {
+    val source = GzFuzzSource(packed, inPiece)
+    val stream = gzipStream(source, packed.size, limit)
+    val output = byteBuffer()
+    var rounds = 0
+    while (rounds <= packed.size + limit + 100) {
+        rounds = rounds + 1
+        val chunk = stream.read(source, outPiece)
+        if (chunk.error != "") return GzFuzzResult(chunk.error, "", rounds)
+        output.appendText(chunk.data)
+        if (chunk.done) return GzFuzzResult("", output.toText(), rounds)
+    }
+    GzFuzzResult("no end", "", rounds)
+}
+
+fun gzFuzzData(var r: Prng): string {
+    val kind = r.below(6)
+    val size = if (r.below(4) == 0) r.below(200000) else r.below(3000)
+    if (kind == 0) return "\x00".repeat(size)
+    if (kind == 1) return "the quick brown fox ".repeat(size / 20 + 1).slice(0, size)
+    if (kind == 2) return mutateBytes(r, size)
+    if (kind == 3) {
+        var out = ""
+        while (out.size < size) out = out + byteString(97 + r.below(4)).repeat(1 + r.below(300))
+        return out.slice(0, size)
+    }
+    if (kind == 4) return "ab".repeat(size / 2 + 1).slice(0, size)
+    ""
+}
+
+fun byteString(c: int): string {
+    val buffer = byteBuffer()
+    buffer.appendByteValue(c)
+    buffer.toText()
+}
+
+/** A description of what is wrong with the decode of `packed` (from `raw` when it was not mutated, else ""), or "". */
+fun gzFuzzCheck(var r: Prng, packed: string, raw: string, mutated: bool): string {
+    val limits: array<int> = [0, 1, 100, 65536, 1048576, 268435456]
+    val limit = r.pickInt(limits)
+    val start = monotonicMilliseconds()
+    val whole = gzFuzzDecode(packed, packed.size + 1, 65536, limit)
+    var cut = gzFuzzDecode(packed, 1 + r.below(9), 1 + r.below(40), limit)
+    val elapsed = monotonicMilliseconds() - start
+    if (elapsed > 3000) return "decoding took $elapsed ms (${packed.size} bytes, limit $limit)"
+    if (whole.error != "" && whole.error != "invalid" && whole.error != "limit") return "an unexpected error '${whole.error}'"
+    if (whole.data.size > limit) return "the output is ${whole.data.size} bytes over the limit $limit"
+    if (cut.data.size > limit) return "the output (cut) is ${cut.data.size} bytes over the limit $limit"
+    if (cut.error != whole.error) return "the error differs with the cutting: whole '${whole.error}', cut '${cut.error}' (${packed.size} bytes, limit $limit)"
+    if (cut.data != whole.data) return "the data differs with the cutting (${packed.size} bytes, limit $limit)"
+    if (!mutated && limit >= raw.size && whole.error != "") return "a valid stream of ${raw.size} bytes is refused with '${whole.error}' at limit $limit"
+    if (!mutated && limit >= raw.size && whole.data != raw) return "a valid stream does not give back its data"
+    if (!mutated && limit < raw.size && whole.error != "limit" && whole.error != "invalid") return "a valid stream of ${raw.size} bytes at limit $limit gave error '${whole.error}'"
+    ""
+}
+
+fun gzFuzzMutate(var r: Prng, packed: string): string {
+    val kind = r.below(8)
+    if (kind == 0 && packed.size > 0) return packed.slice(0, r.below(packed.size))
+    if (kind == 1) return packed + mutateBytes(r, 1 + r.below(8))
+    if (kind == 2 && packed.size > 10) {
+        // The header and the first block header.
+        val at = r.below(14)
+        return packed.slice(0, at) + mutateBytes(r, 1) + packed.slice(at + 1, packed.size)
+    }
+    if (kind == 3 && packed.size > 8) {
+        // The trailer (CRC and size).
+        val at = packed.size - 1 - r.below(8)
+        return packed.slice(0, at) + mutateBytes(r, 1) + packed.slice(at + 1, packed.size)
+    }
+    mutate(r, packed)
+}
+
+fun main: int {
+    var low = 1
+    var high = 50
+    var inputs = 200
+    var verbose = false
+    val count = processArgumentCount()
+    var index = 0
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "--seeds") {
+            val dash = value.indexOf("-")
+            low = (if (dash < 0) value else value.slice(0, dash)).parseInt() ?? 1
+            high = (if (dash < 0) value else value.slice(dash + 1, value.size)).parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--inputs") {
+            inputs = value.parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--verbose") verbose = true
+        index = index + 1
+    }
+    var findings = 0
+    for (seed in low until high + 1) {
+        var r = prngSeeded(seed)
+        for (n in 0 until inputs) {
+            val raw = gzFuzzData(r)
+            val searchLimits: array<int> = [1, 16, 128, 1024]
+            var packed = gzipCompress(raw, r.pickInt(searchLimits))
+            val mutated = r.below(3) != 0
+            if (mutated) packed = gzFuzzMutate(r, packed)
+            if (verbose) println("input seed=$seed n=$n raw=${raw.size} packed=${packed.size} mutated=$mutated")
+            val problem = gzFuzzCheck(r, packed, raw, mutated)
+            if (problem != "") {
+                println("FINDING seed=$seed n=$n: $problem\n  packed: ${mutateEscape(if (packed.size > 120) packed.slice(0, 120) else packed)}")
+                findings = findings + 1
+            }
+        }
+    }
+    println("gzip: seeds $low-$high, $inputs inputs each, $findings findings")
+    if (findings == 0) 0 else 1
+}
