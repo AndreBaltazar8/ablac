@@ -1,0 +1,102 @@
+// The runtime's compile-time watchdog (call 4002, docs/design/windows-jit.md §5), armed for this thread as the compiler arms it
+// around a compile-time call:
+// - spinning in executable memory from VirtualAlloc (as JIT'd code runs) with a check that allows a redirect: the thread is
+//   sent to the target with SIGALRM's number, which jumps back with 3;
+// - asleep in the runtime with the same check: the thread is in a loaded image, so it is never redirected there; its wait
+//   returns EINTR (-4) instead;
+// - asleep with a check that defers the stop (the compiler's code is running): EINTR too, and the check was asked;
+// - reading an empty pipe with no check (an interpreted site): EINTR from CancelSynchronousIo;
+// - disarmed before its deadline: nothing happens, and a sleep runs its time.
+import "abla/io"
+import "abla/text"
+import "abla/sys/linux"
+import "abla/runtime/platform/windows"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/native/function-address"
+
+trusted noescape extern:"c" fun abla_setjmp(buffer: int): int
+trusted noescape extern:"c" fun abla_longjmp(buffer: int, value: int): void
+
+trusted fun load(address: int): int = ablaUnsafeLoadI64(nativePointerFromAddress(address))
+trusted fun store(address: int, value: int): void = ablaUnsafeStoreI64(nativePointerFromAddress(address), value)
+
+// The jump buffer the target jumps back to, and how often the watchdog asked the check.
+var jumpBuffer: int = 0
+var checks: int = 0
+
+// Checks, called by the watchdog while this thread is suspended: 2 a redirect may be made, 1 the stop is deferred.
+trusted fun mayJump(): int {
+    checks += 1
+    2
+}
+
+trusted fun deferStop(): int {
+    checks += 1
+    1
+}
+
+// The redirect target: called on this thread with (14, 0), as the alarm handler is.
+trusted fun onStop(signal: int, info: int): void {
+    abla_longjmp(jumpBuffer, if (signal == 14 && info == 0) 3 else 9)
+}
+
+// Arms the watch: the deadline in milliseconds, the check, the target; 0 milliseconds disarms.
+trusted fun watch(request: int, milliseconds: int, check: int): int {
+    store(request, milliseconds)
+    store(request + 8, check)
+    store(request + 16, nativeFunctionAddress(onStop))
+    store(request + 24, 0)
+    linuxSyscall1(4002, request)
+}
+
+// nanosleep for `seconds` and `nanoseconds`.
+trusted fun sleepFor(request: int, seconds: int, nanoseconds: int): int {
+    store(request, seconds)
+    store(request + 8, nanoseconds)
+    linuxSyscall2(35, request, 0)
+}
+
+trusted fun main: int {
+    val storage = "0123456789abcdef".repeat(40)
+    jumpBuffer = nativeStringAddress(storage)
+    val scratchStorage = "0123456789abcdef".repeat(8)
+    val scratch = nativeStringAddress(scratchStorage)
+    val request = scratch + 64
+    // jmp . (EB FE) in read-write-execute memory (MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE).
+    val code = VirtualAlloc(0, 4096, 12288, 64)
+    ablaUnsafeStoreU8(nativePointerFromAddress(code), 235)
+    ablaUnsafeStoreU8(nativePointerFromAddress(code + 1), 254)
+    val armed = watch(request, 100, nativeFunctionAddress(mayJump))
+    val how = abla_setjmp(jumpBuffer)
+    if (how == 0) {
+        println("not reached ${callNativeMain(code)}")
+        return 1
+    }
+    watch(request, 0, 0)
+    println("armed $armed")
+    println("spin back with $how")
+    watch(request, 100, nativeFunctionAddress(mayJump))
+    val slept = sleepFor(scratch, 30, 0)
+    watch(request, 0, 0)
+    println("runtime sleep $slept")
+    checks = 0
+    watch(request, 100, nativeFunctionAddress(deferStop))
+    val deferred = sleepFor(scratch, 30, 0)
+    watch(request, 0, 0)
+    println("deferred sleep $deferred, asked ${checks > 0}")
+    // pipe2(fds, 0): the read end at scratch; nothing is written.
+    val piped = linuxSyscall2(293, scratch + 32, 0)
+    if (piped != 0) {
+        println("no pipe: $piped")
+        return 1
+    }
+    val readEnd = ablaUnsafeLoadU32(nativePointerFromAddress(scratch + 32))
+    watch(request, 100, 0)
+    val read = linuxSyscall3(0, readEnd, scratch, 16)
+    watch(request, 0, 0)
+    println("interpreted read $read")
+    watch(request, 100, nativeFunctionAddress(mayJump))
+    watch(request, 0, 0)
+    println("disarmed sleep ${sleepFor(scratch, 0, 300000000)}")
+    0
+}

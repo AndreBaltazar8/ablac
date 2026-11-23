@@ -12,6 +12,7 @@
 import "abla/unsafe/memory"
 import "abla/runtime/scalar"
 import "abla/unsafe/memory/raw"
+import "abla/unsafe/native/function-address"
 
 
 /** kernel32 ExitProcess: ends the process with the given status; does not return. */
@@ -1441,6 +1442,164 @@ private trusted fun __ablaRuntimeWindowsDuplicate(fd: int): int {
     __ablaRuntimeWindowsOpenFd(ablaRuntimeLoadI64(scratch), 1, 0)
 }
 
+// --- the compile-time watchdog (docs/design/windows-jit.md §5) ---------------------------------------------------------------
+// Windows has no SIGALRM to stop a compile-time call that runs past its time limit, so call 4002 arms a watchdog thread for the
+// calling thread instead. At the deadline the watchdog stops the thread in one of the ways the Linux alarm does:
+// - running JIT'd code (its program counter in no loaded image, RtlPcToFileHeader): suspended, its CONTEXT pointed at the
+//   redirect target with (14, 0), as the alarm handler is called with SIGALRM, and resumed;
+// - anywhere else (the compiler's or the runtime's code, a system DLL): resumed as it was, its interrupt words set and its
+//   synchronous I/O cancelled (CancelSynchronousIo), so its waits and reads return EINTR, and tried again a millisecond later,
+//   since a redirect there could leave a loader, heap or I/O lock held.
+// The check function, called while the thread is suspended, says which applies: 0 the guard is not armed (try again), 1 the
+// thread is in the compiler's code and the stop is deferred to its return (done), 2 a redirect may be made. With no check
+// function (an interpreted site) every stop is an interrupt, repeated every second until the watch is disarmed, as the Linux
+// interval timer repeats. Between SuspendThread and ResumeThread the watchdog allocates nothing and takes no lock.
+
+// (Private: a program may declare the same calls for itself, as tests/cases/windows/preempt.ab and fault-jump.ab do.)
+/** kernel32 OpenThread: a handle with the given access to the thread with the given id, or 0 when it fails. */
+private trusted noescape extern:"c" fun OpenThread(access: int, inherit: int, id: int): int
+/** kernel32 SuspendThread: suspends a thread; returns its previous suspend count, or 0xFFFFFFFF when it fails. */
+private trusted noescape extern:"c" fun SuspendThread(target: int): int
+/** kernel32 ResumeThread: lowers a thread's suspend count; returns the previous count, or 0xFFFFFFFF when it fails. */
+private trusted noescape extern:"c" fun ResumeThread(target: int): int
+/** kernel32 GetThreadContext: stores a suspended thread's registers in the CONTEXT at context (its ContextFlags say which); returns non-zero on success. */
+private trusted noescape extern:"c" fun GetThreadContext(target: int, context: int): int
+/** kernel32 SetThreadContext: sets a suspended thread's registers from the CONTEXT at context; returns non-zero on success. */
+private trusted noescape extern:"c" fun SetThreadContext(target: int, context: int): int
+/** kernel32 CancelSynchronousIo: ends the thread's pending synchronous read or write with ERROR_OPERATION_ABORTED; returns non-zero when one was cancelled. */
+private trusted noescape extern:"c" fun CancelSynchronousIo(target: int): int
+/** kernel32 RtlPcToFileHeader: the base of the loaded image that holds the address pc (also stored at base), or 0 when no image does. */
+private trusted noescape extern:"c" fun RtlPcToFileHeader(pc: int, base: int): int
+/** kernel32 CreateThread: starts a thread at start with parameter; returns its handle, or 0 when it fails. */
+private trusted noescape extern:"c" fun CreateThread(attributes: int, stack: int, start: int, parameter: int, flags: int, id: int): int
+/** The Abla Windows routine (src/backend/llvm/windows.ab): sets a CONTEXT's ContextFlags to the control and integer registers. */
+private trusted noescape extern:"c" fun abla_windows_context_prepare(context: int): void
+/** The Abla Windows routine (src/backend/llvm/windows.ab): a CONTEXT's program counter. */
+private trusted noescape extern:"c" fun abla_windows_context_pc(context: int): int
+/** The Abla Windows routine (src/backend/llvm/windows.ab): makes a CONTEXT resume at target with first and second as its first two arguments, the stack pointer aligned as a call leaves it. */
+private trusted noescape extern:"c" fun abla_windows_redirect(context: int, target: int, first: int, second: int): void
+
+// The watchdog's block (one for the process, zeroed): 0 the arming count (32 bits, what the watchdog waits on), 8 the deadline in
+// milliseconds of the performance counter (0: disarmed), 16 the watched thread's handle, 24 the check function, 32 the
+// redirect target, 40 another interrupt word to set (0: none), 48 the thread's own interrupt word, 56 the watchdog thread's
+// handle (0: not started), 64 and 72 the watchdog's clock scratch, 80 its copy of the arming count, 88 RtlPcToFileHeader's out
+// parameter, from 128 the CONTEXT (16-aligned, as GetThreadContext requires; x64's is 1232 bytes, ARM64's 912).
+private trusted fun __ablaRuntimeWindowsWatchBlock(): int = (nativeStaticAllocate(4096) + 15) / 16 * 16
+
+// Milliseconds of the performance counter, with `scratch` (16 bytes) for its out-parameters.
+private trusted fun __ablaRuntimeWindowsMilliseconds(scratch: int): int {
+    QueryPerformanceFrequency(scratch)
+    QueryPerformanceCounter(scratch + 8)
+    val frequency = ablaRuntimeLoadI64(scratch)
+    val ticks = ablaRuntimeLoadI64(scratch + 8)
+    ticks / frequency * 1000 + ticks % frequency * 1000 / frequency
+}
+
+// One stop of the watched thread at its deadline: true when it is done (redirected, deferred, an interrupt of an interpreted
+// site, or the thread is gone or disarmed), false to try again a millisecond later.
+private trusted fun __ablaRuntimeWindowsWatchStop(block: int, armed: int): bool {
+    val target = ablaRuntimeLoadI64(block + 16)
+    if ((SuspendThread(target) & 4294967295) == 4294967295) return true
+    // Disarmed or armed again since the deadline was read: nothing to stop (the thread itself arms and disarms, and it is
+    // suspended now).
+    if ((ablaRuntimeAtomicLoadI64(block) & 4294967295) != armed || ablaRuntimeAtomicLoadI64(block + 8) == 0) {
+        ResumeThread(target)
+        return true
+    }
+    val context = block + 128
+    abla_windows_context_prepare(context)
+    val read = GetThreadContext(target, context) != 0
+    val check = ablaRuntimeLoadI64(block + 24)
+    val state = if (check == 0) 3 else ablaUnsafeCallMain(check)
+    if (read && state == 2 && RtlPcToFileHeader(abla_windows_context_pc(context), block + 88) == 0) {
+        abla_windows_redirect(context, ablaRuntimeLoadI64(block + 32), 14, 0)
+        val set = SetThreadContext(target, context) != 0
+        ResumeThread(target)
+        if (set) return true
+    } else ResumeThread(target)
+    ablaRuntimeAtomicStoreI64(ablaRuntimeLoadI64(block + 48), 1)
+    val other = ablaRuntimeLoadI64(block + 40)
+    if (other != 0) ablaRuntimeAtomicStoreI64(other, 1)
+    CancelSynchronousIo(target)
+    state == 1 || state == 3
+}
+
+// The watchdog thread: waits for a deadline, stops the watched thread at it, and waits again.
+private trusted fun __ablaRuntimeWindowsWatchdog(block: int): int {
+    while (true) {
+        val armed = ablaRuntimeAtomicLoadI64(block) & 4294967295
+        ablaRuntimeStoreI64(block + 80, armed)
+        val deadline = ablaRuntimeAtomicLoadI64(block + 8)
+        val now = __ablaRuntimeWindowsMilliseconds(block + 64)
+        if (deadline == 0) WaitOnAddress(block, block + 80, 4, 4294967295)
+        else if (now < deadline) WaitOnAddress(block, block + 80, 4, deadline - now)
+        else if (__ablaRuntimeWindowsWatchStop(block, armed)) {
+            // An interpreted site is interrupted again every second; a native call's watch ends (its thread disarms it).
+            val next = if (ablaRuntimeLoadI64(block + 24) == 0) now + 1000 else 0
+            ablaRuntimeAtomicCompareExchangeI64(block + 8, deadline, next)
+        } else Sleep(1)
+    }
+    0
+}
+
+/** The system call intrinsic: on a Windows target the backend sends it to __ablaRuntimeWindowsSyscall. */
+private trusted noescape extern:"intrinsic" fun ablaLinuxSyscall(
+    number: int,
+    argument0: int,
+    argument1: int,
+    argument2: int,
+    argument3: int,
+    argument4: int,
+    argument5: int
+): int
+
+// The watchdog thread's entry. A function whose address nativeFunctionAddress takes is kept in every build of a program that
+// loads this file, whether or not the code that takes it is (tests/cases/modules/windows-runtime.ab builds it for Linux), so
+// the entry reaches the watchdog only through the translation (call 4003): a build for another target has no kernel32
+// reference.
+private trusted fun __ablaRuntimeWindowsWatchdogEntry(block: int): int = ablaLinuxSyscall(4003, block, 0, 0, 0, 0, 0)
+
+// watch(request): request = {milliseconds until the stop (0: disarm), the check function (0: an interpreted site), the
+// redirect target, another interrupt word to set at the stop (0: none)}, for the calling thread. Disarming clears the thread's
+// interrupt words. Returns 0, or -errno.
+private trusted fun __ablaRuntimeWindowsWatch(request: int): int {
+    val block = __ablaRuntimeWindowsWatchBlock()
+    val milliseconds = ablaRuntimeLoadI64(request)
+    val cell = __ablaRuntimeWindowsInterruptCell()
+    // Disarm (or re-arm): the deadline goes first, so a watchdog that wakes meanwhile finds nothing to stop.
+    ablaRuntimeAtomicStoreI64(block + 8, 0)
+    ablaRuntimeAtomicStoreI64(block, (ablaRuntimeLoadI64(block) + 1) & 4294967295)
+    val previous = ablaRuntimeLoadI64(block + 16)
+    if (previous != 0) {
+        CloseHandle(previous)
+        ablaRuntimeStoreI64(block + 16, 0)
+    }
+    val other = ablaRuntimeLoadI64(block + 40)
+    if (other != 0) ablaRuntimeAtomicStoreI64(other, 0)
+    ablaRuntimeAtomicStoreI64(cell, 0)
+    if (milliseconds <= 0) {
+        WakeByAddressAll(block)
+        return 0
+    }
+    // THREAD_ALL_ACCESS: suspend and resume, the context, CancelSynchronousIo's THREAD_TERMINATE.
+    val target = OpenThread(2097151, 0, GetCurrentThreadId())
+    if (target == 0) return __ablaRuntimeWindowsErrno()
+    ablaRuntimeStoreI64(block + 16, target)
+    ablaRuntimeStoreI64(block + 24, ablaRuntimeLoadI64(request + 8))
+    ablaRuntimeStoreI64(block + 32, ablaRuntimeLoadI64(request + 16))
+    ablaRuntimeStoreI64(block + 40, ablaRuntimeLoadI64(request + 24))
+    ablaRuntimeStoreI64(block + 48, cell)
+    if (ablaRuntimeLoadI64(block + 56) == 0) {
+        val watchdog = CreateThread(0, 0, nativeFunctionAddress(__ablaRuntimeWindowsWatchdogEntry), block, 0, 0)
+        if (watchdog == 0) return __ablaRuntimeWindowsErrno()
+        ablaRuntimeStoreI64(block + 56, watchdog)
+    }
+    ablaRuntimeAtomicStoreI64(block + 8, __ablaRuntimeWindowsMilliseconds(__ablaRuntimeWindowsScratch()) + milliseconds)
+    ablaRuntimeAtomicStoreI64(block, (ablaRuntimeLoadI64(block) + 1) & 4294967295)
+    WakeByAddressAll(block)
+    0
+}
+
 // The process calls: -1000 when `number` is none of them.
 private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: int, a2: int, a3: int): int {
     // wait4(pid, status, options, usage)
@@ -1460,6 +1619,10 @@ private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: in
     if (number == 57 || number == 56 || number == 58 || number == 59) return -38
     // spawn(block)
     if (number == 4001) return __ablaRuntimeWindowsSpawn(a0)
+    // watch(request): the compile-time watchdog for the calling thread
+    if (number == 4002) return __ablaRuntimeWindowsWatch(a0)
+    // the watchdog thread itself (its entry, __ablaRuntimeWindowsWatchdogEntry): does not return
+    if (number == 4003) return __ablaRuntimeWindowsWatchdog(a0)
     -1000
 }
 
@@ -1590,7 +1753,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 89 91 97 109 121 131 186 202 204 217 228 231 257 262 263 288 293 318 4001"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 89 91 97 109 121 131 186 202 204 217 228 231 257 262 263 288 293 318 4001 4002 4003"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;

@@ -76,6 +76,18 @@ tools/windows/wine-run.sh "$out/interrupt.exe" > "$out/interrupt.out" 2> "$out/i
 [[ $status == 0 ]] || fail "interrupt.exe exited $status: $(head -3 "$out/interrupt.out" "$out/interrupt.err")"
 [[ "$(cat "$out/interrupt.out")" == $'interrupted sleep -4\ninterrupted poll -4\ninterrupted socket poll -4\ninterrupted futex wait -4\ninterrupted wait4 -4\ncollected true\nplain sleep 0' ]] || fail "interrupt.exe printed: $(cat "$out/interrupt.out" "$out/interrupt.err")"
 (( SECONDS - started < 25 )) || fail "interrupt.exe took $((SECONDS - started)) s: the interrupted sleep ran its time"
+# The runtime's watchdog (watchdog.ab, call 4002): armed for the calling thread, it redirects it out of executable memory from
+# VirtualAlloc, never out of a loaded image (a runtime sleep gets EINTR instead), interrupts a deferred stop's sleep and an
+# interpreted site's pipe read with EINTR, and does nothing once disarmed. The whole program takes seconds, not the 30-second
+# sleeps a missed stop would.
+"$compiler" build tests/cases/windows/watchdog.ab --target x86_64-windows-hosted -o "$out/watchdog.exe" --fast --no-cache \
+    > "$out/watchdog.log" 2>&1 || { cat "$out/watchdog.log" >&2; fail "watchdog.ab did not build for Windows"; }
+status=0
+started=$SECONDS
+timeout 120 tools/windows/wine-run.sh "$out/watchdog.exe" > "$out/watchdog.out" 2> "$out/watchdog.err" || status=$?
+[[ $status == 0 ]] || fail "watchdog.exe exited $status: $(head -5 "$out/watchdog.out" "$out/watchdog.err")"
+[[ "$(cat "$out/watchdog.out")" == $'armed 0\nspin back with 3\nruntime sleep -4\ndeferred sleep -4, asked true\ninterpreted read -4\ndisarmed sleep 0' ]] || fail "watchdog.exe printed: $(cat "$out/watchdog.out" "$out/watchdog.err")"
+(( SECONDS - started < 25 )) || fail "watchdog.exe took $((SECONDS - started)) s: a stop was missed"
 # The watchdog's two stops (preempt.ab, §5), each from a second thread: a thread spinning in VirtualAlloc'd code is suspended,
 # its CONTEXT redirected to a jump back with 3, and resumed; a thread reading an empty pipe gets EINTR from CancelSynchronousIo.
 "$compiler" build tests/cases/windows/preempt.ab --target x86_64-windows-hosted -o "$out/preempt.exe" --fast --no-cache \

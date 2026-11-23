@@ -112,6 +112,9 @@ var bootstrapCtTraceValue: int = -1
 var bootstrapCtFreeAddress: int = 0
 var bootstrapCtGuardAddress: int = 0
 var bootstrapCtAlarmAddress: int = 0
+// The Windows watchdog's check of the live generation (abla_ct_watch_<g>, ct_jit.ab; 0: none), which stands in for the
+// alarm handler's own tests there (bootstrapCtWindowsWatch).
+var bootstrapCtWatchAddress: int = 0
 var bootstrapCtFaultAddress: int = 0
 // Whether the live generation can start threads (ct_jit.ab): before a call into one, the compiler's heap is shared.
 var bootstrapCtGenerationThreads: bool = false
@@ -908,6 +911,7 @@ var bootstrapCtSigreturnAddress: int = 0
 // SIGALRM for an interpreted site: first after `seconds`, then every second (ITIMER_REAL's interval), without
 // SA_RESTART so a blocked call returns EINTR; the evaluator then sees the deadline passed.
 trusted fun bootstrapCtArmInterpreterAlarm(seconds: int): bool {
+    if (linuxHostIsWindows()) return bootstrapCtWindowsWatch(seconds * 1000, 0, 0)
     val handler = bootstrapCtAlarmReturnAddress
     if (handler == 0) return false
     // (ablaHostIsMacOS, not bootstrapCtHostIsDarwin: that is set only once a native session exists.)
@@ -1059,9 +1063,31 @@ private noescape extern:"intrinsic" fun ablaDarwinSyscall(
     argument5: int
 ): int
 
+// Windows has no SIGALRM (docs/design/windows-jit.md §5): the runtime's watchdog (call 4002) stops the calling thread
+// `milliseconds` from now (0: disarms it). With a check (bootstrapCtWatchAddress), a native call: in JIT'd code the thread is
+// sent to `target`, the alarm handler, which jumps back with 3; in the compiler's code the check defers the stop, as the
+// handler would. Without one, an interpreted site: its waits and reads return EINTR from then on, every second, as the
+// interval timer makes them. The check and target are kept for a re-arm (bootstrapCtSetTimerMilliseconds, a resumed limit).
+var bootstrapCtWindowsCheck: int = 0
+var bootstrapCtWindowsTarget: int = 0
+
+trusted fun bootstrapCtWindowsWatch(milliseconds: int, check: int, target: int): bool {
+    if (milliseconds > 0) {
+        bootstrapCtWindowsCheck = check
+        bootstrapCtWindowsTarget = target
+    }
+    val request = bootstrapCtZeroed(32)
+    ablaRuntimeStoreI64(request, milliseconds)
+    ablaRuntimeStoreI64(request + 8, check)
+    ablaRuntimeStoreI64(request + 16, target)
+    val armed = linuxSyscall1(4002, request) == 0
+    __ablaRuntimeFree(request)
+    armed
+}
+
 // The compiler hosts are x86-64 Linux and macOS. x86-64 Linux arms the timer with
 // the system call (38), so the compiler needs no libc setitimer there (#806); macOS keeps libSystem's.
-// (None on Windows, where no alarm is installed: bootstrapCtSigaction.)
+// (None on Windows, which arms the watchdog instead: bootstrapCtWindowsWatch.)
 trusted fun bootstrapCtSetTimer(value: int): bool =
     if (linuxHostIsWindows()) false
     else if (ablaHostIsMacOS()) setitimer(0, ablaRuntimePointerFromAddress(value),
@@ -1139,6 +1165,8 @@ trusted fun bootstrapCtZeroed(size: int): int {
 // after `seconds`. struct sigaction: Darwin {handler, mask u32, flags i32}; Linux
 // {handler, mask[128], flags i32, restorer}.
 trusted fun bootstrapCtArmAlarm(handler: int, seconds: int): bool {
+    if (linuxHostIsWindows()) return bootstrapCtWatchAddress != 0 &&
+        bootstrapCtWindowsWatch(seconds * 1000, bootstrapCtWatchAddress, handler)
     var action = 0
     if (bootstrapCtHostIsDarwin) {
         action = bootstrapCtZeroed(160)
@@ -1159,6 +1187,7 @@ trusted fun bootstrapCtArmAlarm(handler: int, seconds: int): bool {
 
 // ITIMER_REAL in `milliseconds` (0: stopped), the handler left as it is.
 trusted fun bootstrapCtSetTimerMilliseconds(milliseconds: int): bool {
+    if (linuxHostIsWindows()) return bootstrapCtWindowsWatch(milliseconds, bootstrapCtWindowsCheck, bootstrapCtWindowsTarget)
     val timer = bootstrapCtZeroed(32)
     ablaRuntimeStoreI64(timer + 16, milliseconds / 1000)
     ablaRuntimeStoreI64(timer + 24, (milliseconds - milliseconds / 1000 * 1000) * 1000)
@@ -1193,6 +1222,10 @@ fun bootstrapCtTimeResume(left: i64): i64 {
 }
 
 trusted fun bootstrapCtDisarmAlarm(): void {
+    if (linuxHostIsWindows()) {
+        val _stopped = bootstrapCtWindowsWatch(0, 0, 0)
+        return
+    }
     val timer = bootstrapCtZeroed(32)
     val _stopped = bootstrapCtSetTimer(timer)
     __ablaRuntimeFree(timer)

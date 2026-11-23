@@ -2680,6 +2680,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     bootstrapCtFreeAddress = bootstrapCtLookup("abla_ct_free_$generation")
     bootstrapCtGuardAddress = bootstrapCtLookup("abla_ct_guard_$generation")
     bootstrapCtAlarmAddress = bootstrapCtLookup("abla_ct_alarm_$generation")
+    bootstrapCtWatchAddress = bootstrapCtLookup("abla_ct_watch_$generation")
     bootstrapCtFaultAddress = bootstrapCtLookup("abla_ct_fault_$generation")
     if (bootstrapCtPanicCaught) {
         bootstrapCtPanicTextAddress = bootstrapCtLookup("abla_ct_panic_text_$generation")
@@ -3136,6 +3137,29 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
         } else LLVMBuildRetVoid(builder)
         handler = handler + 1
     }
+    // i64 abla_ct_watch_<g>(): the Windows watchdog's check (the runtime's call 4002, docs/design/windows-jit.md §5), which
+    // it calls on its own thread while the call's thread is suspended, in place of the alarm handler's tests: 0 no call is
+    // armed, 1 the call is in the compiler's code and the stop is deferred to its return (as the handler defers it), 2 the
+    // watchdog may send the thread to abla_ct_alarm_<g>, which jumps back with 3. It only reads and writes the slice's words.
+    val watch = LLVMAddFunction(module, "abla_ct_watch_$generation", LLVMFunctionType(i64Type, nativeNullPointer(), 0, 0))
+    val watchEntry = LLVMAppendBasicBlockInContext(context, watch, "entry")
+    val watchCheck = LLVMAppendBasicBlockInContext(context, watch, "check")
+    val watchIdle = LLVMAppendBasicBlockInContext(context, watch, "idle")
+    val watchDefer = LLVMAppendBasicBlockInContext(context, watch, "defer")
+    val watchJump = LLVMAppendBasicBlockInContext(context, watch, "jump")
+    LLVMPositionBuilderAtEnd(builder, watchEntry)
+    LLVMBuildCondBr(builder, LLVMBuildLoad2(builder, i1, armed, "armed"), watchCheck, watchIdle)
+    LLVMPositionBuilderAtEnd(builder, watchIdle)
+    LLVMBuildRet(builder, LLVMConstInt(i64Type, 0, 0))
+    LLVMPositionBuilderAtEnd(builder, watchCheck)
+    val watchCalls = LLVMBuildLoad2(builder, i64Type, inCompiler, "calls")
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, llvmIntNotEqual(), watchCalls, LLVMConstInt(i64Type, 0, 0), "busy"),
+        watchDefer, watchJump)
+    LLVMPositionBuilderAtEnd(builder, watchDefer)
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 3, 0), deferred)
+    LLVMBuildRet(builder, LLVMConstInt(i64Type, 1, 0))
+    LLVMPositionBuilderAtEnd(builder, watchJump)
+    LLVMBuildRet(builder, LLVMConstInt(i64Type, 2, 0))
     // i64 abla_ct_guard_<g>(ptr entry, ptr stopped): the entry's reply with
     // *stopped = 0, or 0 with *stopped = how the call stopped (the jump's value: 1
     // an abort, 2 a trap, 3 the time limit, 4 a bad access, 5 a runtime panic).
@@ -3557,6 +3581,7 @@ fun bootstrapCtFinishPass(another: bool = true): void {
     bootstrapCtFreeAddress = 0
     bootstrapCtGuardAddress = 0
     bootstrapCtAlarmAddress = 0
+    bootstrapCtWatchAddress = 0
     bootstrapCtFaultAddress = 0
     bootstrapCtFunctions = bootstrapCtNoFunctions()
     bootstrapCtPanicTextAddress = 0
