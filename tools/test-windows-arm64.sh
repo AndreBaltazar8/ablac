@@ -52,6 +52,11 @@ build_pe tls thread-local-image/main
 build_pe stm stm/basic
 build_pe stack-probe windows/arm64/stack-probe
 build_pe crash windows/crash/crash --backtrace
+# The compile-time guard's Windows half (fault-guard, watchdog, preempt: docs/design/windows-jit.md §4, §5), run with the
+# argument "arm64" so they write ARM64 code into executable memory.
+for name in fault-guard watchdog preempt; do
+    build_pe "$name" "windows/$name" --fast
+done
 grep -q 'Symbol: RtlVirtualUnwind' "$out/crash.pe" || fail 'backtrace omitted the Windows unwinder'
 [[ -s $out/crash.exe.debug ]] || fail 'backtrace omitted split debug info'
 llvm-readobj --unwind "$out/threads.exe.o" > "$out/threads.unwind"
@@ -67,4 +72,4 @@ native="$out/files.native"
     { cat "$out/files.native.log" >&2; fail 'could not build the Linux files fixture'; }
 (cd "$out" && "$native") > "$out/files.expected"
 (cd "$out" && sha256sum -- ./*.exe ./crash.exe.debug ./files.expected | sed 's|  \./|  |' > SHA256SUMS)
-echo 'windows-arm64: 10 ARM64 PE programs passed structural checks'
+echo 'windows-arm64: 13 ARM64 PE programs passed structural checks'

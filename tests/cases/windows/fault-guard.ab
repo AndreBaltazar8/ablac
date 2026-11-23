@@ -9,12 +9,14 @@
 import "abla/io"
 import "abla/text"
 import "abla/sys/linux"
+import "abla/sys/linux/process"
 import "abla/runtime/platform/windows"
 import "abla/unsafe/memory/raw"
 import "abla/unsafe/native/function-address"
 
 trusted noescape extern:"c" fun abla_setjmp(buffer: int): int
 trusted noescape extern:"c" fun abla_longjmp(buffer: int, value: int): void
+trusted noescape extern:"c" fun FlushInstructionCache(process: int, address: int, size: int): int
 
 trusted fun load(address: int): int = ablaUnsafeLoadI64(nativePointerFromAddress(address))
 trusted fun store(address: int, value: int): void = ablaUnsafeStoreI64(nativePointerFromAddress(address), value)
@@ -45,14 +47,18 @@ trusted fun main: int {
     val scratch = nativeStringAddress(scratchStorage)
     val request = scratch + 64
     val info = scratch
-    // mov rax, [16]; ret (48 8B 04 25 10 00 00 00 C3) in read-write-execute memory.
+    // In read-write-execute memory, a load from address 16 at code and a function that calls itself (until the stack runs
+    // out) at code + 16. x64: mov rax, [16]; ret (48 8B 04 25 10 00 00 00 C3) and call . (E8 FB FF FF FF). ARM64, which the
+    // runner names with the argument "arm64": mov x0, #16; ldr x0, [x0]; ret and stp x29, x30, [sp, #-16]!; bl back to it.
     val code = VirtualAlloc(0, 4096, 12288, 64)
-    val bytes = [72, 139, 4, 37, 16, 0, 0, 0, 195]
+    val arm64 = linuxArgument(0) == "arm64"
+    val bytes = if (arm64) [0, 2, 128, 210, 0, 0, 64, 249, 192, 3, 95, 214] else [72, 139, 4, 37, 16, 0, 0, 0, 195]
     var at = 0
     while (at < bytes.size) {
         ablaUnsafeStoreU8(nativePointerFromAddress(code + at), bytes[at])
         at += 1
     }
+    FlushInstructionCache(GetCurrentProcess(), code, 64)
     val armed = faults(request, nativeFunctionAddress(onFault), info)
     val how = abla_setjmp(jumpBuffer)
     if (how == 0) {
@@ -68,13 +74,13 @@ trusted fun main: int {
         return 1
     }
     println("own fault back with $again, address $addressSeen")
-    // call . (E8 FB FF FF FF) at code + 16: it calls itself until the stack runs out (STATUS_STACK_OVERFLOW).
-    val recursion = [232, 251, 255, 255, 255]
+    val recursion = if (arm64) [253, 123, 191, 169, 255, 255, 255, 151] else [232, 251, 255, 255, 255]
     at = 0
     while (at < recursion.size) {
         ablaUnsafeStoreU8(nativePointerFromAddress(code + 16 + at), recursion[at])
         at += 1
     }
+    FlushInstructionCache(GetCurrentProcess(), code, 64)
     signalSeen = 0
     faults(request, nativeFunctionAddress(onFault), info)
     val overflow = abla_setjmp(jumpBuffer)

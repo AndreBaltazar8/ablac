@@ -1,14 +1,15 @@
 // The compile-time watchdog's two ways to stop another thread (docs/design/windows-jit.md §5), from a second thread as the
 // watchdog does them:
-// - code that runs on and never makes a system call (a `jmp .` in executable memory from VirtualAlloc, as JIT'd code is): the
-//   watchdog suspends the thread, reads its CONTEXT, finds Rip inside that memory, changes the CONTEXT with
-//   abla_windows_redirect to resume in a jump back to where abla_setjmp armed it with 3 (a time limit, as the guard numbers it),
-//   and resumes it;
+// - code that runs on and never makes a system call (a branch to itself in executable memory from VirtualAlloc, as JIT'd
+//   code is): the watchdog suspends the thread, reads its CONTEXT, finds the program counter inside that memory, changes the
+//   CONTEXT with abla_windows_redirect to resume in a jump back to where abla_setjmp armed it with 3 (a time limit, as the
+//   guard numbers it), and resumes it;
 // - a read of a pipe nothing is written to: the watchdog sets the thread's interrupt word and calls CancelSynchronousIo, and the
 //   read returns EINTR (-4).
 import "abla/io"
 import "abla/text"
 import "abla/sys/linux"
+import "abla/sys/linux/process"
 import "abla/runtime/platform/windows"
 import "abla/unsafe/memory/raw"
 import "abla/unsafe/native/function-address"
@@ -25,6 +26,9 @@ trusted noescape extern:"c" fun GetThreadContext(target: int, context: int): int
 trusted noescape extern:"c" fun SetThreadContext(target: int, context: int): int
 trusted noescape extern:"c" fun CancelSynchronousIo(target: int): int
 trusted noescape extern:"c" fun Sleep(milliseconds: int): void
+trusted noescape extern:"c" fun abla_windows_context_prepare(context: int): void
+trusted noescape extern:"c" fun abla_windows_context_pc(context: int): int
+trusted noescape extern:"c" fun FlushInstructionCache(process: int, address: int, size: int): int
 trusted noescape extern:"c" fun CreateThread(attributes: int, stack: int, start: int, parameter: int, flags: int, id: int): int
 
 trusted fun load(address: int): int = ablaUnsafeLoadI64(nativePointerFromAddress(address))
@@ -34,22 +38,21 @@ trusted fun jumpBack(buffer: int, how: int): void {
     abla_longjmp(buffer, how)
 }
 
-// Stops `target` if its Rip is in [code, code + 4096): 1 when redirected, 0 when it was elsewhere, -1 when a call failed.
-// CONTEXT is 16-aligned; ContextFlags (0x30) CONTEXT_CONTROL | CONTEXT_INTEGER (0x100003); Rsp at 0x98, Rip at 0xF8.
+// Stops `target` if its program counter is in [code, code + 4096): 1 when redirected, 0 when it was elsewhere, -1 when a
+// call failed. CONTEXT is 16-aligned; the runtime's routines set its flags and read its program counter on either machine,
+// and abla_windows_redirect aligns its stack pointer as a call leaves it.
 trusted fun redirect(target: int, context: int, code: int, buffer: int): int {
     if (SuspendThread(target) < 0) return -1
-    ablaUnsafeStoreU32(nativePointerFromAddress(context + 48), 1048579)
+    abla_windows_context_prepare(context)
     if (GetThreadContext(target, context) == 0) {
         ResumeThread(target)
         return -1
     }
-    val rip = load(context + 248)
-    if (rip < code || rip >= code + 4096) {
+    val pc = abla_windows_context_pc(context)
+    if (pc < code || pc >= code + 4096) {
         ResumeThread(target)
         return 0
     }
-    // Below the interrupted frame, 16-aligned less the 8 a call pushes, as a call into jumpBack would leave it.
-    store(context + 152, ((load(context + 152) - 128) / 16) * 16 - 8)
     abla_windows_redirect(context, nativeFunctionAddress(jumpBack), buffer, 3)
     val set = SetThreadContext(target, context)
     ResumeThread(target)
@@ -104,10 +107,16 @@ trusted fun main: int {
         println("no thread handle")
         return 1
     }
-    // jmp . (EB FE) in read-write-execute memory (MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE).
+    // A branch to itself in read-write-execute memory (MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE): jmp . (EB FE) on
+    // x64; b . (0x14000000) on ARM64, which the runner names with the argument "arm64".
     val code = VirtualAlloc(0, 4096, 12288, 64)
-    ablaUnsafeStoreU8(nativePointerFromAddress(code), 235)
-    ablaUnsafeStoreU8(nativePointerFromAddress(code + 1), 254)
+    val spin = if (linuxArgument(0) == "arm64") [0, 0, 0, 20] else [235, 254]
+    var index = 0
+    while (index < spin.size) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(code + index), spin[index])
+        index += 1
+    }
+    FlushInstructionCache(GetCurrentProcess(), code, 16)
     store(at + 8, code)
     store(at + 16, buffer)
     store(at + 24, (nativeStringAddress(contextStorage) + 15) / 16 * 16)
