@@ -51,7 +51,7 @@ examples. The [compact guide](guide.md) is a single-page refresher.
 
 [status.md](status.md), [bootstrap.md](bootstrap.md),
 [self-hosting.md](self-hosting.md), [full-self-hosting.md](full-self-hosting.md),
-[reliability-roadmap.md](reliability-roadmap.md),
+[reliability-roadmap.md](reliability-roadmap.md), [ci-security.md](ci-security.md), [reproducibility.md](reproducibility.md),
 [compile-effect-path-performance.md](compile-effect-path-performance.md) and
 [original-audit.md](original-audit.md) record the state and the plans of the
 compiler itself. [coverage.md](coverage.md) tracks which features are
