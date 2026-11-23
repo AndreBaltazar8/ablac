@@ -96,6 +96,11 @@ class H2Server(
     var resetsInWindow: int = 0,
     var pendingAcks: int = 0,
     var settingsAckDeadline: int = -2,
+    // A response with bytes to send that the peer's flow-control windows hold back for this many ms (counted by tick; 0: never) ends the connection.
+    var responseTimeout: int = 0,
+    var stalledSince: int = 0,
+    var sentBytes: int = 0,
+    var sentAtStall: int = 0,
     var roundRobin: int = 0,
     var goawaySent: bool = false,
     var now: int = 0,
@@ -371,11 +376,22 @@ fun H2Server.shutdown(): void {
 /** The connection is over (nothing more to answer): true once a graceful shutdown has no stream left. */
 fun H2Server.finished(): bool = this.closed || (this.draining && this.streams.size == 0)
 
-/** Timeouts: our SETTINGS unacknowledged for 10 s. */
+/** Timeouts: our SETTINGS unacknowledged for 10 s; and, when `responseTimeout` is set, a response held back by the peer's windows for that long. */
 fun H2Server.tick(now: int): void {
     if (this.closed) return
     if (this.settingsAckDeadline == -2) this.settingsAckDeadline = now + 10000
     if (this.settingsAckDeadline >= 0 && now >= this.settingsAckDeadline) this.fail(H2_SETTINGS_TIMEOUT, "the client did not acknowledge our settings")
+    if (this.responseTimeout > 0 && !this.closed) {
+        var held = false
+        for (stream in this.streams) {
+            if (stream.responding && stream.responseBody.size - stream.responsePosition > 0 && (stream.sendWindow <= 0 || this.connectionSend <= 0)) held = true
+        }
+        if (!held) this.stalledSince = 0
+        else if (this.stalledSince == 0 || this.sentBytes != this.sentAtStall) {
+            this.stalledSince = now
+            this.sentAtStall = this.sentBytes
+        } else if (now - this.stalledSince >= this.responseTimeout) this.fail(H2_ENHANCE_YOUR_CALM, "the client did not open its flow-control window")
+    }
     return
 }
 
@@ -481,6 +497,7 @@ private fun H2Server.pump(): void {
             val last = this.streams[i].bodyFinished && from + take >= this.streams[i].responseBody.size && this.streams[i].responseTrailers.size == 0
             this.queue(h2Frame(0, if (last) 1 else 0, id, this.streams[i].responseBody.slice(from, from + take)))
             this.streams[i].responsePosition = from + take
+            this.sentBytes = this.sentBytes + take
             this.streams[i].sendWindow = this.streams[i].sendWindow - take
             this.connectionSend = this.connectionSend - take
             progress = true

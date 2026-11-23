@@ -760,7 +760,7 @@ peer that trickles bytes (slowloris, a slow POST, a client that reads a large re
 `responseTimeoutMilliseconds` (default 0, off) one that has not taken a queued response that long after it was queued. A connection is closed without an answer.
 The last two are off because a large upload or download on a slow link is legitimate; set them for the traffic you serve. Neither server limits connections
 per client address: on an open network run it behind a proxy that does, and that enforces a minimum data rate. `HttpsEventServer` takes the same options
-in its `base` options, for its HTTP/1.1 connections (HTTP/2 connections have their own idle and ping rules).
+in its `base` options. For its HTTP/2 connections only `responseTimeoutMilliseconds` applies: a connection whose response the client's flow-control windows hold back for that long (no response byte going out) is closed with GOAWAY (`ENHANCE_YOUR_CALM`); HTTP/2 connections otherwise have their own idle and ping rules.
 
 The steady-state HTTP path keeps only readable interest registered. A response
 that fills the kernel send buffer enables writable interest exactly once, then

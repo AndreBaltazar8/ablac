@@ -1,0 +1,64 @@
+// The HTTP/2 server ends a connection whose response the peer's flow-control windows hold back for `responseTimeout` ms (#1139 area 4). A client that
+// opens a stream and gives it no window (SETTINGS_INITIAL_WINDOW_SIZE 0) and then only pings kept the stream, and up to 768 KiB of queued output,
+// for as long as it liked. The clock restarts when any response byte goes out and stops when nothing is held back; 0 (the default) never ends it.
+// Prints "http2 response timeout ok".
+import "abla/io"
+import "abla/text"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+import "abla/http/h2/server"
+
+val GET_BLOCK: array<HpackField> = [HpackField(":method", "GET"), HpackField(":scheme", "https"), HpackField(":path", "/"), HpackField(":authority", "a")]
+
+// A connection with a stream whose response (1000 bytes) is held back by a zero window; `timeout` is the server's responseTimeout.
+fun stalled(timeout: int): H2Server {
+    var server = h2ServerNew()
+    server.responseTimeout = timeout
+    var encoder = hpackEncoderNew(4096)
+    // SETTINGS_INITIAL_WINDOW_SIZE (4) = 0, the acknowledgement of ours, then a GET on stream 1.
+    server.feed(H2_PREFACE + h2Frame(4, 0, 0, h2Setting(4, 0)) + h2Frame(4, 1, 0, "") + h2Frame(1, 5, 1, encoder.encode(GET_BLOCK)), 1000)
+    for (request in server.takeRequests()) server.respond(request.stream, 200, [], "x".repeat(1000))
+    server.takeOutput()
+    server.tick(1000)
+    server
+}
+
+fun main: int {
+    // Held back and never opened: closed once the timeout has passed, not before.
+    var a = stalled(1000)
+    a.tick(1900)
+    if (a.isClosed()) {
+        println("FAIL closed before the timeout")
+        return 1
+    }
+    a.tick(2100)
+    if (!a.isClosed()) {
+        println("FAIL a response held back by a zero window for longer than the timeout did not end the connection")
+        return 1
+    }
+    // Progress restarts the clock: a WINDOW_UPDATE of 10 bytes at 1800 lets 10 bytes out; the 1000 ms count from the next tick that sees it held again.
+    var b = stalled(1000)
+    b.tick(1700)
+    b.feed(h2Frame(8, 0, 1, h2Be32(10)), 1800)
+    b.takeOutput()
+    b.tick(1800)
+    b.tick(2700)
+    if (b.isClosed()) {
+        println("FAIL the clock was not restarted by a response byte going out")
+        return 1
+    }
+    b.tick(2900)
+    if (!b.isClosed()) {
+        println("FAIL a stall that began after progress did not end the connection")
+        return 1
+    }
+    // Off by default.
+    var c = stalled(0)
+    c.tick(5000000)
+    if (c.isClosed()) {
+        println("FAIL a server without a response timeout closed a stalled connection")
+        return 1
+    }
+    println("http2 response timeout ok")
+    0
+}

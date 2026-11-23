@@ -512,6 +512,7 @@ test-serial: ablac
 	tools/test-tls-diff.sh $(COMPILER)
 	tools/test-http2.sh $(COMPILER)
 	tools/test-http2-server.sh $(COMPILER)
+	tools/test-http2-response-timeout.sh $(COMPILER)
 	tools/test-http2-h2o.sh $(COMPILER)
 	tools/test-http2-fuzz.sh $(COMPILER)
 	tools/test-http2-stream.sh $(COMPILER)
