@@ -17,6 +17,7 @@ import "eval_checks.ab"
 import "module_paths.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/fs"
+import "abla/fs/path"
 import "abla/sys/linux/process"
 import "abla/sys/linux/net"
 import "abla/text"
@@ -215,6 +216,46 @@ fun bootstrapBuildCallPathText(path: string): bool {
     true
 }
 
+/** The absolute, normalized `path` with every symbolic link in it followed, from its root down (a link's target read
+ *  against the directory that holds it, ".." after a link taken from where the link led), as the system resolves it; the
+ *  names past the last existing one as they are. At most 40 links (the system's own limit): past it, the path is "" (outside
+ *  any project). */
+fun bootstrapBuildCallRealPath(path: string): string {
+    val windows = pathHostIsWindows()
+    val rootLength = pathRootLength(path, windows)
+    var resolved = path.slice(0, rootLength)
+    var pending: array<string> = []
+    for (name in Path(path).components()) pending.append(name)
+    var links = 0
+    while (pending.size > 0) {
+        val name = pending[0]
+        val rest: array<string> = []
+        var index = 1
+        while (index < pending.size) {
+            rest.append(pending[index])
+            index = index + 1
+        }
+        pending = rest
+        if (name == "" || name == ".") continue
+        if (name == "..") {
+            resolved = Path(resolved).parent().text
+            continue
+        }
+        val candidate = Path(resolved).child(name).text
+        if (Path(candidate).isSymbolicLink()) {
+            links = links + 1
+            if (links > 40) return ""
+            val target = Path(candidate).linkTarget()
+            val followed: array<string> = []
+            if (Path(target).isAbsolute()) resolved = target.slice(0, pathRootLength(target, windows))
+            for (part in Path(target).components()) followed.append(part)
+            for (part in pending) followed.append(part)
+            pending = followed
+        } else resolved = candidate
+    }
+    resolved
+}
+
 /** `path` absolute and normalized ("." and ".." folded). */
 fun bootstrapBuildCallAbsolute(path: string): string =
     bootstrapNormalizeModulePath(if (Path(path).isAbsolute()) path else "${currentDirectory().text}/$path")
@@ -260,8 +301,11 @@ fun bootstrapBuildCallRoot(directory: string): string {
  *  working directory when it is inside it, else absolute), or "" after E_BUILD_PATH_OUTSIDE. */
 fun bootstrapContainBuildCallPath(var evaluator: BootstrapEvaluator, directory: string, path: string,
     subject: string = "the build call's"): string {
-    val resolved = bootstrapBuildCallAbsolute(bootstrapBuildCallPath(directory, path))
-    val root = bootstrapBuildCallRoot(directory)
+    // The path the system would reach (its symbolic links followed, the last one too), held inside the project's own real
+    // path: a link inside the project that points out of it is outside (a lexical check let a write follow one). What is
+    // used is that real path, so no link is followed again between the check and the use.
+    val resolved = bootstrapBuildCallRealPath(bootstrapBuildCallAbsolute(bootstrapBuildCallPath(directory, path)))
+    val root = bootstrapBuildCallRealPath(bootstrapBuildCallRoot(directory))
     if (resolved != root && !resolved.startsWith("$root/")) {
         bootstrapStageDriverDiagnostic(
             "error[E_BUILD_PATH_OUTSIDE]: $subject path \"$path\" is $resolved, outside its source file's project $root (compile-time code reads and writes only inside its own project)\n"

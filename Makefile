@@ -162,6 +162,7 @@ test-serial: ablac
 	tools/test-analysis-check.sh $(COMPILER)
 	tools/test-deep-logical.sh $(COMPILER)
 	tools/test-compile-effect-path.sh $(COMPILER)
+	tools/test-compile-path-symlinks.sh $(COMPILER)
 	tools/test-value-abi.sh $(COMPILER)
 	tools/test-unsafe-mmio.sh $(COMPILER)
 	tools/test-unsafe-stack-memory.sh $(COMPILER)
