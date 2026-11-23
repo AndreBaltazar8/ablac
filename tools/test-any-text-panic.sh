@@ -13,4 +13,17 @@ grep -qx 'panic: unsupported value (runtime tag 8)' "$out/native.err"
 "$compiler" build tests/cases/any-text-panic/build.ab -o "$out/build" --fast
 "$out/build"
 node tests/cases/any-text-panic/run.mjs "$out/main.wasm"
-echo 'native unsupported any interpolation reports a readable panic'
+# At compile time the same interpolation is an error with the same text, in the evaluator and in the native tier.
+for tier in interp jit; do
+    if ABLA_COMPILE_EVAL=$tier "$compiler" build tests/cases/any-text-panic/compile-time.ab -o "$out/compile-time-$tier" --fast --no-cache \
+        >"$out/compile-time-$tier.out" 2>&1; then
+        echo "any text panic: the $tier tier built a program whose \`#\` site interpolates an object" >&2
+        exit 1
+    fi
+    grep -q 'unsupported value (runtime tag 8)' "$out/compile-time-$tier.out" || {
+        echo "any text panic: the $tier tier's error lacks the panic text:" >&2
+        head -5 "$out/compile-time-$tier.out" >&2
+        exit 1
+    }
+done
+echo 'unsupported any interpolation reports a readable panic, natively and at compile time'
