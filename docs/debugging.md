@@ -108,12 +108,12 @@ as Abla wrote them (tools/test-debug-variables.sh):
 | an instance of a class | its fields: `{class = …, extension = 0, x = 2, y = 3}` (the first two are its header) |
 | a nullable instance | a pointer to it: `print *maybe` |
 | `array<int>`, `array<float>` | a pointer to `{length, capacity, data}`: `print *items.data@items.length` (gdb), `parray 3 items->data` (lldb) |
-| any other value | the universal value: `{tag, flags, word0, word1}` |
+| any other value (a nullable string, a `Map`, ...) | the universal value `{tag, flags, word0, word1}` (`tag` 1 is null), its type named as Abla writes it (`string?`, `Map`) |
 
 ```text
-(gdb) break probe.ab:14
+(gdb) break probe.ab:18
 (gdb) run
-Breakpoint 1, probe.describe (p=..., label=...) at probe.ab:14
+Breakpoint 1, probe.describe (p=..., label=...) at probe.ab:18
 (gdb) info args
 p = {class = 4611826755781206992, extension = 0, x = 2, y = 3}
 label = {data = 0x7ffff7fb2744 "pt", length = 2}
@@ -121,9 +121,18 @@ label = {data = 0x7ffff7fb2744 "pt", length = 2}
 items = 0x7ffff7ea8080
 maybe = 0x7ffff7ea8030
 text = {data = 0x7ffff7ea80e0 "pt=5", length = 4}
+note = {tag = 1, flags = 0, word0 = 0, word1 = 0}
+table = {tag = 7, flags = 0, word0 = 140737352593664, word1 = 0}
 total = 5
 ratio = 3.75
 ```
+
+The universal value's four words read as numbers (`tag` 1 is a null; its type carries the Abla name, `string?` or
+`Map`). What reads how, without the VS Code extension: gdb shows every row above as it is (a string as
+`{data = 0x… "pt=5", length = 4}`); lldb shows a string as `(data = "pt=5", length = 4)`, and arrays as a pointer
+(`parray 3 items->data`). The extension's Abla adapter (abla-lsp, `src/dap-proxy.ts`, over lldb-dap) shows a string
+as its text, an array as `length N` that expands to its elements, and a null `string?` as `null`; a `Map` stays a
+universal value there (its entries are not readable from the debug information).
 
 A field that refers to another instance is an untyped pointer (the layout does
 not say which class). `--fast` still optimizes a little (O1), so a local can
