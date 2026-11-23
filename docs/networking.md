@@ -149,6 +149,7 @@ fun main {
 | `router.dispatch(request)` | the response for one request (404 when no route matches) |
 | `request.header(name)`, `routeParameter(name)`, `queryParameter(name)`, `parameter(name)` | request accessors (`""` when absent; header names are case-insensitive; `queryParameter` returns the raw, still percent-encoded text) |
 | `request.queryParameterDecoded(name)` | the query value with `%XX` and `+` undone (`percentDecode` in query mode), or `null` when absent, empty or malformed |
+| `request.path`, route parameters | the raw path and the raw text of each `:name` segment: not percent-decoded (`%2e%2e` and `%2f` stay as written), and `..`, `.` and empty segments (`//`) are not removed or collapsed, so `/a/../b` matches `/a/:x/b` with `x` = `..`. Decode with `percentDecode` and check the result (no `/`, `..` or NUL) before using a parameter as a file name or a key |
 | `httpText(body, status = 200)`, `httpJson(body, status = 200)` | responses with a content type |
 | `httpGet(path)`, `httpPost(path, body)`, `httpRequest(method, path, body, headers)` | build a request |
 | `httpParseRequest(text)`, `httpParseResponse(text)`, `response.render()` | parse and render the wire format |
