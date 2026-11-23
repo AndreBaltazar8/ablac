@@ -273,53 +273,43 @@ fun bootstrapIsOperatorName(name: string): bool {
     false
 }
 
-// Resolutions indexed by node: "<source>:<begin>:<end>:<kind>" → resolution.
+// Hash the span without building a string for each visited node. A generated
+// call can share its argument's span, so compare its kind and spelling too.
 class BootstrapOverloadIndex(
-    val keys: array<string>,
+    val resolutions: array<BootstrapOverloadResolution>,
     val slots: array<int>
 ) {
-    fun find(key: string): int {
-        var slot = bootstrapFunctionDeclarationHash(key)
-        slot = slot - slot / this.slots.size * this.slots.size
-        var probes = 0
-        while (probes < this.slots.size && this.slots[slot] >= 0) {
-            if (this.keys[this.slots[slot]] == key) return this.slots[slot]
-            slot = slot + 1
-            if (slot == this.slots.size) slot = 0
-            probes = probes + 1
+    fun slotFor(source: string, begin: int, end: int, kind: string, text: string): int {
+        val mask = this.slots.size - 1
+        var slot = (begin * 31 + end) & mask
+        while (this.slots[slot] >= 0) {
+            val candidate = this.resolutions[this.slots[slot]]
+            if (candidate.begin == begin && candidate.end == end &&
+                candidate.sourceIdentity == source && candidate.originalKind == kind &&
+                candidate.originalText == text) return slot
+            slot = (slot + 1) & mask
         }
-        -1
+        slot
     }
+
+    fun find(source: string, expression: BootstrapExpression): int =
+        this.slots[this.slotFor(source, expression.begin, expression.end, expression.kind, expression.text)]
 }
 
-// A node's kind and spelling with its span: a subparser's generated call may
-// share its argument's span (`ablaJsonValue(count())`), never its spelling.
-fun bootstrapOverloadNodeKey(source: string, begin: int, end: int, kind: string,
-    text: string): string =
-    "$source:$begin:$end:$kind:$text"
-
 fun bootstrapOverloadIndex(resolutions: array<BootstrapOverloadResolution>): BootstrapOverloadIndex {
-    val keys: array<string> = []
-    for (resolution in resolutions) keys.append(bootstrapOverloadNodeKey(
-        resolution.sourceIdentity, resolution.begin, resolution.end, resolution.originalKind,
-        resolution.originalText
-    ))
     var capacity = 8
-    while (capacity < keys.size * 2 + 1) capacity = capacity * 2
+    while (capacity < resolutions.size * 2 + 1) capacity = capacity * 2
     val slots: array<int> = []
     for (slot in 0 until capacity) slots.append(-1)
+    val index = BootstrapOverloadIndex(resolutions, slots)
     var entry = 0
-    while (entry < keys.size) {
-        var slot = bootstrapFunctionDeclarationHash(keys[entry])
-        slot = slot - slot / capacity * capacity
-        while (slots[slot] >= 0 && keys[slots[slot]] != keys[entry]) {
-            slot = slot + 1
-            if (slot == capacity) slot = 0
-        }
-        slots[slot] = entry
+    while (entry < resolutions.size) {
+        val resolution = resolutions[entry]
+        slots[index.slotFor(resolution.sourceIdentity, resolution.begin, resolution.end,
+            resolution.originalKind, resolution.originalText)] = entry
         entry = entry + 1
     }
-    BootstrapOverloadIndex(keys, slots)
+    index
 }
 
 /** `expression` with every resolved node rewritten into its call. */
@@ -332,9 +322,7 @@ fun bootstrapOverloadRewrite(
     val children: array<BootstrapExpression> = []
     for (child in expression.children) children.append(bootstrapOverloadRewrite(child, source,
         resolutions, index))
-    val found = index.find(bootstrapOverloadNodeKey(
-        source, expression.begin, expression.end, expression.kind, expression.text
-    ))
+    val found = index.find(source, expression)
     if (found >= 0) {
         val resolution = resolutions[found]
         // A float literal passed for an f32 parameter is one.
