@@ -26,7 +26,7 @@ for mode in interp jit auto; do
         tests/cases/compile-eval-cross-target/build-implicit.ab -o "$out/implicit-builder-$mode" --fast --no-cache \
         > "$out/implicit-$mode.log" 2>&1
     "$out/implicit-builder-$mode"
-    ABLA_COMPILE_EVAL=$mode ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build \
+    ABLA_COMPILE_EVAL=$mode ABLA_COMPILE_EVAL_TRACE=1 ABLA_COMPILE_EVAL_TRIAL_STEPS=0 "$compiler" build \
         tests/cases/compile-eval-cross-target/build-implicit-portable.ab \
         -o "$out/implicit-portable-builder-$mode" --fast --no-cache > "$out/implicit-portable-$mode.log" 2>&1
     "$out/implicit-portable-builder-$mode"
@@ -86,6 +86,13 @@ for mode in jit auto; do
     cmp "$out/implicit-portable-interp.wasm" "$out/implicit-portable-$mode.wasm"
     cmp "$out/collision-interp.wasm" "$out/collision-$mode.wasm"
     cmp "$out/floats-interp.wasm" "$out/floats-$mode.wasm"
+    grep -q 'interpreted at .*cross-target implicit runtime dependency: eager global .*FOREIGN' "$out/implicit-$mode.log"
+    marker=$(( $(grep -boa 'val RESULT = #' tests/cases/compile-eval-cross-target/implicit-portable.ab | cut -d: -f1) + 13 ))
+    if ! grep -Eq "native at .*/implicit-portable[.]ab:$marker$" "$out/implicit-portable-$mode.log"; then
+        cat "$out/implicit-portable-$mode.log" >&2
+        echo "cross-target: portable extension default did not run natively" >&2
+        exit 1
+    fi
     if [[ $mode == auto ]]; then
         for log in "" floats- collision- implicit- implicit-portable-; do
             ct_auto_follows_jit "$out/${log}auto.log" "$out/${log}jit.log" ||
@@ -96,13 +103,6 @@ for mode in jit auto; do
     [[ $(grep -c 'interpreted at' "$out/floats-$mode.log") -eq 7 ]]
     ! grep -q 'native at .*[/]floats.ab:' "$out/floats-$mode.log"
     grep -q 'interpreted at .*cross-target host runtime declaration collision: write' "$out/collision-$mode.log"
-    grep -q 'interpreted at .*cross-target implicit runtime dependency' "$out/implicit-$mode.log"
-    marker=$(( $(grep -boa 'val RESULT = #' tests/cases/compile-eval-cross-target/implicit-portable.ab | cut -d: -f1) + 13 ))
-    if ! grep -Eq "native at .*/implicit-portable[.]ab:$marker$" "$out/implicit-portable-$mode.log"; then
-        cat "$out/implicit-portable-$mode.log" >&2
-        echo "cross-target: portable extension default did not run natively" >&2
-        exit 1
-    fi
     # The probe, indirect call, builtin-looking user method, selected native
     # arm and raw pointer operation fall back. The skipped native arm, file
     # read and SHA remain native.

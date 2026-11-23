@@ -327,7 +327,8 @@ fun bootstrapCtCrossDeclarationReason(declaration: BootstrapDeclaration,
     } else if (declaration.kind != "fun" && declaration.kind != "compile.fun" &&
         declaration.kind != "val" && declaration.kind != "var" &&
         declaration.kind != "compile.val" && declaration.kind != "compile.var" &&
-        declaration.kind != "class" && declaration.kind != "interface") reason =
+        declaration.kind != "class" && declaration.kind != "interface" &&
+        !bootstrapIsExtensionFieldKind(declaration.kind)) reason =
         "declaration kind ${declaration.kind} is not proven portable"
     if (reason == "" && library && module != "abla/bytes/entry.ab" &&
         module != "abla/crypto/entry.ab" && module != "abla/text/entry.ab" && module != "abla/json/entry.ab" &&
@@ -553,13 +554,14 @@ class BootstrapCtReach(
         expression: BootstrapExpression,
         var globals: array<int>,
         crossTarget: bool = false,
-        source: string = ""
-    ): string = this.walk(expression, globals, false, false, crossTarget, source)
+        source: string = "",
+        implicitRoot: bool = false
+    ): string = this.walk(expression, globals, false, false, crossTarget, source, implicitRoot)
 
     // What the runtime's own declarations reach is part of every slice.
-    fun keepFrom(expression: BootstrapExpression, source: string = ""): void {
+    fun keepFrom(expression: BootstrapExpression, source: string = "", fromLibrary: bool = true): void {
         val unused: array<int> = []
-        val _ignored = this.walk(expression, unused, true, true, false, source)
+        val _ignored = this.walk(expression, unused, true, fromLibrary, false, source)
         return
     }
 
@@ -572,7 +574,8 @@ class BootstrapCtReach(
         keepOnly: bool,
         fromLibrary: bool,
         crossTarget: bool = false,
-        source: string = ""
+        source: string = "",
+        implicitRoot: bool = false
     ): string {
         val pending: array<BootstrapExpression> = [expression]
         val pendingLibrary: array<bool> = [fromLibrary]
@@ -590,6 +593,11 @@ class BootstrapCtReach(
             pendingReplays.truncate(pendingReplays.size - 1)
             if (crossTarget && !bootstrapCtCrossNodeAllowed(node)) {
                 return "cross-target site reaches expression ${node.kind} `${node.text}`: not proven portable"
+            }
+            if (implicitRoot && (node.kind == "compile" || node.kind == "assign" ||
+                node.kind == "member.assign" || node.kind == "index.assign" ||
+                (node.kind == "member.call" && bootstrapCtStateMutator(node.text)))) {
+                return "expression ${node.kind} is not proven to be safe in an implicit default"
             }
             if (crossTarget && node.kind == "type" && bootstrapTextContains(node.text, "*")) {
                 return "cross-target site reaches type ${node.text}: pointer layout is not portable"
@@ -681,6 +689,13 @@ class BootstrapCtReach(
                         val declaration = if (this.itemMethods[item] < 0) owner
                             else owner.methods[this.itemMethods[item]]
                         if (crossTarget) {
+                            if (implicitRoot && valueItem && !bootstrapCtImplicitScalarGlobal(owner)) {
+                                return "eager global ${owner.name} is not a closed scalar constant"
+                            }
+                            if (implicitRoot && (bootstrapCompileHostProvider(declaration) ||
+                                bootstrapCtCrossEnvironment(declaration))) {
+                                return "effect of ${declaration.name} is not proven safe in an implicit default"
+                            }
                             if (replaying && bootstrapCtCrossEnvironment(declaration) &&
                                 (this.replaySafe.get(nextReplay) ?? false) != true) {
                                 return "cross-target site replays global $nextReplay initializer reaching compilerEnvironment: shared-global replay is not proven equivalent"
@@ -981,13 +996,76 @@ fun bootstrapCtBridgeHelpers(
     result
 }
 
-fun bootstrapCtRuntimeDeclaration(declaration: BootstrapDeclaration): bool =
-    bootstrapTextContains(declaration.sourceIdentity, "/abla/runtime/") ||
+fun bootstrapCtExtensionFieldRoot(declaration: BootstrapDeclaration): bool =
     // An extension field and its default function: reads and writes lower
     // through both, though no call in the source names the function.
     bootstrapIsExtensionFieldKind(declaration.kind) ||
     (declaration.kind == "fun" && declaration.extensionOwner != "" &&
      declaration.name.startsWith(bootstrapExtensionFieldDefaultName("")))
+
+fun bootstrapCtRuntimeDeclaration(declaration: BootstrapDeclaration): bool =
+    bootstrapTextContains(declaration.sourceIdentity, "/abla/runtime/") ||
+    bootstrapCtExtensionFieldRoot(declaration)
+
+// These initializers can run eagerly in the slice without reading state,
+// running a staged site, or performing an operation that can fail.
+fun bootstrapCtImplicitInteger(node: BootstrapExpression): bool {
+    if (node.kind == "integer") return bootstrapCtLiteralNumberType(node) == "int"
+    if (node.children.size == 1 && (node.kind == "unary-" || node.kind == "unary+"))
+        return bootstrapCtImplicitInteger(node.children[0])
+    node.children.size == 2 && (node.kind == "+" || node.kind == "-" || node.kind == "*") &&
+        bootstrapCtImplicitInteger(node.children[0]) && bootstrapCtImplicitInteger(node.children[1])
+}
+
+fun bootstrapCtImplicitScalarGlobal(declaration: BootstrapDeclaration): bool {
+    if (declaration.kind != "val") return false
+    val node = declaration.expression
+    val type = bootstrapNormalizeType(declaration.resultType)
+    val inferred = type == "" || type == "inferred"
+    if (node.kind == "string") return inferred || type == "string"
+    if (node.kind == "true" || node.kind == "false") return inferred || type == "bool"
+    (inferred || type == "i64") && bootstrapCtImplicitInteger(node)
+}
+
+// The field declarations and synthetic defaults are retained even when no
+// site names them. Prove the executed paths, and separately keep the whole
+// source closure: a global named only in a skipped arm can still initialize
+// when the native module starts.
+fun bootstrapCtCrossImplicitRoots(roots: array<BootstrapDeclaration>,
+    var reach: BootstrapCtReach, var portable: BootstrapCtReach): string {
+    if (roots.size == 0) return ""
+    val alreadyKept: array<bool> = []
+    for (kept in reach.kept) alreadyKept.append(kept)
+    for (root in roots) {
+        if (!bootstrapCtExtensionFieldRoot(root))
+            return "cross-target implicit runtime dependency ${root.name}: not proven portable"
+        val name = "${root.extensionOwner}.${root.name}"
+        val declarationReason = bootstrapCtCrossDeclarationReason(root, root)
+        if (declarationReason != "") return "cross-target implicit runtime dependency $name: $declarationReason"
+        val owner = bootstrapNormalizeType(root.extensionOwner)
+        val angle = owner.indexOf("<")
+        val ownerType = BootstrapExpression("type", if (angle > 0) owner.slice(0, angle) else owner, 0, 0, [])
+        val unused: array<int> = []
+        portable.reset()
+        var reason = portable.unsupported(root.expression, unused, true, root.sourceIdentity, true)
+        if (reason == "") reason = portable.unsupported(ownerType, unused, true, root.sourceIdentity, true)
+        if (reason != "") return "cross-target implicit runtime dependency $name: $reason"
+        val library = bootstrapCtLibraryDeclaration(root)
+        reach.keepFrom(root.expression, root.sourceIdentity, library)
+        reach.keepFrom(ownerType, root.sourceIdentity, library)
+    }
+    var index = 0
+    while (index < reach.declarations.size) {
+        val declaration = reach.declarations[index]
+        if (reach.kept[index] && !alreadyKept[index] &&
+            bootstrapDeclarationIsValue(declaration.kind) &&
+            !bootstrapCtImplicitScalarGlobal(declaration)) {
+            return "cross-target implicit runtime dependency: eager global ${declaration.name} is not a closed scalar constant"
+        }
+        index += 1
+    }
+    ""
+}
 
 fun bootstrapCtReach(declarations: array<BootstrapDeclaration>,
     methodTargets: BootstrapResolvedMethodTargets =
@@ -1963,18 +2041,6 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     var implicitReason = if (crossTarget && !targetTriple.startsWith("wasm32-"))
         "cross-target triple $targetTriple is not in the portable JIT target allow-list" else ""
     val runtimeRoot = "${bootstrapCompileProviderStandardLibrary()}/abla/runtime/"
-    if (crossTarget) {
-        for (declaration in parsed.declarations) {
-            if (implicitReason == "" && bootstrapCtRuntimeDeclaration(declaration) &&
-                !declaration.sourceIdentity.startsWith(runtimeRoot)) {
-                // Extension defaults join every slice, even if the site does not
-                // name them. Until these implicit roots have their own proof, no
-                // cross-target site may activate their initializers or bodies.
-                implicitReason =
-                    "cross-target implicit runtime dependency ${declaration.name}: not proven portable"
-            }
-        }
-    }
     // Which ordinary globals compile-time code can write (ct_state.ab): a site reaching one
     // runs in the interpreter, whose copy of it is the only one a change reaches.
     val libraryFlags: array<bool> = []
@@ -2049,10 +2115,15 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         }
     }
     val nativeScanner = "${runtimeRoot}self/simd-scan-x86.ab"
+    val implicitRoots: array<BootstrapDeclaration> = []
     var replaceScanner = false
     for (declaration in parsed.declarations) {
         if (declaration.sourceIdentity == nativeScanner) replaceScanner = true
         else if (bootstrapCtRuntimeDeclaration(declaration)) {
+            if (crossTarget && !declaration.sourceIdentity.startsWith(runtimeRoot)) {
+                implicitRoots.append(declaration)
+                continue
+            }
             reach.keepFrom(declaration.expression, declaration.sourceIdentity)
             // An extension field is kept in every slice, so its owner type is too: without it the
             // slice is refused (field.extension-owner), as jwt's was by CryptoPassword's fields (#828).
@@ -2098,7 +2169,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         }
     }
     if (crossTarget && implicitReason == "") {
-        val runtimeRoot = "${bootstrapCompileProviderStandardLibrary()}/abla/runtime/"
+        implicitReason = bootstrapCtCrossImplicitRoots(implicitRoots, reach, portable)
         var value = 0
         while (implicitReason == "" && value < parsed.declarations.size) {
             val declaration = parsed.declarations[value]

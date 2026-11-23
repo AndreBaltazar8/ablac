@@ -1275,8 +1275,11 @@ The trace names that global. Other compiler and parser queries
 remain interpreted for cross-target sites. It rejects unknown constructs and dependencies, raw pointers
 and memory operations, native externs, target/CPU probes, SIMD, assembly, resources
 `when is` interface dispatch, floating-point computation, and unrecognised modules or annotations. Extension-field defaults are implicit
-roots of every native slice, so a module containing them also keeps cross-target
-sites interpreted until those roots have a portability proof. Such sites keep the evaluator's behavior;
+roots of every native slice. The portability check walks their executed code and
+checks that globals brought in by their full bodies have closed scalar initializers.
+Even a global mentioned in a skipped arm may initialize when the host slice starts.
+Defaults that reach mutable state, compile-time effects, or another unsupported
+operation keep the evaluator's behavior.
 `ABLA_COMPILE_EVAL_TRACE=1` names the first dependency the proof refuses. The
 `ablaAtCompileTime()` branches used by byte buffers are true on both tiers, so
 unexecuted native staging paths do not make their portable SHA operations target
