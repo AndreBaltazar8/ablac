@@ -1,0 +1,548 @@
+// The encrypted-flight side of the TLS handshake differential (#1139 area 3, TLS round 3): a hostile TLS 1.3 server that does a real handshake. It listens on
+// 127.0.0.1:PORT and serves COUNT connections one after the other; for connection i it reads the client's ClientHello, answers with a valid ServerHello, derives the
+// handshake keys (X25519, AES-128-GCM) and sends the server's flight (EncryptedExtensions, Certificate, CertificateVerify, Finished, with the real certificate and a
+// real signature) changed structurally by a generator seeded by (SEED, i): the flight's messages (extensions added, duplicated, deleted, ones a message may not carry,
+// a non-empty certificate request context, certificate entry extensions, an empty chain, a duplicate or empty certificate, a signature scheme that was not offered or does
+// not fit the key, a truncated, extended or flipped signature or Finished), their order (omitted, duplicated, swapped, other message types inserted), the handshake and
+// list lengths, the way they are cut into records (one record, one per message, split anywhere, one byte at a time, padded, an empty handshake record), records that may
+// not be there (a plaintext alert, change_cipher_spec, handshake, application data, an encrypted CCS or alert or an unknown inner type before the Finished), and, after the
+// client's Finished, post-handshake messages under the application keys (NewSessionTicket with every kind of lifetime, nonce, ticket and extension, KeyUpdate with every
+// value, unknown and unexpected handshake types, a message cut over records, application data, a CertificateRequest).
+// What the client does is read off the wire by decrypting its records with the client handshake key: F (it sent a correct Finished: it took the flight), A<n> (an alert,
+// description n: it refused), C (it closed), W (silence). After an F, the post-handshake variants are sent and the client's next reaction is read the same way:
+// F/A<n>, F/C, F/W (it took the messages, or does not tell). One line per connection, "CASE i tags class", for tools/tls-diff to join across the clients.
+//
+//   flight-server PORT SEED COUNT CERT.PEM KEY.PEM [DUMP_INDEX]
+import "abla/io"
+import "abla/text"
+import "abla/array"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/crypto/hkdf"
+import "abla/integer"
+import "abla/net"
+import "abla/sys/linux"
+import "abla/process/arguments"
+import "abla/tls/pure"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/keysched"
+import "abla/tls/pure/record"
+import "abla/tls/pure/client"
+import "../fuzz/prng.ab"
+import "./common.ab"
+
+/** One message of the flight, by name ("EE", "CT", "CV", "FIN" or a name of an inserted one) and its bytes, header included. */
+class FlMessage(var name: string, var bytes: string)
+
+class FlParts(var eeExts: array<DiffExt>, var certContext: string, var certExts: array<DiffExt>, var chainMode: int, var certDelta: int, var listDelta: int,
+    var scheme: int, var sigMode: int, var finMode: int, var order: array<string>, var inserted: array<FlMessage>, var lengthDelta: string, var typeChange: string,
+    var packing: int, var padding: int, var before: array<string>, var postMode: int, var eeBodyDelta: int, var trailing: string, var fragmentAt: int)
+
+fun flExtensions(exts: array<DiffExt>): string {
+    var out = byteBuffer()
+    for (e in exts) {
+        out.appendText(diffU16(e.type) + diffU16(e.body.size + e.delta) + e.body)
+    }
+    out.toText()
+}
+
+fun flHeader(type: int, body: string, delta: int): string = cryptoByteString([type, ((body.size + delta) >> 16) & 255, ((body.size + delta) >> 8) & 255, (body.size + delta) & 255]) + body
+
+var flGenerator: Prng = prngSeeded(1)
+
+fun flRandomBytes(count: int): string = diffBytes(flGenerator, count)
+
+fun flPickText(var r: Prng, values: array<string>): string = values[r.below(values.size)]
+
+fun flBase(): FlParts = FlParts([], "", [], 0, 0, 0, 0x0403, 0, 0, ["EE", "CT", "CV", "FIN"], [], "", "", 0, 0, [], 0, 0, "", -1)
+
+/** An extension type a flight message may or may not carry, with a plausible body. */
+fun flExtensionFor(var r: Prng): DiffExt {
+    val types: array<int> = [0, 1, 5, 10, 11, 13, 16, 18, 21, 23, 35, 42, 43, 44, 45, 49, 50, 51, 65281, 4660, 57, 17, 15, 14, 9, 30032]
+    val type = diffPickInt(r, types)
+    val bodies: array<string> = ["", "\x00", "\x00\x00", "\x00\x02\x00\x1d", "\x00\x03\x02h2", "\x01\x00\x00\x00\x00", "\x03\x04", diffBytes(r, 1 + r.below(40))]
+    DiffExt(type, bodies[r.below(bodies.size)], 0)
+}
+
+fun flMutate(var r: Prng, var parts: FlParts, signatureSchemes: array<int>): string {
+    val kind = r.below(44)
+    if (kind == 0) {
+        val e = flExtensionFor(r)
+        parts.eeExts.append(e)
+        return "ee-ext-${e.type}"
+    }
+    if (kind == 1) {
+        val e = flExtensionFor(r)
+        parts.eeExts.append(e)
+        parts.eeExts.append(DiffExt(e.type, e.body, 0))
+        return "ee-ext-twice"
+    }
+    if (kind == 2) {
+        parts.eeExts.append(DiffExt(diffPickInt(r, [0, 10, 16, 42, 1]), "", 0))
+        parts.eeExts.append(DiffExt(10, "\x00\x02\x00\x1d", 0))
+        return "ee-allowed"
+    }
+    if (kind == 3) {
+        val type = diffPickInt(r, [16, 10, 0, 1])
+        parts.eeExts.append(DiffExt(type, diffBytes(r, 1 + r.below(8)), 0))
+        return "ee-body-$type"
+    }
+    if (kind == 4) {
+        parts.eeExts.append(DiffExt(diffPickInt(r, [0, 10, 16, 4660]), diffBytes(r, 2), diffPickInt(r, [-2, -1, 1, 3, 100])))
+        return "ee-ext-length"
+    }
+    if (kind == 5) {
+        parts.eeBodyDelta = diffPickInt(r, [-2, -1, 1, 2, 5])
+        return "ee-list-length"
+    }
+    if (kind == 6) {
+        parts.certContext = diffBytes(r, 1 + r.below(4))
+        return "cert-context"
+    }
+    if (kind == 7) {
+        val e = flExtensionFor(r)
+        parts.certExts.append(e)
+        return "cert-ext-${e.type}"
+    }
+    if (kind == 8) {
+        parts.certExts.append(DiffExt(diffPickInt(r, [5, 18, 4660]), diffBytes(r, r.below(6)), 0))
+        parts.certExts.append(DiffExt(5, "\x01\x00\x00\x00\x00", 0))
+        return "cert-ext-status"
+    }
+    if (kind == 9) {
+        parts.chainMode = 1 + r.below(4)
+        return "cert-chain-$kind-${parts.chainMode}"
+    }
+    if (kind == 10) {
+        parts.certDelta = diffPickInt(r, [-1, 1, 2, -3, 100])
+        return "cert-length"
+    }
+    if (kind == 11) {
+        parts.listDelta = diffPickInt(r, [-1, 1, 2, -3, 100])
+        return "cert-list-length"
+    }
+    if (kind == 12) {
+        val others: array<int> = [0x0401, 0x0501, 0x0601, 0x0201, 0x0804, 0x0805, 0x0806, 0x0807, 0x0808, 0x0809, 0x0503, 0x0603, 0x0203, 0x0000, 0xffff, 0x0420]
+        parts.scheme = diffPickInt(r, others)
+        return "cv-scheme"
+    }
+    if (kind == 13) {
+        parts.sigMode = 1 + r.below(5)
+        return "cv-signature-${parts.sigMode}"
+    }
+    if (kind == 14) {
+        parts.finMode = 1 + r.below(5)
+        return "fin-${parts.finMode}"
+    }
+    if (kind == 15) {
+        // Omit one message.
+        val drop = diffPickInt(r, [0, 1, 2, 3])
+        val kept: array<string> = []
+        for (i in 0 until parts.order.size) if (i != drop) kept.append(parts.order[i])
+        parts.order = kept
+        return "omit-${parts.order.size}-$drop"
+    }
+    if (kind == 16) {
+        val at = r.below(parts.order.size)
+        val out: array<string> = []
+        for (i in 0 until parts.order.size) {
+            out.append(parts.order[i])
+            if (i == at) out.append(parts.order[i])
+        }
+        parts.order = out
+        return "duplicate-$at"
+    }
+    if (kind == 17) {
+        val a = r.below(parts.order.size)
+        val b = r.below(parts.order.size)
+        val x = parts.order[a]
+        parts.order[a] = parts.order[b]
+        parts.order[b] = x
+        return "swap-$a-$b"
+    }
+    if (kind == 18) {
+        // An unexpected message type inside the flight.
+        val types: array<int> = [1, 2, 4, 5, 13, 24, 25, 99, 254, 0, 255, 12, 14, 16, 3, 6, 7, 9, 10, 17, 21, 22, 23]
+        val type = diffPickInt(r, types)
+        val name = "X$type"
+        val at = r.below(parts.order.size + 1)
+        val out: array<string> = []
+        for (i in 0 until parts.order.size) {
+            if (i == at) out.append(name)
+            out.append(parts.order[i])
+        }
+        if (at >= parts.order.size) out.append(name)
+        parts.order = out
+        parts.inserted.append(FlMessage(name, flHeader(type, diffBytes(r, r.below(12)), 0)))
+        return "insert-$type-at-$at"
+    }
+    if (kind == 19) {
+        val names: array<string> = ["EE", "CT", "CV", "FIN"]
+        parts.lengthDelta = names[r.below(4)] + ":${diffPickInt(r, [-1, 1, 2, 3, 70000])}"
+        return "header-length"
+    }
+    if (kind == 20) {
+        val names: array<string> = ["EE", "CT", "CV", "FIN"]
+        parts.typeChange = names[r.below(4)] + ":${diffPickInt(r, [0, 1, 2, 4, 5, 8, 11, 13, 15, 20, 24, 25, 99, 255])}"
+        return "header-type"
+    }
+    if (kind == 21) {
+        parts.packing = 1
+        return "one-per-record"
+    }
+    if (kind == 22) {
+        parts.packing = 2
+        return "random-split"
+    }
+    if (kind == 23) {
+        parts.packing = 3
+        return "byte-split"
+    }
+    if (kind == 24) {
+        parts.padding = diffPickInt(r, [1, 2, 7, 16, 255, 1000, 16000])
+        return "padding-${parts.padding}"
+    }
+    if (kind == 25) {
+        parts.before.append(flPickText(r, ["plain-alert-warning", "plain-alert-fatal", "plain-ccs", "plain-ccs2", "plain-handshake", "plain-empty-handshake", "plain-app", "plain-ccs-bad"]))
+        return "before-" + parts.before[parts.before.size - 1]
+    }
+    if (kind == 26) {
+        parts.before.append(flPickText(r, ["enc-ccs", "enc-alert-close", "enc-alert-user", "enc-alert-fatal", "enc-unknown-type", "enc-empty-handshake", "enc-app", "enc-empty-app", "enc-alert-short", "enc-alert-long", "enc-zero-type"]))
+        return "before-" + parts.before[parts.before.size - 1]
+    }
+    if (kind == 27) {
+        parts.postMode = 1 + r.below(30)
+        return "post-${parts.postMode}"
+    }
+    if (kind == 28) {
+        parts.trailing = diffBytes(r, 1 + r.below(3))
+        return "trailing-after-flight"
+    }
+    if (kind == 29) {
+        parts.fragmentAt = r.below(4)
+        return "fragment-$kind-${parts.fragmentAt}"
+    }
+    if (kind == 30) {
+        // A zero-length message of each type.
+        val which = diffPickInt(r, [0, 1, 2, 3])
+        val which_names: array<string> = ["EE", "CT", "CV", "FIN"]
+        parts.lengthDelta = which_names[which] + ":-99999"
+        return "empty-message-$which"
+    }
+    // The rest: more post-handshake variants (weights the campaign toward the tickets and key updates).
+    parts.postMode = 1 + r.below(30)
+    "post-${parts.postMode}"
+}
+
+/** The message called `name`, built from the parts and the transcript so far. */
+class FlBuilt(val message: string, val transcript: string)
+
+fun flSerializeChain(parts: FlParts, chain: array<string>): array<string> {
+    if (parts.chainMode == 1) return []
+    if (parts.chainMode == 2) return [chain[0], chain[0]]
+    if (parts.chainMode == 3) return [""]
+    if (parts.chainMode == 4) return [chain[0].slice(0, chain[0].size / 2)]
+    val same: array<string> = []
+    for (der in chain) same.append(der)
+    same
+}
+
+fun flCertificate(parts: FlParts, chain: array<string>): string {
+    var list = byteBuffer()
+    for (der in flSerializeChain(parts, chain)) {
+        list.appendText(cryptoByteString([((der.size + parts.certDelta) >> 16) & 255, ((der.size + parts.certDelta) >> 8) & 255, (der.size + parts.certDelta) & 255]) + der)
+        val ext = flExtensions(parts.certExts)
+        list.appendText(diffU16(ext.size) + ext)
+    }
+    val entries = list.toText()
+    val size = entries.size + parts.listDelta
+    cryptoByteString([parts.certContext.size]) + parts.certContext + cryptoByteString([(size >> 16) & 255, (size >> 8) & 255, size & 255]) + entries
+}
+
+fun flSplit(var r: Prng, data: string, mode: int): array<string> {
+    val out: array<string> = []
+    if (mode == 0 || data.size == 0) {
+        out.append(data)
+        return out
+    }
+    var at = 0
+    while (at < data.size) {
+        var size = data.size - at
+        if (mode == 2) size = 1 + r.below(if (data.size - at > 300) 300 else data.size - at)
+        if (mode == 3) size = 1
+        if (at + size > data.size) size = data.size - at
+        out.append(data.slice(at, at + size))
+        at = at + size
+    }
+    out
+}
+
+/** The client's reaction, read off the wire: records are read for at most `timeoutMilliseconds`; a record under `protection` is opened. */
+fun flReaction(var connection: TcpConnection, var protection: TlsRecordProtection, decrypt: bool, expectedFinished: string, timeoutMilliseconds: int): string {
+    var got = ""
+    var rounds = 0
+    var closed = false
+    while (rounds < 3) {
+        val incoming = connection.readWithTimeoutResult(65536, timeoutMilliseconds)
+        if (incoming.hasData()) {
+            got = got + incoming.bytes
+        } else {
+            if (!incoming.timedOut()) closed = true
+            rounds = 3
+        }
+        rounds = rounds + 1
+        if (got.size >= 5) {
+            // Enough for a verdict if the first non-CCS record is whole.
+            var at = 0
+            var verdict = ""
+            while (verdict == "" && at + 5 <= got.size) {
+                val length = diffRd16(got, at + 3)
+                if (at + 5 + length > got.size) break
+                val type = got[at]
+                if (type == 20) {
+                    at = at + 5 + length
+                    continue
+                }
+                if (type == 21) {
+                    verdict = if (length >= 2) "A${got[at + 6]}" else "A?"
+                } else if (type == 23 && decrypt) {
+                    val opened = tlsOpenRecord(protection, got.slice(at, at + 5 + length))
+                    if (!opened.ok) verdict = "BAD"
+                    else if (opened.type == 21) verdict = if (opened.content.size >= 2) "A${opened.content[1]}" else "A?"
+                    else if (opened.type == 22 && opened.content.size >= 4 && opened.content[0] == 20) verdict = if (expectedFinished == "" || opened.content.slice(4, opened.content.size) == expectedFinished) "F" else "Fbad"
+                    else verdict = "T${opened.type}"
+                } else verdict = "?"
+                at = at + 5 + length
+            }
+            if (verdict != "") return verdict
+        }
+    }
+    if (closed) "C" else "W"
+}
+
+fun main: int {
+    if (processArgumentCount() < 5) {
+        println("usage: flight-server PORT SEED COUNT CERT.PEM KEY.PEM [DUMP_INDEX]")
+        return 2
+    }
+    val port = processArgument(0).parseInt() ?? 0
+    val seed = processArgument(1).parseInt() ?? 1
+    val count = processArgument(2).parseInt() ?? 1
+    val certificatePem = linuxReadFile(processArgument(3), 65536)
+    val keyPem = linuxReadFile(processArgument(4), 65536)
+    val dump = if (processArgumentCount() > 5) processArgument(5).parseInt() ?? -1 else -1
+    val identity = tlsClientIdentityFromPem(certificatePem, keyPem)
+    if (!identity.ok()) {
+        println("FAIL identity: ${identity.error}")
+        return 1
+    }
+    var listener = tcpListenAddress(ipv4Loopback(port))
+    println("listening $port")
+    for (i in 0 until count) {
+        var connection = listener.accept()
+        var got = ""
+        var wanted = 0
+        var tries = 0
+        while (tries < 20 && (got.size < 5 || got.size < 5 + wanted)) {
+            val incoming = connection.readWithTimeoutResult(65536, 500)
+            if (incoming.hasData()) {
+                got = got + incoming.bytes
+                if (got.size >= 5) wanted = diffRd16(got, 3)
+            } else tries = 20
+            tries = tries + 1
+        }
+        if (got.size < 9 || got[0] != 22 || got[5] != 1) {
+            println("CASE $i noclienthello W")
+            connection.close()
+            continue
+        }
+        val helloMessage = got.slice(5, if (got.size > 5 + wanted) 5 + wanted else got.size)
+        val hello = tlsParseClientHello(helloMessage.slice(4, helloMessage.size))
+        var share: TlsKeyShare? = null
+        for (s in hello.shares) if (s.group == 29) share = s
+        if (!hello.ok || share == null) {
+            println("CASE $i badclienthello W")
+            connection.close()
+            continue
+        }
+        var r = prngSeeded(seed * 100003 + i)
+        flGenerator = prngSeeded(seed * 7919 + i)
+        val exchange = tlsServerExchange(29, (share ?? TlsKeyShare(29, "")).publicKey, flRandomBytes)
+        val hash = HKDF_SHA256
+        val serverHello = tlsBuildServerHello(diffBytes(r, 32), hello.sessionId, 4865, TlsKeyShare(29, exchange.publicKey))
+        var transcript = tlsTranscript()
+        transcript.add(helloMessage)
+        transcript.add(serverHello)
+        connection.write(tlsPlaintextRecord(22, 771, serverHello) + tlsPlaintextRecord(20, 771, "\x01"))
+        val early = tlsEarlySecret(hash, "")
+        val secrets = tlsDeriveHandshakeSecrets(hash, early, exchange.secret, transcript.hash(hash))
+        var write = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, secrets.serverTraffic, 16), tlsTrafficIv(hash, secrets.serverTraffic))
+        var clientRead = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, secrets.clientTraffic, 16), tlsTrafficIv(hash, secrets.clientTraffic))
+        var parts = flBase()
+        val rounds = 1 + (if (r.below(5) == 0) 1 else 0)
+        var tags = ""
+        for (k in 0 until rounds) tags = tags + (if (k > 0) "+" else "") + flMutate(r, parts, [])
+        // The messages, in order, each from the transcript so far.
+        val flight: array<string> = []
+        for (name in parts.order) {
+            var message = ""
+            if (name == "EE") {
+                val exts = flExtensions(parts.eeExts)
+                message = flHeader(8, diffU16(exts.size + parts.eeBodyDelta) + exts, 0)
+            } else if (name == "CT") {
+                message = flHeader(11, flCertificate(parts, identity.chain), 0)
+            } else if (name == "CV") {
+                // The signature is over the transcript through the Certificate (whatever was sent before this message).
+                val over = tlsCertificateVerifyContent(true, transcript.hash(hash))
+                var signature = identity.sign(0x0403, over)
+                if (parts.sigMode == 1 && signature.size > 1) signature = signature.slice(0, signature.size - 1)
+                if (parts.sigMode == 2) signature = signature + "\x00"
+                if (parts.sigMode == 3 && signature.size > 10) signature = signature.slice(0, 5) + cryptoByteString([signature[5] ^ 1]) + signature.slice(6, signature.size)
+                if (parts.sigMode == 4) signature = ""
+                if (parts.sigMode == 5) signature = diffBytes(r, signature.size)
+                message = flHeader(15, diffU16(parts.scheme) + diffU16(signature.size) + signature, 0)
+            } else if (name == "FIN") {
+                var verify = tlsFinishedVerifyData(hash, secrets.serverTraffic, transcript.hash(hash))
+                if (parts.finMode == 1 && verify.size > 1) verify = verify.slice(0, verify.size - 1)
+                if (parts.finMode == 2) verify = verify + "\x00"
+                if (parts.finMode == 3) verify = cryptoByteString([verify[0] ^ 1]) + verify.slice(1, verify.size)
+                if (parts.finMode == 4) verify = ""
+                if (parts.finMode == 5) verify = diffBytes(r, 32)
+                message = flHeader(20, verify, 0)
+            } else {
+                for (m in parts.inserted) if (m.name == name) message = m.bytes
+            }
+            // Header edits.
+            if (parts.lengthDelta != "") {
+                val cut = parts.lengthDelta.indexOf(":")
+                if (parts.lengthDelta.slice(0, cut) == name && message.size >= 4) {
+                    val d = parts.lengthDelta.slice(cut + 1, parts.lengthDelta.size).parseInt() ?? 0
+                    message = flHeader(message[0], message.slice(4, message.size), if (d == -99999) -(message.size - 4) else d)
+                }
+            }
+            if (parts.typeChange != "") {
+                val cut = parts.typeChange.indexOf(":")
+                if (parts.typeChange.slice(0, cut) == name && message.size >= 4) {
+                    message = cryptoByteString([parts.typeChange.slice(cut + 1, parts.typeChange.size).parseInt() ?? 0]) + message.slice(1, message.size)
+                }
+            }
+            transcript.add(message)
+            flight.append(message)
+        }
+        var wire = ""
+        for (kind in parts.before) {
+            if (kind == "plain-alert-warning") wire = wire + tlsPlaintextRecord(21, 771, "\x01\x00")
+            else if (kind == "plain-alert-fatal") wire = wire + tlsPlaintextRecord(21, 771, "\x02\x28")
+            else if (kind == "plain-ccs") wire = wire + tlsPlaintextRecord(20, 771, "\x01")
+            else if (kind == "plain-ccs2") wire = wire + tlsPlaintextRecord(20, 771, "\x01") + tlsPlaintextRecord(20, 771, "\x01")
+            else if (kind == "plain-ccs-bad") wire = wire + tlsPlaintextRecord(20, 771, "\x02")
+            else if (kind == "plain-handshake") wire = wire + tlsPlaintextRecord(22, 771, flHeader(14, "", 0))
+            else if (kind == "plain-empty-handshake") wire = wire + tlsPlaintextRecord(22, 771, "")
+            else if (kind == "plain-app") wire = wire + tlsPlaintextRecord(23, 771, "hello")
+            else {
+                var content = ""
+                var type = 22
+                if (kind == "enc-ccs") { type = 20; content = "\x01" }
+                else if (kind == "enc-alert-close") { type = 21; content = "\x01\x00" }
+                else if (kind == "enc-alert-user") { type = 21; content = "\x01\x5a" }
+                else if (kind == "enc-alert-fatal") { type = 21; content = "\x02\x28" }
+                else if (kind == "enc-alert-short") { type = 21; content = "\x01" }
+                else if (kind == "enc-alert-long") { type = 21; content = "\x01\x00\x00" }
+                else if (kind == "enc-unknown-type") { type = 99; content = "x" }
+                else if (kind == "enc-zero-type") { type = 0; content = "x" }
+                else if (kind == "enc-empty-handshake") { type = 22; content = "" }
+                else if (kind == "enc-app") { type = 23; content = "hello" }
+                else if (kind == "enc-empty-app") { type = 23; content = "" }
+                val sealed = tlsProtectRecord(write, type, content, 0)
+                if (sealed.ok) wire = wire + sealed.bytes
+            }
+        }
+        var data = ""
+        for (message in flight) data = data + message
+        data = data + parts.trailing
+        val pieces: array<string> = []
+        if (parts.packing == 1) {
+            for (message in flight) pieces.append(message)
+            if (parts.trailing != "") pieces.append(parts.trailing)
+        } else if (parts.packing == 0) {
+            pieces.append(data)
+        } else {
+            for (piece in flSplit(r, data, parts.packing)) pieces.append(piece)
+        }
+        for (piece in pieces) {
+            val sealed = tlsProtectRecord(write, 22, piece, parts.padding)
+            if (sealed.ok) wire = wire + sealed.bytes
+        }
+        connection.write(wire)
+        if (i == dump) {
+            println("CLIENTHELLO ${hexEncode(got)}")
+            println("WIRE ${hexEncode(wire)}")
+        }
+        // The expected Finished from the client: over the transcript through the server's Finished (the last message sent, if it is a Finished).
+        val clientFinished = tlsFinishedVerifyData(hash, secrets.clientTraffic, transcript.hash(hash))
+        var reaction = flReaction(connection, clientRead, true, clientFinished, 250)
+        if (reaction == "F" && parts.postMode > 0) {
+            // The post-handshake variants, under the server's application keys.
+            val application = tlsDeriveApplicationSecrets(hash, secrets.handshakeSecret, transcript.hash(hash))
+            var applicationWrite = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, application.serverTraffic, 16), tlsTrafficIv(hash, application.serverTraffic))
+            val post = flPost(r, parts.postMode)
+            var out = ""
+            for (piece in post.records) {
+                val sealed = tlsProtectRecord(applicationWrite, piece.type, piece.content, 0)
+                if (sealed.ok) out = out + sealed.bytes
+            }
+            connection.write(out)
+            val second = flReaction(connection, clientRead, false, "", 250)
+            reaction = "F/" + (if (second.startsWith("T") || second == "?") "W" else second)
+            tags = tags + "[" + post.name + "]"
+        } else if (reaction == "F") reaction = "F/-"
+        println("CASE $i $tags $reaction")
+        connection.close()
+    }
+    0
+}
+
+class FlPostRecord(val type: int, val content: string)
+class FlPost(val name: string, val records: array<FlPostRecord>)
+
+fun flTicket(lifetime: int, add: int, nonce: string, ticket: string, extensions: string): string =
+    flHeader(4, cryptoByteString([(lifetime >> 24) & 255, (lifetime >> 16) & 255, (lifetime >> 8) & 255, lifetime & 255, (add >> 24) & 255, (add >> 16) & 255, (add >> 8) & 255, add & 255, nonce.size]) +
+        nonce + diffU16(ticket.size) + ticket + diffU16(extensions.size) + extensions, 0)
+
+/** The post-handshake records for variant `mode` (1..30), under the server's application keys. */
+fun flPost(var r: Prng, mode: int): FlPost {
+    val out: array<FlPostRecord> = []
+    var name = "post"
+    val good = flTicket(7200, 0, "\x00", "tick", "")
+    if (mode == 1) { name = "ticket"; out.append(FlPostRecord(22, good)) }
+    else if (mode == 2) { name = "ticket-lifetime-0"; out.append(FlPostRecord(22, flTicket(0, 0, "\x00", "tick", ""))) }
+    else if (mode == 3) { name = "ticket-lifetime-week"; out.append(FlPostRecord(22, flTicket(604800, 0, "\x00", "tick", ""))) }
+    else if (mode == 4) { name = "ticket-lifetime-over-week"; out.append(FlPostRecord(22, flTicket(604801, 0, "\x00", "tick", ""))) }
+    else if (mode == 5) { name = "ticket-lifetime-max"; out.append(FlPostRecord(22, flTicket(4294967295, 4294967295, "\x00", "tick", ""))) }
+    else if (mode == 6) { name = "ticket-empty"; out.append(FlPostRecord(22, flTicket(7200, 0, "\x00", "", ""))) }
+    else if (mode == 7) { name = "ticket-empty-nonce"; out.append(FlPostRecord(22, flTicket(7200, 0, "", "tick", ""))) }
+    else if (mode == 8) { name = "ticket-long-nonce"; out.append(FlPostRecord(22, flTicket(7200, 0, "n".repeat(255), "tick", ""))) }
+    else if (mode == 9) { name = "ticket-early-data"; out.append(FlPostRecord(22, flTicket(7200, 0, "\x00", "tick", tlsExtension(42, "\x00\x00\x40\x00")))) }
+    else if (mode == 10) { name = "ticket-early-data-bad"; out.append(FlPostRecord(22, flTicket(7200, 0, "\x00", "tick", tlsExtension(42, "\x00")))) }
+    else if (mode == 11) { name = "ticket-unknown-ext"; out.append(FlPostRecord(22, flTicket(7200, 0, "\x00", "tick", tlsExtension(4660, "abc")))) }
+    else if (mode == 12) { name = "ticket-dup-ext"; out.append(FlPostRecord(22, flTicket(7200, 0, "\x00", "tick", tlsExtension(42, "\x00\x00\x40\x00") + tlsExtension(42, "\x00\x00\x40\x00")))) }
+    else if (mode == 13) { name = "ticket-truncated"; out.append(FlPostRecord(22, flHeader(4, "\x00\x00\x1c\x20\x00\x00\x00\x00", 0))) }
+    else if (mode == 14) { name = "ticket-trailing"; out.append(FlPostRecord(22, flHeader(4, good.slice(4, good.size) + "x", 0))) }
+    else if (mode == 15) { name = "ticket-two"; out.append(FlPostRecord(22, good + flTicket(7200, 0, "\x01", "tock", ""))) }
+    else if (mode == 16) { name = "keyupdate-0"; out.append(FlPostRecord(22, flHeader(24, "\x00", 0))) }
+    else if (mode == 17) { name = "keyupdate-1"; out.append(FlPostRecord(22, flHeader(24, "\x01", 0))) }
+    else if (mode == 18) { name = "keyupdate-2"; out.append(FlPostRecord(22, flHeader(24, "\x02", 0))) }
+    else if (mode == 19) { name = "keyupdate-empty"; out.append(FlPostRecord(22, flHeader(24, "", 0))) }
+    else if (mode == 20) { name = "keyupdate-long"; out.append(FlPostRecord(22, flHeader(24, "\x00\x00", 0))) }
+    else if (mode == 21) { name = "certificate-request"; out.append(FlPostRecord(22, tlsBuildCertificateRequest("", [0x0403]))) }
+    else if (mode == 22) { name = "unknown-type"; out.append(FlPostRecord(22, flHeader(99, "x", 0))) }
+    else if (mode == 23) { name = "client-hello"; out.append(FlPostRecord(22, flHeader(1, "x", 0))) }
+    else if (mode == 24) { name = "finished-again"; out.append(FlPostRecord(22, flHeader(20, "x".repeat(32), 0))) }
+    else if (mode == 25) { name = "empty-handshake-record"; out.append(FlPostRecord(22, "")) }
+    else if (mode == 26) { name = "ticket-split"; out.append(FlPostRecord(22, good.slice(0, 5))); out.append(FlPostRecord(22, good.slice(5, good.size))) }
+    else if (mode == 27) { name = "alert-warning-close"; out.append(FlPostRecord(21, "\x01\x00")) }
+    else if (mode == 28) { name = "alert-warning-other"; out.append(FlPostRecord(21, "\x01\x5a")) }
+    else if (mode == 29) { name = "ccs"; out.append(FlPostRecord(20, "\x01")) }
+    else { name = "app-then-ticket"; out.append(FlPostRecord(23, "hello")); out.append(FlPostRecord(22, good)) }
+    FlPost(name, out)
+}

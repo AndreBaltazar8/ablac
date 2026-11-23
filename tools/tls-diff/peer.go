@@ -22,6 +22,8 @@ func main() {
 		server(os.Args[2], os.Args[3], os.Args[4])
 	case "client":
 		client(os.Args[2], os.Args[3:])
+	case "flight":
+		flightClient(os.Args[2], os.Args[3:])
 	default:
 		os.Exit(2)
 	}

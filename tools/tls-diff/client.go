@@ -26,3 +26,27 @@ func client(port string, rest []string) {
 		connection.Close()
 	}
 }
+
+// flight PORT COUNT: as client, for tools/tls-diff/flight-server.ab, which does a real handshake: the certificate is not checked (it is the server's own), the
+// signature and the Finished are; after a handshake that succeeds it reads for a short while, so the post-handshake messages are processed.
+func flightClient(port string, rest []string) {
+	count := 1
+	if len(rest) > 0 {
+		count, _ = strconv.Atoi(rest[0])
+	}
+	config := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}
+	for i := 0; i < count; i++ {
+		connection, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 2*time.Second)
+		if err != nil {
+			continue
+		}
+		connection.SetDeadline(time.Now().Add(900 * time.Millisecond))
+		secured := tls.Client(connection, config)
+		if secured.Handshake() == nil {
+			connection.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+			buffer := make([]byte, 64)
+			secured.Read(buffer)
+		}
+		connection.Close()
+	}
+}
