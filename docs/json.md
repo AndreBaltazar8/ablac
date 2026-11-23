@@ -455,6 +455,12 @@ control bytes while retaining valid non-ASCII UTF-8. A manually forged invalid
 kind, number, string, or object shape produces the contained fallback `"null"`;
 invalid bytes are never emitted as JSON.
 
+`jsonStringifyPretty(value, sortKeys: true)` returns a `JsonEncoded` fragment
+with two-space indentation, lexically sorted object keys, and no terminal
+newline. Use the default `sortKeys: false` to retain stored member order.
+Check `valid` before writing the fragment. Raw nodes, invalid values and
+values beyond `maxDepth` make it invalid. The root is depth zero.
+
 ### Raw nodes: a value that is already encoded
 
 A program that builds a large document once and sends it many times (a language
