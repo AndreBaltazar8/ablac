@@ -22,6 +22,21 @@ printf '%s\n' "$@" >> "$WASM_NAMES_OPT_ARGUMENTS"
 exec "$WASM_NAMES_REAL_OPT" "$@"
 WRAPPER
 chmod +x "$out/tools/wasm-opt"
+export WASM_NAMES_REAL_CLANG
+WASM_NAMES_REAL_CLANG=$(command -v clang)
+export WASM_NAMES_CLANG_ARGUMENTS="$root/$out/clang.arguments"
+cat > "$out/tools/clang" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+for argument; do
+    if [[ $argument == --target=wasm32-* ]]; then
+        printf '%s\n' "$@" >> "$WASM_NAMES_CLANG_ARGUMENTS"
+        break
+    fi
+done
+exec "$WASM_NAMES_REAL_CLANG" "$@"
+WRAPPER
+chmod +x "$out/tools/clang"
 export PATH="$root/$out/tools:$PATH"
 build() { # <mode> <output> [flag]
     cat > "$out/$1.build.ab" <<DRIVER
@@ -36,6 +51,12 @@ build plain "$out/plain.wasm"
 grep -Fxq -- '-O3' "$WASM_NAMES_OPT_ARGUMENTS"
 grep -Fxq -- '--skip-pass=inlining-optimizing' "$WASM_NAMES_OPT_ARGUMENTS" ||
     { echo 'wasm names: release Binaryen ran the optimizing inliner' >&2; exit 1; }
+grep -Fxq -- '-flto' "$WASM_NAMES_CLANG_ARGUMENTS"
+if ! grep -Fxq -- '-O1' "$WASM_NAMES_CLANG_ARGUMENTS" ||
+    grep -Fxq -- '-O2' "$WASM_NAMES_CLANG_ARGUMENTS"; then
+    echo 'wasm names: Wasm LTO pre-link did not use Clang O1' >&2
+    exit 1
+fi
 build names "$out/names.wasm" --wasm-names
 node tests/cases/wasm-names/check.mjs "$out/plain.wasm" "$out/names.wasm"
 cp "$out/names.wasm" "$out/names-first.wasm"
