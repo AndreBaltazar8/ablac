@@ -80,7 +80,7 @@ steps:
 The action supports Linux x86-64 and both Apple Silicon and Intel macOS. Pin it
 to a full commit SHA when an immutable action reference is required.
 
-The Linux toolchain archive, `abla-toolchain-x86_64-linux`, is statically linked from v0.2.66: the
+The Linux toolchain archive, `abla-toolchain-x86_64-linux`, is statically linked from v0.2.67: the
 static compiler, the standard library and runtime, compiler-rt's builtins and the Xtensa installer, with no
 `libLLVM.so`, no loader and no external LLVM tools. It needs no C library on the host and runs with an empty
 `PATH`. The programs it builds need no libc at all unless they bring a C library (docs/toolchain.md). The
@@ -199,7 +199,7 @@ make clean         # remove generated files
 ```
 
 On an empty build directory, `make` downloads the checksum-pinned native
-compiler for the host from `v0.2.66`, then immediately recompiles the current
+compiler for the host from `v0.2.67`, then immediately recompiles the current
 `src/` graph.
 No C++ compiler implementation or generated-C bootstrap is involved.
 
