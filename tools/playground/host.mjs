@@ -62,7 +62,7 @@ export async function compile(module, base, files, options = {}) {
     memory = instance.exports.memory;
     let status;
     try { status = instance.exports.main(); } catch (error) { if (error instanceof Exit) status = error.code; else throw error; }
-    return { status, stdout: output[1], stderr: output[2], vfs, unknown };
+    return { status, stdout: output[1], stderr: output[2], vfs, unknown, memoryBytes: memory.buffer.byteLength };
 }
 
 // Runs a program with the compiler's evaluator: a wrapper module calls the program's `main` at compile time (a `#` site), so the program's
@@ -81,5 +81,5 @@ export async function run(module, base, files, { stdin = "" } = {}) {
     const exit = /^exit=(-?\d+)$/m.exec(result.stderr);
     const diagnostics = result.stderr.split("\n").filter((line) => !/^(exit=|lowered:|errors=)/.test(line)).join("\n").trim();
     const ok = exit !== null && /errors=0 /.test(result.stderr);
-    return { status: ok ? Number(exit[1]) : 1, stdout: result.stdout, stderr: result.stderr, diagnostics, ok };
+    return { status: ok ? Number(exit[1]) : 1, stdout: result.stdout, stderr: result.stderr, diagnostics, ok, memoryBytes: result.memoryBytes };
 }

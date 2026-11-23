@@ -51,4 +51,9 @@ check("run: a runtime error names itself", !bad.ok && /out of bounds/.test(bad.d
 const echo = 'import "abla/io"\n\nfun main {\n    val line = readLine()\n    println("got ${line}")\n}\n';
 const input = await run(module, base, new Map([["main.ab", echo]]), { stdin: "ping\n" });
 check("run: standard input", input.ok && input.stdout === "got ping\n", JSON.stringify({ stdout: input.stdout, diagnostics: input.diagnostics.slice(0, 160) }));
+// A loop of 800,000 small objects: the module collects them (a Wasm module collects only when asked to, src/browser_main.ab), so it stays far
+// below the 2.4 GB it took when nothing was collected.
+const churn = 'import "abla/io"\n\nclass Node(val value: int, val next: Node?)\n\nfun sumList(node: Node?): int = if (node == null) 0 else node.value + sumList(node.next)\n\nfun churn(round: int): int {\n    var list: Node? = null\n    for (index in 0 until 40) list = Node(index + round, list)\n    sumList(list)\n}\n\nfun main: int {\n    var total = 0\n    for (round in 0 until 20000) total = total + churn(round)\n    println("total $total")\n    0\n}\n';
+const churned = await run(module, base, new Map([["main.ab", churn]]));
+check("run: garbage is collected", churned.ok && churned.stdout === "total 8015200000\n" && churned.memoryBytes < 1024 * 1024 * 1024, JSON.stringify({ status: churned.status, megabytes: Math.round(churned.memoryBytes / 1048576), diagnostics: churned.diagnostics.slice(0, 120) }));
 process.exit(failed ? 1 : 0);
