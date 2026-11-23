@@ -26,6 +26,9 @@ expect_panic concat 'string too long'
 expect_panic concat-sum 'string too long'
 expect_panic concat4 'string too long'
 expect_panic repeat 'string too long'
+expect_panic filled 'filledArray size too large (2305843009213693952)'
+expect_panic filled-string 'filledArray size too large'
+expect_panic filled-max 'filledArray size too large (9223372036854775807)'
 "$out/main" fine > "$out/fine.out" || fail "a string of 2^61 bytes is refused"
 [[ $(cat "$out/fine.out") == 2305843009213693952 ]] || fail "the length of a 2^61 byte string: $(cat "$out/fine.out")"
-echo "size overflow: strings past 2^62 bytes panic"
+echo "size overflow: strings past 2^62 bytes and filled arrays whose size wraps panic"
