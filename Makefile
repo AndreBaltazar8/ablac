@@ -332,6 +332,7 @@ test-serial: ablac
 	tools/test-compile-time-parity-sample.sh $(COMPILER)
 	tools/test-compile-time-parity-guard.sh
 	tools/test-eval-allocations.sh $(COMPILER)
+	tools/test-eval-case.sh $(COMPILER)
 	tools/test-eval-scopes-guard.sh
 	tools/test-scoped-region.sh $(COMPILER)
 	tools/test-region-stores.sh $(COMPILER)
