@@ -1845,9 +1845,23 @@ fun bootstrapCtTripleFamily(triple: string): string {
     "$architecture:$system"
 }
 
+// The triple compile-time slices are made for: the compiler's own, or ABLA_CT_HOST_TRIPLE (a test's: the slice another host's
+// compiler would make, written with ABLA_COMPILE_EVAL_DUMP and never run; tools/test-windows-compiler.sh checks what a Windows
+// slice leaves for the process to resolve).
+fun bootstrapCtSliceTriple(): string {
+    val configured = linuxEnvironment("ABLA_CT_HOST_TRIPLE")
+    if (configured.found && configured.value != "") configured.value else llvmDefaultTargetTriple()
+}
+
+// Whether slices are made for another host than this compiler's (ABLA_CT_HOST_TRIPLE): written, never run.
+fun bootstrapCtSliceForeign(): bool = bootstrapCtSliceTriple() != llvmDefaultTargetTriple()
+
+// Whether slices are made for Windows, whose compiler resolves them against its own exports and system DLLs.
+fun bootstrapCtSliceWindows(): bool = bootstrapTextContains(bootstrapCtSliceTriple(), "windows")
+
 // A host build needs no additional portability proof for its native slice.
 fun bootstrapCtTripleIsHost(triple: string): bool =
-    bootstrapCtTripleFamily(triple) == bootstrapCtTripleFamily(llvmDefaultTargetTriple())
+    bootstrapCtTripleFamily(triple) == bootstrapCtTripleFamily(bootstrapCtSliceTriple())
 
 // What a site's walk (reach.visited, after reach.unsupported) reaches that acts outside the compiler, "" when
 // nothing: a program's extern:"c" declaration or a compile-time provider (files, output, the clock, the
@@ -2702,7 +2716,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         // The entries run compile-time code as a hosted program's main runs it:
         // collected under pressure, with the globals as roots.
         bootstrapLlvmExportsAreEntries = true
-        val emitted = bootstrapEmitLlvmProgram(program, llvmDefaultTargetTriple(), false)
+        val emitted = bootstrapEmitLlvmProgram(program, bootstrapCtSliceTriple(), false)
         bootstrapLlvmExportsAreEntries = false
         if (emitted.errors > 0) {
             failure = "slice emission: ${emitted.errors} error(s)"
@@ -2728,6 +2742,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     }
     val emissionDone = linuxMonotonicMilliseconds()
     bootstrapCtInstallGuard(context, module, generation)
+    if (bootstrapCtSliceWindows()) bootstrapCtWindowsNames(module)
     bootstrapCtSetEnvironment(context, module, bootstrapBuildCompileEffectGrants(
         bootstrapBuildCompileEffectRequests(parsed),
         bootstrapBuildCompileEffectAuthorizations(parsed)
@@ -2739,6 +2754,24 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         val dumped = LlvmOwnedModule(context, module, 0, false)
         val _written = dumped.writeText("${dump.value}/generation-$generation.ll")
         dumped.closed = true
+    }
+    // A slice made for another host (ABLA_CT_HOST_TRIPLE) is only written: this process cannot run its code. With
+    // ABLA_COMPILE_EVAL_DUMP it is written again after the passes it would get (generation-<g>.optimized.ll): what the other
+    // host's JIT would code-generate and resolve.
+    if (bootstrapCtSliceForeign()) {
+        bootstrapCtFailReady("the slice is for ${bootstrapCtSliceTriple()} (ABLA_CT_HOST_TRIPLE): written, not run")
+        if (dump.found && dump.value != "") {
+            val options = LLVMCreatePassBuilderOptions()
+            val optimized = llvmConsumeError(LLVMRunPasses(module, bootstrapCtSlicePasses(program.functions.size), nativeNullPointer(),
+                options), 129) == 0
+            LLVMDisposePassBuilderOptions(options)
+            if (optimized) {
+                val written = LlvmOwnedModule(context, module, 0, false)
+                val _optimizedText = written.writeText("${dump.value}/generation-$generation.optimized.ll")
+                written.closed = true
+            }
+        }
+        return
     }
     // Whether the generation can start threads (its runtime creates them with pthread_create): ct_eval.ab enables the
     // compiler heap's lock before calling into it.
@@ -2965,6 +2998,40 @@ fun bootstrapCtMarkStopSites(builder: i64*, callee: i64*, site: i64*): void {
     return
 }
 
+// i64 abla.ct.thread.self(): a Windows slice's thread, GetCurrentThreadId's 32 bits (with the declaration the slice's runtime
+// may already have: its integer result, whose upper half Win64 leaves undefined).
+fun bootstrapCtWindowsThreadSelf(context: i64*, module: i64*): i64* {
+    val i32Type = LLVMInt32TypeInContext(context)
+    val i64Type = LLVMInt64TypeInContext(context)
+    var current = LLVMGetNamedFunction(module, "GetCurrentThreadId")
+    if (pointerIsNull(current)) current = LLVMAddFunction(module, "GetCurrentThreadId", LLVMFunctionType(i32Type, nativeNullPointer(), 0, 0))
+    val currentType = LLVMGlobalGetValueType(current)
+    val self = LLVMAddFunction(module, "abla.ct.thread.self", LLVMFunctionType(i64Type, nativeNullPointer(), 0, 0))
+    LLVMSetLinkage(self, llvmInternalLinkage())
+    val builder = LLVMCreateBuilderInContext(context)
+    LLVMPositionBuilderAtEnd(builder, LLVMAppendBasicBlockInContext(context, self, "entry"))
+    val raw = LLVMBuildCall2(builder, currentType, current, nativeNullPointer(), 0, "id")
+    val wide = if (LLVMGetIntTypeWidth(LLVMGetReturnType(currentType)) < i32(64)) LLVMBuildZExt(builder, raw, i64Type, "id.wide")
+        else LLVMBuildAnd(builder, raw, LLVMConstInt(i64Type, 4294967295, 0), "id.low")
+    LLVMBuildRet(builder, wide)
+    LLVMDisposeBuilder(builder)
+    self
+}
+
+// A Windows slice's C library names, as the Windows compiler exports them: its runtime's write and _exit are abla_windows_write
+// and abla_windows_exit there (src/backend/llvm/windows.ab), and the process has no `write` or `_exit` of its own to resolve.
+fun bootstrapCtWindowsNames(module: i64*): void {
+    val names = [["write", "abla_windows_write"], ["_exit", "abla_windows_exit"]]
+    for (pair in names) {
+        val function = LLVMGetNamedFunction(module, pair[0])
+        if (!pointerIsNull(function) && LLVMIsDeclaration(function) != 0 &&
+            pointerIsNull(LLVMGetNamedFunction(module, pair[1]))) {
+            LLVMSetValueName2(function, pair[1], pair[1].size)
+        }
+    }
+    return
+}
+
 fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool {
     val builder = LLVMCreateBuilderInContext(context)
     val voidType = LLVMVoidTypeInContext(context)
@@ -3011,7 +3078,11 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     val stopSite = LLVMAddGlobal(module, pointer, "abla_ct_stop_site_$generation")
     LLVMSetInitializer(stopSite, LLVMConstNull(pointer))
     val selfType = LLVMFunctionType(i64Type, nativeNullPointer(), 0, 0)
-    var pthreadSelf = LLVMGetNamedFunction(module, "pthread_self")
+    // A Windows slice has no pthreads: its thread is GetCurrentThreadId's (bootstrapCtWindowsThreadSelf), its stop on another
+    // thread is the one recorded in abla.ct.pending (no signal to send: the time limit's watchdog redirects the guard's thread,
+    // whose jump then takes it), and a thread parks in Sleep(INFINITE) where a POSIX one pauses.
+    val windows = bootstrapCtSliceWindows()
+    var pthreadSelf = if (windows) bootstrapCtWindowsThreadSelf(context, module) else LLVMGetNamedFunction(module, "pthread_self")
     if (pointerIsNull(pthreadSelf)) pthreadSelf = LLVMAddFunction(module, "pthread_self", selfType)
     // Every jump back to the guard (the trap, abort and panic catchers, the alarm and fault handlers) goes through
     // abla.ct.jump, with _longjmp's type: a jmp_buf is only good on the thread that set it, and a thread the site
@@ -3053,19 +3124,36 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     killParameters.set(1, i32Type)
     val killType = LLVMFunctionType(i32Type, killParameters.pointer(), 2, 0)
     killParameters.drop()
-    var pthreadKill = LLVMGetNamedFunction(module, "pthread_kill")
-    if (pointerIsNull(pthreadKill)) pthreadKill = LLVMAddFunction(module, "pthread_kill", killType)
-    val killArguments = llvmPointerVector(2)
-    killArguments.set(0, owner)
-    killArguments.set(1, LLVMConstInt(i32Type, 11, 0))
-    LLVMBuildCall2(builder, killType, pthreadKill, killArguments.pointer(), 2, "")
-    killArguments.drop()
+    if (!windows) {
+        var pthreadKill = LLVMGetNamedFunction(module, "pthread_kill")
+        if (pointerIsNull(pthreadKill)) pthreadKill = LLVMAddFunction(module, "pthread_kill", killType)
+        val killArguments = llvmPointerVector(2)
+        killArguments.set(0, owner)
+        killArguments.set(1, LLVMConstInt(i32Type, 11, 0))
+        LLVMBuildCall2(builder, killType, pthreadKill, killArguments.pointer(), 2, "")
+        killArguments.drop()
+    }
     LLVMBuildBr(builder, jumpPark)
     LLVMPositionBuilderAtEnd(builder, jumpPark)
-    val pauseType = LLVMFunctionType(i32Type, nativeNullPointer(), 0, 0)
-    var pause = LLVMGetNamedFunction(module, "pause")
-    if (pointerIsNull(pause)) pause = LLVMAddFunction(module, "pause", pauseType)
-    LLVMBuildCall2(builder, pauseType, pause, nativeNullPointer(), 0, "")
+    if (windows) {
+        // Sleep(INFINITE), with the declaration the slice's runtime may already have (its integer type).
+        var sleep = LLVMGetNamedFunction(module, "Sleep")
+        if (pointerIsNull(sleep)) {
+            val sleepParameters = llvmPointerVector(1)
+            sleepParameters.set(0, i32Type)
+            sleep = LLVMAddFunction(module, "Sleep", LLVMFunctionType(voidType, sleepParameters.pointer(), 1, 0))
+            sleepParameters.drop()
+        }
+        val forever = llvmPointerVector(1)
+        forever.set(0, LLVMConstInt(LLVMTypeOf(LLVMGetParam(sleep, i32(0))), 4294967295, 0))
+        LLVMBuildCall2(builder, LLVMGlobalGetValueType(sleep), sleep, forever.pointer(), 1, "")
+        forever.drop()
+    } else {
+        val pauseType = LLVMFunctionType(i32Type, nativeNullPointer(), 0, 0)
+        var pause = LLVMGetNamedFunction(module, "pause")
+        if (pointerIsNull(pause)) pause = LLVMAddFunction(module, "pause", pauseType)
+        LLVMBuildCall2(builder, pauseType, pause, nativeNullPointer(), 0, "")
+    }
     LLVMBuildBr(builder, jumpPark)
     // A failed runtime check traps (llvm.trap): it stops the same way.
     val trap = LLVMGetNamedFunction(module, "llvm.trap")
@@ -3216,7 +3304,22 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
         handlerJump.drop()
         LLVMBuildUnreachable(builder)
         LLVMPositionBuilderAtEnd(builder, handlerIdle)
-        if (fault) {
+        if (fault && windows) {
+            // A Windows slice ends the process as abort would (status 134, a SIGABRT death's), through kernel32, which the
+            // process always resolves: Windows has no `abort` of its own to find (tools/test-windows-compiler.sh).
+            var ending = LLVMGetNamedFunction(module, "ExitProcess")
+            if (pointerIsNull(ending)) {
+                val exitParameters = llvmPointerVector(1)
+                exitParameters.set(0, i32Type)
+                ending = LLVMAddFunction(module, "ExitProcess", LLVMFunctionType(voidType, exitParameters.pointer(), 1, 0))
+                exitParameters.drop()
+            }
+            val status = llvmPointerVector(1)
+            status.set(0, LLVMConstInt(LLVMTypeOf(LLVMGetParam(ending, i32(0))), 134, 0))
+            LLVMBuildCall2(builder, LLVMGlobalGetValueType(ending), ending, status.pointer(), 1, "")
+            status.drop()
+            LLVMBuildUnreachable(builder)
+        } else if (fault) {
             var fatal = LLVMGetNamedFunction(module, "abort")
             if (pointerIsNull(fatal)) {
                 fatal = LLVMAddFunction(module, "abort", LLVMFunctionType(voidType,

@@ -54,6 +54,29 @@ done
 defined=$(llvm-nm --defined-only --extern-only "$out/ablac.exe.o" | wc -l)
 listed=$(grep -c '^    ' "$kept/exports.def")
 [[ $listed == "$defined" ]] || fail "exports.def lists $listed symbols, the object defines $defined"
+# What the Windows compiler's compile-time slices leave for its process to resolve (docs/design/windows-jit.md): ORC finds a
+# symbol in ablac.exe's exports (exports.def above) or in a system DLL the runtime imports from (runtime/windows/imports), and
+# nowhere else, so a POSIX name (pthread_self, pthread_kill, pause, write: tier=native run 45280182873) fails the generation
+# and every site falls back to the interpreter. The slice a Windows host makes is written here by this compiler
+# (ABLA_CT_HOST_TRIPLE: made for that host, dumped, never run) for a scalar site, and every symbol it declares must be one of
+# those, or an LLVM intrinsic: in the slice after the passes the JIT runs on it (generation-<g>.optimized.ll), as ORC sees it.
+slice="$out/ct-slice"
+rm -rf "$slice"
+ABLA_CT_HOST_TRIPLE=x86_64-pc-windows-msvc ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_DUMP="$slice" \
+    "$compiler" build tests/cases/compile-eval-jit/scalars.ab --target x86_64-windows-hosted -o "$out/ct-slice.exe" --no-cache \
+    > "$out/ct-slice.log" 2>&1 || { tail -5 "$out/ct-slice.log" >&2; fail "the compile-time slice probe did not build"; }
+ls "$slice"/generation-*.optimized.ll > /dev/null 2>&1 || fail "no optimized Windows compile-time slice was written ($out/ct-slice.log)"
+{ awk '/^    / { print $1 }' "$kept/exports.def"; grep -hv '^#' runtime/windows/imports/*.txt; } | sort -u > "$out/ct-slice.allowed"
+# A declaration nothing in the slice uses gives ORC nothing to resolve (the runtime's declarations are many): only a declared
+# symbol the code names again counts.
+grep -h '^declare' "$slice"/generation-*.optimized.ll | sed -E 's/.* @"?([^"( ]+)"?\(.*/\1/' | grep -v '^llvm\.' | sort -u |
+    while read -r symbol; do
+        uses=$(grep -ohE "@\"?${symbol//./\\.}\"?[(, )]" "$slice"/generation-*.optimized.ll | wc -l)
+        ((uses > 1)) && echo "$symbol"
+    done > "$out/ct-slice.declared" || true
+[[ -s $out/ct-slice.declared ]] || fail "the Windows compile-time slice declares nothing to resolve: the probe is not a native slice"
+unresolved=$(comm -23 "$out/ct-slice.declared" "$out/ct-slice.allowed")
+[[ -z $unresolved ]] || fail "a Windows compile-time slice declares what ablac.exe cannot resolve: $(tr '\n' ' ' <<< "$unresolved")"
 { echo .text; grep '^LLVM' "$out/undefined.txt" | while read -r symbol; do printf '.globl %s\n%s:\n    xorl %%eax, %%eax\n    ret\n' "$symbol" "$symbol"; done; } > "$out/stub.s"
 llvm-mc -triple x86_64-pc-windows-msvc -filetype=obj "$out/stub.s" -o "$out/stub.o"
 mkdir -p "$out/package/bin" "$out/package/share/abla" "$out/work"
