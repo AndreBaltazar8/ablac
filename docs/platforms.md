@@ -36,7 +36,8 @@ Checksums accompany the published compiler and toolchain assets.
 | WebAssembly hosted | T2 | No Wasm-hosted compiler gate | Release/development modules execute with the `abla_host` ABI under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | WebAssembly hostless | T2 | No Wasm-hosted compiler gate | Import-free runtime fixtures and differential programs execute under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | Xtensa / ESP32 | T3 | No compiler hosted on the microcontroller | Object/assembly checks and optional companion integration; no required board run | No ablac ESP32 binary; separately versioned LLVM companion |
-| Windows | Planned | No Windows host compiler gate | Generic COFF emission is not Windows program/runtime support | None for Windows |
+| Windows x86-64 | T2 | The packaged `ablac.exe` is exercised on `windows-latest` in release runs (`windows: with` or `only`), not in push CI; no Windows self-rebuild or suite shard yet | Cross-built on Linux; selected programs run natively on `windows-latest` in CI (the freestanding exit-status program and the hosted crash program with its symbolized backtrace); the hosted file, process, socket and thread programs run under Wine on Linux only | None in v0.2.64; `abla-toolchain-x86_64-windows.zip` is built by the release workflow and not yet published |
+| Windows ARM64 | T2 | No Windows-hosted compiler | Hosted programs cross-built on Linux and run natively on `windows-11-arm` in CI | None for Windows ARM64 |
 <!-- readiness-platforms:end -->
 
 `tools/readiness.sh` reads this marked table directly. Update
@@ -181,8 +182,45 @@ in these workflows. See [companion installation and limits](llvm-xtensa.md).
 
 ## Windows
 
-Neither [CI](../.github/workflows/ci.yml) nor
-[Release](../.github/workflows/release.yml) defines a Windows runner entry,
-Windows compiler asset or Windows runtime gate. Accepting `coff` in a generic
-target descriptor proves neither a working Windows linker/runtime nor Windows
-hosting. Windows remains planned.
+x86-64. [CI](../.github/workflows/ci.yml) job `windows-cross`, **Windows
+programs, cross-built on Linux**, builds a freestanding program
+(`x86_64-windows`) and the hosted crash program (`x86_64-windows-hosted`, the
+runtime and standard library over `kernel32`), with and without `--backtrace`,
+and runs [test-windows-link.sh](../tools/test-windows-link.sh). Job
+`windows-run`, **Windows programs, run on Windows**, runs the images on
+`windows-latest`: the exit status of the freestanding program, the hosted
+crash program's access-violation report, and its backtrace symbolized to file
+and line. The local suite adds the Wine lanes:
+[test-windows-hosted.sh](../tools/test-windows-hosted.sh) builds the hosted
+programs in `tests/cases/windows/hosted` (hello, arguments, environment,
+files, processes, loopback sockets, threads) and compares what each prints
+under Wine with the same program on Linux, and
+[test-windows-crash.sh](../tools/test-windows-crash.sh),
+[test-windows-syscalls.sh](../tools/test-windows-syscalls.sh) and
+[test-windows-compiler.sh](../tools/test-windows-compiler.sh) cover the crash
+reports, the system calls the compiler makes and the compiler's image against
+a stub LLVM.
+
+In [Release](../.github/workflows/release.yml), the `windows` input selects the
+Windows toolchain jobs: `windows-object`, `windows-link`, `windows-package`
+(`abla-toolchain-x86_64-windows.zip`, see
+[package-windows-toolchain.sh](../tools/package-windows-toolchain.sh)) and
+`windows-exercise`, which unpacks the zip on `windows-latest` with only
+System32 on `PATH` and builds and runs a hello world and a program that imports
+a project module, with `--backtrace`, from a moved toolchain and from a path
+with a space. `windows: fixpoint` adds `windows-fixpoint`, the compiler's
+self-build on a Windows runner. [Windows compiler link](../.github/workflows/windows-compiler-link.yml)
+links the Windows compiler against its static LLVM SDK.
+
+ARM64. Job `windows-arm64-cross` cross-builds hosted programs and
+`windows-arm64-run`, **Windows ARM64 program runtime**, runs the checked
+images on `windows-11-arm`.
+
+Gaps: no published Windows asset yet (the zip is prepared by the release
+workflow, after the v0.2.64 baseline); the Windows compiler is exercised in
+release runs, not in push CI; the standard library's own test suite has no
+Windows run, and the hosted file, process, socket and thread programs are
+checked under Wine only; the Linux cross-builds link with the external `lld-link`, not the
+in-process one of the packaged toolchain. Accepting `coff` in a generic target descriptor proves
+neither a working Windows linker/runtime nor Windows hosting. See
+[the Windows design](design/windows-target.md).
