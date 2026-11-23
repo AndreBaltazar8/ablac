@@ -8,10 +8,12 @@ tools are installed. This page does not record a fresh run of those checks.
 
 ## Target selection
 
-The compiler's built-in `--target` list is exactly `x86_64-linux`,
-`aarch64-linux`, `riscv64-linux`, `x86_64-macos`, `arm64-macos`,
-`x86_64-windows` and `wasm32-wasi`. See `bootstrapSupportedTargets` and
-`bootstrapTargetDescriptor` in [src/toolchain.ab](../src/toolchain.ab).
+The compiler's built-in `--target` list is `x86_64-linux`, `aarch64-linux`,
+`riscv64-linux`, `x86_64-macos`, `arm64-macos`, `x86_64-windows`
+(freestanding programs), `aarch64-windows` (hosted programs), and
+`wasm32-wasi`. The names are defined by
+`bootstrapSupportedTargets` and `bootstrapTargetDescriptor` in
+[src/toolchain.ab](../src/toolchain.ab).
 There is no built-in `arm64-linux` or Android alias. AArch64 Linux uses
 the spelling `aarch64-linux`. The [platform support matrix](platforms.md)
 records current CI coverage tiers and distinguishes source workflow artifacts
@@ -81,6 +83,7 @@ suite. The local-suite checks below are registered in the [Makefile](../Makefile
 | RISC-V64 raw/build-defined — `riscv64-unknown-elf` or `riscv64-unknown-linux-gnu` | Local-suite object inspection and freestanding emulator execution | [test-target-descriptors.sh](../tools/test-target-descriptors.sh) checks raw ELF objects and exports. [test-wide-integers.sh](../tools/test-wide-integers.sh) supplies its own startup and runs arithmetic under `qemu-riscv64`, including a configuration without the M extension. |
 | RISC-V32 — raw `riscv32-unknown-elf` | Local-suite object/helper inspection; conditional freestanding emulator execution | [test-wide-integers.sh](../tools/test-wide-integers.sh) builds objects, checks arithmetic helper dependencies and runs with its own startup under `qemu-riscv32` when installed, without the M extension. No hosted compiler release. |
 | Windows x86_64 — `x86_64-windows`, `x86_64-pc-windows-msvc` (freestanding only) | Cross-built on Linux; link lane in the local suite, not run on Windows yet | A program whose `abla_start` ends the process through `kernel32` (no runtime, no standard library, no C runtime) is linked by lld-link into a PE32+ console image, with import libraries the compiler writes from [runtime/windows/imports](../runtime/windows/imports) ([src/coff_import.ab](../src/coff_import.ab): no SDK). [test-windows-link.sh](../tools/test-windows-link.sh) checks that it is reproducible, that its imports are within [windows-imports-allowlist.txt](../tools/windows-imports-allowlist.txt) with no C runtime under any name, and runs it under Wine when Wine is installed. The hosted target (runtime, standard library, threads, files) is the plan in [design/windows-target.md](design/windows-target.md); the link runs the external `lld-link`, not yet the in-process one. |
+| Windows ARM64 — `aarch64-windows`, `aarch64-pc-windows-msvc` | Hosted libc-free programs cross-built on Linux | The compiler emits ARM64 COFF and links a console PE using its own entry and the shared Windows runtime. [test-windows-arm64.sh](../tools/test-windows-arm64.sh) checks the images, TLS, unwind, and imports. The `windows-arm64-run` CI job runs the exact checked images on `windows-11-arm`. |
 | Other triples / formats, including COFF | Experimental generic emission contract only | [src/toolchain.ab](../src/toolchain.ab) accepts the raw descriptor formats listed above. [test-target-descriptors.sh](../tools/test-target-descriptors.sh) proves that mechanism for selected ELF targets; it is not evidence of Windows hosting, arbitrary CPU support, or runtime coverage for every LLVM backend. |
 
 ## Toolchain and runtime boundaries

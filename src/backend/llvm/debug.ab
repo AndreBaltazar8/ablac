@@ -1812,9 +1812,18 @@ fun bootstrapLlvmWindowsImageEnd(backend: BootstrapLlvmBackend): i64* {
     LLVMBuildAdd(builder, base, size, "image.end")
 }
 
-// A word of the thread's TEB, by the gs segment (address space 256): the stack's base (highest address) at 8, its
-// limit at 16.
+// The NT_TIB starts the TEB, with the stack base at 8 and the limit at 16.
+// x64 reads through gs (address space 256). ARM64 keeps the TEB in x18.
 fun bootstrapLlvmWindowsThreadWord(backend: BootstrapLlvmBackend, offset: int): i64* {
+    if (backend.targetTriple.startsWith("aarch64-")) {
+        val type = bootstrapLlvmFunctionType(backend, backend.i64Type, [])
+        val assembly = "mov \$0, x18"
+        val teb = bootstrapLlvmCallTyped(backend, type,
+            LLVMGetInlineAsm(type, assembly, assembly.size, "=r", 2, 0, 0, 0, 0),
+            [], "teb")
+        return bootstrapLlvmLoadAddress(backend, backend.i64Type,
+            LLVMBuildAdd(backend.builder, teb, LLVMConstInt(backend.i64Type, offset, 0), ""))
+    }
     val segment = LLVMPointerTypeInContext(backend.context, i32(256))
     LLVMBuildLoad2(backend.builder, backend.i64Type,
         LLVMBuildIntToPtr(backend.builder, LLVMConstInt(backend.i64Type, offset, 0), segment, ""), "")
@@ -1890,25 +1899,25 @@ fun bootstrapLlvmEmitWindowsFaultHandler(backend: BootstrapLlvmBackend): void {
     return
 }
 
-// The stack on Windows, by the system's unwinder over the image's unwind data (.pdata: every function of a -g or
-// --backtrace image has it, bootstrapLlvmWindowsUnwindTables): a CONTEXT (1232 bytes, 16-aligned; Rsp at 152, Rip at
-// 248), the fault's (abla_runtime_fault_context) or this function's own (RtlCaptureContext), is stepped a frame at a
-// time by RtlLookupFunctionEntry and RtlVirtualUnwind, and each return address is printed less one, so it falls inside
-// the call, as Linux's walk prints them. (Win64 code does not keep a frame-pointer chain: LLVM's rbp points into the
-// frame, not at the saved rbp.) A function without unwind data is a leaf, its return address at the stack pointer,
-// read only within this thread's stack (the TEB's bounds). The walk skips the context's own frame (the faulting
-// instruction, printed first, or this function), and ends at a null pc, a stack pointer that does not rise, or after 64
-// frames.
+// RtlLookupFunctionEntry and RtlVirtualUnwind walk the PE unwind data from the
+// interrupted context or one taken by RtlCaptureContext. A leaf's return
+// address comes from the stack on x64 and from LR on ARM64. The walk skips
+// the initial context's frame and stops when it exhausts 64 frames or stalls.
 fun bootstrapLlvmEmitWindowsStackWalk(backend: BootstrapLlvmBackend, printStack: i64*): void {
     val i64 = backend.i64Type
     val builder = backend.builder
+    // Windows ARM64 CONTEXT holds 31 integer registers before SP and PC.
+    val arm = backend.targetTriple.startsWith("aarch64-")
+    val contextBytes = if (arm) 912 else 1232
+    val spOffset = if (arm) 256 else 152
+    val pcOffset = if (arm) 264 else 248
     bootstrapLlvmDebugWrite(
         backend,
         "stack (return addresses: subtract the load address, then llvm-symbolizer on the program gives file:line):\n",
         "abla.stack.header"
     )
     bootstrapLlvmWalkFaultPc(backend, printStack)
-    val context = LLVMBuildAlloca(builder, LLVMArrayType2(backend.i8Type, 1232), "context")
+    val context = LLVMBuildAlloca(builder, LLVMArrayType2(backend.i8Type, contextBytes), "context")
     LLVMSetAlignment(context, 16)
     val contextAddress = LLVMBuildPtrToInt(builder, context, i64, "")
     val imageBase = LLVMBuildAlloca(builder, i64, "unwind.base")
@@ -1935,13 +1944,14 @@ fun bootstrapLlvmEmitWindowsStackWalk(backend: BootstrapLlvmBackend, printStack:
     LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 33, faultContext, LLVMConstInt(i64, 0, 0), ""), copy, capture)
     LLVMPositionBuilderAtEnd(builder, copy)
     LLVMBuildMemCpy(builder, context, i32(16), LLVMBuildIntToPtr(builder, faultContext, backend.pointerType, ""), i32(16),
-        LLVMConstInt(i64, 1232, 0))
+        LLVMConstInt(i64, contextBytes, 0))
     LLVMBuildBr(builder, loop)
     LLVMPositionBuilderAtEnd(builder, capture)
     bootstrapLlvmWindowsCall(backend, "RtlCaptureContext", [contextAddress])
     LLVMBuildBr(builder, loop)
     LLVMPositionBuilderAtEnd(builder, loop)
-    val pc = LLVMBuildLoad2(builder, i64, bootstrapLlvmByteAt(backend, context, 1232, 248), "pc")
+    val pcAt = bootstrapLlvmByteAt(backend, context, contextBytes, pcOffset)
+    val pc = LLVMBuildLoad2(builder, i64, pcAt, "pc")
     val count = LLVMBuildLoad2(builder, i64, counter, "")
     LLVMBuildCondBr(builder, LLVMBuildAnd(builder,
         LLVMBuildICmp(builder, 33, pc, LLVMConstInt(i64, 0, 0), ""),
@@ -1951,7 +1961,7 @@ fun bootstrapLlvmEmitWindowsStackWalk(backend: BootstrapLlvmBackend, printStack:
     LLVMBuildStore(builder, LLVMConstInt(i64, 0, 0), skip)
     LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 33, skipping, LLVMConstInt(i64, 0, 0), ""), step, show)
     LLVMPositionBuilderAtEnd(builder, show)
-    val inCall = LLVMBuildSub(builder, pc, LLVMConstInt(i64, 1, 0), "")
+    val inCall = LLVMBuildSub(builder, pc, LLVMConstInt(i64, if (arm) 4 else 1, 0), "")
     bootstrapLlvmDebugWriteHex(backend, inCall)
     if (bootstrapLlvmBacktrace) {
         bootstrapLlvmCall(backend, bootstrapLlvmBacktraceNameFunction(backend), [inCall], "", false, [])
@@ -1960,33 +1970,52 @@ fun bootstrapLlvmEmitWindowsStackWalk(backend: BootstrapLlvmBackend, printStack:
     LLVMBuildStore(builder, LLVMBuildAdd(builder, count, LLVMConstInt(i64, 1, 0), ""), counter)
     LLVMBuildBr(builder, step)
     LLVMPositionBuilderAtEnd(builder, step)
-    val stackPointerAt = bootstrapLlvmByteAt(backend, context, 1232, 152)
-    val pcAt = bootstrapLlvmByteAt(backend, context, 1232, 248)
+    val stackPointerAt = bootstrapLlvmByteAt(backend, context, contextBytes, spOffset)
     val stackPointer = LLVMBuildLoad2(builder, i64, stackPointerAt, "sp")
+    val controlPc = if (arm) {
+        // The initial PC is in the interrupted frame. Subsequent PCs are
+        // return addresses, so look up the call instruction.
+        LLVMBuildSelect(builder,
+            LLVMBuildICmp(builder, 33, skipping, LLVMConstInt(i64, 0, 0), ""),
+            pc, LLVMBuildSub(builder, pc, LLVMConstInt(i64, 4, 0), ""), "")
+    } else pc
     val entry = bootstrapLlvmWindowsCall(backend, "RtlLookupFunctionEntry",
-        [pc, LLVMBuildPtrToInt(builder, imageBase, i64, ""), LLVMConstInt(i64, 0, 0)])
+        [controlPc, LLVMBuildPtrToInt(builder, imageBase, i64, ""), LLVMConstInt(i64, 0, 0)])
     LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 33, entry, LLVMConstInt(i64, 0, 0), ""), unwind, leaf)
     LLVMPositionBuilderAtEnd(builder, unwind)
     // RtlVirtualUnwind(UNW_FLAG_NHANDLER, image base, pc, entry, context, &handler data, &establisher frame, NULL).
     bootstrapLlvmWindowsCall(backend, "RtlVirtualUnwind", [LLVMConstInt(i64, 0, 0),
-        LLVMBuildLoad2(builder, i64, imageBase, ""), pc, entry, contextAddress,
+        LLVMBuildLoad2(builder, i64, imageBase, ""), controlPc, entry, contextAddress,
         LLVMBuildPtrToInt(builder, handlerData, i64, ""), LLVMBuildPtrToInt(builder, establisher, i64, ""),
         LLVMConstInt(i64, 0, 0)])
     LLVMBuildBr(builder, moved)
     LLVMPositionBuilderAtEnd(builder, leaf)
     val limit = bootstrapLlvmWindowsThreadWord(backend, 16)
+    val base = bootstrapLlvmWindowsThreadWord(backend, 8)
+    val stackRead = if (arm) 0 else 8
     val inside = LLVMBuildICmp(builder, 36, LLVMBuildSub(builder, stackPointer, limit, ""),
-        LLVMBuildSub(builder, LLVMBuildSub(builder, bootstrapLlvmWindowsThreadWord(backend, 8), limit, ""),
-            LLVMConstInt(i64, 8, 0), ""), "")
+        LLVMBuildSub(builder, LLVMBuildSub(builder, base, limit, ""),
+            LLVMConstInt(i64, stackRead, 0), ""), "")
     LLVMBuildCondBr(builder, inside, leafRead, stop)
     LLVMPositionBuilderAtEnd(builder, leafRead)
-    LLVMBuildStore(builder, bootstrapLlvmLoadAddress(backend, i64, stackPointer), pcAt)
-    LLVMBuildStore(builder, LLVMBuildAdd(builder, stackPointer, LLVMConstInt(i64, 8, 0), ""), stackPointerAt)
+    if (arm) {
+        val lr = bootstrapLlvmByteAt(backend, context, contextBytes, 248)
+        LLVMBuildStore(builder, LLVMBuildLoad2(builder, i64, lr, "lr"), pcAt)
+    } else {
+        LLVMBuildStore(builder, bootstrapLlvmLoadAddress(backend, i64, stackPointer), pcAt)
+        LLVMBuildStore(builder, LLVMBuildAdd(builder, stackPointer, LLVMConstInt(i64, 8, 0), ""), stackPointerAt)
+    }
     LLVMBuildBr(builder, moved)
     LLVMPositionBuilderAtEnd(builder, moved)
-    // Only upward: a stack pointer that did not rise ends the walk.
-    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 37, LLVMBuildLoad2(builder, i64, stackPointerAt, ""), stackPointer, ""),
-        stop, loop)
+    val nextSp = LLVMBuildLoad2(builder, i64, stackPointerAt, "")
+    val stalled = if (arm) {
+        // An ARM64 leaf can return through LR with an unchanged SP.
+        val sameSp = LLVMBuildICmp(builder, 32, nextSp, stackPointer, "")
+        val samePc = LLVMBuildICmp(builder, 32, LLVMBuildLoad2(builder, i64, pcAt, ""), pc, "")
+        LLVMBuildOr(builder, LLVMBuildICmp(builder, 36, nextSp, stackPointer, ""),
+            LLVMBuildAnd(builder, sameSp, samePc, ""), "")
+    } else LLVMBuildICmp(builder, 37, nextSp, stackPointer, "")
+    LLVMBuildCondBr(builder, stalled, stop, loop)
     LLVMPositionBuilderAtEnd(builder, stop)
     LLVMBuildStore(builder, LLVMConstInt(i64, 0, 0), pcAt)
     LLVMBuildBr(builder, loop)

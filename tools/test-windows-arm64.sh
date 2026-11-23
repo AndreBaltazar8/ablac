@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Cross-build with the Linux static compiler and retain the inspected artifacts for the ARM runner.
+set -euo pipefail
+export LC_ALL=C
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+compiler=${1:-build/ablac-static}
+[[ $compiler == /* ]] || compiler="$PWD/$compiler"
+cd "$root"
+out="$root/build/windows-arm64-programs"
+mkdir -p "$out"
+tools=$(mktemp -d "$root/build/windows-arm64-tools.XXXXXX")
+trap 'rm -rf -- "$tools"' EXIT
+fail() { printf 'windows-arm64: %s\n' "$*" >&2; exit 1; }
+
+# A split backtrace uses objcopy. With only objcopy on PATH, opt, llc and
+# lld-link have to come from the compiler itself.
+objcopy=$(command -v llvm-objcopy) || fail 'llvm-objcopy is required'
+ln -s "$objcopy" "$tools/llvm-objcopy"
+unset ABLA_LLVM_TOOLS ABLA_TEST_FAST_BUILDS ABLA_DEBUG
+export ABLA_SYSROOT="$root"
+
+allowed=$(cat tools/windows-imports-allowlist.txt)
+build_pe() {
+    local name=$1 source=$2 exe dll function
+    shift 2
+    exe="$out/$name.exe"
+    PATH="$tools" "$compiler" build "tests/cases/$source.ab" --target aarch64-windows \
+        --no-cache -o "$exe" "$@" > "$out/$name.build.log" 2>&1 ||
+        { cat "$out/$name.build.log" >&2; fail "$name did not build"; }
+    llvm-readobj --file-headers --coff-imports --coff-tls-directory --coff-basereloc --unwind \
+        "$exe" > "$out/$name.pe"
+    grep -q 'Machine: IMAGE_FILE_MACHINE_ARM64 (0xAA64)' "$out/$name.pe" || fail "$name has the wrong machine"
+    grep -q 'Subsystem: IMAGE_SUBSYSTEM_WINDOWS_CUI' "$out/$name.pe" || fail "$name has the wrong subsystem"
+    grep -Eq 'AddressOfEntryPoint: 0x[0-9A-Fa-f]*[1-9A-Fa-f]' "$out/$name.pe" || fail "$name lacks an entry point"
+    grep -q 'TLSDirectory {' "$out/$name.pe" || fail "$name lacks loader TLS"
+    grep -q 'Type: DIR64' "$out/$name.pe" || fail "$name lacks 64-bit base relocations"
+    grep -q 'RuntimeFunction {' "$out/$name.pe" || fail "$name lacks ARM64 unwind data"
+    local imports
+    imports=$(awk '/^ *Name:/ { dll = $2 } /^ *Symbol:/ { print dll, $2 }' "$out/$name.pe")
+    grep -qxF 'kernel32.dll ExitProcess' <<< "$imports" || fail "$name lacks ExitProcess"
+    while read -r dll function; do
+        grep -qxF "$dll $function" <<< "$allowed" ||
+            fail "$name imports $dll $function outside the Windows allowlist"
+    done <<< "$imports"
+}
+
+build_pe hello-fast windows/hosted/hello --fast
+for name in hello args environment files threads; do
+    build_pe "$name" "windows/hosted/$name"
+done
+build_pe tls thread-local-image/main
+build_pe stm stm/basic
+build_pe stack-probe windows/arm64/stack-probe
+build_pe crash windows/crash/crash --backtrace
+grep -q 'Symbol: RtlVirtualUnwind' "$out/crash.pe" || fail 'backtrace omitted the Windows unwinder'
+[[ -s $out/crash.exe.debug ]] || fail 'backtrace omitted split debug info'
+llvm-readobj --unwind "$out/threads.exe.o" > "$out/threads.unwind"
+for stub in abla_win_thread_start pthread_create pthread_join; do
+    grep -q "Function: $stub (" "$out/threads.unwind" || fail "$stub lacks unwind data"
+done
+llvm-readobj --relocations "$out/stack-probe.exe.o" > "$out/stack-probe.relocations"
+grep -q 'IMAGE_REL_ARM64_BRANCH26 __chkstk' "$out/stack-probe.relocations" ||
+    fail 'the stack fixture did not call __chkstk'
+
+native="$out/files.native"
+"$compiler" build tests/cases/windows/hosted/files.ab --fast --no-cache -o "$native" > "$out/files.native.log" 2>&1 ||
+    { cat "$out/files.native.log" >&2; fail 'could not build the Linux files fixture'; }
+(cd "$out" && "$native") > "$out/files.expected"
+(cd "$out" && sha256sum -- ./*.exe ./crash.exe.debug ./files.expected | sed 's|  \./|  |' > SHA256SUMS)
+echo 'windows-arm64: 10 ARM64 PE programs passed structural checks'

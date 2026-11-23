@@ -82,9 +82,10 @@ are built with the `--o1` profile, as `ablac run`'s: a suite's time is mostly it
 running. `--fast` builds them with the development profile instead, for tests that
 run for less time than their build takes.
 
-Built-in hosted targets are `x86_64-linux`, `aarch64-linux`, `riscv64-linux`,
-`x86_64-macos`, and `arm64-macos`. Cross-linking Mach-O on Linux requires
-`ABLA_MACOS_SDK`. The optional `ABLA_MACOS_LLVM_LIB` and `ABLA_MACOS_OPENSSL_LIB` select directories holding
+Built-in hosted targets include `x86_64-linux`, `aarch64-linux`, `riscv64-linux`,
+`x86_64-macos`, `arm64-macos`, and `aarch64-windows`. Cross-linking Mach-O on Linux requires
+`ABLA_MACOS_SDK`. The optional `ABLA_MACOS_LLVM_LIB` and
+`ABLA_MACOS_OPENSSL_LIB` select directories holding
 target dylibs or `.tbd` stubs. `tools/build-macos-from-linux.sh` prepares the
 stubs from the pinned target-library ABIs and builds both Mac architectures.
 
