@@ -720,8 +720,9 @@ fun httpReadRequest(
         val preliminary = httpParseRequest(input)
         val framing = httpRequestFraming(preliminary, false, maximumBody)
         val contentLength = framing
-        if (framing == -1) {
-            // Malformed framing: nothing of what was read is returned, so the request is refused.
+        if (framing == -1 || httpRequestLineVersion(input, preliminary, headerEnd) < 0) {
+            // Malformed framing or a line that is not a request (an empty or non-token method, no `HTTP/1.x`): nothing of what was
+            // read is returned, so the request is refused, as the event servers refuse it.
             input = ""
         } else if (framing == -2) {
             var decoded = httpCoreDecodeChunked(
@@ -1723,4 +1724,110 @@ fun serveHttpOnListener(router: HttpRouter, var listener: TcpListener): int {
     }
     listener.close()
     0
+}
+
+/** The request line must be `method SP target SP HTTP/1.x` and nothing else: returns 1 for HTTP/1.1, 0 for HTTP/1.0
+ *  and -1 for anything else, which is refused (a line that is not a request is never routed). The target is an origin
+ *  form (`/p`), `*`, or an absolute form (`http://host/p`, which a proxy sends). The parser has already split the
+ *  line, so this reads only where the version has to be: after the method, the path and the query. */
+fun httpRequestLineVersion(
+    input: string, request: HttpRequest, headerEnd: int
+): int =
+    if (ablaCompileTimeNativeHost()) httpLineVersionNative(input, request, headerEnd)
+    else if (ablaAtCompileTime()) httpLineVersionChecked(input, request, headerEnd)
+    else httpLineVersionNative(input, request, headerEnd)
+
+private @inline trusted fun httpLineByte(data: int, index: int): int =
+    ablaUnsafeLoadU8(nativePointerFromAddress(data + index))
+
+private fun httpLineSchemeChar(byte: int): bool =
+    (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+        (byte >= 48 && byte <= 57) || byte == 43 || byte == 45 || byte == 46
+
+// The checked reads, for the compile-time evaluator.
+private fun httpLineProtocolChecked(input: string, at: int): bool =
+    input[at] == 32 && input[at + 9] == 13 && input[at + 10] == 10 &&
+        input[at + 1] == 72 && input[at + 2] == 84 && input[at + 3] == 84 &&
+        input[at + 4] == 80 && input[at + 5] == 47 && input[at + 6] == 49 &&
+        input[at + 7] == 46 && (input[at + 8] == 48 || input[at + 8] == 49)
+
+private fun httpLineTargetChecked(input: string, first: int, end: int): bool {
+    val lead = input[first]
+    var accepted = lead == 47 || lead == 42
+    if (!accepted && httpLineSchemeChar(lead) && lead > 57) {
+        // A scheme, then "://".
+        var scan = first + 1
+        while (scan < end && httpLineSchemeChar(input[scan])) scan = scan + 1
+        accepted = scan + 3 < end && input[scan] == 58 && input[scan + 1] == 47 &&
+            input[scan + 2] == 47
+    }
+    accepted
+}
+
+private fun httpLineVersionChecked(
+    input: string, request: HttpRequest, headerEnd: int
+): int {
+    val method = request.method.size
+    var after = method + 1 + request.path.size
+    var version = -1
+    if (method > 0 && request.path.size > 0 && after + 10 <= headerEnd && httpLineMethodToken(input, method) &&
+        input[method] == 32) {
+        if (input[after] == 63) after = after + 1 + request.query.size
+        if (after + 10 <= headerEnd && httpLineProtocolChecked(input, after) &&
+            httpLineTargetChecked(input, method + 1, after)) {
+            version = if (input[after + 8] == 49) 1 else 0
+        }
+    }
+    version
+}
+
+// The same reads through raw loads: a few instructions a request. No allocation between taking the address
+// of the input and the last byte read.
+private trusted fun httpLineProtocolNative(data: int, at: int): bool =
+    httpLineByte(data, at) == 32 && httpLineByte(data, at + 9) == 13 &&
+        httpLineByte(data, at + 10) == 10 && httpLineByte(data, at + 1) == 72 &&
+        httpLineByte(data, at + 2) == 84 && httpLineByte(data, at + 3) == 84 &&
+        httpLineByte(data, at + 4) == 80 && httpLineByte(data, at + 5) == 47 &&
+        httpLineByte(data, at + 6) == 49 && httpLineByte(data, at + 7) == 46 &&
+        (httpLineByte(data, at + 8) == 48 || httpLineByte(data, at + 8) == 49)
+
+private trusted fun httpLineTargetNative(data: int, first: int, end: int): bool {
+    val lead = httpLineByte(data, first)
+    var accepted = lead == 47 || lead == 42
+    if (!accepted && httpLineSchemeChar(lead) && lead > 57) {
+        // A scheme, then "://".
+        var scan = first + 1
+        while (scan < end && httpLineSchemeChar(httpLineByte(data, scan))) scan = scan + 1
+        accepted = scan + 3 < end && httpLineByte(data, scan) == 58 &&
+            httpLineByte(data, scan + 1) == 47 && httpLineByte(data, scan + 2) == 47
+    }
+    accepted
+}
+
+private trusted fun httpLineVersionNative(
+    input: string, request: HttpRequest, headerEnd: int
+): int {
+    val data = ablaUnsafeStringAddress(input)
+    val method = request.method.size
+    var after = method + 1 + request.path.size
+    var version = -1
+    if (method > 0 && request.path.size > 0 && after + 10 <= headerEnd && httpLineMethodToken(input, method) &&
+        httpLineByte(data, method) == 32) {
+        if (httpLineByte(data, after) == 63) after = after + 1 + request.query.size
+        if (after + 10 <= headerEnd && httpLineProtocolNative(data, after) &&
+            httpLineTargetNative(data, method + 1, after)) {
+            version = if (httpLineByte(data, after + 8) == 49) 1 else 0
+        }
+    }
+    version
+}
+
+// Whether the first `size` bytes of `input` (the method) are all token characters (RFC 9110 9.1: a method is a token).
+private fun httpLineMethodToken(input: string, size: int): bool {
+    var at = 0
+    while (at < size) {
+        if (!httpTokenByte(input[at])) return false
+        at = at + 1
+    }
+    true
 }

@@ -233,102 +233,6 @@ fun HttpEventServer.closeSlot(slot: int): void {
     return
 }
 
-// The request line must be `method SP target SP HTTP/1.x` and nothing else: returns 1 for HTTP/1.1, 0 for HTTP/1.0
-// and -1 for anything else, which is refused (a line that is not a request is never routed). The target is an origin
-// form (`/p`), `*`, or an absolute form (`http://host/p`, which a proxy sends). The parser has already split the
-// line, so this reads only where the version has to be: after the method, the path and the query.
-private fun httpEventRequestLineVersion(
-    input: string, request: HttpRequest, headerEnd: int
-): int =
-    if (ablaCompileTimeNativeHost()) httpEventVersionNative(input, request, headerEnd)
-    else if (ablaAtCompileTime()) httpEventVersionChecked(input, request, headerEnd)
-    else httpEventVersionNative(input, request, headerEnd)
-
-private @inline trusted fun httpEventByte(data: int, index: int): int =
-    ablaUnsafeLoadU8(nativePointerFromAddress(data + index))
-
-private fun httpEventSchemeChar(byte: int): bool =
-    (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
-        (byte >= 48 && byte <= 57) || byte == 43 || byte == 45 || byte == 46
-
-// The checked reads, for the compile-time evaluator.
-private fun httpEventProtocolChecked(input: string, at: int): bool =
-    input[at] == 32 && input[at + 9] == 13 && input[at + 10] == 10 &&
-        input[at + 1] == 72 && input[at + 2] == 84 && input[at + 3] == 84 &&
-        input[at + 4] == 80 && input[at + 5] == 47 && input[at + 6] == 49 &&
-        input[at + 7] == 46 && (input[at + 8] == 48 || input[at + 8] == 49)
-
-private fun httpEventTargetChecked(input: string, first: int, end: int): bool {
-    val lead = input[first]
-    var accepted = lead == 47 || lead == 42
-    if (!accepted && httpEventSchemeChar(lead) && lead > 57) {
-        // A scheme, then "://".
-        var scan = first + 1
-        while (scan < end && httpEventSchemeChar(input[scan])) scan = scan + 1
-        accepted = scan + 3 < end && input[scan] == 58 && input[scan + 1] == 47 &&
-            input[scan + 2] == 47
-    }
-    accepted
-}
-
-private fun httpEventVersionChecked(
-    input: string, request: HttpRequest, headerEnd: int
-): int {
-    val method = request.method.size
-    var after = method + 1 + request.path.size
-    var version = -1
-    if (method > 0 && request.path.size > 0 && after + 10 <= headerEnd &&
-        input[method] == 32) {
-        if (input[after] == 63) after = after + 1 + request.query.size
-        if (after + 10 <= headerEnd && httpEventProtocolChecked(input, after) &&
-            httpEventTargetChecked(input, method + 1, after)) {
-            version = if (input[after + 8] == 49) 1 else 0
-        }
-    }
-    version
-}
-
-// The same reads through raw loads: a few instructions a request. No allocation between taking the address
-// of the input and the last byte read.
-private trusted fun httpEventProtocolNative(data: int, at: int): bool =
-    httpEventByte(data, at) == 32 && httpEventByte(data, at + 9) == 13 &&
-        httpEventByte(data, at + 10) == 10 && httpEventByte(data, at + 1) == 72 &&
-        httpEventByte(data, at + 2) == 84 && httpEventByte(data, at + 3) == 84 &&
-        httpEventByte(data, at + 4) == 80 && httpEventByte(data, at + 5) == 47 &&
-        httpEventByte(data, at + 6) == 49 && httpEventByte(data, at + 7) == 46 &&
-        (httpEventByte(data, at + 8) == 48 || httpEventByte(data, at + 8) == 49)
-
-private trusted fun httpEventTargetNative(data: int, first: int, end: int): bool {
-    val lead = httpEventByte(data, first)
-    var accepted = lead == 47 || lead == 42
-    if (!accepted && httpEventSchemeChar(lead) && lead > 57) {
-        // A scheme, then "://".
-        var scan = first + 1
-        while (scan < end && httpEventSchemeChar(httpEventByte(data, scan))) scan = scan + 1
-        accepted = scan + 3 < end && httpEventByte(data, scan) == 58 &&
-            httpEventByte(data, scan + 1) == 47 && httpEventByte(data, scan + 2) == 47
-    }
-    accepted
-}
-
-private trusted fun httpEventVersionNative(
-    input: string, request: HttpRequest, headerEnd: int
-): int {
-    val data = ablaUnsafeStringAddress(input)
-    val method = request.method.size
-    var after = method + 1 + request.path.size
-    var version = -1
-    if (method > 0 && request.path.size > 0 && after + 10 <= headerEnd &&
-        httpEventByte(data, method) == 32) {
-        if (httpEventByte(data, after) == 63) after = after + 1 + request.query.size
-        if (after + 10 <= headerEnd && httpEventProtocolNative(data, after) &&
-            httpEventTargetNative(data, method + 1, after)) {
-            version = if (httpEventByte(data, after + 8) == 49) 1 else 0
-        }
-    }
-    version
-}
-
 // HTTP/1.1 keeps the connection unless the request says close; HTTP/1.0 closes unless it says keep-alive.
 private fun httpEventKeepAlive(request: HttpRequest, http10: bool): bool =
     if (http10) httpHeaderTokenContains(request.header("Connection"), "keep-alive") &&
@@ -347,7 +251,7 @@ fun httpEventRequestLength(
         headerEnd > maximumHeader) result = -1
     if (headerEnd >= 0 && headerEnd <= maximumHeader) {
         val request = httpParseRequest(input.slice(0, headerEnd))
-        val version = httpEventRequestLineVersion(input, request, headerEnd)
+        val version = httpRequestLineVersion(input, request, headerEnd)
         val framing = httpRequestFraming(request, version == 0, maximumBody)
         if (version < 0 || framing == -1) result = -1
         else if (framing == -2) {
@@ -402,7 +306,7 @@ fun httpEventFrame(
         // event path parsed every complete request once to discover framing,
         // discarded that graph, then parsed the same bytes again.
         val request = httpParseRequestFrom(input, peer)
-        val version = httpEventRequestLineVersion(input, request, headerEnd)
+        val version = httpRequestLineVersion(input, request, headerEnd)
         http10 = version == 0
         val framing = httpRequestFraming(request, http10, maximumBody)
         if (version < 0 || framing == -1) length = -1

@@ -1,0 +1,60 @@
+// The request line the HTTP/1 servers accept (#1139 area 4): `method SP target SP HTTP/1.x`, the method a token. httpRequestLineVersion
+// is the one decision the event servers and the blocking reader (httpReadRequest, behind serveHttp) share: a line that is not a request is
+// refused (the reader returns nothing), a request is read in full. The reader is checked over a loopback socket.
+import "abla/io"
+import "abla/http"
+import "abla/net"
+import "abla/text"
+
+resource class Job(val port: int, val line: string)
+
+fun versionOf(head: string): int {
+    val request = httpParseRequest(head)
+    httpRequestLineVersion(head, request, httpHeaderEnd(head))
+}
+
+fun sendAndRead(line: string): string {
+    val listener = tcpListenAddress(ipv4Loopback(0))
+    val job = Shared(Job(listener.localPort(), line))
+    val sender = thread {
+        val connection = tcpConnect(ipv4Loopback(job.get().port), 5000)
+        if (connection.descriptor < 0) 1 else {
+            connection.write("${job.get().line}\r\nHost: a\r\n\r\n")
+            0
+        }
+    }
+    val connection = listener.accept()
+    val read = httpReadRequest(connection)
+    await sender
+    read
+}
+
+fun main: int {
+    var bad = 0
+    val tail = "\r\nHost: a\r\n\r\n"
+    val accepted: array<string> = ["GET / HTTP/1.1", "POST /p?x=1 HTTP/1.0", "get /x HTTP/1.1", "G3T / HTTP/1.1", "M-SEARCH * HTTP/1.1",
+        "GET http://a/p HTTP/1.1"]
+    val refused: array<string> = ["]ET / HTTP/1.1", "POS;T /p HTTP/1.1", "GET / HTTP/1.2", "GET /", "GET / HTTP/1.1x", " / HTTP/1.1",
+        "GET  / HTTP/1.1", "GET / http/1.1", "GET /a b HTTP/1.1"]
+    for (line in accepted) {
+        if (versionOf("$line$tail") < 0) {
+            println("refused: $line")
+            bad = bad + 1
+        }
+        if (sendAndRead(line) != "$line$tail") {
+            println("reader dropped: $line")
+            bad = bad + 1
+        }
+    }
+    for (line in refused) {
+        if (versionOf("$line$tail") >= 0) {
+            println("accepted: $line")
+            bad = bad + 1
+        }
+        if (sendAndRead(line) != "") {
+            println("reader kept: $line")
+            bad = bad + 1
+        }
+    }
+    if (bad == 0) 42 else 1
+}
