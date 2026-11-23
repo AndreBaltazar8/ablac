@@ -1329,9 +1329,13 @@ the ordinary-global write analysis use the type checker's selected declaration,
 in host and cross-target builds alike (#828). An unrelated type's method with the
 same name does not become a dependency of that call. Unknown, ambiguous,
 generic or interface dispatch keeps the conservative candidate set; retained
-class bodies and eager global initializers still need their existing checks.
+classes carry the types named in their method signatures as well as their
+bodies, and eager global initializers still need their existing checks.
 The write analysis gives a parameter of a scalar or string type no origins: such
 a value is no part of any global's heap, whatever it was computed from.
+The standard `Path.readText()` call uses the compiler's file provider in both
+tiers, so its runtime file-handling body does not contribute ordinary-global
+writes.
 
 - A runtime panic in native compile-time code is the evaluator's error for the
   same failure, with the same text (`E_EVAL_OUT_OF_BOUNDS`,

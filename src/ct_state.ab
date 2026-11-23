@@ -23,6 +23,7 @@
 import "parser.ab"
 import "sema.ab"
 import "call_targets.ab"
+import "ct_native_effects.ab"
 import "abla/text"
 
 class BootstrapCtStateResult(
@@ -840,12 +841,29 @@ class BootstrapCtState(
         taints
     }
 
+    // The evaluator and the native slice both call the compiler's file
+    // provider for Path.readText. It reads the path and returns a string
+    // without reaching any of the program's ordinary globals through its
+    // runtime implementation (for example through descriptor.close()).
+    fun bridgedReadText(item: int): bool {
+        if (item >= this.declarations.size) return false
+        val declaration = this.declarations[item]
+        declaration.extensionOwner == "Path" && declaration.parameters.size == 0 &&
+            declaration.resultType == "string" &&
+            bootstrapCanonicalDeclarationSourceName(declaration.name) == "readText" &&
+            bootstrapCompileBridgedProvider(declaration)
+    }
+
     fun evaluateMemberCall(expression: BootstrapExpression): array<int> {
         val receiver = this.evaluate(expression.children[0])
         val name = expression.text
         var known = this.methodCandidates(name)
         val exact = this.exactTarget(expression, known)
         if (exact >= 0) known = [exact]
+        if (name == "readText" && known.size == 1 && this.bridgedReadText(known[0])) {
+            this.evaluateArguments(expression, 1)
+            return []
+        }
         // The receiver and the elements, built once (#1022: copying the receiver, merging the elements into the copy and
         // copying that again for the result was most of the write analysis). It is the result: the arguments are
         // evaluated (a lambda argument's parameters merged from it) before anything is added to it.
@@ -864,6 +882,7 @@ class BootstrapCtState(
             bootstrapCtStateMerge(result, arguments)
         }
         for (item in known) {
+            if (name == "readText" && this.bridgedReadText(item)) continue
             this.reach(item)
             this.mergeVariable(item, "$item:this", receiver)
             this.bindArguments(item, taints, 0)
