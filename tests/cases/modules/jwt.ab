@@ -1,5 +1,6 @@
 import "abla/io"
 import "abla/jwt"
+import "abla/crypto/p256"
 
 // Vectors generated with Node crypto (RSA-2048 and P-256 keys); the fixed
 // clock is 1900000000 and the valid tokens expire 600 seconds later.
@@ -40,6 +41,30 @@ fun jwtTestCheck(var tally: JwtTally, name: string, ok: bool): void {
         println("FAIL $name")
         tally.failures = tally.failures + 1
     }
+    return
+}
+
+// A token without `exp` would never expire: refused by default, accepted with requireExpiration = false (decision
+// #116 A). The Node vectors all carry `exp`, so these tokens are signed here with a fixed P-256 key; one with `exp` is
+// the control that the key and signing are right.
+fun jwtTestSigned(privateKey: string, claims: string): string {
+    val message = jwtBase64UrlEncode("{\"alg\":\"ES256\",\"kid\":\"ec-own\"}") + "." + jwtBase64UrlEncode(claims)
+    message + "." + jwtBase64UrlEncode(p256EcdsaSignRaw(privateKey, message).bytes)
+}
+
+fun jwtTestExpiration(var tally: JwtTally): void {
+    val privateKey = "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20"
+    val point = p256PublicKey(privateKey).bytes
+    val keys = jwtKeySet("{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"ec-own\",\"alg\":\"ES256\",\"x\":\"" +
+        jwtBase64UrlEncode(point.slice(1, 33)) + "\",\"y\":\"" + jwtBase64UrlEncode(point.slice(33, 65)) + "\"}]}")
+    val withExp = jwtTestSigned(privateKey, "{\"sub\":\"player-42\",\"exp\":1900000600}")
+    val withoutExp = jwtTestSigned(privateKey, "{\"sub\":\"player-42\"}")
+    val clock = JwtOptions(nowSeconds = 1900000000)
+    jwtTestCheck(tally, "own key with exp", keys.error == "" && keys.verify(withExp, clock).valid)
+    val refused = keys.verify(withoutExp, clock)
+    jwtTestCheck(tally, "no exp refused", !refused.valid && refused.error == "expiration not found in token")
+    val allowed = keys.verify(withoutExp, JwtOptions(nowSeconds = 1900000000, requireExpiration = false))
+    jwtTestCheck(tally, "no exp allowed", allowed.valid && allowed.subject == "player-42")
     return
 }
 
@@ -85,5 +110,6 @@ fun main: int {
         jwtBase64UrlDecode("YWI").bytes == "ab")
     val bad = jwtKeySet("{\"keys\":3}")
     jwtTestCheck(tally, "bad jwks", bad.error != "")
+    jwtTestExpiration(tally)
     if (tally.failures == 0) 42 else 1
 }

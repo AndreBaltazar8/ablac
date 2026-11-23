@@ -531,7 +531,7 @@ if (result.valid) admit(result.subject) else refuse(result.error)
 |---|---|
 | `jwtKeySet(jwksJson)` | a `JwtKeySet` from a JWKS document; `size()`, `hasKey(kid)` |
 | `keySet.verify(token, JwtOptions(...))` | a `JwtVerification(valid, error, subject, kid, header, claims)` |
-| `JwtOptions(issuer = "", audience = "", clockToleranceSeconds = 0, requireSubject = true, nowSeconds = -1)` | the claims to enforce; a negative `nowSeconds` reads the clock |
+| `JwtOptions(issuer = "", audience = "", clockToleranceSeconds = 0, requireSubject = true, nowSeconds = -1, requireExpiration = true)` | the claims to enforce; a negative `nowSeconds` reads the clock; a token without `exp` is refused unless `requireExpiration = false` |
 | `jwtDecodeUnverified(token)` | the claims as `Json`, **without** checking the signature: for logging only |
 | `jwksCache(url, ...)`, `cache.verify(token, options)` | from `abla/jwt/remote`: a cached, refreshed remote key set |
 
