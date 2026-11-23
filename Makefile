@@ -370,6 +370,7 @@ test-serial: ablac
 	tools/test-compile-eval-shared-state.sh $(COMPILER) wasm
 	tools/test-compile-eval-json.sh $(COMPILER)
 	tools/test-compile-eval-cross-target.sh $(COMPILER)
+	tools/test-compile-eval-panic-targets.sh $(COMPILER)
 	tools/test-compile-eval-method-targets.sh $(COMPILER)
 	tools/test-compile-eval-file-state.sh $(COMPILER)
 	tools/test-compile-eval-environment.sh $(COMPILER)
