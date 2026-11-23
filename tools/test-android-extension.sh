@@ -73,8 +73,8 @@ if rg -n 'ABLA_ANDROID|ANDROID_NDK|ANDROID_HOME|ANDROID_SDK_ROOT|libclang_rt' \
     exit 1
 fi
 
-# A synthetic NDK (an empty builtins archive and a libc.so stub in the NDK's layout): the extension finds it through
-# ABLA_ANDROID_NDK or under ANDROID_HOME/ndk/<version> and the link names libc.so as needed; with no NDK, it does not.
+# Discover a synthetic NDK through both roots. A scalar export has no dependency, and an export importing
+# the stub's test symbol keeps the dependency.
 fake="$output_directory/fake"
 rm -rf "$fake"
 ndk="$fake/sdk/ndk/27.0.0/toolchains/llvm/prebuilt/linux-x86_64"
@@ -82,18 +82,32 @@ mkdir -p "$ndk/lib/clang/20/lib/linux" "$ndk/sysroot/usr/lib/aarch64-linux-andro
 : > "$fake/empty.s"
 llvm-mc -triple aarch64-linux-android -filetype=obj "$fake/empty.s" -o "$fake/empty.o"
 llvm-ar rcs "$ndk/lib/clang/20/lib/linux/libclang_rt.builtins-aarch64-android.a" "$fake/empty.o"
-ld.lld -shared -m aarch64linux -soname libc.so "$fake/empty.o" -o "$ndk/sysroot/usr/lib/aarch64-linux-android/24/libc.so"
+llvm-mc -triple aarch64-linux-android -filetype=obj -o "$fake/libc.o" <<'ASM'
+.text
+.globl abla_android_stub_probe
+abla_android_stub_probe:
+    mov x0, #42
+    ret
+ASM
+ld.lld -shared -m aarch64linux -soname libc.so "$fake/libc.o" -o "$ndk/sysroot/usr/lib/aarch64-linux-android/24/libc.so"
 needed() { llvm-readelf -d "$library" | grep -c 'NEEDED.*\[libc.so\]' || true; }
+without_ndk=(env -u ABLA_ANDROID_NDK -u ANDROID_NDK_ROOT -u ANDROID_NDK_HOME
+    -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ABLA_ANDROID_BUILTINS)
 
-env -u ABLA_ANDROID_NDK -u ANDROID_NDK_ROOT -u ANDROID_NDK_HOME -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ABLA_ANDROID_BUILTINS \
+"${without_ndk[@]}" \
     "$compiler" build "$project_root/tests/cases/android-extension/build.ab" \
     -o "$output_directory/build-driver" --fast --no-cache
 [[ $(needed) -eq 0 ]] || { echo "a library built with no NDK needs libc.so" >&2; exit 1; }
-ABLA_ANDROID_NDK="$fake/sdk/ndk/27.0.0" \
+"${without_ndk[@]}" ABLA_ANDROID_NDK="$fake/sdk/ndk/27.0.0" \
+    "$compiler" build "$project_root/tests/cases/android-extension/build.ab" \
+    -o "$output_directory/build-driver" --fast --no-cache
+[[ $(needed) -eq 0 ]] || { echo "an import-free Android library needs libc.so" >&2; exit 1; }
+
+"${without_ndk[@]}" ABLA_TEST_ANDROID_IMPORT=1 ABLA_ANDROID_NDK="$fake/sdk/ndk/27.0.0" \
     "$compiler" build "$project_root/tests/cases/android-extension/build.ab" \
     -o "$output_directory/build-driver" --fast --no-cache
 [[ $(needed) -eq 1 ]] || { echo "ABLA_ANDROID_NDK: the library does not need libc.so" >&2; exit 1; }
-env -u ABLA_ANDROID_NDK ANDROID_HOME="$fake/sdk" \
+"${without_ndk[@]}" ABLA_TEST_ANDROID_IMPORT=1 ANDROID_HOME="$fake/sdk" \
     "$compiler" build "$project_root/tests/cases/android-extension/build.ab" \
     -o "$output_directory/build-driver" --fast --no-cache
 [[ $(needed) -eq 1 ]] || { echo "ANDROID_HOME: the library does not need libc.so" >&2; exit 1; }

@@ -2,7 +2,8 @@
 # Whether an android-arm64 library could load, checked without a device (#811): every symbol it leaves
 # undefined must be defined by the library itself or exported by bionic's API 24 libc, libm, libdl or liblog
 # (the NDK's sysroot stubs), and the set of those imports may only shrink (tools/android-imports-allowlist.txt,
-# "<case> <symbol>"). This is a link check only: nothing here runs Android code.
+# "<case> <symbol>"). Independently, the scalar library should have no shared dependencies, while the libraries
+# using bionic should list libc.so. This is a link check only: nothing here runs Android code.
 # The NDK is looked for like the compiler looks for its builtins: ABLA_ANDROID_NDK, ANDROID_NDK_ROOT,
 # ANDROID_NDK_HOME, then ndk/<newest> or ndk-bundle under ANDROID_HOME and ANDROID_SDK_ROOT. Without one the
 # test says so and skips (exit 0), as the other Android tests do without their tools.
@@ -32,6 +33,7 @@ if [[ -z $libc ]]; then
 fi
 sysroot_libs=$(dirname "$libc")
 nm=$(command -v llvm-nm || command -v nm)
+readelf=$(command -v llvm-readelf || command -v readelf)
 out=build/android-link
 rm -rf "$out"
 mkdir -p "$out"
@@ -41,7 +43,24 @@ for lib in libc libm libdl liblog; do
 done | sort -u > "$exports"
 allow=tools/android-imports-allowlist.txt
 actual=$out/actual.txt
+needed=$out/needed.txt
 : > "$actual"
+: > "$needed"
+
+undefined_symbols() {
+    "$nm" -D --undefined-only "$1" | awk '{ s = $NF; sub(/@.*/, "", s); if (s != "") print s }' | sort -u
+}
+
+check_api_imports() {
+    local library=$1 symbols unresolved
+    symbols=$(undefined_symbols "$library") || return 1
+    unresolved=$(printf '%s\n' "$symbols" | sed '/^$/d' | comm -23 - "$exports") || return 1
+    if [[ -n $unresolved ]]; then
+        printf 'android link: %s imports symbols absent from the API 24 stubs:\n%s\n' "$library" "$unresolved" >&2
+        return 1
+    fi
+    if [[ -n $symbols ]]; then printf '%s\n' "$symbols"; fi
+}
 # label:build program:output directory:ABLA_DEBUG. The debug runtime is part of the set: it must not import a symbol
 # newer than the API level (backtrace is API 33) or bionic's write, and a release build must not import more.
 for variant in small:small:small:0 threads:threads:threads:0 threads-debug:threads:threads:1 rich:rich:rich:0 rich-release:rich-release:rich-release:0 \
@@ -53,14 +72,17 @@ for variant in small:small:small:0 threads:threads:threads:0 threads-debug:threa
     [[ $status -eq 37 ]] || { echo "android link: building the $case library failed ($status)" >&2; exit 1; }
     library=$out/$dir/src/main/jniLibs/arm64-v8a/libabla_app.so
     [[ -f $library ]] || { echo "android link: no $library" >&2; exit 1; }
-    "$nm" -D --undefined-only "$library" | awk -v c="$case" '{ s = $NF; sub(/@.*/, "", s); if (s != "") print c " " s }' | sort -u >> "$actual"
+    check_api_imports "$library" | sed "s/^/$case /" >> "$actual"
+    libraries=$("$readelf" -d "$library" | sed -n 's/.*(NEEDED).*\[\([^]]*\)\].*/\1/p')
+    expected=
+    if [[ $case != small ]]; then expected=libc.so; fi
+    printf '%s %s\n' "$case" "${libraries:-<none>}" >> "$needed"
+    if [[ $libraries != "$expected" ]]; then
+        printf 'android link: %s DT_NEEDED expected [%s], got [%s]\n' "$case" "$expected" "$libraries" >&2
+        exit 1
+    fi
 done
 sort -u -o "$actual" "$actual"
-unresolved=$(awk '{ print $2 }' "$actual" | sort -u | comm -23 - "$exports")
-if [[ -n $unresolved ]]; then
-    printf 'android link: undefined symbols that neither the library nor bionic (API 24) defines, so dlopen would fail:\n%s\n' "$unresolved" >&2
-    exit 1
-fi
 sort -c "$allow" || { echo "android link: $allow must be sorted" >&2; exit 1; }
 unexpected=$(comm -23 "$actual" "$allow")
 if [[ -n $unexpected ]]; then
@@ -69,4 +91,18 @@ if [[ -n $unexpected ]]; then
 fi
 gone=$(comm -13 "$actual" "$allow")
 [[ -z $gone ]] || printf 'android link: no longer imported, remove from %s:\n%s\n' "$allow" "$gone"
-echo "android link: $(wc -l < "$actual") imports, all exported by bionic API 24 and within the allowed list"
+
+# A real shared object with an undefined symbol that none of the stubs can supply.
+llvm-mc -triple aarch64-linux-android -filetype=obj -o "$out/unavailable.o" <<'ASM'
+.text
+.globl abla_android_unavailable_probe
+abla_android_unavailable_probe:
+    b abla_android_missing_api24_symbol
+ASM
+ld.lld -shared -m aarch64linux "$out/unavailable.o" -o "$out/unavailable.so"
+if check_api_imports "$out/unavailable.so" > "$out/unavailable.log" 2>&1; then
+    echo 'android link: accepted the unavailable-import control' >&2
+    exit 1
+fi
+grep -qx abla_android_missing_api24_symbol "$out/unavailable.log"
+echo "android link: $(wc -l < "$actual") allowed API 24 imports, DT_NEEDED checked, unavailable-import control rejected"
