@@ -423,6 +423,7 @@ test-serial: ablac
 	tools/test-package-windows-toolchain.sh $(COMPILER)
 	tools/test-release-check-windows.sh $(COMPILER)
 	tools/test-windows-hosted.sh $(COMPILER)
+	tools/test-windows-programs.sh $(COMPILER)
 	tools/test-windows-syscalls.sh $(COMPILER)
 	tools/test-windows-crash.sh $(COMPILER)
 	tools/test-module-path-identity.sh $(COMPILER)

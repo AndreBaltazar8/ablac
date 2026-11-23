@@ -55,6 +55,9 @@ for source in tests/cases/windows/hosted/*.ab; do
         ran=$((ran + 1))
     done
 done
+# What a Windows runner needs to run the same programs natively (tools/windows/test-hosted.ps1, the windows-run job in ci.yml): the
+# images, the Linux outputs they must print and their hashes, so the runner checks it runs what was built here.
+(cd "$out" && sha256sum -- ./*.exe ./*.expected | sed 's|  \./|  |' > SHA256SUMS)
 if ((skipped > 0)); then
     echo "windows-hosted: built, imports within the allowlist, no C runtime; $skipped runs skipped (Wine is not installed)"
 else

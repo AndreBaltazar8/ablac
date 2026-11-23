@@ -189,12 +189,19 @@ runtime and standard library over `kernel32`), with and without `--backtrace`,
 and runs [test-windows-link.sh](../tools/test-windows-link.sh). Job
 `windows-run`, **Windows programs, run on Windows**, runs the images on
 `windows-latest`: the exit status of the freestanding program, the hosted
-crash program's access-violation report, and its backtrace symbolized to file
-and line. The local suite adds the Wine lanes:
-[test-windows-hosted.sh](../tools/test-windows-hosted.sh) builds the hosted
-programs in `tests/cases/windows/hosted` (hello, arguments, environment,
-files, processes, loopback sockets, threads) and compares what each prints
-under Wine with the same program on Linux, and
+crash program's access-violation report, its backtrace symbolized to file and
+line, the seven hosted programs in `tests/cases/windows/hosted` (hello,
+arguments, environment, files, processes, loopback sockets, threads; `--fast`
+and release) and the 63 standard-library programs listed in
+[programs.txt](../tests/cases/windows/programs.txt) (collections, text, date,
+files, process exit, loopback HTTP and WebSocket, threads, ...). The Linux job
+leaves each image with the output and exit status the same program has built
+natively for Linux and their hashes;
+[test-hosted.ps1](../tools/windows/test-hosted.ps1) compares what the runner's
+Windows prints and returns. The local suite runs the same images under Wine:
+[test-windows-hosted.sh](../tools/test-windows-hosted.sh) and
+[test-windows-programs.sh](../tools/test-windows-programs.sh) compare what each
+prints under Wine with the Linux run, and
 [test-windows-crash.sh](../tools/test-windows-crash.sh),
 [test-windows-syscalls.sh](../tools/test-windows-syscalls.sh) and
 [test-windows-compiler.sh](../tools/test-windows-compiler.sh) cover the crash
@@ -218,9 +225,26 @@ images on `windows-11-arm`.
 
 Gaps: no published Windows asset yet (the zip is prepared by the release
 workflow, after the v0.2.64 baseline); the Windows compiler is exercised in
-release runs, not in push CI; the standard library's own test suite has no
-Windows run, and the hosted file, process, socket and thread programs are
-checked under Wine only; the Linux cross-builds link with the external `lld-link`, not the
-in-process one of the packaged toolchain. Accepting `coff` in a generic target descriptor proves
+release runs, not in push CI; the Linux cross-builds link with the external
+`lld-link`, not the in-process one of the packaged toolchain. Of the
+standard library's test programs (`tests/abla-tests.json`), those in
+`programs.txt` run on Windows; the rest of the survey is blocked by:
+Linux system calls the Windows runtime does not translate (`symlink` in
+`filesystem.ab`, `sendmsg` in `linux-net.ab`, `getrusage` in
+`process-metrics.ab`, `rt_sigprocmask` in `signal-watch.ab`,
+`epoll_create1` in the WebSocket server tests, `geteuid` in
+`path-home`, and raw `linuxSyscall` calls in `udp-ephemeral.ab`);
+no TLS on a hosted Windows program (`network-advanced.ab` fails to link
+`OpenSSL_version_num`; the TLS tests need an OpenSSL); tests that run POSIX tools
+(`printf`, `sh` in `process-capture.ab`, `host-process-configured.ab`,
+`inferred-command`); POSIX path semantics (`path-syntax`: `Path` follows
+the host, see `module-path-identity`); IPv6 loopback and the socket poller
+(`hosted-network.ab` fails under Wine and is unchecked on a runner);
+the asynchronous resolver and HTTP client (`dns-async.ab`, `http-async.ab` exit 1
+under Wine, cause not yet diagnosed);
+and tests whose success depends on arguments, the environment or files a
+driver script sets up (`fs-tree`, `process-environment`, `path-file-mode`,
+`path-directory-mode`). The rest of the compiler's own tests (`tests/cases`
+programs driven by shell scripts) build and run on Linux only. Accepting `coff` in a generic target descriptor proves
 neither a working Windows linker/runtime nor Windows hosting. See
 [the Windows design](design/windows-target.md).
