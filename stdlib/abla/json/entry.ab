@@ -4547,11 +4547,17 @@ trusted fun jsonEncodeStringAt(value: string, destination: int): int {
     destination + jsonEscapedSize(value)
 }
 
-// Returns a syntax call to the named function with one argument.
+// Builds a single-argument call. Static stringification can return a literal.
 compile fun ablaJsonSyntaxCall(
     name: string,
     value: SyntaxExpression
 ): SyntaxExpression {
+    // Evaluate the parser argument before trying the optional fold so a stopped
+    // parse propagates through the original call path.
+    if (name == "jsonStringify") {
+        val output = byteBuffer()
+        if (ablaJsonAppendStatic(output, value, 0)) return syntaxString(output.toText())
+    }
     val arguments: array<SyntaxExpression> = []
     arguments.append(value)
     syntaxCall(name, arguments)
@@ -4692,9 +4698,44 @@ compile fun ablaJsonParseObject(cursor: ParserCursor, streamed: bool = false): S
     if (guarded && !streamed) ablaJsonGuardedTree(object, prefix) else object
 }
 
-// `$jsons` shares the JSON grammar but produces its deterministic encoded
-// string directly. In staged code, `#$jsons {...}` validates and serializes the
-// literal at compile time, leaving only the frozen string in the program.
+/// Appends pre-encoded JSON when every node is literal. Returns false when
+/// ordinary evaluation or validation is needed. Discard the buffer on false.
+private compile fun ablaJsonAppendStatic(
+    var output: ByteBuffer,
+    expression: SyntaxExpression,
+    depth: int
+): bool {
+    // Folding is optional. Deeper trees keep the ordinary writer and its guard.
+    if (depth >= 8) return false
+    val name = syntaxText(expression)
+    if (name == "ablaJsonArray" || name == "ablaJsonObject") {
+        val object = name == "ablaJsonObject"
+        if (object && syntaxChildCount(expression) != 2) return false
+        val keys = syntaxChild(expression, 0)
+        val values = if (object) syntaxChild(expression, 1) else keys
+        output.appendText(if (object) "{" else "[")
+        for (index in 0 until syntaxChildCount(values)) {
+            if (index > 0) output.appendText(",")
+            if (object) {
+                val key = syntaxChild(keys, index)
+                if (syntaxKind(key) != "string" || !syntaxText(key).isValidUtf8()) return false
+                output.appendText(jsonQuote(syntaxText(key)))
+                output.appendText(":")
+            }
+            if (!ablaJsonAppendStatic(output, syntaxChild(values, index), depth + 1)) return false
+        }
+        output.appendText(if (object) "}" else "]")
+    } else if (name == "ablaJsonNull") output.appendText("null")
+    else if (name == "ablaJsonNumberText") output.appendText(syntaxText(syntaxChild(expression, 0)))
+    else if (name == "ablaJsonBoolean") output.appendText(
+        if (syntaxKind(syntaxChild(expression, 0)) == "true") "true" else "false"
+    )
+    else if (name == "ablaJsonString") output.appendText(jsonQuote(syntaxText(syntaxChild(expression, 0))))
+    else return false
+    true
+}
+
+/// Returns compact JSON text, folding shallow static literals after a successful parse.
 compile fun ablaJsonParseStringifiedValue(
     cursor: ParserCursor
 ): SyntaxExpression = ablaJsonSyntaxCall(
