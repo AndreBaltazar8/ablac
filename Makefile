@@ -250,6 +250,7 @@ test-serial: ablac
 	tools/test-collection-modes.sh $(COMPILER)
 	tools/test-android-pointer-tags.sh $(COMPILER)
 	tools/test-arrays-dense.sh $(COMPILER)
+	tools/test-table-search-bound.sh $(COMPILER)
 	tools/test-json-limits.sh $(COMPILER)
 	tools/test-yaml.sh $(COMPILER)
 	tools/test-yaml-diff.sh $(COMPILER)

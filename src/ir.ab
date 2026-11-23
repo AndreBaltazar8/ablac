@@ -12939,6 +12939,14 @@ fun bootstrapLowerWhile(
     val body = if (build == null) expression.children[1] else build.body
     val test = expression.children[0]
     val small = bootstrapSmallCountedWhile(test, body)
+    var tableBound = -1
+    if (build == null && !lowerer.validationOnly && body.kind == "block" &&
+        body.children.size == 3 && body.children[1].kind == "if" &&
+        bootstrapTableSearchBound(lowerer, test, body)) {
+        val mark = lowerer.locals.size
+        tableBound = lowerer.lowerExpression(test.children[1])
+        lowerer.dropTemporaries(mark)
+    }
     val conditionLabel = lowerer.allocateLabel()
     val bodyLabel = lowerer.allocateLabel()
     val mergeLabel = lowerer.allocateLabel()
@@ -12957,7 +12965,8 @@ fun bootstrapLowerWhile(
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, conditionLabel, -1, "")
     val conditionMark = lowerer.locals.size
-    val condition = lowerer.lowerExpression(test)
+    val condition = if (tableBound < 0) lowerer.lowerExpression(test) else
+        lowerer.emit("<", lowerer.lowerExpression(test.children[0]), tableBound, "")
     lowerer.dropTemporaries(conditionMark)
     lowerer.emitControl("branch", condition, bodyLabel, mergeLabel,
         if (small && lowerer.smallWhileDepth > 0) BOOTSTRAP_IR_SMALL_LOOP_NEST else "")
@@ -12982,6 +12991,64 @@ fun bootstrapLowerWhile(
     bootstrapFinishLoopStringBuild(lowerer, build)
     result = lowerer.emit("const.void", -1, -1, "")
     result
+}
+
+private fun bootstrapTableSearchLocal(
+    var lowerer: BootstrapLowerer, expression: BootstrapExpression, type: string
+): bool {
+    if (expression.kind != "identifier") return false
+    val local = lowerer.visibleLocal(expression.text, true)
+    local >= 0 && lowerer.localTypes[local] == type
+}
+
+// A short table search adds an entry to a scalar, may break on its
+// comparison, and advances its index. These operations cannot replace the
+// uncaptured string parameter. Keep the bound live only across this search.
+private @noinline fun bootstrapTableSearchBound(
+    var lowerer: BootstrapLowerer, test: BootstrapExpression, body: BootstrapExpression
+): bool {
+    if (test.kind != "<" || test.children.size != 2) return false
+    val index = test.children[0]
+    if (index.kind != "identifier") return false
+    var size = test.children[1]
+    if (size.kind == "-") {
+        if (size.children.size != 2 || size.children[1].kind != "integer") return false
+        size = size.children[0]
+    }
+    if (size.kind != "member" || size.text != "size" || size.children.size != 1) return false
+    if (!bootstrapTableSearchLocal(lowerer, index, "i64")) return false
+    val text = size.children[0]
+    if (text.kind != "identifier" || !lowerer.isParameter(text.text) ||
+        lowerer.isCapturedParameter(text.text) ||
+        lowerer.lowerParameterMetadataType(text.text) != "string") return false
+    val add = body.children[0]
+    val stop = body.children[1]
+    val update = body.children[2]
+    if (add.kind != "assign" || add.children.size != 1 || stop.children.size != 3 ||
+        stop.children[2].kind != "missing" || update.kind != "assign" ||
+        update.text != index.text || update.children.size != 1) return false
+    val sum = add.children[0]
+    if (sum.kind != "+" || sum.children.size != 2 ||
+        !bootstrapTableSearchLocal(lowerer, sum.children[0], "f64") ||
+        sum.children[0].text != add.text) return false
+    val item = sum.children[1]
+    if (item.kind != "index" || item.children.size != 2 ||
+        item.children[1].kind != "identifier" || item.children[1].text != index.text ||
+        item.children[0].kind != "identifier") return false
+    val table = item.children[0].text
+    if (!lowerer.isParameter(table) || lowerer.isCapturedParameter(table) ||
+        lowerer.lowerParameterMetadataType(table) != "array:f64") return false
+    var exit = stop.children[1]
+    if (exit.kind == "block" && exit.children.size == 1) exit = exit.children[0]
+    if (exit.kind != "break" || exit.text != "") return false
+    val compare = stop.children[0]
+    if ((compare.kind != "<" && compare.kind != ">") || compare.children.size != 2 ||
+        !bootstrapTableSearchLocal(lowerer, compare.children[0], "f64") ||
+        !bootstrapTableSearchLocal(lowerer, compare.children[1], "f64")) return false
+    val step = update.children[0]
+    step.kind == "+" && step.children.size == 2 &&
+        step.children[0].kind == "identifier" && step.children[0].text == index.text &&
+        step.children[1].kind == "integer" && step.children[1].text == "1"
 }
 
 @noinline
