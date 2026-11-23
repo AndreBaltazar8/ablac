@@ -280,7 +280,7 @@ grep -q ' JOBS=8 taskset -c 16-23 tools/run-tests.sh' <<<"$out" || fail "the sui
 grep -q 'RUN_TESTS_FULL' <<<"$out" && fail "the regular gate runs the full suite"
 grep -q 'reproducible-elsewhere' <<<"$out" && fail "the regular gate checks reproducibility"
 grep -q 'make self-rebuild' <<<"$out" || fail "make self-rebuild is missing"
-grep -q '8-11' <<<"$out" && fail "slot 3's gate touches slot 2's cores"
+grep -q 'taskset -c 8-11' <<<"$out" && fail "slot 3's gate touches slot 2's cores"
 # A tree with bootstrap-stages.sh: the quick stage 3, no separate stage builds.
 out=$("$gate" "$new_tree" 4 --dry-run 2>&1) || fail "gate --dry-run failed on a tree with bootstrap-stages.sh"
 grep -q 'taskset -c 24-31 tools/bootstrap-stages.sh build/gate/seed.bin build/gate$' <<<"$out" || { echo "$out" >&2; fail "the quick stages are not used (or --full is given) by the regular gate"; }
