@@ -3,16 +3,16 @@
 set -euo pipefail
 export LC_ALL=C
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-cd "$root"
 out=docs/readiness.md
 data=build/readiness
 notes=${HOME}/agents-memory/abla/ablac-differential-fuzzer.md
 usage() {
-    echo 'usage: tools/readiness.sh [--out FILE] [--data DIR] [--fuzz-notes FILE]' >&2
+    echo 'usage: tools/readiness.sh [--source CHECKOUT] [--out FILE] [--data DIR] [--fuzz-notes FILE]' >&2
     echo 'See docs/readiness-data/README.md for evidence formats and refresh commands.' >&2
 }
 while (($#)); do
     case $1 in
+        --source) root=${2:?}; shift 2 ;;
         --out) out=${2:?}; shift 2 ;;
         --data) data=${2:?}; shift 2 ;;
         --fuzz-notes) notes=${2:?}; shift 2 ;;
@@ -20,13 +20,17 @@ while (($#)); do
         *) usage; exit 2 ;;
     esac
 done
+cd "$root"
+revision=$(git rev-parse HEAD)
 command -v jq >/dev/null || { echo 'readiness: jq is required (use nix-shell)' >&2; exit 2; }
 mkdir -p -- "$(dirname -- "$out")"
 tmp=$(mktemp "${out}.XXXXXXXX")
 trap 'rm -f -- "$tmp"' EXIT
 missing() { printf 'Missing: %s.\n\n' "$*"; }
 evidence() {
-    printf 'Evidence: `%s`; SHA-256 `%s`.\n\n' "$1" "$(sha256sum < "$1" | awk '{print $1}')"
+    local path=$1 name=$1
+    if [[ $path == "$data/"* ]]; then name="saved evidence/${path#"$data/"}"; fi
+    printf 'Evidence: `%s`; SHA-256 `%s`.\n\n' "$name" "$(sha256sum < "$path" | awk '{print $1}')"
 }
 literal() {
     # Indented Markdown keeps arbitrary evidence (including backtick fences) inert.
@@ -34,10 +38,58 @@ literal() {
     printf '\n'
 }
 json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence: $1" >&2; exit 2; }; }
+hosted_ci() {
+    local ci=$data/ci.json
+    if [[ ! -s $ci ]]; then
+        missing 'saved CI run outcomes for the source revision'
+        return
+    fi
+    json_check "$ci" '
+        (.headSha | type == "string") and (.url | type == "string") and
+        (.status | type == "string") and (.conclusion | type == "string") and
+        (.jobs | type == "array" and all(.[];
+            (.name | type == "string") and (.status | type == "string") and
+            (.conclusion | type == "string")))'
+    evidence "$ci"
+    local tested
+    tested=$(jq -r .headSha "$ci")
+    if [[ $tested != "$revision" ]]; then
+        printf 'Saved CI describes `%s`.\n\n' "$tested"
+        missing 'saved CI run outcomes for the source revision'
+        return
+    fi
+    jq -r '
+        def outcome: .status + (if .conclusion == "" then "" else " / " + .conclusion end);
+        "Hosted CI for this revision: [run](\(.url)) · \(outcome)\n",
+        (.jobs[] | "- \(.name) · \(outcome)")' "$ci"
+    printf '\n'
+}
+release_assets() {
+    local release=$data/release.json tag
+    if [[ ! -s $release ]]; then
+        missing 'published asset snapshot for the source revision (release.json)'
+        return
+    fi
+    json_check "$release" '
+        (.tag_name | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+        .draft == false and .prerelease == false and (.html_url | type == "string") and
+        (.assets | type == "array" and all(.[]; .name | type == "string"))'
+    evidence "$release"
+    tag=$(jq -r .tag_name "$release")
+    if [[ $(git rev-parse --verify --quiet "refs/tags/$tag^{commit}") != "$revision" ]]; then
+        printf 'Saved asset snapshot describes release `%s`.\n\n' "$tag"
+        missing 'published asset snapshot for the source revision'
+        return
+    fi
+    jq -r '
+        "Published assets for [\(.tag_name)](\(.html_url)) (\(.assets | length)):\n",
+        (.assets[] | "- `\(.name)`")' "$release"
+    printf '\n'
+}
 {
     printf '# Internal production readiness\n\n'
     printf 'Internal only. Regenerate with `tools/readiness.sh`; this is an evidence inventory, not a production approval or stability policy.\n\n'
-    printf 'Source revision: `%s`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.\n\n' "$(git rev-parse HEAD)"
+    printf 'Source revision: `%s`. Source counts describe this working tree. Saved results may describe older revisions; only explicitly recorded revisions identify what was tested.\n\n' "$revision"
     printf '## Stability\n\n'
     if [[ -s $data/releases.json ]]; then
         json_check "$data/releases.json" 'type == "array" and all(.[]; (.tag_name | type == "string") and (.body | type == "string"))'
@@ -71,7 +123,8 @@ json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence
     if [[ -s $gate ]]; then
         evidence "$gate"
         # The marker alone is not a completed gate. Keep the final exit and suite summary alongside it.
-        awk '/^stage2 == stage3( \(|$)/ {fixed=$0} /[0-9]+ passed, [0-9]+ failed/ {suite=$0} /^exit=/ {status=$0}
+        awk '/^stage2 == stage3( \(|$)/ {fixed=$0} /[0-9]+ passed, [0-9]+ failed/ {suite=$0}
+            /^exit=[0-9]+$|^\[exited with code [0-9]+\]$/ {status=$0}
             END { print "    Fixed point: " (fixed != "" ? fixed : "Missing")
                   print "    Suite: " (suite != "" ? suite : "Missing")
                   print "    Gate completion: " (status != "" ? status : "Missing (unfinished)") }' "$gate"
@@ -79,6 +132,11 @@ json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence
         if [[ -s $data/gate-revision.txt ]]; then literal "$data/gate-revision.txt"; fi
     else
         missing 'completed gate, stage2 == stage3 result and suite pass/fail totals'
+    fi
+    if [[ -s $data/release-check.log ]]; then
+        printf '### Published release checks\n\n'
+        evidence "$data/release-check.log"
+        literal "$data/release-check.log"
     fi
     printf '### Fuzz campaigns and disagreements\n\n'
     printf 'Harness: `tools/fuzz/run`; `tools/test-fuzz-abla.sh` checks the harness and planted disagreement controls. Scratch seed directories are not campaign results.\n\n'
@@ -114,14 +172,22 @@ json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence
     printf '\n'
     if [[ -s $data/security.md ]]; then evidence "$data/security.md"; literal "$data/security.md"; else missing 'independent audit, vulnerability inventory and security fuzz campaign evidence (security.md)'; fi
     printf '## Performance\n\n'
-    if [[ -s $data/benchmarks.md ]]; then evidence "$data/benchmarks.md"; cat "$data/benchmarks.md"; printf '\n'; else
+    if [[ -s $data/benchmarks.md ]]; then evidence "$data/benchmarks.md"; sed -E 's/^#{1,2} /### /' "$data/benchmarks.md"; printf '\n'; else
         printf '| Benchmark | Abla | C | Rust | Go | Zig |\n|---|---|---|---|---|---|\n| Runtime / RSS / compile time / size | Missing | Missing | Missing | Missing | Missing | Missing |\n\n'
         printf 'Awaiting `tools/bench-languages` measurements. Archive its report as `benchmarks.md` with revision, toolchains and host metadata.\n\n'
     fi
     printf '## Platforms\n\n'
+    release_assets
+    hosted_ci
     if [[ -s docs/platforms.md ]]; then
-        printf 'Coverage tiers from [the platform support matrix](platforms.md), based on required checks rather than a current green-run claim:\n\n'
-        awk '/^<!-- readiness-platforms:start -->$/ {inside=1; next} /^<!-- readiness-platforms:end -->$/ {inside=0} inside {print}' docs/platforms.md
+        printf 'Coverage tiers recorded in the source checkout’s platform matrix.\n\n'
+        awk '
+            /^<!-- readiness-platforms:start -->$/ {inside=1; next}
+            /^<!-- readiness-platforms:end -->$/ {inside=0}
+            inside && /^\| Platform \|/ {historical = /\| Published .* assets \|$/}
+            inside && historical && /^\|/ {sub(/[^|]+\|$/, "")}
+            inside {print}
+        ' docs/platforms.md
         printf '\n'
     else missing 'platform coverage tiers (docs/platforms.md)'; fi
     printf 'Declared workflow jobs and matrices, extracted from `.github/workflows`. This configuration does not establish passing CI or hardware coverage; conditional/manual jobs remain conditional/manual.\n\n'
@@ -138,7 +204,6 @@ json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence
         ' "$workflow"
         printf '\n'
     done
-    missing 'saved CI run outcomes for the source revision'
     printf '## Ecosystem\n\n'
     siblings=$data/siblings.txt
     [[ -f $siblings ]] || siblings=build/siblings/summary.txt
@@ -154,12 +219,15 @@ json_check() { jq -e "$2" "$1" >/dev/null || { echo "readiness: invalid evidence
         printf '\nCoverage measures declared API documentation, not documentation quality or example execution.\n\n'
     else missing 'stdlib public declaration documentation coverage (ablac doc coverage.json)'; fi
     printf '## Real-world deployments\n\n'
-    deployments=docs/readiness-data/deployments.tsv
+    deployments=$data/deployments.tsv
+    [[ -f $deployments ]] || deployments=docs/readiness-data/deployments.tsv
     if [[ -s $deployments ]] && awk '!/^#/ && NF {found=1} END {exit !found}' "$deployments"; then
+        evidence "$deployments"
         printf '| Deployment | Revision/version | Evidence | Last verified |\n|---|---|---|---|\n'
         awk -F '\t' '!/^#/ && NF {if (NF != 4) {print "readiness: deployment rows need four tab-separated columns" > "/dev/stderr"; exit 2} gsub(/\|/, "\\|"); print "| " $1 " | " $2 " | " $3 " | " $4 " |"}' "$deployments"
         printf '\nHand-maintained reports; inclusion does not establish a support or stability promise.\n'
     else missing 'verified, hand-maintained deployments'; fi
+    if [[ -s $data/deployments-context.md ]]; then evidence "$data/deployments-context.md"; literal "$data/deployments-context.md"; fi
 } > "$tmp"
 clean=$(sed 's/[[:blank:]]*$//' "$tmp")
 printf '%s\n' "$clean" > "$tmp"

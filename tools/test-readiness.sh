@@ -17,6 +17,9 @@ has 'runner: macos-15-intel'
 has '| Linux x86-64 | T1 |'
 has '| Linux AArch64 | T2 |'
 has '| Windows | Planned |'
+! has 'Published v0.2.64 assets'
+has 'Missing: saved CI run outcomes'
+has 'Missing: published asset snapshot'
 [[ $(grep -c '^## ' "$work/report.md") == 8 ]]
 cat > "$work/data/releases.json" <<'JSON'
 [
@@ -34,6 +37,15 @@ cat > "$work/data/coverage.json" <<'JSON'
 JSON
 printf 'would print stage2 == stage3\n' > "$work/data/gate.log"
 printf 'repository programs regressions unused xfail tests\nfixture 1/1 0 0 0/0 -\n' > "$work/data/siblings.txt"
+printf 'sample site\tv1.0.0\tverified endpoint\t2026-11-23\n' > "$work/data/deployments.tsv"
+revision=$(git rev-parse HEAD)
+jq -n --arg revision "$revision" '{
+    headSha: $revision, url: "https://example.test/run", status: "completed", conclusion: "success",
+    jobs: [
+        {name: "Linux suite", status: "completed", conclusion: "success"},
+        {name: "Optional board", status: "completed", conclusion: "skipped"}
+    ]
+}' > "$work/data/ci.json"
 generate
 has '| v1.0.0 | 2 |'
 has '| v1.0.1 | 0 |'
@@ -44,11 +56,44 @@ has '**3/4** (75%)'
 has 'Fixed point: Missing'
 has 'Gate completion: Missing (unfinished)'
 has 'fixture 1/1 0 0 0/0 -'
+has '| sample site | v1.0.0 | verified endpoint | 2026-11-23 |'
+has 'Hosted CI for this revision: [run](https://example.test/run) · completed / success'
+has 'Optional board · completed / skipped'
+! has 'Missing: saved CI run outcomes'
+jq '.headSha = "different-revision"' "$work/data/ci.json" > "$work/other-ci.json"
+mv "$work/other-ci.json" "$work/data/ci.json"
 printf 'stage2 == stage3 (bitcode)\n544 passed, 1 failed in 10s\nexit=1\n' > "$work/data/gate.log"
 generate
 has 'Fixed point: stage2 == stage3 (bitcode)'
 has 'Suite: 544 passed, 1 failed'
 has 'Gate completion: exit=1'
+has 'Saved CI describes `different-revision`'
+has 'Missing: saved CI run outcomes'
+! has 'Hosted CI for this revision'
+printf 'stage2 == stage3\n601 passed, 0 failed\n[exited with code 0]\n' > "$work/data/gate.log"
+printf '# Historical run\n## Benchmark numbers\n' > "$work/data/benchmarks.md"
+generate
+has 'Gate completion: [exited with code 0]'
+has '### Historical run'
+has '### Benchmark numbers'
+[[ $(grep -c '^## ' "$work/report.md") == 8 ]]
+
+# Render a release snapshot without relying on the checkout's local tags.
+mkdir -p "$work/source/tests/cases"
+git -C "$work/source" init -q
+git -C "$work/source" -c user.name=Fixture -c user.email=fixture@example.test -c commit.gpgsign=false commit -qm fixture --allow-empty
+git -C "$work/source" tag v1.2.3
+printf 'test-serial:\n\t@echo fixture\n' > "$work/source/Makefile"
+touch "$work/source/TODO.md"
+cat > "$work/data/release.json" <<'JSON'
+{"tag_name":"v1.2.3","draft":false,"prerelease":false,"html_url":"https://example.test/release","assets":[{"name":"ablac-static-aarch64-linux"}]}
+JSON
+tools/readiness.sh --source "$work/source" --out "$work/source-report.md" --data "$work/data" --fuzz-notes "$work/absent" >/dev/null
+grep -F 'Published assets for [v1.2.3](https://example.test/release) (1)' "$work/source-report.md" >/dev/null
+grep -F 'ablac-static-aarch64-linux' "$work/source-report.md" >/dev/null
+generate
+has 'Saved asset snapshot describes release `v1.2.3`'
+! has 'Published assets for'
 cp "$work/report.md" "$work/before.md"
 printf '{malformed' > "$work/data/coverage.json"
 if generate 2> "$work/error"; then echo 'readiness: malformed evidence accepted' >&2; exit 1; fi
