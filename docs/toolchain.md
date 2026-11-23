@@ -398,8 +398,8 @@ before reusing staged syntax. A hit skips
 frontend and LLVM work, restores the recorded
 libLLVM/host-adapter link decisions and relinks; a release executable or Wasm
 module also takes the LTO object its entry's first build made, kept under a key
-of the `opt` and `clang` it was made with (the file each name runs, its size
-and time), so a hit neither prepares nor compiles the module again. Every
+of the tools it was made with (the resolved path, size, inode and file times),
+so a hit neither prepares nor compiles the module again. Every
 Mach-O build links the Darwin adapter's object, which the cache keeps by the
 adapter's source, `clang`, SDK and target; a local adapter change is never
 hidden. The
@@ -408,6 +408,20 @@ object semantics change without a corresponding source-graph change.
 `--no-cache` bypasses both lookup and publication while still emitting the
 `.ll`/object sidecars. It is the reproducibility and profiling mode used by the
 pure self-rebuild gate; options after the source are order-independent.
+
+The cache distinguishes explicit compile-time evaluation limits and options,
+unused-import warnings, and the Wasm code generation route and unit settings.
+A request to keep the compiler's pre-optimization bitcode runs the frontend
+so the bitcode is written at the requested destination.
+
+`tools/build-cache-inputs.tsv` records how the compiler handles its build
+flags and `ABLA_*` settings. `tools/test-build-cache-inputs.sh` checks that
+new literal settings and build flags are classified. Its build cases prime a
+cache with one setting, change that setting, and compare with an isolated
+`--no-cache` build. Where native text partitioning changes object layout, the
+test also compares bytes with a fresh cache and compares the public ABI and
+program results with `--no-cache`. The ledger identifies inputs exercised by
+dedicated platform or bootstrap checks.
 
 A module whose package doesn't set `visibility` is [strict](language.md#strict-imports)
 by default; `build --flat-imports` builds those modules flat instead (not a package that says `visibility = "imports"`), the opt-out for code

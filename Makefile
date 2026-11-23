@@ -387,6 +387,7 @@ test-serial: ablac
 	tools/test-doc-examples-tiers.sh $(COMPILER)
 	tools/test-runtime-memory.sh $(COMPILER)
 	tools/test-native-object-cache.sh $(COMPILER)
+	tools/test-build-cache-inputs.sh $(COMPILER)
 	tools/test-running-image-identity.sh $(COMPILER)
 	tools/test-discovery-cache.sh $(COMPILER)
 	tools/test-event-shutdown.sh $(COMPILER)

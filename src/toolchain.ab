@@ -2680,12 +2680,12 @@ fun bootstrapRemoveOldBuildTransactions(): void {
 }
 
 // An external tool as a cache key sees it: the file a command name runs (found on
-// PATH as an exec finds it), its size and modification time. A tool replaced in
-// place, or another one ahead of it on PATH, is another identity.
+// PATH as an exec finds it) and its file stamp. An inode and change time
+// also detect a replacement that preserves size and modification time.
 fun bootstrapToolIdentity(command: string): string {
     val path = linuxExecutablePath(command)
     val info = Path(path).info()
-    "$path:${info.size}:${info.revision}"
+    "$path:${info.size}:${info.inode}:${info.revision}:${info.changed}"
 }
 
 // Where the cache keeps an object made from `identity` (everything the object is a
@@ -5023,7 +5023,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // Filesystem-read providers have serialized content identities. Other
     // ambient effects remain uncached because they do not yet have a stable
     // deterministic provider contract.
+    // A pre-opt bitcode request is an output of the frontend, which a hit
+    // would skip. Run the frontend to produce it at the requested path.
     val compileInputsCacheable =
+        linuxEnvironment("ABLA_COMPILER_BITCODE").value == "" &&
         bootstrapGraphCompileCapabilitiesCacheable(graph)
     var collector = if (!importsRuntimePlatform && !linkOpenSsl && nativeLibraries.size == 0)
         bootstrapReleaseCollectorPlan(target, artifact, cacheProfile, orderedSnapshots)
@@ -5084,7 +5087,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val runtimeIdentity = if (fastRuntime.key == "") "" else "\nabla-fast-runtime:${fastRuntime.key}"
     val collectorIdentity = if (collector.identity == "") "" else "\nabla-release-collector:${collector.identity}"
     val sourceIdentity =
-        "$graphIdentity$runtimeIdentity$collectorIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact\nabla-debug:$bootstrapLlvmDebugInfo$debugDirectory\nabla-backtrace:$bootstrapLlvmBacktrace${if (bootstrapLlvmWasmNames) "\nabla-wasm-names:true" else ""}\nabla-prune:$bootstrapLlvmPruneRuntime\nabla-background-free-default:$bootstrapLlvmBackgroundFreeDefault\nabla-compile-eval:${bootstrapCtCacheTier()}"
+        "$graphIdentity$runtimeIdentity$collectorIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact\nabla-debug:$bootstrapLlvmDebugInfo$debugDirectory\nabla-backtrace:$bootstrapLlvmBacktrace${if (bootstrapLlvmWasmNames) "\nabla-wasm-names:true" else ""}\nabla-prune:$bootstrapLlvmPruneRuntime\nabla-background-free-default:$bootstrapLlvmBackgroundFreeDefault\nabla-compile-eval:${bootstrapCtCacheIdentity()}\nabla-warn-unused-imports:${bootstrapUnusedImportsWanted()}"
     // Release hosted executables may keep their ordinary relocatable sidecar
     // (on request), but the executable itself is optimized across the
     // generated program and runtime boundary. LLVM-backed compiler programs
@@ -5209,19 +5212,21 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (targetToolsIdentity != "") {
             backendIdentity = "$backendIdentity\n$targetToolsIdentity"
         } else if (bootstrapTextContains(cacheProfile, "cross-")) {
+            // The same LLVM version can occupy several paths with different
+            // target defaults, wrappers or patches.
             backendIdentity =
-                "$backendIdentity\nopt:${linuxCommand("opt").argument(
-                    "--version"
-                ).captureText()}\nllc:${linuxCommand("llc").argument(
-                    "--version"
-                ).captureText()}"
+                "$backendIdentity\nopt:${bootstrapToolIdentity("opt")}\nllc:${bootstrapToolIdentity("llc")}\nabla-bundled-codegen:${bootstrapInProcessToolInstalled && bootstrapInProcessEmitterOn()}"
         }
-        if (cacheProfile == "inprocess-o2") {
-            // LLVM-linked release clients still use external opt, and a
-            // textual fallback can use llc. A missing/different tool must
-            // not share the object cache of the pinned native toolchain.
+        val textPartitions = target.hosted && target.objectFormat == "elf" && !nativeHeld
+        if (cacheProfile == "inprocess-o2" || textPartitions) {
+            // Release builds and cached text partitions can call these tools.
+            // The bundled and external routes have independent identities.
             backendIdentity =
-                "$backendIdentity\nopt:${bootstrapToolIdentity(bootstrapHostLlvmTool("opt"))}\nllc:${bootstrapToolIdentity(bootstrapHostLlvmTool("llc"))}"
+                "$backendIdentity\nopt:${bootstrapToolIdentity(bootstrapHostLlvmTool("opt"))}\nllc:${bootstrapToolIdentity(bootstrapHostLlvmTool("llc"))}\nbundled-tools:${bootstrapInProcessToolInstalled && bootstrapInProcessEmitterOn()}"
+        }
+        if (textPartitions) {
+            backendIdentity =
+                "$backendIdentity\nextract:${bootstrapToolIdentity("llvm-extract")}\npartition-linker:${bootstrapToolIdentity("ld.lld")}"
         }
     }
     val compilerImageSize = imageBytes + 1 + backendIdentity.size
@@ -5244,12 +5249,15 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // A held object and the text fallback can have different section layouts.
     // Unit count/threshold also select one object versus an archive and its
     // layout, so changing either must not reuse the other configuration.
+    val unitMode = if (nativeUnits || inProcessCodegen)
+        "-units${bootstrapCodegenUnitCount()}-min${bootstrapCodegenUnitMinimum()}" else "-single"
     val nativeMode = if (balancedHeldCandidate) "-held-o1-single-v1" else if (nativeHeld) {
-        if (nativeUnits) "-held-units${bootstrapCodegenUnitCount()}-min${bootstrapCodegenUnitMinimum()}"
-        else "-held-single"
+        "-held$unitMode"
     } else if (compilerBitcodeCandidate) "-release-bitcode" else ""
+    val wasmMode = if (inProcessCodegen) "-wasm-held$unitMode"
+        else if (bitcodeHandoff) "-wasm-bitcode" else ""
     val cacheStem =
-        "$cacheDirectory/native-${target.name}-llvm21-v17-$cacheProfile${if (bootstrapStrictImportsRequested) "-strict" else ""}$nativeMode-$compilerImageSize-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
+        "$cacheDirectory/native-${target.name}-llvm21-v17-$cacheProfile${if (bootstrapStrictImportsRequested) "-strict" else ""}$nativeMode$wasmMode-$compilerImageSize-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
     val cacheObjectPath = "$cacheStem.o"
     val cacheLlvmPath = "$cacheStem.ll"
     val cacheBitcodePath = "$cacheStem.bc"
