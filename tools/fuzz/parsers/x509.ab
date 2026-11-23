@@ -1,0 +1,180 @@
+// The DER reader and the X.509 certificate parser and verifier against hostile bytes (#1139 area 4). The valid chains of tests/cases/x509/chains
+// (the cases of cases.tsv whose expectation is "ok": leaf, intermediates and trust anchors in RSA, ECDSA P-256/P-384 and Ed25519) are damaged and
+// checked four ways, run from the repository root:
+//   1 one to three byte changes (flip, set, insert, delete) of the leaf or of an intermediate that the path used, then x509Verify with the
+//     real trust anchors: a chain that still verifies with a changed certificate in its path is a finding (every byte of the signed part is
+//     signed, and the signature and its algorithm are checked, so none may); the damaged certificate is parsed first, and parsing must
+//     answer within 2 s whatever it is;
+//   2 the same for the damaged certificate alone, x509ParseDer: no crash, a failure has a message;
+//   3 derItem over random bytes and over the certificates' bytes at every offset: the item it returns lies inside [at, limit];
+//   4 x509ParsePem over mutated PEM text: no crash, skipped + parsed certificates are counted.
+//
+//   tools/fuzz/parsers/run x509 --seeds 1-200 [--inputs 200]
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "abla/integer"
+import "abla/fs"
+import "abla/crypto"
+import "abla/crypto/der"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/process/time"
+import "../prng.ab"
+import "./mutate.ab"
+
+class X509FuzzCase(val name: string, val host: string, val now: int, val chain: array<string>, val roots: array<X509Certificate>, val pems: array<string>)
+
+fun x509FuzzSplit(text: string, separator: int): array<string> {
+    val out: array<string> = []
+    var start = 0
+    for (at in 0 until text.size) {
+        if (text[at] == separator) {
+            out.append(text.slice(start, at))
+            start = at + 1
+        }
+    }
+    out.append(text.slice(start, text.size))
+    out
+}
+
+fun x509FuzzCertificates(directory: string, names: string, var pems: array<string>): array<X509Certificate> {
+    val out: array<X509Certificate> = []
+    for (name in x509FuzzSplit(names, 44)) {
+        if (name == "") continue
+        val text = Path(directory + "/" + name).readText()
+        pems.append(text)
+        for (c in x509ParsePem(text).certificates) out.append(c)
+    }
+    out
+}
+
+fun x509FuzzCases(): array<X509FuzzCase> {
+    val directory = "tests/cases/x509/chains"
+    val cases: array<X509FuzzCase> = []
+    for (line in x509FuzzSplit(Path(directory + "/cases.tsv").readText(), 10)) {
+        if (line == "") continue
+        val fields = x509FuzzSplit(line, 9)
+        if (fields.size != 7 || fields[3] != "ok") continue
+        val pems: array<string> = []
+        val leaf = x509FuzzCertificates(directory, fields[4], pems)
+        val extra = x509FuzzCertificates(directory, fields[5], pems)
+        val roots = x509FuzzCertificates(directory, fields[6], pems)
+        if (leaf.size == 0) continue
+        val chain: array<string> = [leaf[0].der]
+        for (c in extra) chain.append(c.der)
+        cases.append(X509FuzzCase(fields[0], fields[1], fields[2].parseInt() ?? 0, chain, roots, pems))
+    }
+    cases
+}
+
+fun x509FuzzDamage(var r: Prng, der: string): string {
+    var out = der
+    val rounds = 1 + r.below(3)
+    for (i in 0 until rounds) {
+        if (out.size == 0) return out
+        val at = r.below(out.size)
+        val kind = r.below(4)
+        if (kind == 0) out = out.slice(0, at) + mutateBytes(r, 1) + out.slice(at + 1, out.size)
+        else if (kind == 1) out = out.slice(0, at) + byteString(int(out[at]) ^ (1 << r.below(8))) + out.slice(at + 1, out.size)
+        else if (kind == 2) out = out.slice(0, at) + mutateBytes(r, 1) + out.slice(at, out.size)
+        else out = out.slice(0, at) + out.slice(at + 1, out.size)
+    }
+    out
+}
+
+fun byteString(c: int): string {
+    val buffer = byteBuffer()
+    buffer.appendByteValue(c)
+    buffer.toText()
+}
+
+fun x509FuzzChain(var r: Prng, c: X509FuzzCase): string {
+    val which = r.below(c.chain.size)
+    val original = c.chain[which]
+    val damaged = x509FuzzDamage(r, original)
+    if (damaged == original) return ""
+    var start = monotonicMilliseconds()
+    val parsed = x509ParseDer(damaged)
+    if (monotonicMilliseconds() - start > 2000) return "parsing a damaged certificate took over 2 s (${c.name}, element $which)"
+    if (!parsed.ok && parsed.error == "") return "a failed parse with no message (${c.name}, element $which)"
+    val chain: array<string> = []
+    for (i in 0 until c.chain.size) chain.append(if (i == which) damaged else c.chain[i])
+    start = monotonicMilliseconds()
+    val result = x509Verify(chain, X509TrustStore(c.roots), X509Options(c.host, c.now))
+    if (monotonicMilliseconds() - start > 5000) return "verifying a damaged chain took over 5 s (${c.name}, element $which)"
+    if (result.ok) {
+        for (certificate in result.path) {
+            if (certificate.der == damaged) return "a chain verifies with a damaged certificate in its path (${c.name}, element $which of ${c.chain.size}): ${mutateEscape(damaged)}"
+        }
+    } else if (result.error == "") return "a failed verification with no message (${c.name})"
+    ""
+}
+
+fun x509FuzzDer(var r: Prng, c: X509FuzzCase): string {
+    val kind = r.below(3)
+    var data = if (kind == 0) mutateBytes(r, r.below(300)) else x509FuzzDamage(r, c.chain[r.below(c.chain.size)])
+    if (kind == 2 && data.size > 8) data = data.slice(0, 4 + r.below(data.size - 4))
+    for (at in 0 until (if (data.size > 400) 400 else data.size)) {
+        val limit = at + r.below(data.size - at + 1)
+        val item = derItem(data, at, limit)
+        if (item.ok && (item.start < at + 2 || item.end < item.start || item.end > limit)) return "derItem($at, $limit) gave ${item.start}-${item.end}"
+    }
+    val parsed = x509ParseDer(data)
+    if (!parsed.ok && parsed.error == "") return "a failed parse with no message"
+    ""
+}
+
+fun x509FuzzPem(var r: Prng, c: X509FuzzCase): string {
+    val text = mutate(r, r.pick(c.pems))
+    val result = x509ParsePem(text)
+    for (certificate in result.certificates) if (!certificate.ok) return "x509ParsePem returned a certificate that is not ok"
+    ""
+}
+
+fun main: int {
+    var low = 1
+    var high = 50
+    var inputs = 200
+    var verbose = false
+    val count = processArgumentCount()
+    var index = 0
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "--seeds") {
+            val dash = value.indexOf("-")
+            low = (if (dash < 0) value else value.slice(0, dash)).parseInt() ?? 1
+            high = (if (dash < 0) value else value.slice(dash + 1, value.size)).parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--inputs") {
+            inputs = value.parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--verbose") verbose = true
+        index = index + 1
+    }
+    val cases = x509FuzzCases()
+    if (cases.size < 10) {
+        println("FINDING seed=0 n=0: only ${cases.size} valid chains were read (run from the repository root)")
+        return 1
+    }
+    var findings = 0
+    for (seed in low until high + 1) {
+        var r = prngSeeded(seed)
+        for (n in 0 until inputs) {
+            val c = cases[r.below(cases.size)]
+            val kind = r.below(10)
+            if (verbose) println("input seed=$seed n=$n kind=$kind ${c.name}")
+            var problem = ""
+            if (kind < 6) problem = x509FuzzChain(r, c)
+            else if (kind < 9) problem = x509FuzzDer(r, c)
+            else problem = x509FuzzPem(r, c)
+            if (problem != "") {
+                println("FINDING seed=$seed n=$n: $problem")
+                findings = findings + 1
+            }
+        }
+    }
+    println("x509: seeds $low-$high, $inputs inputs each, $findings findings")
+    if (findings == 0) 0 else 1
+}
