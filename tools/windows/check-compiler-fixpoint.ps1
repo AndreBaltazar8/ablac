@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory)][string]$Archive,
     [Parameter(Mandatory)][string]$LlvmRoot,
     [Parameter(Mandatory)][string]$BuildDirectory,
-    [ValidateSet('interp', 'native')][string]$Tier = 'interp'
+    [ValidateSet('interp', 'native')][string]$Tier = 'interp',
+    [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,7 +22,10 @@ if ($expected -cnotmatch '^[0-9a-f]{64}$' -or (Get-FileHash $archivePath).Hash -
 New-Item -ItemType Directory -Path $work | Out-Null
 $seedRoot = Join-Path $work 'seed'
 Expand-Archive -LiteralPath $archivePath -DestinationPath $seedRoot
-$seed = Join-Path $seedRoot 'abla-toolchain-x86_64-windows/bin/ablac.exe'
+$bundleArchitecture = if ($Architecture -eq 'arm64') { 'aarch64' } else { 'x86_64' }
+$target = if ($Architecture -eq 'arm64') { 'aarch64-windows' } else { 'x86_64-windows-hosted' }
+$machine = if ($Architecture -eq 'arm64') { 'IMAGE_FILE_MACHINE_ARM64' } else { 'IMAGE_FILE_MACHINE_AMD64' }
+$seed = Join-Path $seedRoot "abla-toolchain-$bundleArchitecture-windows/bin/ablac.exe"
 $coff = Join-Path $work 'coff'
 $link = Join-Path $work 'link'
 
@@ -32,8 +36,11 @@ $env:ABLA_CODEGEN_UNITS = '1'
 $env:ABLA_MAX_MEMORY_MB = '8192'
 $env:ABLA_WINDOWS_LINK_KEEP = '1'
 
-function Check-CompilerStack([string]$Compiler) {
+function Check-CompilerImage([string]$Compiler) {
     $headers = (& $readobj --file-headers $Compiler) -join "`n"
+    if ($headers -notmatch "(?m)^\s*Machine: $machine\b") {
+        throw "Wrong PE machine in $Compiler (expected $Architecture)"
+    }
     if ($headers -notmatch '(?m)^\s*SizeOfStackReserve:\s+134217728\s*$') {
         throw "Expected a 128 MiB stack reserve in $Compiler"
     }
@@ -129,7 +136,7 @@ function Build-Stage([string]$Compiler, [string]$Stage) {
     # The program linker generates the COFF inputs, then fails to link the
     # compiler without its CRT and LLVM. The SDK link below supplies both.
     $PSNativeCommandUseErrorActionPreference = $false
-    & $Compiler build src/orc_windows_main.ab --target x86_64-windows-hosted --no-cache -o $output *> $log
+    & $Compiler build src/orc_windows_main.ab --target $target --no-cache -o $output *> $log
     $result = $LASTEXITCODE
     $PSNativeCommandUseErrorActionPreference = $true
     if ($result -ne 1 -or !(Test-Path -LiteralPath $object -PathType Leaf) -or
@@ -144,16 +151,16 @@ function Build-Stage([string]$Compiler, [string]$Stage) {
         throw 'The self-built COFF object does not reference the in-process shim'
     }
     & (Join-Path $PSScriptRoot 'build-static-compiler.ps1') -CompilerObject $object `
-        -ImportDirectory $imports -LlvmRoot $sdk -BuildDirectory $link
+        -ImportDirectory $imports -LlvmRoot $sdk -BuildDirectory $link -Architecture $Architecture
     $exe = Join-Path $Stage 'ablac.exe'
     Move-Item -LiteralPath (Join-Path $link 'ablac.exe') -Destination $exe
-    Check-CompilerStack $exe
+    Check-CompilerImage $exe
     Move-Item -LiteralPath $coff -Destination (Join-Path $Stage 'coff')
 }
 
 Push-Location $root
 try {
-    Check-CompilerStack $seed
+    Check-CompilerImage $seed
     $stage2 = Join-Path $work 'stage2'
     $stage3 = Join-Path $work 'stage3'
     if ($Tier -eq 'native') { Test-NativeSite $seed 'seed' }
