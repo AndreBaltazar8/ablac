@@ -417,6 +417,7 @@ test-serial: ablac
 	tools/test-array-remove-last.sh $(COMPILER)
 	tools/test-path-syntax.sh $(COMPILER)
 	tools/test-windows-link.sh $(COMPILER)
+	tools/test-pe-info.sh $(COMPILER)
 	tools/test-windows-hosted.sh $(COMPILER)
 	tools/test-windows-syscalls.sh $(COMPILER)
 	tools/test-windows-crash.sh $(COMPILER)

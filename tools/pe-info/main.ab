@@ -1,0 +1,139 @@
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+
+// What a Windows executable is and imports, read from the PE file itself (no llvm-readobj, no Windows):
+//
+//     ablac run tools/pe-info/main.ab -- <file.exe> [--no-crt] [--forbid <dll>]...
+//
+// Prints `machine x86_64|aarch64|<hex>`, `subsystem console|gui|<n>` and one `import <dll> <name>` line per function imported by
+// name (a function imported by ordinal prints `#<ordinal>`). Exits 1 with a message when the file is not a PE32+ image, when
+// --no-crt finds an import from a C runtime under any name (msvcr*, msvcp*, vcruntime*, ucrtbase*, api-ms-win-crt-*), or when
+// an import comes from a DLL named by --forbid (case-insensitive). The release packaging and its checks use it
+// (tools/package-windows-toolchain.sh, tools/release-check.sh).
+
+fun peU16(data: string, at: int): int =
+    if (at < 0 || at + 2 > data.size) -1 else data[at] + data[at + 1] * 256
+
+fun peU32(data: string, at: int): int =
+    if (at < 0 || at + 4 > data.size) -1
+    else data[at] + data[at + 1] * 256 + data[at + 2] * 65536 + data[at + 3] * 16777216
+
+// The file offset of an RVA, by the section table, or -1.
+fun peOffset(data: string, sections: int, count: int, rva: int): int {
+    var index = 0
+    while (index < count) {
+        val entry = sections + index * 40
+        val size = peU32(data, entry + 8)
+        val address = peU32(data, entry + 12)
+        val raw = peU32(data, entry + 16)
+        val pointer = peU32(data, entry + 20)
+        val extent = if (raw > size) raw else size
+        if (rva >= address && rva < address + extent) return pointer + (rva - address)
+        index = index + 1
+    }
+    -1
+}
+
+fun peString(data: string, at: int): string {
+    if (at < 0 || at >= data.size) return ""
+    var end = at
+    while (end < data.size && data[end] != 0) end = end + 1
+    data.slice(at, end)
+}
+
+fun peHex(value: int): string {
+    var text = ""
+    var rest = value
+    while (rest > 0) {
+        val digit = rest % 16
+        text = "${"0123456789abcdef".slice(digit, digit + 1)}$text"
+        rest = rest / 16
+    }
+    if (text == "") "0" else text
+}
+
+fun peListed(names: array<string>, name: string): bool {
+    for (candidate in names) {
+        if (candidate == name) return true
+    }
+    false
+}
+
+fun peCrtDll(name: string): bool {
+    val lower = name.lowercase()
+    lower.startsWith("msvcr") || lower.startsWith("msvcp") || lower.startsWith("vcruntime") ||
+        lower.startsWith("ucrtbase") || lower.startsWith("api-ms-win-crt-")
+}
+
+fun main: int {
+    val count = processArgumentCount()
+    if (count < 1) {
+        eprintln("usage: pe-info <file.exe> [--no-crt] [--forbid <dll>]...")
+        return 2
+    }
+    var noCrt = false
+    val forbidden: array<string> = []
+    var option = 1
+    while (option < count) {
+        val argument = processArgument(option)
+        if (argument == "--no-crt") {
+            noCrt = true
+        } else if (argument == "--forbid" && option + 1 < count) {
+            forbidden.append(processArgument(option + 1).lowercase())
+            option = option + 1
+        } else {
+            eprintln("pe-info: unknown argument $argument")
+            return 2
+        }
+        option = option + 1
+    }
+    val path = processArgument(0)
+    val data = Path(path).readText()
+    val header = peU32(data, 60)
+    if (data.size < 64 || data[0] != 77 || data[1] != 90 || header < 64 || peU32(data, header) != 17744) {
+        eprintln("pe-info: $path is not a PE image")
+        return 1
+    }
+    val machine = peU16(data, header + 4)
+    val sectionCount = peU16(data, header + 6)
+    val optionalSize = peU16(data, header + 20)
+    val optional = header + 24
+    if (peU16(data, optional) != 523) {
+        eprintln("pe-info: $path is not a PE32+ image")
+        return 1
+    }
+    println("machine ${if (machine == 34404) "x86_64" else if (machine == 43620) "aarch64" else "0x${peHex(machine)}"}")
+    val subsystem = peU16(data, optional + 68)
+    println("subsystem ${if (subsystem == 3) "console" else if (subsystem == 2) "gui" else "$subsystem"}")
+    val sections = optional + optionalSize
+    val importRva = peU32(data, optional + 120)
+    var status = 0
+    var descriptor = if (importRva > 0) peOffset(data, sections, sectionCount, importRva) else -1
+    while (descriptor >= 0 && peU32(data, descriptor + 12) != 0) {
+        val dll = peString(data, peOffset(data, sections, sectionCount, peU32(data, descriptor + 12)))
+        if (noCrt && peCrtDll(dll)) {
+            eprintln("pe-info: $path imports from a C runtime: $dll")
+            status = 1
+        }
+        if (peListed(forbidden, dll.lowercase())) {
+            eprintln("pe-info: $path imports from $dll")
+            status = 1
+        }
+        val lookup = if (peU32(data, descriptor) != 0) peU32(data, descriptor) else peU32(data, descriptor + 16)
+        var entry = peOffset(data, sections, sectionCount, lookup)
+        while (entry >= 0 && peU32(data, entry) != 0 || entry >= 0 && peU32(data, entry + 4) != 0) {
+            val low = peU32(data, entry)
+            val high = peU32(data, entry + 4)
+            if (high >= 2147483648) {
+                println("import $dll #${low & 65535}")
+            } else {
+                println("import $dll ${peString(data, peOffset(data, sections, sectionCount, low) + 2)}")
+            }
+            entry = entry + 8
+        }
+        descriptor = descriptor + 20
+    }
+    status
+}
