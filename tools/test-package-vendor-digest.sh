@@ -24,7 +24,7 @@ git -C "$dep" add -A && git -C "$dep" -c user.name=t -c user.email=t@example.inv
 
 app=$test_root/app
 mkdir -p "$app"
-printf 'name = "app"\nversion = "0.1.0"\nentry = "main.ab"\nvisibility = "flat"\n' > "$app/abla.toml"
+printf 'name = "app"\nversion = "0.1.0"\nentry = "main.ab"\n' > "$app/abla.toml"
 printf 'import github("owner/dep")\nfun main: int = depValue()\n' > "$app/main.ab"
 export ABLA_PACKAGE_CACHE=$test_root/cache
 "$compiler" package update --project "$app" > "$test_root/update.log" 2>&1 || fail 'update failed' "$test_root/update.log"

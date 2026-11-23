@@ -634,6 +634,7 @@ test-serial: ablac
 	tools/test-new-project.sh $(COMPILER)
 	tools/test-package-subpaths.sh $(COMPILER)
 	tools/test-package-vendor-digest.sh $(COMPILER)
+	tools/test-package-vendor-strict.sh $(COMPILER)
 	tools/test-package-install.sh $(COMPILER)
 	tools/test-package-add.sh $(COMPILER)
 	tools/test-package-git-source.sh $(COMPILER)
