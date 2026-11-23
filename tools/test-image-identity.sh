@@ -19,7 +19,7 @@ rm -rf "$out"
 mkdir -p "$out"
 "$compiler" build tests/cases/image-identity/main.ab -o "$out/one" --no-cache > "$out/one.log" 2>&1 || { cat "$out/one.log" >&2; echo 'image identity: the program failed to build' >&2; exit 1; }
 "$compiler" build tests/cases/image-identity/main.ab -o "$out/again" --no-cache > "$out/again.log" 2>&1
-"$compiler" build tests/cases/modules/bootstrap-cfg.ab -o "$out/other" --no-cache > "$out/other.log" 2>&1 || { cat "$out/other.log" >&2; echo 'image identity: the other program failed to build' >&2; exit 1; }
+"$compiler" build tests/cases/modules/native-function-address.ab -o "$out/other" --no-cache > "$out/other.log" 2>&1 || { cat "$out/other.log" >&2; echo 'image identity: the other program failed to build' >&2; exit 1; }
 note=$(readelf -nW "$out/one" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
 [[ -n $note ]] || { echo 'image identity: a program that links LLVM has no GNU build-id' >&2; exit 1; }
 # (1) the program reads that id from its own image
