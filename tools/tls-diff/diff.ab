@@ -1,0 +1,451 @@
+// The ClientHello side of the TLS handshake differential (#1139 area 3, TLS round 2): a valid ClientHello (TLS 1.3, with or without TLS 1.2 offers, ALPN,
+// PSK modes) is changed structurally (version fields, field lengths, the cipher suites, compression, extensions deleted, duplicated, reordered, inserted,
+// their bodies and lengths changed, supported_versions, key_share, signature_algorithms, supported_groups, server_name, ALPN, PSK variants, the handshake
+// and extension block lengths, the record version, fragmentation into several records, trailing bytes, a second message, a flipped byte) and the same bytes
+// are sent to three servers, each on its own port: ours (abla/tls/pure, tools/tls-diff/server.ab), OpenSSL's `s_server` and Go's crypto/tls
+// (tools/tls-diff/peer.go). What each does is read off the wire: H (a ServerHello or HelloRetryRequest came back: the hello was taken), A (an alert),
+// C (the connection closed with nothing), W (nothing came within 120 ms: the server waits for more), R (connection refused: the server is gone, a finding).
+// The run prints, per mutation family, how often each combination of ours/OpenSSL/Go came out ("ours/openssl/go", H counts as accept; A and C as reject),
+// with the first example's seed and input number, and a FINDING for a server that is gone. The disagreements are read as: ours accepts what both others
+// reject (we are more lenient: a strictness gap if the RFC says reject), ours rejects what both accept (we are stricter: an interoperability risk).
+//
+//   diff OURS_PORT OPENSSL_PORT GO_PORT FIRST_SEED SEEDS [INPUTS_PER_SEED]
+import "abla/io"
+import "abla/text"
+import "abla/array"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/integer"
+import "abla/net"
+import "abla/process/arguments"
+import "abla/tls/pure/handshake"
+import "../fuzz/prng.ab"
+import "./common.ab"
+
+
+class DiffHello(var version: int, var random: string, var sessionId: string, var suites: string, var compression: string, var extensions: array<DiffExt>,
+    var sidDelta: int, var suitesDelta: int, var compressionDelta: int, var extensionsDelta: int, var noExtensions: bool,
+    var handshakeDelta: int, var recordVersion: int, var fragments: int, var trailing: string, var secondMessage: bool, var flip: bool, var flipRegion: string)
+
+
+
+/** The ClientHello message the base is built from: its fields, the extensions as a list. */
+fun diffParse(message: string): DiffHello {
+    var at = 4
+    val version = diffRd16(message, at)
+    at = at + 2
+    val random = message.slice(at, at + 32)
+    at = at + 32
+    val sidSize = message[at]
+    at = at + 1
+    val sessionId = message.slice(at, at + sidSize)
+    at = at + sidSize
+    val suitesSize = diffRd16(message, at)
+    at = at + 2
+    val suites = message.slice(at, at + suitesSize)
+    at = at + suitesSize
+    val compressionSize = message[at]
+    at = at + 1
+    val compression = message.slice(at, at + compressionSize)
+    at = at + compressionSize
+    val extensionsSize = diffRd16(message, at)
+    at = at + 2
+    val end = at + extensionsSize
+    val extensions: array<DiffExt> = []
+    while (at + 4 <= end) {
+        val type = diffRd16(message, at)
+        val size = diffRd16(message, at + 2)
+        extensions.append(DiffExt(type, message.slice(at + 4, at + 4 + size), 0))
+        at = at + 4 + size
+    }
+    DiffHello(version, random, sessionId, suites, compression, extensions, 0, 0, 0, 0, false, 0, 771, 1, "", false, false, "")
+}
+
+fun diffBase(var r: Prng): DiffHello {
+    val kind = r.below(3)
+    val shares: array<TlsKeyShare> = [TlsKeyShare(29, diffBytes(r, 32))]
+    val suites: array<int> = [4865, 4866, 4867]
+    val tls12: array<int> = if (kind == 1) [49199, 49200, 49195, 49196, 52392, 52393] else []
+    val alpn: array<string> = if (kind == 2) ["h2", "http/1.1"] else []
+    val message = tlsBuildClientHello(diffBytes(r, 32), if (r.below(2) == 0) diffBytes(r, 32) else "", suites, "localhost", [29, 23, 24], shares,
+        [2052, 1027, 2055, 1025, 2053, 1283], alpn, "", tls12, false, [], 0, kind == 2)
+    diffParse(message)
+}
+
+
+
+fun diffFind(hello: DiffHello, type: int): int {
+    for (i in 0 until hello.extensions.size) if (hello.extensions[i].type == type) return i
+    -1
+}
+
+fun diffSetBody(var hello: DiffHello, type: int, body: string): bool {
+    val at = diffFind(hello, type)
+    if (at < 0) return false
+    hello.extensions[at].body = body
+    true
+}
+
+/** One structural change, as a tag. */
+fun diffMutate(var r: Prng, var hello: DiffHello): string {
+    val op = r.below(27)
+    if (op == 0) {
+        val v = diffPickInt(r, [768, 769, 770, 772, 512, 0, 65535, 258])
+        hello.version = v
+        return "version:$v"
+    }
+    if (op == 1) {
+        val n = diffPickInt(r, [0, 1, 31, 33, 64])
+        hello.random = diffBytes(r, n)
+        return "random:$n"
+    }
+    if (op == 2) {
+        val n = diffPickInt(r, [0, 1, 16, 31, 33, 64, 255])
+        hello.sessionId = diffBytes(r, n)
+        return "sid:$n"
+    }
+    if (op == 3) {
+        val kind = r.below(7)
+        if (kind == 0) hello.suites = ""
+        else if (kind == 1) hello.suites = hello.suites + "\x13"
+        else if (kind == 2 && hello.suites.size >= 2) hello.suites = hello.suites + hello.suites.slice(0, 2)
+        else if (kind == 3) hello.suites = "\x0a\x0a" + hello.suites
+        else if (kind == 4) hello.suites = cryptoByteString([192, 47, 192, 48])
+        else if (kind == 5) hello.suites = "\x00\xff"
+        else hello.suites = "\xc0\x2f"
+        return "suites:$kind"
+    }
+    if (op == 4) {
+        val kind = r.below(5)
+        if (kind == 0) hello.compression = ""
+        else if (kind == 1) hello.compression = "\x01"
+        else if (kind == 2) hello.compression = "\x00\x01"
+        else if (kind == 3) hello.compression = "\x01\x00"
+        else hello.compression = "\x00".repeat(200)
+        return "comp:$kind"
+    }
+    if (hello.extensions.size == 0) return "none"
+    val at = r.below(hello.extensions.size)
+    val type = hello.extensions[at].type
+    if (op == 5) {
+        hello.extensions.removeAt(at)
+        return "ext-del:$type"
+    }
+    if (op == 6) {
+        hello.extensions = diffInsert(hello.extensions, r.below(hello.extensions.size + 1), DiffExt(type, hello.extensions[at].body, 0))
+        return "ext-dup:$type"
+    }
+    if (op == 7) {
+        hello.extensions.append(DiffExt(type, diffBytes(r, r.below(8)), 0))
+        return "ext-dup-body:$type"
+    }
+    if (op == 8) {
+        hello.extensions = diffReverse(hello.extensions)
+        return "ext-order"
+    }
+    if (op == 9) {
+        val t = diffPickInt(r, [2570, 65024, 65535, 21, 35, 5, 18, 49, 42, 23, 22, 15, 1, 65281, 11, 57])
+        hello.extensions = diffInsert(hello.extensions, r.below(hello.extensions.size + 1), DiffExt(t, diffBytes(r, r.below(20)), 0))
+        return "ext-insert:$t"
+    }
+    if (op == 10) {
+        val kind = r.below(4)
+        val body = hello.extensions[at].body
+        if (kind == 0 && body.size > 0) hello.extensions[at].body = body.slice(0, body.size - 1)
+        else if (kind == 1) hello.extensions[at].body = body + "\x00"
+        else if (kind == 2) hello.extensions[at].body = ""
+        else if (body.size > 0) {
+            val p = r.below(body.size)
+            hello.extensions[at].body = body.slice(0, p) + diffBytes(r, 1) + body.slice(p + 1, body.size)
+        }
+        return "ext-body:$type:$kind"
+    }
+    if (op == 11) {
+        val d = diffPickInt(r, [-1, 1, 5, -3])
+        hello.extensions[at].delta = d
+        return "ext-len:$type:$d"
+    }
+    if (op == 12) {
+        val kind = r.below(9)
+        var body = ""
+        if (kind == 0) body = "\x00"
+        else if (kind == 1) body = "\x02\x03\x03"
+        else if (kind == 2) body = "\x02\x03\x04"
+        else if (kind == 3) body = "\x04\x03\x04\x03\x03"
+        else if (kind == 4) body = "\x04\x03\x04\x03\x04"
+        else if (kind == 5) body = "\x03\x03\x04\x03"
+        else if (kind == 6) body = "\x06\x03\x04\x03\x03"
+        else if (kind == 7) body = "\x02\x7f\x1c"
+        else body = "\x02\x03\x01"
+        diffSetBody(hello, 43, body)
+        return "sv:$kind"
+    }
+    if (op == 13) {
+        val kind = r.below(9)
+        var body = ""
+        if (kind == 0) body = "\x00\x00"
+        else if (kind == 1) body = diffU16(34) + diffU16(29) + diffU16(31) + diffBytes(r, 31)
+        else if (kind == 2) body = diffU16(36) + diffU16(29) + diffU16(33) + diffBytes(r, 33)
+        else if (kind == 3) body = diffU16(69) + diffU16(23) + diffU16(65) + "\x04" + diffBytes(r, 64)
+        else if (kind == 4) body = diffU16(72) + diffU16(29) + diffU16(32) + diffBytes(r, 32) + diffU16(29) + diffU16(32) + diffBytes(r, 32)
+        else if (kind == 5) body = diffU16(36) + diffU16(39321) + diffU16(32) + diffBytes(r, 32)
+        else if (kind == 6) body = diffU16(36) + diffU16(29) + diffU16(32) + "\x00".repeat(32)
+        else if (kind == 7) body = diffU16(36) + diffU16(29) + diffU16(32) + "\xff".repeat(32)
+        else body = diffU16(0)
+        diffSetBody(hello, 51, body)
+        return "ks:$kind"
+    }
+    if (op == 14) {
+        val kind = r.below(5)
+        var body = ""
+        if (kind == 0) body = "\x00\x00"
+        else if (kind == 1) body = "\x00\x03\x04\x03\x00"
+        else if (kind == 2) body = "\x00\x02\x00\x00"
+        else if (kind == 3) body = "\x00\x02\x02\x01"
+        else body = "\x00\x04\x08\x04\x08\x04"
+        diffSetBody(hello, 13, body)
+        return "sa:$kind"
+    }
+    if (op == 15) {
+        val kind = r.below(4)
+        var body = ""
+        if (kind == 0) body = "\x00\x00"
+        else if (kind == 1) body = "\x00\x02\x99\x99"
+        else if (kind == 2) body = "\x00\x03\x00\x1d\x00"
+        else body = "\x00\x04\x00\x1d\x00\x1d"
+        diffSetBody(hello, 10, body)
+        return "sg:$kind"
+    }
+    if (op == 16) {
+        val kind = r.below(9)
+        var body = ""
+        if (kind == 0) body = "\x00\x0c\x01\x00\x09localhost"
+        else if (kind == 1) body = "\x00\x03\x00\x00\x00"
+        else if (kind == 2) body = "\x00\x0c\x00\x00\x09LOCALHOST"
+        else if (kind == 3) body = "\x00\x0c\x00\x00\x09locah\x00st"
+        else if (kind == 4) body = "\x00\x0c\x00\x00\x09127.0.0.1"
+        else if (kind == 5) body = "\x00\x0d\x00\x00\x09localhost"
+        else if (kind == 6) body = "\x00\x0d\x00\x00\x0alocalhost."
+        else if (kind == 7) body = "\x00\x18\x00\x00\x09localhost\x00\x00\x09localhost"
+        else body = "\x00\x0c\x00\x00\x09localhost\x00"
+        diffSetBody(hello, 0, body)
+        return "sni:$kind"
+    }
+    if (op == 17) {
+        val kind = r.below(5)
+        var body = ""
+        if (kind == 0) body = "\x00\x00"
+        else if (kind == 1) body = "\x00\x01\x00"
+        else if (kind == 2) body = "\x00\x03\x02h"
+        else if (kind == 3) body = "\x00\x06\x02h2\x02h2"
+        else body = "\x00\x03\x00\x01x"
+        diffSetBody(hello, 16, body)
+        return "alpn:$kind"
+    }
+    if (op == 18) {
+        val d = diffPickInt(r, [-1, 1, -100, 100, -4])
+        hello.handshakeDelta = d
+        return "hslen:$d"
+    }
+    if (op == 19) {
+        val kind = r.below(5)
+        if (kind == 4) hello.noExtensions = true else hello.extensionsDelta = diffPickInt(r, [-1, 1, -10, 10])
+        return "extblock:$kind"
+    }
+    if (op == 20) {
+        val v = diffPickInt(r, [768, 769, 770, 772, 0, 65278])
+        hello.recordVersion = v
+        return "recversion:$v"
+    }
+    if (op == 21) {
+        hello.fragments = 2 + r.below(4)
+        return "frag:${hello.fragments}"
+    }
+    if (op == 22) {
+        hello.trailing = diffBytes(r, 1 + r.below(8))
+        return "trail"
+    }
+    if (op == 23) {
+        hello.secondMessage = true
+        return "second"
+    }
+    if (op == 24) {
+        hello.flip = true
+        return "flip"
+    }
+    if (op == 25) {
+        val kind = r.below(4)
+        if (kind == 0) hello.extensions.append(DiffExt(45, "\x01\x00", 0))
+        else if (kind == 1) hello.extensions.append(DiffExt(45, "\x01\x01", 0))
+        else if (kind == 2) hello.extensions.append(DiffExt(41, "\x00\x00\x00\x00", 0))
+        else {
+            // A pre_shared_key with one identity and a binder, in front of key_share (it must be last).
+            hello.extensions = diffInsert(hello.extensions, 0, DiffExt(41, "\x00\x07\x00\x02ab\x00\x00\x00\x00\x00\x21\x20" + "\x00".repeat(32), 0))
+            hello.extensions.append(DiffExt(45, "\x01\x01", 0))
+        }
+        return "psk:$kind"
+    }
+    // A change to the last extension's body, whatever it is.
+    val last = hello.extensions.size - 1
+    hello.extensions[last].body = hello.extensions[last].body + diffBytes(r, 1)
+    "ext-last"
+}
+
+fun diffSerialize(var r: Prng, var hello: DiffHello): string {
+    val extensions = byteBuffer()
+    for (e in hello.extensions) {
+        extensions.appendText(diffU16(e.type))
+        extensions.appendText(diffU16(e.body.size + e.delta))
+        extensions.appendText(e.body)
+    }
+    val body = byteBuffer()
+    body.appendText(diffU16(hello.version))
+    body.appendText(hello.random)
+    body.appendByteValue(hello.sessionId.size + hello.sidDelta)
+    body.appendText(hello.sessionId)
+    body.appendText(diffU16(hello.suites.size + hello.suitesDelta))
+    body.appendText(hello.suites)
+    body.appendByteValue(hello.compression.size + hello.compressionDelta)
+    body.appendText(hello.compression)
+    if (!hello.noExtensions) {
+        body.appendText(diffU16(extensions.size() + hello.extensionsDelta))
+        body.appendText(extensions.toText())
+    }
+    val text = body.toText()
+    val size = text.size + hello.handshakeDelta
+    var message = "\x01" + cryptoByteString([(size >> 16) & 255, (size >> 8) & 255, size & 255]) + text + hello.trailing
+    if (hello.secondMessage) message = message + "\x01\x00\x00\x00"
+    // A flipped byte, in the handshake message, with the region it fell in (so the tallies say which field a strictness difference is about).
+    if (hello.flip && message.size > 0) {
+        val p = r.below(message.size)
+        message = message.slice(0, p) + diffBytes(r, 1) + message.slice(p + 1, message.size)
+        var region = "header"
+        var offset = 4
+        var found = false
+        if (p >= 4) {
+            val fixed: array<string> = ["version", "random", "sid-len", "sid", "suites-len", "suites", "comp-len", "comp", "ext-len"]
+            val sizes: array<int> = [2, hello.random.size, 1, hello.sessionId.size, 2, hello.suites.size, 1, hello.compression.size, 2]
+            for (k in 0 until fixed.size) {
+                if (!found && p < offset + sizes[k]) {
+                    region = fixed[k]
+                    found = true
+                }
+                offset = offset + sizes[k]
+            }
+            for (e in hello.extensions) {
+                if (!found && p < offset + 4) {
+                    region = "ext:${e.type}:header"
+                    found = true
+                }
+                offset = offset + 4
+                if (!found && p < offset + e.body.size) {
+                    region = "ext:${e.type}:body"
+                    found = true
+                }
+                offset = offset + e.body.size
+            }
+            if (!found) region = "trailing"
+        }
+        hello.flipRegion = region
+    }
+    // The records: the message cut at random points into `fragments` pieces.
+    val out = byteBuffer()
+    var start = 0
+    for (i in 0 until hello.fragments) {
+        var end = if (i == hello.fragments - 1) message.size else start + r.below(message.size - start + 1)
+        if (end > message.size) end = message.size
+        val piece = message.slice(start, end)
+        out.appendByteValue(22)
+        out.appendText(diffU16(hello.recordVersion))
+        out.appendText(diffU16(piece.size))
+        out.appendText(piece)
+        start = end
+    }
+    out.toText()
+}
+
+/** H (a ServerHello), A (an alert), C (closed), W (silence), R (refused), O (some other record). */
+fun diffProbe(port: int, data: string): string {
+    var connection = tcpConnect(ipv4Loopback(port), 1000)
+    if (connection.descriptor < 0) return "R"
+    connection.write(data)
+    var got = ""
+    var state = ""
+    var rounds = 0
+    while (state == "" && rounds < 3) {
+        val incoming = connection.readWithTimeoutResult(4096, 120)
+        if (incoming.hasData()) {
+            got = got + incoming.bytes
+            rounds = rounds + 1
+            if (got.size >= 6) rounds = 3
+        } else if (incoming.timedOut()) state = "W"
+        else state = "C"
+    }
+    connection.close()
+    if (got.size >= 6) {
+        if (got[0] == 22) return if (got[5] == 2) "H" else "O"
+        if (got[0] == 21) return "A"
+        return "?"
+    }
+    if (got.size > 0) return "?"
+    if (state == "") "W" else state
+}
+
+fun diffAccept(c: string): string = if (c == "H") "acc" else if (c == "W") "wait" else if (c == "R") "gone" else "rej"
+
+fun diffCount(var counts: Map<string, int>, var examples: Map<string, string>, key: string, example: string): void {
+    if (counts.has(key)) counts.set(key, (counts.get(key) ?? 0) + 1)
+    else {
+        counts.set(key, 1)
+        examples.set(key, example)
+    }
+    return
+}
+
+fun main: int {
+    if (processArgumentCount() < 5) {
+        println("usage: diff OURS_PORT OPENSSL_PORT GO_PORT FIRST_SEED SEEDS [INPUTS_PER_SEED]")
+        return 2
+    }
+    val ours = processArgument(0).parseInt() ?? 0
+    val openssl = processArgument(1).parseInt() ?? 0
+    val go = processArgument(2).parseInt() ?? 0
+    val first = processArgument(3).parseInt() ?? 1
+    val seeds = processArgument(4).parseInt() ?? 1
+    val inputs = if (processArgumentCount() > 5) processArgument(5).parseInt() ?? 20 else 20
+    var counts: Map<string, int> = Map()
+    var examples: Map<string, string> = Map()
+    var findings = 0
+    var total = 0
+    for (seed in first until first + seeds) {
+        var r = prngSeeded(seed)
+        for (n in 0 until inputs) {
+            val hello = diffBase(r)
+            val rounds = if (r.below(5) == 0) 2 + r.below(2) else 1
+            var tags = ""
+            for (i in 0 until rounds) tags = tags + (if (i > 0) "+" else "") + diffMutate(r, hello)
+            val wire = diffSerialize(r, hello)
+            if (hello.flip) tags = tags + "@" + hello.flipRegion
+            val a = diffProbe(ours, wire)
+            val b = diffProbe(openssl, wire)
+            val c = diffProbe(go, wire)
+            total = total + 1
+            val example = "seed $seed n $n: $tags (${wire.size} bytes)"
+            if (a == "R") {
+                println("FINDING our server is gone after $example")
+                findings = findings + 1
+                return 1
+            }
+            val triple = "${diffAccept(a)}/${diffAccept(b)}/${diffAccept(c)}"
+            // The first tag of the mutation is the family; one-tag inputs are the clean data.
+            val family = if (tags.indexOf("+") < 0) tags else "multi"
+            diffCount(counts, examples, "$family $triple", example)
+            if (triple == "acc/rej/rej" || triple == "rej/acc/acc") println("ODD $triple seed $seed n $n $tags")
+        }
+    }
+    for (key in counts.keys()) println("COUNT ${counts.get(key) ?? 0} $key   e.g. ${examples.get(key) ?? ""}")
+    println("tls-diff clienthello: $total inputs, $findings findings")
+    if (findings == 0) 0 else 1
+}
+
+

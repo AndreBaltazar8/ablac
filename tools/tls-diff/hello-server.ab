@@ -1,0 +1,339 @@
+// The ServerHello side of the TLS handshake differential (#1139 area 3, TLS round 2): a hostile server. It listens on 127.0.0.1:PORT and serves COUNT
+// connections one after the other; for connection i it reads the client's ClientHello, builds a valid ServerHello from it (the session id echoed, a cipher suite the
+// client offered, an X25519 key share, supported_versions 1.3), changes it structurally with a generator seeded by (SEED, i) (the same changes for the same i on
+// every port, whichever client connects), sends it and reads off the wire what the client does within 200 ms:
+//   CCS  the client sent a ChangeCipherSpec (compatibility mode): it took the ServerHello;
+//   CH2  a second ClientHello (it took a HelloRetryRequest);
+//   A<n> an alert, description n: it refused;      C  the connection closed;      W  silence (it waits: it took the hello, or it is still waiting for more).
+// The changes: the legacy version, the random (short, long, the HelloRetryRequest value, the downgrade sentinel), the session id echo, the cipher suite (not offered,
+// TLS 1.2, unknown), the compression method, extensions deleted, duplicated, reordered, inserted (ones a ServerHello may not carry, such as server_name, ALPN, cookie,
+// early_data, pre_shared_key), their bodies and lengths, supported_versions, key_share (not offered group, wrong key length, empty, the HelloRetryRequest form, a
+// low order point), the handshake and extension block lengths, the record version, fragmentation, trailing bytes, an unencrypted message after the ServerHello, a
+// flipped byte, and HelloRetryRequests with every kind of group, cookie and version.
+// One line per connection, "CASE i tags class", for tools/tls-diff to join across the clients.
+//
+//   hello-server PORT SEED COUNT [DUMP_INDEX]    (DUMP_INDEX: also print the hex of the bytes sent for that case, and of the client's ClientHello)
+import "abla/io"
+import "abla/text"
+import "abla/array"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/integer"
+import "abla/net"
+import "abla/process/arguments"
+import "abla/tls/pure/handshake"
+import "../fuzz/prng.ab"
+import "./common.ab"
+
+class ShParts(var version: int, var random: string, var sessionId: string, var suite: int, var compression: int, var extensions: array<DiffExt>,
+    var sidDelta: int, var handshakeDelta: int, var extensionsDelta: int, var noExtensions: bool, var recordVersion: int, var fragments: int,
+    var trailing: string, var extraMessage: bool, var flip: bool, var flipRegion: string)
+
+fun shHelloRetryRandom(): string = hexDecode("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+
+fun shBase(var r: Prng, hello: TlsClientHello): ShParts {
+    var suite = 4865
+    for (s in hello.suites) if (s >= 4865 && s <= 4867) {
+        suite = s
+        break
+    }
+    val exts: array<DiffExt> = [DiffExt(43, "\x03\x04", 0)]
+    var group = 29
+    var size = 32
+    for (share in hello.shares) if (share.group == 29) {
+        group = 29
+        size = share.publicKey.size
+    }
+    exts.append(DiffExt(51, diffU16(group) + diffU16(size) + diffBytes(r, size), 0))
+    ShParts(771, diffBytes(r, 32), hello.sessionId, suite, 0, exts, 0, 0, 0, false, 771, 1, "", false, false, "")
+}
+
+fun shFind(parts: ShParts, type: int): int {
+    for (i in 0 until parts.extensions.size) if (parts.extensions[i].type == type) return i
+    -1
+}
+
+fun shSetBody(var parts: ShParts, type: int, body: string): bool {
+    val at = shFind(parts, type)
+    if (at < 0) return false
+    parts.extensions[at].body = body
+    true
+}
+
+/** One structural change, as a tag. */
+fun shMutate(var r: Prng, var parts: ShParts, hello: TlsClientHello): string {
+    val op = r.below(26)
+    if (op == 0) {
+        val v = diffPickInt(r, [768, 769, 770, 772, 0, 32540, 65535, 770])
+        parts.version = v
+        return "version:$v"
+    }
+    if (op == 1) {
+        val n = diffPickInt(r, [0, 1, 31, 33, 64])
+        parts.random = diffBytes(r, n)
+        return "random:$n"
+    }
+    if (op == 2) {
+        parts.random = shHelloRetryRandom()
+        return "random:hrr"
+    }
+    if (op == 3) {
+        // The downgrade sentinels (RFC 8446 section 4.1.3) in a TLS 1.3 ServerHello.
+        parts.random = diffBytes(r, 24) + (if (r.below(2) == 0) "DOWNGRD\x01" else "DOWNGRD\x00")
+        return "random:downgrade"
+    }
+    if (op == 4) {
+        val kind = r.below(5)
+        if (kind == 0) parts.sessionId = ""
+        else if (kind == 1) parts.sessionId = diffBytes(r, 32)
+        else if (kind == 2) parts.sessionId = parts.sessionId + "\x00"
+        else if (kind == 3 && parts.sessionId.size > 0) parts.sessionId = parts.sessionId.slice(0, parts.sessionId.size - 1)
+        else parts.sessionId = diffBytes(r, 33)
+        return "sid:$kind"
+    }
+    if (op == 5) {
+        val s = diffPickInt(r, [0, 4868, 4869, 49199, 49195, 255, 65535, 4865, 4866, 4867, 53, 47])
+        parts.suite = s
+        return "suite:$s"
+    }
+    if (op == 6) {
+        parts.compression = diffPickInt(r, [1, 255])
+        return "comp:${parts.compression}"
+    }
+    if (parts.extensions.size == 0) return "none"
+    val at = r.below(parts.extensions.size)
+    val type = parts.extensions[at].type
+    if (op == 7) {
+        parts.extensions.removeAt(at)
+        return "ext-del:$type"
+    }
+    if (op == 8) {
+        parts.extensions = diffInsert(parts.extensions, r.below(parts.extensions.size + 1), DiffExt(type, parts.extensions[at].body, 0))
+        return "ext-dup:$type"
+    }
+    if (op == 9) {
+        parts.extensions = diffReverse(parts.extensions)
+        return "ext-order"
+    }
+    if (op == 10) {
+        // Extensions a ServerHello may not carry (RFC 8446 section 4.2: server_name, ALPN, status_request, early_data and the others live in EncryptedExtensions,
+        // Certificate or NewSessionTicket), and unknown ones.
+        val t = diffPickInt(r, [0, 16, 5, 42, 44, 41, 10, 13, 45, 35, 23, 11, 65281, 2570, 65535, 18, 15, 49])
+        parts.extensions = diffInsert(parts.extensions, r.below(parts.extensions.size + 1), DiffExt(t, diffBytes(r, r.below(6)), 0))
+        return "ext-insert:$t"
+    }
+    if (op == 11) {
+        val kind = r.below(4)
+        val body = parts.extensions[at].body
+        if (kind == 0 && body.size > 0) parts.extensions[at].body = body.slice(0, body.size - 1)
+        else if (kind == 1) parts.extensions[at].body = body + "\x00"
+        else if (kind == 2) parts.extensions[at].body = ""
+        else if (body.size > 0) {
+            val p = r.below(body.size)
+            parts.extensions[at].body = body.slice(0, p) + diffBytes(r, 1) + body.slice(p + 1, body.size)
+        }
+        return "ext-body:$type:$kind"
+    }
+    if (op == 12) {
+        val d = diffPickInt(r, [-1, 1, 5])
+        parts.extensions[at].delta = d
+        return "ext-len:$type:$d"
+    }
+    if (op == 13) {
+        val kind = r.below(7)
+        var body = ""
+        if (kind == 0) body = "\x03\x03"
+        else if (kind == 1) body = "\x03\x02"
+        else if (kind == 2) body = "\x7f\x1c"
+        else if (kind == 3) body = "\x03\x04\x03\x04"
+        else if (kind == 4) body = ""
+        else if (kind == 5) body = "\x03\x05"
+        else body = "\x00\x00"
+        shSetBody(parts, 43, body)
+        return "sv:$kind"
+    }
+    if (op == 14) {
+        val kind = r.below(10)
+        var body = ""
+        if (kind == 0) body = diffU16(23) + diffU16(65) + "\x04" + diffBytes(r, 64)
+        else if (kind == 1) body = diffU16(24) + diffU16(97) + "\x04" + diffBytes(r, 96)
+        else if (kind == 2) body = diffU16(39321) + diffU16(32) + diffBytes(r, 32)
+        else if (kind == 3) body = diffU16(29) + diffU16(31) + diffBytes(r, 31)
+        else if (kind == 4) body = diffU16(29) + diffU16(33) + diffBytes(r, 33)
+        else if (kind == 5) body = ""
+        else if (kind == 6) body = diffU16(29) + diffU16(0)
+        else if (kind == 7) body = diffU16(29)
+        else if (kind == 8) body = diffU16(29) + diffU16(32) + "\x00".repeat(32)
+        else body = diffU16(29) + diffU16(32) + diffBytes(r, 32) + diffU16(29) + diffU16(32) + diffBytes(r, 32)
+        shSetBody(parts, 51, body)
+        return "ks:$kind"
+    }
+    if (op == 15) {
+        val d = diffPickInt(r, [-1, 1, -100, 100, -4])
+        parts.handshakeDelta = d
+        return "hslen:$d"
+    }
+    if (op == 16) {
+        val kind = r.below(5)
+        if (kind == 4) parts.noExtensions = true else parts.extensionsDelta = diffPickInt(r, [-1, 1, -10, 10])
+        return "extblock:$kind"
+    }
+    if (op == 17) {
+        val v = diffPickInt(r, [768, 769, 770, 772, 0, 65278])
+        parts.recordVersion = v
+        return "recversion:$v"
+    }
+    if (op == 18) {
+        parts.fragments = 2 + r.below(4)
+        return "frag:${parts.fragments}"
+    }
+    if (op == 19) {
+        parts.trailing = diffBytes(r, 1 + r.below(8))
+        return "trail"
+    }
+    if (op == 20) {
+        parts.extraMessage = true
+        return "plain-ee"
+    }
+    if (op == 21) {
+        parts.flip = true
+        return "flip"
+    }
+    if (op == 22) {
+        // A HelloRetryRequest: its random, supported_versions, and a group (one already shared, one not offered, one never defined), with or without a cookie.
+        parts.random = shHelloRetryRandom()
+        val group = diffPickInt(r, [29, 23, 24, 25, 256, 39321, 0])
+        val ks = DiffExt(51, diffU16(group), 0)
+        shSetBody(parts, 51, diffU16(group))
+        if (r.below(2) == 0) parts.extensions.append(DiffExt(44, diffU16(4) + diffBytes(r, 4), 0))
+        return "hrr:$group"
+    }
+    if (op == 23) {
+        // A HelloRetryRequest with a key_share body that holds a share, or a cookie, or an empty cookie.
+        parts.random = shHelloRetryRandom()
+        val kind = r.below(3)
+        if (kind == 0) parts.extensions.append(DiffExt(44, diffU16(0), 0))
+        else if (kind == 1) parts.extensions.append(DiffExt(44, diffBytes(r, 3), 0))
+        else shSetBody(parts, 51, diffU16(23) + diffU16(65) + "\x04" + diffBytes(r, 64))
+        return "hrr-cookie:$kind"
+    }
+    if (op == 24) {
+        // TLS 1.2: no supported_versions, a TLS 1.2 suite.
+        val at12 = shFind(parts, 43)
+        if (at12 >= 0) parts.extensions.removeAt(at12)
+        parts.suite = diffPickInt(r, [49199, 49195, 52392, 49200, 4865])
+        return "tls12:${parts.suite}"
+    }
+    // pre_shared_key: a selected identity when none was offered.
+    parts.extensions.append(DiffExt(41, diffU16(r.below(3)), 0))
+    "psk"
+}
+
+fun shSerialize(var r: Prng, var parts: ShParts): string {
+    val extensions = byteBuffer()
+    for (e in parts.extensions) {
+        extensions.appendText(diffU16(e.type))
+        extensions.appendText(diffU16(e.body.size + e.delta))
+        extensions.appendText(e.body)
+    }
+    val body = byteBuffer()
+    body.appendText(diffU16(parts.version))
+    body.appendText(parts.random)
+    body.appendByteValue(parts.sessionId.size + parts.sidDelta)
+    body.appendText(parts.sessionId)
+    body.appendText(diffU16(parts.suite))
+    body.appendByteValue(parts.compression)
+    if (!parts.noExtensions) {
+        body.appendText(diffU16(extensions.size() + parts.extensionsDelta))
+        body.appendText(extensions.toText())
+    }
+    val text = body.toText()
+    val size = text.size + parts.handshakeDelta
+    var message = "\x02" + cryptoByteString([(size >> 16) & 255, (size >> 8) & 255, size & 255]) + text + parts.trailing
+    if (parts.extraMessage) message = message + "\x08\x00\x00\x02\x00\x00"
+    if (parts.flip && message.size > 0) {
+        val p = r.below(message.size)
+        message = message.slice(0, p) + diffBytes(r, 1) + message.slice(p + 1, message.size)
+        parts.flipRegion = if (p < 4) "header" else if (p < 6) "version" else if (p < 38) "random" else "rest"
+    }
+    val out = byteBuffer()
+    var start = 0
+    for (i in 0 until parts.fragments) {
+        var end = if (i == parts.fragments - 1) message.size else start + r.below(message.size - start + 1)
+        if (end > message.size) end = message.size
+        val piece = message.slice(start, end)
+        out.appendByteValue(22)
+        out.appendText(diffU16(parts.recordVersion))
+        out.appendText(diffU16(piece.size))
+        out.appendText(piece)
+        start = end
+    }
+    out.toText()
+}
+
+/** The first record the client sends back, as a class. */
+fun shReaction(var connection: TcpConnection): string {
+    val incoming = connection.readWithTimeoutResult(4096, 200)
+    if (incoming.hasData()) {
+        val got = incoming.bytes
+        if (got.size >= 7 && got[0] == 21) return "A${got[6]}"
+        if (got.size >= 1 && got[0] == 20) return "CCS"
+        if (got.size >= 6 && got[0] == 22 && got[5] == 1) return "CH2"
+        if (got.size >= 1 && got[0] == 23) return "APP"
+        return "?"
+    }
+    if (incoming.timedOut()) "W" else "C"
+}
+
+fun main: int {
+    if (processArgumentCount() < 3) {
+        println("usage: hello-server PORT SEED COUNT")
+        return 2
+    }
+    val port = processArgument(0).parseInt() ?? 0
+    val seed = processArgument(1).parseInt() ?? 1
+    val count = processArgument(2).parseInt() ?? 1
+    val dump = if (processArgumentCount() > 3) processArgument(3).parseInt() ?? -1 else -1
+    var listener = tcpListenAddress(ipv4Loopback(port))
+    println("listening $port")
+    for (i in 0 until count) {
+        var connection = listener.accept()
+        var got = ""
+        var wanted = 0
+        var tries = 0
+        while (tries < 20 && (got.size < 5 || got.size < 5 + wanted)) {
+            val incoming = connection.readWithTimeoutResult(65536, 500)
+            if (incoming.hasData()) {
+                got = got + incoming.bytes
+                if (got.size >= 5) wanted = diffRd16(got, 3)
+            } else tries = 20
+            tries = tries + 1
+        }
+        if (got.size < 9 || got[0] != 22 || got[5] != 1) {
+            println("CASE $i noclienthello W")
+            connection.close()
+            continue
+        }
+        val hello = tlsParseClientHello(got.slice(9, if (got.size > 5 + wanted) 5 + wanted else got.size))
+        if (!hello.ok) {
+            println("CASE $i badclienthello(${hello.error}) W")
+            connection.close()
+            continue
+        }
+        var r = prngSeeded(seed * 100003 + i)
+        var parts = shBase(r, hello)
+        val rounds = if (r.below(6) == 0) 2 else 1
+        var tags = ""
+        for (k in 0 until rounds) tags = tags + (if (k > 0) "+" else "") + shMutate(r, parts, hello)
+        val wire = shSerialize(r, parts)
+        if (parts.flip) tags = tags + "@" + parts.flipRegion
+        connection.write(wire)
+        if (i == dump) {
+            println("CLIENTHELLO ${hexEncode(got)}")
+            println("WIRE ${hexEncode(wire)}")
+        }
+        println("CASE $i $tags ${shReaction(connection)}")
+        connection.close()
+    }
+    0
+}
