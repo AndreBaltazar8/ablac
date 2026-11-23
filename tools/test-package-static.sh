@@ -21,7 +21,7 @@ args=("$compiler" "$root" "$out/package.tar.gz")
 report=$(tools/package-linux-static-toolchain.sh "${args[@]}" 2> "$out/package.log") || { tail -5 "$out/package.log" >&2; fail "the package did not build"; }
 tar -C "$out/unpacked" -xzf "$out/package.tar.gz"
 pkg=$out/unpacked/${ABLA_PACKAGE_NAME:-abla-toolchain-static-x86_64-linux}
-for part in bin/ablac libexec/ablac.bin libexec/abla-install-xtensa-native share/abla/stdlib share/abla/stdlib-discovery-v1 share/abla/runtime lib/clang/23/lib/linux/libclang_rt.builtins-x86_64.a share/licenses/abla.txt; do
+for part in bin/ablac libexec/ablac.bin libexec/abla-install-xtensa-native share/abla/stdlib share/abla/stdlib-discovery-v1 share/abla/release-collector-v1/record share/abla/runtime lib/clang/23/lib/linux/libclang_rt.builtins-x86_64.a share/licenses/abla.txt; do
     [[ -e $pkg/$part ]] || fail "the package lacks $part"
 done
 # no shared library, no libLLVM, no tool of an LLVM install
@@ -40,9 +40,23 @@ env -i PATH="$PWD/$out/empty" "$PWD/$pkg/bin/ablac" --version > "$out/version.tx
 grep "^ablac " "$out/version.txt" > /dev/null || fail "ablac --version printed: $(cat "$out/version.txt")"
 hello hello1 cache1
 grep -Fq 'discovery.shipped-hit:' "$out/hello1.log" || fail 'hello did not use the packaged stdlib records'
+grep -Fq "release-collector.hit" "$out/hello1.log" || fail "hello did not use the packaged collector"
 [[ $("$out/hello1") == hello ]] || fail "hello did not print hello"
 hello hello2 cache2
 cmp -s "$out/hello1" "$out/hello2" || fail "two builds of hello differ"
+hello hello-hit cache1
+cmp "$out/hello1" "$out/hello-hit"
+grep -Fq "release-collector.hit" "$out/hello-hit.log" || fail "cached hello did not use the packaged collector"
+# The object is tied to the stdlib contents, including edits that preserve file metadata.
+collector_source="$pkg/share/abla/stdlib/abla/runtime/platform/host.ab"
+cp -p "$collector_source" "$out/host.original.ab"
+sed "s/__ablaRuntimeHostGcWorkersSet(4)/__ablaRuntimeHostGcWorkersSet(3)/" "$out/host.original.ab" > "$collector_source"
+touch -r "$out/host.original.ab" "$collector_source"
+! cmp -s "$out/host.original.ab" "$collector_source" || fail "collector fixture was not edited"
+hello hello-edit cache-edit
+if grep -Fq "release-collector.hit" "$out/hello-edit.log"; then fail "edited collector used the packaged object"; fi
+[[ $("$out/hello-edit") == hello ]] || fail "edited collector did not build a working hello"
+cp -p "$out/host.original.ab" "$collector_source"
 # a program with a compile-time action and a second module build too (the standard library is the package's own)
 env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/cache3" "$PWD/$pkg/bin/ablac" run tests/cases/libc-imports/strings-arrays.ab > "$out/run.log" 2>&1 ||
     { tail -5 "$out/run.log" >&2; fail "a run with an empty PATH failed"; }

@@ -3082,7 +3082,8 @@ trusted fun bootstrapOptimizeHeldWholeProgram(
     llvmTriple: string,
     optimizedPath: string,
     objectPath: string,
-    abiManifest: string
+    abiManifest: string,
+    var collector: BootstrapReleaseCollector, allowCollector: bool
 ): int {
     val nullPointer = nativeNullPointer()
     val module = bootstrapLlvmHeldModule
@@ -3143,7 +3144,11 @@ trusted fun bootstrapOptimizeHeldWholeProgram(
         val passes = bootstrapHostReleasePasses(
             LLVMGetNamedMetadataNumOperands(module, BOOTSTRAP_LLVM_RECURSIVE_CLASS_ARGUMENT) != 0
         )
-        status = llvmConsumeError(LLVMRunPasses(module, passes, machine, options), 167)
+        if (allowCollector && collector.directory != "") {
+            if (collector.seed) status = bootstrapSeedReleaseCollector(collector, module, passes, machine, options)
+            else collector.used = bootstrapReleaseCollectorHook(module, collector.directory, 0, passes, machine, options) == 1
+        }
+        if (status == 0) status = llvmConsumeError(LLVMRunPasses(module, passes, machine, options), 167)
         // (A pipeline LLVM can't parse fails before any pass runs.)
         if (status == 0 && LLVMGetNamedMetadataNumOperands(
             module, BOOTSTRAP_LLVM_SMALL_LOOP_NEST) != 0 && llvmLibraryVersion().startsWith("23.")) {
@@ -3152,7 +3157,7 @@ trusted fun bootstrapOptimizeHeldWholeProgram(
                 LLVMRunPasses(module, BOOTSTRAP_HOST_SMALL_LOOP_PASSES, machine, options), 167
             )
             bootstrapSetLlvmSmallLoopBudget(false)
-        } else if (status != 0) {
+        } else if (status == 167) {
             status = llvmConsumeError(
                 LLVMRunPasses(module, "default<O2>,globaldce", machine, options), 167
             )
@@ -4440,6 +4445,124 @@ private fun bootstrapFastRuntimeEligible(
 private fun bootstrapFastRuntimeDigest(bytes: string): string =
     "${bytes.size}-${bootstrapNativeCacheHash(bytes, 17, 257, 1000000007)}-${bootstrapNativeCacheHash(bytes, 31, 263, 1000000009)}"
 
+class BootstrapReleaseCollector(val directory: string = "", val identity: string = "",
+    val seed: bool = false, val sources: string = "", var used: bool = false)
+
+trusted fun bootstrapNoReleaseCollector(
+    module: i64*, directory: string, mode: int, passes: string,
+    machine: i64*, options: i64*
+): int = 0
+
+var bootstrapReleaseCollectorHook: (i64*, string, int, string, i64*, i64*) -> int =
+    bootstrapNoReleaseCollector
+var bootstrapReleaseCollectorInstalled = false
+
+private fun bootstrapReleaseCollectorFile(path: Path, limit: int): string {
+    val info = path.info()
+    if (!info.isFile() || info.size <= 0 || info.size > limit) return ""
+    val bytes = linuxReadFile(path.text, info.size + 1)
+    if (bytes.size == info.size) bytes else ""
+}
+
+private fun bootstrapReleaseCollectorInput(
+    name: string, size: int, first: int, second: int
+): string = "$name\t$size\t$first\t$second"
+
+private fun bootstrapReleaseCollectorObjectIdentity(directory: Path): string {
+    val object = bootstrapReleaseCollectorFile(directory.child("collector.o"), 1048576)
+    val imports = bootstrapReleaseCollectorFile(directory.child("imports"), 65536)
+    val exports = bootstrapReleaseCollectorFile(directory.child("exports"), 65536)
+    val region = bootstrapReleaseCollectorFile(directory.child("region"), 65536)
+    if (object == "" || imports == "" || exports == "" || region == "") return ""
+    "${bootstrapFastRuntimeDigest(object)}:${bootstrapFastRuntimeDigest(imports)}:${bootstrapFastRuntimeDigest(exports)}:${bootstrapFastRuntimeDigest(region)}"
+}
+
+private fun bootstrapReleaseCollectorPlan(
+    target: BootstrapTargetDescriptor, artifact: string, profile: string,
+    snapshots: array<BootstrapModuleSnapshot>
+): BootstrapReleaseCollector {
+    if (!bootstrapReleaseCollectorInstalled || artifact != "executable" ||
+        profile != "inprocess-o2" || !target.hosted || target.libcFree ||
+        !bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) || ablaHostIsMacOS() ||
+        bootstrapLlvmDebugInfo || bootstrapKeepLlvmText() || bootstrapLlvmOutOfProcess() ||
+        linuxEnvironment("ABLA_RELEASE_COLLECTOR_OBJECT").value == "0") return BootstrapReleaseCollector()
+    val path = Path(bootstrapToolchainRoot()).child("release-collector-v1")
+    val seed = linuxEnvironment("ABLA_SEED_RELEASE_COLLECTOR").value == "1"
+    val header = "ABLA-RELEASE-COLLECTOR-1"
+    var recorded = ""
+    if (!seed) {
+        recorded = bootstrapReleaseCollectorFile(path.child("record"), 65536)
+        if (recorded == "") return BootstrapReleaseCollector()
+    }
+    val image = bootstrapDiscoveryImageIdentity()
+    if (image == "") return BootstrapReleaseCollector()
+    val root = bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
+    val prefix = "$root/"
+    val inputs: Map<string, string> = Map()
+    var sources = "$header\n$image\n"
+    for (snapshot in snapshots) {
+        if (!snapshot.path.startsWith(prefix)) {
+            if (bootstrapProgramRunsCompileTimeCode(snapshot.discovery)) return BootstrapReleaseCollector()
+            continue
+        }
+        val relative = snapshot.path.slice(prefix.size, snapshot.path.size)
+        if (relative.contains("\t") || relative.contains("\n")) return BootstrapReleaseCollector()
+        val identity = bootstrapReleaseCollectorInput(relative, snapshot.size,
+            snapshot.firstFingerprint, snapshot.secondFingerprint)
+        inputs.set(relative, identity)
+        if (seed) sources = "$sources$identity\n"
+    }
+    if (seed) {
+        if (!path.createDirectories()) return BootstrapReleaseCollector()
+        path.child("record").remove()
+        return BootstrapReleaseCollector(path.text, "", true, sources)
+    }
+    val lines = recorded.split("\n")
+    if (lines.size < 5 || lines[0] != header || lines[1] != image ||
+        lines[2] == "" || lines[2] != bootstrapReleaseCollectorObjectIdentity(path)) {
+        return BootstrapReleaseCollector()
+    }
+    for (index in 3 until lines.size - 1) {
+        val fields = lines[index].split("\t")
+        if (fields.size != 4 || fields[0] == "") return BootstrapReleaseCollector()
+        val relative = fields[0]
+        var identity = inputs.get(relative)
+        if (identity == null) {
+            val sourcePath = "$prefix$relative"
+            if (bootstrapNormalizeModulePath(sourcePath) != sourcePath) return BootstrapReleaseCollector()
+            val source = bootstrapReleaseCollectorFile(Path(sourcePath), 4194304)
+            if (source == "") return BootstrapReleaseCollector()
+            identity = bootstrapReleaseCollectorInput(relative, source.size,
+                bootstrapModuleFingerprint(source, 17, 257, 1000000007),
+                bootstrapModuleFingerprint(source, 97, 263, 1000000009))
+        }
+        if (identity != lines[index]) return BootstrapReleaseCollector()
+    }
+    BootstrapReleaseCollector(path.text, bootstrapFastRuntimeDigest(recorded))
+}
+
+private trusted fun bootstrapSeedReleaseCollector(
+    collector: BootstrapReleaseCollector, module: i64*, passes: string, machine: i64*, options: i64*
+): int {
+    val directory = Path(collector.directory)
+    val bitcode = directory.child("collector.bc")
+    val object = directory.child("collector.o")
+    var status = if (bootstrapReleaseCollectorHook(module, collector.directory, 1, passes, machine, options) == 1)
+        bootstrapEmitWholeProgramObject(bitcode.text, object.text) else 1
+    bitcode.remove()
+    if (status == 0 && bootstrapReleaseCollectorHook(nativeNullPointer(), collector.directory,
+        2, "", nativeNullPointer(), nativeNullPointer()) != 1) status = 1
+    directory.child("potential-imports").remove()
+    if (status == 0) {
+        val identity = bootstrapReleaseCollectorObjectIdentity(directory)
+        val split = collector.sources.indexOf("\n", collector.sources.indexOf("\n") + 1) + 1
+        val record = collector.sources.slice(0, split) + "$identity\n" +
+            collector.sources.slice(split, collector.sources.size)
+        if (identity == "" || !directory.child("record").writeTextAtomic(record)) status = 1
+    }
+    status
+}
+
 private fun bootstrapFastRuntimePrepare(
     target: BootstrapTargetDescriptor,
     hostPath: string,
@@ -4859,6 +4982,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // deterministic provider contract.
     val compileInputsCacheable =
         bootstrapGraphCompileCapabilitiesCacheable(graph)
+    var collector = if (!importsRuntimePlatform && !linkOpenSsl && nativeLibraries.size == 0)
+        bootstrapReleaseCollectorPlan(target, artifact, cacheProfile, orderedSnapshots)
+        else BootstrapReleaseCollector()
     val paths = bootstrapModulePaths(graph)
     val llvmPath = "$outputPath.ll"
     val sidecarPath = "$outputPath.o"
@@ -4913,8 +5039,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val debugDirectory = if (bootstrapLlvmDebugInfo && target.objectFormat == "wasm")
         "\nabla-debug-directory:${currentDirectory().text}" else ""
     val runtimeIdentity = if (fastRuntime.key == "") "" else "\nabla-fast-runtime:${fastRuntime.key}"
+    val collectorIdentity = if (collector.identity == "") "" else "\nabla-release-collector:${collector.identity}"
     val sourceIdentity =
-        "$graphIdentity$runtimeIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact\nabla-debug:$bootstrapLlvmDebugInfo$debugDirectory\nabla-backtrace:$bootstrapLlvmBacktrace\nabla-prune:$bootstrapLlvmPruneRuntime\nabla-background-free-default:$bootstrapLlvmBackgroundFreeDefault\nabla-compile-eval:${bootstrapCtCacheTier()}"
+        "$graphIdentity$runtimeIdentity$collectorIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact\nabla-debug:$bootstrapLlvmDebugInfo$debugDirectory\nabla-backtrace:$bootstrapLlvmBacktrace\nabla-prune:$bootstrapLlvmPruneRuntime\nabla-background-free-default:$bootstrapLlvmBackgroundFreeDefault\nabla-compile-eval:${bootstrapCtCacheTier()}"
     // Release hosted executables may keep their ordinary relocatable sidecar
     // (on request), but the executable itself is optimized across the
     // generated program and runtime boundary. LLVM-backed compiler programs
@@ -5118,7 +5245,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "$cacheStem.lto-v2",
             "${target.llvmTriple}\n${bootstrapToolIdentity(bootstrapHostLlvmTool("opt"))}\n${bootstrapToolIdentity(bootstrapHostLlvmTool("llc"))}\n${bootstrapToolIdentity(if (macTarget) macClang else "clang")}\n$macSdkRoot"
         )
-        val compiledInfo = Path(compiled).info()
+        var compiledInfo = Path(compiled).info()
+        if ((!compiledInfo.isFile() || compiledInfo.size <= 0) &&
+            collector.directory != "" && !collector.seed) {
+            compiledInfo = Path("$compiled.release-collector.o").info()
+        }
         if (!compiledInfo.isFile() || compiledInfo.size <= 0) cached = false
     }
     var status = 1
@@ -5758,23 +5889,35 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "${target.llvmTriple}\n${bootstrapToolIdentity(bootstrapHostLlvmTool("opt"))}\n${bootstrapToolIdentity(bootstrapHostLlvmTool("llc"))}\n${bootstrapToolIdentity(if (macTarget) macClang else "clang")}\n$macSdkRoot"
         )
     }
+    // A split module's object needs the collector at the final link. A
+    // separate filename restores that decision on an atomic cache hit.
+    val collectorCache = "$ltoCache.release-collector.o"
     var ltoReused = false
     if (status == 0 && cached && ltoCache != "") {
-        val ltoCacheInfo = Path(ltoCache).info()
-        ltoReused = ltoCacheInfo.isFile() && ltoCacheInfo.size > 0 &&
-            bootstrapCopyNativeObject(ltoCache, ltoObjectPath) == 0
+        if (collector.directory != "" && !collector.seed && !hostImports) {
+            val splitInfo = Path(collectorCache).info()
+            collector.used = splitInfo.isFile() && splitInfo.size > 0 &&
+                bootstrapCopyNativeObject(collectorCache, ltoObjectPath) == 0
+            ltoReused = collector.used
+        }
+        if (!ltoReused) {
+            val ltoCacheInfo = Path(ltoCache).info()
+            ltoReused = ltoCacheInfo.isFile() && ltoCacheInfo.size > 0 &&
+                bootstrapCopyNativeObject(ltoCache, ltoObjectPath) == 0
+        }
     }
     // A Linux executable is one module holding the runtime, so optimizing it as a whole
     // program needs no linker: see bootstrapOptimizeWholeProgram.
     val wholeProgram = ltoEligible && !linkLlvm && target.objectFormat == "elf"
     if (status == 0 && wholeProgram && !ltoReused) {
         status = if (optimizeHeld) bootstrapOptimizeHeldWholeProgram(
-            target.llvmTriple, ltoPreparedPath, ltoObjectPath, abiManifest
+            target.llvmTriple, ltoPreparedPath, ltoObjectPath, abiManifest, collector, !hostImports
         ) else bootstrapOptimizeWholeProgram(llvmPath, ltoPreparedPath, ltoObjectPath, abiManifest)
         if (status == 0 && ltoCache != "" && Path(cacheDirectory).createDirectories()) {
-            bootstrapPublishCacheFile(ltoObjectPath, ltoCache)
+            bootstrapPublishCacheFile(ltoObjectPath, if (collector.used) collectorCache else ltoCache)
         }
     }
+    if (status == 0 && collector.used) bootstrapFrontendTraceMemory("release-collector.hit")
     // (A build that failed before using it.)
     bootstrapDisposeHeldModule()
     if (status == 0 && ltoEligible && !linkLlvm && !wholeProgram && !ltoReused) {
@@ -5975,6 +6118,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             }
             else link.argument(linkedObject)
             if (fastRuntime.objectPath != "") link.argument(fastRuntime.objectPath)
+            if (collector.used) link.argument("${collector.directory}/collector.o")
             if (macTarget) link.argument(hostPath)
             if (staticLlvm) {
                 // LLVM's static archives (the three targets the compiler initialises and the core), libstdc++, libz and libgcc, after the
@@ -5987,7 +6131,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 // (the stubs: abla_lld_main and abla_archive_gnu both return -1)
                 val lldStub = if (lldObject != "") "" else if (aarch64Linux) ".text\n.globl abla_lld_main\n.type abla_lld_main,%function\nabla_lld_main:\nmov x0, #-1\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,%function\nabla_archive_gnu:\nmov x0, #-1\nret\n.globl abla_emit_object\n.type abla_emit_object,%function\nabla_emit_object:\nmov x0, #-1\nret\n.globl abla_tool_main\n.type abla_tool_main,%function\nabla_tool_main:\nmov x0, #-1\nret\n.globl abla_shim_version\n.type abla_shim_version,%function\nabla_shim_version:\nmov x0, #0\nret\n"
                     else ".text\n.globl abla_lld_main\n.type abla_lld_main,@function\nabla_lld_main:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_archive_gnu\n.type abla_archive_gnu,@function\nabla_archive_gnu:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_emit_object\n.type abla_emit_object,@function\nabla_emit_object:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_tool_main\n.type abla_tool_main,@function\nabla_tool_main:\nxorq %rax, %rax\ndecq %rax\nret\n.globl abla_shim_version\n.type abla_shim_version,@function\nabla_shim_version:\nxorq %rax, %rax\nret\n"
-                Path(dataPath).writeText((if (aarch64Linux) bootstrapStaticLibcDataAarch64() else bootstrapStaticLibcData()) + lldStub)
+                Path(dataPath).writeText((if (aarch64Linux) bootstrapStaticLibcDataAarch64() else bootstrapStaticLibcData()) + lldStub +
+                    (if (lldObject != "") "" else if (aarch64Linux)
+                        ".text\n.globl abla_release_collector\n.type abla_release_collector,%function\nabla_release_collector:\nmov x0, #0\nret\n"
+                    else ".text\n.globl abla_release_collector\n.type abla_release_collector,@function\nabla_release_collector:\nxorq %rax, %rax\nret\n"))
                 if (lldObject != "") link.argument(lldObject)
                 // The compiler assembles the file itself (LLVM MC in the shim, `--llvm-tool llvm-mc`), so no clang or assembler is needed on the machine;
                 // without the shim the linker driver takes the .s.

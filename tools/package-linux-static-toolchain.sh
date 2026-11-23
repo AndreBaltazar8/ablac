@@ -119,6 +119,13 @@ ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa"
 
 mkdir -p "$(dirname "$output")"
 "$bundle/bin/ablac" --seed-stdlib-discovery
+cat > "$working/native-build/collector-seed.ab" <<'AB'
+import "abla/io"
+fun main: int { println("hello"); 0 }
+AB
+env -i PATH="$working/native-build" HOME="$working" ABLA_SEED_RELEASE_COLLECTOR=1 \
+    "$bundle/bin/ablac" build "$working/native-build/collector-seed.ab" --no-cache -o "$working/native-build/collector-seed"
+[[ -s $bundle/share/abla/release-collector-v1/record ]]
 
 tar -C "$working" -czf "$output" "$name"
 (

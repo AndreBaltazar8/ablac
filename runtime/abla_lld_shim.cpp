@@ -260,7 +260,7 @@ extern "C" int abla_emit_object(const char *bitcode, const char *object, int ver
 // generation flags LLVM registers itself, --disable-verify, --discard-value-names, the input and -o): the same target machine, the same pipeline.
 //
 //   int abla_tool_main(const char *tool, const char *arguments)     tool "opt", "llc", "llvm-extract" or "llvm-ar"; the arguments one a line; the tool's exit code
-//   int abla_shim_version()                                        3 here; the stub the build without the shim has returns 0
+//   int abla_shim_version()                                        4 here; the stub the build without the shim has returns 0
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/ADT/SetVector.h"
@@ -275,7 +275,7 @@ extern "C" int abla_emit_object(const char *bitcode, const char *object, int ver
 
 extern "C" int optMain(int argc, char **argv, llvm::ArrayRef<llvm::PassPlugin> PassPlugins);
 
-extern "C" int abla_shim_version() { return 3; }
+extern "C" int abla_shim_version() { return 4; }
 
 static std::vector<std::string> abla_lines(const char *text) {
     std::vector<std::string> lines;
@@ -586,3 +586,9 @@ __attribute__((weak)) void xmlSetGenericErrorFunc(void *, void *) {}
 __attribute__((weak)) unsigned char *xmlStrdup(const unsigned char *) { return nullptr; }
 __attribute__((weak)) void xmlUnlinkNode(void *) {}
 }
+
+#if defined(__linux__) && defined(__x86_64__)
+#include "abla_release_collector.h"
+#else
+extern "C" int abla_release_collector(void *, const char *, int, const char *, void *, void *) { return 0; }
+#endif
