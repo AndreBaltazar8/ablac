@@ -40,7 +40,7 @@ if [[ $mode == clienthello ]]; then
     for k in $(seq 0 $((instances - 1))); do
         port=$((24000 + k * 10))
         "$out/server" "$out/c.pem" "$out/k.pem" $port > "$out/server$k.log" 2>&1 & pids+=($!)
-        (sleep 100000 | openssl s_server -accept 127.0.0.1:$((port + 1)) -cert "$out/c.pem" -key "$out/k.pem" -quiet -www > "$out/openssl$k.log" 2>&1) & pids+=($!)
+        (sleep 3000 | openssl s_server -accept 127.0.0.1:$((port + 1)) -cert "$out/c.pem" -key "$out/k.pem" -quiet -www) > "$out/openssl$k.log" 2>&1 & pids+=($!)
         "$out/peer" server $((port + 2)) "$out/c.pem" "$out/k.pem" > "$out/go$k.log" 2>&1 & pids+=($!)
     done
     sleep 2
@@ -73,7 +73,7 @@ else
     for k in $(seq 0 $((instances - 1))); do
         port=$((26000 + k * 10))
         ("$out/client" $port $n; "$out/peer" client $((port + 2)) $n) > /dev/null 2>&1 & runs+=($!)
-        (for i in $(seq 1 $n); do timeout 1 openssl s_client -connect 127.0.0.1:$((port + 1)) -tls1_3 < /dev/null > /dev/null 2>&1 || true; done) & runs+=($!)
+        (for i in $(seq 1 $n); do timeout 1 openssl s_client -connect 127.0.0.1:$((port + 1)) -tls1_3 < /dev/null > /dev/null 2>&1 || true; done) > /dev/null 2>&1 & runs+=($!)
     done
     for pid in "${runs[@]}"; do wait "$pid" || true; done
     : > "$out/serverhello.txt"

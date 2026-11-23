@@ -498,6 +498,7 @@ test-serial: ablac
 	tools/test-tls-trust-env.sh $(COMPILER)
 	tools/test-tls-session.sh $(COMPILER)
 	tools/test-tls-fuzz.sh $(COMPILER)
+	tools/test-tls-diff.sh $(COMPILER)
 	tools/test-http2.sh $(COMPILER)
 	tools/test-http2-server.sh $(COMPILER)
 	tools/test-http2-h2o.sh $(COMPILER)

@@ -61,8 +61,9 @@ fun diffParse(message: string): DiffHello {
     DiffHello(version, random, sessionId, suites, compression, extensions, 0, 0, 0, 0, false, 0, 771, 1, "", false, false, "")
 }
 
-fun diffBase(var r: Prng): DiffHello {
-    val kind = r.below(3)
+fun diffBase(var r: Prng): DiffHello = diffBaseKind(r, r.below(3))
+
+fun diffBaseKind(var r: Prng, kind: int): DiffHello {
     val shares: array<TlsKeyShare> = [TlsKeyShare(29, diffBytes(r, 32))]
     val suites: array<int> = [4865, 4866, 4867]
     val tls12: array<int> = if (kind == 1) [49199, 49200, 49195, 49196, 52392, 52393] else []
@@ -413,6 +414,7 @@ fun main: int {
     val first = processArgument(3).parseInt() ?? 1
     val seeds = processArgument(4).parseInt() ?? 1
     val inputs = if (processArgumentCount() > 5) processArgument(5).parseInt() ?? 20 else 20
+    if (processArgumentCount() > 5 && processArgument(5) == "regress") return diffRegress(ours, openssl, go)
     var counts: Map<string, int> = Map()
     var examples: Map<string, string> = Map()
     var findings = 0
@@ -449,3 +451,36 @@ fun main: int {
 }
 
 
+
+/** The directed cases of the first campaign's findings, always run: a valid hello every server takes, and the four malformed extension bodies our server once took
+ *  that OpenSSL and Go refuse. A finding when a reference does not take the control (the oracle is broken) or when ours takes a malformed hello both references refuse. */
+fun diffRegress(ours: int, openssl: int, go: int): int {
+    var r = prngSeeded(7)
+    val names: array<string> = ["control", "alpn-empty-list", "versions-empty-list", "early-data-body", "status-request-truncated"]
+    var findings = 0
+    for (i in 0 until names.size) {
+        val hello = diffBaseKind(r, if (i == 2) 1 else 2)
+        if (i == 1) diffSetBody(hello, 16, "\x00\x00")
+        else if (i == 2) diffSetBody(hello, 43, "\x00")
+        else if (i == 3) hello.extensions = diffInsert(hello.extensions, 2, DiffExt(42, "\x00", 0))
+        else if (i == 4) hello.extensions = diffInsert(hello.extensions, 2, DiffExt(5, "\x01\x00", 0))
+        val wire = diffSerialize(r, hello)
+        val a = diffAccept(diffProbe(ours, wire))
+        val b = diffAccept(diffProbe(openssl, wire))
+        val c = diffAccept(diffProbe(go, wire))
+        println("REGRESS ${names[i]} ours/openssl/go $a/$b/$c")
+        if (a == "gone") {
+            println("DEAD our server is gone (not a difference: the server process died or never started) at ${names[i]}")
+            return 3
+        }
+        if (i == 0 && (a != "acc" || b != "acc" || c != "acc")) {
+            println("FINDING the control hello is not taken by every server: $a/$b/$c")
+            findings = findings + 1
+        }
+        if (i > 0 && a == "acc" && b == "rej" && c == "rej") {
+            println("FINDING our server takes ${names[i]}, which OpenSSL and Go both refuse")
+            findings = findings + 1
+        }
+    }
+    if (findings == 0) 0 else 1
+}
