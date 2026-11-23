@@ -1,0 +1,133 @@
+// The HTTPS event server (here without TLS, as a plain HTTP/1 server) reads a request that arrives in small pieces in time proportional to its size (#1139 area 4). It keeps
+// reads that cannot complete a request of known length unjoined until the request can be complete, and it keeps a chunked request's
+// head and decoded body apart from the bytes still to come, so each read is looked at once. One program: the server and a client in
+// one thread, the client writing and the server stepping after every write, so every read is one piece. It checks that
+//   - a body in 16-byte pieces arrives whole and is answered, and a request that ends in the same write as the start of the next one
+//     is answered, then the next one;
+//   - a chunked request with extensions and trailers, followed by another request in the same stream, gives the same bodies however
+//     the bytes are split (at every position, and one byte at a time);
+//   - the time grows in proportion: a 1 MiB body in 16-byte pieces (the default body limit) takes at most 12 times what 128 KiB takes
+//     (8 times the bytes), and 12000 one-byte chunks in 6-byte pieces at most 10 times what 3000 take (4 times the bytes), the best of
+//     two runs each, so a shared machine's noise does not matter.
+// Prints "http-event-tls drip ok".
+import "abla/io"
+import "abla/text"
+import "abla/http"
+import "abla/http/event/tls"
+import "abla/net"
+import "abla/sys/linux/process"
+
+fun answer(request: HttpRequest): HttpResponse = httpText("got ${request.body.size}")
+
+fun echo(request: HttpRequest): HttpResponse = httpText("[${request.body}]")
+
+fun head(total: int): string = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: ${total}\r\n\r\n"
+
+fun reply(client: TcpConnection): string {
+    client.setNonblocking()
+    client.readCompact(65536)
+}
+
+fun newServer(): HttpsEventServer {
+    val router = httpRouter()
+    router.post("/", answer)
+    router.post("/echo", echo)
+    httpsEventServer(router, ipv4Loopback(0))
+}
+
+// Sends `data` (after a first write of `start`) in pieces of `piece`; the milliseconds, or -1 when the answer lacks `expected`.
+fun drip(start: string, data: string, piece: int, expected: string): int {
+    val server = newServer()
+    if (server.listener.descriptor < 0) return -1
+    val client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
+    client.write(start)
+    server.step(50)
+    val started = linuxMonotonicMilliseconds()
+    var sent = 0
+    while (sent < data.size) {
+        val n = if (sent + piece <= data.size) piece else data.size - sent
+        client.write(data.slice(sent, sent + n))
+        sent = sent + n
+        server.step(0)
+    }
+    val elapsed = linuxMonotonicMilliseconds() - started
+    for (i in 0 until 5) server.step(20)
+    val answered = reply(client)
+    client.close()
+    if (!answered.contains(expected)) {
+        println("FAIL a request sent in pieces of ${piece} was answered with: ${answered}")
+        return -1
+    }
+    elapsed
+}
+
+fun best(start: string, data: string, piece: int, expected: string): int {
+    var result = drip(start, data, piece, expected)
+    if (result < 0) return -1
+    val next = drip(start, data, piece, expected)
+    if (next < 0) return -1
+    if (next < result) result = next
+    result
+}
+
+fun bodyDrip(total: int): int = best(head(total), "x".repeat(total), 16, "got ${total}")
+
+fun chunkDrip(chunks: int): int = best(
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", "1\r\nx\r\n".repeat(chunks) + "0\r\n\r\n", 6, "got ${chunks}"
+)
+
+fun main: int {
+    // A request that ends with the start of the next one in the same write: both are answered.
+    if (drip(head(10) + "01234", "56789" + head(3) + "abc", 5, "got 10") < 0) return 1
+    val server = newServer()
+    if (server.listener.descriptor < 0) return 1
+    val client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
+    client.write(head(10) + "01234")
+    server.step(50)
+    client.write("56789" + head(3) + "abc")
+    for (i in 0 until 5) server.step(20)
+    val answered = reply(client)
+    client.close()
+    if (!answered.contains("got 10") || !answered.contains("got 3")) {
+        println("FAIL pipelined requests after a held body were not both answered: ${answered}")
+        return 1
+    }
+    // A chunked request with an extension, a chunk of several bytes and trailers, then a second request: the same answers at every split.
+    val wire = "POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n" +
+        "5;a=b\r\nhello\r\n1\r\n \r\n7\r\nworld!!\r\n0\r\nTrailer-X: y\r\n\r\n" + head(3) + "abc"
+    for (cut in 1 until wire.size) {
+        val s = newServer()
+        if (s.listener.descriptor < 0) return 1
+        val c = tcpConnectIpv4("127.0.0.1", s.listener.localPort(), 2000)
+        c.write(wire.slice(0, cut))
+        s.step(20)
+        c.write(wire.slice(cut, wire.size))
+        for (i in 0 until 4) s.step(20)
+        val got = reply(c)
+        c.close()
+        if (!got.contains("[hello world!!]") || !got.contains("got 3")) {
+            println("FAIL a chunked request split at ${cut} was answered with: ${got}")
+            return 1
+        }
+    }
+    if (drip("", wire, 1, "[hello world!!]") < 0) return 1
+    val small = bodyDrip(131072)
+    val large = bodyDrip(1048576)
+    if (small < 0 || large < 0) return 1
+    // A tiny small-time is noise; the quadratic cost would show as 17 times or more.
+    val floor = if (small < 50) 50 else small
+    if (large > 12 * floor) {
+        println("FAIL the time is not in proportion to the size: 128 KiB took ${small} ms, 1 MiB took ${large} ms in 16-byte pieces")
+        return 1
+    }
+    val fewChunks = chunkDrip(3000)
+    val manyChunks = chunkDrip(12000)
+    if (fewChunks < 0 || manyChunks < 0) return 1
+    val chunkFloor = if (fewChunks < 40) 40 else fewChunks
+    if (manyChunks > 10 * chunkFloor) {
+        println("FAIL the time is not in proportion to the number of chunks: 3000 took ${fewChunks} ms, 12000 took ${manyChunks} ms")
+        return 1
+    }
+    println("http-event-tls drip ok")
+    0
+}

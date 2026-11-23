@@ -10,6 +10,7 @@
 // The handler (or router) is the one of HttpEventServer: `(HttpRequest) -> HttpResponse`, called once per request (once per stream over HTTP/2, when the request is whole),
 // on the event loop's thread. A handler that is slow stalls every connection, as there.
 
+import "abla/bytes"
 import "abla/http"
 import "abla/http/stream"
 import "abla/http/event"
@@ -172,7 +173,12 @@ resource class HttpsEventServer(
     // Streaming routes and their live exchanges (registered with streamRoute).
     val streamRoutes: array<HttpsStreamRoute> = [],
     val exchanges: array<HttpsExchange> = [],
-    var nextExchange: int = 1
+    var nextExchange: int = 1,
+    // Reads that cannot complete the HTTP/1 request yet wait in `tails[slot]`, unjoined, until `needs[slot]` bytes are held, and a chunked request
+    // is kept in pieces in `chunkStates[slot]`: each read is looked at once, not the whole buffer again (see HttpEventServer).
+    val needs: array<int> = [],
+    val tails: array<ByteBuffer> = [],
+    val chunkStates: array<HttpEventChunkState> = []
 ) {
     /// Closes the active sockets, poller and listener when the server is dropped.
     fun drop(): void {
@@ -875,6 +881,9 @@ private fun HttpsEventServer.allocate(descriptor: int): int {
         this.lastActivity.append(now)
         this.started.append(now)
         this.peers.append(peer)
+        this.needs.append(0)
+        this.tails.append(byteBuffer())
+        this.chunkStates.append(httpEventChunkState())
     } else {
         this.descriptors[slot] = descriptor
         this.peers[slot] = peer
@@ -886,6 +895,9 @@ private fun HttpsEventServer.allocate(descriptor: int): int {
         this.closing[slot] = false
         this.lastActivity[slot] = now
         this.started[slot] = now
+        this.needs[slot] = 0
+        this.tails[slot] = byteBuffer()
+        this.chunkStates[slot].reset()
     }
     while (this.descriptorSlots.size <= descriptor) this.descriptorSlots.append(-1)
     this.descriptorSlots[descriptor] = slot
@@ -923,6 +935,7 @@ fun HttpsEventServer.closeSlot(slot: int): void {
         this.writeWatching[slot] = false
         this.closing[slot] = false
         this.lastActivity[slot] = 0
+        this.needs[slot] = 0
         this.abortExchanges(slot, "the connection closed")
         if (wasHttp2) {
             this.h2[slot] = h2ServerNew()
@@ -1061,7 +1074,7 @@ private fun HttpsEventServer.serveHttp1(slot: int): void {
             continue
         }
         // A request for a streaming route is started from its head, whatever of its body has arrived.
-        if (this.streamRoutes.size > 0) {
+        if (this.streamRoutes.size > 0 && this.chunkStates[slot].head == null) {
             val seen = this.inputs[slot]
             val headEnd = httpHeaderEnd(seen)
             if (headEnd > 0 && headEnd <= base.maximumHeaderBytes) {
@@ -1078,8 +1091,13 @@ private fun HttpsEventServer.serveHttp1(slot: int): void {
                 }
             }
         }
-        val frame = httpEventFrame(this.inputs[slot], base.maximumHeaderBytes, base.maximumBodyBytes, this.peers[slot])
+        val frame = this.chunkStates[slot].assemble(this.inputs[slot], base.maximumHeaderBytes, base.maximumBodyBytes, this.peers[slot])
         val length = frame.length
+        this.needs[slot] = if (length == 0) frame.need else 0
+        if (length == 0 && frame.trim > 0) {
+            // A chunked request still incomplete: what is before its first incomplete chunk element is in the slot's state now.
+            this.inputs[slot] = this.inputs[slot].slice(frame.trim, this.inputs[slot].size)
+        }
         if (length < 0) {
             this.outputs[slot] = httpText("bad request", 400).render()
             this.outputOffsets[slot] = 0
@@ -1163,8 +1181,18 @@ private fun HttpsEventServer.onBytes(slot: int, data: string): void {
     if (state == httpsHttp2) {
         this.serveHttp2(slot, data)
     } else if (state == httpsHttp1) {
+        val held = this.tails[slot].size()
+        if (this.needs[slot] > 0 && this.inputs[slot].size + held + data.size < this.needs[slot]) {
+            // The request cannot be complete yet: keep the piece, look at nothing.
+            this.tails[slot].appendText(data)
+            return
+        }
+        if (held > 0) {
+            this.inputs[slot] = this.inputs[slot] + this.tails[slot].toText()
+            this.tails[slot] = byteBuffer()
+        }
         this.inputs[slot] = this.inputs[slot] + data
-        if (this.inputs[slot].size > this.options.base.maximumHeaderBytes + this.options.base.maximumBodyBytes &&
+        if (this.chunkStates[slot].head == null && this.inputs[slot].size > this.options.base.maximumHeaderBytes + this.options.base.maximumBodyBytes &&
             httpEventRequestLength(this.inputs[slot], this.options.base.maximumHeaderBytes, this.options.base.maximumBodyBytes) <= 0) this.closeSlot(slot)
         else this.serveHttp1(slot)
     }
