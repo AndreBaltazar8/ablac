@@ -27,6 +27,7 @@ try {
         ["rev", "0123456789abcdef0123456789abcdef01234567", "fetch", false],
         ["branch", "main", "ls-remote", true],
     ]) {
+        const scenario = interrupt ? operation + " on SIGTERM" : operation + " deadline";
         const app = join(scratch, interrupt ? "interrupt" : selector);
         const cache = join(app, "cache");
         mkdirSync(app);
@@ -39,7 +40,9 @@ try {
             socket.on("data", bytes => {
                 if (received || bytes[0] !== 22) return;
                 received = true;
-                if (interrupt) child.kill("SIGINT");
+                // The launcher runs timeout as a background job, which inherits
+                // SIGINT ignored. Termination is forwarded to the compiler.
+                if (interrupt) child.kill("SIGTERM");
             });
             socket.on("error", () => {});
             socket.once("close", () => sockets.delete(socket));
@@ -76,9 +79,9 @@ try {
         }, 10000);
         try {
             const [status] = await once(child, "close");
-            assert.ok(received, operation + " did not send a TLS ClientHello:\n" + diagnostic);
-            assert.ok(!expired, operation + " hung until the test watchdog");
-            assert.notEqual(status, 0, operation + " unexpectedly succeeded");
+            assert.ok(received, scenario + " did not send a TLS ClientHello:\n" + diagnostic);
+            assert.ok(!expired, scenario + " hung until the test watchdog:\n" + diagnostic);
+            assert.notEqual(status, 0, scenario + " unexpectedly succeeded");
             if (interrupt) assert.ok(!diagnostic.includes("E_PACKAGE_GIT_TIMEOUT"), diagnostic);
             else {
                 assert.ok(diagnostic.includes("error[E_PACKAGE_GIT_TIMEOUT]"), diagnostic);
@@ -89,7 +92,7 @@ try {
             const fetchCache = join(cache, "git", "silent");
             if (existsSync(fetchCache)) assert.deepEqual(readdirSync(fetchCache), [], "partial fetch cache");
             for (let i = 0; sockets.size > 0 && i < 100; i++) await delay(10);
-            assert.equal(sockets.size, 0, operation + " left its HTTPS helper connected");
+            assert.equal(sockets.size, 0, scenario + " left its HTTPS helper connected");
         } finally {
             clearTimeout(watchdog);
             for (const socket of sockets) socket.destroy();
