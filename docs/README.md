@@ -39,6 +39,7 @@ examples. The [compact guide](guide.md) is a single-page refresher.
 | [platforms.md](platforms.md) | Coverage tiers, compiler hosts, runtime targets, release assets and remaining platform gaps |
 | [targets.md](targets.md) | Target selection, release platforms and evidence for cross-target coverage |
 | [stdlib/ios-build.md](stdlib/ios-build.md) | iOS SDK selection, static libraries, exported C ABI and XCFramework packaging |
+| [playground.md](playground.md) | The compiler in a page: the front end as a Wasm module, running programs with the evaluator, the release package |
 | [toolchain.md](toolchain.md) | `ablac build`, `run`, `repl`, `serve`, `package`; targets and Wasm |
 | [llvm-backend.md](llvm-backend.md) | How code is emitted; `@naked`, `@section`, inline assembly |
 | [freestanding.md](freestanding.md) | Programs without libc or an operating system |
