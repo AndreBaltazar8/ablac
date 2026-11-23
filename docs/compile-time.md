@@ -470,6 +470,47 @@ Without the manifest entry, it stops with `compile.capability-not-authorized:fil
 In a package, a dependency's `compileCapabilities` must be a subset of the
 root project's (`E_PACKAGE_CAPABILITY_DENIED`).
 
+### Grants per package
+
+Capabilities are granted per package, not per program. A `#` site gets what its own package has:
+
+- the `#compilerGrant` requests of that package's modules,
+- ∩ what the package declares: for a dependency, the `compileCapabilities` of its own `abla.toml`; for the root,
+  its authorization,
+- ∩ what the root allows that package. For the root's own code that is its `compileCapabilities`. A dependency
+  gets the same list without `trusted.native`, which it gets only by name:
+
+```toml
+compileCapabilities = ["filesystem.read", "trusted.native"]   # the root's own `#` code, and the ceiling for all
+
+[dependencyCompileCapabilities]                                # named grants, one line per locked package
+fast-json = ["trusted.native"]
+```
+
+A named grant holds only while `abla.lock` pins that package's content digest (else
+`E_PACKAGE_CAPABILITY_UNPINNED`), and never beyond the root's own list (`E_PACKAGE_CAPABILITY_DENIED`).
+A dependency that requests a capability its `abla.toml` doesn't declare stops the build with
+`E_COMPILE_CAPABILITY_UNDECLARED`, naming the module and the capability. The check is the same for a
+dependency of a dependency.
+
+The package a module belongs to is decided by where the module is, never by a manifest inside it:
+
+- The root's tree is its project: the nearest directory at or above the entry whose `abla.toml` has a
+  `name`, else the repository root, else the working directory. This is the same project that bounds
+  compile-time paths. A symbolically linked directory in the tree counts by its path, so it is part of
+  the tree. The standard library counts as the root's.
+- A locked package is its copy under the root's `.abla/packages/<name>/`, or its vendored tree
+  `vendor/<name>/` with its revision marker.
+- Any other package copy gets nothing. That covers the package cache, another project's
+  `.abla/packages/`, and a vendored tree whose name the lock doesn't have.
+- A module imported by path from outside the tree (a sibling checkout, `../abla-mobile/src/android_build.ab`)
+  belongs to whoever imports it. If the root's own code reaches it, it is the root's. Otherwise the
+  first dependency whose code reaches it owns it, so a file a dependency reaches with `../../..` out of
+  its copy is that dependency's and never the root's. A module nobody owns gets nothing.
+
+Grants are per site. A dependency's `#` site that calls a function of a module the root owns is judged
+by the dependency's grants, because the effects the function reaches are counted at the site.
+
 The compiler works out which capabilities each function needs, transitively.
 The error names the whole call path, as in
 `compile.effect-denied:environment:readBuildEnvironment->compilerEnvironment`.

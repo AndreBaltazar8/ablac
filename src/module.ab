@@ -1458,6 +1458,339 @@ fun bootstrapManifestCompileCapabilities(
     capabilities
 }
 
+// --- compile capabilities per package (#1142 F1) -------------------------------------------------------------------
+//
+// A `#` site's grants are its own package's: the #compilerGrant requests of that package's modules, ∩ the package's
+// declared compileCapabilities (a dependency's own abla.toml; the root's is the authorization itself), ∩ what the root
+// allows that package. The root allows a dependency its compileCapabilities without the named-only ones; a named-only
+// capability comes only by a line in the root's [dependencyCompileCapabilities] table, and only while abla.lock pins
+// the package's content digest. Before, one set was granted to the whole program: the union of every module's
+// requests ∩ the root's list, so a dependency that declared nothing got whatever the root granted its own code.
+
+/** The capabilities a dependency gets only when the root names it in [dependencyCompileCapabilities]. */
+val BOOTSTRAP_COMPILE_NAMED_ONLY: int = 512
+
+/** The effects in `left` and not in `right`. */
+fun bootstrapCompileEffectWithout(left: int, right: int): int {
+    var result = 0
+    var effect = 4
+    while (effect <= BOOTSTRAP_COMPILE_TRANSFORM_LIBRARY) {
+        if (bootstrapCompileEffectHas(left, effect) && !bootstrapCompileEffectHas(right, effect)) result = result + effect
+        effect = effect * 2
+    }
+    result
+}
+
+/** The effects of capability names (unknown names give none). */
+fun bootstrapCompileEffectsOfNames(names: array<string>): int {
+    var effects = 0
+    for (name in names) effects = bootstrapCompileEffectMerge(effects, bootstrapCompileEffectFromName(name))
+    effects
+}
+
+// A module outside the root's tree that is no package's copy: whose it is depends on who imports it.
+val BOOTSTRAP_COMPILE_PACKAGE_PATH: string = "~"
+
+/** The name of the directory right after `marker` in `absolute` (from `at`), or "". */
+fun bootstrapCompilePackageNameAfter(absolute: string, at: int, marker: string): string {
+    val rest = absolute.slice(at + marker.size, absolute.size)
+    val slash = rest.indexOf("/")
+    if (slash > 0) rest.slice(0, slash) else ""
+}
+
+/**
+ * The package the module `path` belongs to by where it is, for a build whose root project is at `rootDirectory`
+ * (absolute, bootstrapBuildCallRoot) with the locked packages `locked`:
+ *   - "" for the root: its own tree by the lexical path (a symbolically linked directory in it included), and the
+ *     standard library;
+ *   - a locked package's name in the root's prepared copy (`<root>/.abla/packages/<name>/`) or vendored tree
+ *     (`<root>/vendor/<name>/` with its revision marker);
+ *   - "?" (no package, nothing granted) in any other package copy: the package cache, another `.abla/packages/`, a
+ *     vendored tree of a name the lock doesn't have;
+ *   - BOOTSTRAP_COMPILE_PACKAGE_PATH for any other path outside the root (a sibling checkout imported by path).
+ * A package's own abla.toml never names it: a dependency could carry a manifest that claims another package's name.
+ */
+fun bootstrapCompilePackageOf(rootDirectory: string, path: string, locked: array<BootstrapLockedPackage>): string {
+    if (bootstrapStandardLibraryModuleSource(path)) return ""
+    val absolute = bootstrapUnusedImportAbsolute(path)
+    val prepared = "$rootDirectory/.abla/packages/"
+    if (absolute.startsWith(prepared)) {
+        val name = bootstrapCompilePackageNameAfter(absolute, 0, prepared)
+        return if (name != "" && bootstrapPackageLockIndex(locked, name) >= 0) name else "?"
+    }
+    val vendored = "$rootDirectory/vendor/"
+    if (absolute.startsWith(vendored)) {
+        val name = bootstrapCompilePackageNameAfter(absolute, 0, vendored)
+        if (name != "" && Path("$vendored$name/.abla-revision").exists())
+            return if (bootstrapPackageLockIndex(locked, name) >= 0) name else "?"
+    }
+    if (absolute.contains("/.abla/packages/")) return "?"
+    val cache = bootstrapUnusedImportAbsolute(bootstrapPackageCacheRoot())
+    if (absolute.startsWith("$cache/")) return "?"
+    // A vendored package's copy anywhere (`…/vendor/<name>/` with its revision marker).
+    var at = absolute.indexOf("/vendor/")
+    while (at >= 0) {
+        val name = bootstrapCompilePackageNameAfter(absolute, at, "/vendor/")
+        if (name != "" && Path("${absolute.slice(0, at)}/vendor/$name/.abla-revision").exists()) return "?"
+        val next = absolute.slice(at + 1, absolute.size).indexOf("/vendor/")
+        at = if (next < 0) -1 else at + 1 + next
+    }
+    if (absolute.startsWith("$rootDirectory/")) "" else BOOTSTRAP_COMPILE_PACKAGE_PATH
+}
+
+/** The directory holding the abla.toml of the locked package `name` under the root project at `rootDirectory`. */
+fun bootstrapCompilePackageDirectory(rootDirectory: string, name: string): string {
+    val vendored = "$rootDirectory/vendor/$name"
+    if (Path("$vendored/.abla-revision").exists() && !Path("$rootDirectory/.abla/packages/$name/source").exists())
+        return vendored
+    "$rootDirectory/.abla/packages/$name/source"
+}
+
+/**
+ * The root manifest's [dependencyCompileCapabilities] lines, as "name\tcapability,capability" (one per line of the
+ * table, a single-line array of quoted names), or "\t<line>" for a line that isn't one.
+ */
+fun bootstrapManifestNamedCompileGrants(manifest: string): array<string> {
+    val entries: array<string> = []
+    if (manifest == "") return entries
+    val source = Path(manifest).readText()
+    var inTable = false
+    var lineBegin = 0
+    while (lineBegin < source.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < source.size && source[lineEnd] != 10 && source[lineEnd] != 13) lineEnd = lineEnd + 1
+        var contentEnd = lineEnd
+        var quote = false
+        var cursor = lineBegin
+        while (cursor < contentEnd) {
+            if (source[cursor] == 34) quote = !quote
+            if (source[cursor] == 35 && !quote) contentEnd = cursor
+            cursor = cursor + 1
+        }
+        val line = bootstrapPackageTrim(source.slice(lineBegin, contentEnd))
+        if (line.size > 0 && line[0] == 91) {
+            inTable = line == "[dependencyCompileCapabilities]"
+        } else if (inTable && line != "") {
+            val equals = line.indexOf("=")
+            val name = if (equals > 0) bootstrapPackageTrim(line.slice(0, equals)) else ""
+            val value = if (equals > 0) bootstrapPackageTrim(line.slice(equals + 1, line.size)) else ""
+            var capabilities = ""
+            var valid = name != "" && value.size >= 2 && value[0] == 91 && value[value.size - 1] == 93
+            if (valid) {
+                for (part in value.slice(1, value.size - 1).split(",")) {
+                    val item = bootstrapPackageTrim(part)
+                    if (item.size >= 2 && item[0] == 34 && item[item.size - 1] == 34) {
+                        val capability = item.slice(1, item.size - 1)
+                        capabilities = if (capabilities == "") capability else "$capabilities,$capability"
+                    } else if (item != "") valid = false
+                }
+            }
+            entries.append(if (valid) "$name\t$capabilities" else "\t$line")
+        }
+        lineBegin = lineEnd + 1
+    }
+    entries
+}
+
+/**
+ * Each of `snapshots`' package, for grants (bootstrapCompilePackageOf; "" the root, a locked name, "?" none). A module
+ * outside the root's tree and every package copy (BOOTSTRAP_COMPILE_PACKAGE_PATH) is its importer's: the root's when
+ * the root's own code (the entry always) reaches it through such modules, else the first dependency's that does, else
+ * no one's. So a sibling checkout the project imports by path is the project's own code, and a file a dependency
+ * reaches with `../../..` out of its copy is that dependency's, never the root's, wherever it lies.
+ */
+fun bootstrapCompilePackageOwners(
+    snapshots: array<BootstrapModuleSnapshot>,
+    importTargets: array<array<string>>,
+    rootDirectory: string,
+    entry: string,
+    locked: array<BootstrapLockedPackage>
+): array<string> {
+    val owners: array<string> = []
+    val positions: Map<string, int> = Map()
+    var index = 0
+    for (snapshot in snapshots) {
+        val located = bootstrapCompilePackageOf(rootDirectory, snapshot.path, locked)
+        val isEntry = located == BOOTSTRAP_COMPILE_PACKAGE_PATH &&
+            bootstrapUnusedImportAbsolute(snapshot.path) == entry
+        owners.append(if (isEntry) "" else located)
+        positions.set(snapshot.path, index)
+        index = index + 1
+    }
+    // The root's reach first (it wins a module both reach), then each dependency's in order.
+    for (rootPass in [true, false]) {
+        val queue: array<int> = []
+        index = 0
+        while (index < owners.size) {
+            val owner = owners[index]
+            if (owner != BOOTSTRAP_COMPILE_PACKAGE_PATH && owner != "?" && (owner == "") == rootPass) queue.append(index)
+            index = index + 1
+        }
+        var head = 0
+        while (head < queue.size) {
+            val current = queue[head]
+            head = head + 1
+            if (current >= importTargets.size) continue
+            for (target in importTargets[current]) {
+                val position = positions.get(target)
+                if (position != null && owners[position] == BOOTSTRAP_COMPILE_PACKAGE_PATH) {
+                    owners[position] = owners[current]
+                    queue.append(position)
+                }
+            }
+        }
+    }
+    index = 0
+    while (index < owners.size) {
+        if (owners[index] == BOOTSTRAP_COMPILE_PACKAGE_PATH) owners[index] = "?"
+        index = index + 1
+    }
+    owners
+}
+
+class BootstrapCompilePackagePlan(
+    val errors: int,
+    val diagnostics: string,
+    // Changes when any module's grants do (the parse cache's key).
+    val fingerprint: int
+)
+
+/**
+ * Grants each of `snapshots` its package's compile capabilities (ct_native.ab, ctNativeSetModuleGrants) for the build
+ * whose entry is `entry` and whose root authorizes `authorized`, and reports what the packages can't have:
+ *   - E_COMPILE_CAPABILITY_UNDECLARED: a dependency's module requests (#compilerGrant) a capability its abla.toml
+ *     doesn't declare, or a module outside the project and every locked package requests one;
+ *   - E_PACKAGE_CAPABILITY_UNPINNED: a [dependencyCompileCapabilities] line for a package abla.lock doesn't pin by
+ *     digest;
+ *   - E_PACKAGE_CAPABILITY_DENIED: a named grant beyond the root's own compileCapabilities, or a line that isn't
+ *     `name = ["capability", ...]`.
+ */
+fun bootstrapPlanCompilePackageGrants(
+    snapshots: array<BootstrapModuleSnapshot>,
+    // Each snapshot's plain imports, resolved to module identities.
+    importTargets: array<array<string>>,
+    authorized: int,
+    entry: string
+): BootstrapCompilePackagePlan {
+    if (entry == "") {
+        ctNativeModuleGrantsActive = false
+        return BootstrapCompilePackagePlan(0, "", 0)
+    }
+    val entryAbsolute = bootstrapUnusedImportAbsolute(entry)
+    // The authorization is the nearest manifest's (a capability-only one under the project included); the root's tree
+    // is its project, as for compile-time paths (eval.ab, bootstrapBuildCallRoot): the nearest named manifest's
+    // directory, else the repository's, else the working directory.
+    val manifest = bootstrapCompileManifestFor(entryAbsolute)
+    val rootDirectory = bootstrapBuildCallRoot(Path(entryAbsolute).parent().text)
+    val lockPath = "$rootDirectory/abla.lock"
+    val locked = if (Path(lockPath).exists()) bootstrapPackageReadLock(lockPath).packages else []
+    var errors = 0
+    var diagnostics = ""
+    // What the root allows each locked package by name, beyond the default.
+    val namedPackages: array<string> = []
+    val namedEffects: array<int> = []
+    for (line in bootstrapManifestNamedCompileGrants(manifest)) {
+        val tab = line.indexOf("\t")
+        val name = line.slice(0, tab)
+        if (name == "") {
+            errors = errors + 1
+            diagnostics = "${diagnostics}error[E_PACKAGE_CAPABILITY_DENIED]: root manifest '$manifest' [dependencyCompileCapabilities] line '${line.slice(tab + 1, line.size)}' is not `name = [\"capability\", ...]`\n"
+            continue
+        }
+        val names = line.slice(tab + 1, line.size).split(",")
+        val effects = bootstrapCompileEffectsOfNames(names)
+        for (capability in names) {
+            if (capability != "" && !bootstrapCompileEffectHas(authorized, bootstrapCompileEffectFromName(capability))) {
+                errors = errors + 1
+                diagnostics = "${diagnostics}error[E_PACKAGE_CAPABILITY_DENIED]: root manifest '$manifest' grants dependency '$name' compile capability '$capability' by name, but not in its own compileCapabilities, which bound every package's\n"
+            }
+        }
+        val lockIndex = bootstrapPackageLockIndex(locked, name)
+        if (lockIndex < 0 || locked[lockIndex].digest == "") {
+            errors = errors + 1
+            diagnostics = "${diagnostics}error[E_PACKAGE_CAPABILITY_UNPINNED]: root manifest '$manifest' grants dependency '$name' compile capabilities by name, but abla.lock doesn't pin its content digest; run 'ablac package update --project $rootDirectory'\n"
+        } else {
+            namedPackages.append(name)
+            namedEffects.append(bootstrapBuildCompileEffectGrants(effects, authorized))
+        }
+    }
+    val owned = bootstrapCompilePackageOwners(snapshots, importTargets, rootDirectory, entryAbsolute, locked)
+    // Each package's requests, its declared capabilities and what the root allows it.
+    val packages: array<string> = []
+    val requests: array<int> = []
+    // What a package's modules may have: the root's authorization for its own; for a dependency, what it declares ∩
+    // what the root allows it; nothing for a module of no package.
+    val limits: array<int> = []
+    val declarations: array<int> = []
+    val owners: array<int> = []
+    var ownedIndex = 0
+    for (snapshot in snapshots) {
+        val package = owned[ownedIndex]
+        ownedIndex = ownedIndex + 1
+        val requested = bootstrapBuildCompileEffectRequests(snapshot.discovery)
+        var index = 0
+        while (index < packages.size && packages[index] != package) index = index + 1
+        if (index == packages.size) {
+            var declared = 0
+            var limit = 0
+            if (package == "") {
+                declared = authorized
+                limit = authorized
+            } else if (package != "?") {
+                declared = bootstrapCompileEffectsOfNames(bootstrapPackageManifestStringArray(
+                    "${bootstrapCompilePackageDirectory(rootDirectory, package)}/abla.toml", "compileCapabilities"))
+                var allowed = bootstrapCompileEffectWithout(authorized, BOOTSTRAP_COMPILE_NAMED_ONLY)
+                var named = 0
+                while (named < namedPackages.size) {
+                    if (namedPackages[named] == package) allowed = bootstrapCompileEffectMerge(allowed, namedEffects[named])
+                    named = named + 1
+                }
+                limit = bootstrapBuildCompileEffectGrants(declared, allowed)
+            }
+            packages.append(package)
+            requests.append(0)
+            limits.append(limit)
+            declarations.append(declared)
+        }
+        owners.append(index)
+        requests[index] = bootstrapCompileEffectMerge(requests[index], requested)
+        // A request beyond what the package declares is refused by name, not quietly dropped. (The root's own beyond
+        // its authorization is sema's compile.capability-not-authorized.)
+        if (package != "") {
+            val undeclared = bootstrapCompileEffectWithout(requested, declarations[index])
+            var effect = 4
+            while (effect <= BOOTSTRAP_COMPILE_TRANSFORM_LIBRARY) {
+                if (bootstrapCompileEffectHas(undeclared, effect)) {
+                    errors = errors + 1
+                    val capability = bootstrapCompileEffectName(effect)
+                    diagnostics = if (package == "?")
+                        "${diagnostics}error[E_COMPILE_CAPABILITY_UNDECLARED]: module '${snapshot.path}' requests compile capability '$capability' (#compilerGrant), but it is in no package the build grants to: a package copy the project at '$rootDirectory' doesn't lock, or a file outside it that no package's code imports\n"
+                    else
+                        "${diagnostics}error[E_COMPILE_CAPABILITY_UNDECLARED]: module '${snapshot.path}' of dependency '$package' requests compile capability '$capability' (#compilerGrant), which its abla.toml doesn't declare in compileCapabilities\n"
+                }
+                effect = effect * 2
+            }
+        }
+    }
+    var root = 0
+    var index = 0
+    while (index < packages.size) {
+        if (packages[index] == "") root = bootstrapBuildCompileEffectGrants(requests[index], limits[index])
+        index = index + 1
+    }
+    ctNativeBeginModuleGrants(root)
+    var fingerprint = 53
+    var module = 0
+    while (module < snapshots.size) {
+        val package = owners[module]
+        val grants = bootstrapBuildCompileEffectGrants(requests[package], limits[package])
+        ctNativeSetModuleGrants(snapshots[module].path, grants)
+        fingerprint = (fingerprint * 31 + grants + package) % 1000000007
+        module = module + 1
+    }
+    BootstrapCompilePackagePlan(errors, diagnostics, fingerprint)
+}
+
 // The bootstrap package reader intentionally accepts a small deterministic
 // TOML subset. String fields provide root/package identity and entry selection;
 // import providers and lock records use the bounded package scanner.
@@ -5314,8 +5647,21 @@ class BootstrapModuleGraph(
             requestedEffects,
             authorizedEffects
         )
+        // Each module's own package's grants (#1142 F1): what its `#` sites get, at parse and in analysis and lowering.
+        val importTargets: array<array<string>> = []
+        for (importer in preparedSnapshots) {
+            val targets: array<string> = []
+            for (edge in importer.importEdges) {
+                if (!edge.provider) targets.append(this.state.exposedTarget(bootstrapResolveImport(importer.path, edge.source)))
+            }
+            importTargets.append(targets)
+        }
+        val packageGrants = bootstrapPlanCompilePackageGrants(preparedSnapshots, importTargets, authorizedEffects,
+            this.index.entryPath)
+        parseErrors = parseErrors + packageGrants.errors
+        parseDiagnostics = "$parseDiagnostics${packageGrants.diagnostics}"
         dependencyFingerprint = dependencyFingerprint + allowedCompileEffects +
-            completeDeclarationFingerprint
+            completeDeclarationFingerprint + packageGrants.fingerprint
         for (requesting in preparedSnapshots) {
             if (bootstrapCompileEffectHas(bootstrapBuildCompileEffectRequests(requesting.discovery),
                     BOOTSTRAP_COMPILE_TIME_UNLIMITED) &&
@@ -5416,7 +5762,7 @@ class BootstrapModuleGraph(
                 currentDeclarationBegin,
                 snapshot.discovery.declarations.size,
                 BootstrapSubparserRegistry(moduleRegistrations, 0, ""),
-                allowedCompileEffects
+                ctNativeGrantsAt(snapshot.path, allowedCompileEffects)
             )
             bootstrapFrontendTraceMemory(
                 "parse.module.end:$moduleIndex:${parsed.declarations.size}"
