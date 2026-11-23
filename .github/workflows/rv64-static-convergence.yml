@@ -5,20 +5,19 @@ on:
 
 permissions:
   contents: read
-
 defaults:
   run:
     shell: bash
+env:
+  ABLA_NATIVE_JOBS: '4'
+  ABLA_CODEGEN_JOBS: '1'
+  ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1800'
 
 jobs:
-  compare:
-    name: Compare native RV64 release stages under QEMU
+  stage2:
+    name: Build native RV64 release stage 2 under QEMU
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    env:
-      ABLA_NATIVE_JOBS: '4'
-      ABLA_CODEGEN_JOBS: '1'
-      ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1800'
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -39,28 +38,86 @@ jobs:
             make ablac
             tools/test-static-compiler-riscv64.sh build/ablac "$deps"
           ' 2>&1 | tee build/ci-logs/rv64-static-seed.log
-      - name: Build and compare stages 2 and 3
-        timeout-minutes: 150
+      - name: Build stage 2
+        timeout-minutes: 200
         run: |
           nix-shell shell.nix --run '
             set -euo pipefail
             deps=$(cat build/ci-logs/rv64-sdk.path)
             seed=build/static-compiler-riscv64/ablac-static-riscv64-linux
             shim=build/static-compiler-riscv64/abla_lld_shim.o
-            tools/test-rv64-static-convergence.sh "$deps" "$seed" "$shim"
+            tools/test-rv64-static-convergence.sh "$deps" "$seed" "$shim" stage2
+          ' 2>&1 | tee build/ci-logs/rv64-stage2.log
+      - name: Upload stage 2 and the exact shim object for stage 3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rv64-static-stage2
+          path: |
+            build/rv64-static-convergence/run-ci/stage2
+            build/rv64-static-convergence/run-ci/stage2.sha256
+            build/rv64-static-convergence/run-ci/abla_lld_shim.o
+            build/rv64-static-convergence/run-ci/shim.sha256
+            build/rv64-static-convergence/run-ci/source.sha
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain stage 2 evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rv64-static-stage2-evidence
+          path: |
+            build/ci-logs/
+            build/static-compiler-riscv64/*.log
+            build/static-compiler-riscv64/compiler.sha256
+            build/rv64-static-convergence/run-ci/*.log
+            build/rv64-static-convergence/run-ci/*.time
+            build/rv64-static-convergence/run-ci/*.sha256
+            build/rv64-static-convergence/run-ci/*.elf
+          if-no-files-found: warn
+          retention-days: 14
+
+  stage3:
+    name: Build native RV64 release stage 3 and compare
+    needs: stage2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: rv64-static-stage2
+          path: build/rv64-static-convergence/run-ci
+      - name: Realise the pinned SDK
+        timeout-minutes: 15
+        run: |
+          mkdir -p build/ci-logs
+          deps=$(nix-build --no-out-link nix/riscv64-static-native-deps.nix)
+          printf '%s\n' "$deps" > build/ci-logs/rv64-sdk.path
+          cp "$deps/SOURCE" build/ci-logs/rv64-sdk-source.txt
+      - name: Verify stage 2, build stage 3 and compare bytes
+        timeout-minutes: 205
+        run: |
+          nix-shell shell.nix --run '
+            set -euo pipefail
+            deps=$(cat build/ci-logs/rv64-sdk.path)
+            inputs=build/rv64-static-convergence/run-ci
+            tools/test-rv64-static-convergence.sh "$deps" "$inputs/stage2" "$inputs/abla_lld_shim.o" stage3
           ' 2>&1 | tee build/ci-logs/rv64-static-convergence.log
-      - name: Retain RV64 convergence evidence
+      - name: Retain the comparison and stage 3 evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rv64-static-convergence
           path: |
             build/ci-logs/
-            build/static-compiler-riscv64/*.log
-            build/static-compiler-riscv64/compiler.sha256
-            build/rv64-static-convergence/run-*/*.log
-            build/rv64-static-convergence/run-*/*.time
-            build/rv64-static-convergence/run-*/*.sha256
-            build/rv64-static-convergence/run-*/*.elf
+            build/rv64-static-convergence/run-ci/*.log
+            build/rv64-static-convergence/run-ci/*.time
+            build/rv64-static-convergence/run-ci/*.sha256
+            build/rv64-static-convergence/run-ci/*.elf
           if-no-files-found: warn
           retention-days: 14
