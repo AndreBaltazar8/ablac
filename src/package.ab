@@ -1942,6 +1942,239 @@ fun bootstrapPackageVendorMarked(vendorRoot: string, package: BootstrapLockedPac
 fun bootstrapPackageVendorMismatch(package: BootstrapLockedPackage): string =
     "error[E_PACKAGE_VENDOR_DIGEST_MISMATCH]: the vendored copy of dependency '${package.name}' (vendor/${package.name}) does not match the digest '${package.digest}' in abla.lock: its files differ from the locked revision; restore them or run 'ablac package vendor' again\n"
 
+// ---- locked dependency data (#1175): compilerReadDependencyFile ---------------------------------------------------
+
+class BootstrapPackageDependencyFile(val found: bool, val text: string, val diagnostic: string)
+
+// The most a compile-time dependency read returns: the same bound as a compile-time write.
+val BOOTSTRAP_PACKAGE_FILE_LIMIT: int = 16777216
+
+fun bootstrapPackageDependencyFileFailure(code: string, name: string, relative: string, why: string): BootstrapPackageDependencyFile =
+    BootstrapPackageDependencyFile(false, "", "error[$code]: dependency '$name' file '$relative': $why\n")
+
+// A package-relative data path: slash-separated ordinary components (no empty, `.`, `..`, `.git` or `.abla*` one, no
+// backslash, colon (a drive), NUL or absolute form).
+fun bootstrapPackageDataPathValid(relative: string): bool {
+    if (relative.size == 0 || relative.size > 1024) return false
+    var valid = true
+    var index = 0
+    while (valid && index < relative.size) {
+        val byte = relative[index]
+        if (byte == 0 || byte == 92 || byte == 58 || byte < 32) valid = false
+        index = index + 1
+    }
+    if (!valid) return false
+    for (part in relative.split("/")) {
+        if (part == "" || part == "." || part == ".." || part == ".git" || part.startsWith(".abla")) valid = false
+    }
+    valid
+}
+
+class BootstrapPackageTreeEntries(val ok: bool, val entries: array<string>)
+
+fun bootstrapPackageSplitNul(text: string): array<string> {
+    val parts: array<string> = []
+    var begin = 0
+    var index = 0
+    while (index < text.size) {
+        if (text[index] == 0) {
+            if (index > begin) parts.append(text.slice(begin, index))
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    if (begin < text.size) parts.append(text.slice(begin, text.size))
+    parts
+}
+
+// The entries `git ls-tree` lists under `tree` for each prefix of `relative`, as "mode type sha<TAB>path" records.
+fun bootstrapPackageTreeEntries(gitArguments: array<string>, tree: string, relative: string): BootstrapPackageTreeEntries {
+    val command = bootstrapPackageGit()
+    for (argument in gitArguments) command.argument(argument)
+    command.argument("ls-tree")
+    command.argument("-z")
+    command.argument(tree)
+    command.argument("--")
+    command.argument(relative)
+    val captured = command.capture()
+    BootstrapPackageTreeEntries(captured.status == 0, bootstrapPackageSplitNul(captured.output))
+}
+
+// The bytes of the regular file `relative` in the git tree `tree` (the locked digest) of the repository the
+// arguments select: read from the tree's own objects, never from a working tree, so what is returned is what the
+// digest covers. A symbolic link (the leaf or any directory on the way), a submodule and a directory are refused.
+fun bootstrapPackageTreeFile(gitArguments: array<string>, tree: string, name: string, relative: string): BootstrapPackageDependencyFile {
+    val parts = relative.split("/")
+    var prefix = ""
+    var index = 0
+    var blob = ""
+    var failure = ""
+    while (index < parts.size && failure == "") {
+        prefix = if (prefix == "") parts[index] else "$prefix/${parts[index]}"
+        val listed = bootstrapPackageTreeEntries(gitArguments, tree, prefix)
+        if (!listed.ok) return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNAVAILABLE", name, relative, "the locked tree cannot be listed")
+        var entry = ""
+        for (record in listed.entries) {
+            val tab = record.indexOf("\t")
+            if (tab > 0 && record.slice(tab + 1, record.size) == prefix) entry = record.slice(0, tab)
+        }
+        val leaf = index + 1 == parts.size
+        val fields = entry.split(" ")
+        if (entry == "") {
+            failure = "is not in the locked tree"
+        } else if (fields.size != 3) {
+            failure = "has an unreadable tree entry"
+        } else if (fields[0] == "120000") {
+            failure = "is, or goes through, a symbolic link ('$prefix'), which a dependency read never follows"
+        } else if (leaf && fields[1] == "blob" && (fields[0] == "100644" || fields[0] == "100755")) {
+            blob = fields[2]
+        } else if (leaf) {
+            failure = if (fields[1] == "tree") "is a directory, not a file"
+                else if (fields[1] == "commit") "is a nested repository, outside the data surface"
+                else "is not a regular file"
+        } else if (fields[1] != "tree") {
+            failure = "goes through '$prefix', which is not a directory"
+        }
+        index = index + 1
+    }
+    if (failure != "") return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_INVALID", name, relative, failure)
+    if (!bootstrapPackageHexRevision(blob)) return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_INVALID", name, relative, "has an unreadable tree entry")
+    val sizeCommand = bootstrapPackageGit()
+    for (argument in gitArguments) sizeCommand.argument(argument)
+    sizeCommand.argument("cat-file")
+    sizeCommand.argument("-s")
+    sizeCommand.argument(blob)
+    val size = sizeCommand.capture()
+    if (size.status != 0) return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNAVAILABLE", name, relative, "the locked tree's file cannot be read")
+    val digits = bootstrapPackageTrim(size.output)
+    var bytes = 0
+    var numeric = digits.size > 0 && digits.size <= 9
+    var place = 0
+    while (numeric && place < digits.size) {
+        if (digits[place] < 48 || digits[place] > 57) numeric = false else bytes = bytes * 10 + digits[place] - 48
+        place = place + 1
+    }
+    if (!numeric || bytes > BOOTSTRAP_PACKAGE_FILE_LIMIT) {
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_INVALID", name, relative, "is larger than ${BOOTSTRAP_PACKAGE_FILE_LIMIT} bytes")
+    }
+    val command = bootstrapPackageGit()
+    for (argument in gitArguments) command.argument(argument)
+    command.argument("cat-file")
+    command.argument("blob")
+    command.argument(blob)
+    val captured = command.capture()
+    if (captured.status != 0) return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNAVAILABLE", name, relative, "the locked tree's file cannot be read")
+    BootstrapPackageDependencyFile(true, captured.output, "")
+}
+
+// The scratch repository holding the tree of a vendored copy (as bootstrapPackageVendorDigest builds it), or "": the
+// bytes then come from the objects `git add` made, whose tree the caller compares with the lock's digest.
+fun bootstrapPackageVendorScratch(vendorRoot: string): string {
+    val cacheRoot = bootstrapPackageCacheRoot()
+    val scratchName = "$cacheRoot/vendor-read.${linuxProcessId()}"
+    val scratch = if (Path(cacheRoot).isAbsolute()) scratchName else currentDirectory().child(scratchName).text
+    bootstrapPackageRemoveTree(scratch)
+    if (!Path(scratch).parent().createDirectories()) return ""
+    val init = bootstrapPackageGit()
+    init.argument("init")
+    init.argument("--quiet")
+    init.argument("--bare")
+    init.argument("--object-format=sha1")
+    init.argument(scratch)
+    if (init.run() != 0) return ""
+    val add = bootstrapPackageGit()
+    add.workingDirectory = vendorRoot
+    add.argument("--git-dir=$scratch")
+    add.argument("--work-tree=.")
+    add.argument("add")
+    add.argument("--all")
+    add.argument("--force")
+    add.argument("--")
+    add.argument(".")
+    add.argument(":(exclude).abla-revision")
+    add.argument(":(exclude).abla-digest")
+    if (add.run() != 0) {
+        bootstrapPackageRemoveTree(scratch)
+        return ""
+    }
+    scratch
+}
+
+// The file `relative` of the direct dependency `name` of the package `sitePackage` ("" the root project at `root`, whose
+// manifest is `rootManifest`), from the root's lock: the dependency must be in that package's own manifest, match a
+// lock record that pins a content digest, and be present as a checked-in vendor copy or a prepared copy under
+// .abla/packages that holds that digest. Never fetches, installs or resolves.
+fun bootstrapPackageReadDependencyFile(
+    root: string, rootManifest: string, sitePackage: string, name: string, relative: string
+): BootstrapPackageDependencyFile {
+    if (!bootstrapPackageNameValid(name)) {
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNDECLARED", name, relative, "is not a dependency name")
+    }
+    if (!bootstrapPackageDataPathValid(relative)) {
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_INVALID", name, relative,
+            "is not a package-relative file path: use slash-separated components, none empty, `.`, `..`, `.git` or `.abla*`, with no backslash or drive")
+    }
+    val manifest = if (sitePackage == "") rootManifest
+        else "${bootstrapCompilePackageDirectory(root, sitePackage)}/abla.toml"
+    val owner = if (sitePackage == "") "the project" else "package '$sitePackage'"
+    if (manifest == "" || !Path(manifest).exists()) {
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNDECLARED", name, relative, "$owner has no abla.toml declaring it")
+    }
+    val declared = bootstrapPackageManifestDependencies(manifest)
+    if (declared.errors != 0) {
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNDECLARED", name, relative, "the manifest of $owner is invalid")
+    }
+    val declaredIndex = bootstrapPackageDependencyIndex(declared.values, name)
+    if (declaredIndex < 0) {
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNDECLARED", name, relative,
+            "is not a direct dependency in the abla.toml of $owner, which reads it")
+    }
+    val lockPath = "$root/abla.lock"
+    val lock = bootstrapPackageReadLock(lockPath)
+    val lockedIndex = if (lock.valid) bootstrapPackageLockIndex(lock.packages, name) else -1
+    if (lockedIndex < 0 || !bootstrapPackageDependencyMatches(declared.values[declaredIndex], lock.packages[lockedIndex]) ||
+        lock.packages[lockedIndex].digest == "") {
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNPINNED", name, relative,
+            "is not pinned by abla.lock to the dependency $owner declares (with a content digest); run 'ablac package update'")
+    }
+    val package = lock.packages[lockedIndex]
+    val vendor = "$root/vendor/$name"
+    if (bootstrapPackageVendorMarked(vendor, package)) {
+        val scratch = bootstrapPackageVendorScratch(vendor)
+        if (scratch == "") {
+            return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNAVAILABLE", name, relative, "the vendored copy cannot be read")
+        }
+        val write = bootstrapPackageGit()
+        write.argument("--git-dir=$scratch")
+        write.argument("write-tree")
+        val tree = write.capture()
+        if (tree.status != 0 || bootstrapPackageTrim(tree.output) != package.digest) {
+            bootstrapPackageRemoveTree(scratch)
+            return BootstrapPackageDependencyFile(false, "", bootstrapPackageVendorMismatch(package))
+        }
+        val read = bootstrapPackageTreeFile(["--git-dir=$scratch"], package.digest, name, relative)
+        bootstrapPackageRemoveTree(scratch)
+        return read
+    }
+    val packageRoot = "$root/.abla/packages/$name"
+    val source = "$packageRoot/source"
+    if (Path("$packageRoot/revision").readText() != package.revision || Path("$packageRoot/digest").readText() != package.digest ||
+        !bootstrapPackageCheckoutValid(source, package)) {
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNAVAILABLE", name, relative,
+            "its locked revision '${package.revision}' is not prepared under the project (a build prepares it from the cache; this read never fetches)")
+    }
+    bootstrapPackageTreeFile(["-C", source], package.digest, name, relative)
+}
+
+// What a build journals for a dependency read: the lock's digest and the bytes, or the failure, so a cached build is
+// valid only while the same file of the same pin is still there. Neither copy's directory is part of it.
+fun bootstrapPackageDependencyFileObservation(
+    root: string, rootManifest: string, sitePackage: string, name: string, relative: string
+): string {
+    val read = bootstrapPackageReadDependencyFile(root, rootManifest, sitePackage, name, relative)
+    if (read.found) "ok\n${read.text}" else "error\n${read.diagnostic}"
+}
+
 fun bootstrapPackageMaterialize(
     projectRoot: string,
     package: BootstrapLockedPackage,

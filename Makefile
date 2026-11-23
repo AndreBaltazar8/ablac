@@ -642,6 +642,7 @@ test-serial: ablac
 	tools/test-package-vendor-digest.sh $(COMPILER)
 	tools/test-package-vendor-strict.sh $(COMPILER)
 	tools/test-package-symlink.sh $(COMPILER)
+	tools/test-package-dependency-data.sh $(COMPILER)
 	tools/test-package-install.sh $(COMPILER)
 	tools/test-package-add.sh $(COMPILER)
 	tools/test-package-git-source.sh $(COMPILER)
