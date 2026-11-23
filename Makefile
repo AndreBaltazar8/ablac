@@ -484,6 +484,7 @@ test-serial: ablac
 	tools/test-http-differential.sh $(COMPILER)
 	tools/test-http-host.sh $(COMPILER)
 	tools/test-http-native-scan.sh $(COMPILER)
+	tools/test-http-async-surplus.sh $(COMPILER)
 	tools/test-http-close-delimited.sh $(COMPILER)
 	tools/test-http-interim.sh $(COMPILER)
 	tools/test-http-request-scan.sh $(COMPILER)

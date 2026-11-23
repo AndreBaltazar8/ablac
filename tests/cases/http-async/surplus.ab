@@ -1,0 +1,82 @@
+// The async HTTP client does not reuse a connection whose peer sent bytes after the end of a response (#1139 area 4). A response followed by more
+// bytes in the same read (a second response, a longer body than the framing says) means the two ends disagree about where the response ends; the
+// next request on that connection could be answered by what is left. The client closes such a connection and the next request opens a new one.
+// One program: a server that answers the first request with "ok" and a surplus response, and the next with "good"; a client
+// that asks twice in turn. Prints "http-async surplus ok".
+import "abla/io"
+import "abla/text"
+import "abla/net"
+import "abla/http/async"
+
+val FIRST = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL"
+val FIRST_CHUNKED = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL"
+val LATER = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ngood"
+
+// Runs the exchange with `first` as the answer to the first request of a connection; the number of connections the client used, or -1 when an
+// answer was wrong.
+fun exchange(first: string): int {
+    val listener = tcpListenAddress(ipv4Loopback(0))
+    listener.setNonblocking()
+    val port = listener.localPort()
+    val connections: array<TcpConnection> = []
+    var asked = 0
+    val client = httpAsyncClient()
+    for (n in 0 until 2) {
+        val id = client.get("http://127.0.0.1:${port}/r${n}")
+        var done = false
+        var loops = 0
+        while (!done && loops < 600) {
+            // The server: accept, read a request, answer.
+            var accepted = listener.accept()
+            if (accepted.descriptor >= 0) {
+                accepted.setNonblocking()
+                connections.append(move(accepted))
+            }
+            for (i in 0 until connections.size) {
+                if (connections[i].descriptor >= 0) {
+                    val read = connections[i].readResult(4096)
+                    if (read.hasData() && read.bytes.contains("GET ")) {
+                        asked = asked + 1
+                        connections[i].write(if (asked == 1) first else LATER)
+                    }
+                }
+            }
+            client.step(5)
+            for (c in client.takeCompletions()) {
+                if (c.id == id) {
+                    val expected = if (n == 0) "ok" else "good"
+                    if (c.status != 200 || c.body != expected) {
+                        println("FAIL request ${n}: status ${c.status} body ${c.body} error ${c.error}")
+                        return -1
+                    }
+                    done = true
+                }
+            }
+            loops = loops + 1
+        }
+        if (!done) {
+            println("FAIL request ${n} was not answered")
+            return -1
+        }
+    }
+    for (i in 0 until connections.size) connections[i].close()
+    listener.close()
+    connections.size
+}
+
+fun main: int {
+    val plain = exchange(FIRST)
+    if (plain < 0) return 1
+    if (plain != 2) {
+        println("FAIL after a response followed by surplus bytes the client used ${plain} connection(s), not 2")
+        return 1
+    }
+    val chunked = exchange(FIRST_CHUNKED)
+    if (chunked < 0) return 1
+    if (chunked != 2) {
+        println("FAIL after a chunked response followed by surplus bytes the client used ${chunked} connection(s), not 2")
+        return 1
+    }
+    println("http-async surplus ok")
+    0
+}

@@ -886,10 +886,16 @@ fun HttpAsyncClient.parseResponse(slot: int, eof: bool): bool {
     var keepAlive = !httpCoreHeaderTokenContains(response.header("Connection"), "close") &&
         textFindSequence(input, "HTTP/1.1", 0, 8) == 0
     if (response.status == 101) keepAlive = false
+    // Bytes after the end of the response (a second response, a longer body than the framing says) mean the two ends disagree about where it ends: the
+    // connection is not reused, as what is left could answer the next request.
+    var surplus = false
     val requestSlot = this.connectionRequests[slot]
     val headRequest = requestSlot >= 0 && httpRequestIsHead(this.requestPayloads[requestSlot])
     if (headRequest || (response.status >= 100 && response.status < 200) ||
-        response.status == 204 || response.status == 304) complete = true
+        response.status == 204 || response.status == 304) {
+        complete = true
+        surplus = bodyBytes > 0
+    }
     else if (chunked) {
         val decoded = httpCoreDecodeChunked(input.slice(headerEnd, input.size), maximum)
         if (!decoded.valid) {
@@ -897,6 +903,7 @@ fun HttpAsyncClient.parseResponse(slot: int, eof: bool): bool {
             return false
         }
         complete = decoded.complete
+        surplus = decoded.complete && decoded.consumed < bodyBytes
         body = decoded.body
     } else if (transferEncoding == "" && lengthHeader != "") {
         val expected = httpDecimalLength(lengthHeader, maximum)
@@ -907,12 +914,14 @@ fun HttpAsyncClient.parseResponse(slot: int, eof: bool): bool {
         if (bodyBytes >= expected) {
             complete = true
             body = input.slice(headerEnd, headerEnd + expected)
+            surplus = bodyBytes > expected
         }
     } else {
         keepAlive = false
         complete = eof
         body = input.slice(headerEnd, input.size)
     }
+    if (complete && surplus) keepAlive = false
     if (!complete) {
         if (eof) this.fail(slot, "connection closed mid-response")
         else if (bodyBytes > maximum) this.fail(slot, "response too large")
