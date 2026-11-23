@@ -10,7 +10,7 @@ for tier in interp jit; do
         --no-cache --fast -o "$out/main-$tier"
     [[ $("$out/main-$tier") == ok ]]
     ABLA_GC_STRESS=1 "$out/main-$tier" | grep -x ok >/dev/null
-    for name in invalid-literal invalid-literal-expression invalid-literal-interpolation invalid-literal-named invalid-literal-escape; do
+    for name in invalid-literal invalid-literal-expression invalid-literal-interpolation invalid-literal-named invalid-literal-escape invalid-literal-multiline; do
         log="$out/$name-$tier.log"
         if ABLA_COMPILE_EVAL=$tier "$compiler" build "tests/cases/regex/$name.ab" \
             --no-cache --fast -o "$out/invalid" >"$log" 2>&1; then
@@ -19,12 +19,18 @@ for tier in interp jit; do
         message='expected a plain string literal in $regex'
         [[ $name != invalid-literal ]] || message='invalid $regex at pattern byte 0: missing ]'
         [[ $name != invalid-literal-named ]] || message="invalid \$regex at pattern byte 13: duplicate capture name 'name'"
-        [[ $name != invalid-literal-escape ]] || message='invalid $regex at pattern byte 2: unknown escape'
+        if [[ $name == invalid-literal-escape || $name == invalid-literal-multiline ]]; then
+            message='invalid $regex at pattern byte 2: unknown escape'
+        fi
         grep -Fx "error[E_SUBPARSER_FAILURE]: $message" "$log" >/dev/null || { cat "$log"; exit 1; }
         grep -F 'E_SUBPARSER_FAILURE' "$log" >/dev/null || { cat "$log"; exit 1; }
         [[ $(grep -c 'E_SUBPARSER_FAILURE' "$log") == 1 ]]
         # parserFail is at the closing parenthesis, inside the literal site.
-        position=$(LC_ALL=C awk 'BEGIN {n=0} {p=index($0,"$regex("); if(p) {print n+length($0)-1; exit} n+=length($0)+1}' "tests/cases/regex/$name.ab")
+        position=$(LC_ALL=C awk '
+            index($0, "$regex(") {literal=1}
+            literal && /\)$/ {print n+length($0)-1; exit}
+            {n+=length($0)+1}
+        ' "tests/cases/regex/$name.ab")
         grep -E "source\[subparser\]:.*$name.ab:$position:$position$" "$log" >/dev/null || { cat "$log"; exit 1; }
     done
 done
