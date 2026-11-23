@@ -56,7 +56,7 @@ fresh
 output=$(run "$work/artifacts" "$work/out-none")
 [[ -z $(line windows "$output") ]] || fail "a windows line without a windows asset"
 
-SOURCE_DATE_EPOCH=315532800 tools/package-windows-toolchain.sh "$work/good.exe" "$root" "$work/good.zip" > "$work/package.log" 2>&1 || { cat "$work/package.log" >&2; fail "the package was not built"; }
+SOURCE_DATE_EPOCH=315532800 tools/package-windows-toolchain.sh "$work/good.exe" "$work/good.exe" "$root" "$work/good.zip" > "$work/package.log" 2>&1 || { cat "$work/package.log" >&2; fail "the package was not built"; }
 fresh; add_zip "$work/good.zip"
 judge good PASS
 
@@ -65,6 +65,7 @@ unpack() { rm -rf "$work/tree"; mkdir "$work/tree"; unzip -q "$work/good.zip" -d
 repack() { (cd "$work/tree" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | zip -q -X "$work/$1.zip" -@); fresh; add_zip "$work/$1.zip"; }
 top=abla-toolchain-x86_64-windows
 unpack; rm "$work/tree/$top/bin/ablac.exe"; repack noexe; judge noexe FAIL "bin/ablac.exe"
+unpack; rm "$work/tree/$top/bin/llvm-objcopy.exe"; repack noobjcopy; judge noobjcopy FAIL "llvm-objcopy.exe"
 unpack; rm "$work/tree/$top/share/abla/runtime/windows/imports/kernel32.txt"; repack noimports; judge noimports FAIL "kernel32.txt"
 unpack; echo x > "$work/tree/stray.txt"; repack stray; judge stray FAIL "outside"
 unpack; printf 'MZ not a PE\0ablac 9.9.9' > "$work/tree/$top/bin/ablac.exe"; repack notpe; judge notpe FAIL "ablac.exe"

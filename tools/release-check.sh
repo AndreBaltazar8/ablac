@@ -439,7 +439,7 @@ if ((playground_present)); then
 fi
 
 # 11. windows: when the run ships the Windows toolchain (abla-toolchain-x86_64-windows.zip, tools/package-windows-toolchain.sh): one top
-# directory holding bin/ablac.exe, share/abla/{runtime,stdlib} (with runtime/windows/imports/*.txt) and share/licenses; no repository or build
+# directory holding bin/ablac.exe, bin/llvm-objcopy.exe (--backtrace), share/abla/{runtime,stdlib} (with runtime/windows/imports/*.txt) and share/licenses; no repository or build
 # metadata; at most 150 MB as an archive and 400 MB unpacked; ablac.exe carries this version's string and, read by tools/pe-info (built by the
 # release's Linux compiler), is an x86-64 console PE32+ image with no C runtime import under any name. It cannot be run here: the Windows job
 # of the release exercises it on a Windows runner.
@@ -459,7 +459,7 @@ if ((windows_present)); then
         ((unpacked <= 400 * 1048576)) || bad="$bad unpacked it is $((unpacked / 1048576)) MB (cap 400);"
         outside=$(unzip -Z1 "$zipfile" | grep -v "^$top/" | head -3 | tr '\n' ' ' || true)
         [[ -z $outside ]] || bad="$bad entries outside $top/: ${outside% };"
-        for required in bin/ablac.exe share/abla/stdlib share/abla/runtime/windows/imports/kernel32.txt share/licenses/abla.txt; do
+        for required in bin/ablac.exe bin/llvm-objcopy.exe share/abla/stdlib share/abla/runtime/windows/imports/kernel32.txt share/licenses/abla.txt; do
             [[ -e $unpack/$top/$required ]] || bad="$bad no $required;"
         done
         metadata=$(unzip -Z1 "$zipfile" | grep -E '(^|/)\.git(/|$)|\.abla-' | head -3 | tr '\n' ' ' || true)
