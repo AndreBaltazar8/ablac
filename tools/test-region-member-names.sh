@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # A member call in a region is checked against the declaration it resolves to (#827): two unrelated classes with a
 # method `dispatch`, one of which stores what it is given in a module value. A region may call the other's, directly,
-# through `this`, a field and an element of an array field (allowed.ab exits 28).
-# The storing one is still refused both directly and through an array field (refused.ab).
+# through `this`, a field, an array element and a typed binding (allowed.ab exits 34).
+# The storing one is still refused, including a shadowing local and an interface call.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -16,14 +16,14 @@ mkdir -p "$output_directory"
 "$compiler" build "$cases/allowed.ab" -o "$output_directory/allowed"
 status=0
 "$project_root/tools/run-limited.sh" "$output_directory/allowed" || status=$?
-[[ $status == 28 ]] ||
-    { echo "region member names: allowed exited $status, not 28" >&2; exit 1; }
+[[ $status == 34 ]] ||
+    { echo "region member names: allowed exited $status, not 34" >&2; exit 1; }
 
 if "$compiler" build "$cases/refused.ab" -o "$output_directory/refused" \
     > "$output_directory/refused.err" 2>&1; then
     echo "region member names: refused.ab compiled" >&2; exit 1
 fi
-for member in dispatch store; do
+for member in dispatch store storeParameter shadowed storeDynamic; do
     count=$(grep -cxF "error[E_SEMANTIC]: region.call-retention:$member" "$output_directory/refused.err" || true)
     [[ $count == 1 ]] ||
         { echo "region member names: expected one refusal of $member, got $count" >&2
