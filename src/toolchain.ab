@@ -240,6 +240,9 @@ fun bootstrapBuiltinLinkArguments(arguments: array<string>, outputPath: string):
         if (argument == "--target=aarch64-unknown-linux-gnu") {
             emulation = "aarch64linux"
             little = true
+        } else if (argument == "--target=riscv64-unknown-linux-gnu") {
+            emulation = "elf64lriscv"
+            little = true
         } else if (argument == "--target=x86_64-unknown-linux-gnu") {
             emulation = "elf_x86_64"
         } else if (argument == "-nostdlib") {
@@ -903,6 +906,12 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
             name, "wasm32-unknown-wasip1", "wasm", false, true, "", "wasm-ld", "none", true
         )
     }
+    if (name == "riscv64-linux") {
+        result = BootstrapTargetDescriptor(
+            name, "riscv64-unknown-linux-gnu", "elf", true, false,
+            "main", "host-clang", "elf64lriscv", true
+        )
+    }
     if (name == "x86_64-windows") {
         // A freestanding Windows program (W1a, docs/design/windows-target.md): no runtime and no C library, the PE entry point
         // abla_start (the program's own function), linked by lld-link against import libraries the compiler writes from
@@ -1037,7 +1046,7 @@ fun bootstrapDefinedTargetDescriptor(
 )
 
 fun bootstrapSupportedTargets(): string =
-    "x86_64-linux, aarch64-linux, x86_64-macos, arm64-macos, x86_64-windows, wasm32-wasi"
+    "x86_64-linux, aarch64-linux, riscv64-linux, x86_64-macos, arm64-macos, x86_64-windows, wasm32-wasi"
 
 class BootstrapNativeBuild(
     val status: int,
@@ -2095,12 +2104,15 @@ fun bootstrapOwnOrPathToolCommand(name: string): LinuxCommand =
 fun bootstrapCrossCommand(own: bool, tools: BootstrapXtensaTools, name: string): LinuxCommand =
     if (own) bootstrapOwnToolCommand(name) else bootstrapXtensaCommand(tools, name)
 
+private val BOOTSTRAP_RISCV64_LINUX_FEATURES = "-mattr=+m,+a,+f,+d,+c,+zicsr,+zifencei"
+
 fun bootstrapExternalEmitObjectForTargetWithTools(
     llvmPath: string,
     objectPath: string,
     llvmTriple: string,
     fast: bool,
-    tools: BootstrapXtensaTools
+    tools: BootstrapXtensaTools,
+    riscv64Hosted: bool
 ): int {
     // Cross-target LLVM still contains the complete portable runtime. Even a
     // fast build must prune unreachable host-only implementation details before
@@ -2131,6 +2143,7 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
     val ownTools = bootstrapInProcessToolInstalled && tools.root == "" && !mcuTarget && bootstrapInProcessEmitterOn()
     val optimize = bootstrapCrossCommand(ownTools, tools, "opt")
     bootstrapXtensaTargetOptions(tools, optimize)
+    if (riscv64Hosted) optimize.argument(BOOTSTRAP_RISCV64_LINUX_FEATURES)
     val passes = if (fast) {
         // Scalar promotion, local cleanup and the inliner (small helpers and
         // column accessors dominate generated code), without O1's loop and
@@ -2206,6 +2219,10 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
         )
         emitObject.argument(if (fast) "-O0" else "-O2")
         emitObject.argument("-mtriple=$llvmTriple")
+        if (riscv64Hosted) {
+            emitObject.argument(BOOTSTRAP_RISCV64_LINUX_FEATURES)
+            emitObject.argument("-target-abi=lp64d")
+        }
         if (tools.root != "") {
             if (tools.directCalls) emitObject.argument("-xtensa-direct-calls")
             if (tools.narrowBranches) emitObject.argument("-xtensa-narrow-branches")
@@ -4915,7 +4932,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val balancedProfile = cacheProfile == "inprocess-o1" ||
         cacheProfile == "raw-inprocess-o1"
     val hostedLtoEligible = target.hosted && artifact == "executable" &&
-        releaseProfile && !(target.objectFormat == "coff")
+        releaseProfile && target.objectFormat != "coff" && target.name != "riscv64-linux"
     val wasmLtoEligible = target.objectFormat == "wasm" &&
         artifact == "module" && releaseProfile
     val ltoEligible = hostedLtoEligible || wasmLtoEligible
@@ -5179,6 +5196,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         val enclosingExportRuntime = bootstrapIrExportRuntime
         val enclosingFreestandingStart = bootstrapLlvmFreestandingStart
         val enclosingAarch64Hosted = bootstrapLlvmAarch64Hosted
+        val enclosingRiscv64Hosted = bootstrapLlvmRiscv64Hosted
         val enclosingCoverage = bootstrapLlvmCoverage
         // The same targets the flag is accepted for (coverage.ab): a macOS executable too, which this left out,
         // so a macOS build took the flag and wrote no list.
@@ -5205,6 +5223,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             bootstrapLlvmTargetIsMacOS(target.llvmTriple)
         bootstrapLlvmAarch64Hosted = target.hosted && artifact == "executable" &&
             bootstrapLlvmTargetIsAarch64Linux(target.llvmTriple)
+        bootstrapLlvmRiscv64Hosted = target.name == "riscv64-linux" && artifact == "executable"
         // A shared library defines the memory and jump routines too, but not the entry or thread routines.
         bootstrapLlvmLibraryRoutines = target.hosted && artifact == "shared-library" &&
             bootstrapLlvmTargetIsX8664Linux(target.llvmTriple)
@@ -5279,6 +5298,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapIrExportRuntime = enclosingExportRuntime
         bootstrapLlvmFreestandingStart = enclosingFreestandingStart
         bootstrapLlvmAarch64Hosted = enclosingAarch64Hosted
+        bootstrapLlvmRiscv64Hosted = enclosingRiscv64Hosted
         bootstrapLlvmCoverage = enclosingCoverage
         bootstrapLlvmStoreBoxes = enclosingStoreBoxes
         bootstrapLlvmAllowBulkObjectZero = enclosingBulkObjectZero
@@ -5822,6 +5842,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         else if (hostImports) "it calls extern \"host\" functions"
         else ""
         val aarch64Linux = !macTarget && bootstrapLlvmTargetIsAarch64Linux(target.llvmTriple)
+        val riscv64Linux = target.name == "riscv64-linux"
         // The libc-free link takes nothing from the system: not its start files, not
         // libgcc (a machine without C development files has none), only the builtins
         // of the toolchain's own clang (#806).
@@ -5829,8 +5850,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         var linking = true
         while (linking) {
             val link = bootstrapLinkCommand(if (macTarget) macClang else "clang")
-            if (aarch64Linux) {
-                // A cross-built AArch64 Linux program never links libc (#811): its own
+            if (aarch64Linux || riscv64Linux) {
+                // A cross-built Linux program never links libc (#811): its own
                 // start-up (abla_start), no C library, no runtime library.
                 link.argument("--target=${target.llvmTriple}")
                 link.argument("-nostdlib")
@@ -6031,7 +6052,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             // x86-64 without SSE4.1; Darwin's libSystem already carries libm.
             // Only as needed: a program that calls none of it (float `%` is the
             // runtime's own on x86-64 Linux) does not depend on libm (#806).
-            if (!macTarget && !libcFree && !aarch64Linux) {
+            if (!macTarget && !libcFree && !aarch64Linux && !riscv64Linux) {
                 link.argument("-Wl,--as-needed")
                 link.argument("-lm")
                 link.argument("-Wl,--no-as-needed")
@@ -6073,6 +6094,15 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 if (other != "") {
                     linuxPrintStandardError(
                         "error: the AArch64 image needs a relocation abla_start does not apply: $other\n"
+                    )
+                    status = 1
+                }
+            }
+            if (status == 0 && riscv64Linux) {
+                val other = bootstrapOtherRelocation(publishPath, "R_RISCV_", 3)
+                if (other != "") {
+                    linuxPrintStandardError(
+                        "error: the RISC-V image needs a relocation abla_start does not apply: $other\n"
                     )
                     status = 1
                 }

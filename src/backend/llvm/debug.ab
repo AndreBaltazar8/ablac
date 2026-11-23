@@ -1396,7 +1396,7 @@ fun bootstrapLlvmStackGuardKernel(backend: BootstrapLlvmBackend): bool =
     ((bootstrapTextContains(backend.targetTriple, "x86_64") &&
       bootstrapTextContains(backend.targetTriple, "linux") &&
       !bootstrapTextContains(backend.targetTriple, "gnux32")) ||
-     bootstrapLlvmAarch64LinuxExecutable(backend))
+     bootstrapLlvmAarch64LinuxExecutable(backend) || bootstrapLlvmRiscv64LinuxExecutable(backend))
 
 // What the debug report writes to standard error and how it lists the stack: by the kernel's write and a walk of the
 // frame pointers where the fault handlers are by system call too, and also in an arm64 Android library, which has
@@ -1432,7 +1432,7 @@ fun bootstrapLlvmStackGuardKernelAction(
 // The rt_sigreturn trampoline an x86-64 Linux signal handler returns through
 // (the kernel's SA_RESTORER), declared on first use.
 fun bootstrapLlvmSigreturnRestorer(backend: BootstrapLlvmBackend): i64* {
-    if (bootstrapLlvmAarch64LinuxExecutable(backend)) {
+    if (bootstrapLlvmAarch64LinuxExecutable(backend) || bootstrapLlvmRiscv64LinuxExecutable(backend)) {
         return LLVMConstNull(backend.pointerType)
     }
     var restorer = LLVMGetNamedFunction(backend.module, "abla_runtime_sigreturn")
@@ -1722,7 +1722,8 @@ fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
         val restorer = bootstrapLlvmSigreturnRestorer(backend)
         val kernelAction = bootstrapLlvmStackGuardKernelAction(
             backend, handler,
-            if (bootstrapLlvmAarch64LinuxExecutable(backend)) 134217732 else 201326596,
+            if (bootstrapLlvmAarch64LinuxExecutable(backend) ||
+                bootstrapLlvmRiscv64LinuxExecutable(backend)) 134217732 else 201326596,
             restorer, "signal.kernel.action"
         )
         for (signal in [11, 7]) {
@@ -2121,7 +2122,11 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
     val machine = if (mac) LLVMBuildLoad2(
         backend.builder, backend.pointerType, bootstrapLlvmByteAt(backend, signalContext, 56, 48), "mcontext"
     ) else signalContext
+    // RV64 starts its 16-byte-aligned sigcontext at 176. PC is first,
+    // followed by integer registers x1 through x31.
+    val riscv = bootstrapLlvmRiscv64LinuxExecutable(backend)
     val stackPointerAt = if (mac) (if (bootstrapLlvmMachOIsArm(backend.targetTriple)) 264 else 72)
+        else if (riscv) 192
         else if (bootstrapTextContains(backend.targetTriple, "aarch64")) 432 else 160
     val interrupted = LLVMBuildLoad2(
         backend.builder, i64,
@@ -2197,6 +2202,7 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         // 168 on x86-64, sigcontext.pc at 440 on AArch64; on macOS through the mcontext, __ss.__rip at 144 on x86-64
         // and __ss.__pc at 272 on arm64 (beside the stack pointers read above).
         val pcAt = if (mac) (if (bootstrapLlvmMachOIsArm(backend.targetTriple)) 272 else 144)
+            else if (riscv) 176
             else if (bootstrapTextContains(backend.targetTriple, "aarch64")) 440 else 168
         val faultPc = bootstrapLlvmFaultPcGlobal(backend)
         LLVMBuildStore(backend.builder, LLVMBuildLoad2(backend.builder, i64,
@@ -2204,6 +2210,7 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         // And its frame pointer, where the walk starts (not this handler's frame, on the signal stack): gregs[REG_RBP]
         // at 120 and x29 at 416 on Linux, __rbp at 64 and __fp at 248 on macOS.
         val frameAt = if (mac) (if (bootstrapLlvmMachOIsArm(backend.targetTriple)) 248 else 64)
+            else if (riscv) 240
             else if (bootstrapTextContains(backend.targetTriple, "aarch64")) 416 else 120
         LLVMBuildStore(backend.builder, LLVMBuildLoad2(backend.builder, i64,
             bootstrapLlvmByteAt(backend, machine, 512, frameAt), "interrupted.frame"), bootstrapLlvmFaultFrameGlobal(backend))
@@ -2436,11 +2443,15 @@ fun bootstrapLlvmEmitFramePointerWalk(
     LLVMPositionBuilderAtEnd(backend.builder, read)
     // process_vm_readv(pid, &local, 1, &remote, 1, 0): the 16 bytes at the frame
     // (saved frame pointer, return address) into `record`.
+    // RV64's frame pointer is the CFA, with the saved pair immediately below.
+    val recordAddress = if (bootstrapLlvmRiscv64LinuxExecutable(backend)) {
+        LLVMBuildSub(backend.builder, current, LLVMConstInt(i64, 16, 0), "frame.record")
+    } else current
     LLVMBuildStore(backend.builder, record, iov)
     LLVMBuildStore(
         backend.builder, LLVMConstInt(i64, 16, 0), bootstrapLlvmByteAt(backend, iov, 32, 8)
     )
-    LLVMBuildStore(backend.builder, current, bootstrapLlvmByteAt(backend, iov, 32, 16))
+    LLVMBuildStore(backend.builder, recordAddress, bootstrapLlvmByteAt(backend, iov, 32, 16))
     LLVMBuildStore(
         backend.builder, LLVMConstInt(i64, 16, 0), bootstrapLlvmByteAt(backend, iov, 32, 24)
     )
@@ -2477,13 +2488,13 @@ fun bootstrapLlvmEmitFramePointerWalk(
     }
     LLVMPositionBuilderAtEnd(backend.builder, direct)
     val savedFrame = LLVMBuildLoad2(
-        backend.builder, i64, LLVMBuildIntToPtr(backend.builder, current, backend.pointerType, ""),
+        backend.builder, i64, LLVMBuildIntToPtr(backend.builder, recordAddress, backend.pointerType, ""),
         ""
     )
     val savedReturn = LLVMBuildLoad2(
         backend.builder, i64,
         LLVMBuildIntToPtr(
-            backend.builder, LLVMBuildAdd(backend.builder, current, LLVMConstInt(i64, 8, 0), ""),
+            backend.builder, LLVMBuildAdd(backend.builder, recordAddress, LLVMConstInt(i64, 8, 0), ""),
             backend.pointerType, ""
         ),
         ""
