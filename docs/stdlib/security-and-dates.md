@@ -314,7 +314,7 @@ fun main {
 | RSA encryption and decryption | as above, with empty-label OAEP. PKCS#1 v1.5 uses deterministic implicit rejection: invalid padding returns synthetic plaintext. Prefer OAEP, and make subsequent protocol checks indistinguishable to remote peers |
 | `rsaGeneratePrivateKey(bits = 2048)` | Generate a key with 2048, 3072 or 4096 bits and exponent 65537. Check `ok()` or `error`; generation fails without randomness. |
 | `private.toPkcs8Der()`, `private.toPkcs8Pem()` | Export unencrypted PKCS#8. A number-only key without its private exponent returns an error. |
-| `cryptoSetRandom(source)` | where the randomness for encryption, blinding and key generation comes from. Needed on anything but x86-64 Linux, where it's `getrandom`: a Wasm host's `crypto.getRandomValues`, an ESP32's hardware RNG. Its quality is yours to answer for. Without one, what needs it fails, and signing never goes on unblinded |
+| `cryptoSetRandom(source)` | where the randomness for encryption, blinding and key generation comes from. Needed on WebAssembly (bare and WASI: the module does not ask the host for random bytes on its own) and on an ESP32, whose hardware RNG it takes; Linux (x86-64, AArch64) uses `getrandom`, macOS `getentropy` and Windows `ProcessPrng`. A Wasm host's `crypto.getRandomValues` is the usual source. Its quality is yours to answer for. Without one, what needs it fails, and signing never goes on unblinded |
 
 For parsed PEM and DER keys, the synthetic PKCS#1 v1.5 result matches OpenSSL's implicit rejection for the same
 private exponent and ciphertext. `rsaPrivateFromNumbers` accepts an optional private exponent as its last argument;

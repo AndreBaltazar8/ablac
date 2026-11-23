@@ -28,7 +28,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more heap-residue signatures sha3 mlkem p384 wipe-views)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more wycheproof-hashes heap-residue signatures sha3 mlkem p384 wipe-views)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -64,6 +64,13 @@ if "$out/wycheproof-more" tests/vectors/crypto > "$out/wycheproof-more.log" 2>&1
     echo "ok   wycheproof (more): $(grep "_test.json" "$out/wycheproof-more.log" | awk '{ n += $2 } END { print n " cases" }')"
 else
     fail wycheproof-more; tail -20 "$out/wycheproof-more.log"
+fi
+
+# Wycheproof sets for other hashes (tests/cases/crypto-pure/wycheproof-hashes.ab): HMAC with SHA-1, SHA-512 and SHA-3, HKDF with SHA-1 and SHA-512, ECDSA with SHA-3 and SHAKE, RSA-OAEP and RSASSA-PSS with other hashes and parameters (what the library does not take must fail closed), and HMAC at the block-size boundaries.
+if "$out/wycheproof-hashes" tests/vectors/crypto > "$out/wycheproof-hashes.log" 2>&1; then
+    echo "ok   wycheproof (hashes): $(grep "_test.json" "$out/wycheproof-hashes.log" | awk '{ n += $2 } END { print n " cases" }'), $(grep "^hmac boundaries" "$out/wycheproof-hashes.log")"
+else
+    fail wycheproof-hashes; tail -20 "$out/wycheproof-hashes.log"
 fi
 
 # Key residue in the heap (tests/cases/crypto-pure/heap-residue.ab): after an operation with a key, the caller's own copy wiped and two collections, no window of the key (or of the
