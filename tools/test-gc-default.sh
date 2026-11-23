@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Decision #107 (option B): a release (not --fast) hosted Linux executable gets the collection with background freeing, and the adaptive collection threads, without asking.
-# tests/cases/gc-default/plain.ab says nothing about the collector: its trace (ABLA_GC_TRACE=1) has the background collector's phase lines and a
-# parallel mark. The opt-outs: ABLA_GC_BACKGROUND=0 (no background collector), ABLA_GC_WORKERS=0 (background collector, no threads),
+# The trace of plain.ab shows background freeing on both heap sizes and a parallel mark only for the wide heap. The opt-outs: ABLA_GC_BACKGROUND=0 (no background collector), ABLA_GC_WORKERS=0 (background collector, no threads),
 # memorySetBackgroundFree(false) (off.ab), memorySetGcWorkers(0) (serial.ab), and memorySetManualCollection() (manual.ab: no background collector).
 # Every variant prints the same result.
 set -euo pipefail
@@ -39,7 +38,13 @@ for mode in release fast; do
         continue
     fi
     [[ $plain == *"gc: phases us"* ]] || fail "plain ($mode): no background collection by default"
-    [[ $plain == *"gc: parallel mark"* ]] || fail "plain ($mode): no collection threads by default"
+    [[ $plain != *"gc: parallel mark"* ]] || fail "plain ($mode): a small live heap used collection threads"
+    wide=$(run "wide" "$root/tools/run-limited.sh" "$out/plain.$mode" wide)
+    [[ $wide == *"gc: parallel mark"* ]] || fail "wide ($mode): no collection threads on a large live heap"
+    wide_off=$(run "wide opt-out" env ABLA_GC_BACKGROUND=0 "$root/tools/run-limited.sh" "$out/plain.$mode" wide | grep -a "default gc ok")
+    [[ $wide == *"$wide_off"* ]] || fail "wide ($mode): parallel collection changed the result"
+    forced=$(run "ABLA_GC_WORKERS=2" env ABLA_GC_WORKERS=2 "$root/tools/run-limited.sh" "$out/plain.$mode")
+    [[ $forced == *"gc: parallel mark"* ]] || fail "ABLA_GC_WORKERS=2 ($mode): worker override was ignored"
     # Under ABLA_GC_STRESS=1 a default program stays serial and synchronous (thousands of collections would each pay the helper and the workers).
     stressed=$(run "ABLA_GC_STRESS=1" env ABLA_GC_STRESS=1 "$root/tools/run-limited.sh" "$out/plain.$mode")
     [[ $stressed != *"gc: phases us"* && $stressed != *"gc: parallel"* ]] || fail "ABLA_GC_STRESS=1 ($mode): the default background collector ran"
@@ -53,7 +58,7 @@ for mode in release fast; do
     [[ $serial == *"gc: phases us"* && $serial != *"gc: parallel"* ]] || fail "memorySetGcWorkers(0) ($mode): wanted the background collector without threads"
     manual=$(run "manual.ab" "$root/tools/run-limited.sh" "$out/manual.$mode")
     [[ $manual != *"gc: phases us"* && $manual != *"gc: parallel"* ]] || fail "memorySetManualCollection ($mode): the background collector ran"
-    for variant in "$stressed" "$off" "$workers" "$offprogram" "$serial" "$manual"; do
+    for variant in "$forced" "$stressed" "$off" "$workers" "$offprogram" "$serial" "$manual"; do
         [[ $variant == *"$expected"* ]] || fail "($mode) a variant printed another result: ${variant: -120}"
     done
     echo "gc default ($mode): background freeing and collection threads by default; ABLA_GC_BACKGROUND=0, ABLA_GC_WORKERS=0, memorySetBackgroundFree(false), memorySetGcWorkers(0) and manual collection opt out"

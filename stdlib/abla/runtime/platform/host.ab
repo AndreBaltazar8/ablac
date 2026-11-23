@@ -3586,7 +3586,7 @@ trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
     }
 }
 
-// ---- Parallel mark (ABLA_GC_WORKERS=n, off by default) ---------------------------------------------------------------
+// ---- Parallel mark ---------------------------------------------------------------
 // The mark of __ablaRuntimeHostTraceMarkedAllocations on n threads (the collecting thread and n - 1 started for the mark):
 // each claims an object by a compare-and-swap of its state word (layout -> layout + 16; the loser of a race leaves it),
 // keeps a stack of its own claimed payloads (4,096 entries), and gives half of it to a shared pool (the collection's work
@@ -3686,7 +3686,7 @@ private trusted fun __ablaRuntimeHostMarkLocate(cache: int, candidate: int): int
     if (bitmap != 0) {
         payload = __ablaRuntimeHostCollectionNearest(bitmap, page, (candidate & 65535) >> 4)
     }
-    if (payload == 0) {
+    if (payload == 0 && page > 0) {
         val previous = __ablaRuntimeHostMarkBitmapOf(cache, page - 1)
         if (previous != 0) payload = __ablaRuntimeHostCollectionNearest(previous, page - 1, 4095)
     }
@@ -3937,9 +3937,11 @@ trusted fun __ablaRuntimeHostTraceParallel(workers: int): void {
         ablaRuntimeStoreI64(context + 64, 0)
         ablaRuntimeStoreI64(context + 72, 0)
         ablaRuntimeStoreI64(context + 80, 0)
+        // Invalidate the keys. A worker fills a bitmap address when it misses the cache.
+        val cache = ablaRuntimeLoadI64(context + 16)
         var cached = 0
-        while (cached < 512) {
-            ablaRuntimeStoreI64(context + __ablaRuntimeHostMarkHeader + __ablaRuntimeHostMarkStack * 8 + cached * 8, 0)
+        while (cached < 256) {
+            ablaRuntimeStoreI64(cache + cached * 16, 0)
             cached = cached + 1
         }
         index = index + 1
@@ -4103,6 +4105,11 @@ trusted fun __ablaRuntimePlatformMemorySetBackgroundFree(enabled: bool): void {
 // the environment: then the environment decides (also 0 and 1, which turn it off).
 trusted fun __ablaRuntimePlatformMemorySetGcWorkers(count: int): void {
     __ablaRuntimeHostGcWorkersAsked = true
+    __ablaRuntimeHostGcWorkersSet(count)
+    return
+}
+
+private trusted fun __ablaRuntimeHostGcWorkersSet(count: int): void {
     val value = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(
         __ablaRuntimeWord0("ABLA_GC_WORKERS")
     )))
@@ -4128,7 +4135,7 @@ trusted fun __ablaRuntimeHostGcWorkersDefault(): void {
     if (__ablaRuntimeHostGcWorkersDefaulted) return
     __ablaRuntimeHostGcWorkersDefaulted = true
     if (__ablaRuntimeHostGcWorkersAsked || __ablaRuntimeHostGcWorkersForced) return
-    __ablaRuntimePlatformMemorySetGcWorkers(4)
+    __ablaRuntimeHostGcWorkersSet(4)
     return
 }
 
@@ -4528,8 +4535,10 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     val background = __ablaRuntimeHostBackgroundFreeOn()
     // Without background freeing (the program or ABLA_GC_BACKGROUND=0 turned it off) this is the plain serial collection.
     if (background) __ablaRuntimeHostGcWorkersDefault()
-    val useParallel = background && __ablaRuntimeHostGcUseParallel(allocationCount)
-    val timed = background && __ablaRuntimeHostGcWorkers >= 2 && !__ablaRuntimeHostGcStress && !__ablaRuntimeHostGcWorkersForced
+    val workers = background && __ablaRuntimeHostGcWorkers >= 2
+    val forced = __ablaRuntimeHostGcStress || __ablaRuntimeHostGcWorkersForced
+    val timed = workers && !forced && __ablaRuntimeHostGcAdaptiveEligible(allocationCount)
+    val useParallel = workers && (forced || (timed && __ablaRuntimeHostGcUseAdaptiveParallel()))
     val phaseStart = if (__ablaRuntimeHostGcTrace || timed) __ablaRuntimeHostStwMicroseconds() else 0
     __ablaRuntimeHostCollectionLookupBegin(useParallel)
     val phasePages = if (__ablaRuntimeHostGcTrace) __ablaRuntimeHostStwMicroseconds() else 0
@@ -4835,19 +4844,23 @@ trusted fun __ablaRuntimeHostGcWorkersForcedConfigured(): bool =
         __ablaRuntimeWord0("ABLA_GC_WORKERS")
     ))) != 0
 
-/// The registry size, in slots, below which a collection always runs serially, whatever the worker setting.
+/// The minimum registry size, in slots, for an adaptive parallel collection.
 val __ablaRuntimeHostGcAdaptiveMinimumSlots: int = 262144
+
+// Automatic workers need a substantial surviving heap to justify building a new
+// page directory. A heap that needed the directory in serial mode already pays that cost.
+private trusted fun __ablaRuntimeHostGcAdaptiveEligible(slots: int): bool =
+    slots >= __ablaRuntimeHostGcAdaptiveMinimumSlots &&
+        (__ablaRuntimeHostGcWorkersAsked || __ablaRuntimeHostCollectionNeedsDirectory ||
+            __ablaRuntimeHostCollectionKept >= 32 * 1024 * 1024)
 
 private trusted fun __ablaRuntimeHostGcPrefersParallel(state: int): bool {
     val ratio = ablaRuntimeLoadI64(state + 16)
     ratio == 0 || ratio <= 900
 }
 
-// Whether the collection of `slots` registry slots uses the threads.
-private trusted fun __ablaRuntimeHostGcUseParallel(slots: int): bool {
-    if (__ablaRuntimeHostGcWorkers < 2) return false
-    if (__ablaRuntimeHostGcStress || __ablaRuntimeHostGcWorkersForced) return true
-    if (slots < __ablaRuntimeHostGcAdaptiveMinimumSlots) return false
+// Whether an eligible adaptive collection uses the threads.
+private trusted fun __ablaRuntimeHostGcUseAdaptiveParallel(): bool {
     val state = __ablaRuntimeHostGcAdaptiveState()
     val prefers = __ablaRuntimeHostGcPrefersParallel(state)
     val since = ablaRuntimeLoadI64(state + 24) + 1
@@ -4865,7 +4878,6 @@ private trusted fun __ablaRuntimeHostGcUseParallel(slots: int): bool {
 
 // A collection of `slots` registry slots took `micros` in the mode it used.
 private trusted fun __ablaRuntimeHostGcAdaptiveRecord(parallel: bool, micros: int, slots: int): void {
-    if (slots < __ablaRuntimeHostGcAdaptiveMinimumSlots) return
     val state = __ablaRuntimeHostGcAdaptiveState()
     val cost = micros * 1024000 / slots
     val mode = if (parallel) 1 else 2
