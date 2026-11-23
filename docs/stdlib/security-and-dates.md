@@ -263,7 +263,7 @@ yet, and each is a short wrapper around OpenSSL when something does.
 RFC 8439 in Abla, with no OpenSSL and no table: `chaCha20Poly1305Seal(key, nonce, plaintext, associatedData = "")` returns the
 ciphertext and then the 16-byte tag in a `CryptoResult`; `chaCha20Poly1305Open(key, nonce, sealed, associatedData = "")` checks the
 tag in constant time before any plaintext exists and fails with one message whichever part was wrong. The key is 32 bytes and the
-nonce 12 (never reuse a nonce under a key). `chaCha20Xor(key, counter, nonce, data)` is the bare cipher and
+nonce 12 (never reuse a nonce under a key). `chaCha20Poly1305SealRandom(key, plaintext, associatedData = "")` draws a fresh random nonce and returns nonce, ciphertext and tag in one box that `chaCha20Poly1305OpenRandom(key, box, associatedData = "")` opens; it fails without a random source, and a key may seal at most 2^32 messages this way (the chance of a repeated random 96-bit nonce stays below 2^-32): count nonces yourself, or change the key, beyond that. `chaCha20Xor(key, counter, nonce, data)` is the bare cipher and
 `poly1305(key, message)` the bare one-time authenticator, for protocols that build on them (TLS 1.3 uses the AEAD). The secret-handling
 cores are read in the generated code of x86-64, AArch64, Wasm and Xtensa by `tools/test-ct.sh`, with a leaking twin of each kind that
 the check must catch. Tests: RFC 8439's vectors on every target, and every message length from 0 to 200 against Node.
@@ -292,6 +292,7 @@ import "abla/crypto"
 import "abla/crypto/aes"
 
 fun main {
+    // The key and nonce here are an RFC test vector's: never copy them. Draw a key with secureRandomBytes and use aesGcmSealRandom, which picks a fresh nonce.
     val key = hexDecode("000102030405060708090a0b0c0d0e0f")
     val nonce = hexDecode("202122232425262728292a2b")
     val sealed = aesGcmEncrypt(key, nonce, "a message", "its context")
@@ -307,6 +308,7 @@ fun main {
 
 | | |
 |---|---|
+| `aesGcmSealRandom(key, plaintext, associatedData = "")`, `aesGcmOpenRandom(key, box, associatedData = "")` | AES-GCM with a fresh random 12-byte nonce, returned first in the box (nonce, ciphertext, tag); fails without a random source. At most 2^32 messages per key this way (NIST SP 800-38D 8.3). **Never reuse a nonce under a key** with `aesGcmEncrypt`: one repeat gives away the authentication key and the XOR of two plaintexts |
 | `aesGcmEncrypt`, `aesGcmDecrypt`, `aesCbcEncryptPkcs7`, `aesCbcDecryptPkcs7`, `aesEcbEncryptPkcs5`, `aesEcbDecryptPkcs5` | as in [`abla/crypto/hosted`](#aes) |
 | `rsaPublicKeyFromPem`, `rsaPublicKeyFromDer`, `rsaPublicKeyFromCertificateDer` | as [there](#rsa). A certificate's chain, dates and signature aren't checked |
 | `rsaPrivateKeyFromPem(pem)`, `rsaPrivateKeyFromDer(der)` | PKCS#8 and PKCS#1, unencrypted. Password-resource overloads read PBES2/PBKDF2/AES-CBC [encrypted PKCS#8](encrypted-keys.md); `rsaPrivateKeyFromPkcs12(der, password, limits)` reads modern MAC-verified DER key bags (see the same limits and restrictions) |

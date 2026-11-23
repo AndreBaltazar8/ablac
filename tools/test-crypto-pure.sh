@@ -28,7 +28,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more wycheproof-hashes heap-residue signatures sha3 mlkem p384 wipe-views)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more wycheproof-hashes aead-random heap-residue signatures sha3 mlkem p384 wipe-views)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -71,6 +71,13 @@ if "$out/wycheproof-hashes" tests/vectors/crypto > "$out/wycheproof-hashes.log" 
     echo "ok   wycheproof (hashes): $(grep "_test.json" "$out/wycheproof-hashes.log" | awk '{ n += $2 } END { print n " cases" }'), $(grep "^hmac boundaries" "$out/wycheproof-hashes.log")"
 else
     fail wycheproof-hashes; tail -20 "$out/wycheproof-hashes.log"
+fi
+
+# AES-GCM and ChaCha20-Poly1305 with a random nonce (tests/cases/crypto-pure/aead-random.ab).
+if "$out/aead-random" > "$out/aead-random.log" 2>&1 && grep -q '^aead random ok$' "$out/aead-random.log"; then
+    echo "ok   aead with random nonces"
+else
+    fail aead-random; tail -20 "$out/aead-random.log"
 fi
 
 # Key residue in the heap (tests/cases/crypto-pure/heap-residue.ab): after an operation with a key, the caller's own copy wiped and two collections, no window of the key (or of the

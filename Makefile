@@ -203,6 +203,7 @@ test-serial: ablac
 	tools/test-wasm-float-remainder.sh $(COMPILER)
 	tools/test-path-under.sh $(COMPILER)
 	tools/test-wasm-host.sh $(COMPILER)
+	tools/test-wasm-random.sh $(COMPILER)
 	tools/test-wasm-wasi.sh $(COMPILER)
 	tools/test-browser-frontend.sh $(COMPILER)
 	tools/test-playground-build.sh $(COMPILER)
