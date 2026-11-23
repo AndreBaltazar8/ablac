@@ -192,8 +192,12 @@ fun DnsAsyncResolver.send(slot: int): bool {
 // deadline; false when the send failed (the query is then finished).
 fun DnsAsyncResolver.ask(slot: int): bool {
     val entropy = secureRandomBytes(2)
-    this.queryIdentifiers[slot] = if (entropy.succeeded)
-        entropy.bytes[0] * 256 + entropy.bytes[1] else 4242
+    // No fixed identifier when the random source fails: the query fails instead.
+    if (!entropy.succeeded) {
+        this.finish(slot, DnsResolution([], false, false, 22), "dns send failed")
+        return false
+    }
+    this.queryIdentifiers[slot] = entropy.bytes[0] * 256 + entropy.bytes[1]
     val now = linuxMonotonicMilliseconds()
     this.queryDeadlines[slot] = now + this.options.timeoutMilliseconds
     this.querySentAt[slot] = now
@@ -361,7 +365,10 @@ fun DnsAsyncResolver.receive(descriptor: int): bool {
     socket.descriptor = -1
     if (!datagram.received) return false
     val identifier = this.queryIdentifiers[slot]
-    val resolution = dnsParseResponse(datagram.bytes, identifier)
+    // A reply counts only from the server asked, to this question (identifier, name, type, class); anything else is ignored (RFC 5452).
+    if (datagram.source.address != this.nameserver || datagram.source.port != this.options.nameserverPort ||
+        !dnsReplyQuestionMatches(datagram.bytes, identifier, this.candidate(slot), this.queryTypes[slot])) return false
+    val resolution = dnsParseResponse(datagram.bytes, identifier, 32, this.candidate(slot))
     if (resolution.succeeded && resolution.addresses.size > 0) {
         this.finish(slot, resolution, "")
         return true

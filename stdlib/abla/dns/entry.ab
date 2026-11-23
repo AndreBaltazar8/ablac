@@ -92,40 +92,61 @@ fun dnsQuery(host: string, recordType: int, identifier: int): string {
     output.toText()
 }
 
-// Returns the name and next offset from a possibly compressed DNS name, marking invalid pointers or truncated labels as failure.
+// Returns the name and next offset from a possibly compressed DNS name, marking invalid pointers or truncated labels as failure. A pointer must point
+// before itself (RFC 1035 4.1.4: to a prior occurrence of a name), so a loop is an error and not a name after 128 hops; the name's wire form is at most 255 bytes.
 fun dnsDecodeName(input: string, start: int): DnsDecodedName {
     var name = ""
     var offset = start
     var next = -1
     var valid = start >= 0 && start < input.size
     var labels = 0
-    while (valid && labels < 128) {
+    var wire = 1
+    var finished = false
+    while (valid && !finished && labels < 128) {
         if (offset >= input.size) valid = false
         else {
             val length = input[offset]
             if (length == 0) {
                 if (next < 0) next = offset + 1
-                labels = 128
+                finished = true
             } else if ((length & 192) == 192) {
                 if (offset + 1 >= input.size) valid = false
                 else {
                     if (next < 0) next = offset + 2
-                    offset = (length & 63) * 256 + input[offset + 1]
+                    val target = (length & 63) * 256 + input[offset + 1]
+                    if (target >= offset) valid = false
+                    offset = target
                     labels = labels + 1
                 }
             } else if ((length & 192) != 0 || length > 63 ||
                 offset + 1 + length > input.size) {
                 valid = false
             } else {
-                if (name != "") name = "$name."
-                name = "$name${input.slice(offset + 1, offset + 1 + length)}"
-                offset = offset + 1 + length
-                labels = labels + 1
+                wire = wire + 1 + length
+                if (wire > 255) valid = false
+                else {
+                    if (name != "") name = "$name."
+                    name = "$name${input.slice(offset + 1, offset + 1 + length)}"
+                    offset = offset + 1 + length
+                    labels = labels + 1
+                }
             }
         }
     }
-    if (next < 0) valid = false
+    if (!finished || next < 0) valid = false
     DnsDecodedName(name, next, valid)
+}
+
+/**
+ * Whether `input` is a reply to the query for `name` and `recordType` with this identifier: the response bit set, the identifier equal, one question
+ * whose name (ASCII case ignored), type and class IN are the ones asked. A reply that fails this is not an answer to our question and is to be ignored.
+ */
+fun dnsReplyQuestionMatches(input: string, identifier: int, name: string, recordType: int): bool {
+    if (input.size < 12 || dnsReadU16(input, 0) != identifier || (dnsReadU16(input, 2) & 32768) == 0 || dnsReadU16(input, 4) != 1) return false
+    val question = dnsDecodeName(input, 12)
+    if (!question.valid || question.nextOffset + 4 > input.size) return false
+    dnsAsciiLower(question.name) == dnsAsciiLower(name) && dnsReadU16(input, question.nextOffset) == recordType &&
+        dnsReadU16(input, question.nextOffset + 2) == 1
 }
 
 private fun dnsIpv4Text(input: string, offset: int): string =
@@ -156,13 +177,17 @@ private fun dnsIpv6Text(input: string, offset: int): string {
     output
 }
 
-// Returns the addresses from a bounded DNS response or a failure for malformed data or a mismatched transaction identifier.
+// Returns the addresses from a bounded DNS response or a failure for malformed data or a mismatched transaction identifier. With a non-empty `queryName`
+// only the records whose owner is that name (ASCII case ignored) or a name reached from it by CNAME records earlier in the answer (at most eight links) count; the
+// others, which a server has no business sending for this question, are skipped. An empty `queryName` keeps every address record.
 fun dnsParseResponse(
     input: string,
     identifier: int,
-    maximumAddresses: int = 32
+    maximumAddresses: int = 32,
+    queryName: string = ""
 ): DnsResolution {
     val addresses: array<DnsAddress> = []
+    val owners: array<string> = [dnsAsciiLower(queryName)]
     var valid = input.size >= 12 && dnsReadU16(input, 0) == identifier
     val flags = dnsReadU16(input, 2)
     if ((flags & 32768) == 0 || (flags & 15) != 0) valid = false
@@ -190,10 +215,15 @@ fun dnsParseResponse(
             val length = dnsReadU16(input, name.nextOffset + 8)
             val body = name.nextOffset + 10
             valid = length >= 0 && body + length <= input.size
-            if (valid && recordClass == 1 && recordType == 1 && length == 4) {
+            val owned = queryName == "" || dnsNameListed(owners, dnsAsciiLower(name.name))
+            if (valid && owned && recordClass == 1 && recordType == 5 && queryName != "" && owners.size < 9) {
+                val target = dnsDecodeName(input, body)
+                if (target.valid && target.nextOffset <= body + length) owners.append(dnsAsciiLower(target.name))
+            }
+            if (valid && owned && recordClass == 1 && recordType == 1 && length == 4) {
                 addresses.append(DnsAddress(4, dnsIpv4Text(input, body), ttl))
             }
-            if (valid && recordClass == 1 && recordType == 28 && length == 16) {
+            if (valid && owned && recordClass == 1 && recordType == 28 && length == 16) {
                 addresses.append(DnsAddress(6, dnsIpv6Text(input, body), ttl))
             }
             if (valid) offset = body + length
@@ -410,29 +440,42 @@ private fun dnsExchange(
     port: int
 ): DnsExchange {
     val entropy = secureRandomBytes(2)
-    val identifier = if (entropy.succeeded)
-        entropy.bytes[0] * 256 + entropy.bytes[1]
-    else 1
-    val query = dnsQuery(name, recordType, identifier)
     var result = DnsExchange(DnsResolution([], false, false, 22), false)
+    // No fixed identifier when the random source fails: the exchange fails instead.
+    if (!entropy.succeeded) return result
+    val identifier = entropy.bytes[0] * 256 + entropy.bytes[1]
+    val query = dnsQuery(name, recordType, identifier)
     if (query != "") {
         val socket = udpBindPort(0)
         val sent = socket.sendTo(query, ipv4SocketAddress(nameserver, port))
         if (sent.succeeded()) {
-            val response = socket.receiveFromWithTimeout(
-                4096, timeoutMilliseconds
-            )
-            if (response.received) {
-                val resolution = dnsParseResponse(response.bytes, identifier)
-                val notFound = !resolution.succeeded &&
-                    response.source.address == nameserver &&
-                    response.source.port == port &&
-                    dnsResponseCode(response.bytes, identifier, name) == 3
-                result = DnsExchange(resolution, notFound)
-            } else {
-                result = DnsExchange(DnsResolution(
-                    [], false, response.timedOut, response.errorCode
-                ), false)
+            // Only the server asked answers, and only to this question (identifier, name, type, class): a datagram from another address or port, or for
+            // another question, is not a reply and is ignored until a real one or the timeout (RFC 5452).
+            val deadline = linuxMonotonicMilliseconds() + timeoutMilliseconds
+            var waiting = true
+            var datagrams = 0
+            while (waiting) {
+                val left = deadline - linuxMonotonicMilliseconds()
+                if (left <= 0 || datagrams >= 64) {
+                    result = DnsExchange(DnsResolution([], false, true, 110), false)
+                    waiting = false
+                } else {
+                    datagrams = datagrams + 1
+                    val response = socket.receiveFromWithTimeout(4096, left)
+                    if (!response.received) {
+                        result = DnsExchange(DnsResolution(
+                            [], false, response.timedOut, response.errorCode
+                        ), false)
+                        waiting = false
+                    } else if (response.source.address == nameserver && response.source.port == port &&
+                        dnsReplyQuestionMatches(response.bytes, identifier, name, recordType)) {
+                        val resolution = dnsParseResponse(response.bytes, identifier, 32, name)
+                        val notFound = !resolution.succeeded &&
+                            dnsResponseCode(response.bytes, identifier, name) == 3
+                        result = DnsExchange(resolution, notFound)
+                        waiting = false
+                    }
+                }
             }
         } else result = DnsExchange(
             DnsResolution([], false, false, sent.errorCode), false
@@ -568,4 +611,9 @@ fun tcpConnectHost(
         }
     }
     connection
+}
+
+private fun dnsNameListed(names: array<string>, name: string): bool {
+    for (listed in names) if (listed == name) return true
+    false
 }

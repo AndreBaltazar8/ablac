@@ -1,0 +1,142 @@
+// abla/dns against hostile replies (#1139 area 4), with a forked mock name server on 127.0.0.1. The blocking resolver (dnsResolveType) must
+//   - take a reply only from the server it asked: a reply with the right identifier, question and an answer sent from another port first is ignored;
+//   - take a reply only to its question (name, type, class): a reply for another name with the right identifier first is ignored;
+//   - keep only the address records whose owner is the name asked or reached from it by CNAME records: an answer for another owner is dropped,
+//     and a CNAME chain is followed;
+//   - refuse a name that loops through pointers (an error, not an empty name).
+// dnsDecodeName refuses a pointer that does not point before itself, a loop, and a name of more than 255 bytes on the wire.
+import "abla/io"
+import "abla/bytes"
+import "abla/text"
+import "abla/dns"
+import "abla/sys/linux/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+
+fun rr(owner: string, recordType: int, data: string): string {
+    val output = byteBuffer()
+    output.appendText(owner)
+    dnsAppendU16(output, recordType)
+    dnsAppendU16(output, 1)
+    dnsAppendU16(output, 0)
+    dnsAppendU16(output, 30)
+    dnsAppendU16(output, data.size)
+    output.appendText(data)
+    output.toText()
+}
+
+fun reply(identifier: int, name: string, records: string, count: int): string {
+    val output = byteBuffer()
+    dnsAppendU16(output, identifier)
+    dnsAppendU16(output, 33152)
+    dnsAppendU16(output, 1)
+    dnsAppendU16(output, count)
+    dnsAppendU16(output, 0)
+    dnsAppendU16(output, 0)
+    output.appendText(dnsEncodeName(name))
+    dnsAppendU16(output, 1)
+    dnsAppendU16(output, 1)
+    output.appendText(records)
+    output.toText()
+}
+
+fun addressBytes(a: int, b: int, c: int, d: int): string {
+    val output = byteBuffer()
+    output.appendByteValue(a)
+    output.appendByteValue(b)
+    output.appendByteValue(c)
+    output.appendByteValue(d)
+    output.toText()
+}
+
+fun pointer(offset: int): string {
+    val output = byteBuffer()
+    output.appendByteValue(192 + offset / 256)
+    output.appendByteValue(offset % 256)
+    output.toText()
+}
+
+fun mockServe(socket: UdpSocket, other: UdpSocket): int {
+    var loops = 0
+    while (loops < 200) {
+        val request = socket.receiveFromWithTimeout(4096, 100)
+        if (request.received && request.bytes.size > 12 && (dnsReadU16(request.bytes, 2) & 32768) == 0) {
+            val id = dnsReadU16(request.bytes, 0)
+            val name = dnsDecodeName(request.bytes, 12).name
+            val owner = pointer(12)
+            if (name == "good.test") {
+                socket.sendTo(reply(id, name, rr(owner, 1, addressBytes(10, 1, 2, 3)), 1), request.source)
+            } else if (name == "wrongsrc.test") {
+                other.sendTo(reply(id, name, rr(owner, 1, addressBytes(10, 6, 6, 6)), 1), request.source)
+                socket.sendTo(reply(id, name, rr(owner, 1, addressBytes(10, 4, 4, 4)), 1), request.source)
+            } else if (name == "wrongq.test") {
+                socket.sendTo(reply(id, "other.test", rr(owner, 1, addressBytes(10, 7, 7, 7)), 1), request.source)
+                socket.sendTo(reply(id, name, rr(owner, 1, addressBytes(10, 4, 4, 4)), 1), request.source)
+            } else if (name == "owner.test") {
+                socket.sendTo(reply(id, name, rr(dnsEncodeName("evil.test"), 1, addressBytes(10, 8, 8, 8)), 1), request.source)
+            } else if (name == "chain.test") {
+                val records = rr(owner, 5, dnsEncodeName("target.test")) + rr(dnsEncodeName("target.test"), 1, addressBytes(10, 9, 9, 9))
+                socket.sendTo(reply(id, name, records, 2), request.source)
+            } else if (name == "loop.test") {
+                // The answer's owner is a pointer to itself.
+                val at = 12 + dnsEncodeName(name).size + 4
+                socket.sendTo(reply(id, name, rr(pointer(at), 1, addressBytes(10, 5, 5, 5)), 1), request.source)
+            }
+        }
+        loops = loops + 1
+    }
+    0
+}
+
+class Tally(var failures: int)
+
+fun expect(var tally: Tally, label: string, ok: bool): void {
+    if (!ok) {
+        println("dns hardening: $label failed")
+        tally.failures = tally.failures + 1
+    }
+    return
+}
+
+fun resolve(name: string, port: int): DnsResolution =
+    dnsResolveType(name, 1, 1500, "127.0.0.1", port, "/nonexistent/resolv.conf", "/nonexistent/hosts")
+
+fun first(resolution: DnsResolution): string = if (resolution.addresses.size == 0) "" else resolution.addresses[0].address
+
+fun main: int {
+    var tally = Tally(0)
+    // dnsDecodeName on its own.
+    val header = "\x00".repeat(12)
+    val loop = dnsDecodeName(header + pointer(12), 12)
+    expect(tally, "a pointer to itself is an error", !loop.valid)
+    val forward = dnsDecodeName(header + pointer(16) + "\x00\x00" + "\x01a\x00", 12)
+    expect(tally, "a forward pointer is an error", !forward.valid)
+    val plain = dnsDecodeName(header + "\x01a\x01b\x00" + pointer(12), 17)
+    expect(tally, "a pointer back to a name is read", plain.valid && plain.name == "a.b" && plain.nextOffset == 19)
+    val label = "\x3f" + "x".repeat(63)
+    val three = dnsDecodeName(header + label + label + label + "\x00", 12)
+    expect(tally, "a name of 193 bytes is read", three.valid && three.name.size == 191)
+    val four = dnsDecodeName(header + label + label + label + label + "\x00", 12)
+    expect(tally, "a name of 257 bytes is refused", !four.valid)
+    // The resolver against the mock.
+    var mock = udpBind(ipv4Loopback(0))
+    var other = udpBind(ipv4Loopback(0))
+    val port = mock.localPort()
+    val child = linuxSyscall0(57)
+    if (child == 0) linuxSyscall1(60, mockServe(mock, other))
+    mock.close()
+    other.close()
+    expect(tally, "an ordinary reply", first(resolve("good.test", port)) == "10.1.2.3")
+    val wrongSource = first(resolve("wrongsrc.test", port))
+    expect(tally, "a reply from another port is ignored: $wrongSource", wrongSource == "10.4.4.4")
+    val wrongQuestion = first(resolve("wrongq.test", port))
+    expect(tally, "a reply to another question is ignored: $wrongQuestion", wrongQuestion == "10.4.4.4")
+    val foreign = resolve("owner.test", port)
+    expect(tally, "an answer for another owner is dropped", foreign.addresses.size == 0)
+    expect(tally, "a CNAME chain is followed", first(resolve("chain.test", port)) == "10.9.9.9")
+    val looped = resolve("loop.test", port)
+    expect(tally, "a pointer loop in an answer is an error", !looped.succeeded && looped.addresses.size == 0)
+    linuxSyscall2(62, child, 9)
+    linuxWaitProcess(child)
+    if (tally.failures == 0) 42 else 1
+}
