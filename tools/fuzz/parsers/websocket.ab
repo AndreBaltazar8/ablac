@@ -1,0 +1,158 @@
+// The WebSocket frame codec against hostile bytes (#1139 area 4): webSocketDecodeFrame on mutated frames (every opcode, masked and not,
+// fragmented, close frames, 7-, 16- and 64-bit lengths, lying lengths, reserved bits). For each input, with a payload limit and a masking
+// requirement drawn at random, a frame that decodes (succeeded) must have:
+//   reserved bits clear, a valid opcode, a control frame that is final and at most 125 bytes, a payload within the limit, the mask the
+//   input says (and one if required), the shortest length encoding, a close payload that is empty or has a valid code and a UTF-8 reason,
+//   consumed = header + payload and never more than the input, and the encoder's output for it equals the bytes consumed (round trip);
+// the decoder is consistent on prefixes: a prefix that is an error is the same error on the whole input, a prefix that decodes decodes
+// the same on the whole input; and webSocketUtf8Valid agrees with string.isValidUtf8 on the payload and on mutations of it.
+//
+//   tools/fuzz/parsers/run websocket --seeds 1-200 [--inputs 200]
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "abla/integer"
+import "abla/websocket"
+import "abla/process/arguments"
+import "../prng.ab"
+import "./mutate.ab"
+
+fun wsFuzzPayload(var r: Prng, size: int): string {
+    val kind = r.below(3)
+    if (kind == 0) return "x".repeat(size)
+    if (kind == 1) return mutateBytes(r, size)
+    "éa€\u{1F600}".repeat(size / 8 + 1).slice(0, size)
+}
+
+fun wsFuzzFrame(var r: Prng): string {
+    val sizes: array<int> = [0, 1, 2, 3, 100, 124, 125, 126, 127, 200, 1000]
+    val opcodes: array<int> = [0, 1, 2, 8, 9, 10, 1, 2, 0, 1]
+    var size = r.pickInt(sizes)
+    val opcode = r.pickInt(opcodes)
+    var payload = wsFuzzPayload(r, size)
+    if (opcode == 8) payload = if (r.below(3) == 0) wsFuzzPayload(r, r.below(4)) else webSocketClosePayload(1000 + r.below(20), wsFuzzPayload(r, r.below(10)))
+    val key = if (r.below(2) == 0) "abcd" else ""
+    val encoded = webSocketEncodeFrame(payload, opcode, r.below(4) != 0, key)
+    if (encoded != "") return encoded
+    // The encoder refused (a control frame that is long or fragmented, an invalid close payload): hand-build the header instead.
+    mutateBytes(r, 2 + r.below(8))
+}
+
+fun wsFuzzRaw(var r: Prng): string {
+    val first = r.pickInt([0x81, 0x82, 0x88, 0x89, 0x8a, 0x01, 0x00, 0xc1, 0x83, 0x8f, 0x91, 0xf1])
+    val second = r.pickInt([0x00, 0x7d, 0x7e, 0x7f, 0x80, 0xfd, 0xfe, 0xff, 0x81, 0x85])
+    val head = byteBuffer()
+    head.appendByteValue(first)
+    head.appendByteValue(second)
+    head.toText() + mutateBytes(r, r.below(14))
+}
+
+fun wsFuzzInput(var r: Prng): string {
+    val kind = r.below(10)
+    if (kind < 6) return mutate(r, wsFuzzFrame(r))
+    if (kind < 8) return wsFuzzFrame(r) + wsFuzzFrame(r)
+    if (kind < 9) return wsFuzzRaw(r)
+    mutate(r, wsFuzzFrame(r) + wsFuzzFrame(r))
+}
+
+/** A description of what is wrong when decoding `input` with the limit and masking requirement breaks an invariant, else "". */
+fun wsFuzzCheck(input: string, maximum: int, requireMasked: bool): string {
+    val d = webSocketDecodeFrame(input, maximum, requireMasked)
+    if (d.consumed > input.size) return "consumed ${d.consumed} of ${input.size} bytes"
+    if (d.error != "" && d.consumed != 0) return "an error with ${d.consumed} bytes consumed"
+    if (d.succeeded()) {
+        val first = input[0]
+        val second = input[1]
+        val opcode = first & 15
+        val length = d.frame.payload.size
+        if ((first & 112) != 0) return "accepted reserved bits"
+        if (!(opcode <= 2 || (opcode >= 8 && opcode <= 10))) return "accepted opcode $opcode"
+        if (opcode >= 8 && (!d.frame.final || length > 125)) return "accepted a control frame that is fragmented or long (final ${d.frame.final}, $length bytes)"
+        if (length > maximum) return "accepted a payload of $length over the limit $maximum"
+        if (d.frame.masked != ((second & 128) != 0)) return "the masked flag differs from the input"
+        if (requireMasked && !d.frame.masked) return "accepted an unmasked frame when masking is required"
+        val code = second & 127
+        var header = 2
+        if (code == 126) {
+            header = 4
+            if (length < 126) return "accepted a 16-bit length of $length"
+        } else if (code == 127) {
+            header = 10
+            if (length <= 65535) return "accepted a 64-bit length of $length"
+        } else if (code != length) return "a 7-bit length $code for a payload of $length"
+        if (d.frame.masked) header = header + 4
+        if (d.consumed != header + length) return "consumed ${d.consumed}, header $header + payload $length"
+        if (opcode == 8) {
+            if (length == 1) return "accepted a close payload of one byte"
+            if (length >= 2) {
+                val closeCode = d.frame.payload[0] * 256 + d.frame.payload[1]
+                if (!webSocketCloseCodeValid(closeCode)) return "accepted close code $closeCode"
+                if (!d.frame.payload.slice(2, length).isValidUtf8()) return "accepted a close reason that is not UTF-8"
+            }
+        }
+        val key = if (d.frame.masked) input.slice(header - 4, header) else ""
+        val again = webSocketEncodeFrame(d.frame.payload, opcode, d.frame.final, key)
+        if (again != input.slice(0, d.consumed)) return "the encoder does not reproduce the accepted frame (${mutateEscape(wsFuzzHead(again, 24))} vs ${mutateEscape(wsFuzzHead(input, 24))})"
+    }
+    // Prefix consistency, at a few cut points.
+    val cuts: array<int> = [1, 2, 3, 5, 9, 10, 14, input.size / 2, input.size - 1]
+    for (cut in cuts) {
+        if (cut < 1 || cut >= input.size) continue
+        val p = webSocketDecodeFrame(input.slice(0, cut), maximum, requireMasked)
+        if (p.error != "" && p.error != d.error) return "a prefix of $cut bytes is the error '${p.error}', the whole input '${d.error}'"
+        if (p.succeeded() && !(d.succeeded() && d.consumed == p.consumed && d.frame.payload == p.frame.payload)) return "a prefix of $cut bytes decodes but the whole input does not agree"
+    }
+    ""
+}
+
+fun wsFuzzUtf8(var r: Prng): string {
+    var text = wsFuzzPayload(r, r.below(40))
+    if (r.below(2) == 0) text = mutate(r, text)
+    if (webSocketUtf8Valid(text) != text.isValidUtf8()) return "webSocketUtf8Valid ${webSocketUtf8Valid(text)} but isValidUtf8 ${text.isValidUtf8()} for ${mutateEscape(text)}"
+    ""
+}
+
+fun main: int {
+    var low = 1
+    var high = 50
+    var inputs = 200
+    var verbose = false
+    val count = processArgumentCount()
+    var index = 1
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "--seeds") {
+            val dash = value.indexOf("-")
+            low = (if (dash < 0) value else value.slice(0, dash)).parseInt() ?? 1
+            high = (if (dash < 0) value else value.slice(dash + 1, value.size)).parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--inputs") {
+            inputs = value.parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--verbose") verbose = true
+        index = index + 1
+    }
+    var findings = 0
+    val limits: array<int> = [125, 1000, 1048576]
+    for (seed in low until high + 1) {
+        var r = prngSeeded(seed)
+        for (n in 0 until inputs) {
+            val input = wsFuzzInput(r)
+            val maximum = r.pickInt(limits)
+            val requireMasked = r.below(2) == 0
+            if (verbose) println("input seed=$seed n=$n max=$maximum masked=$requireMasked ${mutateEscape(wsFuzzHead(input, 120))}")
+            var problem = wsFuzzCheck(input, maximum, requireMasked)
+            if (problem == "") problem = wsFuzzUtf8(r)
+            if (problem != "") {
+                println("FINDING seed=$seed n=$n: $problem\n  input: ${mutateEscape(wsFuzzHead(input, 200))} (max $maximum, masked $requireMasked)")
+                findings = findings + 1
+            }
+        }
+    }
+    println("websocket: seeds $low-$high, $inputs inputs each, $findings findings")
+    if (findings == 0) 0 else 1
+}
+
+/** The first `count` bytes of `text`, or all of it when shorter. */
+fun wsFuzzHead(text: string, count: int): string = if (text.size > count) text.slice(0, count) else text
