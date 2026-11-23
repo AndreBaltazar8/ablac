@@ -31,6 +31,26 @@ trusted noescape extern:"c" fun __ablaWasiClock(clock: i32, precision: i64, time
 /// Fills the buffer with random bytes, returning zero or a WASI error.
 @wasmImport(["wasi_snapshot_preview1", "random_get"])
 trusted noescape extern:"c" fun __ablaWasiRandom(data: i32, size: i32): i32
+/// Identifies a preopened descriptor and writes its name length.
+@wasmImport(["wasi_snapshot_preview1", "fd_prestat_get"])
+trusted noescape extern:"c" fun __ablaWasiPrestat(fd: i32, result: i32): i32
+/// Writes the guest name of a preopened descriptor and returns a WASI error on failure.
+@wasmImport(["wasi_snapshot_preview1", "fd_prestat_dir_name"])
+trusted noescape extern:"c" fun __ablaWasiPrestatName(fd: i32, name: i32, length: i32): i32
+/// Opens a path relative to a directory descriptor with explicitly requested rights.
+@wasmImport(["wasi_snapshot_preview1", "path_open"])
+trusted noescape extern:"c" fun __ablaWasiPathOpen(fd: i32, lookup: i32, path: i32,
+    length: i32, flags: i32, rights: i64, inherited: i64, fdFlags: i32, result: i32): i32
+/// Closes the given guest descriptor and returns zero or a WASI error.
+@wasmImport(["wasi_snapshot_preview1", "fd_close"])
+trusted noescape extern:"c" fun __ablaWasiClose(fd: i32): i32
+/// Creates a directory relative to a granted directory descriptor.
+@wasmImport(["wasi_snapshot_preview1", "path_create_directory"])
+trusted noescape extern:"c" fun __ablaWasiDirectoryCreate(fd: i32, path: i32, length: i32): i32
+/// Writes metadata for a path within a granted directory descriptor.
+@wasmImport(["wasi_snapshot_preview1", "path_filestat_get"])
+trusted noescape extern:"c" fun __ablaWasiPathStat(fd: i32, lookup: i32, path: i32,
+    length: i32, result: i32): i32
 
 /// Returns the startup argv address, writes argc, and exits on a failed WASI host call.
 trusted fun __ablaRuntimeWasiArguments(argc: int): int {
@@ -89,10 +109,19 @@ private fun wasiResult(error: i32): int {
     if (error == 0) return 0
     if (error == 8) return -9   // BADF
     if (error == 6) return -11  // AGAIN
+    if (error == 2 || error == 76) return -13 // ACCES, NOTCAPABLE
+    if (error == 20) return -17 // EXIST
     if (error == 27) return -4  // INTR
     if (error == 28) return -22 // INVAL
+    if (error == 31) return -21 // ISDIR
+    if (error == 32) return -40 // LOOP
+    if (error == 37) return -36 // NAMETOOLONG
+    if (error == 44) return -2  // NOENT
+    if (error == 51) return -28 // NOSPC
     if (error == 52) return -38 // NOSYS
+    if (error == 54) return -20 // NOTDIR
     if (error == 58) return -95 // NOTSUP
+    if (error == 69) return -30 // ROFS
     -5                         // I/O failure
 }
 
@@ -109,11 +138,107 @@ private trusted fun wasiTransfer(write: bool, fd: int, buffer: int, length: int)
     result
 }
 
-/// Translates standard I/O, exits, clocks and randomness to WASI. Other calls return ENOSYS.
-trusted fun __ablaRuntimeWasiSyscall(number: int, a0: int, a1: int, a2: int): int {
+// The host names the current-directory preopen ".". Discover it by its
+// guest name since other preopens can precede it in the descriptor table.
+private trusted fun wasiWorkingDirectory(scratch: int): int {
+    var fd: i32 = 3
+    while (__ablaWasiPrestat(fd, i32(scratch)) == 0) {
+        if (ablaRuntimeLoadU8(scratch) == 0 && ablaRuntimeLoadI32(scratch + 4) == 1 &&
+            __ablaWasiPrestatName(fd, i32(scratch), 1) == 0 &&
+            ablaRuntimeLoadU8(scratch) == 46) return int(fd)
+        fd += i32(1)
+    }
+    -13
+}
+
+// Refuse absolute paths and parent components before passing any name to the
+// host. WASI still checks that resolution, including followed links, stays
+// within the directory capability.
+private trusted fun wasiRelativePathLength(path: int): int {
+    val length = __ablaRuntimeWasiCStringLength(path)
+    if (length == 0) return -2
+    if (ablaRuntimeLoadU8(path) == 47) return -13
+    var component = 0
+    var index = 0
+    while (index <= length) {
+        if (index == length || ablaRuntimeLoadU8(path + index) == 47) {
+            if (index - component == 2 && ablaRuntimeLoadU8(path + component) == 46 &&
+                ablaRuntimeLoadU8(path + component + 1) == 46) return -13
+            component = index + 1
+        }
+        index += 1
+    }
+    length
+}
+
+private trusted fun wasiOpenFile(fd: i32, path: i32, length: i32, flags: int, result: int): int {
+    // Linux O_ACCMODE, CREAT, EXCL, TRUNC, APPEND, NOFOLLOW, CLOEXEC.
+    // The guest has no exec and WASI creation permissions are host-defined.
+    val access = flags & 3
+    if ((flags & ~(3 | 64 | 128 | 512 | 1024 | 131072 | 524288)) != 0 || access == 3) return -22
+    val rights = (if (access != 1) 2 else 0) | (if (access != 0) 64 else 0) // FD_READ, FD_WRITE
+    val openFlags = (if ((flags & 64) != 0) 1 else 0) |
+        (if ((flags & 128) != 0) 4 else 0) | (if ((flags & 512) != 0) 8 else 0)
+    val error = __ablaWasiPathOpen(fd, if ((flags & 131072) == 0) 1 else 0, path, length,
+        i32(openFlags), i64(rights), i64(0), if ((flags & 1024) != 0) 1 else 0, i32(result))
+    if (error == 0) ablaRuntimeLoadI32(result) & 4294967295 else wasiResult(error)
+}
+
+private trusted fun wasiStatFile(fd: i32, path: i32, length: i32, output: int, flags: int, stat: int): int {
+    if (flags != 0 && flags != 256) return -22 // AT_SYMLINK_NOFOLLOW
+    val error = __ablaWasiPathStat(fd, if (flags == 0) 1 else 0, path, length, i32(stat))
+    if (error != 0) return wasiResult(error)
+    // Translate the 64-byte Preview 1 filestat to the x86-64 Linux stat
+    // layout read by abla/fs. WASI supplies no Unix ownership or mode bits.
+    var offset = 0
+    while (offset < 144) {
+        ablaRuntimeStoreI64(output + offset, 0)
+        offset += 8
+    }
+    val fileType = ablaRuntimeLoadU8(stat + 16)
+    val kind = if (fileType == 4) 8 else if (fileType == 3) 4 else if (fileType == 7) 10 else 1
+    ablaRuntimeStoreI64(output, ablaRuntimeLoadI64(stat))
+    ablaRuntimeStoreI64(output + 8, ablaRuntimeLoadI64(stat + 8))
+    ablaRuntimeStoreI64(output + 16, ablaRuntimeLoadI64(stat + 24))
+    ablaRuntimeStoreI32(output + 24, kind * 4096)
+    ablaRuntimeStoreI64(output + 48, ablaRuntimeLoadI64(stat + 32))
+    offset = 0
+    while (offset < 24) {
+        val time = ablaRuntimeLoadI64(stat + 40 + offset)
+        ablaRuntimeStoreI64(output + 72 + offset * 2, time / 1000000000)
+        ablaRuntimeStoreI64(output + 80 + offset * 2, time % 1000000000)
+        offset += 8
+    }
+    0
+}
+
+private trusted fun wasiFileOperation(number: int, path: int, a2: int, a3: int): int {
+    val length = wasiRelativePathLength(path)
+    if (length < 0) return length
+    val scratch = __ablaRuntimeWasmMalloc(64)
+    val fd = wasiWorkingDirectory(scratch)
+    val result = if (fd < 0) fd
+        else if (number == 257) wasiOpenFile(i32(fd), i32(path), i32(length), a2, scratch)
+        else if (number == 262) wasiStatFile(i32(fd), i32(path), i32(length), a2, a3, scratch)
+        else wasiResult(__ablaWasiDirectoryCreate(i32(fd), i32(path), i32(length)))
+    __ablaRuntimeWasmMallocFree(scratch)
+    result
+}
+
+/// Returns the result of a syscall translated to WASI. Unsupported calls return ENOSYS.
+trusted fun __ablaRuntimeWasiSyscall(number: int, a0: int, a1: int, a2: int, a3: int): int {
     if (number == 0 || number == 1) {
-        if (a0 < 0 || a0 > 2) return -9
+        if (a0 < 0 || a0 > 4294967295) return -9
         return wasiTransfer(number == 1, a0, a1, a2)
+    }
+    if (number == 3) {
+        if (a0 < 0 || a0 > 4294967295) return -9
+        return wasiResult(__ablaWasiClose(i32(a0)))
+    }
+    if (number == 83) return wasiFileOperation(number, a0, 0, 0)
+    if (number == 257 || number == 262) {
+        if (a0 != -100) return -9 // AT_FDCWD: only the working-directory preopen.
+        return wasiFileOperation(number, a1, a2, a3)
     }
     if (number == 60 || number == 231) {
         __ablaWasiExit(i32(a0 & 255))

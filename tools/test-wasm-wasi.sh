@@ -17,10 +17,12 @@ printf 'hello from WASI\n' > "$out/hello.expected"
 printf 'return:two words\nfirst:second\n' > "$out/return.expected"
 printf 'exit:two words\nfirst:second\n' > "$out/exit.expected"
 printf 'input line\n' > "$out/stderr.expected"
+printf 'first\nsecond\n' > "$out/files.expected"
+printf 'outside the preopen\n' > "$out/outside.txt"
 for profile in release fast; do
     flags=()
     [[ $profile == release ]] || flags+=(--fast)
-    for program in hello command; do
+    for program in hello command files; do
         "$compiler" build "tests/cases/wasm-wasi/$program.ab" --target wasm32-wasi \
             --no-debug --no-cache "${flags[@]}" -o "$out/$program-$profile.wasm"
     done
@@ -46,5 +48,13 @@ for profile in release fast; do
         cmp "$out/$mode.expected" "$out/command.stdout"
         cmp "$out/stderr.expected" "$out/command.stderr"
     done
+    rm -rf -- "$out/preopen" "$out/spare"
+    mkdir -p "$out/preopen" "$out/spare"
+    ln -s ../outside.txt "$out/preopen/escape.txt"
+    "$runtime" run "$out/files-$profile.wasm"
+    "$runtime" run --dir "$out/spare::x" --dir "$out/preopen::." \
+        "$out/files-$profile.wasm" "$PWD/$out/preopen/nested/round-trip.txt" > "$out/files.stdout"
+    cmp "$out/files.expected" "$out/files.stdout"
+    cmp "$out/files.expected" "$out/preopen/nested/round-trip.txt"
 done
-echo 'wasm-wasi: startup, args, environment, stdio, clocks, randomness and both exit paths pass in release and fast builds'
+echo 'wasm-wasi: startup, args, environment, stdio, clocks, randomness, exit paths and preopen-scoped files pass in release and fast builds'

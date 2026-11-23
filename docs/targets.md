@@ -45,9 +45,15 @@ before the module path and program arguments after it.
 This target uses the `wasi_snapshot_preview1` ABI directly and needs no WASI
 libc or SDK. The command receives arguments and environment variables from
 the host. Standard input/output, standard error, exit status, wall and
-monotonic clocks, and random bytes work through WASI. Filesystem access is
-not yet supported. Browser and hostless modules still use `wasm32-module`
-and their existing export and host-import contracts.
+monotonic clocks, and random bytes work through WASI. Browser and hostless
+modules use `wasm32-module` and their existing export and host-import contracts.
+
+To grant file access, run `wasmtime run --dir ./data::. app.wasm`. Abla
+resolves relative paths through the preopen named `.` in the guest. The
+portable `abla/fs` operations for reading, writing, appending, creating
+directories and reading path metadata use that capability. Absolute paths
+and `..` components are rejected, and the host checks links during
+resolution. Creation permissions come from the host.
 
 [test-wasm-wasi.sh](../tools/test-wasm-wasi.sh) exercises development and
 release commands under Wasmtime when it is installed.
