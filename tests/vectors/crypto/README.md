@@ -33,3 +33,9 @@ primitives abla/tls/pure uses that had no Wycheproof test (`ecdh_secp384r1_ecpoi
 ## mlkem768/
 
 ML-KEM-768 known answers from the NIST ACVP server (commit and format in `mlkem768/README.md`), read by `tests/cases/crypto-pure/mlkem.ab` and, in part, embedded in `tests/cases/crypto-pure/kat.ab` (`tools/test-crypto-pure.sh`).
+
+Also from C2SP/wycheproof `testvectors_v1` (master when fetched, 2026-11-23), read by `tests/cases/crypto-pure/wycheproof-more.ab` (`tools/test-crypto-pure.sh`): `mlkem_768_test`, `mlkem_768_encaps_test` and
+`mlkem_768_semi_expanded_decaps_test` (ML-KEM-768: the implicit-rejection secret of altered ciphertexts, encapsulation keys with a coefficient over q refused, key validation),
+`ecdsa_secp256r1_sha512_test`, `ecdsa_secp256r1_sha512_p1363_test`, `ecdsa_secp384r1_sha256_test`, `ecdsa_secp384r1_sha512_test` (a digest longer or shorter than the curve order),
+`rsa_pkcs1_3072_test` (PKCS#1 v1.5 decryption: the Bleichenbacher cases), `rsa_oaep_3072_sha256_mgf1sha256_test`, `rsa_oaep_4096_sha256_mgf1sha256_test` and `rsa_signature_4096_sha256_test`.
+Not read: the sets below 2048 bits (refused by policy), SHA-3 and SHAKE variants, SHA-1/224/512 OAEP, RSA-PSS "misc"/"params".

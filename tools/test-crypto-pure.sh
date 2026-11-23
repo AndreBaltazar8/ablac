@@ -28,7 +28,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls signatures sha3 mlkem p384 wipe-views)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more signatures sha3 mlkem p384 wipe-views)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -57,6 +57,13 @@ if "$out/wycheproof-tls" tests/vectors/crypto > "$out/wycheproof-tls.log" 2>&1; 
     echo "ok   wycheproof (TLS primitives): $(grep "_test.json" "$out/wycheproof-tls.log" | awk '{ n += $2 } END { print n " tests" }'), $(grep "^x25519:" "$out/wycheproof-tls.log")"
 else
     fail wycheproof-tls; tail -20 "$out/wycheproof-tls.log"
+fi
+
+# Wycheproof sets the TLS test does not read: ML-KEM-768 (implicit rejection, modulus overflow), ECDSA with SHA-512 and SHA-256 on P-384, RSA PKCS#1 v1.5 decryption and OAEP at 3072 and 4096 bits.
+if "$out/wycheproof-more" tests/vectors/crypto > "$out/wycheproof-more.log" 2>&1; then
+    echo "ok   wycheproof (more): $(grep "_test.json" "$out/wycheproof-more.log" | awk '{ n += $2 } END { print n " cases" }')"
+else
+    fail wycheproof-more; tail -20 "$out/wycheproof-more.log"
 fi
 
 # Signatures a verifier must refuse: ECDSA r or s of 0, n and above, Ed25519 S + L, RSA PKCS#1 paddings that a lax parser takes.
