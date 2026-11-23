@@ -69,30 +69,35 @@ for round in 1 2 3 4 5; do
         break
     fi
 done
-# What a commit can be held to is the live bytes, which load, the machine and the checkout do not move (two runs of one
-# compiler: 0.02% apart; the resident peak moves 1.5-2% inside one commit and 10% with four days of source growth): the
-# largest value ABLA_COMPILER_MEMORY_TRACE prints, per byte of the modules the compile parses (the trace names each one),
-# may not exceed 72 (measured 68.6 on 2026-11-22 with the relative path the test uses, +5%). A stage's growth of over 5% fails whatever the resident peak says.
-reachable_per_source_byte_hundredths=7200
+# The ordinary trace can count the rendered LLVM text and garbage awaiting collection in one sample.
+# A cadence shift made the optimized compiler measure 71.11 B/B against the earlier compiler's 64.54.
+# In retained mode the compiler collects at major phase boundaries. The optimized compiler measured
+# 49.42–49.45 B/B across three inputs. A limit of 54 leaves about 9% margin. The RSS runs keep default GC.
+retained_per_source_byte_hundredths=5400
 traced="$output_directory/traced.err"
 (
     cd "$project_root"
-    ABLA_COMPILER_MEMORY_TRACE=1 ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=120 \
+    ABLA_COMPILER_MEMORY_TRACE=retained \
+        ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=120 \
         "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm src/orc_main.ab >"$output_directory/self.ll" 2>"$traced"
 ) || {
     echo "compiler-memory-peak: the traced --emit-llvm failed" >&2
     tr -d '\0' <"$traced" | sed -n '1,20p' >&2
     exit 1
 }
-reachable=$(tr -d '\0' <"$traced" | awk '/^abla-[a-z]+-memory / && $NF + 0 > m { m = $NF + 0 } END { printf "%d", m }')
+peak_sample=$(tr -d '\0' <"$traced" | awk '
+    /^abla-retained-memory / && $NF + 0 > m { m = $NF + 0; phase = $2 }
+    END { printf "%s %d\n", (phase != "" ? phase : "unknown"), m }
+')
+read -r peak_phase retained <<< "$peak_sample"
 source_bytes=$(tr -d '\0' <"$traced" | sed -n 's/^abla-frontend-memory graph\.acquire:\(.*\) [0-9]*$/\1/p' | sort -u |
     (cd "$project_root" && xargs -d '\n' cat) | wc -c)
-if (( reachable <= 0 || source_bytes <= 0 )); then
-    echo "compiler-memory-peak: no live-bytes lines in the trace (reachable $reachable, source $source_bytes)" >&2
+if (( retained <= 0 || source_bytes <= 0 )); then
+    echo "compiler-memory-peak: no retained-heap samples in the trace (retained $retained, source $source_bytes)" >&2
     exit 1
 fi
-if (( reachable * 100 > source_bytes * reachable_per_source_byte_hundredths )); then
-    echo "compiler-memory-peak: $reachable live bytes at the trace's peak for $source_bytes bytes of source: $((reachable / source_bytes)) per byte, over the limit of $((reachable_per_source_byte_hundredths / 100)). Find the phase that grew (ABLA_COMPILER_MEMORY_TRACE=1), or raise the limit in the commit that adds the memory, saying why." >&2
+if (( retained * 100 > source_bytes * retained_per_source_byte_hundredths )); then
+    echo "compiler-memory-peak: $retained retained bytes at $peak_phase for $source_bytes bytes of source: $((retained / source_bytes)) per byte, over the limit of $((retained_per_source_byte_hundredths / 100)). Inspect the retained trace with ABLA_COMPILER_MEMORY_TRACE=retained." >&2
     exit 1
 fi
 if (( peak * 100 > relative_peak * 105 )); then
@@ -103,4 +108,4 @@ if (( peak * 100 > recorded * 120 )); then
     echo "compiler-memory-peak: $peak kB, over the recorded $recorded kB by more than 20% (a loose ceiling: the live-bytes check is the tight one, and it passed). Add a line to $record saying why, or find what grew." >&2
     exit 1
 fi
-echo "compiler-memory-peak: --emit-llvm of the compiler peaks at $peak kB resident (recorded $recorded kB; $relative_peak kB given a relative path; $rounds rounds), $reachable live bytes for $source_bytes source bytes ($((reachable * 100 / source_bytes)) hundredths per byte)"
+echo "compiler-memory-peak: --emit-llvm of the compiler peaks at $peak kB resident (recorded $recorded kB; $relative_peak kB given a relative path; $rounds rounds), $retained retained bytes at $peak_phase for $source_bytes source bytes ($((retained * 100 / source_bytes)) hundredths per byte)"
