@@ -26,7 +26,12 @@ val TLS_TICKET_MAXIMUM_LIFETIME = 604800
 /** One ticket key: its name (16 random bytes, sent in the clear in every ticket it seals), the AES-256 key, when it was made and, once replaced, when. */
 class TlsTicketKey(val name: string, val key: string, val created: int, val retired: int)
 
-private class TlsTicketStore(var keys: array<TlsTicketKey>)
+/** The current key's seal count: a ticket is AES-256-GCM under a random 96-bit nonce, which is safe for far fewer than 2^32 seals under one key
+ *  (a repeated nonce would let tickets be forged), so the key is replaced after `TLS_TICKET_MAXIMUM_SEALS` of them whatever its age. */
+private class TlsTicketStore(var keys: array<TlsTicketKey>, var sealed: int = 0)
+
+/** The default number of tickets one key seals before a new key is made (2^24, the AES-GCM record limit of RFC 8446 section 5.5). */
+val TLS_TICKET_MAXIMUM_SEALS = 16777216
 
 /** What a ticket holds. */
 class TlsTicketState(val ok: bool, val suite: int, val issued: int, val ageAdd: int, val psk: string, val alpn: string, val serverName: string)
@@ -65,19 +70,22 @@ private fun tlsRotateTicketKeys(var store: TlsTicketStore, random: (int) -> stri
     val ordered: array<TlsTicketKey> = [fresh]
     for (key in store.keys) ordered.append(if (key.retired == 0) TlsTicketKey(key.name, key.key, key.created, at) else key)
     store.keys = ordered
+    store.sealed = 0
     tlsExpireTicketKeys(store, now, lifetime)
     true
 }
 
-private fun tlsSealTicket(var store: TlsTicketStore, random: (int) -> string, now: () -> int, lifetime: int, rotateAfter: int,
+private fun tlsSealTicket(var store: TlsTicketStore, random: (int) -> string, now: () -> int, lifetime: int, rotateAfter: int, maximumSeals: int,
     suite: int, ageAdd: int, psk: string, alpn: string, serverName: string): string {
     if (rotateAfter > 0 && store.keys.size > 0 && now() - store.keys[0].created >= rotateAfter) tlsRotateTicketKeys(store, random, now, lifetime)
+    if (store.keys.size > 0 && store.keys[0].retired == 0 && store.sealed >= maximumSeals) tlsRotateTicketKeys(store, random, now, lifetime)
     tlsExpireTicketKeys(store, now, lifetime)
     if (store.keys.size == 0 || store.keys[0].retired != 0) {
         if (!tlsRotateTicketKeys(store, random, now, lifetime)) return ""
     }
     val keyBytes = store.keys[0].key
     val keyName = store.keys[0].name
+    store.sealed = store.sealed + 1
     val nonce = random(12)
     if (nonce.size != 12) return ""
     val issued = now()
@@ -126,15 +134,16 @@ private fun tlsOpenTicket(store: TlsTicketStore, ticket: string): TlsTicketState
 
 /** Ticket keys with one current key. `random` is the source (fresh bytes each call), `now` the clock in seconds, `lifetime` the ticket_lifetime
  *  (capped at seven days), `count` the tickets sent per connection, `rotateAfter` the age in seconds after which the current key is replaced when a
- *  ticket is next sealed (0: only `rotate` does it). */
-fun tlsTicketKeysNew(random: (int) -> string, now: () -> int, lifetime: int = 7200, count: int = 1, rotateAfter: int = 0): TlsTicketKeys {
+ *  ticket is next sealed (0: only `rotate` does it), `maximumSeals` the tickets one key seals before it is replaced (default TLS_TICKET_MAXIMUM_SEALS). */
+fun tlsTicketKeysNew(random: (int) -> string, now: () -> int, lifetime: int = 7200, count: int = 1, rotateAfter: int = 0,
+    maximumSeals: int = TLS_TICKET_MAXIMUM_SEALS): TlsTicketKeys {
     val store = TlsTicketStore([])
     val first = tlsNewTicketKey(random, now())
     if (first != null) store.keys = [first]
     val bounded = if (lifetime < 1) 1 else if (lifetime > TLS_TICKET_MAXIMUM_LIFETIME) TLS_TICKET_MAXIMUM_LIFETIME else lifetime
     TlsTicketKeys(
         { suite: int, ageAdd: int, psk: string, alpn: string, serverName: string ->
-            tlsSealTicket(store, random, now, bounded, rotateAfter, suite, ageAdd, psk, alpn, serverName)
+            tlsSealTicket(store, random, now, bounded, rotateAfter, if (maximumSeals < 1) 1 else maximumSeals, suite, ageAdd, psk, alpn, serverName)
         },
         { ticket: string -> tlsOpenTicket(store, ticket) },
         { tlsRotateTicketKeys(store, random, now, bounded) },
