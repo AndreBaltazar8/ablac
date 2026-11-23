@@ -1,0 +1,330 @@
+// The regular expression engine (abla/regex, a Pike VM with no backtracking) against hostile patterns and texts (#1139 area 4). Three parts per input:
+//   1 differential: a random pattern over a small alphabet is generated from a syntax tree (literals, ., classes, concatenation, |, groups, *, +, ?,
+//     {n,m}, greedy and lazy), so the harness knows its meaning, and `find` and `matches` on short texts are compared with a reference matcher in
+//     this file (ordered end positions per node: leftmost-first, as the engine documents); the engine has several paths (literal tables, a fixed-width
+//     scan, the VM) and each must agree;
+//   2 pathological: the patterns that make a backtracking engine take exponential time, (a*)*b, (a|aa)+$, (a+)+, ((a*)*)*, {1000}{1000} and
+//     the like, over a text of 600 `a` through matches, find, findAll and replace: each call must finish within 2 s and a compile within 2 s;
+//   3 hostile: a mutated pattern from a corpus of syntax edge cases (deep groups, huge counts, bad escapes, bad classes, bytes that are not
+//     UTF-8) is compiled (a refusal has a message and an offset inside the pattern) and, when it compiles, run on short texts: spans inside the
+//     text, groups inside the match, matches == matchFull, findAll[0] == find.
+//
+//   tools/fuzz/parsers/run regex --seeds 1-200 [--inputs 200]
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "abla/integer"
+import "abla/regex"
+import "abla/process/arguments"
+import "abla/process/time"
+import "../prng.ab"
+import "./mutate.ab"
+
+class Rx(val kind: int, val ch: int, val kids: array<Rx>, val lo: int, val hi: int, val lazy: bool)
+
+val RX_LIT = 0
+val RX_ANY = 1
+val RX_CLASS = 2
+val RX_CAT = 3
+val RX_ALT = 4
+val RX_STAR = 5
+val RX_PLUS = 6
+val RX_OPT = 7
+val RX_REP = 8
+val RX_GROUP = 9
+
+fun rxClassMatches(index: int, c: int): bool {
+    if (index == 0) return c == 97 || c == 98
+    if (index == 1) return c != 97
+    if (index == 2) return c >= 97 && c <= 99
+    c == 98 || c == 99
+}
+
+fun rxNullable(n: Rx): bool {
+    if (n.kind == RX_LIT || n.kind == RX_ANY || n.kind == RX_CLASS) return false
+    if (n.kind == RX_CAT) {
+        for (kid in n.kids) if (!rxNullable(kid)) return false
+        return true
+    }
+    if (n.kind == RX_ALT) return rxNullable(n.kids[0]) || rxNullable(n.kids[1])
+    if (n.kind == RX_STAR || n.kind == RX_OPT) return true
+    if (n.kind == RX_PLUS || n.kind == RX_GROUP) return rxNullable(n.kids[0])
+    n.lo == 0 || rxNullable(n.kids[0])
+}
+
+fun rxGen(var r: Prng, depth: int, mustConsume: bool): Rx {
+    val none: array<Rx> = []
+    val pick = if (depth <= 0) r.below(3) else r.below(12)
+    if (pick == 0) return Rx(RX_LIT, 97 + r.below(3), none, 0, 0, false)
+    if (pick == 1) return Rx(RX_ANY, 0, none, 0, 0, false)
+    if (pick == 2) return Rx(RX_CLASS, r.below(4), none, 0, 0, false)
+    if (pick == 3 || pick == 4) {
+        val a = rxGen(r, depth - 1, mustConsume)
+        val b = rxGen(r, depth - 1, false)
+        return Rx(RX_CAT, 0, [a, b], 0, 0, false)
+    }
+    if (pick == 5) return Rx(RX_ALT, 0, [rxGen(r, depth - 1, mustConsume), rxGen(r, depth - 1, mustConsume)], 0, 0, false)
+    if (pick == 6) return Rx(RX_GROUP, 0, [rxGen(r, depth - 1, mustConsume)], 0, 0, false)
+    // Repetitions: the body consumes at least a byte, so empty loops (where engines differ) do not arise.
+    var body = rxGen(r, depth - 1, true)
+    if (rxNullable(body)) body = Rx(RX_LIT, 97 + r.below(3), none, 0, 0, false)
+    val lazy = r.below(3) == 0
+    if (pick == 7) return Rx(RX_STAR, 0, [body], 0, 0, lazy)
+    if (pick == 8) return Rx(RX_PLUS, 0, [body], 0, 0, lazy)
+    if (pick == 9) return Rx(RX_OPT, 0, [body], 0, 0, lazy)
+    val lo = r.below(3)
+    val hi = if (r.below(4) == 0) -1 else lo + r.below(3)
+    Rx(RX_REP, 0, [body], lo, hi, lazy)
+}
+
+fun rxAtomic(n: Rx): bool = n.kind == RX_LIT || n.kind == RX_ANY || n.kind == RX_CLASS || n.kind == RX_GROUP
+
+fun rxWrap(n: Rx): string = if (rxAtomic(n)) rxPrint(n) else "(?:${rxPrint(n)})"
+
+fun rxPrint(n: Rx): string {
+    if (n.kind == RX_LIT) return byteString(n.ch)
+    if (n.kind == RX_ANY) return "."
+    if (n.kind == RX_CLASS) return if (n.ch == 0) "[ab]" else if (n.ch == 1) "[^a]" else if (n.ch == 2) "[a-c]" else "[b-c]"
+    if (n.kind == RX_CAT) {
+        var out = ""
+        for (kid in n.kids) out = out + (if (kid.kind == RX_ALT) "(?:${rxPrint(kid)})" else rxPrint(kid))
+        return out
+    }
+    if (n.kind == RX_ALT) return rxPrint(n.kids[0]) + "|" + rxPrint(n.kids[1])
+    if (n.kind == RX_GROUP) return "(${rxPrint(n.kids[0])})"
+    val lazy = if (n.lazy) "?" else ""
+    val body = rxWrap(n.kids[0])
+    if (n.kind == RX_STAR) return body + "*" + lazy
+    if (n.kind == RX_PLUS) return body + "+" + lazy
+    if (n.kind == RX_OPT) return body + "?" + lazy
+    body + "{" + "${n.lo}" + (if (n.hi < 0) "," else if (n.hi == n.lo) "" else ",${n.hi}") + "}" + lazy
+}
+
+fun byteString(c: int): string {
+    val buffer = byteBuffer()
+    buffer.appendByteValue(c)
+    buffer.toText()
+}
+
+/** The end positions, in priority order and without repeats, of the matches of `n` that start at `p` of `t`. */
+fun rxEnds(n: Rx, t: string, p: int): array<int> {
+    var out: array<int> = []
+    if (n.kind == RX_LIT) {
+        if (p < t.size && t[p] == n.ch) out.append(p + 1)
+        return rxFresh(out)
+    }
+    if (n.kind == RX_ANY) {
+        if (p < t.size) out.append(p + 1)
+        return rxFresh(out)
+    }
+    if (n.kind == RX_CLASS) {
+        if (p < t.size && rxClassMatches(n.ch, t[p])) out.append(p + 1)
+        return rxFresh(out)
+    }
+    if (n.kind == RX_CAT) {
+        var current: array<int> = [p]
+        for (kid in n.kids) {
+            var next: array<int> = []
+            for (e in current) for (e2 in rxEnds(kid, t, e)) rxAdd(next, e2)
+            current = next
+        }
+        return rxFresh(current)
+    }
+    if (n.kind == RX_ALT) {
+        for (e in rxEnds(n.kids[0], t, p)) rxAdd(out, e)
+        for (e in rxEnds(n.kids[1], t, p)) rxAdd(out, e)
+        return rxFresh(out)
+    }
+    if (n.kind == RX_GROUP) return rxEnds(n.kids[0], t, p)
+    if (n.kind == RX_STAR) return rxRep(n.kids[0], t, p, 0, -1, n.lazy)
+    if (n.kind == RX_PLUS) return rxRep(n.kids[0], t, p, 1, -1, n.lazy)
+    if (n.kind == RX_OPT) return rxRep(n.kids[0], t, p, 0, 1, n.lazy)
+    rxRep(n.kids[0], t, p, n.lo, n.hi, n.lazy)
+}
+
+fun rxAdd(var list: array<int>, value: int): void {
+    for (existing in list) if (existing == value) return
+    list.append(value)
+    return
+}
+
+/** The ends of `x{lo,hi}` (hi -1: no limit) from `p`, greedy or lazy; `x` always consumes. */
+fun rxRep(x: Rx, t: string, p: int, lo: int, hi: int, lazy: bool): array<int> {
+    var out: array<int> = []
+    if (lo > 0) {
+        for (e in rxEnds(x, t, p)) for (e2 in rxRep(x, t, e, lo - 1, if (hi < 0) -1 else hi - 1, lazy)) rxAdd(out, e2)
+        return rxFresh(out)
+    }
+    if (hi == 0) {
+        out.append(p)
+        return rxFresh(out)
+    }
+    if (lazy) rxAdd(out, p)
+    for (e in rxEnds(x, t, p)) for (e2 in rxRep(x, t, e, 0, if (hi < 0) -1 else hi - 1, lazy)) rxAdd(out, e2)
+    if (!lazy) rxAdd(out, p)
+    rxFresh(out)
+}
+
+fun rxText(var r: Prng): string {
+    val size = r.below(11)
+    val buffer = byteBuffer()
+    for (i in 0 until size) buffer.appendByteValue(97 + r.below(3))
+    buffer.toText()
+}
+
+fun rxDifferential(var r: Prng): string {
+    val tree = rxGen(r, 3, false)
+    val pattern = rxPrint(tree)
+    val compiled = regexCompile(pattern)
+    if (!compiled.succeeded) return "a generated pattern does not compile: $pattern: ${compiled.error.message} at ${compiled.error.offset}"
+    val regex = compiled.regex
+    for (round in 0 until 6) {
+        val text = rxText(r)
+        var start = -1
+        var end = -1
+        for (s in 0 until text.size + 1) {
+            if (start < 0) {
+                val ends = rxEnds(tree, text, s)
+                if (ends.size > 0) {
+                    start = s
+                    end = ends[0]
+                }
+            }
+        }
+        var whole = false
+        for (e in rxEnds(tree, text, 0)) if (e == text.size) whole = true
+        val found = regex.find(text)
+        val work = regex.findWork(text)
+        val bound = 2 * (text.size + 1) * (regex.program.size / 3)
+        if (work > bound) return "pattern $pattern text '$text': findWork $work over the documented bound $bound"
+        if (start < 0 && found != null) return "pattern $pattern text '$text': find gave ${found.start()}-${found.end()}, the reference none"
+        if (start >= 0 && found == null) return "pattern $pattern text '$text': find gave none, the reference $start-$end"
+        if (found != null && (found.start() != start || found.end() != end)) return "pattern $pattern text '$text': find gave ${found.start()}-${found.end()}, the reference $start-$end"
+        if (regex.matches(text) != whole) return "pattern $pattern text '$text': matches gave ${regex.matches(text)}, the reference $whole"
+    }
+    ""
+}
+
+val RX_PATHOLOGICAL: array<string> = ["(a*)*b", "(a|aa)+$", "(a+)+b", "((a*)*)*b", "(a|a)*b", "(.*)*x", "(a?){30}a{30}", "a{1000}{1000}", "(a{1,1000}){1,1000}",
+    "((((((((((a*)*)*)*)*)*)*)*)*)*)*b", "(x+x+)+y", "(a|b|ab)*c", "(?:a*){1000}b", "\\w+\\w+\\w+\\w+\\w+\\w+!", "(?:(?:a|b)*)*c", "(a*a*a*a*a*a*a*a*a*a*)b"]
+
+fun rxTimed(label: string, start: int, limit: int = 2000): string {
+    val elapsed = monotonicMilliseconds() - start
+    if (elapsed > limit) return "$label took $elapsed ms"
+    ""
+}
+
+fun rxPathological(var r: Prng): string {
+    val pattern = r.pick(RX_PATHOLOGICAL)
+    val begin = monotonicMilliseconds()
+    val compiled = regexCompile(pattern)
+    val late = rxTimed("compiling $pattern", begin)
+    if (late != "") return late
+    if (!compiled.succeeded) return ""
+    val text = "a".repeat(600)
+    // The documented bound: a search takes at most 2 * (text size + 1) * program size steps, whatever the pattern.
+    val bound = 2 * (text.size + 1) * (compiled.regex.program.size / 3)
+    val work = compiled.regex.findWork(text)
+    if (work > bound) return "findWork of $pattern on 600 a is $work steps, over the documented bound $bound"
+    var t = monotonicMilliseconds()
+    compiled.regex.matches(text)
+    var bad = rxTimed("matches of $pattern on 600 a", t, 20000)
+    if (bad != "") return bad
+    t = monotonicMilliseconds()
+    compiled.regex.find(text)
+    bad = rxTimed("find of $pattern on 600 a", t, 20000)
+    if (bad != "") return bad
+    t = monotonicMilliseconds()
+    compiled.regex.findAll(text)
+    bad = rxTimed("findAll of $pattern on 600 a", t, 20000)
+    if (bad != "") return bad
+    t = monotonicMilliseconds()
+    compiled.regex.replace(text, "x")
+    rxTimed("replace of $pattern on 600 a", t, 20000)
+}
+
+val RX_CORPUS: array<string> = ["a", "abc", "a|b", "(a)(b)(c)", "(?:a|b)+c", "[a-z]+", "[^a-z]", "\\d+\\.\\d*", "\\w+@\\w+", "a{2,5}", "a{,3}", "a{1000}", "a{1001}", "(a{10}){10}",
+    "(?P<n>a)", "(?<n>a)", "\\p{L}", "\\x41", "\\u00e9", "\\Q", "[a-", "[]", "[^]", "(", ")", "(?", "*", "a**", "a*?", "a{2", "\\", "^a$", "\\bword\\b", ".*",
+    "((((((((((((((((((((((((((((((((((((((((((((((((((((a))))))))))))))))))))))))))))))))))))))))))))))))))))", "é€", "[é-€]", "\xff", "[\xc0\xaf]"]
+
+fun rxHostile(var r: Prng): string {
+    val pattern = mutate(r, r.pick(RX_CORPUS))
+    val begin = monotonicMilliseconds()
+    val compiled = regexCompile(pattern)
+    val late = rxTimed("compiling ${mutateEscape(pattern)}", begin)
+    if (late != "") return late
+    if (!compiled.succeeded) {
+        if (compiled.error.message == "") return "a refusal with no message for ${mutateEscape(pattern)}"
+        if (compiled.error.offset < 0 || compiled.error.offset > pattern.size) return "an error offset ${compiled.error.offset} outside the ${pattern.size} bytes of ${mutateEscape(pattern)}"
+        return ""
+    }
+    val regex = compiled.regex
+    for (round in 0 until 4) {
+        val text = mutate(r, r.pick(["abc", "a1b2", "word word", "é€", "", "aaaa"]))
+        val t = monotonicMilliseconds()
+        val found = regex.find(text)
+        val all = regex.findAll(text)
+        val whole = regex.matchFull(text)
+        val slow = rxTimed("running ${mutateEscape(pattern)} on ${mutateEscape(text)}", t)
+        if (slow != "") return slow
+        if (found != null) {
+            if (found.start() < 0 || found.end() < found.start() || found.end() > text.size) return "a span ${found.start()}-${found.end()} outside the ${text.size} bytes of the text for ${mutateEscape(pattern)}"
+            for (g in 1 until found.groupCount() + 1) if (found.hasGroup(g) && (found.groupStart(g) < found.start() || found.groupEnd(g) > found.end() || found.groupEnd(g) < found.groupStart(g))) {
+                return "group $g outside the match for ${mutateEscape(pattern)} on ${mutateEscape(text)}"
+            }
+        }
+        if ((found == null) != (all.size == 0)) return "find and findAll disagree for ${mutateEscape(pattern)} on ${mutateEscape(text)}"
+        if (found != null && all.size > 0 && (all[0].start() != found.start() || all[0].end() != found.end())) return "findAll[0] differs from find for ${mutateEscape(pattern)} on ${mutateEscape(text)}"
+        if (regex.matches(text) != (whole != null)) return "matches and matchFull disagree for ${mutateEscape(pattern)} on ${mutateEscape(text)}"
+        if (whole != null && (whole.start() != 0 || whole.end() != text.size)) return "matchFull does not span the text for ${mutateEscape(pattern)}"
+    }
+    ""
+}
+
+fun main: int {
+    var low = 1
+    var high = 50
+    var inputs = 200
+    var verbose = false
+    val count = processArgumentCount()
+    var index = 0
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "--seeds") {
+            val dash = value.indexOf("-")
+            low = (if (dash < 0) value else value.slice(0, dash)).parseInt() ?? 1
+            high = (if (dash < 0) value else value.slice(dash + 1, value.size)).parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--inputs") {
+            inputs = value.parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--verbose") verbose = true
+        index = index + 1
+    }
+    var findings = 0
+    for (seed in low until high + 1) {
+        var r = prngSeeded(seed)
+        for (n in 0 until inputs) {
+            val kind = r.below(20)
+            if (verbose) println("input seed=$seed n=$n kind=$kind")
+            var problem = ""
+            if (kind < 12) problem = rxDifferential(r)
+            else if (kind < 13) problem = rxPathological(r)
+            else problem = rxHostile(r)
+            if (problem != "") {
+                println("FINDING seed=$seed n=$n: $problem")
+                findings = findings + 1
+            }
+        }
+    }
+    println("regex: seeds $low-$high, $inputs inputs each, $findings findings")
+    if (findings == 0) 0 else 1
+}
+
+/** A new array with the elements of `list`. */
+fun rxFresh(list: array<int>): array<int> {
+    var copy: array<int> = []
+    for (e in list) copy.append(e)
+    copy
+}
