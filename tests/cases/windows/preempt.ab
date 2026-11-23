@@ -1,0 +1,141 @@
+// The compile-time watchdog's two ways to stop another thread (docs/design/windows-jit.md §5), from a second thread as the
+// watchdog does them:
+// - code that runs on and never makes a system call (a `jmp .` in executable memory from VirtualAlloc, as JIT'd code is): the
+//   watchdog suspends the thread, reads its CONTEXT, finds Rip inside that memory, changes the CONTEXT with
+//   abla_windows_redirect to resume in a jump back to where abla_setjmp armed it with 3 (a time limit, as the guard numbers it),
+//   and resumes it;
+// - a read of a pipe nothing is written to: the watchdog sets the thread's interrupt word and calls CancelSynchronousIo, and the
+//   read returns EINTR (-4).
+import "abla/io"
+import "abla/text"
+import "abla/sys/linux"
+import "abla/runtime/platform/windows"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/native/function-address"
+
+trusted noescape extern:"c" fun abla_setjmp(buffer: int): int
+trusted noescape extern:"c" fun abla_longjmp(buffer: int, value: int): void
+trusted noescape extern:"c" fun abla_windows_redirect(context: int, target: int, first: int, second: int): void
+trusted noescape extern:"c" fun VirtualAlloc(address: int, size: int, kind: int, protect: int): int
+trusted noescape extern:"c" fun GetCurrentThreadId(): int
+trusted noescape extern:"c" fun OpenThread(access: int, inherit: int, id: int): int
+trusted noescape extern:"c" fun SuspendThread(target: int): int
+trusted noescape extern:"c" fun ResumeThread(target: int): int
+trusted noescape extern:"c" fun GetThreadContext(target: int, context: int): int
+trusted noescape extern:"c" fun SetThreadContext(target: int, context: int): int
+trusted noescape extern:"c" fun CancelSynchronousIo(target: int): int
+trusted noescape extern:"c" fun Sleep(milliseconds: int): void
+trusted noescape extern:"c" fun CreateThread(attributes: int, stack: int, start: int, parameter: int, flags: int, id: int): int
+
+trusted fun load(address: int): int = ablaUnsafeLoadI64(nativePointerFromAddress(address))
+trusted fun store(address: int, value: int): void = ablaUnsafeStoreI64(nativePointerFromAddress(address), value)
+
+trusted fun jumpBack(buffer: int, how: int): void {
+    abla_longjmp(buffer, how)
+}
+
+// Stops `target` if its Rip is in [code, code + 4096): 1 when redirected, 0 when it was elsewhere, -1 when a call failed.
+// CONTEXT is 16-aligned; ContextFlags (0x30) CONTEXT_CONTROL | CONTEXT_INTEGER (0x100003); Rsp at 0x98, Rip at 0xF8.
+trusted fun redirect(target: int, context: int, code: int, buffer: int): int {
+    if (SuspendThread(target) < 0) return -1
+    ablaUnsafeStoreU32(nativePointerFromAddress(context + 48), 1048579)
+    if (GetThreadContext(target, context) == 0) {
+        ResumeThread(target)
+        return -1
+    }
+    val rip = load(context + 248)
+    if (rip < code || rip >= code + 4096) {
+        ResumeThread(target)
+        return 0
+    }
+    // Below the interrupted frame, 16-aligned less the 8 a call pushes, as a call into jumpBack would leave it.
+    store(context + 152, ((load(context + 152) - 128) / 16) * 16 - 8)
+    abla_windows_redirect(context, nativeFunctionAddress(jumpBack), buffer, 3)
+    val set = SetThreadContext(target, context)
+    ResumeThread(target)
+    if (set == 0) -1 else 1
+}
+
+// The watchdogs run on threads of their own made with CreateThread, as the compiler's is, and allocate nothing; each gets a
+// block: the target thread's handle, the code's address, the jump buffer, the CONTEXT, the interrupt word's address, and
+// the result at 40.
+trusted fun block(at: int, field: int): int = load(at + field * 8)
+
+// The watchdog for the spinning thread: tries every 10 ms until the redirect lands.
+trusted fun stopSpin(at: int): int {
+    Sleep(100)
+    var tries = 0
+    var done = 0
+    while (done == 0 && tries < 500) {
+        done = redirect(block(at, 0), block(at, 3), block(at, 1), block(at, 2))
+        if (done == 0) Sleep(10)
+        tries += 1
+    }
+    store(at + 40, done)
+    0
+}
+
+// The watchdog for the reading thread: sets its interrupt word, then cancels its read once it has started.
+trusted fun stopRead(at: int): int {
+    Sleep(100)
+    store(block(at, 4), 1)
+    var cancelled = 0
+    var tries = 0
+    while (cancelled == 0 && tries < 500) {
+        cancelled = CancelSynchronousIo(block(at, 0))
+        if (cancelled == 0) Sleep(10)
+        tries += 1
+    }
+    store(at + 40, cancelled)
+    0
+}
+
+// Runs `watchdog` on a new thread with the block; returns its handle.
+trusted fun start(watchdog: int, at: int): int = CreateThread(0, 0, watchdog, at, 0, 0)
+
+trusted fun main: int {
+    val storage = "0123456789abcdef".repeat(40)
+    val buffer = nativeStringAddress(storage)
+    val blockStorage = "0123456789abcdef".repeat(4)
+    val at = nativeStringAddress(blockStorage)
+    val contextStorage = "0123456789abcdef".repeat(80)
+    store(at, OpenThread(2032639, 0, GetCurrentThreadId()))
+    if (block(at, 0) == 0) {
+        println("no thread handle")
+        return 1
+    }
+    // jmp . (EB FE) in read-write-execute memory (MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE).
+    val code = VirtualAlloc(0, 4096, 12288, 64)
+    ablaUnsafeStoreU8(nativePointerFromAddress(code), 235)
+    ablaUnsafeStoreU8(nativePointerFromAddress(code + 1), 254)
+    store(at + 8, code)
+    store(at + 16, buffer)
+    store(at + 24, (nativeStringAddress(contextStorage) + 15) / 16 * 16)
+    store(at + 40, 0)
+    val spinWatch = start(nativeFunctionAddress(stopSpin), at)
+    val how = abla_setjmp(buffer)
+    if (how == 0) {
+        println("spinning")
+        println("not reached ${callNativeMain(code)}")
+        return 1
+    }
+    WaitForSingleObject(spinWatch, 4294967295)
+    println("back with $how, watchdog ${block(at, 5)}")
+    // pipe2(fds, 0): the read end at fds, the write end at fds + 4; nothing is written.
+    val fds = buffer + 256
+    val piped = linuxSyscall2(293, fds, 0)
+    if (piped != 0) {
+        println("no pipe: $piped")
+        return 1
+    }
+    val readEnd = ablaUnsafeLoadU32(nativePointerFromAddress(fds))
+    val cell = __ablaRuntimeWindowsInterruptCell()
+    store(at + 32, cell)
+    store(at + 40, 0)
+    val readWatch = start(nativeFunctionAddress(stopRead), at)
+    println("interrupted pipe read ${linuxSyscall3(0, readEnd, buffer, 16)}")
+    WaitForSingleObject(readWatch, 4294967295)
+    println("cancelled ${block(at, 5) != 0}")
+    store(cell, 0)
+    0
+}

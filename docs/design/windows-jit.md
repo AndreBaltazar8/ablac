@@ -122,8 +122,10 @@ to the thread. The design:
   not wake it). The word is per thread, not one for the process: the compiler's other threads (code generation, a generation's
   own threads) must not see EINTR. The runtime gives each thread its word in native TLS and a function that returns its address
   (`abla_runtime_windows_interrupt_cell`); the guard records that address while it is armed, and the watchdog writes 1 through
-  it. CreatePipe's handles are synchronous, so **[confirm]** under Wine and on the runner that CancelSynchronousIo ends a read
-  of one.
+  it. CreatePipe's handles are synchronous; CancelSynchronousIo ends a read of one with EINTR under Wine **[checked]**
+  (tests/cases/windows/preempt.ab), on the runner **[confirm]**. The same test redirects a thread spinning in VirtualAlloc'd
+  code from another thread (SuspendThread, GetThreadContext, abla_windows_redirect, SetThreadContext, ResumeThread) under
+  Wine **[checked]**.
 - **New kernel32 imports** (for the compiler, which is CRT-linked per #104, so they can come from the CRT's kernel32 import
   library rather than our list): SuspendThread, ResumeThread, GetThreadContext, SetThreadContext, CancelSynchronousIo,
   CreateEventW, SetEvent, WaitForSingleObject (already), SetThreadStackGuarantee.

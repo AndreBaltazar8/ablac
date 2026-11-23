@@ -76,4 +76,12 @@ tools/windows/wine-run.sh "$out/interrupt.exe" > "$out/interrupt.out" 2> "$out/i
 [[ $status == 0 ]] || fail "interrupt.exe exited $status: $(head -3 "$out/interrupt.out" "$out/interrupt.err")"
 [[ "$(cat "$out/interrupt.out")" == $'interrupted sleep -4\ninterrupted poll -4\ninterrupted socket poll -4\ninterrupted futex wait -4\ninterrupted wait4 -4\ncollected true\nplain sleep 0' ]] || fail "interrupt.exe printed: $(cat "$out/interrupt.out" "$out/interrupt.err")"
 (( SECONDS - started < 25 )) || fail "interrupt.exe took $((SECONDS - started)) s: the interrupted sleep ran its time"
-echo "windows-syscalls: the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame; a fault redirected with abla_windows_redirect jumps back too; a thread's interrupt word ends its wait with EINTR"
+# The watchdog's two stops (preempt.ab, §5), each from a second thread: a thread spinning in VirtualAlloc'd code is suspended,
+# its CONTEXT redirected to a jump back with 3, and resumed; a thread reading an empty pipe gets EINTR from CancelSynchronousIo.
+"$compiler" build tests/cases/windows/preempt.ab --target x86_64-windows-hosted -o "$out/preempt.exe" --fast --no-cache \
+    > "$out/preempt.log" 2>&1 || { cat "$out/preempt.log" >&2; fail "preempt.ab did not build for Windows"; }
+status=0
+timeout 60 tools/windows/wine-run.sh "$out/preempt.exe" > "$out/preempt.out" 2> "$out/preempt.err" || status=$?
+[[ $status == 0 ]] || fail "preempt.exe exited $status: $(head -5 "$out/preempt.out" "$out/preempt.err")"
+[[ "$(cat "$out/preempt.out")" == $'spinning\nback with 3, watchdog 1\ninterrupted pipe read -4\ncancelled true' ]] || fail "preempt.exe printed: $(cat "$out/preempt.out" "$out/preempt.err")"
+echo "windows-syscalls: the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame; a fault redirected with abla_windows_redirect jumps back too; a thread's interrupt word ends its wait with EINTR; another thread stops one spinning in executable memory with a CONTEXT redirect and one reading a pipe with CancelSynchronousIo"
