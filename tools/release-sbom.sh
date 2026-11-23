@@ -35,13 +35,16 @@ macos_revision=$(shellvar "$root/tools/llvm-macos-pins.sh" LLVM_MACOS_REVISION)
 macos_tag=$(shellvar "$root/tools/llvm-macos-pins.sh" LLVM_MACOS_TAG)
 macos_arm64=$(shellvar "$root/tools/llvm-macos-pins.sh" LLVM_MACOS_ARM64_SHA256)
 macos_x86_64=$(shellvar "$root/tools/llvm-macos-pins.sh" LLVM_MACOS_X86_64_SHA256)
+windows_url=$(sed -n 's/.*"url": "\([^"]*\)".*/\1/p' "$root/nix/llvm-windows-static-pin.json")
+windows_sha=$(sed -n 's/.*"sha256": "\([^"]*\)".*/\1/p' "$root/nix/llvm-windows-static-pin.json")
+windows_tag=$(printf '%s' "$windows_url" | sed -n 's|.*/releases/download/\([^/]*\)/.*|\1|p')
 seed_version=$(sed -n 's/^version=//p' "$root/tools/bootstrap-compiler.sh" | head -n 1)
 seed_linux=$(awk '/^        artifact=ablac-x86_64-linux$/ { want = 1; next } want && /platform_sha256=/ { sub(/.*platform_sha256=/, ""); print; exit }' "$root/tools/bootstrap-compiler.sh")
 # The newest published Xtensa companion release of the catalog: its LLVM version and source commit.
 companion=$(awk '/^    "[0-9][^"]*": \{/ { name = $1; gsub(/[":]/, "", name) } /"status": "published"/ { last = name } END { print last }' "$root/tools/xtensa-companions.json")
 companion_llvm=$(awk -v n="$companion" '$1 == "\"" n "\":" { on = 1 } on && /"llvmVersion"/ { gsub(/[",]/, "", $2); print $2; exit }' "$root/tools/xtensa-companions.json")
 companion_commit=$(awk -v n="$companion" '$1 == "\"" n "\":" { on = 1 } on && /"sourceCommit"/ { gsub(/[",]/, "", $2); print $2; exit }' "$root/tools/xtensa-companions.json")
-for required in llvm_fork_commit nixpkgs_commit seed_version portable_tag macos_version companion companion_commit; do
+for required in windows_url windows_sha windows_tag llvm_fork_commit nixpkgs_commit seed_version portable_tag macos_version companion companion_commit; do
     [[ -n ${!required} ]] || { echo "release-sbom: could not read $required from the checkout" >&2; exit 1; }
 done
 
@@ -58,6 +61,7 @@ created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     printf '    {"SPDXID": "SPDXRef-llvm-portable-linux", "name": "llvm-23 prebuilt for Linux (portable archive)", "versionInfo": "%s", "downloadLocation": "https://github.com/AndreBaltazar8/llvm-project/releases/tag/%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION"},\n' "$portable_tag" "$portable_tag" "$portable_sha"
     printf '    {"SPDXID": "SPDXRef-llvm-macos-arm64", "name": "llvm %s-fdiv-%s prebuilt for Apple Silicon", "versionInfo": "%s", "downloadLocation": "https://github.com/AndreBaltazar8/llvm-project/releases/tag/%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION"},\n' "$macos_version" "$macos_revision" "$macos_version" "$macos_tag" "$macos_arm64"
     printf '    {"SPDXID": "SPDXRef-llvm-macos-x86-64", "name": "llvm %s-fdiv-%s prebuilt for Intel macOS", "versionInfo": "%s", "downloadLocation": "https://github.com/AndreBaltazar8/llvm-project/releases/tag/%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION"},\n' "$macos_version" "$macos_revision" "$macos_version" "$macos_tag" "$macos_x86_64"
+    printf '    {"SPDXID": "SPDXRef-llvm-windows-x86-64", "name": "llvm prebuilt for Windows x86-64 (static, /MT; linked into ablac.exe, llvm-objcopy.exe shipped beside it)", "versionInfo": "%s", "downloadLocation": "%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION", "comment": "nix/llvm-windows-static-pin.json; the Windows toolchain zip also carries Microsoft'"'"'s Visual C++ runtime libraries, linked statically"},\n' "$windows_tag" "$windows_url" "$windows_sha"
     printf '    {"SPDXID": "SPDXRef-xtensa-companion", "name": "abla Xtensa LLVM companion (optional, installed explicitly)", "versionInfo": "%s", "downloadLocation": "git+https://github.com/AndreBaltazar8/llvm-project@%s", "filesAnalyzed": false, "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION", "comment": "LLVM %s; its archives and checksums are pinned in tools/xtensa-companions.json"},\n' "$companion" "$companion_commit" "$companion_llvm"
     printf '    {"SPDXID": "SPDXRef-nixpkgs", "name": "nixpkgs (the Linux build environment)", "versionInfo": "%s", "downloadLocation": "%s", "filesAnalyzed": false, "licenseConcluded": "MIT", "licenseDeclared": "MIT", "copyrightText": "NOASSERTION", "comment": "nix/nixpkgs.nix; supplies the C toolchain, lld, compiler-rt, OpenSSL and the other Linux inputs, not shipped in the static assets except compiler-rt builtins and the statically linked LLVM and lld"},\n' "$nixpkgs_commit" "$nixpkgs_url"
     printf '    {"SPDXID": "SPDXRef-seed", "name": "ablac bootstrap seed", "versionInfo": "%s", "downloadLocation": "https://github.com/AndreBaltazar8/ablac/releases/tag/v%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s", "comment": "ablac-x86_64-linux"}], "licenseConcluded": "MPL-2.0", "licenseDeclared": "MPL-2.0", "copyrightText": "NOASSERTION", "comment": "tools/bootstrap-compiler.sh; the compiler that builds this release (stage 1)"}\n' "$seed_version" "${seed_version#v}" "$seed_linux"
@@ -72,7 +76,7 @@ created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     done < <(find "$assets" -type f | LC_ALL=C sort)
     printf '\n  ],\n  "relationships": [\n'
     printf '    {"spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": "SPDXRef-ablac"},\n'
-    for dependency in llvm-fork llvm-portable-linux llvm-macos-arm64 llvm-macos-x86-64 xtensa-companion nixpkgs seed; do
+    for dependency in llvm-fork llvm-portable-linux llvm-macos-arm64 llvm-macos-x86-64 llvm-windows-x86-64 xtensa-companion nixpkgs seed; do
         printf '    {"spdxElementId": "SPDXRef-ablac", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-%s"},\n' "$dependency"
     done
     first=1

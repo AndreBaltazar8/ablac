@@ -72,7 +72,7 @@ cp "$work/good.pub" "$local_root/release-signing.pub"
 if command -v git >/dev/null 2>&1; then
     mkdir -p "$local_root/tools" "$local_root/nix"
     cp "$root/tools/bootstrap-compiler.sh" "$root/tools/xtensa-companions.json" "$root/tools/llvm-linux-portable-pins.sh" "$root/tools/llvm-macos-pins.sh" "$local_root/tools/"
-    cp "$root/nix/llvm-fork.nix" "$root/nix/nixpkgs.nix" "$root/nix/llvm-instcombine-fdiv-zero.patch" "$local_root/nix/"
+    cp "$root/nix/llvm-fork.nix" "$root/nix/nixpkgs.nix" "$root/nix/llvm-instcombine-fdiv-zero.patch" "$root/nix/llvm-windows-static-pin.json" "$local_root/nix/"
     git -C "$local_root" init -q -b master
     git -C "$local_root" -c user.name=t -c user.email=t@t add -A
     git -C "$local_root" -c user.name=t -c user.email=t@t commit -q -m start
@@ -80,6 +80,15 @@ if command -v git >/dev/null 2>&1; then
     (cd "$local_root" && ABLA_RELEASE_SIGNING_KEY_FILE="$work/good" tools/sign-release.sh "$work/rel" --tag v9.9.9) > "$work/out" 2>&1 || { cat "$work/out" >&2; fail 'sign-release.sh failed on a local directory'; }
     [[ -f $work/rel/ablac-9.9.9.spdx.json && -f $work/rel/SHA256SUMS.sig ]] || fail 'sign-release.sh wrote no SBOM or signature'
     grep -q 'ablac-9.9.9.spdx.json' "$work/rel/SHA256SUMS" || fail 'the SBOM is not in SHA256SUMS'
+    accepts "$work/rel"
+    # The Windows toolchain zip is an ordinary asset: signed in SHA256SUMS, listed in the SBOM, whose Windows LLVM entry comes from the pin.
+    fresh; rm -f "$work/rel/SHA256SUMS" "$work/rel/SHA256SUMS.sig"
+    printf 'zip bytes\n' > "$work/rel/abla-toolchain-x86_64-windows.zip"
+    printf '%s  abla-toolchain-x86_64-windows.zip\n' "$(sha256sum "$work/rel/abla-toolchain-x86_64-windows.zip" | cut -d' ' -f1)" > "$work/rel/abla-toolchain-x86_64-windows.zip.sha256"
+    (cd "$local_root" && ABLA_RELEASE_SIGNING_KEY_FILE="$work/good" tools/sign-release.sh "$work/rel" --tag v9.9.9) > "$work/out" 2>&1 || { cat "$work/out" >&2; fail 'sign-release.sh refused a directory with the Windows zip'; }
+    grep -q ' abla-toolchain-x86_64-windows.zip$' "$work/rel/SHA256SUMS" || fail 'the Windows zip is not in SHA256SUMS'
+    grep -q '"fileName": "abla-toolchain-x86_64-windows.zip"' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the Windows zip is not in the SBOM'
+    grep -q 'SPDXRef-llvm-windows-x86-64' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM has no Windows LLVM package'
     accepts "$work/rel"
     printf 'x' > "$work/rel/static-suite-source.sha"
     if "$root/tools/sign-release.sh" "$work/rel" "$work/good" > "$work/out" 2>&1; then fail 'sign-release.sh signed a directory with static-suite-source.sha'; fi

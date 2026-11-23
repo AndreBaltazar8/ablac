@@ -77,7 +77,9 @@ steps:
   - run: ablac build app.ab -o build/app
 ```
 
-The action supports Linux x86-64 and both Apple Silicon and Intel macOS. Pin it
+The action supports Linux x86-64, both Apple Silicon and Intel macOS, and (from the release that ships
+`abla-toolchain-x86_64-windows.zip`) Windows x86-64 runners, where the toolchain is one `ablac.exe` with
+`llvm-objcopy.exe` beside it and needs no Visual Studio or SDK. Pin it
 to a full commit SHA when an immutable action reference is required.
 
 The Linux toolchain archive, `abla-toolchain-x86_64-linux`, is statically linked from v0.2.66: the
