@@ -67,9 +67,29 @@ llvm-readobj --relocations "$out/stack-probe.exe.o" > "$out/stack-probe.relocati
 grep -q 'IMAGE_REL_ARM64_BRANCH26 __chkstk' "$out/stack-probe.relocations" ||
     fail 'the stack fixture did not call __chkstk'
 
+# The links above ran lld's COFF driver inside the compiler (only llvm-objcopy is on PATH: there is no lld-link to start). The
+# same program linked by the external lld-link (ABLA_LINK_INPROCESS=0, lld-link on PATH) must be the same image, byte for
+# byte, for either Windows machine: the in-process link is the external one's, not an approximation of it.
+lld_link=$(command -v lld-link) || fail 'lld-link is required for the comparison with the external link'
+external=$(mktemp -d "$root/build/windows-link-tools.XXXXXX")
+trap 'rm -rf -- "$tools" "$external"' EXIT
+ln -s "$objcopy" "$external/llvm-objcopy"
+ln -s "$lld_link" "$external/lld-link"
+for target in aarch64-windows x86_64-windows-hosted; do
+    PATH="$tools" "$compiler" build tests/cases/windows/hosted/hello.ab --target "$target" --no-cache \
+        -o "$out/link-inprocess.$target.exe" > "$out/link-inprocess.$target.log" 2>&1 ||
+        { cat "$out/link-inprocess.$target.log" >&2; fail "$target: the in-process link failed"; }
+    PATH="$external" ABLA_LINK_INPROCESS=0 "$compiler" build tests/cases/windows/hosted/hello.ab --target "$target" --no-cache \
+        -o "$out/link-external.$target.exe" > "$out/link-external.$target.log" 2>&1 ||
+        { cat "$out/link-external.$target.log" >&2; fail "$target: the external lld-link failed"; }
+    cmp "$out/link-inprocess.$target.exe" "$out/link-external.$target.exe" ||
+        fail "$target: the in-process link and the external lld-link wrote different images"
+    rm -f "$out/link-inprocess.$target".* "$out/link-external.$target".*
+done
+
 native="$out/files.native"
 "$compiler" build tests/cases/windows/hosted/files.ab --fast --no-cache -o "$native" > "$out/files.native.log" 2>&1 ||
     { cat "$out/files.native.log" >&2; fail 'could not build the Linux files fixture'; }
 (cd "$out" && "$native") > "$out/files.expected"
 (cd "$out" && sha256sum -- ./*.exe ./crash.exe.debug ./files.expected | sed 's|  \./|  |' > SHA256SUMS)
-echo 'windows-arm64: 13 ARM64 PE programs passed structural checks'
+echo 'windows-arm64: 13 ARM64 PE programs passed structural checks; the compiler'"'"'s own lld-link writes the external one'"'"'s images (x64 and ARM64)'
