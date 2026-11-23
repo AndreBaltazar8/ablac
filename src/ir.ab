@@ -3189,7 +3189,7 @@ fun bootstrapFinalizeIrFunction(
     targetFeatures: string = "",
     runtimeImplementation: bool = false
 ): BootstrapIrFunction {
-    val canonical: array<BootstrapInstruction> = []
+    var canonical: array<BootstrapInstruction> = []
     var terminated = false
     var index = 0
     while (index < lowered.size) {
@@ -3222,24 +3222,34 @@ fun bootstrapFinalizeIrFunction(
         else bootstrapIrSourcePosition
     ))
 
-    val initialBlocks = bootstrapBuildIrBlocks(canonical)
-    val initialErrors = bootstrapVerifyIrFunction(canonical, initialBlocks)
+    val canonicalSize = canonical.size
+    var blocks = bootstrapBuildIrBlocks(canonical)
+    val initialErrors = bootstrapVerifyIrFunction(canonical, blocks)
     bootstrapSemanticUnit()
-    val reachableInstructions: array<BootstrapInstruction> = []
-    var block = 0
-    while (block < initialBlocks.size) {
-        if (initialBlocks[block].reachable) {
-            index = initialBlocks[block].begin
-            while (index < initialBlocks[block].end) {
-                reachableInstructions.append(canonical[index])
+    var pruneBlocks = false
+    for (block in blocks) {
+        if (!block.reachable) {
+            pruneBlocks = true
+            break
+        }
+    }
+    // If every block stays, the original instructions and block offsets
+    // already describe the reachable function.
+    if (pruneBlocks) {
+        val kept: array<BootstrapInstruction> = []
+        for (block in blocks) {
+            if (!block.reachable) continue
+            index = block.begin
+            while (index < block.end) {
+                kept.append(canonical[index])
                 index = index + 1
             }
         }
-        block = block + 1
+        canonical = move(kept)
+        blocks = bootstrapBuildIrBlocks(canonical)
     }
-    val blocks = bootstrapBuildIrBlocks(reachableInstructions)
     val locals = bootstrapBuildIrLocals(
-        reachableInstructions,
+        canonical,
         blocks,
         parameters
     )
@@ -3265,33 +3275,33 @@ fun bootstrapFinalizeIrFunction(
     // Pruning copies an ordered subsequence. Equal lengths mean the same
     // instructions and CFG, so a successful structural check still holds.
     // Keep the repeated check on errors to preserve diagnostic counts.
-    if (initialErrors != 0 || reachableInstructions.size != canonical.size) {
+    if (initialErrors != 0 || canonical.size != canonicalSize) {
         errors = errors + bootstrapVerifyIrFunction(
-            reachableInstructions,
+            canonical,
             blocks
         )
     }
     bootstrapSemanticUnit()
     val immediateDominators = bootstrapBuildImmediateDominators(blocks)
     errors = errors + bootstrapVerifyIrDominance(
-        reachableInstructions,
+        canonical,
         blocks,
         immediateDominators
     )
     errors = errors + bootstrapVerifyIrLocals(
-        reachableInstructions,
+        canonical,
         blocks,
         locals,
         immediateDominators
     )
-    bootstrapPrepareIrBorrowMetadata(reachableInstructions)
+    bootstrapPrepareIrBorrowMetadata(canonical)
     errors = errors + bootstrapVerifyIrPlaces(
-        reachableInstructions,
+        canonical,
         blocks
     )
     bootstrapSemanticUnit()
     errors = errors + bootstrapVerifyIrBorrows(
-        reachableInstructions,
+        canonical,
         blocks,
         locals
     )
@@ -3299,8 +3309,8 @@ fun bootstrapFinalizeIrFunction(
         var assemblyCount = 0
         var nakedValid = true
         index = 0
-        while (index < reachableInstructions.size) {
-            val instruction = reachableInstructions[index]
+        while (index < canonical.size) {
+            val instruction = canonical[index]
             if (instruction.opcode == "inline.assembly") {
                 assemblyCount = assemblyCount + 1
                 if (instruction.operands.size != 0) nakedValid = false
@@ -3313,7 +3323,7 @@ fun bootstrapFinalizeIrFunction(
     }
     // Checked as written, then emitted without what nothing reads.
     val trimmed = if (errors == 0 && !naked)
-        bootstrapIrWithoutDeadValues(reachableInstructions, result) else []
+        bootstrapIrWithoutDeadValues(canonical, result) else []
     val trim = trimmed.size > 0
     val trimmedBlocks = if (trim) bootstrapBuildIrBlocks(trimmed) else []
     val trimmedLocals = if (trim) bootstrapBuildIrLocals(trimmed, trimmedBlocks, parameters) else []
@@ -3327,7 +3337,7 @@ fun bootstrapFinalizeIrFunction(
     BootstrapIrFunction(
         name,
         parameters,
-        if (trim) trimmed else reachableInstructions,
+        if (trim) trimmed else canonical,
         result,
         if (trim) trimmedBlocks else blocks,
         if (trim) trimmedLocals else locals,
