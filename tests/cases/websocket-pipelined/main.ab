@@ -1,0 +1,52 @@
+// A blocking WebSocket connection reads frames that arrive pipelined (#1139 area 4): with a payload limit of 100 bytes the client sends the
+// first masked frame in two pieces and the rest of it together with a whole second frame. Both are within the limit, so both are read; a frame
+// over the limit is still refused.
+import "abla/io"
+import "abla/net"
+import "abla/text"
+import "abla/websocket"
+import "abla/process/time"
+
+resource class Job(val port: int, val first: string, val second: string, val gap: int)
+
+fun frameOf(size: int): string = webSocketEncodeFrame("x".repeat(size), 2, true, "abcd")
+
+/** The client writes `first` (a prefix of a frame), waits, then writes `second`; the server reads two frames of at most 100 bytes. */
+fun exchange(first: string, second: string): string {
+    val listener = tcpListenAddress(ipv4Loopback(0))
+    val job = Shared(Job(listener.localPort(), first, second, 200))
+    val sender = thread {
+        val connection = tcpConnect(ipv4Loopback(job.get().port), 5000)
+        if (connection.descriptor < 0) 1 else {
+            connection.write(job.get().first)
+            sleep(job.get().gap)
+            connection.write(job.get().second)
+            sleep(300)
+            0
+        }
+    }
+    var socket = webSocketConnection(listener.accept(), true)
+    val one = socket.readFrame(100, 3000)
+    val two = socket.readFrame(100, 3000)
+    await sender
+    "${one.available}:${one.frame.payload.size}:${one.error}|${two.available}:${two.frame.payload.size}:${two.error}"
+}
+
+fun main: int {
+    var bad = 0
+    val a = frameOf(100)
+    val b = frameOf(100)
+    val split = a.slice(0, 60)
+    val rest = a.slice(60, a.size) + b
+    val got = exchange(split, rest)
+    if (got != "true:100:|true:100:") {
+        println("pipelined frames within the limit: $got")
+        bad = bad + 1
+    }
+    val over = exchange(frameOf(101), "")
+    if (!over.startsWith("false:0:payload exceeds configured limit")) {
+        println("a frame over the limit: $over")
+        bad = bad + 1
+    }
+    if (bad == 0) 42 else 1
+}
