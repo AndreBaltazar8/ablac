@@ -49,6 +49,46 @@ fun main {
 // error: region.escape:assignment.saved
 ```
 
+A map keeps what it is given, so `set` is a store like an append: a key or a value built in the region cannot go into
+a map outside it.
+
+```abla error
+fun main {
+    val names: Map<string, string> = Map()
+    val n = region {
+        names.set("first", "a" + "b")
+        0
+    }
+}
+// error: region.escape:map.set
+```
+
+```abla error
+fun main {
+    val counts: Map<string, int> = Map()
+    val n = region {
+        counts.set("k" + "1", 1)
+        0
+    }
+}
+// error: region.escape:map.set.key
+```
+
+A `TVar` outside the region is the same: its `setValue` keeps the value.
+
+```abla error
+import "abla/stm"
+
+fun main {
+    val shared = TVar("x")
+    val n = region {
+        atomic { shared.setValue("a" + "b") }
+        0
+    }
+}
+// error: region.escape:setValue
+```
+
 A function the region calls is held to the same rules: one that stores what
 it is given, or builds, in a module value cannot be called inside a region,
 however deep the call:
