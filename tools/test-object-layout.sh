@@ -23,9 +23,15 @@ run() { # program [environment...]
     echo "status $status"
 }
 
-"$compiler" build "$project_root/tests/cases/object-layout/main.ab" \
+ABLA_KEEP_LLVM_TEXT=1 "$compiler" build "$project_root/tests/cases/object-layout/main.ab" \
     -o "$output_directory/layout" --no-cache > "$output_directory/layout.log" 2>&1 ||
     { cat "$output_directory/layout.log" >&2; exit 1; }
+# Empty and Wide occupy 16 and 96 bytes. Both calls should pass the size
+# with the high bit set, leaving the descriptor lookup out of allocation.
+for encoded in -2147483632 -2147483552; do
+    grep -Eq "call .*@abla_object_create\(.*i32 $encoded," "$output_directory/layout.ll" ||
+        { echo "object layout: constructor size missing from the allocation call" >&2; exit 1; }
+done
 for stress in 0 1; do
     output=$(run "$output_directory/layout" ABLA_GC_STRESS=$stress)
     [[ $output == $'object layout: 0 failed\nobject sizes: 0 failed\nstatus 42' ]] ||
