@@ -24,10 +24,17 @@ const browser = spawn(chrome, ['--headless=new', '--remote-debugging-port=0', `-
   '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
 // Whatever ends this script ends the browser.
 process.on('exit', () => { try { browser.kill(); } catch {} });
+// A loaded machine can keep Chrome shutting down after SIGTERM for minutes (the whole check took 19 s on one busy CPU and
+// then waited out the test's 120 s here): it gets 5 s, then SIGKILL, then 5 s more.
 const finish = async (code) => {
   const exited = new Promise((resolve) => browser.on('exit', resolve));
+  const within = (seconds) => Promise.race([exited.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), seconds * 1000))]);
   browser.kill();
-  await exited;
+  if (!(await within(5))) {
+    browser.kill('SIGKILL');
+    await within(5);
+  }
   server.close();
   try { fs.rmSync(profile, { recursive: true, force: true }); } catch {}
   process.exit(code);
@@ -72,8 +79,18 @@ const next = async (method) => {
 };
 await send('Debugger.enable');
 await send('Runtime.enable');
-await send('Page.navigate', { url: `http://127.0.0.1:${server.address().port}/page.html` });
-const ready = await send('Runtime.evaluate', { expression: 'window.ready', awaitPromise: true });
+const page = `http://127.0.0.1:${server.address().port}/page.html`;
+await send('Page.navigate', { url: page });
+// Page.navigate answers before the new document exists: an evaluation right after it ran in about:blank under load
+// (window.ready undefined). Wait, up to 30 s, until page.html's own document has defined window.ready, then await it.
+let ready = null;
+for (let tries = 0; tries < 600 && ready === null; tries++) {
+  const loaded = await send('Runtime.evaluate',
+    { expression: `location.href === ${JSON.stringify(page)} && window.ready !== undefined` });
+  if (loaded.result?.result?.value === true) ready = await send('Runtime.evaluate', { expression: 'window.ready', awaitPromise: true });
+  else await new Promise((resolve) => setTimeout(resolve, 50));
+}
+if (ready === null) fail('page.html did not load within 30 s');
 if (ready.result?.result?.value !== 'ready') fail(`the page did not load the module: ${JSON.stringify(ready)}`);
 const script = events.filter((event) => event.method === 'Debugger.scriptParsed').map((event) => event.params)
   .find((parsed) => parsed.url.endsWith('probe.wasm'));
