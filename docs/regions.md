@@ -103,6 +103,24 @@ fun main {
 // error: region.escape:setValue
 ```
 
+A `Mutex`, a `task` and a `thread` made inside the region are region objects as
+well: the handle lives in the region's memory, so it can't be stored in a
+variable that outlives the region either (`thread` and `task` handles are
+awaited inside the block):
+
+```abla error
+resource class Item(var name: string)
+
+fun main {
+    var saved = Mutex(Item("outer"))
+    val n = region {
+        saved = Mutex(Item("in" + "ner"))
+        0
+    }
+}
+// error: region.escape:assignment.saved
+```
+
 A function the region calls is held to the same rules: one that stores what
 it is given, or builds, in a module value cannot be called inside a region,
 however deep the call:
