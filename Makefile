@@ -22,7 +22,7 @@ define install_launcher
 	fi
 endef
 
-.PHONY: all bootstrap ablac ablac-dev self-rebuild test test-full test-serial test-wide-integers-full check compile benchmark \
+.PHONY: all bootstrap ablac ablac-dev playground self-rebuild test test-full test-serial test-wide-integers-full check compile benchmark \
 	benchmark-network clean prepare-test-driver
 
 all: ablac
@@ -63,6 +63,10 @@ ablac: $(COMPILER)
 ablac-dev: bootstrap
 	ABLA_SYSROOT=$(CURDIR) $(COMPILER_PAYLOAD) build $(COMPILER_ENTRY) \
 		-o $(BUILD_DIR)/ablac-dev --no-cache --fast
+
+# The browser compiler as a build product (tools/build-playground.sh): build/playground/abla-playground-<version>.tar.gz.
+playground: ablac
+	tools/build-playground.sh $(COMPILER) $(BUILD_DIR)/playground
 
 self-rebuild: ablac
 	tools/test-pure-self-rebuild.sh $(COMPILER_PAYLOAD)
@@ -200,6 +204,7 @@ test-serial: ablac
 	tools/test-wasm-host.sh $(COMPILER)
 	tools/test-wasm-wasi.sh $(COMPILER)
 	tools/test-browser-frontend.sh $(COMPILER)
+	tools/test-playground-build.sh $(COMPILER)
 	tools/test-wasm-panic-message.sh $(COMPILER)
 	tools/test-release-scripts.sh $(COMPILER)
 	tools/test-siblings-tool.sh

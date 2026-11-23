@@ -1,0 +1,54 @@
+// Checks an unpacked abla-playground package from its own files, as a page would use it:
+//   node package-check.mjs <unpacked directory> [size limits JSON]
+// The manifest's sizes and hashes match the files, the stdlib bundle loads over HTTP (served with Content-Encoding: br, as the site does), the
+// module compiles, and the host runs a program with the compiler's evaluator.
+import { createHash } from "node:crypto";
+import { createServer } from "node:http";
+import { readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { brotliCompressSync, constants } from "node:zlib";
+
+const [directory, limitsJson = "{}"] = process.argv.slice(2);
+const limits = { wasmBytes: 8 * 1048576, wasmBrotliBytes: 2 * 1048576, stdlibBytes: 1.2 * 1048576, ...JSON.parse(limitsJson) };
+const fail = (message) => { console.error(`playground package: ${message}`); process.exit(1); };
+const manifest = JSON.parse(readFileSync(join(directory, "manifest.json"), "utf8"));
+if (manifest.format !== 1) fail(`unknown manifest format ${manifest.format}`);
+
+for (const entry of [manifest.compiler, manifest.stdlib, ...manifest.host]) {
+    const bytes = readFileSync(join(directory, entry.file));
+    if (bytes.length !== entry.bytes) fail(`${entry.file} is ${bytes.length} bytes, the manifest says ${entry.bytes}`);
+    if (createHash("sha256").update(bytes).digest("hex") !== entry.sha256) fail(`${entry.file} does not match its hash`);
+}
+if (!manifest.compiler.file.includes(manifest.compiler.sha256.slice(0, 16))) fail("the module's name does not carry its hash");
+if (!manifest.stdlib.file.includes(manifest.stdlib.sha256)) fail("the bundle's name does not carry its hash");
+
+const wasm = readFileSync(join(directory, manifest.compiler.file));
+const brotli = brotliCompressSync(wasm, { params: { [constants.BROTLI_PARAM_QUALITY]: 11, [constants.BROTLI_PARAM_SIZE_HINT]: wasm.length } }).length;
+if (wasm.length > limits.wasmBytes) fail(`the module is ${wasm.length} bytes, over ${limits.wasmBytes}`);
+if (brotli > limits.wasmBrotliBytes) fail(`the module is ${brotli} bytes with brotli, over ${limits.wasmBrotliBytes}`);
+if (manifest.stdlib.bytes > limits.stdlibBytes) fail(`the stdlib bundle is ${manifest.stdlib.bytes} bytes, over ${limits.stdlibBytes}`);
+
+const server = createServer((request, response) => {
+    const file = join(directory, request.url.slice(1));
+    try {
+        const body = readFileSync(file);
+        const headers = { "Content-Type": "application/octet-stream" };
+        if (file.endsWith(".br")) headers["Content-Encoding"] = "br";
+        response.writeHead(200, headers);
+        response.end(body);
+    } catch { response.writeHead(404); response.end(); }
+});
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+try {
+    const { loadStdlib } = await import(pathToFileURL(join(directory, "stdlib-bundle.mjs")));
+    const host = await import(pathToFileURL(join(directory, "host.mjs")));
+    const stdlib = await loadStdlib(`http://127.0.0.1:${server.address().port}/${manifest.stdlib.file}`);
+    const module = await WebAssembly.compile(wasm);
+    const source = 'import "abla/io"\n\nfun main: int {\n    println("package ok")\n    7\n}\n';
+    const result = await host.run(module, host.createBase(stdlib), new Map([["main.ab", source]]));
+    if (!result.ok || result.stdout !== "package ok\n" || result.status !== 7) fail(`the program ran as ${JSON.stringify({ ok: result.ok, status: result.status, stdout: result.stdout, diagnostics: result.diagnostics.slice(0, 200) })}`);
+    console.log(`playground package ${manifest.version}: module ${(wasm.length / 1048576).toFixed(2)} MB (${(brotli / 1048576).toFixed(2)} MB brotli), stdlib bundle ${(manifest.stdlib.bytes / 1048576).toFixed(2)} MB; hashes match, the bundle loads over HTTP, a program runs`);
+} finally {
+    server.close();
+}
