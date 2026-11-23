@@ -178,7 +178,9 @@ resource class HttpsEventServer(
     // is kept in pieces in `chunkStates[slot]`: each read is looked at once, not the whole buffer again (see HttpEventServer).
     val needs: array<int> = [],
     val tails: array<ByteBuffer> = [],
-    val chunkStates: array<HttpEventChunkState> = []
+    val chunkStates: array<HttpEventChunkState> = [],
+    // The clocks of the HTTP/1 request being received and the response being sent, per connection (see HttpEventServerOptions).
+    val deadlines: HttpEventDeadlines = httpEventDeadlines()
 ) {
     /// Closes the active sockets, poller and listener when the server is dropped.
     fun drop(): void {
@@ -884,6 +886,7 @@ private fun HttpsEventServer.allocate(descriptor: int): int {
         this.needs.append(0)
         this.tails.append(byteBuffer())
         this.chunkStates.append(httpEventChunkState())
+        this.deadlines.deadlineGrow()
     } else {
         this.descriptors[slot] = descriptor
         this.peers[slot] = peer
@@ -898,6 +901,7 @@ private fun HttpsEventServer.allocate(descriptor: int): int {
         this.needs[slot] = 0
         this.tails[slot] = byteBuffer()
         this.chunkStates[slot].reset()
+        this.deadlines.deadlineReset(slot)
     }
     while (this.descriptorSlots.size <= descriptor) this.descriptorSlots.append(-1)
     this.descriptorSlots[descriptor] = slot
@@ -1094,6 +1098,7 @@ private fun HttpsEventServer.serveHttp1(slot: int): void {
         val frame = this.chunkStates[slot].assemble(this.inputs[slot], base.maximumHeaderBytes, base.maximumBodyBytes, this.peers[slot])
         val length = frame.length
         this.needs[slot] = if (length == 0) frame.need else 0
+        if (length == 0 && (frame.need > 0 || frame.head != null)) this.deadlines.deadlineHeadSeen(slot, this.requestCounts[slot])
         if (length == 0 && frame.trim > 0) {
             // A chunked request still incomplete: what is before its first incomplete chunk element is in the slot's state now.
             this.inputs[slot] = this.inputs[slot].slice(frame.trim, this.inputs[slot].size)
@@ -1378,6 +1383,12 @@ private fun HttpsEventServer.timers(): void {
         } else if (this.options.base.idleTimeoutMilliseconds > 0 && now - this.lastActivity[slot] >= this.options.base.idleTimeoutMilliseconds) {
             this.closeSlot(slot)
         }
+        // The request head, request and response deadlines of an HTTP/1 connection (see HttpEventServerOptions).
+        if (this.descriptors[slot] >= 0 && this.states[slot] == httpsHttp1 && this.deadlines.deadlineExpired(
+            slot, now, this.options.base,
+            this.inputs[slot].size > 0 || this.tails[slot].size() > 0 || this.chunkStates[slot].head != null,
+            this.chunkStates[slot].head != null, this.requestCounts[slot], this.outputs[slot].size > 0
+        )) this.closeSlot(slot)
     }
     return
 }

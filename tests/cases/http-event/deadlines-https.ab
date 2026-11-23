@@ -1,0 +1,110 @@
+// The HTTPS event server (here without TLS, as a plain HTTP/1 server) closes a connection that does not finish a request or take a response in time (#1139 area 4). The idle timeout restarts on every
+// byte, so a peer that trickles bytes could hold a connection for ever; three deadlines of HttpEventServerOptions end it: the head of a request (default
+// 30 s), the whole request and a queued response (off by default). One program, the server and its clients in one thread, a pass every 50 ms. On one
+// server with a head deadline of 600 ms, a request deadline of 1500 ms and a response deadline of 800 ms:
+//   - a head sent a byte every 100 ms is closed by about 600 ms (the idle timeout is 10 s);
+//   - a request whose head is complete and whose body is sent a byte every 100 ms is not closed at 600 ms, but is by the request deadline;
+//   - a request answered at once is answered, and its connection stays;
+//   - a response the client does not read (the server's send buffer is made small) is closed by the response deadline.
+// On a second server with the three deadlines off, the same three connections are all still open after 3 s. Prints "http-event-tls deadlines ok".
+import "abla/io"
+import "abla/text"
+import "abla/http"
+import "abla/http/event"
+import "abla/http/event/tls"
+import "abla/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+fun big(request: HttpRequest): HttpResponse = httpText("y".repeat(if (request.path == "/big") 1500000 else 2))
+
+// SO_SNDBUF of 4096 on the listener: the connections it accepts take it, so a response the peer does not read stays queued in the server.
+fun smallSendBuffer(descriptor: int): void {
+    val value = nativeByteBuffer(8)
+    value.store(0, 0)
+    value.store(1, 16)
+    value.store(2, 0)
+    value.store(3, 0)
+    linuxSyscall5(54, descriptor, 1, 7, nativePointerAddress(value.address), 4)
+    value.close()
+    return
+}
+
+class Outcome(val head: int, val body: int, val answered: bool, val slowClosed: bool)
+
+// Runs the scenario for `duration` ms; the closing times in ms of the head and body connections (-1: still open), whether the normal request was answered,
+// and whether the slow reader's connection was closed.
+fun scenario(headMs: int, requestMs: int, responseMs: int, duration: int): Outcome {
+    val router = httpRouter()
+    router.get("/", big)
+    router.get("/big", big)
+    router.post("/", big)
+    val options = HttpEventServerOptions(16, 65536, 1048576, 2097152, 1000, 10000, 256, 1000, headMs, requestMs, responseMs)
+    val server = httpsEventServer(router, ipv4Loopback(0), null, HttpsEventServerOptions(options))
+    smallSendBuffer(server.listener.descriptor)
+    val port = server.listener.localPort()
+    val head = tcpConnectIpv4("127.0.0.1", port, 2000)
+    val body = tcpConnectIpv4("127.0.0.1", port, 2000)
+    val normal = tcpConnectIpv4("127.0.0.1", port, 2000)
+    val slow = tcpConnectIpv4("127.0.0.1", port, 2000)
+    head.setNonblocking()
+    body.setNonblocking()
+    normal.setNonblocking()
+    slow.setNonblocking()
+    head.write("GET / HTTP/1.1\r\nHost: a\r\n")
+    body.write("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n")
+    normal.write("GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+    slow.write("GET /big HTTP/1.1\r\nHost: a\r\n\r\n")
+    val started = linuxMonotonicMilliseconds()
+    var closedHead = -1
+    var closedBody = -1
+    var answered = false
+    var lastByte = 0
+    while (linuxMonotonicMilliseconds() - started < duration) {
+        server.step(50)
+        val now = linuxMonotonicMilliseconds() - started
+        if (now - lastByte >= 100) {
+            lastByte = now
+            if (closedHead < 0) head.write("X")
+            if (closedBody < 0) body.write("y")
+        }
+        // A closed connection reads as end of input.
+        if (closedHead < 0 && head.readResult(16).reachedEof()) closedHead = now
+        if (closedBody < 0 && body.readResult(16).reachedEof()) closedBody = now
+        if (!answered) answered = normal.readResult(4096).hasData()
+    }
+    // The count of open connections tells the slow reader's fate: the normal one stays, the head and body ones are accounted for above.
+    var expectedOpen = 1
+    if (closedHead < 0) expectedOpen = expectedOpen + 1
+    if (closedBody < 0) expectedOpen = expectedOpen + 1
+    Outcome(closedHead, closedBody, answered, server.activeConnections() <= expectedOpen)
+}
+
+fun main: int {
+    val timed = scenario(600, 1500, 800, 4000)
+    if (timed.head < 400 || timed.head > 2500) {
+        println("FAIL a head sent a byte at a time was closed at ${timed.head} ms (deadline 600)")
+        return 1
+    }
+    if (timed.body < 1300 || timed.body > 3500) {
+        println("FAIL a body sent a byte at a time was closed at ${timed.body} ms (request deadline 1500; the head deadline must not apply to it)")
+        return 1
+    }
+    if (!timed.answered) {
+        println("FAIL a request answered at once was not answered")
+        return 1
+    }
+    if (!timed.slowClosed) {
+        println("FAIL a response the client does not read was not closed by the response deadline (800 ms)")
+        return 1
+    }
+    val off = scenario(0, 0, 0, 3000)
+    if (off.head >= 0 || off.body >= 0 || !off.answered || off.slowClosed) {
+        println("FAIL with the deadlines off the connections were closed anyway: head ${off.head}, body ${off.body}, slow closed ${off.slowClosed}")
+        return 1
+    }
+    println("http-event-tls deadlines ok")
+    0
+}

@@ -753,6 +753,15 @@ for the rest and the idle timeout closes the connection without an answer; bytes
 after a body of the declared length are the next request, never part of this
 one. A blank line before the request line is not skipped (it is answered `400`). `tests/cases/modules/http-event.ab` runs each of these.
 
+The idle timeout of the event servers (`HttpEventServerOptions.idleTimeoutMilliseconds`, 30 s) restarts on every byte received or written, so it does not end a
+peer that trickles bytes (slowloris, a slow POST, a client that reads a large response a few bytes at a time). Three deadlines do:
+`requestHeadTimeoutMilliseconds` (default 30 s) closes a connection whose request head is still incomplete that long after its first byte;
+`requestTimeoutMilliseconds` (default 0, off) one whose whole request, body included, is not complete that long after its first byte;
+`responseTimeoutMilliseconds` (default 0, off) one that has not taken a queued response that long after it was queued. A connection is closed without an answer.
+The last two are off because a large upload or download on a slow link is legitimate; set them for the traffic you serve. Neither server limits connections
+per client address: on an open network run it behind a proxy that does, and that enforces a minimum data rate. `HttpsEventServer` takes the same options
+in its `base` options, for its HTTP/1.1 connections (HTTP/2 connections have their own idle and ping rules).
+
 The steady-state HTTP path keeps only readable interest registered. A response
 that fills the kernel send buffer enables writable interest exactly once, then
 removes it after the pending output drains. Ordinary complete writes therefore

@@ -12,6 +12,11 @@ import "abla/bytes"
 import "abla/unsafe/memory/raw"
 
 // Sets maximum connections, input header and body bytes, pending output bytes, requests per connection, idle timeout, minimum size for gzip, and shutdown drain timeout.
+// The idle timeout restarts on every byte received or written, so it does not end a peer that trickles bytes. The three deadlines after it do:
+// `requestHeadTimeoutMilliseconds` closes a connection whose request head is not complete that long after its first byte (default 30 s: a head is a few
+// hundred bytes), `requestTimeoutMilliseconds` one whose whole request (head and body) is not complete that long after its first byte, and
+// `responseTimeoutMilliseconds` one that has not taken a queued response that long after it was queued; the last two are 0 (off) by default, since a large upload or
+// download on a slow link is legitimate. A connection is closed without an answer. Run a server on an open network behind a proxy that limits connections per address.
 class HttpEventServerOptions(
     val maximumConnections: int,
     val maximumHeaderBytes: int,
@@ -20,8 +25,74 @@ class HttpEventServerOptions(
     val maximumRequestsPerConnection: int,
     val idleTimeoutMilliseconds: int,
     val gzipMinimumBytes: int,
-    val drainTimeoutMilliseconds: int
+    val drainTimeoutMilliseconds: int,
+    val requestHeadTimeoutMilliseconds: int = 30000,
+    val requestTimeoutMilliseconds: int = 0,
+    val responseTimeoutMilliseconds: int = 0
 )
+
+// The clocks of a server's connections for a request being received and a response being sent: when the request that is being received began
+// (0: none), which request that was and whether its head has been seen, and when the queued response began. One per server, indexed by slot;
+// `deadlineExpired` says whether a connection has run out of the time the options give it.
+class HttpEventDeadlines(
+    val requestStarted: array<int>,
+    val requestStamp: array<int>,
+    val headSeen: array<int>,
+    val outputStarted: array<int>
+)
+
+// Creates the clocks of a server with no connection slots.
+fun httpEventDeadlines(): HttpEventDeadlines = HttpEventDeadlines([], [], [], [])
+
+// Adds the clocks of a new connection slot.
+fun HttpEventDeadlines.deadlineGrow(): void {
+    this.requestStarted.append(0)
+    this.requestStamp.append(0)
+    this.headSeen.append(0)
+    this.outputStarted.append(0)
+    return
+}
+
+// Stops the clocks of a slot (its connection closed or a new one took it); stores integers only.
+fun HttpEventDeadlines.deadlineReset(slot: int): void {
+    this.requestStarted[slot] = 0
+    this.requestStamp[slot] = 0
+    this.headSeen[slot] = 0
+    this.outputStarted[slot] = 0
+    return
+}
+
+// Records that the head of the request being received on `slot` is complete, `requestsServed` requests having been answered before it.
+fun HttpEventDeadlines.deadlineHeadSeen(slot: int, requestsServed: int): void {
+    this.headSeen[slot] = requestsServed + 1
+    return
+}
+
+// Whether the connection of `slot` has used the time `options` give a request it is `receiving` (any byte of one is held) or a response it is
+// `sending` (queued output). `headKnown` says that the head of the request is complete by other means (a chunked request being assembled). The clocks
+// start on the first call that finds the request or the response, so how finely they measure is how often this is called.
+fun HttpEventDeadlines.deadlineExpired(
+    slot: int, now: int, options: HttpEventServerOptions, receiving: bool, headKnown: bool, requestsServed: int, sending: bool
+): bool {
+    var expired = false
+    if (!receiving) this.requestStarted[slot] = 0
+    else {
+        if (this.requestStarted[slot] == 0 || this.requestStamp[slot] != requestsServed + 1) {
+            this.requestStarted[slot] = now
+            this.requestStamp[slot] = requestsServed + 1
+        }
+        val elapsed = now - this.requestStarted[slot]
+        val head = headKnown || this.headSeen[slot] == requestsServed + 1
+        if (!head && options.requestHeadTimeoutMilliseconds > 0 && elapsed >= options.requestHeadTimeoutMilliseconds) expired = true
+        if (options.requestTimeoutMilliseconds > 0 && elapsed >= options.requestTimeoutMilliseconds) expired = true
+    }
+    if (!sending) this.outputStarted[slot] = 0
+    else {
+        if (this.outputStarted[slot] == 0) this.outputStarted[slot] = now
+        if (options.responseTimeoutMilliseconds > 0 && now - this.outputStarted[slot] >= options.responseTimeoutMilliseconds) expired = true
+    }
+    expired
+}
 
 // Holds the parsed request, HTTP version flag, and a frame length of zero for incomplete or -1 for invalid input.
 class HttpEventFrame(
@@ -70,7 +141,9 @@ resource class HttpEventServer(
     val needs: array<int> = [],
     val tails: array<ByteBuffer> = [],
     // A chunked request whose body is not complete, per connection (see `HttpEventChunkState`).
-    val chunkStates: array<HttpEventChunkState> = []
+    val chunkStates: array<HttpEventChunkState> = [],
+    // The clocks of the request being received and the response being sent, per connection (see HttpEventServerOptions).
+    val deadlines: HttpEventDeadlines = httpEventDeadlines()
 ) {
     // Closes the open client descriptors when the server is released.
     fun drop(): void {
@@ -211,6 +284,7 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.needs.append(0)
         this.tails.append(byteBuffer())
         this.chunkStates.append(httpEventChunkState())
+        this.deadlines.deadlineGrow()
     } else {
         this.descriptors[slot] = descriptor
         this.peerAddresses[slot] = peer
@@ -224,6 +298,7 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.needs[slot] = 0
         this.tails[slot] = byteBuffer()
         this.chunkStates[slot].reset()
+        this.deadlines.deadlineReset(slot)
     }
     while (this.descriptorSlots.size <= descriptor) {
         this.descriptorSlots.append(-1)
@@ -252,6 +327,7 @@ fun HttpEventServer.closeSlot(slot: int): void {
         // Nothing is allocated or stored here (closeSlot runs inside the region the no-escape server reads in): the held reads and the chunked-request
         // state of the closed connection stay until allocateSlot gives the slot fresh ones.
         this.needs[slot] = 0
+        this.deadlines.deadlineReset(slot)
     }
     return
 }
@@ -599,6 +675,7 @@ fun HttpEventServer.processNoEscapeInputInRegion(
     // A chunked request that is not complete yet starts to be assembled outside the region.
     if (length == 0 && frame.head != null) return -3
     this.needs[slot] = if (length == 0) frame.need else 0
+    if (length == 0 && (frame.need > 0 || frame.head != null)) this.deadlines.deadlineHeadSeen(slot, this.requestCounts[slot])
     if (length < 0) {
         this.outputs[slot] = memoryPromoteString(
             httpText("bad request", 400).render()
@@ -639,6 +716,7 @@ fun HttpEventServer.processNoEscapeChunked(slot: int): void {
         )
         val length = frame.length
         this.needs[slot] = if (length == 0) frame.need else 0
+        if (length == 0 && (frame.need > 0 || frame.head != null)) this.deadlines.deadlineHeadSeen(slot, this.requestCounts[slot])
         if (length == 0 && frame.trim > 0) {
             this.inputs[slot] = this.inputs[slot].slice(frame.trim, this.inputs[slot].size)
         }
@@ -713,6 +791,7 @@ fun HttpEventServer.processSlot(slot: int): void {
             this.inputs[slot] = this.inputs[slot].slice(frame.trim, this.inputs[slot].size)
         }
         this.needs[slot] = if (length == 0) frame.need else 0
+        if (length == 0 && (frame.need > 0 || frame.head != null)) this.deadlines.deadlineHeadSeen(slot, this.requestCounts[slot])
         if (length < 0) {
             this.outputs[slot] = httpText("bad request", 400).render()
             this.outputOffsets[slot] = 0
@@ -1019,6 +1098,17 @@ fun HttpEventServer.step(timeoutMilliseconds: int = 1000): int {
             }
             index = index + 1
         }
+    }
+    // The request, request head and response deadlines (see HttpEventServerOptions).
+    var slot = 0
+    while (slot < this.descriptors.size) {
+        if (this.descriptors[slot] >= 0 &&
+            this.deadlines.deadlineExpired(
+                slot, this.passMilliseconds, this.options,
+                this.inputs[slot].size > 0 || this.tails[slot].size() > 0 || this.chunkStates[slot].head != null,
+                this.chunkStates[slot].head != null, this.requestCounts[slot], this.outputs[slot].size > 0
+            )) this.closeSlot(slot)
+        slot = slot + 1
     }
     handled
 }
