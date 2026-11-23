@@ -11,6 +11,18 @@ cd "$root"
 out=build/wasm-names
 rm -rf "$out"
 mkdir -p "$out"
+mkdir "$out/tools"
+export WASM_NAMES_REAL_OPT
+WASM_NAMES_REAL_OPT=$(command -v wasm-opt)
+export WASM_NAMES_OPT_ARGUMENTS="$root/$out/wasm-opt.arguments"
+cat > "$out/tools/wasm-opt" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" >> "$WASM_NAMES_OPT_ARGUMENTS"
+exec "$WASM_NAMES_REAL_OPT" "$@"
+WRAPPER
+chmod +x "$out/tools/wasm-opt"
+export PATH="$root/$out/tools:$PATH"
 build() { # <mode> <output> [flag]
     cat > "$out/$1.build.ab" <<DRIVER
 import "abla/wasm/build"
@@ -21,6 +33,9 @@ DRIVER
         { cat "$out/$1.log" >&2; echo "wasm names: the $1 build failed" >&2; exit 1; }
 }
 build plain "$out/plain.wasm"
+grep -Fxq -- '-O3' "$WASM_NAMES_OPT_ARGUMENTS"
+grep -Fxq -- '--skip-pass=inlining-optimizing' "$WASM_NAMES_OPT_ARGUMENTS" ||
+    { echo 'wasm names: release Binaryen ran the optimizing inliner' >&2; exit 1; }
 build names "$out/names.wasm" --wasm-names
 node tests/cases/wasm-names/check.mjs "$out/plain.wasm" "$out/names.wasm"
 cp "$out/names.wasm" "$out/names-first.wasm"

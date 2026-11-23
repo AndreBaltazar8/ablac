@@ -191,10 +191,10 @@ clmul_read() { # object, architecture
 }
 
 # The key-handling functions of AES (the schedule, the hardware decryption keys, the hardware block loops), which are
-# functions of plain integers that stay calls. They are read whole with their calls followed: x86-64 only. The same
+# functions of plain integers that stay calls. They are read whole with their calls followed. The same
 # specs must be refused without following (the calls are what is covered), and each has a twin with a secret-indexed
 # store after the call, which has to be found for a secret address and not for a refused call.
-worker_read() { # object, architecture (default x86_64), how many of the reads must follow a call (default all)
+worker_read() { # object, architecture (default x86_64)
     local object=$1 arch=${2:-x86_64} specs=() leaks_follow=() spec
     while IFS= read -r spec; do specs+=("$spec"); done < "$cases/crypto-generated.follow"
     while IFS= read -r spec; do leaks_follow+=("$spec"); done < "$cases/crypto-generated.followleaks"
@@ -202,7 +202,7 @@ worker_read() { # object, architecture (default x86_64), how many of the reads m
         cat "$out/$arch-workers.log" >&2; echo "ct: a secret reached a branch or an address in a key-handling function" >&2; exit 1
     }
     # Every read really went into a callee: the ok line names how many functions it followed.
-    [[ $(grep -c '^ok.*following [1-9]' "$out/$arch-workers.log") == "${3:-${#specs[@]}}" ]] || {
+    [[ $(grep -c '^ok.*following [1-9]' "$out/$arch-workers.log") == "${#specs[@]}" ]] || {
         cat "$out/$arch-workers.log" >&2; echo "ct: a key-handling read followed no call" >&2; exit 1
     }
     if $check "$arch" "$object" "${specs[@]}" > "$out/$arch-workers-nofollow.log" 2>&1; then
@@ -301,10 +301,8 @@ kem_read() { # object, architecture (default x86_64)
     $check --follow-calls "$arch" "$object" "${specs[@]}" > "$out/$arch-kem.log" 2>&1 || {
         cat "$out/$arch-kem.log" >&2; echo "ct: a secret reached a branch or an address in SHA-3 or ML-KEM" >&2; exit 1
     }
-    # Wasm inlines most of the kernels into their wrappers (only the permutation and the NTT stay calls there), the other targets keep every call.
-    local want=${#specs[@]}
-    [[ $arch == wasm ]] && want=2
-    [[ $(grep -c '^ok.*following [1-9]' "$out/$arch-kem.log") == "$want" ]] || {
+    # The Wasm pipeline leaves these calls intact by skipping Binaryen's optimizing inliner.
+    [[ $(grep -c '^ok.*following [1-9]' "$out/$arch-kem.log") == "${#specs[@]}" ]] || {
         cat "$out/$arch-kem.log" >&2; echo "ct: a SHA-3 or ML-KEM read followed no call" >&2; exit 1
     }
     if $check "$arch" "$object" "${specs[@]}" > "$out/$arch-kem-nofollow.log" 2>&1; then
@@ -1043,10 +1041,10 @@ if part wasm; then
 node "$cases/run.mjs" "$out/ct.wasm"
 read_target wasm "$out/ct.wasm"
 wasm_follow_read
-# The bignum routines and the AES key functions with their calls followed (two of the seven key reads need no call
-# in this module: the hardware paths have no body to call on Wasm).
+# The hardware AES exports on Wasm now call their unsupported-instruction path
+# out of line. Its trap is guarded by the public block count.
 orchestration_read "$out/ct.wasm" wasm
-worker_read "$out/ct.wasm" wasm 5
+worker_read "$out/ct.wasm" wasm
 p256_read "$out/ct.wasm" wasm
 x25519_read "$out/ct.wasm" wasm
 ed25519_read "$out/ct.wasm" wasm
