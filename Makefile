@@ -442,6 +442,7 @@ test-serial: ablac
 	tools/test-runtime-checks.sh $(COMPILER)
 	tools/test-stack-guard.sh $(COMPILER)
 	tools/test-probe-stack-targets.sh $(COMPILER)
+	tools/test-native-twins.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)
 	tools/test-named-method-arguments.sh $(COMPILER)
 	tools/test-named-overloads.sh $(COMPILER)
