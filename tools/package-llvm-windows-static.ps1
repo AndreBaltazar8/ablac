@@ -14,6 +14,7 @@ $work = Join-Path $env:RUNNER_TEMP 'abla-llvm'
 $source = Join-Path $work 'src'
 $build = Join-Path $work 'build'
 $patch = Join-Path $work 'llvm-instcombine-fdiv-zero.patch'
+$optPatch = Join-Path $work 'llvm-windows-opt-utf8.patch'
 $pin = Get-Content (Join-Path $root 'nix/llvm-fork.nix') -Raw
 if ($pin -cnotmatch 'commit = "([0-9a-f]{40})";') {
     throw 'Could not read the LLVM fork commit from nix/llvm-fork.nix'
@@ -31,6 +32,7 @@ if (!(Test-Path $clang) -or !(Test-Path $linker)) {
 New-Item -ItemType Directory -Path $source | Out-Null
 # The Windows checkout may expand the patch to CRLF, while the fork tarball uses LF.
 git -C $root cat-file blob 'HEAD:nix/llvm-instcombine-fdiv-zero.patch' > $patch
+git -C $root cat-file blob 'HEAD:nix/llvm-windows-opt-utf8.patch' > $optPatch
 $sourceArchive = Join-Path $work 'source.tar.gz'
 $prefix = "llvm-project-$commit"
 Invoke-WebRequest "https://codeload.github.com/AndreBaltazar8/llvm-project/tar.gz/$commit" -OutFile $sourceArchive
@@ -42,8 +44,8 @@ Invoke-WebRequest "https://codeload.github.com/AndreBaltazar8/llvm-project/tar.g
 Remove-Item $sourceArchive
 Push-Location (Join-Path $source 'llvm')
 try {
-    git apply --check $patch
-    git apply $patch
+    git apply --check $patch $optPatch
+    git apply $patch $optPatch
 } finally {
     Pop-Location
 }
@@ -95,11 +97,11 @@ if (!$compileCommands -or $wrongCrt.Count) {
 Write-Host "Verified /MT in $($compileCommands.Count) C/C++ compile commands"
 
 # Build the default static libraries and just the command-line tools we check/ship.
-cmake --build $build --parallel 4 --target all opt llc llvm-readobj
+cmake --build $build --parallel 4 --target all opt llc llvm-objcopy llvm-readobj
 cmake --install $build --prefix $bundle
 $bin = Join-Path $bundle 'bin'
 New-Item -ItemType Directory -Path $bin -Force | Out-Null
-foreach ($tool in @('opt', 'llc', 'llvm-readobj')) {
+foreach ($tool in @('opt', 'llc', 'llvm-objcopy', 'llvm-readobj')) {
     Copy-Item (Join-Path $build "bin/$tool.exe") $bin
 }
 
@@ -116,7 +118,14 @@ foreach ($name in @(
 
 $opt = Join-Path $bin 'opt.exe'
 $llc = Join-Path $bin 'llc.exe'
+$objcopy = Join-Path $bin 'llvm-objcopy.exe'
 $readobj = Join-Path $bin 'llvm-readobj.exe'
+$optDriver = (& $readobj --symbols (Join-Path $bundle 'lib/LLVMOptDriver.lib')) -join "`n"
+if ($optDriver -cnotmatch '(?m)^\s+Name: optMainUtf8\s*$') {
+    throw 'LLVMOptDriver.lib is missing the optMainUtf8 entry'
+}
+Write-Host 'LLVMOptDriver: optMainUtf8 is available to the native compiler'
+
 $fixture = Join-Path $root 'tests/cases/llvm-miscompiles/fdiv-zero-by-zero-times-value.ll'
 $optimized = Join-Path $work 'fdiv-opt.ll'
 $coff = Join-Path $work 'fdiv.obj'
@@ -155,7 +164,7 @@ if ($shimInfo -notmatch 'IMAGE_FILE_MACHINE_AMD64' -or $shimInfo -notmatch 'DEFA
 }
 Write-Host 'shim: x64 COFF, static CRT'
 
-foreach ($exe in @($probe, $opt, $llc, $readobj)) {
+foreach ($exe in @($probe, $opt, $llc, $objcopy, $readobj)) {
     $imports = (& $readobj --file-headers --coff-imports $exe) -join "`n"
     if ($imports -notmatch 'IMAGE_FILE_MACHINE_AMD64' -or $imports -notmatch '(?m)^\s+Name: .+\.dll\s*$' -or
         $imports -match '(?mi)^\s+Name: (?:api-ms-win-crt-[^\s]+|ucrtbased?\.dll|msvc[pr][^\s]*\.dll|vcruntime[^\s]*\.dll)\s*$') {
@@ -166,11 +175,13 @@ foreach ($exe in @($probe, $opt, $llc, $readobj)) {
 Write-Host 'CRT: no dynamic MSVC or UCRT imports in the probe or LLVM tools'
 
 $patchHash = (Get-FileHash -Algorithm SHA256 $patch).Hash.ToLowerInvariant()
+$optPatchHash = (Get-FileHash -Algorithm SHA256 $optPatch).Hash.ToLowerInvariant()
 @(
     'llvm-project=AndreBaltazar8/llvm-project'
     "commit=$commit"
     "abla-commit=$env:GITHUB_SHA"
     "fdiv-patch-sha256=$patchHash"
+    "opt-utf8-patch-sha256=$optPatchHash"
     'target=x86_64-pc-windows-msvc'
     'crt=MT'
     "msvc-toolset=$env:VCToolsVersion"
