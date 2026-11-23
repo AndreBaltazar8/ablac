@@ -9,7 +9,12 @@ class HttpChunkDecode(
     val body: string,
     val consumed: int,
     val complete: bool,
-    val error: string
+    val error: string,
+    // For incomplete input: the offset of the first chunk element (a size line with its data, or the last chunk and its trailers) that
+    // is not complete. `body` holds everything before it, so a caller may drop those bytes and decode the rest when more arrives.
+    val resume: int = 0,
+    // For input that ends inside a chunk's data: the input size at which that chunk is complete (zero otherwise).
+    val need: int = 0
 )
 
 /// Stores the data, optional event name and ID, and retry interval of an SSE message.
@@ -110,9 +115,15 @@ fun httpDecodeChunked(
     var offset = 0
     var complete = false
     var error = ""
+    var resume = -1
+    var need = 0
     while (!complete && error == "" && offset < input.size) {
+        val elementStart = offset
         val lineEnd = httpLineEnd(input, offset)
-        if (lineEnd >= input.size) offset = input.size
+        if (lineEnd >= input.size) {
+            offset = input.size
+            resume = elementStart
+        }
         else {
             var extension = offset
             while (extension < lineEnd && input[extension] != 59) {
@@ -141,10 +152,17 @@ fun httpDecodeChunked(
                 if (trailerEnd >= 0) {
                     offset = trailerEnd
                     complete = true
-                } else offset = input.size
+                } else {
+                    offset = input.size
+                    resume = elementStart
+                }
             } else {
                 val body = lineEnd + 2
-                if (body + length + 2 > input.size) offset = input.size
+                if (body + length + 2 > input.size) {
+                    offset = input.size
+                    resume = elementStart
+                    need = body + length + 2
+                }
                 else if (input[body + length] != 13 ||
                     input[body + length + 1] != 10) {
                     error = "chunk is missing terminator"
@@ -155,7 +173,7 @@ fun httpDecodeChunked(
             }
         }
     }
-    HttpChunkDecode(output, offset, complete, error)
+    HttpChunkDecode(output, offset, complete, error, if (resume >= 0) resume else offset, need)
 }
 
 /// Renders an HTTP/1.1 response with chunked framing, the given headers and a terminating chunk.

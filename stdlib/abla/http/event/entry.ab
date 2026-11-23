@@ -28,7 +28,15 @@ class HttpEventFrame(
     val length: int,
     val request: HttpRequest?,
     // An HTTP/1.0 request: its connection closes unless it asks for keep-alive.
-    val http10: bool = false
+    val http10: bool = false,
+    // For incomplete input whose body length is known: the input size at which the request can first be complete
+    // (the head and the whole body). Zero when unknown. The server then holds small reads without re-framing them.
+    val need: int = 0,
+    // A chunked request whose body is not complete: its head, the body decoded so far, and how many bytes of the input are
+    // consumed into those (the server drops them and continues with `HttpEventServer.frameSlot`). Length is zero.
+    val head: HttpRequest? = null,
+    val partial: string = "",
+    val trim: int = 0
 )
 
 // Owns the listener, kernel poller, and per-connection state for an event-driven HTTP server.
@@ -56,7 +64,15 @@ resource class HttpEventServer(
     // The clock when this pass of step began: a request needn't read it again.
     var passMilliseconds: int,
     // One socket lookup per accepted connection, shared by persistent requests.
-    val peerAddresses: array<SocketPeerAddress?> = []
+    val peerAddresses: array<SocketPeerAddress?> = [],
+    // Reads that cannot complete the request yet wait here, unjoined, until `needs[slot]` bytes are held: joining and
+    // re-framing the whole buffer on every read made a body sent a byte at a time cost quadratic CPU (#1139 area 4).
+    val needs: array<int> = [],
+    val tails: array<ByteBuffer> = [],
+    // A chunked request whose body is not complete (see `frameSlot`): its head, whether it is HTTP/1.0, and the body decoded so far.
+    val chunkHeads: array<HttpRequest?> = [],
+    val chunkHttp10: array<bool> = [],
+    val chunkBodies: array<ByteBuffer> = []
 ) {
     // Closes the open client descriptors when the server is released.
     fun drop(): void {
@@ -194,6 +210,11 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.requestCounts.append(0)
         this.closing.append(false)
         this.lastActivityMilliseconds.append(linuxMonotonicMilliseconds())
+        this.needs.append(0)
+        this.tails.append(byteBuffer())
+        this.chunkHeads.append(null)
+        this.chunkHttp10.append(false)
+        this.chunkBodies.append(byteBuffer())
     } else {
         this.descriptors[slot] = descriptor
         this.peerAddresses[slot] = peer
@@ -204,6 +225,11 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.requestCounts[slot] = 0
         this.closing[slot] = false
         this.lastActivityMilliseconds[slot] = linuxMonotonicMilliseconds()
+        this.needs[slot] = 0
+        this.tails[slot] = byteBuffer()
+        this.chunkHeads[slot] = null
+        this.chunkHttp10[slot] = false
+        this.chunkBodies[slot] = byteBuffer()
     }
     while (this.descriptorSlots.size <= descriptor) {
         this.descriptorSlots.append(-1)
@@ -229,6 +255,11 @@ fun HttpEventServer.closeSlot(slot: int): void {
         this.writeWatching[slot] = false
         this.closing[slot] = false
         this.lastActivityMilliseconds[slot] = 0
+        // Nothing is allocated here (closeSlot runs inside the region the no-escape server reads in): the held reads and the decoded
+        // chunks of the closed connection stay until allocateSlot gives the slot fresh ones.
+        this.needs[slot] = 0
+        this.chunkHeads[slot] = null
+        this.chunkHttp10[slot] = false
     }
     return
 }
@@ -299,6 +330,10 @@ fun httpEventFrame(
     var length = 0
     var framedRequest: HttpRequest? = null
     var http10 = false
+    var need = 0
+    var head: HttpRequest? = null
+    var partial = ""
+    var trim = 0
     if ((headerEnd < 0 && input.size > maximumHeader) ||
         headerEnd > maximumHeader) length = -1
     if (headerEnd >= 0 && headerEnd <= maximumHeader) {
@@ -322,6 +357,14 @@ fun httpEventFrame(
                     request.headers, decoded.body,
                     request.parameterNames, request.parameterValues, peer
                 )
+            } else {
+                // Incomplete: hand back the head and what was decoded before the first incomplete chunk element, so that
+                // the server keeps them and decodes only what arrives next (a chunked body used to be decoded again whole
+                // on every read).
+                head = request
+                partial = decoded.body
+                trim = headerEnd + decoded.resume
+                if (decoded.need > 0) need = headerEnd + decoded.need
             }
         } else {
             val bodyLength = framing
@@ -335,10 +378,10 @@ fun httpEventFrame(
                     input.slice(headerEnd, length),
                     request.parameterNames, request.parameterValues, peer
                 )
-            }
+            } else need = headerEnd + bodyLength
         }
     }
-    HttpEventFrame(length, framedRequest, http10)
+    HttpEventFrame(length, framedRequest, http10, need, head, partial, trim)
 }
 
 // Renders a response with request-aware body suppression and optional gzip compression.
@@ -445,18 +488,60 @@ trusted fun httpEventResponseNative(
 // lets readReady place the socket buffer, parser graph, handler result, and
 // response framing in one allocation region. Only an incomplete input or a
 // backpressured output is promoted across that boundary.
+// Frames the input of a connection slot. A chunked request whose body is not complete is kept in pieces: its head, the body decoded
+// so far and the position in the chunk stream stay in the slot, and `trim` bytes of the input (everything before the first incomplete
+// chunk element) are the caller's to drop. The next call then decodes only what follows (a body of many chunks sent a piece at a
+// time used to be decoded again from its start on every read).
+fun HttpEventServer.frameSlot(slot: int, input: string): HttpEventFrame {
+    val head = this.chunkHeads[slot]
+    if (head == null) {
+        val frame = httpEventFrame(
+            input, this.options.maximumHeaderBytes,
+            this.options.maximumBodyBytes, this.peerAddresses[slot]
+        )
+        val partialHead = frame.head
+        if (frame.length != 0 || partialHead == null) return frame
+        val body = byteBuffer()
+        body.appendText(frame.partial)
+        this.chunkHeads[slot] = partialHead
+        this.chunkHttp10[slot] = frame.http10
+        this.chunkBodies[slot] = body
+        return HttpEventFrame(0, null, frame.http10, if (frame.need > 0) frame.need - frame.trim else 0, null, "", frame.trim)
+    }
+    val http10 = this.chunkHttp10[slot]
+    val decoded = httpDecodeChunked(input, this.options.maximumBodyBytes - this.chunkBodies[slot].size())
+    // One chunk element (a size line with its extensions, or the trailers) may not be longer than a request head.
+    if (decoded.error != "" || (!decoded.complete && input.size - decoded.resume > this.options.maximumHeaderBytes)) {
+        this.chunkHeads[slot] = null
+        this.chunkBodies[slot] = byteBuffer()
+        return HttpEventFrame(-1, null, http10)
+    }
+    if (decoded.complete) {
+        this.chunkBodies[slot].appendText(decoded.body)
+        val request = HttpRequest(
+            head.method, head.path, head.query, head.headers, this.chunkBodies[slot].toText(),
+            head.parameterNames, head.parameterValues, this.peerAddresses[slot]
+        )
+        this.chunkHeads[slot] = null
+        this.chunkBodies[slot] = byteBuffer()
+        return HttpEventFrame(decoded.consumed, request, http10)
+    }
+    this.chunkBodies[slot].appendText(decoded.body)
+    return HttpEventFrame(0, null, http10, if (decoded.need > 0) decoded.need - decoded.resume else 0, null, "", decoded.resume)
+}
+
 fun HttpEventServer.processNoEscapeInputInRegion(
     slot: int,
     input: string
 ): int {
     var readyToWrite = false
+    // The stateless framing: this runs in a region, and what the chunked-request state keeps (a parsed head, a buffer that grows) must not
+    // be allocated in one. A chunked body is decoded again whole on each read here, as before.
     val frame = httpEventFrame(
-        input,
-        this.options.maximumHeaderBytes,
-        this.options.maximumBodyBytes,
-        this.peerAddresses[slot]
+        input, this.options.maximumHeaderBytes, this.options.maximumBodyBytes, this.peerAddresses[slot]
     )
     val length = frame.length
+    this.needs[slot] = if (length == 0) frame.need else 0
     if (length < 0) {
         this.outputs[slot] = memoryPromoteString(
             httpText("bad request", 400).render()
@@ -560,12 +645,13 @@ fun HttpEventServer.processSlot(slot: int): void {
     var processing = slot >= 0 && slot < this.descriptors.size &&
         this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
     while (processing) {
-        val frame = httpEventFrame(
-            this.inputs[slot],
-            this.options.maximumHeaderBytes,
-            this.options.maximumBodyBytes
-        )
+        val frame = this.frameSlot(slot, this.inputs[slot])
         val length = frame.length
+        if (length == 0 && frame.trim > 0) {
+            // A chunked request still incomplete: what is before its first incomplete chunk element is in the slot's state.
+            this.inputs[slot] = this.inputs[slot].slice(frame.trim, this.inputs[slot].size)
+        }
+        this.needs[slot] = if (length == 0) frame.need else 0
         if (length < 0) {
             this.outputs[slot] = httpText("bad request", 400).render()
             this.outputOffsets[slot] = 0
@@ -650,6 +736,10 @@ fun HttpEventServer.readReady(slot: int): void {
     while (reading) {
         if (this.useNoEscapeHandler) {
             var clearInput = false
+            // A read held back (see `needs`) and whether the held ones were joined: both are stored after the
+            // region, as nothing allocated in it may be kept by the server.
+            var heldPiece = ""
+            var tailsTaken = false
             reading = region {
                 var pending = this.inputs[slot]
                 var accumulating = true
@@ -672,8 +762,17 @@ fun HttpEventServer.readReady(slot: int): void {
                     if (incoming.size > 0) {
                         this.lastActivityMilliseconds[slot] =
                             this.passMilliseconds
+                        val held = if (tailsTaken) 0 else this.tails[slot].size()
+                        if (!tailsTaken && this.needs[slot] > 0 &&
+                            pending.size + held + incoming.size < this.needs[slot]) {
+                            heldPiece = memoryPromoteString(incoming)
+                        } else {
+                        if (held > 0) {
+                            pending = "$pending${this.tails[slot].toText()}"
+                            tailsTaken = true
+                        }
                         val input = "$pending$incoming"
-                        if (input.size >
+                        if (this.chunkHeads[slot] == null && input.size >
                             this.options.maximumHeaderBytes +
                             this.options.maximumBodyBytes &&
                             httpEventRequestLength(input,
@@ -702,6 +801,7 @@ fun HttpEventServer.readReady(slot: int): void {
                                 this.descriptors[slot] >= 0 &&
                                 this.outputs[slot].size == 0
                         }
+                        }
                         continueReading = incoming.size == receiveMaximum &&
                             this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
                     }
@@ -712,6 +812,8 @@ fun HttpEventServer.readReady(slot: int): void {
                 continueReading
             }
             if (clearInput) this.inputs[slot] = ""
+            if (tailsTaken && this.descriptors[slot] >= 0) this.tails[slot] = byteBuffer()
+            if (heldPiece.size > 0 && this.descriptors[slot] >= 0) this.tails[slot].appendText(heldPiece)
         } else {
             val connection = TcpConnection(this.descriptors[slot])
             // Read a typical API body and its headers in one receive
@@ -721,10 +823,24 @@ fun HttpEventServer.readReady(slot: int): void {
             if (incoming.size > 0) {
                 this.lastActivityMilliseconds[slot] =
                     this.passMilliseconds
+                val held = this.tails[slot].size()
+                if (this.needs[slot] > 0 &&
+                    this.inputs[slot].size + held + incoming.size < this.needs[slot]) {
+                    // The request cannot be complete yet: keep the piece, parse nothing (a body sent a byte at a time
+                    // used to be joined and re-framed whole on every read).
+                    this.tails[slot].appendText(memoryPromoteString(incoming))
+                    reading = incoming.size == 32768 &&
+                        this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
+                } else {
+                var joined = this.inputs[slot]
+                if (held > 0) {
+                    joined = "$joined${this.tails[slot].toText()}"
+                    this.tails[slot] = byteBuffer()
+                }
                 this.inputs[slot] = memoryPromoteString(
-                    "${this.inputs[slot]}$incoming"
+                    "$joined$incoming"
                 )
-                if (this.inputs[slot].size >
+                if (this.chunkHeads[slot] == null && this.inputs[slot].size >
                     this.options.maximumHeaderBytes +
                     this.options.maximumBodyBytes &&
                     httpEventRequestLength(this.inputs[slot],
@@ -734,6 +850,7 @@ fun HttpEventServer.readReady(slot: int): void {
                 } else this.processSlot(slot)
                 reading = incoming.size == 32768 &&
                     this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
+                }
             } else reading = false
         }
     }
