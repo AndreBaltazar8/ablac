@@ -27,14 +27,17 @@ checks the rules below on every workflow (`--controls` shows each rule refusing 
 
 ## Settings that are not in the repository
 
-These need the repository owner, and the rules above do not replace them:
+These need the repository owner. They were applied on 2026-11-23 (decision #114), and the rules above do not replace them:
 
 1. Settings → Actions → General: *Workflow permissions* = read repository contents; *Require approval for all outside
-   collaborators* for fork pull requests.
-2. A GitHub Environment `release` with a required reviewer and the `master` branch (and `v*` tags) as the only deployment
-   targets, holding `ABLA_RELEASE_SIGNING_KEY` instead of a repository secret, and `environment: release` on the publish
-   job. Without it, anyone who can push a branch can dispatch a workflow on it that reads the secret.
-3. A tag ruleset on `v*` (no deletion, no moving) and branch protection on `master`.
+   collaborators* for fork pull requests. **Done.**
+2. A GitHub Environment `release` with a required reviewer (André) and `master` as the only deployment branch, holding
+   `ABLA_RELEASE_SIGNING_KEY`, and `environment: release` on the publish job (`release.yml`; `test-workflow-security.sh`
+   fails a workflow whose job reads the key without it). Without it, anyone who can push a branch can dispatch a
+   workflow on it that reads the secret. **Done**; a repository-level secret of the same name is deleted once the
+   workflow with `environment: release` is on master.
+3. A ruleset on `v*` tags (no deletion, no moving: "release tags") and one on `master` (no deletion, no force-push:
+   "master"). **Done.**
 
 ## Findings of the first review (2026-11-23)
 

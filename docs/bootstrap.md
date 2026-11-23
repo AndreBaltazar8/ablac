@@ -122,7 +122,7 @@ reintroducing a second compiler implementation.
 From the release named in `tools/first-signed-release`, every release carries `SHA256SUMS` (the sha256 of every
 asset, including the bill of materials) and `SHA256SUMS.sig`, an `ssh-keygen -Y sign` signature (namespace
 `abla-release`) by the project key whose public half is `release-signing.pub` at the repository root. The private key
-is the Actions secret `ABLA_RELEASE_SIGNING_KEY` (its backup is git-crypt encrypted in `secrets/`); the publish job of
+is the secret `ABLA_RELEASE_SIGNING_KEY` of the GitHub environment `release` (master-only, André reviews each run; its backup is git-crypt encrypted in `secrets/`); the publish job of
 `.github/workflows/release.yml` signs with `tools/sign-release.sh`, which verifies the result against the committed
 public key before anything is published. The release also ships `ablac-<version>.spdx.json`, an SPDX 2.3 bill of
 materials (`tools/release-sbom.sh`: the assets with their sha256, the LLVM fork commit and patch, the prebuilt LLVM

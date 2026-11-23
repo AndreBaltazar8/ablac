@@ -54,6 +54,16 @@ if [[ ${1:-} == --controls ]]; then
     control injection 'untrusted expression' '7=echo ${{ inputs.x }}'
     control event-injection 'untrusted expression' '7=echo ${{ github.event.pull_request.title }}'
     control self-hosted 'self-hosted' 8=self-hosted
+    # The release environment rule: the signing key's job names it.
+    release_workflow() { # environment-line
+        printf 'name: r\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  publish:\n    runs-on: ubuntu-24.04\n%s    steps:\n      - uses: actions/checkout@%s\n        with:\n          persist-credentials: false\n      - env:\n          ABLA_RELEASE_SIGNING_KEY: ${{ secrets.ABLA_RELEASE_SIGNING_KEY }}\n        run: test -n "$ABLA_RELEASE_SIGNING_KEY"\n' "$1" "$pin"
+    }
+    rm -rf "$work/w"; mkdir "$work/w"; release_workflow '    environment: release
+' > "$work/w/release.yml"
+    "$0" "$work/w" > "$work/out" 2>&1 || { cat "$work/out" >&2; echo "workflow security: release.yml with the environment is refused" >&2; exit 1; }
+    rm -rf "$work/w"; mkdir "$work/w"; release_workflow '' > "$work/w/release.yml"
+    if "$0" "$work/w" > "$work/out" 2>&1; then echo "workflow security control 'release environment': accepted" >&2; exit 1; fi
+    grep -q 'without environment: release' "$work/out" || { cat "$work/out" >&2; echo "workflow security control 'release environment': wrong refusal" >&2; exit 1; }
     echo 'workflow security controls: every rule refuses a workflow that breaks it'
     exit 0
 fi
@@ -108,6 +118,16 @@ for file in "${files[@]}"; do
         if [[ $name != release.yml || $uses != 'secrets.ABLA_RELEASE_SIGNING_KEY ' ]]; then
             fail "$name: secrets used: $uses (only release.yml may use secrets.ABLA_RELEASE_SIGNING_KEY)"
         fi
+    fi
+    # 6b. the signing key is only reachable through the `release` environment (master-only, with a required reviewer)
+    if [[ $name == release.yml ]]; then
+        unguarded=$(awk '
+            /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job = $1; next }
+            /^    environment:[[:space:]]*release[[:space:]]*$/ { guarded[job] = 1 }
+            /secrets\.ABLA_RELEASE_SIGNING_KEY/ { used[job] = 1 }
+            END { for (j in used) if (!(j in guarded)) printf "%s ", j }
+        ' "$file")
+        [[ -z $unguarded ]] || fail "$name: job(s) $unguarded read secrets.ABLA_RELEASE_SIGNING_KEY without environment: release"
     fi
     # 7. untrusted expressions inside run scripts
     injected=$(awk '
