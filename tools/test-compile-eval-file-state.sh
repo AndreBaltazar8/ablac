@@ -33,6 +33,12 @@ for mode in interp jit auto; do
     status=0
     "$out/lookalike" || status=$?
     [[ $status == 42 ]]
+    ABLA_COMPILE_EVAL=$mode "$compiler" build "$fixture/map-native.ab" --fast --no-cache \
+        -o "$out/map-native" > "$out/map-$mode.log" 2>&1
+    cp "$out/map-native" "$out/map-$mode.bin"
+    status=0
+    "$out/map-native" || status=$?
+    [[ $status == 42 ]]
 done
 for target in native wasm; do
     grep -Eq '^note\[ct-jit\]: native at .*compile-eval-file-state/main[.]ab:' "$out/$target-jit.log"
@@ -41,8 +47,11 @@ done
 for mode in jit auto; do
     cmp "$out/native-interp.bin" "$out/native-$mode.bin"
     cmp "$out/main-interp.wasm" "$out/main-$mode.wasm"
+    cmp "$out/map-interp.bin" "$out/map-$mode.bin"
     grep -q 'ordinary mutable global RECEIPTS' "$out/lookalike-$mode.log"
 done
+marker=$(( $(grep -boa 'val RESULT = #' "$fixture/map-native.ab" | cut -d: -f1) + 13 ))
+grep -Eq "^note\[ct-jit\]: native at .*map-native[.]ab:$marker$" "$out/map-jit.log"
 node - "$out/main-jit.wasm" <<'JS'
 const bytes = require("node:fs").readFileSync(process.argv[2]);
 const result = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports.run();
