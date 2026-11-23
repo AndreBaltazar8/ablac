@@ -882,43 +882,49 @@ fun bootstrapLlvmBackendOwnedBridge(symbol: string): bool {
     owned
 }
 
-/** The set for a pruned build: the symbols of the instructions of the functions in
- *  `reachable`, and the backend's own. */
-fun bootstrapLlvmBridgeSymbolsGatherReachable(
-    program: BootstrapIrProgram,
-    reachable: array<bool>
-): void {
-    bootstrapLlvmBridgeSymbolsReset()
-    bootstrapLlvmPruneFieldFamily = false
-    bootstrapLlvmPruneConcurrencyFamily = false
-    var index = 0
-    while (index < program.functions.size) {
-        if (index < reachable.size && reachable[index]) {
-            for (instruction in program.functions[index].instructions) {
-                bootstrapLlvmBridgeSymbolAdd(bootstrapLlvmRuntimeBridgeInstructionSymbol(instruction))
-                val opcode = instruction.opcode
-                if (bootstrapLlvmTextStartsWith(opcode,
-                    "field.") || bootstrapLlvmTextStartsWith(opcode, "object.") ||
-                    bootstrapLlvmTextStartsWith(opcode, "array.")) {
-                    bootstrapLlvmPruneFieldFamily = true
-                }
-                if (bootstrapLlvmTextStartsWith(opcode,
-                    "generator.") || bootstrapLlvmTextStartsWith(opcode, "task.") ||
-                    bootstrapLlvmTextStartsWith(opcode, "thread.") || opcode == "await") {
-                    bootstrapLlvmPruneConcurrencyFamily = true
-                }
-                // A call to an extern the standard library declares by a bridge's name (the text,
-                // JSON, byte and encoding natives).
-                if (bootstrapLlvmTextStartsWith(opcode, "extern.")) {
-                    bootstrapLlvmBridgeSymbolAdd(instruction.text)
-                    for (name in instruction.texts) bootstrapLlvmBridgeSymbolAdd(name)
-                }
-            }
-        }
-        index = index + 1
+// Record the bridges used by a reached instruction. Both the symbol set and
+// the family flags are monotonic as the reachability worklist grows.
+fun bootstrapLlvmBridgeSymbolsGatherInstruction(instruction: BootstrapInstruction): void {
+    bootstrapLlvmBridgeSymbolAdd(bootstrapLlvmRuntimeBridgeInstructionSymbol(instruction))
+    val opcode = instruction.opcode
+    if (bootstrapLlvmTextStartsWith(opcode,
+        "field.") || bootstrapLlvmTextStartsWith(opcode, "object.") ||
+        bootstrapLlvmTextStartsWith(opcode, "array.")) {
+        bootstrapLlvmPruneFieldFamily = true
     }
-    for (symbol in bootstrapLlvmBackendBridgeSymbols()) bootstrapLlvmBridgeSymbolAdd(symbol)
-    bootstrapLlvmBridgeSymbols.ready = true
+    if (bootstrapLlvmTextStartsWith(opcode,
+        "generator.") || bootstrapLlvmTextStartsWith(opcode, "task.") ||
+        bootstrapLlvmTextStartsWith(opcode, "thread.") || opcode == "await") {
+        bootstrapLlvmPruneConcurrencyFamily = true
+    }
+    // A call to an extern the standard library declares by a bridge's name (the text,
+    // JSON, byte and encoding natives).
+    if (bootstrapLlvmTextStartsWith(opcode, "extern.")) {
+        bootstrapLlvmBridgeSymbolAdd(instruction.text)
+        for (name in instruction.texts) bootstrapLlvmBridgeSymbolAdd(name)
+    }
+    return
+}
+
+// The current bridge demand adds edges to the runtime's Abla implementations.
+// Queue only new functions. Their bodies may in turn demand more bridges.
+fun bootstrapLlvmAppendBridgeRoots(
+    program: BootstrapIrProgram,
+    var reachable: array<bool>,
+    var pending: array<int>
+): void {
+    for (index in 0 until program.functions.size) {
+        if (reachable[index]) continue
+        val symbol = bootstrapLlvmSelfHostedRuntimeSymbol(program.functions[index].name)
+        if (symbol != "" && (
+            bootstrapLlvmBackendOwnedBridge(symbol) ||
+            bootstrapLlvmBridgeSymbols.slots[bootstrapLlvmBridgeSymbolSlot(symbol)] >= 0 ||
+            (symbol == "abla_runtime_thread_entry" &&
+             bootstrapLlvmBridgeSymbols.slots[bootstrapLlvmBridgeSymbolSlot("abla_thread_create")] >= 0))) {
+            reachable[index] = true
+            pending.append(index)
+        }
+    }
     return
 }
 
