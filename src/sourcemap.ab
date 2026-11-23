@@ -894,3 +894,67 @@ fun bootstrapSourceMapApplyCalls(
     }
     return
 }
+
+// `build --wasm-names`: a release module's name section keeps the code as the link left it (renaming the functions in LLVM would reorder the code and its
+// types), so its hashed function names (`abla_fn_...`) are replaced here, in the finished module, by the readable ones the backend recorded
+// (bootstrapLlvmBacktraceNames, by symbol). Every other byte is copied as it is; "" when `module` is no WebAssembly module.
+fun bootstrapWasmReadableNames(module: string, readable: Map<string, string>): string {
+    var valid = module.size >= 8 && module[0] == 0 && module[1] == 97 && module[2] == 115 && module[3] == 109
+    var output = byteBuffer()
+    if (valid) output.appendText(module.slice(0, 8))
+    var cursor = 8
+    while (valid && cursor < module.size) {
+        val id = module[cursor]
+        val size = bootstrapSourceMapReadLeb(module, cursor + 1)
+        val payloadEnd = size.end + size.value
+        if (payloadEnd > module.size) {
+            valid = false
+        } else if (id == 0) {
+            val nameLength = bootstrapSourceMapReadLeb(module, size.end)
+            val name = module.slice(nameLength.end, nameLength.end + nameLength.value)
+            if (name == "name") {
+                var kept = byteBuffer()
+                bootstrapSourceMapAppendLeb(kept, 4)
+                kept.appendText("name")
+                var subsection = nameLength.end + nameLength.value
+                while (subsection < payloadEnd) {
+                    val subsectionSize = bootstrapSourceMapReadLeb(module, subsection + 1)
+                    val subsectionEnd = subsectionSize.end + subsectionSize.value
+                    if (module[subsection] == 1) {
+                        // The function names: a count, then each function's index and name.
+                        var names = byteBuffer()
+                        val count = bootstrapSourceMapReadLeb(module, subsectionSize.end)
+                        bootstrapSourceMapAppendLeb(names, count.value)
+                        var entry = count.end
+                        for (item in 0 until count.value) {
+                            if (entry >= subsectionEnd) break
+                            val index = bootstrapSourceMapReadLeb(module, entry)
+                            val length = bootstrapSourceMapReadLeb(module, index.end)
+                            val symbol = module.slice(length.end, length.end + length.value)
+                            val shown = readable.get(symbol) ?? symbol
+                            bootstrapSourceMapAppendLeb(names, index.value)
+                            bootstrapSourceMapAppendLeb(names, shown.size)
+                            names.appendText(shown)
+                            entry = length.end + length.value
+                        }
+                        kept.appendByteValue(1)
+                        bootstrapSourceMapAppendLeb(kept, names.size())
+                        kept.appendBuffer(names)
+                    } else {
+                        kept.appendText(module.slice(subsection, subsectionEnd))
+                    }
+                    subsection = subsectionEnd
+                }
+                output.appendByteValue(0)
+                bootstrapSourceMapAppendLeb(output, kept.size())
+                output.appendBuffer(kept)
+            } else {
+                output.appendText(module.slice(cursor, payloadEnd))
+            }
+        } else {
+            output.appendText(module.slice(cursor, payloadEnd))
+        }
+        cursor = payloadEnd
+    }
+    if (valid) output.toText() else ""
+}

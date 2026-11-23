@@ -225,6 +225,13 @@ RuntimeError: unreachable
     at crash.wasm.crash.crash (wasm://wasm/crash.wasm-948bddf2:wasm-function[8]:0x1c1e)
 ```
 
+`--backtrace` also changes how a module dies. For the names alone, `--wasm-names`
+(or `ABLA_WASM_NAMES=1`, for a build a build program starts) keeps the name
+section and changes nothing else: every other section, the code among them, is
+the bytes of the release build, so a profile of the module (a browser's
+profiler, `node --cpu-prof`) shows its functions by name. Without it a release
+module has no name section.
+
 ### Windows
 
 A hosted Windows program (`--target x86_64-windows-hosted`) reports how it

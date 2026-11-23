@@ -579,6 +579,7 @@ test-serial: ablac
 	tools/test-wasm-devtools.sh $(COMPILER)
 	tools/test-symbolize.sh $(COMPILER)
 	tools/test-wasm-backtrace.sh $(COMPILER)
+	tools/test-wasm-names.sh $(COMPILER)
 	tools/test-android-extension.sh $(COMPILER)
 	tools/test-android-link.sh $(COMPILER)
 	tools/test-android-run.sh $(COMPILER)
