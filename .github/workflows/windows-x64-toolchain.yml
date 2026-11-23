@@ -1,0 +1,160 @@
+name: Windows x64 toolchain
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+      ci:
+        description: Use the shorter smoke-test job timeouts
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  windows-object:
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.ci && 25 || 60 }}
+    env:
+      ABLA_NATIVE_JOBS: '4'
+      ABLA_CODEGEN_JOBS: '4'
+      ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1200'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - name: Build the compiler, its Windows object and the PE reader
+        run: |
+          nix-shell shell.nix --run '
+            set -euo pipefail
+            make ablac
+            tools/windows/cross-compiler-object.sh build/ablac src/orc_windows_main.ab build/windows-compiler-coff
+            build/ablac build tools/pe-info/main.ab -o build/windows-compiler-coff/pe-info --fast --no-cache
+            build/ablac --version | sed "s/^ablac //" > build/windows-compiler-coff/version.txt
+            git log -1 --format=%ct > build/windows-compiler-coff/source-date-epoch.txt
+          '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-compiler-coff
+          path: |
+            build/windows-compiler-coff/ablac.exe.o
+            build/windows-compiler-coff/ablac.exe.imports/
+            build/windows-compiler-coff/pe-info
+            build/windows-compiler-coff/version.txt
+            build/windows-compiler-coff/source-date-epoch.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  windows-link:
+    needs: windows-object
+    runs-on: windows-latest
+    timeout-minutes: ${{ inputs.ci && 10 || 30 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: windows-compiler-coff
+          path: build/windows-compiler-coff
+      - name: Install the verified Windows LLVM SDK
+        shell: pwsh
+        run: ./tools/windows/install-static-llvm.ps1 -Destination build/llvm
+      - name: Link ablac.exe
+        shell: pwsh
+        run: |
+          ./tools/windows/build-static-compiler.ps1 `
+            -CompilerObject build/windows-compiler-coff/ablac.exe.o `
+            -ImportDirectory build/windows-compiler-coff/ablac.exe.imports `
+            -LlvmRoot build/llvm -BuildDirectory build/windows-compiler
+          Copy-Item build/llvm/bin/llvm-objcopy.exe build/windows-compiler/llvm-objcopy.exe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-compiler
+          path: |
+            build/windows-compiler/ablac.exe
+            build/windows-compiler/llvm-objcopy.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  windows-package:
+    needs: [windows-object, windows-link]
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.ci && 5 || 15 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: windows-compiler-coff
+          path: build/windows-compiler-coff
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: windows-compiler
+          path: build/windows-compiler
+      - name: Package the Windows toolchain
+        run: |
+          chmod +x build/windows-compiler-coff/pe-info
+          mkdir -p build/windows-release
+          SOURCE_DATE_EPOCH=$(cat build/windows-compiler-coff/source-date-epoch.txt) \
+          ABLA_PE_INFO=$PWD/build/windows-compiler-coff/pe-info \
+            tools/package-windows-toolchain.sh build/windows-compiler/ablac.exe build/windows-compiler/llvm-objcopy.exe . \
+              build/windows-release/abla-toolchain-x86_64-windows.zip
+          (cd build/windows-release && sha256sum abla-toolchain-x86_64-windows.zip > abla-toolchain-x86_64-windows.zip.sha256)
+          cp build/windows-compiler-coff/version.txt build/windows-release-version.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ablac-windows-toolchain
+          path: |
+            build/windows-release/abla-toolchain-x86_64-windows.zip
+            build/windows-release/abla-toolchain-x86_64-windows.zip.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-toolchain-version
+          path: build/windows-release-version.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  windows-exercise:
+    needs: windows-package
+    runs-on: windows-latest
+    timeout-minutes: ${{ inputs.ci && 10 || 30 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: ablac-windows-toolchain
+          path: build/windows-release
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: windows-toolchain-version
+          path: build/windows-version
+      - name: Check the archive against its checksum
+        shell: pwsh
+        run: |
+          $expected = (Get-Content build/windows-release/abla-toolchain-x86_64-windows.zip.sha256).Split(' ')[0]
+          $actual = (Get-FileHash -Algorithm SHA256 build/windows-release/abla-toolchain-x86_64-windows.zip).Hash
+          if ($actual -ine $expected) { throw "the archive does not match its .sha256" }
+      - name: Unpack and exercise the toolchain with only System32 on the PATH
+        shell: pwsh
+        run: |
+          $version = (Get-Content build/windows-version/windows-release-version.txt -Raw).Trim()
+          ./tools/windows/exercise-toolchain.ps1 -Archive build/windows-release/abla-toolchain-x86_64-windows.zip -Version $version

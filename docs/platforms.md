@@ -36,7 +36,7 @@ Checksums accompany the published compiler and toolchain assets.
 | WebAssembly hosted | T2 | No Wasm-hosted compiler gate | Release/development modules execute with the `abla_host` ABI under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | WebAssembly hostless | T2 | No Wasm-hosted compiler gate | Import-free runtime fixtures and differential programs execute under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | Xtensa / ESP32 | T3 | No compiler hosted on the microcontroller | Object/assembly checks and optional companion integration; no required board run | No ablac ESP32 binary; separately versioned LLVM companion |
-| Windows x86-64 | T2 | The packaged `ablac.exe` is exercised on `windows-latest` in release runs (`windows: with` or `only`), not in push CI; no Windows self-rebuild or suite shard yet | Cross-built on Linux; selected programs run natively on `windows-latest` in CI (the freestanding exit-status program and the hosted crash program with its symbolized backtrace); the hosted file, process, socket and thread programs run under Wine on Linux only | None in v0.2.64; `abla-toolchain-x86_64-windows.zip` is built by the release workflow and not yet published |
+| Windows x86-64 | T2 | The packaged `ablac.exe` is exercised on `windows-latest` in a nightly master smoke test, on manual dispatch, and in release runs; the Windows self-build is dispatch-only | Cross-built on Linux; the freestanding exit-status program, the hosted crash program with its symbolized backtrace, and selected hosted programs run natively on `windows-latest` in CI | None in v0.2.64; `abla-toolchain-x86_64-windows.zip` shipped in v0.2.68 |
 | Windows ARM64 | T2 | Native compiler link and packaged smoke on `windows-11-arm` in release runs | Hosted programs cross-built on Linux and run natively on `windows-11-arm` in CI | None in v0.2.64. `ablac-windows-arm64.zip` starts with v0.2.69. |
 <!-- readiness-platforms:end -->
 
@@ -208,16 +208,18 @@ prints under Wine with the Linux run, and
 reports, the system calls the compiler makes and the compiler's image against
 a stub LLVM.
 
-In [Release](../.github/workflows/release.yml), the `windows` input selects the
-Windows toolchain jobs: `windows-object`, `windows-link`, `windows-package`
-(`abla-toolchain-x86_64-windows.zip`, see
-[package-windows-toolchain.sh](../tools/package-windows-toolchain.sh)) and
-`windows-exercise`, which unpacks the zip on `windows-latest` with only
-System32 on `PATH` and builds and runs a hello world and a program that imports
-a project module, with `--backtrace`, from a moved toolchain and from a path
-with a space. `windows: fixpoint` adds `windows-fixpoint`, the compiler's
-self-build on a Windows runner. [Windows compiler link](../.github/workflows/windows-compiler-link.yml)
-links the Windows compiler against its static LLVM SDK.
+[Windows x64 toolchain smoke](../.github/workflows/windows-x64-ci.yml) runs
+nightly on master and can be started manually from the Actions run list.
+It calls the same [Windows x64 toolchain workflow](../.github/workflows/windows-x64-toolchain.yml)
+as [Release](../.github/workflows/release.yml). That workflow cross-builds
+the compiler object, links `ablac.exe` against the static LLVM SDK, and builds
+`abla-toolchain-x86_64-windows.zip` with
+[package-windows-toolchain.sh](../tools/package-windows-toolchain.sh).
+It checks the zip's checksum, then exercises the installed compiler on
+`windows-latest` with only System32 on `PATH`. The smoke test builds and runs
+hello and a program that imports a project module, checks `--backtrace`, and
+repeats the checks after moving the toolchain to a path with a space.
+In Release, `windows: fixpoint` adds the compiler's self-build on a Windows runner.
 
 ARM64. Job `windows-arm64-cross` cross-builds hosted programs and
 `windows-arm64-run`, **Windows ARM64 program runtime**, runs the checked
