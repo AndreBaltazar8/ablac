@@ -26,7 +26,8 @@ try {
     New-Item -ItemType Directory -Path $sdk | Out-Null
     & "$env:SystemRoot/System32/tar.exe" -xf $archive -C $sdk --strip-components 1
     $source = Get-Content (Join-Path $sdk 'SOURCE')
-    if ("fdiv-patch-sha256=$($pin.patchSha256)" -cnotin $source -or 'crt=MT' -cnotin $source) {
+    if ("fdiv-patch-sha256=$($pin.patchSha256)" -cnotin $source -or
+        "opt-utf8-patch-sha256=$($pin.optUtf8PatchSha256)" -cnotin $source -or 'crt=MT' -cnotin $source) {
         throw 'Windows LLVM archive has unexpected patch or CRT metadata'
     }
     Move-Item -LiteralPath $sdk -Destination $Destination

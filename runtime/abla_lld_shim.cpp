@@ -43,6 +43,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
+#include <functional>
 #include <list>
 #include <string>
 #include <vector>
@@ -273,7 +274,14 @@ extern "C" int abla_emit_object(const char *bitcode, const char *object, int ver
 #include "llvm/Transforms/IPO/StripDeadPrototypes.h"
 #include "llvm/Transforms/IPO/StripSymbols.h"
 
-extern "C" int optMain(int argc, char **argv, llvm::ArrayRef<llvm::PassPlugin> PassPlugins);
+namespace llvm { class PassBuilder; }
+// The pinned optdriver.cpp's signature: the last argument is the pass-builder callbacks the driver takes (none here).
+extern "C" int optMain(int argc, char **argv, llvm::ArrayRef<std::function<void(llvm::PassBuilder &)>> PassBuilderCallbacks);
+#if defined(_WIN32)
+// The Windows SDK's libLLVMOptDriver also has optMainUtf8: optMain without the InitLLVM that replaces its argv with the process command line (GetCommandLineW), which
+// is `ablac.exe --llvm-tool opt ...` here. Its argv is UTF-8 already and is used as given.
+extern "C" int optMainUtf8(int argc, char **argv, llvm::ArrayRef<std::function<void(llvm::PassBuilder &)>> PassBuilderCallbacks);
+#endif
 
 extern "C" int abla_shim_version() { return 4; }
 
@@ -563,7 +571,11 @@ extern "C" int abla_tool_main(const char *tool, const char *arguments) {
     lines.insert(lines.begin(), "opt");
     std::vector<char *> argv;
     for (std::string &line : lines) argv.push_back(&line[0]);
+#if defined(_WIN32)
+    return optMainUtf8(static_cast<int>(argv.size()), argv.data(), {});
+#else
     return optMain(static_cast<int>(argv.size()), argv.data(), {});
+#endif
 }
 
 // libxml2, which lld's COFF driver reaches through LLVM's WindowsManifestMerger (only for /manifest:embed, /manifestinput and the like): the archives carry no libxml2, and the

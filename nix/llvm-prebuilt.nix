@@ -47,13 +47,14 @@ rec {
   windowsStatic =
     let pin = builtins.fromJSON (builtins.readFile ./llvm-windows-static-pin.json); in
     assert builtins.hashFile "sha256" ./llvm-instcombine-fdiv-zero.patch == pin.patchSha256;
+    assert builtins.hashFile "sha256" ./llvm-windows-opt-utf8.patch == pin.optUtf8PatchSha256;
     pkgs.runCommand "llvm-23.1.3-x86_64-windows-msvc-static" {
       src = pkgs.fetchurl { inherit (pin) url sha256; };
       nativeBuildInputs = [ pkgs.gnutar pkgs.xz ];
     } ''
       mkdir -p "$out"
       tar -xJf "$src" -C "$out" --strip-components=1
-      test -s "$out/lib/LLVMOptDriver.lib" && test -s "$out/lib/lldCOFF.lib"
+      test -s "$out/lib/LLVMOptDriver.lib" && test -s "$out/lib/lldCOFF.lib" && test -s "$out/bin/llvm-objcopy.exe"
     '';
 
   llvm = pkgs.stdenv.mkDerivation {
