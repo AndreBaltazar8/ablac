@@ -1,0 +1,124 @@
+// Abla's side of the framing differential (#1139 area 4): reads cases.tsv (gen.mjs) and prints the verdict of the event servers' framing
+// for each stream in the format of oracle-llhttp.mjs: the requests framed one after the other (httpEventFrame, as the server does),
+// then E when the stream is refused, or nothing more when it is incomplete. A request after which the server closes (Connection: close,
+// HTTP/1.0 without keep-alive) ends the list.
+//   framing <cases.tsv> [--split] > abla.tsv
+// With --split the stream is read in pieces of 1 to 9 bytes through the chunked-request state, as an event server reads it (verdictSplit).
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "abla/fs"
+import "abla/http"
+import "abla/http/stream"
+import "abla/http/event"
+import "abla/process/arguments"
+
+fun hexValue(c: int): int =
+    if (c >= 48 && c <= 57) c - 48 else if (c >= 97 && c <= 102) c - 87 else if (c >= 65 && c <= 70) c - 55 else 0
+
+fun fromHex(hex: string): string {
+    val out = byteBuffer()
+    var i = 0
+    while (i + 1 < hex.size) {
+        out.appendByteValue(hexValue(hex[i]) * 16 + hexValue(hex[i + 1]))
+        i = i + 2
+    }
+    out.toText()
+}
+
+fun hexOf(s: string): string {
+    if (s.size == 0) return "-"
+    var out = ""
+    for (b in s) out = out + "0123456789abcdef".slice(b / 16, b / 16 + 1) + "0123456789abcdef".slice(b % 16, b % 16 + 1)
+    out
+}
+
+fun verdict(stream: string): string {
+    var input = stream
+    var out = ""
+    var more = true
+    while (more) {
+        val frame = httpEventFrame(input, 65536, 1048576)
+        if (frame.length < 0) {
+            out = out + (if (out == "") "" else " | ") + "E"
+            more = false
+        } else if (frame.length == 0 || frame.request == null) {
+            more = false
+        } else {
+            val request = frame.request
+            if (request != null) {
+                out = out + (if (out == "") "" else " | ") + "R:" + request.method + " " + request.path + " " + hexOf(request.body)
+                // The server closes the connection after this request (Connection: close, or HTTP/1.0 without keep-alive): nothing after it is read.
+                val keep = if (frame.http10) httpHeaderTokenContains(request.header("Connection"), "keep-alive") && httpRequestKeepAlive(request) else httpRequestKeepAlive(request)
+                if (!keep) more = false
+            }
+            input = input.slice(frame.length, input.size)
+            if (input.size == 0) more = false
+        }
+    }
+    if (out == "") "I" else out
+}
+
+// The same stream read in pieces, as a server reads it: the pieces are added to the connection's buffer, a request that cannot be complete
+// yet (`need`) is not looked at, and the chunked-request state (HttpEventChunkState) keeps a chunked request in parts. Piece sizes come
+// from a generator seeded by the stream, 1 to 9 bytes. The verdict must be the one of the whole stream.
+fun verdictSplit(stream: string): string {
+    val state = httpEventChunkState()
+    var buffer = ""
+    var out = ""
+    var need = 0
+    var at = 0
+    var seed = stream.size * 2654435761 + 12345
+    var more = true
+    while (more && at < stream.size) {
+        seed = (seed * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+        val size = 1 + (seed >> 33) % 9
+        val end = if (at + size < stream.size) at + size else stream.size
+        buffer = buffer + stream.slice(at, end)
+        at = end
+        if (need == 0 || buffer.size >= need) {
+            var looking = true
+            while (looking) {
+                val frame = state.assemble(buffer, 65536, 1048576, null)
+                need = if (frame.length == 0) frame.need else 0
+                if (frame.length == 0 && frame.trim > 0) buffer = buffer.slice(frame.trim, buffer.size)
+                if (frame.length < 0) {
+                    out = out + (if (out == "") "" else " | ") + "E"
+                    more = false
+                    looking = false
+                } else if (frame.length == 0 || frame.request == null) {
+                    looking = false
+                } else {
+                    val request = frame.request
+                    if (request != null) {
+                        out = out + (if (out == "") "" else " | ") + "R:" + request.method + " " + request.path + " " + hexOf(request.body)
+                        val keep = if (frame.http10) httpHeaderTokenContains(request.header("Connection"), "keep-alive") && httpRequestKeepAlive(request) else httpRequestKeepAlive(request)
+                        if (!keep) {
+                            more = false
+                            looking = false
+                        }
+                    }
+                    buffer = buffer.slice(frame.length, buffer.size)
+                    need = 0
+                    if (buffer.size == 0) looking = false
+                }
+            }
+        }
+    }
+    if (out == "") "I" else out
+}
+
+fun main: int {
+    val split = processArgumentCount() > 1 && processArgument(1) == "--split"
+    val lines = Path(processArgument(0)).readText().split("\n")
+    for (line in lines) {
+        if (line.size > 0) {
+            val fields = line.split("\t")
+            if (fields.size >= 3) {
+                val stream = fromHex(fields[2])
+                println(fields[0] + "\t" + (if (split) verdictSplit(stream) else verdict(stream)))
+            }
+        }
+    }
+    0
+}
