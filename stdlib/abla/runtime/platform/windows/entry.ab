@@ -97,6 +97,10 @@ trusted noescape extern:"c" fun FindClose(search: int): int
 trusted noescape extern:"c" fun GetFileAttributesW(path: int): int
 /** bcryptprimitives ProcessPrng: fills size bytes at buffer with cryptographically secure random bytes; returns non-zero (it cannot fail on Windows 10 and later). */
 trusted noescape extern:"c" fun ProcessPrng(buffer: int, size: int): int
+/** kernel32 LoadLibraryExW: loads the DLL named by the UTF-16 string (file 0); with flags 0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32) only from System32; returns the module handle, or 0. */
+trusted noescape extern:"c" fun LoadLibraryExW(name: int, file: int, flags: int): int
+/** kernel32 GetProcAddress: the address of the function the NUL-ended ASCII name gives in a module, or 0. */
+trusted noescape extern:"c" fun GetProcAddress(module: int, name: int): int
 /** ws2_32 WSAStartup: initialises Winsock for version (0x0202 is 2.2), filling the 408-byte WSADATA at data; returns 0 on success. */
 trusted noescape extern:"c" fun WSAStartup(version: int, data: int): int
 /** ws2_32 WSAGetLastError: the calling thread's last Winsock error code. */
@@ -559,7 +563,10 @@ private trusted fun __ablaRuntimeWindowsClose(fd: int): int {
         val page = ablaRuntimeLoadI64(entry + 16)
         if (page != 0) VirtualFree(page, 0, 32768)
     }
-    if (ablaRuntimeLoadI64(entry + 8) == 3) closesocket(handle) else CloseHandle(handle)
+    if (ablaRuntimeLoadI64(entry + 8) == 4) {
+        val registry = ablaRuntimeLoadI64(entry + 16)
+        if (registry != 0) VirtualFree(registry, 0, 32768)
+    } else if (ablaRuntimeLoadI64(entry + 8) == 3) closesocket(handle) else CloseHandle(handle)
     ablaRuntimeAtomicStoreI64(entry, 0)
     0
 }
@@ -980,10 +987,263 @@ private trusted fun __ablaRuntimeWindowsPoll(fds: int, count: int, timeout: int)
     0
 }
 
-// The socket calls: -1000 when `number` is none of them.
-private trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int): int {
+// ---- epoll over WSAPoll ----
+// epoll_create1 makes a descriptor of kind 4 whose page (word 2 of its table entry) holds the registered sockets, 16 bytes each (the
+// descriptor, the events, the caller's data word); word 3 counts them, word 4 is a spin lock. epoll_ctl edits the registry, epoll_wait
+// polls the registered sockets (level triggered, as the standard library asks for) and fills 12-byte packed epoll_event records. A
+// registered socket that was closed without being removed is dropped by the next wait. Linux events: IN 1, PRI 2, OUT 4, ERR 8,
+// HUP 16, RDHUP 8192; WSAPoll reports an abortive close as HUP, a graceful one as readable (the read returns 0).
+
+private val __ablaRuntimeWindowsEpollCapacity = 4096
+
+// The table entry of descriptor `epfd` when it is an epoll descriptor, else 0.
+private trusted fun __ablaRuntimeWindowsEpollEntry(epfd: int): int {
+    if (epfd < 3 || epfd >= __ablaRuntimeWindowsFdCount) return 0
+    val table = __ablaRuntimeWindowsFds()
+    if (table == 0) return 0
+    val entry = table + epfd * 64
+    if (ablaRuntimeAtomicLoadI64(entry) == 0 || ablaRuntimeLoadI64(entry + 8) != 4) return 0
+    entry
+}
+
+private trusted fun __ablaRuntimeWindowsEpollLock(entry: int): void {
+    while (ablaRuntimeAtomicCompareExchangeI64(entry + 32, 0, 1) != 0) Sleep(0)
+    return
+}
+
+private trusted fun __ablaRuntimeWindowsEpollUnlock(entry: int): void {
+    ablaRuntimeAtomicStoreI64(entry + 32, 0)
+    return
+}
+
+// epoll_create1(flags): the new descriptor, or -errno.
+private @noinline trusted fun __ablaRuntimeWindowsEpollCreate(): int {
+    val page = VirtualAlloc(0, __ablaRuntimeWindowsEpollCapacity * 16, 12288, 4)
+    if (page == 0) return -12
+    val fd = __ablaRuntimeWindowsOpenFd(1, 4, page)
+    if (fd < 0) VirtualFree(page, 0, 32768)
+    fd
+}
+
+// The index of `fd` in the registry at `page` of `count` entries, or -1.
+private trusted fun __ablaRuntimeWindowsEpollFind(page: int, count: int, fd: int): int {
+    var index = 0
+    while (index < count) {
+        if (ablaRuntimeLoadI32(page + index * 16) == fd) return index
+        index = index + 1
+    }
+    -1
+}
+
+// Takes entry `index` out of the registry at `page` (the last one moves into its place).
+private trusted fun __ablaRuntimeWindowsEpollRemove(entry: int, page: int, index: int): void {
+    val last = ablaRuntimeLoadI64(entry + 24) - 1
+    if (index != last) {
+        ablaRuntimeStoreI64(page + index * 16, ablaRuntimeLoadI64(page + last * 16))
+        ablaRuntimeStoreI64(page + index * 16 + 8, ablaRuntimeLoadI64(page + last * 16 + 8))
+    }
+    ablaRuntimeStoreI64(entry + 24, last)
+    return
+}
+
+// epoll_ctl(epfd, operation, fd, event): ADD 1, DEL 2, MOD 3 of a socket; `event` is the packed 12 bytes (events, then the data word).
+private @noinline trusted fun __ablaRuntimeWindowsEpollControl(epfd: int, operation: int, fd: int, event: int): int {
+    val entry = __ablaRuntimeWindowsEpollEntry(epfd)
+    if (entry == 0) return -9
+    if (fd < 3 || fd >= __ablaRuntimeWindowsFdCount) return -9
+    if (__ablaRuntimeWindowsSocketOf(fd) == 0) return -1
+    if (operation < 1 || operation > 3) return -22
+    if (operation != 2 && event == 0) return -14
+    val page = ablaRuntimeLoadI64(entry + 16)
+    __ablaRuntimeWindowsEpollLock(entry)
+    val count = ablaRuntimeLoadI64(entry + 24)
+    val index = __ablaRuntimeWindowsEpollFind(page, count, fd)
+    var result = 0
+    if (operation == 1) {
+        if (index >= 0) result = -17
+        else if (count >= __ablaRuntimeWindowsEpollCapacity) result = -28
+        else {
+            val slot = page + count * 16
+            ablaRuntimeStoreI32(slot, fd)
+            ablaRuntimeStoreI32(slot + 4, ablaRuntimeLoadI32(event))
+            ablaRuntimeStoreI32(slot + 8, ablaRuntimeLoadI32(event + 4))
+            ablaRuntimeStoreI32(slot + 12, ablaRuntimeLoadI32(event + 8))
+            ablaRuntimeStoreI64(entry + 24, count + 1)
+        }
+    } else if (index < 0) result = -2
+    else if (operation == 2) __ablaRuntimeWindowsEpollRemove(entry, page, index)
+    else {
+        val slot = page + index * 16
+        ablaRuntimeStoreI32(slot + 4, ablaRuntimeLoadI32(event))
+        ablaRuntimeStoreI32(slot + 8, ablaRuntimeLoadI32(event + 4))
+        ablaRuntimeStoreI32(slot + 12, ablaRuntimeLoadI32(event + 8))
+    }
+    __ablaRuntimeWindowsEpollUnlock(entry)
+    result
+}
+
+// epoll_wait(epfd, events, maximum, timeout): the number of records stored, 0 on a timeout, or -errno.
+private @noinline trusted fun __ablaRuntimeWindowsEpollWait(epfd: int, output: int, maximum: int, timeout: int): int {
+    val entry = __ablaRuntimeWindowsEpollEntry(epfd)
+    if (entry == 0) return -9
+    if (maximum < 1 || output == 0) return -22
+    val buffer = __ablaRuntimeWindowsPathBuffer()
+    if (buffer == 0) return -12
+    // The thread's buffer: the WSAPOLLFD array in its first half, in its second the events and data word each entry registered.
+    val page = ablaRuntimeLoadI64(entry + 16)
+    __ablaRuntimeWindowsEpollLock(entry)
+    var count = ablaRuntimeLoadI64(entry + 24)
+    var sockets = 0
+    var index = 0
+    while (index < count) {
+        val slot = page + index * 16
+        val socket = __ablaRuntimeWindowsSocketOf(ablaRuntimeLoadI32(slot))
+        if (socket == 0) {
+            __ablaRuntimeWindowsEpollRemove(entry, page, index)
+            count = count - 1
+        } else {
+            val wanted = ablaRuntimeLoadI32(slot + 4)
+            var windows = 0
+            if ((wanted & 1) != 0) windows = windows + 768
+            if ((wanted & 2) != 0) windows = windows + 1024
+            if ((wanted & 4) != 0) windows = windows + 16
+            val poll = buffer + sockets * 16
+            ablaRuntimeStoreI64(poll, socket)
+            ablaRuntimeStoreI32(poll + 8, windows)
+            val kept = buffer + 65536 + sockets * 16
+            ablaRuntimeStoreI32(kept, wanted)
+            ablaRuntimeStoreI32(kept + 4, ablaRuntimeLoadI32(slot + 8))
+            ablaRuntimeStoreI32(kept + 8, ablaRuntimeLoadI32(slot + 12))
+            sockets = sockets + 1
+            index = index + 1
+        }
+    }
+    __ablaRuntimeWindowsEpollUnlock(entry)
+    if (sockets == 0) {
+        // nothing to wait on but time
+        if (timeout > 0) return __ablaRuntimeWindowsSleep(timeout)
+        return 0
+    }
+    var left = timeout
+    var result = 0
+    while (true) {
+        val slice = if (left < 0 || left > __ablaRuntimeWindowsWaitSlice) __ablaRuntimeWindowsWaitSlice else left
+        result = WSAPoll(buffer, sockets, slice)
+        if (result != 0 || left == 0) break
+        if (left > 0) left = left - slice
+        if (__ablaRuntimeWindowsInterrupted()) return -4
+    }
+    if (result < 0) return __ablaRuntimeWindowsSocketErrno()
+    var stored = 0
+    index = 0
+    while (index < sockets && stored < maximum) {
+        val revents = ablaRuntimeLoadU8(buffer + index * 16 + 10) + ablaRuntimeLoadU8(buffer + index * 16 + 11) * 256
+        val kept = buffer + 65536 + index * 16
+        val wanted = ablaRuntimeLoadI32(kept)
+        var linux = 0
+        if ((revents & 768) != 0 && (wanted & 1) != 0) linux = linux + 1
+        if ((revents & 1024) != 0 && (wanted & 2) != 0) linux = linux + 2
+        if ((revents & 16) != 0 && (wanted & 4) != 0) linux = linux + 4
+        if ((revents & 5) != 0) linux = linux + 8
+        if ((revents & 2) != 0) {
+            linux = linux + 16
+            if ((wanted & 8192) != 0) linux = linux + 8192
+        }
+        if (linux != 0) {
+            val record = output + stored * 12
+            ablaRuntimeStoreI32(record, linux)
+            ablaRuntimeStoreI32(record + 4, ablaRuntimeLoadI32(kept + 4))
+            ablaRuntimeStoreI32(record + 8, ablaRuntimeLoadI32(kept + 8))
+            stored = stored + 1
+        }
+        index = index + 1
+    }
+    stored
+}
+
+// The Windows-only system call 4006, `systemRoots`: the DER of every certificate in the user's ROOT store (the system's trusted roots),
+// each as a 32-bit length and the bytes, in the buffer of `size` bytes. Returns the bytes the records take (more than `size` when
+// the buffer was too small: none was stored past it, and the caller asks again with that much) or -errno. The standard library's
+// trust store (abla/tls/pure) reads them where Linux reads a bundle file.
+// The calls through an address GetProcAddress gave (the two shapes crypt32's functions take): declared here, not imported from abla/unsafe/native,
+// which this module does not link against.
+private trusted noescape extern:"intrinsic" fun ablaUnsafeCallAddressPointerPointer(address: int, first: i64*, second: i64*): int
+private trusted noescape extern:"intrinsic" fun ablaUnsafeCallI64PointerI32(address: int, first: i64*, second: int): int
+
+private @noinline trusted fun __ablaRuntimeWindowsSystemRoots(buffer: int, size: int): int {
+    // crypt32 is loaded here, not linked: a program that never asks for the roots does not import it. Only from System32 (nothing
+    // beside the program or on the PATH can stand in for it), and a failure to load or find any of the three functions fails the
+    // call: the caller gets an error, never a store that was not read.
+    val scratch = __ablaRuntimeWindowsScratch()
+    ablaRuntimeStoreI64(scratch, 23644237351288914)
+    ablaRuntimeStoreI64(scratch + 8, 0)
+    ablaRuntimeStoreI64(scratch + 16, 31525717090107491)
+    ablaRuntimeStoreI64(scratch + 24, 12948063680397428)
+    ablaRuntimeStoreI64(scratch + 32, 463863545956)
+    val module = LoadLibraryExW(scratch + 16, 0, 2048)
+    if (module == 0) return -2
+    val open = GetProcAddress(module, nativeCStringAddress("CertOpenSystemStoreW"))
+    val enumerate = GetProcAddress(module, nativeCStringAddress("CertEnumCertificatesInStore"))
+    val close = GetProcAddress(module, nativeCStringAddress("CertCloseStore"))
+    if (open == 0 || enumerate == 0 || close == 0) return -2
+    val store = ablaUnsafeCallAddressPointerPointer(open, nativePointerFromAddress(0), nativePointerFromAddress(scratch))
+    if (store == 0) return -2
+    var used = 0
+    var context = ablaUnsafeCallAddressPointerPointer(enumerate, nativePointerFromAddress(store), nativePointerFromAddress(0))
+    while (context != 0) {
+        val der = ablaRuntimeLoadI64(context + 8)
+        val length = ablaRuntimeLoadI32(context + 16) & 4294967295
+        if (used + 4 + length <= size) {
+            ablaRuntimeStoreI32(buffer + used, length)
+            var at = 0
+            while (at < length) {
+                ablaRuntimeStoreU8(buffer + used + 4 + at, ablaRuntimeLoadU8(der + at))
+                at = at + 1
+            }
+        }
+        used = used + 4 + length
+        context = ablaUnsafeCallAddressPointerPointer(enumerate, nativePointerFromAddress(store), nativePointerFromAddress(context))
+    }
+    ablaUnsafeCallI64PointerI32(close, nativePointerFromAddress(store), 0)
+    used
+}
+
+// The socket calls: -1000 when `number` is none of them. Not inlined into __ablaRuntimeWindowsSyscall: the compile-time guard's vectored
+// handler reaches that function (call 4005) on an overflowed stack, where Wine leaves little room (tests/cases/windows/fault-guard.ab), and
+// the socket cases' frames must not add to its frame.
+private @noinline trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int): int {
     // poll(fds, count, milliseconds)
     if (number == 7) return __ablaRuntimeWindowsPoll(a0, a1, a2)
+    // sendmsg(fd, message, flags): a connected socket's msghdr (the standard library sends a vector of pieces with it, MSG_NOSIGNAL
+    // meaning nothing here): one send per iovec, in order, ending at the first that sends less than it was given. The bytes sent,
+    // or the error when none went.
+    if (number == 46) {
+        val socket = __ablaRuntimeWindowsSocketOf(a0)
+        if (socket == 0) return -88
+        val vectors = ablaRuntimeLoadI64(a1 + 16)
+        val vectorCount = ablaRuntimeLoadI64(a1 + 24)
+        if (vectorCount < 0 || vectorCount > 1024) return -22
+        var total = 0
+        var piece = 0
+        while (piece < vectorCount) {
+            val length = ablaRuntimeLoadI64(vectors + piece * 16 + 8)
+            if (length > 0) {
+                val sent = send(socket, ablaRuntimeLoadI64(vectors + piece * 16), length, 0)
+                if (sent < 0) {
+                    if (total > 0) return total
+                    return __ablaRuntimeWindowsSocketErrno()
+                }
+                total = total + sent
+                if (sent < length) return total
+            }
+            piece = piece + 1
+        }
+        return total
+    }
+    // epoll_wait(epfd, events, maximum, timeout), epoll_ctl(epfd, operation, fd, event), epoll_create1(flags)
+    if (number == 232) return __ablaRuntimeWindowsEpollWait(a0, a1, a2, a3)
+    if (number == 233) return __ablaRuntimeWindowsEpollControl(a0, a1, a2, a3)
+    if (number == 291) return __ablaRuntimeWindowsEpollCreate()
     // ioctl(fd, request, argument): FIONREAD (0x541B) and FIONBIO (0x5421) on a socket; the terminal queries are ENOTTY
     if (number == 16) {
         val socket = __ablaRuntimeWindowsSocketOf(a0)
@@ -1017,6 +1277,23 @@ private trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: int, a1: int
     if (number == 42 || number == 49 || number == 51 || number == 52) {
         val socket = __ablaRuntimeWindowsSocketOf(a0)
         if (socket == 0) return -88
+        // Linux cuts an address that does not fit the caller's room (a 16-byte IPv4 buffer asked for an IPv6 socket's port) and
+        // reports its full length; Winsock fails with WSAEFAULT. The address is read into room of the runtime's and copied.
+        if ((number == 51 || number == 52) && (ablaRuntimeLoadI32(a2) & 4294967295) < 28) {
+            val room = ablaRuntimeLoadI32(a2) & 4294967295
+            val spare = __ablaRuntimeWindowsPathBuffer() + 130944
+            ablaRuntimeStoreI32(spare + 120, 120)
+            val taken = if (number == 51) getsockname(socket, spare, spare + 120) else getpeername(socket, spare, spare + 120)
+            if (taken != 0) return __ablaRuntimeWindowsSocketErrno()
+            __ablaRuntimeWindowsFamily(spare, false)
+            var copied = 0
+            while (copied < room && copied < 120) {
+                ablaRuntimeStoreU8(a1 + copied, ablaRuntimeLoadU8(spare + copied))
+                copied = copied + 1
+            }
+            ablaRuntimeStoreI32(a2, ablaRuntimeLoadI32(spare + 120))
+            return 0
+        }
         __ablaRuntimeWindowsFamily(a1, true)
         var result = 0
         if (number == 42) result = connect(socket, a1, a2)
@@ -1721,6 +1998,8 @@ private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: in
     if (number == 4004) return __ablaRuntimeWindowsFaults(a0)
     // the vectored handler itself (its entry, __ablaRuntimeWindowsFaultEntry)
     if (number == 4005) return __ablaRuntimeWindowsFault(a0)
+    // systemRoots(buffer, size): the DER of the system's trusted root certificates
+    if (number == 4006) return __ablaRuntimeWindowsSystemRoots(a0, a1)
     -1000
 }
 
@@ -1851,7 +2130,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 89 91 97 109 121 131 186 202 204 217 228 231 257 262 263 288 293 318 4001 4002 4003 4004 4005"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 46 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 89 91 97 109 121 131 186 202 204 217 228 231 232 233 257 262 263 288 291 293 318 4001 4002 4003 4004 4005 4006"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;

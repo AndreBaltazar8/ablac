@@ -71,10 +71,30 @@ private val tlsDefaultReadWriteTimeoutMilliseconds = 30000
 // first to commit wins; an empty result is not kept (a bundle installed later is found).
 private var pureTlsSystemCache: X509TrustStore? by TVar<X509TrustStore?>(null)
 
+// The roots a Windows system trusts: system call 4006 of the runtime (crypt32's ROOT store), asked again with a larger buffer when the
+// first was too small.
+private fun pureTlsWindowsRoots(): X509TrustStore {
+    var size = 1048576
+    var attempt = 0
+    while (attempt < 2) {
+        val buffer = nativeByteBuffer(size)
+        val used = linuxSyscall2(4006, nativePointerAddress(buffer.address), size)
+        if (used < 0) {
+            buffer.close()
+            return X509TrustStore([])
+        }
+        if (used <= size) return x509TrustStoreFromDerRecords(buffer.adoptString(used))
+        buffer.close()
+        size = used
+        attempt = attempt + 1
+    }
+    X509TrustStore([])
+}
+
 private fun pureTlsSystemBundle(): X509TrustStore {
     val kept = atomic { pureTlsSystemCache }
     if (kept != null) return kept
-    val loaded = x509SystemTrustStore()
+    val loaded = if (linuxHostIsWindows()) pureTlsWindowsRoots() else x509SystemTrustStore()
     if (loaded.certificates.size == 0) return loaded
     atomic {
         if (pureTlsSystemCache == null) pureTlsSystemCache = loaded

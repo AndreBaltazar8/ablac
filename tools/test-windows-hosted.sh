@@ -39,6 +39,13 @@ for source in tests/cases/windows/hosted/*.ab; do
             { cat "$exe.log" >&2; fail "$name ($mode) did not build for Windows"; }
         imports=$(llvm-readobj --coff-imports "$exe" | awk '/^ *Name:/ { dll = $2 } /^ *Symbol:/ { print dll, $2 }')
         ! grep -qiE 'msvcrt|ucrtbase|vcruntime|api-ms-win-crt' <<< "$imports" || fail "$name ($mode): a C runtime import: $imports"
+        # A program that uses nothing of the optional DLLs imports the same ones as hello does (tools/windows-hello-dlls.txt): crypt32, which
+        # the system roots need, is loaded when they are first asked for (system call 4006), not linked into every program.
+        if [[ $name == hello ]]; then
+            dlls=$(awk '{ print $1 }' <<< "$imports" | sort -u)
+            [[ $dlls == "$(cat tools/windows-hello-dlls.txt)" ]] ||
+                fail "hello ($mode) imports other DLLs than tools/windows-hello-dlls.txt lists: $(tr '\n' ' ' <<< "$dlls")"
+        fi
         while read -r dll function; do
             [[ -z $dll ]] || grep -qxF "$dll $function" <<< "$allowed" ||
                 fail "$name ($mode): import not in tools/windows-imports-allowlist.txt: $dll $function"

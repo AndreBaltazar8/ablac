@@ -192,7 +192,7 @@ and runs [test-windows-link.sh](../tools/test-windows-link.sh). Job
 crash program's access-violation report, its backtrace symbolized to file and
 line, the seven hosted programs in `tests/cases/windows/hosted` (hello,
 arguments, environment, files, processes, loopback sockets, threads; `--fast`
-and release) and the 63 standard-library programs listed in
+and release) and the 67 standard-library programs listed in
 [programs.txt](../tests/cases/windows/programs.txt) (collections, text, date,
 files, process exit, loopback HTTP and WebSocket, threads, ...). The Linux job
 leaves each image with the output and exit status the same program has built
@@ -243,19 +243,25 @@ standard library's test programs (`tests/abla-tests.json`), those in
 Linux system calls the Windows runtime does not translate (`symlink` in
 `filesystem.ab`, `sendmsg` in `linux-net.ab`, `getrusage` in
 `process-metrics.ab`, `rt_sigprocmask` in `signal-watch.ab`,
-`epoll_create1` in the WebSocket server tests, `geteuid` in
-`path-home`, and raw `linuxSyscall` calls in `udp-ephemeral.ab`);
-no TLS on a hosted Windows program (`network-advanced.ab` fails to link
-`OpenSSL_version_num`; the TLS tests need an OpenSSL); tests that run POSIX tools
+`geteuid` in `path-home`, and raw `linuxSyscall` calls in
+`udp-ephemeral.ab`); the OpenSSL-backed `abla/tls/hosted` (`network-advanced.ab` fails to link
+`OpenSSL_version_num`; the pure TLS of `abla/tls/pure`, which the HTTPS client uses, runs on Windows: see below);
+tests that fork (the WebSocket server tests; `dns-async.ab` and `http-async.ab` have thread-based
+copies in `tests/cases/windows`); tests that run POSIX tools
 (`printf`, `sh` in `process-capture.ab`, `host-process-configured.ab`,
 `inferred-command`); POSIX path semantics (`path-syntax`: `Path` follows
-the host, see `module-path-identity`); IPv6 loopback and the socket poller
-(`hosted-network.ab` fails under Wine and is unchecked on a runner);
-the asynchronous resolver and HTTP client (`dns-async.ab`, `http-async.ab` exit 1
-under Wine, cause not yet diagnosed);
-and tests whose success depends on arguments, the environment or files a
+the host, see `module-path-identity`); and tests whose success depends on arguments, the environment or files a
 driver script sets up (`fs-tree`, `process-environment`, `path-file-mode`,
 `path-directory-mode`). The rest of the compiler's own tests (`tests/cases`
-programs driven by shell scripts) build and run on Linux only. Accepting `coff` in a generic target descriptor proves
+programs driven by shell scripts) build and run on Linux only.
+
+Sockets and TLS on a hosted Windows program: the poller (`epoll_create1`, `epoll_ctl`, `epoll_wait`) is emulated over `WSAPoll`
+(level triggered, at most 4096 sockets per poller), `sendmsg` sends its vector with one `send` per piece, and an address that does
+not fit the caller's room is cut as on Linux. The pure TLS 1.3 client and server (`abla/tls/pure`, the HTTPS client built on it) need
+no OpenSSL; their random bytes are `ProcessPrng`, and the default trust store is the user's ROOT certificate store (crypt32, the
+runtime's system call 4006, loaded from System32 on first use, so a program without TLS does not import it; an error there leaves the store empty and nothing verifies) where Linux reads a CA bundle file; `SSL_CERT_FILE` and `SSL_CERT_DIR` still replace it.
+`tests/cases/windows/https-loopback.ab` runs a handshake between a program and its own child over loopback. Not done: the DNS
+resolver's default configuration (`/etc/resolv.conf`, `/etc/hosts`) has no Windows source, so a name resolves on Windows only with
+the paths and name server given in the options (`DnsAsyncOptions`, `dnsResolve`), which is what the thread-based `dns-async.ab` does. Accepting `coff` in a generic target descriptor proves
 neither a working Windows linker/runtime nor Windows hosting. See
 [the Windows design](design/windows-target.md).

@@ -505,7 +505,7 @@ if (!result.ok) println(result.error)                   // result.path is the va
 | `X509Options(hostname, now, maximumDepth = 8, usage = 0)` | the host name or IP address to match ("" skips the check), the time in seconds since 1970 (required: this module reads no clock, so a TLS layer passes its own), the longest path, and 0 for server authentication (1 for client) |
 | `x509MatchesHost(cert, host)`, `x509DnsMatches(pattern, host)`, `x509IpBytes(text)` | the RFC 6125 rules on their own |
 | `x509CheckSignature(cert, issuer)`, `x509ValidatePath(path, options)` | the pieces: one signature, and the checks of a built path |
-| `x509TrustStoreFromPem`, `x509TrustStoreFromFile`, `x509SystemTrustStore()` | the store; the system one is the first of the usual bundle files (`x509SystemBundlePaths()`: Debian, Red Hat, SUSE, Alpine, FreeBSD, macOS) that holds a certificate |
+| `x509TrustStoreFromPem`, `x509TrustStoreFromFile`, `x509SystemTrustStore()` | the store; the system one is the first of the usual bundle files (`x509SystemBundlePaths()`: Debian, Red Hat, SUSE, Alpine, FreeBSD, macOS) that holds a certificate; `abla/tls/pure` on Windows uses the user's ROOT certificate store instead (`x509TrustStoreFromDerRecords` parses what the runtime's system call 4006 returns) |
 
 What a path must satisfy: every certificate is within its validity and has no critical extension this code does not know; every
 issuer is a CA (basicConstraints cA, and keyCertSign in its keyUsage if it has one), within its path length constraint (self-issued

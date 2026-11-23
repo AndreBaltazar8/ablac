@@ -1,0 +1,77 @@
+// TLS on a hosted Windows program (tools/test-windows-programs.sh): the standard library's pure TLS 1.3 (abla/tls/pure, no OpenSSL) between
+// two processes over loopback. The program starts itself with the argument "serve" (the pure stack's state is global, so a thread cannot be
+// the server): that child listens with a self-signed certificate (written to files first: tlsListen takes paths) and answers every
+// connection that completes its handshake. The parent connects trusting that certificate (tlsConnectWithCa) and gets the answer, then
+// connects against the system trust store, which must refuse it (the certificate is in no store), and loads that store (the runtime's
+// system call 4006 on Windows, a bundle file on Linux). The certificate, a P-256 key's, is for 127.0.0.1 and localhost.
+import "abla/io"
+import "abla/fs"
+import "abla/net"
+import "abla/integer"
+import "abla/process/arguments"
+import "abla/process/command"
+import "abla/process/time"
+import "abla/sys/linux/process"
+import "abla/tls/pure"
+
+val certificatePem = "-----BEGIN CERTIFICATE-----\nMIIBqzCCAVGgAwIBAgIUBcI7/waq4uNvLQxdsdeZFBnnZ48wCgYIKoZIzj0EAwIw\nFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEyMzIyMjAzMloYDzIxMjYxMDMw\nMjIyMDMyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\nPQMBBwNCAASm/UOCQcdKlssN/oXY4GkkDwCbMgeuK2mpR2KKBX9Nkg9kzCoS9OWx\n9zKhdEK7wprWyt2nWbgJgsuRPbD0l8mno38wfTAdBgNVHQ4EFgQU7vGkPBeTrvVc\nDdHh+IpSxo3dam8wHwYDVR0jBBgwFoAU7vGkPBeTrvVcDdHh+IpSxo3dam8wGgYD\nVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P\nAQH/BAQDAgKEMAoGCCqGSM49BAMCA0gAMEUCIQCMoR3ahbryAQgxr+lmFQrWCdr2\n08yr3/WmP0H6qFoFtAIgRbeAPw94T/kmdhosCD5faknqDsW4LyvX1oHyRv4WNWc=\n-----END CERTIFICATE-----\n"
+val keyPem = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgN2N55cgZDgLxJbL3\nqDUmLebv8NOgWkr0HOZyPD9PYnShRANCAASm/UOCQcdKlssN/oXY4GkkDwCbMgeu\nK2mpR2KKBX9Nkg9kzCoS9OWx9zKhdEK7wprWyt2nWbgJgsuRPbD0l8mn\n-----END PRIVATE KEY-----\n"
+
+// The server: answers connections for at most 30 s; the parent stops it sooner.
+fun serve(port: int): int {
+    val listener = tlsListen("https-loopback-cert.pem", "https-loopback-key.pem", "127.0.0.1", port, 16, false)
+    if (listener.handle == -1) return 1
+    val deadline = linuxMonotonicMilliseconds() + 30000
+    while (linuxMonotonicMilliseconds() < deadline) {
+        val connection = listener.accept(1000, 5000)
+        if (connection.handle != -1) {
+            val request = connection.read(4096)
+            if (request.size > 0) {
+                connection.write("HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nhello over tls")
+            }
+            connection.close()
+        }
+    }
+    listener.close()
+    0
+}
+
+fun main: int {
+    if (processArgumentCount() > 1 && processArgument(0) == "serve") return serve((processArgument(1).parseInt() ?? 0))
+    path("https-loopback-cert.pem").writeText(certificatePem)
+    path("https-loopback-key.pem").writeText(keyPem)
+    var probe = tcpListenAddress(ipv4Loopback(0))
+    val port = probe.localPort()
+    probe.close()
+    val child = command("/proc/self/exe").argument("serve").argument("$port").start()
+    // The child binds the port after it starts: wait until a connection to it is accepted (at most 30 s).
+    var listening = false
+    var attempt = 0
+    while (!listening && attempt < 1500) {
+        var tcp = tcpConnectIpv4("127.0.0.1", port, 200)
+        if (tcp.descriptor >= 0) {
+            tcp.close()
+            listening = true
+        } else sleepNanoseconds(20000000)
+        attempt = attempt + 1
+    }
+    val connection = tlsConnectWithCa("127.0.0.1", "https-loopback-cert.pem", port, 5000, 5000)
+    println("connected ${connection.handle != -1}")
+    var response = ""
+    if (connection.handle != -1) {
+        connection.write("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        response = connection.read(4096)
+        connection.close()
+    }
+    println("response ${response.slice(0, 15)} ends ${response.slice(response.size - 14, response.size)}")
+    // The system trust store does not hold this certificate: the handshake is refused. (tlsConnect checks the chain against it.)
+    val untrusted = tlsConnect("127.0.0.1", port, 5000, 5000)
+    println("untrusted refused ${untrusted.handle == -1}")
+    if (untrusted.handle != -1) untrusted.close()
+    println("system roots ${tlsSystemTrustStore().certificates.size > 0}")
+    child.stop(2000)
+    path("https-loopback-cert.pem").remove()
+    path("https-loopback-key.pem").remove()
+    if (listening && response.size > 14 && response.slice(response.size - 14, response.size) == "hello over tls" &&
+        untrusted.handle == -1) 42 else 1
+}

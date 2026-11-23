@@ -1,0 +1,161 @@
+import "abla/io"
+import "abla/net"
+import "abla/process/time"
+import "abla/http/async"
+import "abla/http/event"
+import "abla/http"
+import "abla/bytes"
+
+// tests/cases/modules/http-async.ab without fork or Linux system calls, for a hosted Windows program (tools/test-windows-programs.sh):
+// a keep-alive HTTP server runs in a thread; the nonblocking client is driven from the main thread. A listener that never answers
+// covers timeouts.
+
+// What the two threads share: the port the server binds and whether it should stop.
+resource class Control(val port: int, var stop: bool)
+
+fun requestStop(var control: Control): int {
+    control.stop = true
+    0
+}
+
+fun stopRequested(var control: Control): bool = control.stop
+
+fun controlPort(var control: Control): int = control.port
+
+fun asyncTestHandler(request: HttpRequest): HttpResponse {
+    if (request.path == "/echo") {
+        HttpResponse(200, [
+            HttpHeader("Content-Type", "application/json"),
+            HttpHeader("X-Seen-Key", request.header("X-API-KEY"))
+        ], request.body)
+    } else if (request.path == "/big") {
+        val output = byteBuffer()
+        var index = 0
+        while (index < 200000) {
+            output.appendByteValue(97 + index % 26)
+            index = index + 1
+        }
+        httpText(output.toText())
+    } else httpText("world:${request.path}")
+}
+
+fun asyncTestServe(control: Mutex<Control>): int {
+    val port = control.with(controlPort)
+    val server = httpEventServerHandler(asyncTestHandler, ipv4Loopback(port))
+    var loops = 0
+    while (loops < 3000 && !control.with(stopRequested)) {
+        server.step(10)
+        loops = loops + 1
+    }
+    0
+}
+
+// The server thread binds the port after it starts: wait until a connection to it is accepted (at most 30 s) instead of a fixed
+// pause, which a loaded machine outlasts.
+fun serverListening(port: int): bool {
+    var attempt = 0
+    while (attempt < 1500) {
+        var probe = tcpConnectIpv4("127.0.0.1", port, 200)
+        if (probe.descriptor >= 0) {
+            probe.close()
+            return true
+        }
+        sleepNanoseconds(20000000)
+        attempt = attempt + 1
+    }
+    false
+}
+
+fun main: int {
+    // Reserve a port, release it, and let the server thread bind it.
+    var probe = tcpListenAddress(ipv4Loopback(0))
+    val port = probe.localPort()
+    probe.close()
+    val control = Mutex(Control(port, false))
+    val serverControl = control.clone()
+    val server = thread { asyncTestServe(serverControl) }
+    if (!serverListening(port)) return 1
+
+    val silent = tcpListenAddress(ipv4Loopback(0))
+    val silentPort = silent.localPort()
+    var refused = tcpListenAddress(ipv4Loopback(0))
+    val refusedPort = refused.localPort()
+    refused.close()
+
+    val client = httpAsyncClient(HttpAsyncOptions(maximumConnectionsPerHost = 4))
+    val base = "http://127.0.0.1:$port"
+    val ids: array<int> = []
+    var index = 0
+    while (index < 12) {
+        ids.append(client.get("$base/hello$index"))
+        index = index + 1
+    }
+    val echo = client.postJson(
+        "$base/echo", "{\"grant\":42}",
+        [HttpHeader("X-API-KEY", "secret"), HttpHeader("Idempotency-Key", "k-1")]
+    )
+    val big = client.get("$base/big")
+    val timeout = client.request("GET", "http://127.0.0.1:$silentPort/", [], "", 300)
+    val refusal = client.get("http://127.0.0.1:$refusedPort/")
+    val invalid = client.get("ftp://nowhere")
+
+    var failures = 0
+    var helloes = 0
+    var received = 0
+    var loops = 0
+    while (received < 17 && loops < 2000) {
+        client.step(10)
+        val done = client.takeCompletions()
+        var item = 0
+        while (item < done.size) {
+            val completion = done[item]
+            received = received + 1
+            if (completion.id == echo) {
+                if (completion.status != 200 || completion.body != "{\"grant\":42}" ||
+                    completion.header("X-Seen-Key") != "secret") {
+                    println("echo: ${completion.status} ${completion.error} ${completion.body}")
+                    failures = failures + 1
+                }
+            } else if (completion.id == big) {
+                if (completion.status != 200 || completion.body.size != 200000) {
+                    println("big: ${completion.status} ${completion.error} ${completion.body.size}")
+                    failures = failures + 1
+                }
+            } else if (completion.id == timeout) {
+                if (completion.error != "timeout") failures = failures + 1
+            } else if (completion.id == refusal) {
+                if (completion.succeeded()) failures = failures + 1
+            } else if (completion.id == invalid) {
+                if (completion.error != "invalid URL") failures = failures + 1
+            } else {
+                val position = completion.id - ids[0]
+                // Plain http stays HTTP/1.1 with the default options (HTTP/2 is on by default for https only).
+                if (completion.status == 200 && completion.protocol == "http/1.1" &&
+                    completion.body == "world:/hello$position") helloes = helloes + 1
+                else println("hello: ${completion.status} ${completion.error} ${completion.body}")
+            }
+            item = item + 1
+        }
+        loops = loops + 1
+    }
+    // Keep-alive: a second wave reuses pooled connections.
+    val opened = client.connectionsOpened
+    val again = client.get("$base/again")
+    var reused = false
+    loops = 0
+    while (!reused && loops < 500) {
+        client.step(10)
+        val done = client.takeCompletions()
+        if (done.size == 1 && done[0].id == again && done[0].status == 200) reused = true
+        loops = loops + 1
+    }
+    val pooled = client.connectionsOpened == opened
+    control.with(requestStop)
+    await server
+    if (failures == 0 && helloes == 12 && received == 17 && reused && pooled &&
+        opened <= 6 && client.pending() == 0) 42
+    else {
+        println("failures=$failures helloes=$helloes received=$received reused=$reused pooled=$pooled opened=$opened pending=${client.pending()}")
+        1
+    }
+}
