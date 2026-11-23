@@ -21,7 +21,7 @@ on:
         default: true
         type: boolean
       windows:
-        description: "The Windows toolchain (abla-toolchain-x86_64-windows.zip): off, with (added to this release run), or only (just the Windows jobs, to try them; nothing is published)"
+        description: "Windows toolchain: off, with (add to release), only (test the zip), or fixpoint (test the zip and self-build)"
         required: true
         default: 'off'
         type: choice
@@ -29,13 +29,21 @@ on:
           - 'off'
           - with
           - only
+          - fixpoint
+      windows_fixpoint_tier:
+        description: Compile-time evaluation tier for the Windows fixed-point test
+        default: interp
+        type: choice
+        options:
+          - interp
+          - native
 
 permissions:
   contents: read
 
 jobs:
   compiler:
-    if: ${{ inputs.windows != 'only' }}
+    if: ${{ inputs.windows != 'only' && inputs.windows != 'fixpoint' }}
     permissions:
       contents: write
     strategy:
@@ -384,7 +392,7 @@ jobs:
           if-no-files-found: error
 
   static-suite:
-    if: ${{ inputs.windows != 'only' }}
+    if: ${{ inputs.windows != 'only' && inputs.windows != 'fixpoint' }}
     needs: compiler
     uses: ./.github/workflows/static-suite.yml
     with:
@@ -392,8 +400,8 @@ jobs:
       release_mode: true
 
   # The Windows toolchain (abla-toolchain-x86_64-windows.zip, tools/package-windows-toolchain.sh). `windows: with` adds it to a release run,
-  # `windows: only` runs just these jobs (with publish off: nothing is published) to try them without the Linux and macOS builds, and `off` (the
-  # default) leaves them out. They need nothing from the compiler job: the Linux compiler that cross-compiles ablac.exe is built from the
+  # `windows: only` and `windows: fixpoint` run the Windows jobs without publishing, and `off` (the default) leaves them out.
+  # They need nothing from the compiler job: the Linux compiler that cross-compiles ablac.exe is built from the
   # checked-out source here, as windows-compiler-link.yml does. When they run, the publish job waits for windows-exercise.
   windows-object:
     if: ${{ inputs.windows != 'off' }}
@@ -536,10 +544,44 @@ jobs:
           $version = (Get-Content build/windows-version/windows-release-version.txt -Raw).Trim()
           ./tools/windows/exercise-toolchain.ps1 -Archive build/windows-release/abla-toolchain-x86_64-windows.zip -Version $version
 
+  windows-fixpoint:
+    if: ${{ inputs.windows == 'fixpoint' }}
+    needs: windows-exercise
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref || inputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: ablac-windows-toolchain
+          path: build/windows-release
+      - name: Install the verified Windows LLVM SDK
+        shell: pwsh
+        run: ./tools/windows/install-static-llvm.ps1 -Destination build/llvm
+      - name: Compare two native self-builds
+        shell: pwsh
+        env:
+          FIXPOINT_TIER: ${{ inputs.windows_fixpoint_tier }}
+        run: |
+          ./tools/windows/check-compiler-fixpoint.ps1 `
+            -Archive build/windows-release/abla-toolchain-x86_64-windows.zip `
+            -LlvmRoot build/llvm -BuildDirectory build/windows-fixpoint -Tier $env:FIXPOINT_TIER
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: windows-fixpoint-logs
+          path: |
+            build/windows-fixpoint/stage*/compile.log
+            build/windows-fixpoint/native-site.log
+          retention-days: 7
+
   publish:
-    # Not after a Windows-only run, and not when a job it needs failed or was cancelled; a needed job that was skipped (the Windows ones
-    # with `windows: off`) does not hold it back.
-    if: ${{ !cancelled() && !failure() && inputs.publish_release && inputs.windows != 'only' }}
+    # Windows-only modes never publish. A failed or cancelled dependency also blocks publication; a skipped Windows job
+    # with `windows: off` does not hold it back.
+    if: ${{ !cancelled() && !failure() && inputs.publish_release && inputs.windows != 'only' && inputs.windows != 'fixpoint' }}
     needs: [compiler, static-suite, windows-exercise]
     runs-on: ubuntu-24.04
     # The signing key lives in this environment (master-only, André as the required reviewer), not in a repository secret.
