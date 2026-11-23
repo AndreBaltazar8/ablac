@@ -64,15 +64,21 @@ runs "$output_directory/member-report-main" "a!"
 # A subparser's text is the subparser's: a word there that names a declaration elsewhere (abla-mvc's
 # `$mvcview <main>`, `main` the program's) is no use of it, strict or in the report; an expression the subparser
 # parses from the source is code, checked as any other.
-"$compiler" build "$cases/subparser/main.ab" -o "$output_directory/subparser" --strict-imports
-runs "$output_directory/subparser" ""
-rejected "$cases/subparser/bad-main.ab" --strict-imports '`markupValue` is declared in'
-if grep -qE '`(main|shell)` is declared in' "$output_directory/rejected.err"; then
-    echo "strict-imports: a subparser's text taken for names:"; cat "$output_directory/rejected.err"; exit 1
-fi
+for mode in cached warm uncached; do
+    flag=--strict-imports
+    [[ $mode != uncached ]] || flag+=' --no-cache'
+    ABLA_CACHE_DIR="$output_directory/subparser-cache" "$compiler" build "$cases/subparser/main.ab" \
+        -o "$output_directory/subparser" $flag
+    runs "$output_directory/subparser" ""
+    ABLA_CACHE_DIR="$output_directory/subparser-cache" rejected "$cases/subparser/bad-main.ab" \
+        "$flag" '`markupValue` is declared in'
+    if grep -qE '`(main|home|shell)` is declared in' "$output_directory/rejected.err"; then
+        echo "strict-imports: a subparser's text taken for names:"; cat "$output_directory/rejected.err"; exit 1
+    fi
+done
 "$compiler" build "$cases/subparser/bad-main.ab" -o "$output_directory/subparser-flat" --flat-imports \
     --visibility-report "$output_directory/subparser.tsv"
-grep -qF "	markupValue	" "$output_directory/subparser.tsv" && ! grep -qE '	(main|shell)	' "$output_directory/subparser.tsv" ||
+grep -qF "	markupValue	" "$output_directory/subparser.tsv" && ! grep -qE '	(main|home|shell)	' "$output_directory/subparser.tsv" ||
     { echo "strict-imports: the subparser report:"; cat "$output_directory/subparser.tsv"; exit 1; }
 
 # A program written flat builds with --flat-imports, and is rejected by default and with --strict-imports; a
