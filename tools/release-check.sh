@@ -172,14 +172,12 @@ toolchain_switched=0
 # The browser compiler (tools/build-playground.sh) is an optional extra with a name that holds the version: neither expected nor an extra; check 10 judges it.
 playground_present=0
 ! grep -qxF "abla-playground-$version.tar.gz" "$actual" || playground_present=1
-# The Windows toolchain (tools/package-windows-toolchain.sh) is optional the same way: check 11 judges it.
-windows_present=0
-! grep -qxF abla-toolchain-x86_64-windows.zip "$actual" || windows_present=1
+# The Windows toolchain zips (tools/package-windows-toolchain.sh) are optional the same way: check 11 judges them.
 # The publish job adds SHA256SUMS, its signature and the SBOM: they are not build artifacts, so they are neither expected here
 # nor counted as extras (check 9, signature, judges them where they exist).
 grep -vE "^(SHA256SUMS(\.sig)?|ablac-[0-9.]+\.spdx\.json)\$" "$actual" > "$actual.generated" || true
 mv -f "$actual.generated" "$actual"
-grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz|abla-playground-[0-9.]+\.tar\.gz|abla-toolchain-x86_64-windows\.zip)(\.sha256)?\$" "$actual" > "$actual.filtered" || true
+grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz|abla-playground-[0-9.]+\.tar\.gz|abla-toolchain-x86_64-windows\.zip|ablac-windows-arm64\.zip)(\.sha256)?\$" "$actual" > "$actual.filtered" || true
 mv -f "$actual.filtered" "$actual"
 if [[ -n $assets_from ]]; then
     sort "$assets_from" >"$expected"
@@ -201,7 +199,7 @@ else
 fi
 grep -vE "^(SHA256SUMS(\.sig)?|ablac-[0-9.]+\.spdx\.json)\$" "$expected" > "$expected.generated" || true
 mv -f "$expected.generated" "$expected"
-grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz|abla-playground-[0-9.]+\.tar\.gz|abla-toolchain-x86_64-windows\.zip)(\.sha256)?\$" "$expected" > "$expected.filtered" || true
+grep -vE "^(ablac-(static-(x86_64|aarch64)|dynamic-x86_64)-linux|abla-toolchain-dynamic-x86_64-linux\.tar\.gz|abla-playground-[0-9.]+\.tar\.gz|abla-toolchain-x86_64-windows\.zip|ablac-windows-arm64\.zip)(\.sha256)?\$" "$expected" > "$expected.filtered" || true
 mv -f "$expected.filtered" "$expected"
 if ((count == 0)); then
     report FAIL assets "no files in the artifacts"
@@ -438,20 +436,26 @@ if ((playground_present)); then
     rm -rf -- "$unpack"
 fi
 
-# 11. windows: when the run ships the Windows toolchain (abla-toolchain-x86_64-windows.zip, tools/package-windows-toolchain.sh): one top
+# 11. windows: when the run ships either Windows toolchain (tools/package-windows-toolchain.sh): one top
 # directory holding bin/ablac.exe, bin/llvm-objcopy.exe (--backtrace), share/abla/{runtime,stdlib} (with runtime/windows/imports/*.txt) and share/licenses; no repository or build
 # metadata; at most 150 MB as an archive and 400 MB unpacked; ablac.exe carries this version's string and, read by tools/pe-info (built by the
-# release's Linux compiler), is an x86-64 console PE32+ image with no C runtime import under any name. It cannot be run here: the Windows job
+# release's Linux compiler), is a console PE32+ image for the selected architecture with no C runtime import. The Windows job
 # of the release exercises it on a Windows runner.
-if ((windows_present)); then
-    zipfile=$out/abla-toolchain-x86_64-windows.zip
+for windows_machine in x86_64 aarch64; do
+    top=abla-toolchain-$windows_machine-windows
+    zipfile=$out/$top.zip
+    check=windows
+    if [[ $windows_machine == aarch64 ]]; then
+        zipfile=$out/ablac-windows-arm64.zip
+        check=windows-arm64
+    fi
+    [[ -f $zipfile ]] || continue
     unpack=$(mktemp -d)
-    top=abla-toolchain-x86_64-windows
     bad=
     if ! command -v unzip > /dev/null; then
-        report FAIL windows "unzip is not installed"
+        report FAIL "$check" "unzip is not installed"
     elif ! unzip -q "$zipfile" -d "$unpack"; then
-        report FAIL windows "the archive does not unzip"
+        report FAIL "$check" "the archive does not unzip"
     else
         size=$(stat -c %s "$zipfile")
         ((size <= 150 * 1048576)) || bad="$bad the archive is $((size / 1048576)) MB (cap 150);"
@@ -477,18 +481,18 @@ if ((windows_present)); then
                 bad="$bad tools/pe-info could not be built by the release's Linux compiler;"
             elif ! report_pe=$("$pe_info" "$exe" --no-crt 2> "$unpack/pe-info.err"); then
                 bad="$bad ablac.exe: $(tail -n 1 "$unpack/pe-info.err");"
-            elif ! grep -qx 'machine x86_64' <<< "$report_pe" || ! grep -qx 'subsystem console' <<< "$report_pe"; then
-                bad="$bad ablac.exe is not an x86-64 console image;"
+            elif ! grep -qxF "machine $windows_machine" <<< "$report_pe" || ! grep -qx 'subsystem console' <<< "$report_pe"; then
+                bad="$bad ablac.exe: expected console PE for $windows_machine;"
             fi
         fi
         if [[ -z $bad ]]; then
-            report PASS windows "the toolchain layout, $((size / 1048576)) MB, ablac.exe is an x86-64 console PE with no C runtime import and carries version $version"
+            report PASS "$check" "the toolchain layout, $((size / 1048576)) MB, ablac.exe is a console PE for $windows_machine with no C runtime import and carries version $version"
         else
-            report FAIL windows "${bad# }"
+            report FAIL "$check" "${bad# }"
         fi
     fi
     rm -rf -- "$unpack"
-fi
+done
 
 printf 'release-check %s  run %s  %s\n' "$tag" "$run_id" "$out"
 printf '%s\n' "${results[@]}"

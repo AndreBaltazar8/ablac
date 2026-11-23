@@ -10,9 +10,9 @@
 #
 # There is no launcher: ablac.exe finds the sysroot beside its own image (src/module_paths.ab, bootstrapWindowsToolchainRoot), and its
 # PE header reserves the stack the Unix launchers raise with ulimit. The compiler is checked before anything is packed (tools/pe-info):
-# a PE32+ x86-64 console image that imports no C runtime DLL under any name (the runtime is linked in).
+# a PE32+ console image for the selected machine that imports no C runtime DLL. ARM64 uses the same layout under abla-toolchain-aarch64-windows.
 #
-#   tools/package-windows-toolchain.sh <ablac.exe> <llvm-objcopy.exe> <abla-root> <output.zip>
+#   tools/package-windows-toolchain.sh <ablac.exe> <llvm-objcopy.exe> <abla-root> <output.zip> [x86_64|aarch64]
 #
 # bin/llvm-objcopy.exe (the Windows LLVM SDK's) is carried beside ablac.exe: `ablac --backtrace` runs it, and CreateProcess searches the
 # compiler's own directory first, so it is found with an empty PATH. It is checked like the compiler.
@@ -21,8 +21,8 @@
 # (default 315532800, the earliest zip date) stamps every entry. Needs zip. Prints the archive's size and sha256.
 set -euo pipefail
 export TZ=UTC   # the zip format stores local times
-if [[ $# -ne 4 ]]; then
-    printf 'usage: %s <ablac.exe> <llvm-objcopy.exe> <abla-root> <output.zip>\n' "$0" >&2
+if [[ $# != 4 && $# != 5 ]]; then
+    printf 'usage: %s <ablac.exe> <llvm-objcopy.exe> <abla-root> <output.zip> [x86_64|aarch64]\n' "$0" >&2
     exit 2
 fi
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -30,7 +30,9 @@ compiler_binary=$(realpath "$1")
 objcopy_binary=$(realpath "$2")
 abla_root=$(realpath "$3")
 output=$(realpath -m "$4")
+machine=${5:-x86_64}
 fail() { printf 'package-windows-toolchain: %s\n' "$1" >&2; exit 1; }
+[[ $machine == x86_64 || $machine == aarch64 ]] || fail "unsupported PE machine: $machine"
 
 [[ -f $compiler_binary ]] || fail "missing compiler executable: $compiler_binary"
 [[ -f $objcopy_binary ]] || fail "missing llvm-objcopy executable: $objcopy_binary"
@@ -52,12 +54,12 @@ if [[ -z $pe_info ]]; then
         { cat "$working/pe-info.log" >&2; fail "tools/pe-info/main.ab did not build"; }
 fi
 report=$("$pe_info" "$compiler_binary" --no-crt) || fail "$compiler_binary is not a PE image without a C runtime import"
-grep -qx 'machine x86_64' <<< "$report" || fail "$compiler_binary is not an x86-64 image"
+grep -qxF "machine $machine" <<< "$report" || fail "$compiler_binary is not a $machine image"
 grep -qx 'subsystem console' <<< "$report" || fail "$compiler_binary is not a console image"
 objcopy_report=$("$pe_info" "$objcopy_binary" --no-crt) || fail "$objcopy_binary is not a PE image without a C runtime import"
-grep -qx 'machine x86_64' <<< "$objcopy_report" || fail "$objcopy_binary is not an x86-64 image"
+grep -qxF "machine $machine" <<< "$objcopy_report" || fail "$objcopy_binary is not a $machine image"
 
-name=abla-toolchain-x86_64-windows
+name=abla-toolchain-$machine-windows
 bundle=$working/$name
 mkdir -p "$bundle/bin" "$bundle/share/abla" "$bundle/share/licenses"
 cp "$compiler_binary" "$bundle/bin/ablac.exe"

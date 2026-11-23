@@ -1,0 +1,155 @@
+name: Windows ARM64 toolchain
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  object:
+    name: Cross-build the Windows ARM64 compiler object on Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ABLA_NATIVE_JOBS: '4'
+      ABLA_CODEGEN_JOBS: '4'
+      ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1200'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - name: Build the compiler object, import libraries and PE reader
+        run: |
+          nix-shell shell.nix --run '
+            set -euo pipefail
+            make ablac
+            out=build/windows-arm64-coff
+            tools/windows/cross-compiler-object.sh build/ablac src/orc_windows_main.ab "$out" aarch64-windows
+            llvm-readobj --file-headers "$out/ablac.exe.o" > "$out/machine.txt"
+            grep -q "Machine: IMAGE_FILE_MACHINE_ARM64" "$out/machine.txt"
+            build/ablac build tools/pe-info/main.ab -o "$out/pe-info" --fast --no-cache
+            build/ablac --version | sed "s/^ablac //" > "$out/version.txt"
+            git log -1 --format=%ct > "$out/source-date-epoch.txt"
+          '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-arm64-compiler-coff
+          path: |
+            build/windows-arm64-coff/ablac.exe.o
+            build/windows-arm64-coff/ablac.exe.imports/
+            build/windows-arm64-coff/pe-info
+            build/windows-arm64-coff/version.txt
+            build/windows-arm64-coff/source-date-epoch.txt
+            build/windows-arm64-coff/build.log
+            build/windows-arm64-coff/machine.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  link:
+    name: Link the ARM64 compiler with the pinned SDK and static CRT
+    needs: object
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: windows-arm64-compiler-coff
+          path: build/windows-arm64-coff
+      - name: Install the verified ARM64 SDK
+        shell: pwsh
+        run: ./tools/windows/install-static-llvm.ps1 -Destination build/llvm-arm64 -Architecture arm64
+      - name: Link ablac.exe
+        shell: pwsh
+        run: |
+          ./tools/windows/build-static-compiler.ps1 `
+            -CompilerObject build/windows-arm64-coff/ablac.exe.o `
+            -ImportDirectory build/windows-arm64-coff/ablac.exe.imports `
+            -LlvmRoot build/llvm-arm64 -BuildDirectory build/windows-arm64-compiler -Architecture arm64
+          Copy-Item build/llvm-arm64/bin/llvm-objcopy.exe build/windows-arm64-compiler/llvm-objcopy.exe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-arm64-compiler
+          path: |
+            build/windows-arm64-compiler/ablac.exe
+            build/windows-arm64-compiler/llvm-objcopy.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  package:
+    name: Package the Windows ARM64 toolchain
+    needs: [object, link]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: windows-arm64-compiler-coff
+          path: build/windows-arm64-coff
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: windows-arm64-compiler
+          path: build/windows-arm64-compiler
+      - name: Inspect both ARM64 PE images and build the zip
+        run: |
+          chmod +x build/windows-arm64-coff/pe-info
+          mkdir -p build/windows-arm64-release
+          SOURCE_DATE_EPOCH=$(cat build/windows-arm64-coff/source-date-epoch.txt) \
+          ABLA_PE_INFO=$PWD/build/windows-arm64-coff/pe-info \
+            tools/package-windows-toolchain.sh build/windows-arm64-compiler/ablac.exe \
+              build/windows-arm64-compiler/llvm-objcopy.exe . \
+              build/windows-arm64-release/ablac-windows-arm64.zip aarch64
+          (cd build/windows-arm64-release && sha256sum ablac-windows-arm64.zip > ablac-windows-arm64.zip.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ablac-windows-arm64-toolchain
+          path: build/windows-arm64-release/
+          if-no-files-found: error
+
+  exercise:
+    name: Run the packaged ARM64 compiler with only System32 on PATH
+    needs: package
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: windows-arm64-compiler-coff
+          path: build/windows-arm64-coff
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: ablac-windows-arm64-toolchain
+          path: build/windows-arm64-release
+      - name: Verify and exercise the zip
+        shell: pwsh
+        run: |
+          $zip = 'build/windows-arm64-release/ablac-windows-arm64.zip'
+          $expected = (Get-Content "$zip.sha256").Split(' ')[0]
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash
+          if ($actual -ine $expected) { throw 'ARM64 toolchain zip does not match its SHA-256' }
+          $version = (Get-Content build/windows-arm64-coff/version.txt -Raw).Trim()
+          ./tools/windows/exercise-toolchain.ps1 -Archive $zip -Version $version -Architecture arm64

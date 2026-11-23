@@ -4,6 +4,7 @@
 # from an x86-64 console PE that carries the version's string; FAIL for a zip with no bin/ablac.exe, with no import lists, with an entry
 # outside the top directory, with an ablac.exe that is not a PE, that imports a C runtime, or that lacks the version string. Fake
 # artifacts and no network; the executables are linked by lld-link (skipped with a message without lld-link, zip or unzip).
+# Both architectures can ship together, and an x64 executable in the ARM64 zip fails its machine check.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -34,22 +35,27 @@ chmod +x "$work/base/ablac-x86_64-linux"
 cp "$work/base/ablac-x86_64-linux" "$work/stage2"
 printf 'toolchain' > "$work/base/abla-toolchain-x86_64-linux.tar.gz"
 (cd "$work/base" && for name in ablac-x86_64-linux abla-toolchain-x86_64-linux.tar.gz; do sha256sum "$name" > "$name.sha256"; done; ls | sort) > "$work/expected"
+printf '{"passed":false}\n' > "$work/convergence.json"
 run() { # artifacts-dir out-dir -> the output lines
-    "$root/tools/release-check.sh" v9.9.9 1 "$work/stage2" --artifacts "$1" --assets-from "$work/expected" --out "$2" --source-ref 0000000000000000000000000000000000000000 2>&1 || true
+    "$root/tools/release-check.sh" v9.9.9 1 "$work/stage2" --artifacts "$1" --assets-from "$work/expected" --out "$2" \
+        --source-ref 0000000000000000000000000000000000000000 --lineage v9.9.8 \
+        --convergence-comparison "$work/convergence.json" 2>&1 || true
 }
 line() { grep -E "^(PASS|FAIL|SKIP) +$1 " <<< "$2" || true; }
 fresh() { rm -rf "$work/artifacts"; cp -R "$work/base" "$work/artifacts"; }
-add_zip() { # zip file -> in the artifacts, with its checksum
-    cp "$1" "$work/artifacts/abla-toolchain-x86_64-windows.zip"
-    (cd "$work/artifacts" && sha256sum abla-toolchain-x86_64-windows.zip > abla-toolchain-x86_64-windows.zip.sha256)
+add_zip() { # zip file [asset name] -> in the artifacts, with its checksum
+    local asset=${2:-abla-toolchain-x86_64-windows.zip}
+    cp "$1" "$work/artifacts/$asset"
+    (cd "$work/artifacts" && sha256sum "$asset" > "$asset.sha256")
 }
-judge() { # label expected-prefix needle
-    local output
+judge() { # label expected-prefix [needle] [check]
+    local output check=${4:-windows} result
     output=$(run "$work/artifacts" "$work/out-$1")
     [[ $(line assets "$output") == PASS* ]] || fail "$1: assets: $(line assets "$output")"
     [[ $(line sha256 "$output") == PASS* ]] || fail "$1: sha256: $(line sha256 "$output")"
-    [[ $(line windows "$output") == $2* ]] || fail "$1: expected $2, got: $(line windows "$output")"
-    [[ -z ${3:-} ]] || grep -q -- "$3" <<< "$(line windows "$output")" || fail "$1: the line does not say '$3': $(line windows "$output")"
+    result=$(line "$check" "$output")
+    [[ $result == $2* ]] || fail "$1: expected $2, got: $result"
+    [[ -z ${3:-} ]] || grep -q -- "$3" <<< "$result" || fail "$1: the line does not say '$3': $result"
 }
 
 fresh
@@ -72,4 +78,20 @@ unpack; printf 'MZ not a PE\0ablac 9.9.9' > "$work/tree/$top/bin/ablac.exe"; rep
 unpack; cp "$work/crt.exe" "$work/tree/$top/bin/ablac.exe"; repack crt; judge crt FAIL "C runtime"
 unpack; cp "$work/good.exe" "$work/tree/$top/bin/ablac.exe"; printf '' > /dev/null
 head -c "$(( $(stat -c %s "$work/good.exe") - 12 ))" "$work/good.exe" > "$work/tree/$top/bin/ablac.exe"; repack noversion; judge noversion FAIL "ablac 9.9.9"
+
+"$compiler" build tests/cases/windows/hosted/hello.ab --fast --target aarch64-windows --no-cache -o "$work/arm64.exe" > "$work/arm64.log" 2>&1 ||
+    { cat "$work/arm64.log" >&2; fail "the ARM64 fixture did not build"; }
+printf 'ablac 9.9.9\0' >> "$work/arm64.exe"
+tools/package-windows-toolchain.sh "$work/arm64.exe" "$work/arm64.exe" "$root" "$work/arm64.zip" aarch64
+fresh
+add_zip "$work/good.zip"
+add_zip "$work/arm64.zip" ablac-windows-arm64.zip
+judge both-x64 PASS
+judge both-arm64 PASS '' windows-arm64
+mkdir "$work/arm64-tree"
+unzip -q "$work/arm64.zip" -d "$work/arm64-tree"
+cp "$work/good.exe" "$work/arm64-tree/abla-toolchain-aarch64-windows/bin/ablac.exe"
+(cd "$work/arm64-tree" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | zip -q -X "$work/arm64-wrong-machine.zip" -@)
+add_zip "$work/arm64-wrong-machine.zip" ablac-windows-arm64.zip
+judge arm64-wrong-machine FAIL 'expected console PE for aarch64' windows-arm64
 echo "release-check windows: the windows check passes the packaged toolchain and fails a missing compiler, missing import lists, a stray entry, a non-PE compiler, a C runtime import and a missing version string"

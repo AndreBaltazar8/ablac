@@ -9,7 +9,8 @@
 # Any failure stops with a message naming the step.
 param(
     [Parameter(Mandatory)][string]$Archive,
-    [Parameter(Mandatory)][string]$Version
+    [Parameter(Mandatory)][string]$Version,
+    [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64'
 )
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -27,20 +28,40 @@ $first = Join-Path $temp 'first'
 New-Item -ItemType Directory -Path $first | Out-Null
 & "$env:SystemRoot\System32\tar.exe" -xf (Resolve-Path -LiteralPath $Archive).Path -C $first
 if ($LASTEXITCODE -ne 0) { Fail 'the archive does not unpack' }
-$top = Join-Path $first 'abla-toolchain-x86_64-windows'
+$bundleArchitecture = if ($Architecture -eq 'arm64') { 'aarch64' } else { 'x86_64' }
+$top = Join-Path $first "abla-toolchain-$bundleArchitecture-windows"
+if ($Architecture -eq 'arm64' -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'Arm64') {
+    Fail 'the ARM64 toolchain exercise requires an ARM64 operating system'
+}
 foreach ($required in 'bin\ablac.exe', 'bin\llvm-objcopy.exe', 'share\abla\stdlib', 'share\abla\runtime\windows\imports\kernel32.txt') {
     if (-not (Test-Path -LiteralPath (Join-Path $top $required))) { Fail "the package has no $required" }
 }
 
 # Nothing on the PATH but Windows itself: the toolchain must bring everything.
-$env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+$env:PATH = "$env:SystemRoot\System32"
+if ($Architecture -eq 'x64') { $env:PATH += ";$env:SystemRoot" }
 foreach ($name in 'ABLA_SYSROOT', 'ABLA_HOME', 'ABLA_LLVM', 'ABLA_LLVM_TOOLS', 'ABLA_LLD') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
 foreach ($tool in 'clang', 'lld-link', 'llvm-objcopy', 'link', 'cl', 'git') {
     if (Get-Command $tool -ErrorAction SilentlyContinue) { Fail "$tool is still on the PATH; the exercise would not prove the package is self-contained" }
 }
 
+function Check-Arm64Image([string]$image) {
+    if ($Architecture -ne 'arm64') { return }
+    $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($image))
+    try {
+        $reader.BaseStream.Position = 0x3c
+        $reader.BaseStream.Position = $reader.ReadUInt32()
+        if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0xaa64) {
+            Fail "$image is not an ARM64 PE"
+        }
+    } finally {
+        $reader.Dispose()
+    }
+}
+
 function Check-Toolchain([string]$root, [string]$label) {
     $ablac = Join-Path $root 'bin\ablac.exe'
+    Check-Arm64Image $ablac
     $reported = (Run $ablac @('--version') "$label --version").Trim()
     if ($reported -cne "ablac $Version") { Fail "$label --version printed '$reported', not 'ablac $Version'" }
     $work = Join-Path $temp "work-$label"
@@ -51,6 +72,7 @@ import "abla/io"
 fun main { println("hello from abla on windows") }
 '@
     Run $ablac @('build', 'hello.ab', '-o', 'hello.exe', '--no-cache') "$label build hello" | Out-Null
+    Check-Arm64Image (Join-Path $work 'hello.exe')
     $said = (Run (Join-Path $work 'hello.exe') @() "$label run hello").Trim()
     if ($said -cne 'hello from abla on windows') { Fail "$label hello printed '$said'" }
     Set-Content -Path helper.ab -Encoding ascii -Value 'fun answer(): int = 41 + 1'
@@ -60,9 +82,14 @@ import "helper.ab"
 fun main { println("answer ${answer()}") }
 '@
     Run $ablac @('build', 'project.ab', '-o', 'project.exe', '--no-cache') "$label build project" | Out-Null
+    Check-Arm64Image (Join-Path $work 'project.exe')
     $said = (Run (Join-Path $work 'project.exe') @() "$label run project").Trim()
     if ($said -cne 'answer 42') { Fail "$label project printed '$said'" }
     Run $ablac @('build', 'hello.ab', '-o', 'hello-backtrace.exe', '--no-cache', '--backtrace') "$label build --backtrace" | Out-Null
+    Check-Arm64Image (Join-Path $work 'hello-backtrace.exe')
+    if ($Architecture -eq 'arm64' -and !(Test-Path -LiteralPath (Join-Path $work 'hello-backtrace.exe.debug') -PathType Leaf)) {
+        Fail "$label --backtrace did not produce split debug information"
+    }
     $said = (Run (Join-Path $work 'hello-backtrace.exe') @() "$label run --backtrace hello").Trim()
     if ($said -cne 'hello from abla on windows') { Fail "$label --backtrace hello printed '$said'" }
 }

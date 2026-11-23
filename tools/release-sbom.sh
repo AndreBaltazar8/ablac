@@ -38,6 +38,15 @@ macos_x86_64=$(shellvar "$root/tools/llvm-macos-pins.sh" LLVM_MACOS_X86_64_SHA25
 windows_url=$(sed -n 's/.*"url": "\([^"]*\)".*/\1/p' "$root/nix/llvm-windows-static-pin.json")
 windows_sha=$(sed -n 's/.*"sha256": "\([^"]*\)".*/\1/p' "$root/nix/llvm-windows-static-pin.json")
 windows_tag=$(printf '%s' "$windows_url" | sed -n 's|.*/releases/download/\([^/]*\)/.*|\1|p')
+windows_arm64_url=
+if [[ -f $assets/ablac-windows-arm64.zip ]]; then
+    windows_arm64_pin=$root/nix/llvm-windows-arm64-static-pin.json
+    windows_arm64_url=$(sed -n 's/.*"url": "\([^"]*\)".*/\1/p' "$windows_arm64_pin")
+    windows_arm64_sha=$(sed -n 's/.*"sha256": "\([^"]*\)".*/\1/p' "$windows_arm64_pin")
+    windows_arm64_tag=$(printf '%s' "$windows_arm64_url" | sed -n 's|.*/releases/download/\([^/]*\)/.*|\1|p')
+    [[ -n $windows_arm64_tag && $windows_arm64_sha =~ ^[0-9a-f]{64}$ ]] ||
+        { echo 'release-sbom: invalid Windows ARM64 LLVM SDK pin' >&2; exit 1; }
+fi
 seed_version=$(sed -n 's/^version=//p' "$root/tools/bootstrap-compiler.sh" | head -n 1)
 seed_linux=$(awk '/^        artifact=ablac-x86_64-linux$/ { want = 1; next } want && /platform_sha256=/ { sub(/.*platform_sha256=/, ""); print; exit }' "$root/tools/bootstrap-compiler.sh")
 # The newest published Xtensa companion release of the catalog: its LLVM version and source commit.
@@ -56,6 +65,9 @@ created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     printf '  "creationInfo": {"created": "%s", "creators": ["Tool: ablac tools/release-sbom.sh"]},\n' "$created"
     printf '  "documentDescribes": ["SPDXRef-ablac"],\n'
     printf '  "packages": [\n'
+    if [[ -n $windows_arm64_url ]]; then
+        printf '    {"SPDXID": "SPDXRef-llvm-windows-arm64", "name": "LLVM and lld for Windows ARM64 (static, /MT)", "versionInfo": "%s", "downloadLocation": "%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION"},\n' "$windows_arm64_tag" "$windows_arm64_url" "$windows_arm64_sha"
+    fi
     printf '    {"SPDXID": "SPDXRef-ablac", "name": "ablac", "versionInfo": "%s", "supplier": "Person: André Baltazar", "downloadLocation": "git+https://github.com/AndreBaltazar8/ablac@%s", "filesAnalyzed": false, "licenseConcluded": "MPL-2.0", "licenseDeclared": "MPL-2.0", "copyrightText": "NOASSERTION", "comment": "The compiler, its standard library and its runtime (all in this repository), as the release assets below."},\n' "$version" "$commit"
     printf '    {"SPDXID": "SPDXRef-llvm-fork", "name": "llvm-project (AndreBaltazar8 fork: Xtensa backend and the InstCombine fdiv fix)", "versionInfo": "%s", "downloadLocation": "https://github.com/AndreBaltazar8/llvm-project/archive/%s.tar.gz", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s", "comment": "nix fetchzip hash (nix base32) of the archive"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION", "comment": "nix/llvm-fork.nix; patch nix/llvm-instcombine-fdiv-zero.patch sha256 %s"},\n' "$llvm_fork_commit" "$llvm_fork_commit" "$llvm_fork_sha" "$patch_sha"
     printf '    {"SPDXID": "SPDXRef-llvm-portable-linux", "name": "llvm-23 prebuilt for Linux (portable archive)", "versionInfo": "%s", "downloadLocation": "https://github.com/AndreBaltazar8/llvm-project/releases/tag/%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION"},\n' "$portable_tag" "$portable_tag" "$portable_sha"
@@ -76,6 +88,9 @@ created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     done < <(find "$assets" -type f | LC_ALL=C sort)
     printf '\n  ],\n  "relationships": [\n'
     printf '    {"spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": "SPDXRef-ablac"},\n'
+    if [[ -n $windows_arm64_url ]]; then
+        printf '    {"spdxElementId": "SPDXRef-ablac", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-llvm-windows-arm64"},\n'
+    fi
     for dependency in llvm-fork llvm-portable-linux llvm-macos-arm64 llvm-macos-x86-64 llvm-windows-x86-64 xtensa-companion nixpkgs seed; do
         printf '    {"spdxElementId": "SPDXRef-ablac", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-%s"},\n' "$dependency"
     done

@@ -5,7 +5,11 @@ project(AblaWindowsCompiler LANGUAGES CXX)
 set(CMAKE_NINJA_FORCE_RESPONSE_FILE ON)
 
 if(NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-  message(FATAL_ERROR "The Windows compiler requires an x64 MSVC toolchain")
+  message(FATAL_ERROR "The Windows compiler requires a 64-bit MSVC toolchain")
+endif()
+set(ABLA_WINDOWS_MACHINE "x64" CACHE STRING "PE machine to link")
+if(NOT ABLA_WINDOWS_MACHINE MATCHES "^(x64|arm64)$")
+  message(FATAL_ERROR "The Windows compiler machine must be x64 or arm64")
 endif()
 
 find_package(LLD 23.1.3 EXACT REQUIRED CONFIG PATHS "${ABLA_LLVM_ROOT}/lib/cmake/lld" NO_DEFAULT_PATH)
@@ -25,5 +29,5 @@ target_include_directories(ablac PRIVATE ${LLVM_INCLUDE_DIRS} ${LLD_INCLUDE_DIRS
 # The compiler calls the ORC C API directly. LLD does not pull in its archive.
 target_link_libraries(ablac PRIVATE lldCOFF lldELF lldWasm LLVMOptDriver LLVMOrcJIT ${windows_imports})
 target_link_options(ablac PRIVATE
-  /entry:wmainCRTStartup /subsystem:console /machine:x64 /brepro /stack:134217728
+  /entry:wmainCRTStartup /subsystem:console "/machine:${ABLA_WINDOWS_MACHINE}" /brepro /stack:134217728
   "/def:${ABLA_IMPORT_DIR}/exports.def")
