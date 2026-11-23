@@ -1689,6 +1689,17 @@ trusted fun __ablaRuntimeCopyStringBytes(value: any, destination: int): void {
 trusted fun __ablaRuntimeAllocateOutOfLine(size: int, layout: int): int =
     __ablaRuntimeAllocateLayout(size, layout)
 
+/// Panics when a concatenation would be longer than a string can be. A rope names a length without holding the bytes, so
+/// doubling a string 62 times makes one of 2^62 bytes with no allocation; a longer length would wrap the sum, and the
+/// flat path would then copy the whole rope into a buffer sized by the wrapped (negative or tiny) total.
+@noinline
+trusted fun __ablaRuntimePanicStringTooLong(left: int, right: int): never =
+    __ablaRuntimePanic("string too long: $left and $right bytes cannot be joined")
+
+/// The longest string (2^62 bytes: no allocation holds one that long, and the sum of two such lengths still fits).
+@inline
+trusted fun __ablaRuntimeStringMaxLength(): int = 4611686018427387904
+
 /// Returns the concatenated byte strings, choosing flat storage or a rope based on the result length.
 trusted fun __ablaRuntimeStringConcat(left: any, right: any): any {
     val leftLength = __ablaRuntimeStringLengthValue(left)
@@ -1697,12 +1708,15 @@ trusted fun __ablaRuntimeStringConcat(left: any, right: any): any {
     else if (rightLength == 0) left
     else if (leftLength + rightLength <= __ablaRuntimeStringFlatLimit()) {
         val length = leftLength + rightLength
+        // Two lengths of 2^62 wrap to a negative sum, which this branch would take for a short string.
+        if (length < 0) __ablaRuntimePanicStringTooLong(leftLength, rightLength)
         val data = __ablaRuntimeAllocateOutOfLine(length + 1, 1)
         __ablaRuntimeCopyStringBytes(left, data)
         __ablaRuntimeCopyStringBytes(right, data + leftLength)
         ablaRuntimeStoreU8(data + length, 0)
         __ablaRuntimeStringStatic(data, length)
     } else {
+        if (leftLength + rightLength > __ablaRuntimeStringMaxLength()) __ablaRuntimePanicStringTooLong(leftLength, rightLength)
         val rope = __ablaRuntimeAllocateOutOfLine(48, 6)
         ablaRuntimeStoreI64(rope, leftLength + rightLength)
         ablaRuntimeStoreI64(rope + 8, __ablaRuntimeWord0(left))
@@ -1726,12 +1740,15 @@ trusted fun __ablaRuntimeStringConcat4(first: any, second: any, third: any, four
     val thirdLength = __ablaRuntimeStringLengthValue(third)
     val fourthLength = __ablaRuntimeStringLengthValue(fourth)
     val length = firstLength + secondLength + thirdLength + fourthLength
+    // Four lengths of up to 2^62 can wrap the sum to a small or negative one: a part of 2^60 or more takes the chain, whose
+    // concatenations check each sum.
+    val huge = (firstLength | secondLength | thirdLength | fourthLength) >= 1152921504606846976
     var parts = 0
     if (firstLength != 0) parts = parts + 1
     if (secondLength != 0) parts = parts + 1
     if (thirdLength != 0) parts = parts + 1
     if (fourthLength != 0) parts = parts + 1
-    if (parts < 2 || length > __ablaRuntimeStringFlatLimit()) {
+    if (parts < 2 || huge || length > __ablaRuntimeStringFlatLimit()) {
         __ablaRuntimeStringConcat(
             __ablaRuntimeStringConcat(__ablaRuntimeStringConcat(first, second), third), fourth
         )

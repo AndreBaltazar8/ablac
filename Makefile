@@ -233,6 +233,7 @@ test-serial: ablac
 	tools/test-wide-integers.sh $(COMPILER) int128
 	tools/test-array-truncate.sh $(COMPILER)
 	tools/test-array-filled.sh $(COMPILER)
+	tools/test-size-overflow.sh $(COMPILER)
 	tools/test-load-alias.sh $(COMPILER)
 	tools/test-darwin-seed-import.sh
 	tools/test-alias-local-shadow.sh $(COMPILER)
