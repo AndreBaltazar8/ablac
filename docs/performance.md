@@ -20,6 +20,47 @@ Two compilers were compared with `tools/bench-compare.py` (compile instructions,
 run cycles and instructions, on `tests/benchmarks`, under `perf`); it was removed with the repository's Python (see git history at a8e65b35), and
 the CI macOS runtime benchmark and `tools/wasm-bench` are what runs today.
 
+## Regions for transient data
+
+Use a checked allocation region when temporary objects share a lifetime.
+In binary-trees, build and check one short-lived tree inside each region.
+Keep the long-lived tree in the enclosing scope. Only the integer checksum
+leaves the transient region, so the runtime can reclaim its pages together.
+[Allocation region rules](regions.md)
+
+```abla
+import "abla/io"
+
+class Node(val left: Node?, val right: Node?)
+
+fun makeTree(depth: int): Node =
+    if (depth == 0) Node(null, null)
+    else Node(makeTree(depth - 1), makeTree(depth - 1))
+
+fun checksum(tree: Node): int {
+    val left = tree.left
+    val right = tree.right
+    if (left != null && right != null) 1 + checksum(left) + checksum(right) else 1
+}
+
+fun main {
+    var total = 0
+    for (round in 0 until 3) {
+        total += region { checksum(makeTree(4)) }
+    }
+    println("$total")
+}
+// output:
+// 93
+```
+
+In seven depth-18 runs on one Linux x86-64 core, a region per transient tree
+cut wall time from 2.10 to 0.89 seconds (58%) and peak RSS from 181 to 88 MiB.
+All checksums matched. A region per depth keeps all completed trees at that
+depth in memory until the loop ends. It took 2.58 seconds (23% slower than
+ordinary allocation) and peaked at 554 MiB. Place the reset where the last
+reference dies, and measure peak memory as well as elapsed time.
+
 ## Faster builds, smaller and faster programs, ten times faster tests (2026-11-03)
 
 Against master `753d1d10` (v0.2.32 plus the previous round), everything below and in the
