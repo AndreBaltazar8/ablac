@@ -12,7 +12,9 @@
 // description n: it refused), C (it closed), W (silence). After an F, the post-handshake variants are sent and the client's next reaction is read the same way:
 // F/A<n>, F/C, F/W (it took the messages, or does not tell). One line per connection, "CASE i tags class", for tools/tls-diff to join across the clients.
 //
-//   flight-server PORT SEED COUNT CERT.PEM KEY.PEM [DUMP_INDEX]
+//   flight-server PORT SEED COUNT CERT.PEM KEY.PEM [DUMP_INDEX [SUITE [KEY_KIND [hrr]]]]
+// SUITE is 4865 (AES-128-GCM, the default), 4866 (AES-256-GCM, SHA-384) or 4867 (ChaCha20-Poly1305); KEY_KIND is p256 (the default), p384, ed25519 or rsa (RSA-PSS): the key of CERT and KEY,
+// and the scheme of the CertificateVerify; with hrr the server first sends a HelloRetryRequest for P-256 with a cookie, and the flight follows the client's second ClientHello.
 import "abla/io"
 import "abla/text"
 import "abla/array"
@@ -54,7 +56,7 @@ fun flRandomBytes(count: int): string = diffBytes(flGenerator, count)
 
 fun flPickText(var r: Prng, values: array<string>): string = values[r.below(values.size)]
 
-fun flBase(): FlParts = FlParts([], "", [], 0, 0, 0, 0x0403, 0, 0, ["EE", "CT", "CV", "FIN"], [], "", "", 0, 0, [], 0, 0, "", -1)
+fun flBase(scheme: int): FlParts = FlParts([], "", [], 0, 0, 0, scheme, 0, 0, ["EE", "CT", "CV", "FIN"], [], "", "", 0, 0, [], 0, 0, "", -1)
 
 /** An extension type a flight message may or may not carry, with a plausible body. */
 fun flExtensionFor(var r: Prng): DiffExt {
@@ -322,7 +324,7 @@ fun flReaction(var connection: TcpConnection, var protection: TlsRecordProtectio
 
 fun main: int {
     if (processArgumentCount() < 5) {
-        println("usage: flight-server PORT SEED COUNT CERT.PEM KEY.PEM [DUMP_INDEX]")
+        println("usage: flight-server PORT SEED COUNT CERT.PEM KEY.PEM [DUMP_INDEX [SUITE [p256|p384|ed25519|rsa [hrr]]]]")
         return 2
     }
     val port = processArgument(0).parseInt() ?? 0
@@ -331,6 +333,15 @@ fun main: int {
     val certificatePem = linuxReadFile(processArgument(3), 65536)
     val keyPem = linuxReadFile(processArgument(4), 65536)
     val dump = if (processArgumentCount() > 5) processArgument(5).parseInt() ?? -1 else -1
+    val suiteCode = if (processArgumentCount() > 6) processArgument(6).parseInt() ?? 4865 else 4865
+    val keyKind = if (processArgumentCount() > 7) processArgument(7) else "p256"
+    val hrr = processArgumentCount() > 8 && processArgument(8) == "hrr"
+    val aead = tlsAeadFor(suiteCode)
+    val keyLength = tlsAeadKeyLength(aead)
+    var baseScheme = 0x0403
+    if (keyKind == "p384") baseScheme = 0x0503
+    if (keyKind == "ed25519") baseScheme = 0x0807
+    if (keyKind == "rsa") baseScheme = 0x0804
     val identity = tlsClientIdentityFromPem(certificatePem, keyPem)
     if (!identity.ok()) {
         println("FAIL identity: ${identity.error}")
@@ -356,29 +367,82 @@ fun main: int {
             connection.close()
             continue
         }
-        val helloMessage = got.slice(5, if (got.size > 5 + wanted) 5 + wanted else got.size)
-        val hello = tlsParseClientHello(helloMessage.slice(4, helloMessage.size))
+        var helloMessage = got.slice(5, if (got.size > 5 + wanted) 5 + wanted else got.size)
+        val firstHello = helloMessage
+        var hello = tlsParseClientHello(helloMessage.slice(4, helloMessage.size))
+        var groupOffered = 29
+        if (hrr) groupOffered = 23
         var share: TlsKeyShare? = null
-        for (s in hello.shares) if (s.group == 29) share = s
-        if (!hello.ok || share == null) {
+        if (!hello.ok) {
             println("CASE $i badclienthello W")
             connection.close()
             continue
         }
         var r = prngSeeded(seed * 100003 + i)
         flGenerator = prngSeeded(seed * 7919 + i)
-        val exchange = tlsServerExchange(29, (share ?? TlsKeyShare(29, "")).publicKey, flRandomBytes)
-        val hash = HKDF_SHA256
-        val serverHello = tlsBuildServerHello(diffBytes(r, 32), hello.sessionId, 4865, TlsKeyShare(29, exchange.publicKey))
+        val hash = tlsSuiteHash(suiteCode)
+        var hrrMessage = ""
+        if (hrr) {
+            // A HelloRetryRequest asks for P-256 (no share for it was sent: the hello offers X25519 first); the second ClientHello must carry the share and echo the cookie.
+            var offersGroup = false
+            for (g in hello.groups) if (g == 23) offersGroup = true
+            if (!offersGroup) {
+                println("CASE $i nogroup W")
+                connection.close()
+                continue
+            }
+            val cookie = diffBytes(r, 16)
+            hrrMessage = tlsBuildHelloRetryRequest(hello.sessionId, suiteCode, 23, cookie)
+            connection.write(tlsPlaintextRecord(22, 771, hrrMessage) + tlsPlaintextRecord(20, 771, "\x01"))
+            var more = ""
+            var second = ""
+            var waits = 0
+            while (second == "" && waits < 8) {
+                waits = waits + 1
+                val incoming = connection.readWithTimeoutResult(65536, 500)
+                if (!incoming.hasData()) break
+                more = more + incoming.bytes
+                while (more.size >= 5 && second == "") {
+                    val length = diffRd16(more, 3)
+                    if (more.size < 5 + length) break
+                    if (more[0] == 22 && length >= 4 && more[5] == 1) second = more.slice(5, 5 + length)
+                    more = more.slice(5 + length, more.size)
+                }
+            }
+            if (second == "") {
+                println("CASE $i noclienthello2 W")
+                connection.close()
+                continue
+            }
+            helloMessage = second
+            hello = tlsParseClientHello(second.slice(4, second.size))
+            if (!hello.ok || hello.cookie != cookie) {
+                println("CASE $i badclienthello2 W")
+                connection.close()
+                continue
+            }
+        }
+        for (s in hello.shares) if (s.group == groupOffered) share = s
+        if (share == null) {
+            println("CASE $i noshare W")
+            connection.close()
+            continue
+        }
+        val exchange = tlsServerExchange(groupOffered, (share ?? TlsKeyShare(groupOffered, "")).publicKey, flRandomBytes)
+        val serverHello = tlsBuildServerHello(diffBytes(r, 32), hello.sessionId, suiteCode, TlsKeyShare(groupOffered, exchange.publicKey))
         var transcript = tlsTranscript()
+        if (hrr) {
+            transcript.add(tlsHandshakeMessage(254, tlsHashOf(hash, firstHello)))
+            transcript.add(hrrMessage)
+        }
         transcript.add(helloMessage)
         transcript.add(serverHello)
         connection.write(tlsPlaintextRecord(22, 771, serverHello) + tlsPlaintextRecord(20, 771, "\x01"))
         val early = tlsEarlySecret(hash, "")
         val secrets = tlsDeriveHandshakeSecrets(hash, early, exchange.secret, transcript.hash(hash))
-        var write = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, secrets.serverTraffic, 16), tlsTrafficIv(hash, secrets.serverTraffic))
-        var clientRead = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, secrets.clientTraffic, 16), tlsTrafficIv(hash, secrets.clientTraffic))
-        var parts = flBase()
+        var write = tlsRecordProtection(aead, tlsTrafficKey(hash, secrets.serverTraffic, keyLength), tlsTrafficIv(hash, secrets.serverTraffic))
+        var clientRead = tlsRecordProtection(aead, tlsTrafficKey(hash, secrets.clientTraffic, keyLength), tlsTrafficIv(hash, secrets.clientTraffic))
+        var parts = flBase(baseScheme)
         val rounds = 1 + (if (r.below(5) == 0) 1 else 0)
         var tags = ""
         for (k in 0 until rounds) tags = tags + (if (k > 0) "+" else "") + flMutate(r, parts, [])
@@ -394,7 +458,7 @@ fun main: int {
             } else if (name == "CV") {
                 // The signature is over the transcript through the Certificate (whatever was sent before this message).
                 val over = tlsCertificateVerifyContent(true, transcript.hash(hash))
-                var signature = identity.sign(0x0403, over)
+                var signature = identity.sign(baseScheme, over)
                 if (parts.sigMode == 1 && signature.size > 1) signature = signature.slice(0, signature.size - 1)
                 if (parts.sigMode == 2) signature = signature + "\x00"
                 if (parts.sigMode == 3 && signature.size > 10) signature = signature.slice(0, 5) + cryptoByteString([signature[5] ^ 1]) + signature.slice(6, signature.size)
@@ -484,7 +548,7 @@ fun main: int {
         if (reaction == "F" && parts.postMode > 0) {
             // The post-handshake variants, under the server's application keys.
             val application = tlsDeriveApplicationSecrets(hash, secrets.handshakeSecret, transcript.hash(hash))
-            var applicationWrite = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, application.serverTraffic, 16), tlsTrafficIv(hash, application.serverTraffic))
+            var applicationWrite = tlsRecordProtection(aead, tlsTrafficKey(hash, application.serverTraffic, keyLength), tlsTrafficIv(hash, application.serverTraffic))
             val post = flPost(r, parts.postMode)
             var out = ""
             for (piece in post.records) {

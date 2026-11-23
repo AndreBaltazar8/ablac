@@ -8,8 +8,25 @@ out=$1 programs=$2 seed=$3 count=$4
 mkdir -p "$out"
 cert=${5:-$out/c.pem}
 key=${6:-$out/k.pem}
+# Round 5: FLIGHT_SUITE (4865 AES-128-GCM, 4866 AES-256-GCM, 4867 ChaCha20-Poly1305), FLIGHT_KIND (p256, p384, ed25519, rsa: the server's key, in OUTDIR when it is not p256) and
+# FLIGHT_HRR=1 (a HelloRetryRequest for P-256 first) change what the TLS 1.3 server does; the TLS 1.2 server ignores them.
+suite=${FLIGHT_SUITE:-4865}
+kind=${FLIGHT_KIND:-p256}
+hrr_argument=()
+[[ -n ${FLIGHT_HRR:-} ]] && hrr_argument=(hrr)
+if [[ $kind != p256 ]]; then
+    cert=$out/c-$kind.pem
+    key=$out/k-$kind.pem
+fi
 if [[ ! -f $cert ]]; then
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$key" -out "$cert" -subj /CN=localhost -addext subjectAltName=DNS:localhost -days 2 2> /dev/null
+    case $kind in
+        p256) algorithm=(-newkey ec -pkeyopt ec_paramgen_curve:prime256v1) ;;
+        p384) algorithm=(-newkey ec -pkeyopt ec_paramgen_curve:secp384r1) ;;
+        ed25519) algorithm=(-newkey ed25519) ;;
+        rsa) algorithm=(-newkey rsa:2048) ;;
+        *) echo "flight: unknown FLIGHT_KIND $kind" >&2; exit 2 ;;
+    esac
+    openssl req -x509 "${algorithm[@]}" -nodes -keyout "$key" -out "$cert" -subj /CN=localhost -addext subjectAltName=DNS:localhost -days 2 2> /dev/null
 fi
 base=${FLIGHT_PORT:-29000}
 server_program=flight-server
@@ -23,7 +40,7 @@ fi
 pids=()
 trap 'for p in "${pids[@]}"; do kill "$p" 2> /dev/null || true; done' EXIT
 for index in 0 1 2; do
-    "$programs/$server_program" $((base + index)) "$seed" "$count" "$cert" "$key" > "$out/fs-$index.out" 2>&1 &
+    "$programs/$server_program" $((base + index)) "$seed" "$count" "$cert" "$key" -1 "$suite" "$kind" "${hrr_argument[@]}" > "$out/fs-$index.out" 2>&1 &
     pids+=("$!")
 done
 for ((w = 0; w < 100; w++)); do

@@ -14,7 +14,9 @@
 #   tools/tls-diff/run.sh COMPILER flight|flight12|cflight|cflightauth|cflight12|cresume INSTANCES FIRST_SEED CASES_PER_INSTANCE   (round 3: see below)
 #
 # Round 3 (the encrypted part of the handshake, with a real handshake behind each case; flight.sh and cflight.sh print the combinations and the LENIENT and STRICT lines):
-#   flight      our client against a hostile TLS 1.3 server (flight-server.ab) that changes its encrypted flight and the post-handshake messages, against openssl s_client and Go
+#   flight      our client against a hostile TLS 1.3 server (flight-server.ab) that changes its encrypted flight and the post-handshake messages, against openssl s_client and Go;
+#               FLIGHT_SUITE=4865|4866|4867 (AES-128, AES-256, ChaCha20), FLIGHT_KIND=p256|p384|ed25519|rsa (the certificate key, RSA-PSS for rsa) and FLIGHT_HRR=1 (a HelloRetryRequest for
+#               P-256 first) in the environment change the server (round 5)
 #   flight12    the same for TLS 1.2 (flight12-server.ab)
 #   cflight     our server against a hostile TLS 1.3 client (cflight.ab) that changes its Finished flight and the post-handshake messages, against openssl s_server and Go
 #   cflightauth the same with client certificates required: the Certificate and CertificateVerify are changed too
