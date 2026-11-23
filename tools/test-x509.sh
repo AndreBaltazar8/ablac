@@ -28,7 +28,7 @@ done
 echo "ok   X.509 chains, host names, damaged certificates"
 "$out/p384" tests/cases/p384/vectors
 echo "ok   P-384 ECDSA against Wycheproof"
-for cases in limbo-core limbo-bettertls-nc; do
+for cases in limbo-core limbo-bettertls-nc limbo-client; do
     "$out/limbo" "tests/cases/x509/limbo/$cases.json" tests/cases/x509/limbo/known.tsv
 done
-echo "ok   x509-limbo and BetterTLS cases"
+echo "ok   x509-limbo (server and client) and BetterTLS cases"
