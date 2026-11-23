@@ -2053,6 +2053,7 @@ private fun bootstrapLlvmDenseLocalIntegers(
             val id = owner[value]
             if (id < 0 || allowed[id] == 0) continue
             val opcode = instruction.opcode
+            if (opcode == "array.copy.dense" && position < 2) continue
             val local = opcode == "local.declare" && at == declarations[id]
             val appended = if (opcode == "array.append" && instruction.operands.size == 2)
                 instruction.operands[1] else -1
@@ -2068,8 +2069,8 @@ private fun bootstrapLlvmDenseLocalIntegers(
     owner
 }
 
-private fun bootstrapLlvmDenseArrayElement(
-    backend: BootstrapLlvmBackend, function: i64*, array: i64*, index: i64*, word: i64*
+private @inline fun bootstrapLlvmDenseArrayAddress(
+    backend: BootstrapLlvmBackend, array: i64*
 ): i64* {
     val payload = LLVMBuildStructGEP2(
         backend.builder, backend.valueType, array, 2, "dense.array.payload"
@@ -2077,10 +2078,34 @@ private fun bootstrapLlvmDenseArrayElement(
     val field = LLVMBuildStructGEP2(
         backend.builder, backend.payloadType, payload, 0, "dense.array.reference"
     )
-    val address = LLVMBuildLoad2(backend.builder, backend.i64Type, field, "dense.array.address")
+    LLVMBuildLoad2(backend.builder, backend.i64Type, field, "dense.array.address")
+}
+
+private @inline fun bootstrapLlvmDenseArrayLength(backend: BootstrapLlvmBackend, address: i64*): i64* {
     val header = LLVMBuildIntToPtr(backend.builder, address, backend.pointerType, "dense.array.header")
     val length = LLVMBuildLoad2(backend.builder, backend.i64Type, header, "dense.array.length")
     LLVMSetMetadata(length, backend.aliasKind, backend.aliasArrayHeader)
+    length
+}
+
+private @inline fun bootstrapLlvmDenseArraySlot(
+    backend: BootstrapLlvmBackend, address: i64*, index: i64*
+): i64* {
+    val dataField = LLVMBuildAdd(backend.builder, address, LLVMConstInt(backend.i64Type, 16, 0),
+        "dense.array.data.field")
+    val dataPointer = LLVMBuildIntToPtr(backend.builder, dataField, backend.pointerType, "dense.array.data.pointer")
+    val data = LLVMBuildLoad2(backend.builder, backend.i64Type, dataPointer, "dense.array.data")
+    LLVMSetMetadata(data, backend.aliasKind, backend.aliasArrayHeader)
+    val offset = LLVMBuildMul(backend.builder, index, LLVMConstInt(backend.i64Type, 8, 0), "dense.array.offset")
+    val slot = LLVMBuildAdd(backend.builder, data, offset, "dense.array.slot")
+    LLVMBuildIntToPtr(backend.builder, slot, backend.pointerType, "dense.array.element")
+}
+
+private fun bootstrapLlvmDenseArrayElement(
+    backend: BootstrapLlvmBackend, function: i64*, array: i64*, index: i64*, word: i64*
+): i64* {
+    val address = bootstrapLlvmDenseArrayAddress(backend, array)
+    val length = bootstrapLlvmDenseArrayLength(backend, address)
     // Array lengths are nonnegative, so an unsigned comparison rejects
     // negative indices and indices past the last element in one check.
     val valid = LLVMBuildICmp(
@@ -2099,14 +2124,55 @@ private fun bootstrapLlvmDenseArrayElement(
     }
     LLVMBuildUnreachable(backend.builder)
     LLVMPositionBuilderAtEnd(backend.builder, ready)
-    val dataField = LLVMBuildAdd(backend.builder, address, LLVMConstInt(backend.i64Type, 16, 0),
-        "dense.array.data.field")
-    val dataPointer = LLVMBuildIntToPtr(backend.builder, dataField, backend.pointerType, "dense.array.data.pointer")
-    val data = LLVMBuildLoad2(backend.builder, backend.i64Type, dataPointer, "dense.array.data")
-    LLVMSetMetadata(data, backend.aliasKind, backend.aliasArrayHeader)
-    val offset = LLVMBuildMul(backend.builder, index, LLVMConstInt(backend.i64Type, 8, 0), "dense.array.offset")
-    val slot = LLVMBuildAdd(backend.builder, data, offset, "dense.array.slot")
-    LLVMBuildIntToPtr(backend.builder, slot, backend.pointerType, "dense.array.element")
+    bootstrapLlvmDenseArraySlot(backend, address, index)
+}
+
+private @noinline fun bootstrapLlvmDenseArrayCopy(
+    backend: BootstrapLlvmBackend, function: i64*, storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction
+): i64* {
+    val no = LLVMConstInt(backend.i1Type, 0, 0)
+    val destination = instruction.operands[0]
+    val source = instruction.operands[1]
+    if (destination >= storage.denseWords.size || source >= storage.denseWords.size ||
+        storage.denseWords[destination] < 0 || storage.denseWords[source] < 0) return no
+    val begin = bootstrapLlvmScalarOperand(backend, storage, instruction.operands[2], "i64")
+    val end = bootstrapLlvmScalarOperand(backend, storage, instruction.operands[3], "i64")
+    val destinationAddress = bootstrapLlvmDenseArrayAddress(backend, storage.values[destination])
+    val sourceAddress = bootstrapLlvmDenseArrayAddress(backend, storage.values[source])
+    val destinationLength = bootstrapLlvmDenseArrayLength(backend, destinationAddress)
+    val sourceLength = bootstrapLlvmDenseArrayLength(backend, sourceAddress)
+    val advance = instruction.text == "advance"
+    val nonempty = LLVMBuildICmp(backend.builder, llvmIntUnsignedLessThan(), begin, end,
+        "dense.copy.nonempty")
+    val destinationFits = LLVMBuildICmp(backend.builder, llvmIntUnsignedLessOrEqual(), end,
+        destinationLength, "dense.copy.destination.fits")
+    val sourceFits = LLVMBuildICmp(backend.builder,
+        if (advance) llvmIntUnsignedLessThan() else llvmIntUnsignedLessOrEqual(),
+        end, sourceLength, "dense.copy.source.fits")
+    val fits = LLVMBuildAnd(backend.builder, destinationFits, sourceFits, "dense.copy.fits")
+    val valid = LLVMBuildAnd(backend.builder, nonempty, fits, "dense.copy.valid")
+    val checked = LLVMGetInsertBlock(backend.builder)
+    val copy = LLVMAppendBasicBlockInContext(backend.context, function, "dense.copy")
+    val done = LLVMAppendBasicBlockInContext(backend.context, function, "dense.copy.done")
+    LLVMBuildCondBr(backend.builder, valid, copy, done)
+    LLVMPositionBuilderAtEnd(backend.builder, copy)
+    val sourceBegin = if (advance) LLVMBuildAdd(backend.builder, begin,
+        LLVMConstInt(backend.i64Type, 1, 0), "dense.copy.source.begin") else begin
+    val from = bootstrapLlvmDenseArraySlot(backend, sourceAddress, sourceBegin)
+    val to = bootstrapLlvmDenseArraySlot(backend, destinationAddress, begin)
+    val words = LLVMBuildSub(backend.builder, end, begin, "dense.copy.words")
+    val bytes = LLVMBuildMul(backend.builder, words, LLVMConstInt(backend.i64Type, 8, 0),
+        "dense.copy.bytes")
+    // With the same backing array the ranges coincide or the destination
+    // starts one element earlier. Both match the original forward copy.
+    LLVMBuildMemMove(backend.builder, to, 8, from, 8, bytes)
+    LLVMBuildBr(backend.builder, done)
+    LLVMPositionBuilderAtEnd(backend.builder, done)
+    val result = LLVMBuildPhi(backend.builder, backend.i1Type, "dense.copy.performed")
+    bootstrapLlvmAddPhiIncoming(result, no, checked)
+    bootstrapLlvmAddPhiIncoming(result, LLVMConstInt(backend.i1Type, 1, 0), copy)
+    result
 }
 
 fun bootstrapLlvmEmitScalarOperation(
@@ -9171,6 +9237,11 @@ fun bootstrapLlvmEmitFunction(
                  )],
                 "", true, [false, false, false]
             )
+        }
+        if (reachable && opcodeHead == 97 && opcode == "array.copy.dense") {
+            matched = true
+            val copied = bootstrapLlvmDenseArrayCopy(backend, llvmFunction, storage, instruction)
+            bootstrapLlvmSetNativeValue(backend, storage, instruction.result, copied)
         }
         if (reachable && (opcodeHead == 105 && opcode == "index.set")) {
             matched = true

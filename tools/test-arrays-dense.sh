@@ -130,3 +130,36 @@ END {
 AWK
 awk -f "$output_directory/scalars.awk" "$output_directory/scalars.ll" "$output_directory/scalars.ll" || { echo 'scalar arrays: scalar store lowering guard failed' >&2; exit 1; }
 echo "scalar arrays: native words, exact float bits, boxed fallback, checked bounds and staged stores"
+
+copy_source="$project_root/tests/cases/arrays-dense/copy.ab"
+"$compiler" --emit-llvm "$copy_source" > "$output_directory/copy.ll"
+copies=$(awk '
+    /call void @llvm\.memmove.*%dense\.array\.element/ { copies++ }
+    END { print copies + 0 }
+' "$output_directory/copy.ll")
+[[ $copies == 2 ]] || { echo "dense array copy: expected two guarded word transfers, found $copies" >&2; exit 1; }
+for profile in release fast; do
+    flags=()
+    [[ $profile == release ]] || flags=(--fast)
+    "$compiler" build "$copy_source" --no-cache -o "$output_directory/copy-$profile" "${flags[@]}"
+    for stress in 0 1; do
+        status=0
+        ABLA_GC_STRESS=$stress "$output_directory/copy-$profile" || status=$?
+        [[ $status == 42 ]] || exit 1
+    done
+    for mode in negative destination source shift-bound; do
+        case $mode in
+            negative) index=-1 size=3 ;;
+            destination) index=2 size=2 ;;
+            source) index=3 size=3 ;;
+            shift-bound) index=4 size=4 ;;
+        esac
+        status=0
+        "$output_directory/copy-$profile" "$mode" > "$output_directory/trap.out" \
+            2> "$output_directory/trap.err" || status=$?
+        [[ $status == 101 ]] || { cat "$output_directory/trap.err"; exit 1; }
+        IFS= read -r message < "$output_directory/trap.err"
+        [[ $message == "panic: index $index out of bounds for array of size $size" ]] || exit 1
+    done
+done
+echo "dense array copy: guarded copy, overlapping left shift, boxed fallback and bounds diagnostics"

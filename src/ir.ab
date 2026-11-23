@@ -12861,6 +12861,67 @@ fun bootstrapSmallCountedWhile(test: BootstrapExpression, body: BootstrapExpress
         increment.kind == "integer" && increment.text == "1"
 }
 
+// Recognize a forward, unit-stride copy. The native backend can decline
+// the copy; the original loop then performs its writes and checks in order.
+private @noinline fun bootstrapPrepareArrayCopy(
+    var lowerer: BootstrapLowerer, test: BootstrapExpression, body: BootstrapExpression,
+    mergeLabel: int
+): void {
+    if (test.kind != "<" || test.children.size != 2) return
+    val counter = test.children[0]
+    val limit = test.children[1]
+    if (counter.kind != "identifier" || limit.kind != "identifier" ||
+        counter.text == limit.text) return
+    val assignment = body.children[0]
+    val update = body.children[1]
+    if (assignment.children.size != 3 || update.kind != "assign" ||
+        update.text != counter.text || update.children.size != 1) return
+    val step = update.children[0]
+    if (!bootstrapArrayCopyUnitStep(step, counter.text)) return
+    val target = assignment.children[0]
+    val index = assignment.children[1]
+    val read = assignment.children[2]
+    if (target.kind != "identifier" || index.kind != "identifier" ||
+        index.text != counter.text || read.kind != "index" || read.children.size != 2) return
+    val source = read.children[0]
+    val sourceIndex = read.children[1]
+    if (source.kind != "identifier") return
+    val sameIndex = sourceIndex.kind == "identifier" && sourceIndex.text == counter.text
+    if (!sameIndex && !bootstrapArrayCopyUnitStep(sourceIndex, counter.text)) return
+    val startLocal = lowerer.visibleLocal(counter.text, true)
+    val endLocal = lowerer.visibleLocal(limit.text, true)
+    val targetLocal = lowerer.visibleLocal(target.text, true)
+    val sourceLocal = lowerer.visibleLocal(source.text, true)
+    if (startLocal < 0 || targetLocal < 0 || sourceLocal < 0 ||
+        lowerer.localTypes[startLocal] != "i64" ||
+        lowerer.localTypes[targetLocal] != "array:i64" ||
+        lowerer.localTypes[sourceLocal] != "array:i64") return
+    if (endLocal >= 0) {
+        if (lowerer.localTypes[endLocal] != "i64") return
+    } else if (!lowerer.isParameter(limit.text) || lowerer.isCapturedParameter(limit.text) ||
+        lowerer.lowerParameterMetadataType(limit.text) != "i64") return
+    val begin = lowerer.emit("local.load", -1, -1, lowerer.localStorage[startLocal])
+    val end = if (endLocal >= 0) lowerer.emit("local.load", -1, -1, lowerer.localStorage[endLocal])
+        else lowerer.emit("parameter.load", -1, -1, limit.text)
+    val destination = lowerer.emit("local.load", -1, -1, lowerer.localStorage[targetLocal])
+    val origin = lowerer.emit("local.load", -1, -1, lowerer.localStorage[sourceLocal])
+    val copied = lowerer.emitMany("array.copy.dense", [destination, origin, begin, end],
+        if (sameIndex) "" else "advance")
+    val advance = lowerer.allocateLabel()
+    val checkedLabel = lowerer.allocateLabel()
+    lowerer.emitControl("branch", copied, advance, checkedLabel, "")
+    lowerer.emitControl("label", -1, advance, -1, "")
+    lowerer.emit("local.assign", end, -1, lowerer.localStorage[startLocal])
+    lowerer.emitControl("jump", -1, mergeLabel, -1, "")
+    lowerer.emitControl("label", -1, checkedLabel, -1, "")
+    return
+}
+
+private fun bootstrapArrayCopyUnitStep(step: BootstrapExpression, counter: string): bool =
+    step.kind == "+" && step.children.size == 2 &&
+    step.children[0].kind == "identifier" && step.children[0].text == counter &&
+    step.children[1].kind == "integer" && step.children[1].text == "1"
+
 @noinline
 fun bootstrapLowerWhile(
     var lowerer: BootstrapLowerer,
@@ -12883,6 +12944,10 @@ fun bootstrapLowerWhile(
     lowerer.continueLabel = conditionLabel
     lowerer.breakScope = lowerer.currentScope
     lowerer.continueScope = lowerer.currentScope
+    if (build == null && body.kind == "block" && body.children.size == 2 &&
+        body.children[0].kind == "index.assign" && !lowerer.validationOnly) {
+        bootstrapPrepareArrayCopy(lowerer, test, body, mergeLabel)
+    }
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, conditionLabel, -1, "")
     val conditionMark = lowerer.locals.size
