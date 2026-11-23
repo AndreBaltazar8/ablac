@@ -6,7 +6,9 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
-for parser in http1; do
-    tools/fuzz/parsers/run "$parser" --compiler "$compiler" --seeds 1-20 --inputs 100 || { echo "fuzz-parsers: $parser reported a finding" >&2; exit 1; }
+# name seeds inputs: h2 builds a connection per input, so it gets fewer.
+for entry in "http1 1-20 100" "h2 1-10 50"; do
+    read -r parser seeds inputs <<< "$entry"
+    tools/fuzz/parsers/run "$parser" --compiler "$compiler" --seeds "$seeds" --inputs "$inputs" || { echo "fuzz-parsers: $parser reported a finding" >&2; exit 1; }
 done
-echo "fuzz-parsers: http1 20 seeds x 100 inputs, no finding"
+echo "fuzz-parsers: http1 (20 seeds x 100 inputs) and h2 (10 seeds x 50), no finding"

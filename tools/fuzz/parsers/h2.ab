@@ -1,0 +1,232 @@
+// HTTP/2 server state machine and HPACK against hostile frames (#1139 area 4). The server (abla/http/h2/server) is driven in memory with
+// feed(bytes, now); four scenarios per input:
+//   0 mixed: a connection preface, then random frames of every type (valid-looking fields, then byte mutations), fed in random chunks;
+//   1 rapid reset (CVE-2023-44487): HEADERS + RST_STREAM pairs at one instant, which must end the connection within the reset budget;
+//   2 CONTINUATION flood: a HEADERS without END_HEADERS and CONTINUATIONs after it, which must end the connection within the block limits;
+//   3 HPACK: raw header blocks (table size updates, indexed and literal fields, Huffman strings, huge integers) into a decoder, which must stay in its limits.
+// The invariants: no crash or hang; open streams never above the limit plus the one being made; what the server writes is bounded by
+// the bytes it read (control frames are answered one for one, a flood ends the connection); a closed connection writes nothing more
+// and reads nothing; the HPACK table never above its advertised size and a block never above its field and list limits.
+//
+//   tools/fuzz/parsers/run h2 --seeds 1-200 [--inputs 200]
+import "abla/io"
+import "abla/text"
+import "abla/integer"
+import "abla/http"
+import "abla/http/h2"
+import "abla/http/h2/server"
+import "abla/http/h2/hpack"
+import "abla/process/arguments"
+import "../prng.ab"
+import "./mutate.ab"
+
+val H2_FUZZ_STREAMS = 8
+
+fun h2FuzzBlock(var r: Prng): string {
+    var encoder = hpackEncoderNew(4096)
+    var fields: array<HpackField> = [HpackField(":method", "GET"), HpackField(":scheme", "https"), HpackField(":path", "/${r.below(100)}"), HpackField(":authority", "a")]
+    if (r.below(3) == 0) fields.append(HpackField("x-${r.below(9)}", mutateBytes(r, r.below(40))))
+    if (r.below(6) == 0) fields.append(HpackField(":method", "POST"))
+    if (r.below(6) == 0) fields.append(HpackField("content-length", "${r.below(100)}"))
+    if (r.below(8) == 0) fields.append(HpackField("TE", "trailers"))
+    var block = encoder.encode(fields)
+    if (r.below(4) == 0) block = mutate(r, block)
+    block
+}
+
+fun h2FuzzStream(var r: Prng): int {
+    val kind = r.below(10)
+    if (kind == 0) return 0
+    if (kind == 1) return 2 * (1 + r.below(H2_FUZZ_STREAMS))
+    if (kind == 2) return 2147483647
+    1 + 2 * r.below(H2_FUZZ_STREAMS)
+}
+
+fun h2FuzzFrame(var r: Prng): string {
+    val kind = r.below(14)
+    val stream = h2FuzzStream(r)
+    val flags = if (r.below(3) == 0) r.below(256) else r.pickInt([0, 1, 4, 5, 8, 32])
+    if (kind == 0) return h2Frame(0, flags, stream, mutateBytes(r, r.below(40)))
+    if (kind == 1) return h2Frame(1, flags, stream, h2FuzzBlock(r))
+    if (kind == 2) return h2Frame(2, flags, stream, mutateBytes(r, if (r.below(4) == 0) r.below(9) else 5))
+    if (kind == 3) return h2Frame(3, flags, stream, mutateBytes(r, if (r.below(4) == 0) r.below(9) else 4))
+    if (kind == 4) {
+        var payload = ""
+        val settings = r.below(4)
+        for (i in 0 until settings) payload = payload + h2Setting(r.below(9), if (r.below(3) == 0) r.below(4294967296) else r.below(70000))
+        return h2Frame(4, if (r.below(5) == 0) 1 else 0, if (r.below(8) == 0) stream else 0, if (r.below(8) == 0) payload + mutateBytes(r, 1 + r.below(5)) else payload)
+    }
+    if (kind == 5) return h2Frame(5, flags, stream, mutateBytes(r, r.below(40)))
+    if (kind == 6) return h2Frame(6, flags, if (r.below(8) == 0) stream else 0, mutateBytes(r, if (r.below(6) == 0) r.below(12) else 8))
+    if (kind == 7) return h2Frame(7, flags, if (r.below(8) == 0) stream else 0, mutateBytes(r, 8 + r.below(12)))
+    if (kind == 8) return h2Frame(8, flags, if (r.below(3) == 0) 0 else stream, h2Be32(if (r.below(4) == 0) r.below(4294967296) else r.below(70000)))
+    if (kind == 9) return h2Frame(9, flags, stream, h2FuzzBlock(r))
+    if (kind == 10) return h2Frame(10 + r.below(246), flags, stream, mutateBytes(r, r.below(30)))
+    // A length that lies: the frame header says more than the payload that follows, or less.
+    if (kind == 11) return mutate(r, h2Frame(r.below(10), flags, stream, mutateBytes(r, r.below(30))))
+    if (kind == 12) return h2Frame(0, flags, stream, mutateBytes(r, 1 + r.below(2000)))
+    mutateBytes(r, 1 + r.below(30))
+}
+
+/** A description of what is wrong when the connection, after `input` bytes were fed, broke an invariant, else "". */
+fun h2FuzzCheck(server: H2Server, input: int, output: int, label: string): string {
+    if (server.openStreams() > 100 + 1) return "$label: ${server.openStreams()} open streams over the limit of 100"
+    if (output > 4096 + 6 * input + H2_MAX_OUTPUT_BYTES) return "$label: ${output} bytes written for ${input} read"
+    ""
+}
+
+fun h2FuzzMixed(var r: Prng, seed: int, n: int, verbose: bool): string {
+    var server = h2ServerNew()
+    var wire = if (r.below(10) == 0) mutate(r, H2_PREFACE) else H2_PREFACE
+    wire = wire + h2Frame(4, 0, 0, "")
+    val frames = 1 + r.below(60)
+    for (i in 0 until frames) wire = wire + h2FuzzFrame(r)
+    if (verbose) println("input seed=$seed n=$n mixed ${wire.size} bytes ${mutateEscape(wire.slice(0, 300))}")
+    var at = 0
+    var written = 0
+    var fed = 0
+    var now = 1000
+    var wasClosed = false
+    while (at < wire.size) {
+        val step = 1 + r.below(if (r.below(4) == 0) 20 else 4000)
+        val piece = wire.slice(at, if (at + step > wire.size) wire.size else at + step)
+        at = at + piece.size
+        now = now + r.below(30)
+        server.feed(piece, now)
+        fed = fed + piece.size
+        val out = server.takeOutput()
+        if (wasClosed && out.size > 0) return "mixed: a closed connection wrote ${out.size} bytes"
+        written = written + out.size
+        val requests = server.takeRequests()
+        for (request in requests) server.respond(request.stream, 200, [], "ok")
+        written = written + server.takeOutput().size
+        val bad = h2FuzzCheck(server, fed, written, "mixed")
+        if (bad != "") return bad
+        wasClosed = server.isClosed()
+    }
+    server.tick(now + 20000)
+    ""
+}
+
+fun h2FuzzRapidReset(var r: Prng): string {
+    var server = h2ServerNew()
+    server.feed(H2_PREFACE + h2Frame(4, 0, 0, ""), 5000)
+    var encoder = hpackEncoderNew(4096)
+    val block = encoder.encode([HpackField(":method", "GET"), HpackField(":scheme", "https"), HpackField(":path", "/"), HpackField(":authority", "a")])
+    val pairs = 1000 + r.below(2000)
+    var stream = 1
+    var decoded = 0
+    var written = 0
+    for (i in 0 until pairs) {
+        if (server.isClosed()) break
+        // END_HEADERS only: the stream stays open until the client resets it. Some pairs also finish the request first.
+        val finish = r.below(4) == 0
+        server.feed(h2Frame(1, if (finish) 5 else 4, stream, block) + h2Frame(3, 0, stream, h2Be32(8)), 5000 + r.below(400))
+        stream = stream + 2
+        decoded = decoded + 1
+        written = written + server.takeOutput().size
+        server.takeRequests()
+    }
+    if (!server.isClosed()) return "rapid reset: $decoded HEADERS+RST_STREAM pairs inside one second and the connection is still open"
+    if (decoded > 250) return "rapid reset: $decoded pairs accepted before the connection ended (budget is 200 per second)"
+    if (written > 1 + 40 * decoded + 1024) return "rapid reset: $written bytes written for $decoded pairs"
+    ""
+}
+
+fun h2FuzzContinuationFlood(var r: Prng): string {
+    var server = h2ServerNew()
+    server.feed(H2_PREFACE + h2Frame(4, 0, 0, ""), 5000)
+    // HEADERS without END_HEADERS, then CONTINUATIONs of 16 KiB each with a block that never ends (valid literal bytes or noise).
+    val chunk = if (r.below(2) == 0) mutateBytes(r, 16384) else "\x00\x01a\x01b".repeat(4000).slice(0, 16384)
+    var sent = 0
+    server.feed(h2Frame(1, 0, 1, chunk), 5001)
+    sent = sent + 16384
+    var frames = 0
+    while (!server.isClosed() && frames < 200) {
+        server.feed(h2Frame(9, 0, 1, chunk), 5002)
+        sent = sent + 16384
+        frames = frames + 1
+    }
+    if (!server.isClosed()) return "continuation flood: $sent bytes of CONTINUATION accepted and the connection is still open"
+    if (sent > H2_MAX_BLOCK_BYTES + 3 * 16384) return "continuation flood: $sent bytes accepted before the connection ended (limit ${H2_MAX_BLOCK_BYTES})"
+    ""
+}
+
+fun h2FuzzHpackBlock(var r: Prng): string {
+    var block = ""
+    val parts = 1 + r.below(30)
+    for (i in 0 until parts) {
+        val kind = r.below(8)
+        if (kind == 0) block = block + "\x3f" + mutateBytes(r, 1 + r.below(6))
+        else if (kind == 1) block = block + "\x7f\xff\xff\xff\xff\xff\xff\x7f"
+        else if (kind == 2) block = block + "\x40\x7f" + mutateBytes(r, r.below(5))
+        else if (kind == 3) block = block + mutateBytes(r, 1 + r.below(12))
+        else if (kind == 4) block = block + "\xff" + mutateBytes(r, r.below(4))
+        else if (kind == 5) block = block + "\x40\x01a\x0f" + mutateBytes(r, r.below(30))
+        else if (kind == 6) block = block + "\x40\x83" + mutateBytes(r, 3) + "\x81" + mutateBytes(r, 1)
+        else block = block + h2FuzzBlock(r)
+    }
+    block
+}
+
+fun h2FuzzHpack(var r: Prng): string {
+    var decoder = hpackDecoderNew(4096, 65536, 8192, 128)
+    for (round in 0 until 20) {
+        val block = h2FuzzHpackBlock(r)
+        val result = decoder.decode(block)
+        if (result.ok) {
+            if (result.fields.size > 128) return "hpack: ${result.fields.size} fields from one block over the limit of 128"
+            var total = 0
+            for (field in result.fields) {
+                if (field.name.size > 8192 || field.value.size > 8192) return "hpack: a field of ${field.name.size}+${field.value.size} bytes over the limit of 8192"
+                total = total + field.name.size + field.value.size + 32
+            }
+            if (total > 65536) return "hpack: a header list of $total bytes over the limit of 65536"
+        }
+        if (decoder.tableBytes() > 4096) return "hpack: the dynamic table holds ${decoder.tableBytes()} bytes, above the advertised 4096"
+        if (!result.ok) return ""
+    }
+    ""
+}
+
+fun main: int {
+    var low = 1
+    var high = 50
+    var inputs = 200
+    var verbose = false
+    val count = processArgumentCount()
+    var index = 1
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "--seeds") {
+            val dash = value.indexOf("-")
+            low = (if (dash < 0) value else value.slice(0, dash)).parseInt() ?? 1
+            high = (if (dash < 0) value else value.slice(dash + 1, value.size)).parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--inputs") {
+            inputs = value.parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--verbose") verbose = true
+        index = index + 1
+    }
+    var findings = 0
+    for (seed in low until high + 1) {
+        var r = prngSeeded(seed)
+        for (n in 0 until inputs) {
+            val scenario = r.below(20)
+            var problem = ""
+            if (verbose) println("input seed=$seed n=$n scenario ${scenario}")
+            if (scenario < 12) problem = h2FuzzMixed(r, seed, n, verbose)
+            else if (scenario < 14) problem = h2FuzzRapidReset(r)
+            else if (scenario < 16) problem = h2FuzzContinuationFlood(r)
+            else problem = h2FuzzHpack(r)
+            if (problem != "") {
+                println("FINDING seed=$seed n=$n: $problem")
+                findings = findings + 1
+            }
+        }
+    }
+    println("h2: seeds $low-$high, $inputs inputs each, $findings findings")
+    if (findings == 0) 0 else 1
+}
