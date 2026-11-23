@@ -467,6 +467,16 @@ strings, parsing/search inputs, comparisons and existing subparser literals are
 excluded. The lint uses compiler types and declaration identities; unrelated
 methods named `appendText` do not qualify.
 
+`--warn-regex-construction` enables `W_REGEX_CONSTRUCTION` suggestions for
+`regexCompile("literal")` calls, whose pattern `$regex("literal")` would check
+during the build. It is off by default and independent of the JSON lint. The
+suggestion carries an edit only for `regexCompile("literal").regex` with a
+literal that has no escape and no `$` and that compiles: a bare
+`regexCompile("literal")` yields a `RegexCompileResult`, not a `Regex`, so it
+gets the suggestion alone. Calls with a run-time pattern, tests and fixtures are
+not reported. Editor clients enable it with initialize option
+`regexConstruction: true`.
+
 Editor clients enable it with initialize option `jsonConstruction: true`.
 Diagnostics carry edits only for complete, compact JSON with known scalar
 values and no escaping, alias, effect or result-type ambiguity. String fixes

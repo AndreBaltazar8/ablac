@@ -5,9 +5,13 @@ import "lexer.ab"
 import "source_rewrite.ab"
 import "abla/bytes"
 import "abla/json"
+import "abla/regex"
 import "abla/text"
 
 var bootstrapJsonConstructionRequested = false
+// Which suggestions the request wants: `--warn-json-construction` and `--warn-regex-construction` share this machinery.
+var bootstrapJsonConstructionJsonWanted = false
+var bootstrapRegexConstructionWanted = false
 var bootstrapJsonConstructionSources: Map<string, string> = Map()
 var bootstrapJsonConstructionOwned: Map<string, bool> = Map()
 var bootstrapJsonConstructionImports: Map<string, bool> = Map()
@@ -20,7 +24,9 @@ class BootstrapJsonConstructionFact(
 class BootstrapJsonConstructionSite(
     val source: string, val expression: BootstrapExpression,
     val owner: BootstrapDeclaration, val calls: array<BootstrapExpression>,
-    val terminal: bool, val controlled: bool, val generic: bool
+    val terminal: bool, val controlled: bool, val generic: bool,
+    // A `regexCompile("literal")` call (or its `.regex`) that `$regex("literal")` would check at build time.
+    val regex: bool = false
 )
 class BootstrapJsonConstructionContext(
     val sites: array<BootstrapJsonConstructionSite>,
@@ -29,7 +35,7 @@ class BootstrapJsonConstructionContext(
 )
 class BootstrapJsonConstructionFinding(
     val file: string, val begin: int, val end: int, val buffer: bool,
-    val replacement: string
+    val replacement: string, val regex: bool = false
 )
 var bootstrapJsonConstructionContext = BootstrapJsonConstructionContext([], Map())
 var bootstrapJsonConstructionFindings: array<BootstrapJsonConstructionFinding> = []
@@ -141,16 +147,30 @@ fun bootstrapJsonConstructionRequest(source: string, expression: BootstrapExpres
     facts.set(bootstrapJsonConstructionKey(source, expression), BootstrapJsonConstructionFact())
     for (child in expression.children) bootstrapJsonConstructionRequest(source, child, facts)
 }
+/** `regexCompile("literal")`, or `regexCompile("literal").regex` (the whole member expression): the call, else null. */
+fun bootstrapRegexConstructionCall(expression: BootstrapExpression): BootstrapExpression? {
+    var call = expression
+    if (expression.kind == "member" && expression.text == "regex" && expression.children.size == 1) call = expression.children[0]
+    if (call.kind == "call" && call.text == "regexCompile" && call.children.size == 1 && call.children[0].kind == "string") call else null
+}
 fun bootstrapJsonConstructionCollect(owner: BootstrapDeclaration, expression: BootstrapExpression,
     controlled: bool, generic: bool, var sites: array<BootstrapJsonConstructionSite>): void {
-    if (expression.kind == "subparser.placeholder" || bootstrapJsonConstructionExcluded(expression)) return
+    // The exclusions (comparisons, parse/search calls, asserts) are about hand-built JSON: a `regexCompile(...).regex.matches(...)` chain is still a regex site.
+    if (expression.kind == "subparser.placeholder" || (bootstrapJsonConstructionJsonWanted && bootstrapJsonConstructionExcluded(expression))) return
     if ((expression.kind == "local.val" || expression.kind == "local.var") &&
         expression.text.startsWith("expected")) return
     val flow = controlled || expression.kind == "if" || expression.kind == "for" ||
         expression.kind == "while" || expression.kind == "do.while" || expression.kind == "when" ||
         expression.kind == "lambda" || expression.kind == "local.fun" ||
         expression.kind == "compile" || expression.kind == "declaration.block"
-    if (expression.kind == "string.template" || expression.kind == "+") {
+    if (bootstrapRegexConstructionWanted) {
+        val call = bootstrapRegexConstructionCall(expression)
+        if (call != null) {
+            sites.append(BootstrapJsonConstructionSite(owner.sourceIdentity, expression, owner, [], false, flow, generic, true))
+            return
+        }
+    }
+    if (bootstrapJsonConstructionJsonWanted && (expression.kind == "string.template" || expression.kind == "+")) {
         val parts: array<BootstrapExpression> = []
         bootstrapJsonConstructionParts(expression, parts)
         if (bootstrapJsonConstructionShape(parts, false)) {
@@ -162,7 +182,7 @@ fun bootstrapJsonConstructionCollect(owner: BootstrapDeclaration, expression: Bo
         var at = 0
         while (at < expression.children.size) {
             val first = expression.children[at]
-            if (bootstrapJsonConstructionAppend(first)) {
+            if (bootstrapJsonConstructionJsonWanted && bootstrapJsonConstructionAppend(first)) {
                 val calls: array<BootstrapExpression> = []
                 val parts: array<BootstrapExpression> = []
                 val receiver = first.children[0]
@@ -350,10 +370,28 @@ fun bootstrapJsonConstructionReplacement(site: BootstrapJsonConstructionSite): s
     if (site.calls.size == 0) "jsonStringify(\$json ${body.toText()})"
     else "\$jsonw(${bootstrapJsonConstructionOriginal(site, site.calls[0].children[0])}) ${body.toText()}"
 }
+/**
+ * The fix for `regexCompile("literal").regex`: `$regex("literal")`, only when the literal has no escape and no
+ * `$` (so its source text is its pattern) and the pattern compiles. A bare `regexCompile("literal")` yields a
+ * `RegexCompileResult`, not a `Regex`: it gets the suggestion without an edit.
+ */
+fun bootstrapRegexConstructionReplacement(site: BootstrapJsonConstructionSite): string {
+    if (site.expression.kind != "member") return ""
+    val call = bootstrapRegexConstructionCall(site.expression)
+    if (call == null) return ""
+    val pattern = call.children[0]
+    val written = bootstrapJsonConstructionOriginal(site, pattern)
+    if (written.size < 2 || written.contains("\\") || written.contains("$") || written.contains("//") || written.contains("/*")) return ""
+    if (pattern.text.contains("\\") || !regexCompile(pattern.text).succeeded) return ""
+    "\$regex($written)"
+}
 fun bootstrapJsonConstructionFinish(context: BootstrapJsonConstructionContext): void {
     for (site in context.sites) {
         var certain = true
-        if (site.calls.size == 0) {
+        if (site.regex) {
+            val call = bootstrapRegexConstructionCall(site.expression)
+            certain = call != null && bootstrapJsonConstructionKnown(site.source, call, "regex", "regexCompile")
+        } else if (site.calls.size == 0) {
             val fact = bootstrapJsonConstructionFact(site.source, site.expression)
             certain = fact != null && fact.type == "string" && fact.target == ""
         } else for (call in site.calls) {
@@ -379,8 +417,10 @@ fun bootstrapJsonConstructionFinish(context: BootstrapJsonConstructionContext): 
         if (expanded) continue
         // A generated expansion may point back at its `$name` site. It is not
         // an ordinary string expression written at that place in the file.
-        if (site.calls.size == 0 && source[begin] != 34) continue
-        val finding = BootstrapJsonConstructionFinding(file, begin, end, site.calls.size > 0,
+        if (!site.regex && site.calls.size == 0 && source[begin] != 34) continue
+        val finding = if (site.regex) BootstrapJsonConstructionFinding(file, begin, end, false,
+            bootstrapRegexConstructionReplacement(site), true)
+            else BootstrapJsonConstructionFinding(file, begin, end, site.calls.size > 0,
             bootstrapJsonConstructionReplacement(site))
         var duplicate = false
         for (previous in bootstrapJsonConstructionFindings) if (previous.file == file && previous.begin == begin && previous.end == end) duplicate = true
@@ -390,7 +430,8 @@ fun bootstrapJsonConstructionFinish(context: BootstrapJsonConstructionContext): 
 fun bootstrapJsonConstructionWarnings(): string {
     val output = byteBuffer()
     for (finding in bootstrapJsonConstructionFindings) {
-        output.appendText("warning[W_JSON_CONSTRUCTION]: ${finding.file}: hand-built JSON; consider \$${if (finding.buffer) "jsonw" else "json"} instead\nsource[json-construction]:${finding.file}:${finding.begin}:${finding.end}\n")
+        if (finding.regex) output.appendText("warning[W_REGEX_CONSTRUCTION]: ${finding.file}: a literal pattern compiled at run time; consider \$regex(...), which checks it during the build\nsource[json-construction]:${finding.file}:${finding.begin}:${finding.end}\n")
+        else output.appendText("warning[W_JSON_CONSTRUCTION]: ${finding.file}: hand-built JSON; consider \$${if (finding.buffer) "jsonw" else "json"} instead\nsource[json-construction]:${finding.file}:${finding.begin}:${finding.end}\n")
     }
     output.toText()
 }
