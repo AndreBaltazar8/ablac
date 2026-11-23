@@ -151,6 +151,41 @@ search: the cost is the pattern's instructions times the text's length, so `(?:a
 characters is up to 18 million steps (about 0.2 s in a release build, 10 times that in a `--fast` build), and the same pattern over
 a megabyte of text would be a few minutes. Bound the text's size as well when the pattern is not yours.
 
+Use `re.findWithin(text, maximumSteps, start = 0)` to limit a single search.
+Its sealed result has three cases.
+
+- `RegexSearchMatch` contains the completed leftmost match in `.matched`.
+- `RegexSearchMiss` means the search finished without a match or the start offset was out of range.
+- `RegexSearchExhausted` means another step was needed. It carries no tentative match.
+
+Each step is a VM position visit, an instruction reached in a closure, a thread
+advance, or a character-class range check. The bounded search runs the general VM
+so those charges also apply to patterns with an ordinary literal or fixed-width
+fast path. Nonpositive limits exhaust a valid search before running it.
+The budget counts search steps. VM initialization, the cost of copying capture
+slots within a step, and pattern compilation have their own costs. Use
+`regexCompileWithin` to limit compiled program size.
+
+### Inspecting a bounded result
+
+```abla
+import "abla/io"
+import "abla/regex"
+
+fun main {
+    val colour = regexCompile("red|green").regex
+    val result = colour.findWithin("light green", 200)
+    val message = when (result) {
+        is RegexSearchMatch -> result.matched.text0()
+        is RegexSearchMiss -> "no colour"
+        is RegexSearchExhausted -> "search budget exhausted"
+    }
+    println(message)
+}
+// output:
+// green
+```
+
 ## Syntax
 
 | Form | Meaning |

@@ -74,6 +74,16 @@ class Regex(
         val spans = regexRun(this, vm, start, false, false, false)
         if (spans.size == 0) null else RegexMatch(text, spans)
     }
+    /// Finds the leftmost match using at most `maximumSteps` search steps.
+    /// An invalid start is a miss. Exhaustion returns its own result without a partial match.
+    fun findWithin(text: string, maximumSteps: int, start: int = 0): RegexSearchResult {
+        if (start < 0 || start > text.size || this.program.size == 0) return RegexSearchMiss()
+        if (maximumSteps <= 0) return RegexSearchExhausted()
+        var vm = regexVm(this, text)
+        val spans = regexRunBounded(vm, start, maximumSteps)
+        if (vm.work < 0) return RegexSearchExhausted()
+        if (spans.size == 0) RegexSearchMiss() else RegexSearchMatch(RegexMatch(text, spans))
+    }
     /** Byte offset of the first match at or after start, or -1. */
     fun findStart(text: string, start: int = 0): int {
         if (start < 0 || start > text.size) return -1
@@ -188,6 +198,18 @@ class Regex(
         out.toText()
     }
 }
+
+/// The outcomes of a bounded search.
+sealed interface RegexSearchResult
+
+/// A completed search that found the leftmost match and its capture spans.
+class RegexSearchMatch(val matched: RegexMatch) : RegexSearchResult
+
+/// A completed search without a match, or a search with a start offset out of range.
+class RegexSearchMiss : RegexSearchResult
+
+/// A search that needed another step after spending its budget.
+class RegexSearchExhausted : RegexSearchResult
 
 // Holds a named capture's group slot and source span in the pattern.
 class RegexCaptureName(val name: string, val slot: int, val begin: int, val end: int)
@@ -1147,6 +1169,137 @@ private fun regexRun(re: Regex, var vm: RegexVm, from: int, anchored: bool, need
     if (matched) {
         val base = vm.resultEntry() * vm.slots
         for (k in 0 until vm.slots) result.append(vm.store[base + k])
+    }
+    result
+}
+
+// The bounded Pike search uses the same program, thread lists and capture slots.
+// A negative work count marks exhaustion, even with a tentative match.
+private @inline fun RegexVm.searchStep(maximumSteps: int): bool {
+    if (this.work == maximumSteps) {
+        this.work = -1
+        return false
+    }
+    this.work += 1
+    true
+}
+
+private @inline fun RegexVm.addBounded(list: int, pc0: int, source: int, position: int,
+    maximumSteps: int): bool {
+    val stackBase = this.n * 2
+    val work = this.workEntry()
+    var sp = 1
+    this.stackPcs[0] = pc0
+    this.copyEntry(source, stackBase)
+    while (sp > 0) {
+        sp -= 1
+        var pc = this.stackPcs[sp]
+        this.copyEntry(stackBase + sp, work)
+        var follow = true
+        while (follow) {
+            follow = false
+            if (this.seen[pc] != this.generation) {
+                this.seen[pc] = this.generation
+                if (!this.searchStep(maximumSteps)) return false
+                val op = this.program[pc * 3]
+                if (op == 4) {
+                    pc = this.program[pc * 3 + 1]
+                    follow = true
+                } else if (op == 3) {
+                    this.stackPcs[sp] = this.program[pc * 3 + 2]
+                    this.copyEntry(work, stackBase + sp)
+                    sp += 1
+                    pc = this.program[pc * 3 + 1]
+                    follow = true
+                } else if (op == 5) {
+                    this.store[work * this.slots + this.program[pc * 3 + 1]] = position
+                    pc += 1
+                    follow = true
+                } else if (op == 6) {
+                    if (this.assertionHolds(this.program[pc * 3 + 1], position)) {
+                        pc += 1
+                        follow = true
+                    }
+                } else {
+                    val at = list * this.n + this.counts[list]
+                    this.pcs[at] = pc
+                    this.copyEntry(work, at)
+                    this.counts[list] = this.counts[list] + 1
+                }
+            }
+        }
+    }
+    true
+}
+
+private @inline fun RegexVm.classMatchesBounded(index: int, c: int, maximumSteps: int): bool {
+    val ranges = this.classes[index]
+    var i = 0
+    var hit = false
+    var work = this.work
+    while (!hit && i < ranges.size) {
+        if (work == maximumSteps) {
+            work = -1
+            break
+        }
+        work += 1
+        hit = c >= ranges[i] && c <= ranges[i + 1]
+        i += 2
+    }
+    this.work = work
+    hit
+}
+
+private fun regexRunBounded(var vm: RegexVm, from: int, maximumSteps: int): array<int> {
+    val size = vm.text.size
+    var matched = false
+    var current = 0
+    var position = from
+    vm.generation += 1
+    while (!matched || vm.counts[current] != 0) {
+        if (!vm.searchStep(maximumSteps)) return []
+        if (!matched) {
+            val start = vm.startEntry()
+            for (slot in 0 until vm.slots) vm.store[start * vm.slots + slot] = -1
+            if (!vm.addBounded(current, 0, start, position, maximumSteps)) return []
+        }
+        val next = 1 - current
+        vm.generation += 1
+        vm.counts[next] = 0
+        val width = if (position < size) regexWidth(vm.text, position) else 0
+        val scalar = if (width != 0) regexScalar(vm.text, position, width) else -1
+        for (threadIndex in 0 until vm.counts[current]) {
+            if (!vm.searchStep(maximumSteps)) return []
+            val entry = current * vm.n + threadIndex
+            val pc = vm.pcs[entry]
+            val op = vm.program[pc * 3]
+            if (op == 7) {
+                // Keep only paths ahead of this result in priority order.
+                vm.copyEntry(entry, vm.resultEntry())
+                matched = true
+                break
+            }
+            if (scalar >= 0) {
+                val x = vm.program[pc * 3 + 1]
+                var hit = false
+                if (op == 0) hit = scalar == x
+                else if (op == 1) hit = scalar != 10
+                else if (op == 2) {
+                    val contains = vm.classMatchesBounded(x, scalar, maximumSteps)
+                    if (vm.work < 0) return []
+                    hit = contains != (vm.program[pc * 3 + 2] == 1)
+                }
+                if (hit && !vm.addBounded(next, pc + 1, entry, position + width, maximumSteps)) return []
+            }
+        }
+        if (position == size) break
+        position += width
+        current = next
+    }
+    val result: array<int> = []
+    if (matched) {
+        val base = vm.resultEntry() * vm.slots
+        for (slot in 0 until vm.slots) result.append(vm.store[base + slot])
     }
     result
 }

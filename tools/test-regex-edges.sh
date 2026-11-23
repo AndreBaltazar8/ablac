@@ -33,3 +33,10 @@ done
 sed '1s/.*/mutated/' "$cases/main.expected" > "$out/mutated.expected"
 ! cmp -s "$out/mutated.expected" "$out/main-interp.txt" || { echo "regex edges: the negative control matched" >&2; exit 1; }
 echo "regex edges: $(grep -a -c '^LIVE' "$cases/main.expected") refusal and syntax cases (run time and under #, both tiers) and $(grep -a -c '^LIMIT' "$cases/main.expected") limit cases agree with main.expected"
+
+for mode in fast release; do
+    options=()
+    [[ $mode == release ]] || options+=(--fast)
+    "$compiler" build tests/cases/regex/within.ab -o "$out/within-$mode" --no-cache "${options[@]}"
+    "$out/within-$mode" | grep -Fx 'bounded regex: ok' >/dev/null
+done
