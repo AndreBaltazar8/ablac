@@ -50,7 +50,7 @@ commit "$consumer" one
 
 app=$test_root/app
 manifest() { # extra manifest text after the dependencies
-    printf 'name = "app"\nversion = "0.1.0"\nentry = "main.ab"\ncompileCapabilities = ["filesystem.read"]\n\n[dependencies]\ndata = { git = "%s", branch = "main" }\nconsumer = { git = "%s", branch = "main" }\n%s' \
+    printf 'name = "app"\nversion = "0.1.0"\nentry = "main.ab"\ncompileCapabilities = ["filesystem.read"]\n\n[dependencies]\ndata = { git = "%s", branch = "main" }\nconsumer = { git = "%s", branch = "main" }\n\n[dependencyCompileCapabilities]\nconsumer = ["filesystem.read"]\n%s' \
         "$data" "$consumer" "${1:-}" > "$app/abla.toml"
 }
 mkdir -p "$app"
@@ -135,7 +135,7 @@ good helper-site-declares 'locked bytes one'
 
 # Without its own direct edge, the project's site is refused although the consumer (whose helper runs) declares it.
 manifest_no_data() {
-    printf 'name = "app"\nversion = "0.1.0"\nentry = "main.ab"\ncompileCapabilities = ["filesystem.read"]\n\n[dependencies]\nconsumer = { git = "%s", branch = "main" }\n' "$consumer" > "$app/abla.toml"
+    printf 'name = "app"\nversion = "0.1.0"\nentry = "main.ab"\ncompileCapabilities = ["filesystem.read"]\n\n[dependencies]\nconsumer = { git = "%s", branch = "main" }\n\n[dependencyCompileCapabilities]\nconsumer = ["filesystem.read"]\n' "$consumer" > "$app/abla.toml"
 }
 manifest_no_data
 "$compiler" package update --project "$app" > "$test_root/update3.log" 2>&1 || fail 'update (no direct data) failed' "$test_root/update3.log"
@@ -148,6 +148,13 @@ import "consumer-provider.ab"
 import consumerSource()
 fun main { print(consumerOwn()) }
 AB
+# A dependency's own site reads another package's tree only with filesystem.read named for it (#112 A).
+printf 'name = "app"\nversion = "0.1.0"\nentry = "main.ab"\ncompileCapabilities = ["filesystem.read"]\n\n[dependencies]\nconsumer = { git = "%s", branch = "main" }\n' "$consumer" > "$app/abla.toml"
+"$compiler" package update --project "$app" > "$test_root/update3b.log" 2>&1 || fail 'update (unnamed) failed' "$test_root/update3b.log"
+refused consumer-own-unnamed E_PACKAGE_FILE_DENIED "package 'consumer'"
+refused consumer-own-unnamed-native E_PACKAGE_FILE_DENIED "" native
+manifest_no_data
+"$compiler" package update --project "$app" > "$test_root/update3c.log" 2>&1 || fail 'update (named) failed' "$test_root/update3c.log"
 good consumer-own 'locked bytes one'
 good consumer-own-native 'locked bytes one' native
 manifest
