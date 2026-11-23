@@ -11,8 +11,10 @@ compiler=$1
 base="$project_root/build/repl-test"
 
 # Feeds standard input to a REPL of its own, with its output in $base.$1.out and .err.
-# The time limits only stop a hung REPL: a loaded machine (the suite runs scripts in parallel) slows its compiles
-# several times. Where live mode runs (x86-64 Linux, macOS) the REPL is one live program and one compiler for the
+# The time limits only stop a hung REPL: a loaded machine slows its compiles several times. The suite runs scripts in
+# parallel, and here up to twelve sessions run at once, each its own compiler: on CI's Intel Macs (3 to 4 vCPUs) the
+# whole step took 77 to 181 s, and a short session's 120 s ran out (exit 124 at 162 s and 181 s), so every session but
+# the long one gets 300 s. Where live mode runs (x86-64 Linux, macOS) the REPL is one live program and one compiler for the
 # whole session (src/live_repl.ab), whose address space passes 1 GB within a few lines: 3 GB there; elsewhere each
 # line compiles in a child compiler of its own, 1 GB.
 live=0
@@ -24,25 +26,34 @@ session() { # name seconds
         "$project_root/tools/run-limited.sh" "$compiler" repl \
         > "$base.$1.out" 2> "$base.$1.err"
 }
+# Waits for a session's REPL and stops the test, naming it, unless it ended well (124: its time limit ran out).
+waited() { # name pid
+    local status=0
+    wait "$2" || status=$?
+    ((status == 0)) && return
+    echo "repl ($1): the session ended with status $status$( ((status == 124)) && echo ' (its time limit)' )" >&2
+    cat "$base.$1.out" "$base.$1.err" >&2
+    exit 1
+}
 
 # The sessions share nothing, so they run at once.
-printf 'missingName\n20 + 21\n20 + 22\n:quit\n' | session recovery 120 &
+printf 'missingName\n20 + 21\n20 + 22\n:quit\n' | session recovery 300 &
 recovery=$!
 printf 'fun add(value: int): int = value + 1\nadd(41)\nval base: int = 40\nbase + 2\n:reset\nbase\n:quit\n' |
-    session definitions 120 &
+    session definitions 300 &
 definitions=$!
 # An entry continues while a bracket is open ("....> "): a function over four lines, an expression over two; an empty
 # line ends one still open (its error is shown, and the session goes on).
 printf 'fun add(value: int): int {\n    val one = 1\n    return value + one\n}\nadd(41)\n(1 +\n2)\n(1 +\n\n20 + 22\n:quit\n' |
-    session multiline 120 &
+    session multiline 300 &
 multiline=$!
 # Commands: :help lists them, an unknown one is refused without a compile (no parser error), and a command may have
 # spaces around it (the ":quit " ends the session before the last line).
-printf ':help\n:nope 1\n20 + 22\n  :quit \n20 + 1\n' | session commands 120 &
+printf ':help\n:nope 1\n20 + 22\n  :quit \n20 + 1\n' | session commands 300 &
 commands=$!
 # A diagnostic names its place in the entry (line and column of what was typed), never the session's hidden source
 # file: in a declaration over lines, in an expression, and at the end of one cut short.
-printf 'fun f(): int {\n    return missing\n}\n1 + nope\n(2 *\n\n:quit\n' | session diagnostics 120 &
+printf 'fun f(): int {\n    return missing\n}\n1 + nope\n(2 *\n\n:quit\n' | session diagnostics 300 &
 diagnostics=$!
 # Each line compiles in a child compiler (about half a second, most of it
 # the runtime, on an idle machine), so 32 generations stay within the memory
@@ -81,32 +92,32 @@ if ((live)); then
         "$base.load/lib.ab" "$base.load/broken.ab" "$base.load/none.ab" | session load 300 &
     loading=$!
 fi
-wait "$recovery"
-wait "$definitions"
-wait "$multiline"
-wait "$commands"
-wait "$diagnostics"
-wait "$generations"
+waited recovery "$recovery"
+waited definitions "$definitions"
+waited multiline "$multiline"
+waited commands "$commands"
+waited diagnostics "$diagnostics"
+waited generations "$generations"
 if ((live)); then
-    wait "$state"
-    wait "$panicking"
-    wait "$refused"
+    waited state "$state"
+    waited panic "$panicking"
+    waited refused "$refused"
     [[ $(< "$base.state.out") == $'abla> defined\nabla> 5\nabla> 5\nabla> a{c\nabla> 4.5\nabla> <array of size 3>\nabla> ' ]] ||
         { echo 'repl (state): a variable did not keep its value, or a value did not print' >&2; cat "$base.state.out" "$base.state.err" >&2; exit 1; }
     [[ $(< "$base.panic.out") == $'abla> defined\nabla> abla> 2\nabla> ' ]] && grep -q 'E_LIVE_PANIC' "$base.panic.err" ||
         { echo 'repl (panic): a line that panics did not leave the session and its state as they were' >&2; cat "$base.panic.out" "$base.panic.err" >&2; exit 1; }
     [[ $(< "$base.refused.out") == $'abla> defined\nabla> defined\nabla> abla> 1\nabla> ' ]] && grep -q 'E_LIVE_SIGNATURE' "$base.refused.err" ||
         { echo 'repl (refused): a refused redefinition did not keep the old one' >&2; cat "$base.refused.out" "$base.refused.err" >&2; exit 1; }
-    wait "$types"
+    waited types "$types"
     [[ $(< "$base.types.out") == $'abla> defined\nabla> array<int>\nabla> float\nabla> void\nabla> abla> abla> ' ]] &&
         grep -q '^:type needs an expression' "$base.types.err" && grep -q 'identifier:nope' "$base.types.err" &&
         grep -q '^  --> entry:1:1$' "$base.types.err" && ! grep -q 'generic.cannot-infer' "$base.types.err" ||
         { echo 'repl (types): :type did not name a type, or ran the expression' >&2; cat "$base.types.out" "$base.types.err" >&2; exit 1; }
-    wait "$classes"
+    waited classes "$classes"
     [[ $(< "$base.classes.out") == $'abla> defined\nabla> 4\nabla> defined\nabla> 10\nabla> defined\nabla> abla> 7\nabla> defined\nabla> q\nabla> ' ]] &&
         grep -q 'E_LIVE_LAYOUT: class P changed' "$base.classes.err" ||
         { echo 'repl (classes): a class could not be added, or a changed one was not refused' >&2; cat "$base.classes.out" "$base.classes.err" >&2; exit 1; }
-    wait "$loading"
+    waited load "$loading"
     [[ $(< "$base.load.out") == "abla> loaded 4 declarations from $base.load/lib.ab (its main is loadedMain())"$'\nabla> 5\nabla> main ran\n0\nabla> abla> 5\nabla> abla> abla> ' ]] &&
         grep -q 'identifier:missing' "$base.load.err" && grep -q "^:load: no such file: $base.load/none.ab\$" "$base.load.err" &&
         grep -q '^:load needs a file' "$base.load.err" ||
