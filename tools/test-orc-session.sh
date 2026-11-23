@@ -30,7 +30,9 @@ payload=${ABLA_COMPILER_PAYLOAD:-"${compiler}.bin"}
 if [[ $(uname -s) == Linux ]] &&
     readelf --dyn-syms --wide "$payload" 2>/dev/null | grep -E 'UND +LLVMVerifyModule(@|$)' >/dev/null; then
     preload="$project_root/build/orc-session-verify-failure.so"
-    clang -shared -fPIC "$project_root/tests/cases/orc-session/verify-failure.c" -o "$preload" -ldl
+    # The launcher can run through a different libc before reaching the
+    # compiler. Resolve dlsym from the process that actually calls the shim.
+    clang -shared -fPIC -nostdlib "$project_root/tests/cases/orc-session/verify-failure.c" -o "$preload"
     status=0
     LD_PRELOAD="$preload" "$compiler" --emit-llvm "$source" >"$first_ir.rejected" 2>"$first_ir.diagnostics" ||
         status=$?
