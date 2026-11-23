@@ -81,6 +81,10 @@ before measurement. Each observation has separate storage.
 | `p256-sign-nonce` | `p256EcdsaSign` with a fixed key of a zero vs random 64-byte message: the message is public, the nonce it sets is not |
 | `ed25519-sign` | `ed25519Sign` of a fixed message with a zero vs random seed |
 | `ed25519-sign-nonce` | `ed25519Sign` with a fixed seed of a zero vs random 64-byte message (the secret nonce follows) |
+| `p384-sign` | `p384EcdsaSign` (RFC 6979 nonce) of a fixed message with a key whose top byte is 0x7f in both classes, zero vs random below it |
+| `p384-sign-nonce` | `p384EcdsaSign` with a fixed key of a zero vs random 64-byte message |
+| `rsa-pkcs1-decrypt` | `decryptPkcs1Legacy` (implicit rejection) of a fixed 2048-bit key: a valid ciphertext of a fixed message in the zero class, a random ciphertext below the modulus (a padding failure) in the random class: the padding-oracle target |
+| `rsa-oaep-decrypt` | `decryptOaepSha256`, as `rsa-pkcs1-decrypt`: a valid ciphertext against a random one (refused) |
 | `leaky-compare` | Deliberately early-exiting 256-byte Abla comparison; mandatory detection control |
 
 AES key expansion is outside these encryption tests. RSA CRT includes the

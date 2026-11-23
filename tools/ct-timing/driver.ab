@@ -109,6 +109,13 @@ trusted fun main: int {
     val kemEncapsulation = mlkem768EncapsulateWithMessage(mlkem768EncapsulationKey(kemKey.bytes), signSeed(3))
     if (!kemKey.ok || !kemEncapsulation.ok || mlkem768Decapsulate(kemKey.bytes, kemEncapsulation.ciphertext).bytes != kemEncapsulation.sharedSecret) return 15
     if (p384Peer.size != 97) return 16
+    // RSA decryption: a valid PKCS#1 v1.5 and a valid OAEP ciphertext of a fixed message under the test key, for the padding-oracle targets.
+    val rsaPublic = rsaPublicFromNumbers(key.modulus, "\x01\x00\x01", "public key")
+    val pkcsValid = rsaPublic.encryptPkcs1Legacy("timing target message")
+    val oaepValid = rsaPublic.encryptOaepSha256("timing target message")
+    if (!rsaPublic.ok() || !pkcsValid.ok || !oaepValid.ok || key.decryptPkcs1Legacy(pkcsValid.bytes).bytes != "timing target message" ||
+        key.decryptOaepSha256(oaepValid.bytes).bytes != "timing target message") return 17
+    val p384Key = "\x7f\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f"
     if (peer.size != 32 || p256Peer.size != 65) return 12
     // Signing as a TLS server or client does it (CertificateVerify): a fixed key that signs and verifies, checked before
     // timing.
@@ -118,6 +125,8 @@ trusted fun main: int {
     if (!p256Signature.ok || !p256EcdsaVerify(p256PublicKey(signKey).bytes, signMessage, p256Signature.bytes)) return 13
     val edSignature = ed25519Sign(signKey, signMessage)
     if (!edSignature.ok || !ed25519Verify(ed25519PublicKey(signKey).bytes, signMessage, edSignature.bytes)) return 14
+    val p384Signature = p384EcdsaSign(p384Key, signMessage)
+    if (!p384Signature.ok || !p384EcdsaVerify(p384PublicKey(p384Key).bytes, signMessage, p384Signature.bytes)) return 18
 
     // Warm every selected primitive on separate samples. The first 128 records
     // are removed by the runner; class labels never enter this code.
@@ -206,6 +215,31 @@ trusted fun main: int {
             ctt_begin(state, data, output, work)
             val shared = mlkem768Decapsulate(kemKey.bytes, ciphertext)
             ctt_end(state, i, data, output, work, shared.bytes.size)
+        } else if (mode == "rsa-pkcs1-decrypt" || mode == "rsa-oaep-decrypt") {
+            // The padding oracle: a valid ciphertext (zero class) or a random one below the modulus (random class). The first is a message, the
+            // second is a padding failure (PKCS#1: the implicit-rejection output; OAEP: a refusal): the time must not say which.
+            val pkcs = mode == "rsa-pkcs1-decrypt"
+            var fixedClass = true
+            for (j in 0 until 32) {
+                if (ablaUnsafeLoadU8(bnPointer(data + j)) != u8(0)) fixedClass = false
+            }
+            ablaUnsafeStoreU8(bnPointer(data), ablaUnsafeLoadU8(bnPointer(data)) & 127)
+            val rsaCiphertext = if (fixedClass) (if (pkcs) pkcsValid.bytes else oaepValid.bytes) else bytesAt(data, 256)
+            ctt_begin(state, data, output, work)
+            val rsaResult = if (pkcs) key.decryptPkcs1Legacy(rsaCiphertext) else key.decryptOaepSha256(rsaCiphertext)
+            ctt_end(state, i, data, output, work, rsaResult.bytes.size)
+        } else if (mode == "p384-sign") {
+            // As p256-sign: the key (top byte 0x7f in both classes) is the secret; the RFC 6979 nonce follows from it.
+            ablaUnsafeStoreU8(bnPointer(data), 127)
+            val key384 = bytesAt(data, 48)
+            ctt_begin(state, data, output, work)
+            val signature384 = p384EcdsaSign(key384, signMessage)
+            ctt_end(state, i, data, output, work, signature384.bytes.size)
+        } else if (mode == "p384-sign-nonce") {
+            val message384 = bytesAt(data, 64)
+            ctt_begin(state, data, output, work)
+            val nonce384 = p384EcdsaSign(p384Key, message384)
+            ctt_end(state, i, data, output, work, nonce384.bytes.size)
         } else if (mode == "p256-sign") {
             // The secret is the key (top byte 0x7f in both classes, so it is in 1..n-1); the RFC 6979 nonce follows from it.
             ablaUnsafeStoreU8(bnPointer(data), 127)
