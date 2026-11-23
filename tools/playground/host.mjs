@@ -23,7 +23,7 @@ export async function compile(module, base, files, options = {}) {
         constructor(code) { super(`exit ${code}`); this.code = code; }
     }
     if (options.entry) vfs.put("/work/entry", encoder.encode(`/work/${options.entry}`));
-    const fileCalls = createSyscalls(vfs, () => memory, { stdin: options.stdin, unknown: (n) => { unknown[n] = (unknown[n] ?? 0) + 1; } });
+    const fileCalls = createSyscalls(vfs, () => memory, { cwd: "/work", stdin: options.stdin, unknown: (n) => { unknown[n] = (unknown[n] ?? 0) + 1; } });
     const heap = () => new Uint8Array(memory.buffer);
     const address = (value) => Number(BigInt.asUintN(32, BigInt(value)));
     // The module's one host import, abla_host.syscall: the calls that leave the file system are the page's (output, exit, the clocks,

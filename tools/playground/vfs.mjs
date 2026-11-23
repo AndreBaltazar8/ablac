@@ -89,7 +89,7 @@ export function createSyscalls(vfs, memory, options = {}) {
     const stdin = options.stdin ?? new Uint8Array(0);
     let stdinPosition = 0;
     let next = 3;
-    let cwd = "/";
+    let cwd = options.cwd ?? "/";
     const bytes = () => new Uint8Array(memory().buffer);
     const view = () => new DataView(memory().buffer);
     const cstring = (address) => {
