@@ -1,0 +1,80 @@
+import "abla/io"
+import "abla/websocket/event"
+import "abla/http"
+import "abla/sys/linux/net"
+import "abla/websocket"
+
+// Fragmented messages on the event WebSocket server (#1139 area 4, RFC 6455 5.4): a text frame without FIN followed by a continuation with FIN is one
+// message and is echoed; a data frame that starts a new message while one is open fails the connection with close code 1002, as the blocking
+// reader (readMessage) does.
+resource class FragmentLink(var done: bool)
+resource class FragmentJob(val port: int, val frames: string)
+
+fun fragmentDone(var link: FragmentLink): bool = link.done
+fun fragmentFinish(var link: FragmentLink): bool {
+    link.done = true
+    true
+}
+
+fun fragmentEcho(path: string, kind: string, payload: string): WebSocketEventReply =
+    webSocketEventReply("$path:$kind:$payload", "text", true)
+
+/** What the server answered after the handshake: "opcode:payload" of the first frame, or "" when there was none. */
+fun fragmentClient(link: Mutex<FragmentLink>, job: Shared<FragmentJob>): string {
+    val connection = tcpConnectIpv4("127.0.0.1", job.get().port, 1000)
+    if (connection.descriptor < 0) {
+        link.with(fragmentFinish)
+        return "connect failed"
+    }
+    val request = "GET /rooms/7 HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    connection.write("$request${job.get().frames}")
+    var response = ""
+    var reading = true
+    while (reading) {
+        val incoming = connection.readWithTimeoutResult(65536, 1000)
+        if (incoming.hasData()) response = "${response}${incoming.bytes}"
+        else reading = false
+    }
+    connection.close()
+    link.with(fragmentFinish)
+    val headerEnd = httpHeaderEnd(response)
+    if (headerEnd <= 0 || response.slice(0, 12) != "HTTP/1.1 101") return "no upgrade: ${response.slice(0, 20)}"
+    val decoded = webSocketDecodeFrame(response.slice(headerEnd, response.size))
+    if (!decoded.succeeded()) return "no frame"
+    val code = if (decoded.frame.opcode == 8 && decoded.frame.payload.size >= 2) decoded.frame.payload[0] * 256 + decoded.frame.payload[1] else 0
+    if (decoded.frame.opcode == 8) "close:$code" else "text:${decoded.frame.payload}"
+}
+
+fun exchange(var server: WebSocketEventServer, frames: string): string {
+    val link = Mutex(FragmentLink(false))
+    val job = Shared(FragmentJob(server.listener.localPort(), frames))
+    val forClient = link.clone()
+    val client = thread { fragmentClient(forClient, job) }
+    while (!link.with(fragmentDone)) server.step(100)
+    await client
+}
+
+fun main: int {
+    val router = webSocketEventRouter()
+    router.route("/rooms/:room", fragmentEcho)
+    var server = webSocketEventServer(router, ipv4Loopback(0))
+    var bad = 0
+    val whole = exchange(server, webSocketEncodeFrame("ab", 1, false, "mask") + webSocketEncodeFrame("cd", 0, true, "mask"))
+    if (whole != "text:/rooms/7:text:abcd") {
+        println("a fragmented message: $whole")
+        bad = bad + 1
+    }
+    val interleaved = exchange(server, webSocketEncodeFrame("ab", 1, false, "mask") + webSocketEncodeFrame("cd", 1, true, "mask"))
+    if (interleaved != "close:1002") {
+        println("a new data frame while a message is open: $interleaved")
+        bad = bad + 1
+    }
+    val binaryOver = exchange(server, webSocketEncodeFrame("ab", 2, false, "mask") + webSocketEncodeFrame("cd", 2, false, "mask"))
+    if (binaryOver != "close:1002") {
+        println("a new binary frame while a message is open: $binaryOver")
+        bad = bad + 1
+    }
+    server.stop()
+    server.drain()
+    if (bad == 0) 42 else 1
+}
