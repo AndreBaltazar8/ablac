@@ -117,7 +117,8 @@ to 64 KiB (`tlsMessageLimit`). Parsing is linear in the staple; the signature ch
 
 ## Open questions
 
-- The default for `revocation` on `tlsX509Verifier`: 0 keeps today's behaviour; 1 is what browsers do (and would make a must-staple certificate work out of the box). Proposal: 0
-  until the interop is in, then 1 in the next minor release, announced in the notes.
-- Whether `ocspRequestDer` belongs in the stdlib at all (the application needs it only if it fetches), or in a sibling package with the HTTP client.
-- Per-entry staples for intermediates in TLS 1.3: parsed and verified when present (the design allows it), not requested specially.
+Answered by the security reviewer (7e) on 2026-11-24:
+
+- The default for `revocation` stays 0 (today's behaviour). Flipping it to 1 changes what every client accepts, so it is the project owner's decision when the implementation is scheduled; the proposal above (0 until the interop is in, then 1 in a minor release, announced in the notes) is what is put to them then.
+- `ocspRequestDer` goes in the stdlib next to the response parser: it is pure encoding. Fetching a response stays with the application.
+- Per-entry staples in TLS 1.3 (intermediates) are verified when present and not requested specially, as designed.
