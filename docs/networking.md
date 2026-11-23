@@ -736,7 +736,16 @@ differ, a `Transfer-Encoding` other than exactly `chunked` (`identity`, `gzip`,
 `chunked, gzip`, or given twice), whitespace before a header's colon, a folded
 line, a line without a colon, a bare LF or CR in a head line, and a byte in a
 header name that is not a token character (`Content-Length\x0b:`,
-`Content_Length:`). One strict helper, `httpRequestFraming`, decides it for the
+`Content_Length:`). So is a request with more than one `Host` line or a `Host`
+value that has a space, a comma or a control byte in it (RFC 9112 3.2: the
+application and a proxy in front could read different hosts). A missing `Host`
+is allowed on purpose, which RFC 9112 does not allow for HTTP/1.1. Other
+repeated headers are not refused: `request.header(name)` returns the last line
+of that name and `request.headers` has all of them, so an application that
+reads a single-valued header such as `Authorization`, `Cookie` or `Content-Type`
+sees what the last line says; behind a proxy that checks the first line, refuse
+a request whose headers repeat one of them. One strict helper, `httpRequestFraming`,
+decides it for the
 event server, `httpReadRequest` and the WebSocket handshake. A client reading a
 response refuses two `Content-Length`s that differ and stops reading at once. A body shorter than declared waits
 for the rest and the idle timeout closes the connection without an answer; bytes

@@ -482,6 +482,7 @@ test-serial: ablac
 	tools/test-http-event-drip.sh $(COMPILER)
 	tools/test-websocket-server-drip.sh $(COMPILER)
 	tools/test-http-differential.sh $(COMPILER)
+	tools/test-http-host.sh $(COMPILER)
 	tools/test-http-close-delimited.sh $(COMPILER)
 	tools/test-http-interim.sh $(COMPILER)
 	tools/test-http-request-scan.sh $(COMPILER)
