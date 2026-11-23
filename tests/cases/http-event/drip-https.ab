@@ -15,7 +15,14 @@ import "abla/text"
 import "abla/http"
 import "abla/http/event/tls"
 import "abla/net"
-import "abla/sys/linux/process"
+import "abla/process/metrics"
+
+// The CPU time this process has used, in milliseconds. The drip tests compare work, not wall time: a machine busy with other jobs stretches the
+// wall time of a run (a gate's 6 jobs made a good server's 1 MiB take 1291 ms where it needs a third of that), but not the time the process runs.
+fun cpuMilliseconds(): int {
+    val times = processCpuMicroseconds()
+    (times[0] + times[1]) / 1000
+}
 
 fun answer(request: HttpRequest): HttpResponse = httpText("got ${request.body.size}")
 
@@ -42,7 +49,7 @@ fun drip(start: string, data: string, piece: int, expected: string): int {
     val client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
     client.write(start)
     server.step(50)
-    val started = linuxMonotonicMilliseconds()
+    val started = cpuMilliseconds()
     var sent = 0
     while (sent < data.size) {
         val n = if (sent + piece <= data.size) piece else data.size - sent
@@ -50,7 +57,7 @@ fun drip(start: string, data: string, piece: int, expected: string): int {
         sent = sent + n
         server.step(0)
     }
-    val elapsed = linuxMonotonicMilliseconds() - started
+    val elapsed = cpuMilliseconds() - started
     for (i in 0 until 5) server.step(20)
     val answered = reply(client)
     client.close()
@@ -75,6 +82,28 @@ fun bodyDrip(total: int): int = best(head(total), "x".repeat(total), 16, "got ${
 fun chunkDrip(chunks: int): int = best(
     "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", "1\r\nx\r\n".repeat(chunks) + "0\r\n\r\n", 6, "got ${chunks}"
 )
+
+class Proportion(val ok: bool, val small: int, val large: int)
+
+// Whether `large` takes at most `limit` times what `small` takes (not less than `floor` ms: a time that short is noise). Load on the machine only
+// makes a run slower, so each is the fastest of several runs: the cost this test is after, one that grows
+// with the square of the size, shows in the fastest runs too, and noise in one run neither fails a good server nor passes a bad one.
+fun proportion(small: () -> int, large: () -> int, limit: int, floor: int): Proportion {
+    var s = -2
+    for (run in 0 until 5) {
+        val t = small()
+        if (t < 0) return Proportion(false, t, 0)
+        if (s == -2 || t < s) s = t
+    }
+    var l = -2
+    for (run in 0 until 3) {
+        val t = large()
+        if (t < 0) return Proportion(false, s, t)
+        if (l == -2 || t < l) l = t
+    }
+    val base = if (s < floor) floor else s
+    Proportion(l <= limit * base, s, l)
+}
 
 fun main: int {
     // A request that ends with the start of the next one in the same write: both are answered.
@@ -111,21 +140,14 @@ fun main: int {
         }
     }
     if (drip("", wire, 1, "[hello world!!]") < 0) return 1
-    val small = bodyDrip(131072)
-    val large = bodyDrip(1048576)
-    if (small < 0 || large < 0) return 1
-    // A tiny small-time is noise; the quadratic cost would show as 17 times or more.
-    val floor = if (small < 50) 50 else small
-    if (large > 12 * floor) {
-        println("FAIL the time is not in proportion to the size: 128 KiB took ${small} ms, 1 MiB took ${large} ms in 16-byte pieces")
+    val body = proportion({ -> bodyDrip(131072) }, { -> bodyDrip(1048576) }, 12, 100)
+    if (!body.ok) {
+        println("FAIL the time is not in proportion to the size (fastest of five and of three runs): 128 KiB took ${body.small} ms, 1 MiB took ${body.large} ms of CPU time in 16-byte pieces")
         return 1
     }
-    val fewChunks = chunkDrip(3000)
-    val manyChunks = chunkDrip(12000)
-    if (fewChunks < 0 || manyChunks < 0) return 1
-    val chunkFloor = if (fewChunks < 40) 40 else fewChunks
-    if (manyChunks > 10 * chunkFloor) {
-        println("FAIL the time is not in proportion to the number of chunks: 3000 took ${fewChunks} ms, 12000 took ${manyChunks} ms")
+    val chunks = proportion({ -> chunkDrip(3000) }, { -> chunkDrip(12000) }, 10, 80)
+    if (!chunks.ok) {
+        println("FAIL the time is not in proportion to the number of chunks (fastest of five and of three runs): 3000 took ${chunks.small} ms, 12000 took ${chunks.large} ms")
         return 1
     }
     println("http-event-tls drip ok")

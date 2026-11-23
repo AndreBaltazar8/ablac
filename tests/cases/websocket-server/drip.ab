@@ -11,7 +11,14 @@ import "abla/text"
 import "abla/net"
 import "abla/websocket"
 import "abla/websocket/server"
-import "abla/sys/linux/process"
+import "abla/process/metrics"
+
+// The CPU time this process has used, in milliseconds. The drip tests compare work, not wall time: a machine busy with other jobs stretches the
+// wall time of a run (a gate's 6 jobs made a good server's 1 MiB take 1291 ms where it needs a third of that), but not the time the process runs.
+fun cpuMilliseconds(): int {
+    val times = processCpuMicroseconds()
+    (times[0] + times[1]) / 1000
+}
 
 val UPGRADE = "GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
 val KEY = "\u0001\u0002\u0003\u0004"
@@ -37,7 +44,7 @@ fun drip(data: string, piece: int, expected: string): int {
     client.readCompact(4096)
     var seen = ""
     var events: array<WebSocketServerEvent> = []
-    val started = linuxMonotonicMilliseconds()
+    val started = cpuMilliseconds()
     var sent = 0
     while (sent < data.size) {
         val n = if (sent + piece <= data.size) piece else data.size - sent
@@ -45,7 +52,7 @@ fun drip(data: string, piece: int, expected: string): int {
         sent = sent + n
         for (k in 0 until 3) server.step(0)
     }
-    val elapsed = linuxMonotonicMilliseconds() - started
+    val elapsed = cpuMilliseconds() - started
     for (i in 0 until 3) server.step(20)
     seen = delivered(server.takeEvents())
     client.close()
@@ -65,6 +72,28 @@ fun best(data: string, expected: string): int {
 }
 
 fun messageDrip(size: int): int = best(webSocketEncodeFrame("x".repeat(size), 2, true, KEY), "[${size}]")
+
+class Proportion(val ok: bool, val small: int, val large: int)
+
+// Whether `large` takes at most `limit` times what `small` takes (not less than `floor` ms: a time that short is noise). Load on the machine only
+// makes a run slower, so each is the fastest of several runs: the cost this test is after, one that grows
+// with the square of the size, shows in the fastest runs too, and noise in one run neither fails a good server nor passes a bad one.
+fun proportion(small: () -> int, large: () -> int, limit: int, floor: int): Proportion {
+    var s = -2
+    for (run in 0 until 5) {
+        val t = small()
+        if (t < 0) return Proportion(false, t, 0)
+        if (s == -2 || t < s) s = t
+    }
+    var l = -2
+    for (run in 0 until 3) {
+        val t = large()
+        if (t < 0) return Proportion(false, s, t)
+        if (l == -2 || t < l) l = t
+    }
+    val base = if (s < floor) floor else s
+    Proportion(l <= limit * base, s, l)
+}
 
 fun main: int {
     // Text 3 bytes (not final) + continuation 4 bytes + continuation 5 bytes (final), then a ping: one message of 12 bytes.
@@ -90,13 +119,9 @@ fun main: int {
         }
     }
     if (drip(wire, 1, "[12]") < 0) return 1
-    val small = messageDrip(65536)
-    val large = messageDrip(262144)
-    if (small < 0 || large < 0) return 1
-    // A tiny small-time is noise; the quadratic cost would show as 17 times.
-    val floor = if (small < 50) 50 else small
-    if (large > 10 * floor) {
-        println("FAIL the time is not in proportion to the size: 64 KiB took ${small} ms, 256 KiB took ${large} ms in one-byte pieces")
+    val message = proportion({ -> messageDrip(65536) }, { -> messageDrip(262144) }, 10, 150)
+    if (!message.ok) {
+        println("FAIL the time is not in proportion to the size (fastest of five and of three runs): 64 KiB took ${message.small} ms, 256 KiB took ${message.large} ms of CPU time in one-byte pieces")
         return 1
     }
     println("websocket-server drip ok")
