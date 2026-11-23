@@ -1003,6 +1003,11 @@ fun main: int = count
 // error: the table is empty
 ```
 
+For a Wasm target, a site can call the standard library's `panic` from the
+host JIT slice. The slice stops the evaluation and reports the full message.
+An eager global initializer that can reach `panic` keeps the site in the
+evaluator, since the initializer can run before the site's bridge is active.
+
 ## Interactive programs at compile time
 
 A `#` site can run a whole interactive program. A game client built on a

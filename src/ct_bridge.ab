@@ -50,7 +50,9 @@ class CtBridgeFrame(
     val results: array<BootstrapEvalValue>,
     // A native entry's arguments and its returned value (at most one).
     val entryArguments: array<BootstrapEvalValue>,
-    val entryResults: array<BootstrapEvalValue>
+    val entryResults: array<BootstrapEvalValue>,
+    // Compiler-owned text saved before the guard unwinds the host slice.
+    var explicitPanic: string? = null
 )
 
 val CT_BRIDGE_BOX_BITS = 24
@@ -216,6 +218,8 @@ fun ctBridgeUnreportedInvalid(value: BootstrapEvalValue, errors: int): bool {
     false
 }
 
+val CT_BRIDGE_EXPLICIT_PANIC = "__ablaCtExplicitPanic"
+
 // Performs intrinsic `name` on the staged arguments in the active frame.
 // 0: success. 1: the intrinsic failed (the evaluator holds the diagnostic,
 // and the evaluation fails as it would under the interpreter). 2: no active
@@ -224,6 +228,14 @@ fun ctBridgeDispatch(name: string): int {
     val top = ctBridgeTopIndex()
     var status = 2
     if (top >= 0) {
+        if (name == CT_BRIDGE_EXPLICIT_PANIC) {
+            if (ctBridgeArgumentCount() != 1 || ctBridgeFrames[top].staging.size != 1) return 1
+            val message = ctBridgeArgumentAt(0)
+            if (message.kind != "string") return 1
+            ctBridgeFrames[top].explicitPanic = message.text
+            ctBridgeClearStaging()
+            return 0
+        }
         ctBridgeFrames[top].results.truncate(0)
         val begin = ctBridgeFrames[top].begin
         val end = ctBridgeFrames[top].end
@@ -689,11 +701,21 @@ fun ctBridgeExitSource(declaration: BootstrapDeclaration): string =
     if (!bootstrapCompileExitProvider(declaration)) ""
     else "fun ${declaration.name}(code: int): never {\n    __ablaPanicContain(\"$BOOTSTRAP_COMPILE_EXIT_MARK${bootstrapCompileExitMessage("\$code")}\")\n    while (true) {}\n}\n"
 
+// Copy the explicit panic's full text into the caller's bridge frame before
+// the guarded stop. The generic runtime panic catcher holds only a prefix.
+fun ctBridgeExplicitPanicSource(declaration: BootstrapDeclaration): string =
+    "trusted fun ${declaration.name}(message: string): never {\n" +
+    "    ablaCtBridgeArgString(message)\n" +
+    "    ablaCtBridgeInvoke(\"$CT_BRIDGE_EXPLICIT_PANIC\")\n" +
+    "    __ablaPanicContain(\"compile-time panic\")\n" +
+    "    while (true) {}\n}\n"
+
 // What the native tier's slice carries in place of `declaration`: its bridge
 // replacement, its provider shim or its `exit`; "" when it is kept as it is.
 fun ctBridgeSliceSource(declaration: BootstrapDeclaration): string {
     val replacement = ctBridgeReplacementSource(declaration)
     if (replacement != "") replacement
+    else if (!ctBridgeHostSlice && bootstrapCtCrossPanic(declaration)) ctBridgeExplicitPanicSource(declaration)
     else if (bootstrapCompileExitProvider(declaration)) ctBridgeExitSource(declaration)
     else ctBridgeProviderSource(declaration)
 }
