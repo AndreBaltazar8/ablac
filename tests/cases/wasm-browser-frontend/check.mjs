@@ -11,9 +11,7 @@ const fail = (message) => {
 const bytes = readFileSync(path);
 if (!WebAssembly.validate(bytes)) fail("not a valid module");
 const module = new WebAssembly.Module(bytes);
-const allowed = new Set([
-    "abla_host.write", "abla_host.exit", "abla_host.clock_ns", "abla_host.random", "env.fork", "env.strlen"
-]);
+const allowed = new Set(["abla_host.syscall", "env.fork", "env.strlen"]);
 for (const entry of WebAssembly.Module.imports(module)) {
     if (!allowed.has(`${entry.module}.${entry.name}`)) fail(`unexpected import ${entry.module}.${entry.name}`);
 }

@@ -86,6 +86,8 @@ export function createSyscalls(vfs, memory, options = {}) {
     // A guest address is 32 bits; one above 2 GB arrives sign-extended.
     const ptr = (value) => Number(BigInt.asUintN(32, BigInt(value)));
     const descriptors = new Map();
+    const stdin = options.stdin ?? new Uint8Array(0);
+    let stdinPosition = 0;
     let next = 3;
     let cwd = "/";
     const bytes = () => new Uint8Array(memory().buffer);
@@ -208,6 +210,12 @@ export function createSyscalls(vfs, memory, options = {}) {
         try {
             switch (number) {
                 case 0: { // read
+                    if (Number(a0) === 0) { // standard input: the bytes the page gave
+                        const length = Math.min(Number(a2), stdin.length - stdinPosition);
+                        bytes().set(stdin.subarray(stdinPosition, stdinPosition + length), ptr(a1));
+                        stdinPosition += length;
+                        return BigInt(length);
+                    }
                     const entry = descriptors.get(Number(a0));
                     if (!entry) return -BigInt(EBADF);
                     if (entry.directory) return -BigInt(EISDIR);
