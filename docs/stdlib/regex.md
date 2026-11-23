@@ -146,7 +146,10 @@ continuations.
 A search costs at most 2 × (text size + 1) × instructions steps (about 12 ns each), so at the limit of
 100,000 instructions a megabyte of text could take many minutes. Nested counted repeats multiply: `(a{1,30}){1,30}` is
 1,863 instructions. For patterns from an untrusted source use `regexCompileWithin(pattern, maximumInstructions)`, which
-refuses a larger program with the same error (it never allows more than 100,000).
+refuses a larger program with the same error (it never allows more than 100,000). It bounds the size of the pattern, not the time of a
+search: the cost is the pattern's instructions times the text's length, so `(?:a*){1000}b` (about 3,000 instructions) over 3,000
+characters is up to 18 million steps (about 0.2 s in a release build, 10 times that in a `--fast` build), and the same pattern over
+a megabyte of text would be a few minutes. Bound the text's size as well when the pattern is not yours.
 
 ## Syntax
 
