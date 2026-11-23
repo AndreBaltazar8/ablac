@@ -416,6 +416,17 @@ checked. A path is held inside by where it leads, not by its spelling: its symbo
 project that points out of it is outside), except the last name of a removal, a move or `isSymbolicLink()`, which act on
 the link itself, as `unlink`, `rename` and `lstat` do: removing a link removes the link, not its target.
 
+The check and the use are one step on Linux and macOS: a path inside the working directory is held inside the project by the real path it
+leads to (every link followed), and then opened by walking that real path from the root with `O_NOFOLLOW` on each name (`AnchoredPath`
+in `abla/fs`, `openat`, `unlinkat`, `renameat` through the directory's descriptor). A directory swapped for a link to somewhere else between
+the check and the open (a racing process, or a second thread of the build) makes the operation fail instead of leading out of the project
+([tools/test-compile-path-race.sh](../tools/test-compile-path-race.sh): reads and writes while a process flips a directory and a link,
+fails without it within one build). This covers every compile-time file operation (`Path` reads, writes, moves, listings, metadata and
+`compilerReadFile`, `compilerWriteFile` and the like), not the toolchain's own outputs, whose build directory may legitimately be a link.
+It does not cover a project outside the working directory (its paths are absolute, so they are handled as an absolute path is: by the check
+alone), nor Windows, whose host layer translates only path-based calls; the Windows equivalent (opening each name relative to a directory handle
+with `FILE_OPEN_REPARSE_POINT` and refusing a reparse point) is not done.
+
 A tree built without its `.git` (a `git archive` export, a release tarball, a copy) has no repository root to find, so
 it is bounded by its working directory: built from a subdirectory, a read of `../assets` that works in the checkout
 fails there. A project that is built from such a copy names itself in a root `abla.toml` (`name = "my-game"`); it is

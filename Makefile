@@ -167,6 +167,7 @@ test-serial: ablac
 	tools/test-deep-logical.sh $(COMPILER)
 	tools/test-compile-effect-path.sh $(COMPILER)
 	tools/test-compile-path-symlinks.sh $(COMPILER)
+	tools/test-compile-path-race.sh $(COMPILER)
 	tools/test-compile-package-grants.sh $(COMPILER)
 	tools/test-value-abi.sh $(COMPILER)
 	tools/test-unsafe-mmio.sh $(COMPILER)

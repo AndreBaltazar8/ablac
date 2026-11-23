@@ -681,3 +681,303 @@ private fun linuxForwardSlashes(text: string): string {
     }
     if (begin == 0) text else "$result${text.slice(begin, text.size)}"
 }
+
+// ---- Anchored paths -------------------------------------------------------------------------------------------------------------------------
+// A path that a check has already resolved to the real path it names (compile-time file operations, src/eval.ab: no symbolic link in it), used
+// without following a link again: every directory of the path is opened from the root with openat and O_NOFOLLOW, and the last name is opened
+// or changed through the descriptor of its directory with O_NOFOLLOW or the *at calls. A link swapped in between the check and the use
+// then fails the operation (ELOOP, ENOTDIR) instead of leading out of the project. The operations are those of Path with the same results.
+// Only a relative path is walked (it is read against the working directory, which the system reports with no link in it); an absolute path,
+// and every path on a host whose raw calls are translated (Windows), is handed to the Path method as it is. Where the system does not
+// know openat (ENOSYS, asked once per process) the Path method is used too; no other error falls back.
+
+// A path that was resolved to the real one it names, used without following a link again: the operations of Path, walked from the root with O_NOFOLLOW.
+class AnchoredPath(val text: string)
+
+// O_CLOEXEC | O_NOFOLLOW, and with O_DIRECTORY.
+private val anchoredLeafFlags = 655360
+private val anchoredDirectoryFlags = 720896
+
+// The directory names of the absolute path `text` reads against the working directory, "." and empty names left out.
+private fun anchoredNames(text: string): array<string> {
+    val whole = if (text.size > 0 && text[0] == 47) text else "${currentDirectory().text}/$text"
+    val names: array<string> = []
+    var begin = 0
+    var index = 0
+    while (index <= whole.size) {
+        if (index == whole.size || whole[index] == 47) {
+            val name = whole.slice(begin, index)
+            if (name != "" && name != ".") names.append(name)
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    names
+}
+
+// The descriptor of the directory made of the first `count` names, each opened from the one before with O_NOFOLLOW (created with `mode` when
+// `create` and missing), or a negative errno.
+private fun anchoredOpenDirectory(names: array<string>, count: int, create: bool, mode: int): int {
+    var descriptor = linuxSyscall4(257, -100, nativeCStringAddress("/"), 589824, 0)
+    var index = 0
+    while (descriptor >= 0 && index < count) {
+        var next = linuxSyscall4(257, descriptor, nativeCStringAddress(names[index]), anchoredDirectoryFlags, 0)
+        if (next == -2 && create) {
+            val made = linuxSyscall3(258, descriptor, nativeCStringAddress(names[index]), mode)
+            if (made == 0 || made == -17) next = linuxSyscall4(257, descriptor, nativeCStringAddress(names[index]), anchoredDirectoryFlags, 0)
+        }
+        linuxSyscall1(3, descriptor)
+        descriptor = next
+        index = index + 1
+    }
+    descriptor
+}
+
+// A directory held open and the name inside it that a path ends with; `descriptor` is negative (an errno) when the walk failed.
+private class AnchoredLeaf(val descriptor: int, val name: string)
+
+private fun anchoredLeaf(text: string, create: bool): AnchoredLeaf {
+    val names = anchoredNames(text)
+    if (names.size == 0) return AnchoredLeaf(-22, "")
+    AnchoredLeaf(anchoredOpenDirectory(names, names.size - 1, create, 0o777), names[names.size - 1])
+}
+
+// Whether the walk failed because the system does not know the call at all (ENOSYS). Only that is a reason to use the Path method, and it is
+// settled once per process by anchoredMissing; any other failure (EINVAL, EPERM, ELOOP, ...) is the operation's failure.
+private fun anchoredUnsupported(status: int): bool = status == -38
+
+// 0 not asked yet, 1 the system has openat, 2 it answered ENOSYS to the first one.
+private var anchoredSupport = 0
+
+// Whether the system has no openat (asked once per process, by opening "/").
+private fun anchoredMissing(): bool {
+    if (anchoredSupport == 0) {
+        val root = linuxSyscall4(257, -100, nativeCStringAddress("/"), 589824, 0)
+        if (root >= 0) linuxSyscall1(3, root)
+        anchoredSupport = if (root == -38) 2 else 1
+    }
+    anchoredSupport == 2
+}
+
+// What the path names itself (a link is not followed): metadata through the directory descriptor.
+private fun anchoredStat(directory: int, name: string, flags: int, filePath: Path): FileInfo {
+    val status = nativeByteBuffer(144)
+    val measured = linuxSyscall4(262, directory, nativeCStringAddress(name), nativePointerAddress(status.address), flags)
+    var kind = 0
+    var size = -1
+    var revision = 0
+    var inode = 0
+    var changed = 0
+    if (measured == 0) {
+        val modeKind = linuxLoadU32(status, 24) / 4096
+        kind = 3
+        if (modeKind == 8) kind = 1
+        if (modeKind == 4) kind = 2
+        if (modeKind == 10) kind = 4
+        size = status.loadI64(48)
+        revision = status.loadI64(88) * 1000000000 + status.loadI64(96)
+        inode = status.loadI64(8)
+        changed = status.loadI64(104) * 1000000000 + status.loadI64(112)
+    }
+    status.close()
+    FileInfo(filePath, kind, size, revision, inode, changed)
+}
+
+// Whether `path` is handled by Path as it is (absolute, or a host whose calls are translated).
+private fun anchoredPlain(text: string): bool = pathHostIsWindows() || text.size == 0 || text[0] == 47 || anchoredMissing()
+
+// The file's contents or why not, as Path.readTextResult, never through a link.
+fun AnchoredPath.readTextResult(): FileReadResult {
+    if (anchoredPlain(this.text)) return Path(this.text).readTextResult()
+    val leaf = anchoredLeaf(this.text, false)
+    if (anchoredUnsupported(leaf.descriptor)) return Path(this.text).readTextResult()
+    if (leaf.descriptor < 0) return FileReadResult("", false, -leaf.descriptor)
+    val descriptor = linuxSyscall4(257, leaf.descriptor, nativeCStringAddress(leaf.name), anchoredLeafFlags, 0)
+    var result = FileReadResult("", false, -descriptor)
+    if (descriptor >= 0) {
+        val info = anchoredStat(descriptor, "", 4096, Path(this.text))
+        result = if (info.isDirectory()) FileReadResult("", false, 21) else linuxReadDescriptorText(descriptor, info.size)
+        linuxSyscall1(3, descriptor)
+    }
+    linuxSyscall1(3, leaf.descriptor)
+    result
+}
+
+// The file's contents, or "" for any failure, as Path.readText.
+fun AnchoredPath.readText(): string {
+    val read = this.readTextResult()
+    if (read.succeeded) read.text else ""
+}
+
+// The path's metadata without following a link at the end (kind 4 for one), as Path.info for a path with none.
+fun AnchoredPath.info(): FileInfo {
+    if (anchoredPlain(this.text)) return Path(this.text).info()
+    val leaf = anchoredLeaf(this.text, false)
+    if (anchoredUnsupported(leaf.descriptor)) return Path(this.text).info()
+    var result = FileInfo(Path(this.text), 0, -1, 0)
+    if (leaf.descriptor >= 0) {
+        result = anchoredStat(leaf.descriptor, leaf.name, 256, Path(this.text))
+        linuxSyscall1(3, leaf.descriptor)
+    }
+    result
+}
+
+// Whether the path names anything.
+fun AnchoredPath.exists(): bool = this.info().exists()
+
+// The modification time in nanoseconds, as Path.revision.
+fun AnchoredPath.revision(): int = this.info().revision
+
+// Whether the path itself is a link.
+fun AnchoredPath.isSymbolicLink(): bool = this.info().kind == 4
+
+// The immediate child paths of a directory, as Path.entries.
+fun AnchoredPath.entries(): array<Path> {
+    if (anchoredPlain(this.text)) return Path(this.text).entries()
+    val names = anchoredNames(this.text)
+    val directory = anchoredOpenDirectory(names, names.size, false, 0o777)
+    if (anchoredUnsupported(directory)) return Path(this.text).entries()
+    val entries: array<Path> = []
+    if (directory >= 0) {
+        val buffer = nativeByteBuffer(65536)
+        var reading = true
+        while (reading) {
+            val measured = linuxSyscall3(217, directory, nativePointerAddress(buffer.address), buffer.capacity)
+            if (measured <= 0) reading = false
+            var offset = 0
+            while (offset + 19 <= measured) {
+                val recordLength = linuxLoadU16(buffer, offset + 16)
+                val validRecord = recordLength >= 20 && offset + recordLength <= measured
+                if (!validRecord) {
+                    offset = measured
+                    reading = false
+                }
+                if (validRecord) {
+                    val name = linuxDirectoryEntryName(buffer, offset + 19, offset + recordLength)
+                    if (name != "." && name != "..") entries.append(Path(this.text).child(name))
+                    offset = offset + recordLength
+                }
+            }
+        }
+        buffer.close()
+        linuxSyscall1(3, directory)
+    }
+    entries
+}
+
+// Creates the directories of the path, as Path.createDirectories.
+fun AnchoredPath.createDirectories(mode: int = 0o777): bool {
+    if (anchoredPlain(this.text)) return Path(this.text).createDirectories(mode)
+    val names = anchoredNames(this.text)
+    val directory = anchoredOpenDirectory(names, names.size, true, mode)
+    if (anchoredUnsupported(directory)) return Path(this.text).createDirectories(mode)
+    if (directory >= 0) linuxSyscall1(3, directory)
+    directory >= 0
+}
+
+// Creates the directories that hold the path, as Path.createParentDirectories.
+fun AnchoredPath.createParentDirectories(): bool {
+    if (anchoredPlain(this.text)) return Path(this.text).createParentDirectories()
+    val names = anchoredNames(this.text)
+    if (names.size == 0) return false
+    val directory = anchoredOpenDirectory(names, names.size - 1, true, 0o777)
+    if (anchoredUnsupported(directory)) return Path(this.text).createParentDirectories()
+    if (directory >= 0) linuxSyscall1(3, directory)
+    directory >= 0
+}
+
+private fun anchoredWrite(text: string, contents: string, flags: int, mode: int): bool {
+    val leaf = anchoredLeaf(text, true)
+    if (leaf.descriptor < 0) return false
+    val descriptor = linuxSyscall4(257, leaf.descriptor, nativeCStringAddress(leaf.name), flags + anchoredLeafFlags, mode)
+    var success = descriptor >= 0
+    if (success) success = linuxWriteAll(descriptor, contents)
+    if (descriptor >= 0 && linuxSyscall1(3, descriptor) != 0) success = false
+    linuxSyscall1(3, leaf.descriptor)
+    success
+}
+
+// Writes the file (created with `mode`, truncated), as Path.writeText.
+fun AnchoredPath.writeText(contents: string, mode: int = 0o666): bool {
+    if (anchoredPlain(this.text)) return Path(this.text).writeText(contents, mode)
+    if (mode < 0 || mode > 0o777) return false
+    val probe = anchoredLeaf(this.text, true)
+    if (anchoredUnsupported(probe.descriptor)) return Path(this.text).writeText(contents, mode)
+    if (probe.descriptor >= 0) linuxSyscall1(3, probe.descriptor)
+    anchoredWrite(this.text, contents, 577, mode)
+}
+
+// Appends to the file, as Path.appendText.
+fun AnchoredPath.appendText(contents: string): bool {
+    if (anchoredPlain(this.text)) return Path(this.text).appendText(contents)
+    val probe = anchoredLeaf(this.text, true)
+    if (anchoredUnsupported(probe.descriptor)) return Path(this.text).appendText(contents)
+    if (probe.descriptor >= 0) linuxSyscall1(3, probe.descriptor)
+    anchoredWrite(this.text, contents, 1089, 0o666)
+}
+
+// Replaces the file through a temporary beside it, as Path.writeTextAtomic.
+fun AnchoredPath.writeTextAtomic(contents: string, mode: int = 0o666): bool {
+    if (anchoredPlain(this.text)) return Path(this.text).writeTextAtomic(contents, mode)
+    this.replace(contents, mode, false, true, true)
+}
+
+// The replacement writeTextAtomic and a build's own files share: a new temporary named like the file's with the process id, O_EXCL, written, optionally
+// synced, renamed over the file. `exactMode` gives the file `mode` whatever it had; otherwise an existing file keeps its permissions
+// when `preserveExisting`. Not for an absolute path or on a translated host: those use the Path implementation.
+fun AnchoredPath.replace(contents: string, mode: int, exactMode: bool, preserveExisting: bool, sync: bool): bool {
+    if (mode < 0 || mode > 0o777) return false
+    val leaf = anchoredLeaf(this.text, true)
+    if (leaf.descriptor < 0) return false
+    val existingMode = if (preserveExisting) linuxExistingMode(leaf.descriptor, leaf.name) else -1
+    val keptMode = if (exactMode) mode else if (existingMode >= 0) existingMode else mode
+    val temporary = "${leaf.name}.tmp.${linuxProcessId()}"
+    var descriptor = linuxSyscall4(257, leaf.descriptor, nativeCStringAddress(temporary), 705 + anchoredLeafFlags, keptMode)
+    var success = descriptor >= 0
+    if (success && (exactMode || existingMode >= 0)) success = linuxSyscall2(91, descriptor, keptMode) == 0
+    if (success) success = linuxWriteAll(descriptor, contents)
+    if (success && sync && linuxSyscall1(74, descriptor) != 0) success = false
+    if (descriptor >= 0 && linuxSyscall1(3, descriptor) != 0) success = false
+    if (success) success = linuxSyscall5(264, leaf.descriptor, nativeCStringAddress(temporary), leaf.descriptor, nativeCStringAddress(leaf.name), 0) == 0
+    if (!success && descriptor >= 0) linuxSyscall3(263, leaf.descriptor, nativeCStringAddress(temporary), 0)
+    linuxSyscall1(3, leaf.descriptor)
+    success
+}
+
+// Whether a relative path is walked by AnchoredPath (not an absolute path, not a translated host): the build's own file writes use it then.
+fun anchoredApplies(text: string): bool = !anchoredPlain(text)
+
+// The permission bits of the file `name` in the directory `directory`, or -1.
+private fun linuxExistingMode(directory: int, name: string): int {
+    val status = nativeByteBuffer(144)
+    val measured = linuxSyscall4(262, directory, nativeCStringAddress(name), nativePointerAddress(status.address), 256)
+    val mode = if (measured == 0) linuxLoadU32(status, 24) & 4095 else -1
+    status.close()
+    mode
+}
+
+// Removes a file, a link or an empty directory, as Path.remove.
+fun AnchoredPath.remove(): bool {
+    if (anchoredPlain(this.text)) return Path(this.text).remove()
+    val leaf = anchoredLeaf(this.text, false)
+    if (anchoredUnsupported(leaf.descriptor)) return Path(this.text).remove()
+    if (leaf.descriptor < 0) return false
+    var status = linuxSyscall3(263, leaf.descriptor, nativeCStringAddress(leaf.name), 0)
+    if (status != 0) status = linuxSyscall3(263, leaf.descriptor, nativeCStringAddress(leaf.name), 512)
+    linuxSyscall1(3, leaf.descriptor)
+    status == 0
+}
+
+// Moves the path to `destination` (both read the same way), creating the destination's directories, as Path.moveTo.
+fun AnchoredPath.moveTo(destination: AnchoredPath): bool {
+    if (anchoredPlain(this.text) || anchoredPlain(destination.text)) return Path(this.text).moveTo(Path(destination.text))
+    val source = anchoredLeaf(this.text, false)
+    if (anchoredUnsupported(source.descriptor)) return Path(this.text).moveTo(Path(destination.text))
+    if (source.descriptor < 0) return false
+    val target = anchoredLeaf(destination.text, true)
+    var success = target.descriptor >= 0
+    if (success) success = linuxSyscall5(264, source.descriptor, nativeCStringAddress(source.name), target.descriptor, nativeCStringAddress(target.name), 0) == 0
+    if (target.descriptor >= 0) linuxSyscall1(3, target.descriptor)
+    linuxSyscall1(3, source.descriptor)
+    success
+}
