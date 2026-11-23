@@ -69,7 +69,8 @@ fun bootstrapSourceUsesSubparser(
 }
 
 fun bootstrapActionsRegisterSubparser(
-    actions: array<BootstrapExpression>
+    actions: array<BootstrapExpression>,
+    rawOnly: bool = false
 ): bool {
     var found = false
     var index = 0
@@ -79,7 +80,8 @@ fun bootstrapActionsRegisterSubparser(
             expression = expression.children[0]
         }
         found = expression.kind == "call" &&
-            expression.text == "compilerRegisterSubparser"
+            expression.text == "compilerRegisterSubparser" &&
+            (!rawOnly || expression.children.size == 3)
         index = index + 1
     }
     found
@@ -4379,6 +4381,8 @@ class BootstrapRawImportFrame(
     var resolved: int = 0
 )
 
+class BootstrapRawPreviewSource(val path: string, val source: string, val host: string)
+
 class BootstrapRawImportScope(
     val syntaxOnly: bool,
     val overlayPaths: array<string>,
@@ -4386,11 +4390,27 @@ class BootstrapRawImportScope(
     val bindings: Map<string, BootstrapRawBoundaryBinding> = Map(),
     val seen: Map<string, bool> = Map(),
     val declarations: array<BootstrapDeclaration> = [],
-    val frames: array<BootstrapRawImportFrame> = []
+    val frames: array<BootstrapRawImportFrame> = [],
+    val pendingDeclarations: array<BootstrapRawPreviewSource> = [],
+    var collectingDeclarations: bool = false
 ) {
+    // Token-form sites need no evaluator context. Keep sources in import
+    // order until a raw registration needs the declarations they define.
+    fun materializeDeclarations(): void {
+        if (this.collectingDeclarations) return
+        this.collectingDeclarations = true
+        for (pending in this.pendingDeclarations) {
+            val discovery = bootstrapModuleDiscovery(pending.source, pending.path, pending.host)
+            for (declaration in discovery.declarations) {
+                this.declarations.append(declaration)
+            }
+        }
+        this.pendingDeclarations.truncate(0)
+    }
+
     fun addRegistrations(path: string, discovery: BootstrapParseResult, frame: int): void {
         if (this.syntaxOnly && !bootstrapPathIsStandardLibrary(path)) return
-        if (!bootstrapActionsRegisterSubparser(discovery.actions)) return
+        if (!bootstrapActionsRegisterSubparser(discovery.actions, true)) return
         val declarations = if (frame >= 0) this.frames[frame].declarations else this.declarations
         val registry = bootstrapBuildSubparserRegistry(BootstrapParseResult(
             declarations, discovery.actions, discovery.errors, discovery.extensionErrors,
@@ -4433,7 +4453,16 @@ class BootstrapRawImportScope(
                 this.collect(scope, bootstrapResolveImport(path, edge.source))
             }
         }
+        if (!this.collectingDeclarations && source.indexOf("compilerRegisterSubparser") < 0) {
+            this.pendingDeclarations.append(BootstrapRawPreviewSource(path, source, host))
+            return
+        }
         val discovery = bootstrapModuleDiscovery(source, path, host)
+        if (!this.collectingDeclarations && !bootstrapActionsRegisterSubparser(discovery.actions, true)) {
+            this.pendingDeclarations.append(BootstrapRawPreviewSource(path, source, host))
+            return
+        }
+        this.materializeDeclarations()
         for (declaration in discovery.declarations) {
             this.declarations.append(declaration)
         }
@@ -4455,10 +4484,13 @@ class BootstrapRawImportScope(
             }
             this.frames[frame].nextRegistration = next
             val discovery = bootstrapModuleDiscovery(bootstrapRawPlanPrefix(begin), path)
-            this.frames[frame].declarations.truncate(0)
-            for (declaration in this.declarations) this.frames[frame].declarations.append(declaration)
-            for (declaration in discovery.declarations) this.frames[frame].declarations.append(declaration)
-            this.addRegistrations(path, discovery, frame)
+            if (bootstrapActionsRegisterSubparser(discovery.actions, true)) {
+                this.materializeDeclarations()
+                this.frames[frame].declarations.truncate(0)
+                for (declaration in this.declarations) this.frames[frame].declarations.append(declaration)
+                for (declaration in discovery.declarations) this.frames[frame].declarations.append(declaration)
+                this.addRegistrations(path, discovery, frame)
+            }
         }
         val imported = this.bindings.get(name)
         if (imported != null) return imported

@@ -14,7 +14,7 @@ mkdir -p "$out"
 "$compiler" build "$cases/valid.ab" --fast -o "$out/valid"
 "$out/valid"
 
-for case in local transitive/main; do
+for case in local preview-local transitive/main; do
     output="$out/${case//\//-}"
     "$compiler" build "$cases/$case.ab" --fast -o "$output"
     "$output"
