@@ -1,6 +1,7 @@
 import "../../ct_global_graph.ab"
 import "ios.ab"
 import "../../frontend.ab"
+import "../../ct_native.ab"
 import "../../module_paths.ab"
 import "../../codegen_units.ab"
 import "../../wasm_panic.ab"
@@ -150,6 +151,35 @@ trusted fun bootstrapLlvmEraseUnusedDormant(module: i64*): void {
             pointerIsNull(LLVMGetFirstUse(function))) LLVMDeleteFunction(function)
         function = following
     }
+}
+
+// What a compilation does with its lowered program: a native compiler emits it as LLVM IR (bootstrapEmitLlvmProgram, installed by
+// bootstrapEmitLlvmInstall); a compiler built without LLVM (the browser's) installs its own, so no LLVM symbol is reachable from it.
+fun bootstrapEmitUnavailable(
+    program: BootstrapIrProgram,
+    targetTriple: string,
+    requireMain: bool
+): BootstrapLlvmEmission = BootstrapLlvmEmission("", 1, "")
+
+var bootstrapEmitProgram: (BootstrapIrProgram, string, bool) -> BootstrapLlvmEmission = bootstrapEmitUnavailable
+
+// The compile-time tiers that run a pass's sites as native code (ct_jit.ab) are LLVM's too: a pass without them analyses the program and
+// leaves its `#` sites to the interpreter (ABLA_COMPILE_EVAL=interp, the default).
+fun bootstrapCtAnalyzeInterpreted(parsed: BootstrapParseResult, targetTriple: string): BootstrapSemanticResult {
+    ctNativeSetBuildTarget(targetTriple)
+    bootstrapAnalyzeParsed(parsed)
+}
+
+fun bootstrapCtFinishPassNone(another: bool): void {}
+
+var bootstrapCtAnalyzeHook: (BootstrapParseResult, string) -> BootstrapSemanticResult = bootstrapCtAnalyzeInterpreted
+var bootstrapCtFinishPassHook: (bool) -> void = bootstrapCtFinishPassNone
+
+// A native compiler: LLVM emission and the native compile-time tiers.
+fun bootstrapEmitLlvmInstall(): void {
+    bootstrapEmitProgram = bootstrapEmitLlvmProgram
+    bootstrapCtAnalyzeHook = bootstrapCtAnalyze
+    bootstrapCtFinishPassHook = bootstrapCtFinishPass
 }
 
 fun bootstrapEmitLlvmProgram(
@@ -1220,7 +1250,7 @@ fun bootstrapCompileLlvmParsedCached(
         bootstrapFloatDemandPrepare(parsed.declarations)
         bootstrapFloatDemandActive = true
     }
-    val analyzed = bootstrapCtAnalyze(parsed, targetTriple)
+    val analyzed = bootstrapCtAnalyzeHook(parsed, targetTriple)
     bootstrapFloatDemandActive = outerFloatDemandActive
     if (floatProbe) bootstrapFloatDemandNames = Map()
     if (floatProbe && analyzed.errors == 0) {
@@ -1229,7 +1259,7 @@ fun bootstrapCompileLlvmParsedCached(
             if (demanded && !bootstrapFloatBridgeAvailable) {
                 bootstrapSemanticTargetsWasm = outerTargetsWasm
                 bootstrapSemanticWasmUnwinds = false
-                bootstrapCtFinishPass()
+                bootstrapCtFinishPassHook(true)
                 val _discardedExports = bootstrapTakeExportRequests()
                 return BootstrapLlvmCompilation("", 0, 0, 0, 0, 0, "", false, false, [], [], "",
                     true)
@@ -1252,7 +1282,7 @@ fun bootstrapCompileLlvmParsedCached(
         val _prunedDiagnosed = bootstrapTakeDiagnosedLoweringErrors()
         val _prunedDiagnostics = bootstrapTakeDriverDiagnostics()
         val _prunedNamed = bootstrapTakeNamedArgumentErrors()
-        bootstrapCtFinishPass()
+        bootstrapCtFinishPassHook(true)
         if (bootstrapPruneRuntimeTrace()) linuxWriteStandardError("abla-prune-runtime fallback: built again without the prune\n")
         bootstrapRuntimePruneOff = true
         bootstrapFloatBridgeProbe = bridgeProbe
@@ -1335,7 +1365,7 @@ fun bootstrapCompileLlvmParsedCached(
         val _prunedDiagnosed = bootstrapTakeDiagnosedLoweringErrors()
         val _prunedDiagnostics = bootstrapTakeDriverDiagnostics()
         val _prunedNamed = bootstrapTakeNamedArgumentErrors()
-        bootstrapCtFinishPass()
+        bootstrapCtFinishPassHook(true)
         bootstrapRestoreCompileGlobals(globals)
         if (bootstrapPruneRuntimeTrace()) linuxWriteStandardError("abla-prune-runtime fallback: built again without the prune\n")
         bootstrapRuntimePruneOff = true
@@ -1352,7 +1382,7 @@ fun bootstrapCompileLlvmParsedCached(
         val _discardedExports = bootstrapTakeExportRequests()
         val _discardedDiagnosed = bootstrapTakeDiagnosedLoweringErrors()
         val _discardedDiagnostics = bootstrapTakeDriverDiagnostics()
-        bootstrapCtFinishPass()
+        bootstrapCtFinishPassHook(true)
         if (round + 1 >= BOOTSTRAP_COMPILE_EDIT_ROUNDS) {
             var asked = ""
             for (edit in roundEdits) {
@@ -1418,7 +1448,7 @@ fun bootstrapCompileLlvmParsedCached(
     } else {
         val enclosingFloatKinds = bootstrapLlvmFloatKindEquality
         bootstrapLlvmFloatKindEquality = floatKinds
-        val result = bootstrapEmitLlvmProgram(
+        val result = bootstrapEmitProgram(
             program, targetTriple, requireMain && written.errors == 0
         )
         bootstrapLlvmFloatKindEquality = enclosingFloatKinds
@@ -1453,7 +1483,7 @@ fun bootstrapCompileLlvmParsedCached(
         )
     )
     // (The compilation is over: what its last generation left pending stays unread, ct_eval.ab.)
-    bootstrapCtFinishPass(false)
+    bootstrapCtFinishPassHook(false)
     BootstrapLlvmCompilation(
         emitted.output,
         totalErrors,
@@ -1477,7 +1507,7 @@ fun bootstrapCompileLlvmParsed(
     parsed: BootstrapParseResult
 ): BootstrapLlvmCompilation {
     val cache = bootstrapIrTransientState()
-    bootstrapCompileLlvmParsedCached(parsed, cache, llvmDefaultTargetTriple())
+    bootstrapCompileLlvmParsedCached(parsed, cache, ctNativeDefaultTriple())
 }
 
 // For `--emit-llvm`: a big import graph costs what it reaches, as in a build.
@@ -1487,7 +1517,7 @@ fun bootstrapCompileLlvmEmit(
 ): BootstrapLlvmCompilation {
     val cache = bootstrapIrTransientState()
     bootstrapLowerEveryBodyOf = bootstrapNormalizeModulePath(sourcePath)
-    val compilation = bootstrapCompileLlvmParsedCached(parsed, cache, llvmDefaultTargetTriple(),
+    val compilation = bootstrapCompileLlvmParsedCached(parsed, cache, ctNativeDefaultTriple(),
         true)
     bootstrapLowerEveryBodyOf = ""
     compilation

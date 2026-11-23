@@ -897,17 +897,17 @@ fun bootstrapCtInterpretEnd(timed: bool): void {
     return
 }
 
-// A handler that only returns, so that SIGALRM interrupts a blocked system call (EINTR) and nothing else. The
-// bytes are `ret` on x86-64 and `add x3, x6, #0; ret` on AArch64 (x3 is a scratch register): one body for every
-// compiler host, as bootstrapCtSigreturn is written in bytes.
-@naked
-trusted fun bootstrapCtAlarmReturn(): void =
-    bootstrapCtSigreturnAssembly(".byte 0xc3, 0x00, 0x00, 0x91, 0xc0, 0x03, 0x5f, 0xd6", "")
+// The addresses of the signal trampolines: a handler that only returns (so that SIGALRM interrupts a blocked system call, EINTR, and nothing
+// else) and the sigreturn restorer. They are machine code, which only a native compiler has (ct_signal_trampolines.ab installs them); a
+// compiler for a target without signals (the browser's) leaves 0, and arms nothing.
+var bootstrapCtAlarmReturnAddress: int = 0
+var bootstrapCtSigreturnAddress: int = 0
 
 // SIGALRM for an interpreted site: first after `seconds`, then every second (ITIMER_REAL's interval), without
 // SA_RESTART so a blocked call returns EINTR; the evaluator then sees the deadline passed.
 trusted fun bootstrapCtArmInterpreterAlarm(seconds: int): bool {
-    val handler = nativeFunctionAddress(bootstrapCtAlarmReturn)
+    val handler = bootstrapCtAlarmReturnAddress
+    if (handler == 0) return false
     // (ablaHostIsMacOS, not bootstrapCtHostIsDarwin: that is set only once a native session exists.)
     val action = if (ablaHostIsMacOS()) bootstrapCtZeroed(160) else bootstrapCtKernelAction(handler, 0)
     if (ablaHostIsMacOS()) ablaRuntimeStoreI64(action, handler)
@@ -1069,21 +1069,8 @@ noescape extern:"c" fun sigaltstack(stack: i64*, previous: i64*): i32
 
 // x86-64 Linux talks to the kernel (#806): rt_sigaction (13) with the kernel's struct
 // {handler, flags, restorer, mask} and sigaltstack (131), so the compiler needs no
-// libc sigaction/sigaltstack there; macOS keeps libSystem's.
-trusted noescape extern:"inline-assembly" fun bootstrapCtSigreturnAssembly(
-    template: string,
-    constraints: string
-): void
-
-// The trampoline a returning handler goes through (SA_RESTORER): rt_sigreturn.
-// The x86-64 Linux rt_sigreturn trampoline, `movq $15, %rax; syscall` (48 c7 c0 0f 00 00 00 0f 05),
-// written as bytes because this module is compiled for every host, and the bootstrap compiler
-// must assemble the same source on arm64 macOS: mnemonics there are assembler errors. Off
-// x86-64 Linux the bytes are never executed: bootstrapCtSigaction takes libSystem's sigaction
-// on macOS, so nothing there installs this address as a signal restorer.
-@naked
-trusted fun bootstrapCtSigreturn(): void =
-    bootstrapCtSigreturnAssembly(".byte 0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x05", "")
+// libc sigaction/sigaltstack there; macOS keeps libSystem's. (The restorer, rt_sigreturn, is
+// bootstrapCtSigreturnAddress.)
 
 // The kernel's struct sigaction (a zeroed 160-byte buffer) for `handler` and `flags`
 // (SA_RESTORER added); the handler returns through bootstrapCtSigreturn.
@@ -1091,7 +1078,7 @@ trusted fun bootstrapCtKernelAction(handler: int, flags: int): int {
     val action = bootstrapCtZeroed(160)
     ablaRuntimeStoreI64(action, handler)
     ablaRuntimeStoreI64(action + 8, flags + 67108864)
-    ablaRuntimeStoreI64(action + 16, nativeFunctionAddress(bootstrapCtSigreturn))
+    ablaRuntimeStoreI64(action + 16, bootstrapCtSigreturnAddress)
     action
 }
 

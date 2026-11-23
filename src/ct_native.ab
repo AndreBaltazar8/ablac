@@ -23,7 +23,6 @@ import "abla/sys/linux"
 import "abla/sys/linux/process"
 import "abla/sys/linux/fs"
 import "abla/fs/path"
-import "abla/llvm/orc"
 import "abla/float"
 import "abla/platform/host"
 import "abla/io"
@@ -68,7 +67,24 @@ var ctNativeSearchedDirectories: string = ""
 
 // The thunk JIT (created on the first extern:"c" call) and its thunks, one per
 // signature key.
-var ctNativeSessions: array<LlvmOrcSession> = []
+// The JIT and the dynamic loader behind them are LLVM's (ct_native_orc.ab installs them in a native compiler). A compiler built without LLVM
+// (the browser's) leaves these refusing, so no LLVM symbol is reachable from the evaluator: a native call at compile time then fails with
+// the status ENOSYS (38), and the target's own triple is the compiler's host.
+fun ctNativeNoJitCompile(symbol: string, text: string): int = 38
+fun ctNativeNoJitLookup(symbol: string): int = -38
+fun ctNativeNoLoad(path: string): int = -1
+fun ctNativeNoSearch(name: string): int = 0
+fun ctNativeNoTriple(): string = "wasm32-unknown-unknown"
+// Compiles `text` (LLVM IR) under `symbol`: 0, or the ORC status.
+var ctNativeJitCompile: (string, string) -> int = ctNativeNoJitCompile
+// The address of a compiled symbol, or minus the ORC status.
+var ctNativeJitLookup: (string) -> int = ctNativeNoJitLookup
+// llvmLoadLibraryPermanently: 0 when the library loaded.
+var ctNativeHookLoad: (string) -> int = ctNativeNoLoad
+// llvmSearchForAddressOfSymbol: the address in the loaded libraries, 0 when absent.
+var ctNativeSearchSymbol: (string) -> int = ctNativeNoSearch
+// llvmDefaultTargetTriple.
+var ctNativeDefaultTriple: () -> string = ctNativeNoTriple
 var ctNativeThunkKeys: array<string> = []
 var ctNativeThunkAddresses: array<int> = []
 
@@ -279,12 +295,12 @@ fun ctNativeEvaluatePrimitive(
     }
     if (name == "ablaCtNarrowTarget") {
         val narrow = if (ctNativeBuildNarrow >= 0) ctNativeBuildNarrow == 1
-            else ctNativeNarrowOfTriple(llvmDefaultTargetTriple())
+            else ctNativeNarrowOfTriple(ctNativeDefaultTriple())
         return bootstrapEvalBoolean(narrow)
     }
     if (name == "ablaSimdTargetArch") {
         return bootstrapEvalInteger(if (ctNativeBuildArch >= 0) ctNativeBuildArch
-            else ctNativeArchOfTriple(llvmDefaultTargetTriple()))
+            else ctNativeArchOfTriple(ctNativeDefaultTriple()))
     }
     if (name == "ablaSimdCpuProbe") return bootstrapEvalInteger(0)
     // Whether the wipe needs the image's stack limit (Xtensa): under `#` no wipe touches a native stack, so the
@@ -912,21 +928,14 @@ fun ctNativeThunk(parameterTypes: array<string>, resultType: string): int {
         if (ctNativeThunkKeys[index] == key) return ctNativeThunkAddresses[index]
         index = index + 1
     }
-    if (ctNativeSessions.size == 0) {
-        ctNativeSessions.append(llvmOrcCreateSession())
-    }
-    val session = ctNativeSessions[0]
-    if (session.status != 0) return -session.status
     val symbol = "abla_ct_native_thunk_${ctNativeThunkKeys.size}"
-    val generation = session.addText(
-        symbol, ctNativeThunkSource(symbol, parameterTypes, resultType)
-    )
-    if (generation.status != 0) return -generation.status
-    val lookup = session.lookup(symbol)
-    if (lookup.status != 0) return -lookup.status
+    val generation = ctNativeJitCompile(symbol, ctNativeThunkSource(symbol, parameterTypes, resultType))
+    if (generation != 0) return -generation
+    val address = ctNativeJitLookup(symbol)
+    if (address < 0) return address
     ctNativeThunkKeys.append(key)
-    ctNativeThunkAddresses.append(lookup.address)
-    lookup.address
+    ctNativeThunkAddresses.append(address)
+    address
 }
 
 // ---- native libraries ----
@@ -1058,7 +1067,7 @@ fun ctNativeLibraryDirectories(): array<string> {
 // Loads a library file; a GNU ld script (a Linux `lib<name>.so` may be one)
 // loads the shared objects it names instead.
 fun ctNativeLoadFile(path: string): bool {
-    if (llvmLoadLibraryPermanently(path) == 0) return true
+    if (ctNativeHookLoad(path) == 0) return true
     var loaded = false
     val info = Path(path).info()
     if (info.size > 0 && info.size < 4096) {
@@ -1074,7 +1083,7 @@ fun ctNativeLoadFile(path: string): bool {
                            script[end] != 9) end = end + 1
                     val candidate = script.slice(index, end)
                     if (bootstrapTextContains(candidate, ".so") &&
-                        llvmLoadLibraryPermanently(candidate) == 0) loaded = true
+                        ctNativeHookLoad(candidate) == 0) loaded = true
                     index = end
                 } else {
                     index = index + 1
@@ -1099,7 +1108,7 @@ fun ctNativeLoadLibrary(name: string, directories: array<string>): string {
     }
     // The dynamic loader's own search (its configured paths, and on Darwin the
     // shared cache that holds the system libraries).
-    if (loaded == "" && llvmLoadLibraryPermanently(file) == 0) loaded = file
+    if (loaded == "" && ctNativeHookLoad(file) == 0) loaded = file
     loaded
 }
 
@@ -1169,10 +1178,10 @@ var ctNativeProcessScopeLoaded: bool = false
 trusted fun ctNativeProcessSymbol(name: string): int {
     if (ablaHostIsMacOS()) return nativePointerAddress(dlsym(dlopen(nativeNullPointer(), 1), name))
     if (!ctNativeProcessScopeLoaded) {
-        llvmLoadLibraryPermanently("")
+        ctNativeHookLoad("")
         ctNativeProcessScopeLoaded = true
     }
-    llvmSearchForAddressOfSymbol(name)
+    ctNativeSearchSymbol(name)
 }
 
 // The address of a C symbol (0 when absent): the compiler process, then the
@@ -1185,7 +1194,7 @@ fun ctNativeSymbol(name: string): int {
     }
     ctNativePrepareLibraries()
     var address = ctNativeProcessSymbol(name)
-    if (address == 0) address = llvmSearchForAddressOfSymbol(name)
+    if (address == 0) address = ctNativeSearchSymbol(name)
     if (address != 0) {
         ctNativeSymbolNames.append(name)
         ctNativeSymbolAddresses.append(address)
@@ -1522,24 +1531,13 @@ trusted fun ctNativeEvaluateFunctionAddress(
         }
         index = index + 1
     }
-    if (ctNativeSessions.size == 0) {
-        ctNativeSessions.append(llvmOrcCreateSession())
-    }
-    val session = ctNativeSessions[0]
     val slot = ctNativeCallbackKeys.size
     val symbol = "abla_ct_native_callback_$slot"
-    var status = session.status
+    var status = ctNativeJitCompile(symbol, ctNativeCallbackSource(symbol, slot, parameterTypes, resultType))
     var address = 0
     if (status == 0) {
-        val generation = session.addText(
-            symbol, ctNativeCallbackSource(symbol, slot, parameterTypes, resultType)
-        )
-        status = generation.status
-    }
-    if (status == 0) {
-        val lookup = session.lookup(symbol)
-        status = lookup.status
-        address = lookup.address
+        val looked = ctNativeJitLookup(symbol)
+        if (looked < 0) status = -looked else address = looked
     }
     if (status != 0) {
         evaluator.errors = evaluator.errors + 1
