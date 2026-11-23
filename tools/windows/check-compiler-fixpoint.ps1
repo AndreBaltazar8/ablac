@@ -39,6 +39,86 @@ function Check-CompilerStack([string]$Compiler) {
     }
 }
 
+function Get-SectionSignatures([string]$Path) {
+    $description = (& $readobj --sections --section-relocations $Path) -join "`n"
+    $sections = [regex]::Matches($description, '(?ms)^  Section \{\n(.*?)^  \}')
+    if (!$sections.Count) { throw "No COFF sections in $Path" }
+
+    $signatures = [Collections.Generic.Dictionary[string,Collections.Generic.List[string]]]::new()
+    $file = [IO.File]::OpenRead($Path)
+    try {
+        foreach ($section in $sections) {
+            $fields = $section.Groups[1].Value
+            $name = [regex]::Match($fields, '(?m)^    Name: (.+) \([0-9A-Fa-f ]+\)$').Groups[1].Value
+            $size = [regex]::Match($fields, '(?m)^    RawDataSize: (\d+)$')
+            $offset = [regex]::Match($fields, '(?m)^    PointerToRawData: 0x([0-9A-Fa-f]+)$')
+            if (!$name -or !$size.Success -or !$offset.Success) { throw "Incomplete section information in $Path" }
+
+            $position = [Convert]::ToInt64($offset.Groups[1].Value, 16)
+            $sizeInBytes = [int]$size.Groups[1].Value
+            $hash = ''
+            if ($position -ne 0 -and $sizeInBytes -ne 0) {
+                $bytes = [byte[]]::new($sizeInBytes)
+                $file.Position = $position
+                $file.ReadExactly($bytes, 0, $bytes.Length)
+                $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+            }
+            # Keep relocation records and section attributes, but ignore physical
+            # file offsets that can shift when a preceding section changes size.
+            $metadata = $fields -creplace '(?m)^    (?:Number|PointerTo(?:RawData|Relocations|LineNumbers)): .*\n', ''
+            if (!$signatures.ContainsKey($name)) {
+                $signatures[$name] = [Collections.Generic.List[string]]::new()
+            }
+            $signatures[$name].Add("$metadata$hash")
+        }
+    } finally {
+        $file.Dispose()
+    }
+    return ,$signatures
+}
+
+function Show-SectionDifferences([string]$Name, [string]$Second, [string]$Third) {
+    try {
+        $left = Get-SectionSignatures $Second
+        $right = Get-SectionSignatures $Third
+        $names = (@($left.Keys) + @($right.Keys)) | Sort-Object -Unique -CaseSensitive
+        $changed = foreach ($section in $names) {
+            if (($left[$section] -join "`n") -cne ($right[$section] -join "`n")) { $section }
+        }
+        if ($changed) {
+            Write-Host "$Name differing sections: $($changed -join ', ')"
+        } else {
+            Write-Host "$Name section contents and metadata match. The difference is outside the compared sections."
+        }
+    } catch {
+        Write-Warning "Could not compare $Name sections: $_"
+    }
+}
+
+function Test-NativeSite([string]$Compiler, [string]$Label) {
+    $directory = Join-Path $work "native-$Label"
+    New-Item -ItemType Directory -Path $directory | Out-Null
+    $probe = Join-Path $directory 'scalar-site.exe'
+    $trace = Join-Path $directory 'compile.log'
+    try {
+        & $Compiler build tests/cases/compile-eval-jit/scalars.ab --no-cache -o $probe *> $trace
+    } catch {
+        Get-Content $trace -Tail 50 | Out-Host
+        throw
+    }
+    $native = @(Select-String -LiteralPath $trace -Pattern '^note\[ct-jit\]: native at ')
+    if (!$native.Count) {
+        Get-Content $trace -Tail 50 | Out-Host
+        throw "$Label did not execute a native compile-time site"
+    }
+    $PSNativeCommandUseErrorActionPreference = $false
+    & $probe
+    $result = $LASTEXITCODE
+    if ($result -ne 42) { throw "$Label native-site probe exited $result instead of 42" }
+    $global:LASTEXITCODE = 0
+    Write-Host "$Label executed $($native.Count) native compile-time sites"
+}
+
 function Build-Stage([string]$Compiler, [string]$Stage) {
     New-Item -ItemType Directory -Path $coff, $Stage | Out-Null
     $output = Join-Path $coff 'ablac.exe'
@@ -76,14 +156,24 @@ try {
     Check-CompilerStack $seed
     $stage2 = Join-Path $work 'stage2'
     $stage3 = Join-Path $work 'stage3'
+    if ($Tier -eq 'native') { Test-NativeSite $seed 'seed' }
     Build-Stage $seed $stage2
-    Build-Stage (Join-Path $stage2 'ablac.exe') $stage3
+    $secondCompiler = Join-Path $stage2 'ablac.exe'
+    if ($Tier -eq 'native') { Test-NativeSite $secondCompiler 'stage2' }
+    Build-Stage $secondCompiler $stage3
     $different = @()
     foreach ($file in 'coff/ablac.exe.o', 'coff/ablac.exe.imports/exports.def', 'ablac.exe') {
-        $second = (Get-FileHash (Join-Path $stage2 $file)).Hash
-        $third = (Get-FileHash (Join-Path $stage3 $file)).Hash
+        $secondPath = Join-Path $stage2 $file
+        $thirdPath = Join-Path $stage3 $file
+        $second = (Get-FileHash $secondPath).Hash
+        $third = (Get-FileHash $thirdPath).Hash
         Write-Host "$file stage2 $second, stage3 $third"
-        if ($second -cne $third) { $different += $file }
+        if ($second -cne $third) {
+            $different += $file
+            if ($file -ne 'coff/ablac.exe.imports/exports.def') {
+                Show-SectionDifferences $file $secondPath $thirdPath
+            }
+        }
     }
     if ($different.Count) {
         throw "Stage 2 and stage 3 differ in $($different -join ', ')"
@@ -94,26 +184,7 @@ try {
     & $compiler build tests/cases/libc-imports/hello.ab --no-cache -o $hello
     if ((& $hello | Out-String).Trim() -cne 'hello') { throw 'Stage 3 hello output differs' }
 
-    if ($Tier -eq 'native') {
-        $probe = Join-Path $work 'native-site.exe'
-        $trace = Join-Path $work 'native-site.log'
-        try {
-            & $compiler build tests/cases/compile-eval-jit/scalars.ab --no-cache -o $probe *> $trace
-        } catch {
-            Get-Content $trace -Tail 50 | Out-Host
-            throw
-        }
-        if (!(Select-String -LiteralPath $trace -Quiet -Pattern '^note\[ct-jit\]: native at ')) {
-            Get-Content $trace -Tail 50 | Out-Host
-            throw 'Stage 3 did not execute a native compile-time site'
-        }
-        $PSNativeCommandUseErrorActionPreference = $false
-        & $probe
-        $result = $LASTEXITCODE
-        $PSNativeCommandUseErrorActionPreference = $true
-        if ($result -ne 42) { throw "Stage 3 native-site probe exited $result instead of 42" }
-        $global:LASTEXITCODE = 0
-    }
+    if ($Tier -eq 'native') { Test-NativeSite $compiler 'stage3' }
     Write-Host "Windows stage2 == stage3 ($Tier)"
 } finally {
     Pop-Location
