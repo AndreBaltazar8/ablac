@@ -1,0 +1,97 @@
+// The YAML parser against hostile documents (#1139 area 4): the 269 documents of tests/cases/yaml/corpus (the YAML test suite) and a few
+// hand-made ones (alias towers, deep nesting, long scalars, merge-like keys), mutated (inserted tokens, deleted, duplicated, swapped
+// ranges) and parsed under the default limits and under tight ones. The invariants: no crash or hang (each input is timed: over 2 s is a
+// finding), a failure carries a code and an offset inside the source, and a document that parses and emits does not change when it is
+// parsed and emitted again (emit(parse(emit(v))) == emit(v)).
+//
+//   tools/fuzz/parsers/run yaml --seeds 1-200 [--inputs 200]   (from the repository root)
+import "abla/io"
+import "abla/text"
+import "abla/integer"
+import "abla/fs"
+import "abla/yaml"
+import "abla/process/arguments"
+import "abla/process/time"
+import "../prng.ab"
+import "./mutate.ab"
+
+fun yamlFuzzCorpus(): array<string> {
+    var corpus: array<string> = [
+        "a: &x [1, 2, 3]\nb: &y [*x, *x, *x]\nc: &z [*y, *y, *y]\nd: [*z, *z, *z]\n",
+        "- &a [x, x]\n- &b [*a, *a]\n- &c [*b, *b]\n- &d [*c, *c]\n- &e [*d, *d]\n- &f [*e, *e]\n- &g [*f, *f]\n- &h [*g, *g]\n",
+        "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+        "a: 1\n<<: {b: 2}\n<<: [{c: 3}, {d: 4}]\n",
+        "? [a, b]\n: c\n? {x: y}\n: z\n",
+        "a: |\n  text\n  more\nb: >-\n  folded\n  text\nc: \"q\\n\\u00e9\"\nd: 'it''s'\n",
+        "---\na: 1\n...\n---\nb: 2\n",
+        "a: !!str 12\nb: !!int \"3\"\nc: !custom x\n",
+        "\u{feff}a: 1\n",
+        "a:\n\t- b\n"]
+    val lines = Path("tests/cases/yaml/corpus.list").readText().split("\n")
+    for (name in lines) {
+        if (name.size == 0) continue
+        corpus.append(Path("tests/cases/yaml/corpus/$name.yaml").readText())
+    }
+    corpus
+}
+
+fun yamlFuzzCheck(source: string, limits: YamlLimits): string {
+    val start = monotonicMilliseconds()
+    val parsed = yamlParse(source, limits)
+    val elapsed = monotonicMilliseconds() - start
+    if (elapsed > 2000) return "parsing took $elapsed ms"
+    if (!parsed.succeeded) {
+        if (parsed.error.code == "") return "a failure with no code"
+        if (parsed.error.byteOffset < 0 || parsed.error.byteOffset > source.size) return "an error offset ${parsed.error.byteOffset} outside the ${source.size} bytes of the source"
+        return ""
+    }
+    val emitted = yamlEmit(parsed.value, YamlEmitOptions(), limits)
+    if (!emitted.succeeded) return ""
+    val again = yamlParse(emitted.text, limits)
+    if (!again.succeeded) return "the emitted document does not parse: ${again.error.code} ${again.error.message}\n  emitted: ${mutateEscape(emitted.text)}"
+    val second = yamlEmit(again.value, YamlEmitOptions(), limits)
+    if (!second.succeeded) return "the re-parsed document cannot be emitted: ${second.error.code}"
+    if (second.text != emitted.text) return "emit(parse(emit(v))) differs from emit(v)\n  first: ${mutateEscape(emitted.text)}\n  second: ${mutateEscape(second.text)}"
+    ""
+}
+
+fun main: int {
+    var low = 1
+    var high = 50
+    var inputs = 200
+    var verbose = false
+    val count = processArgumentCount()
+    var index = 0
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "--seeds") {
+            val dash = value.indexOf("-")
+            low = (if (dash < 0) value else value.slice(0, dash)).parseInt() ?? 1
+            high = (if (dash < 0) value else value.slice(dash + 1, value.size)).parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--inputs") {
+            inputs = value.parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--verbose") verbose = true
+        index = index + 1
+    }
+    val corpus = yamlFuzzCorpus()
+    val tight = YamlLimits(maximumBytes = 4096, maximumDepth = 8, maximumNodes = 200, maximumScalarBytes = 512, maximumCollectionMembers = 50, maximumAnchors = 8, maximumAliases = 16, maximumExpandedNodes = 400, maximumExpandedScalarBytes = 4096, maximumNumberBytes = 32, maximumWork = 100000)
+    var findings = 0
+    for (seed in low until high + 1) {
+        var r = prngSeeded(seed)
+        for (n in 0 until inputs) {
+            val source = if (r.below(6) == 0) r.pick(corpus) else mutate(r, r.pick(corpus))
+            val limits = if (r.below(3) == 0) tight else yamlDefaultLimits()
+            if (verbose) println("input seed=$seed n=$n ${mutateEscape(if (source.size > 200) source.slice(0, 200) else source)}")
+            val problem = yamlFuzzCheck(source, limits)
+            if (problem != "") {
+                println("FINDING seed=$seed n=$n: $problem\n  source: ${mutateEscape(if (source.size > 300) source.slice(0, 300) else source)}")
+                findings = findings + 1
+            }
+        }
+    }
+    println("yaml: seeds $low-$high, $inputs inputs each, $findings findings")
+    if (findings == 0) 0 else 1
+}
