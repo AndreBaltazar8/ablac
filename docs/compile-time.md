@@ -1331,6 +1331,8 @@ same name does not become a dependency of that call. Unknown, ambiguous,
 generic or interface dispatch keeps the conservative candidate set; retained
 classes carry the types named in their method signatures as well as their
 bodies, and eager global initializers still need their existing checks.
+When the checker selects a built-in Map operation, its call has no user method
+declaration to retain.
 The write analysis gives a parameter of a scalar or string type no origins: such
 a value is no part of any global's heap, whatever it was computed from.
 The standard `Path.readText()` call uses the compiler's file provider in both
