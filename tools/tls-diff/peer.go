@@ -19,7 +19,7 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "server":
-		server(os.Args[2], os.Args[3], os.Args[4])
+		server(os.Args[2], os.Args[3], os.Args[4], len(os.Args) > 5 && os.Args[5] == "hold")
 	case "client":
 		client(os.Args[2], os.Args[3:])
 	case "flight":
@@ -29,7 +29,7 @@ func main() {
 	}
 }
 
-func server(port, certFile, keyFile string) {
+func server(port, certFile, keyFile string, hold bool) {
 	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "peer:", err)
@@ -49,7 +49,15 @@ func server(port, certFile, keyFile string) {
 		}
 		connection.SetDeadline(time.Now().Add(400 * time.Millisecond))
 		secured := tls.Server(connection, config)
-		secured.Handshake()
+		if secured.Handshake() == nil && hold {
+			connection.SetDeadline(time.Now().Add(900 * time.Millisecond))
+			buffer := make([]byte, 64)
+			for {
+				if _, err := secured.Read(buffer); err != nil {
+					break
+				}
+			}
+		}
 		connection.Close()
 	}
 }
