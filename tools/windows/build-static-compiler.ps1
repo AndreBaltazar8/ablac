@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
-& (Join-Path $PSScriptRoot 'msvc-x64-env.ps1')
+& (Join-Path $PSScriptRoot 'msvc-env.ps1')
 $llvmTools = Join-Path $env:ProgramFiles 'LLVM/bin'
 $clang = Join-Path $llvmTools 'clang-cl.exe'
 $linker = Join-Path $llvmTools 'lld-link.exe'

@@ -1,14 +1,19 @@
 # Build the fork used by nix/llvm-fork.nix. The caller packs the checked install tree.
+param([ValidateSet('x64', 'arm64')][string]$Architecture = 'x64')
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $PSNativeCommandUseErrorActionPreference = $true
 
-if ($env:RUNNER_ARCH -ne 'X64' -or $env:REVISION -cnotmatch '^[1-9][0-9]*$') {
-    throw 'Use an x64 Windows runner and a positive asset revision'
+if ($env:RUNNER_ARCH -ne $Architecture -or $env:REVISION -cnotmatch '^[1-9][0-9]*$') {
+    throw "Use a $Architecture Windows runner and a positive asset revision"
 }
 
+$assetArchitecture = if ($Architecture -eq 'arm64') { 'aarch64' } else { 'x86_64' }
+$triple = "$assetArchitecture-pc-windows-msvc"
+$machine = if ($Architecture -eq 'arm64') { 'IMAGE_FILE_MACHINE_ARM64' } else { 'IMAGE_FILE_MACHINE_AMD64' }
 $root = Split-Path -Parent $PSScriptRoot
-$asset = "llvm-23.1.3-fdiv-$env:REVISION-x86_64-windows-msvc"
+$asset = "llvm-23.1.3-fdiv-$env:REVISION-$assetArchitecture-windows-msvc"
 $bundle = Join-Path $root $asset
 $work = Join-Path $env:RUNNER_TEMP 'abla-llvm'
 $source = Join-Path $work 'src'
@@ -21,7 +26,7 @@ if ($pin -cnotmatch 'commit = "([0-9a-f]{40})";') {
 }
 $commit = $Matches[1]
 
-& (Join-Path $PSScriptRoot 'windows/msvc-x64-env.ps1')
+& (Join-Path $PSScriptRoot 'windows/msvc-env.ps1') -Architecture $Architecture
 $llvmTools = Join-Path $env:ProgramFiles 'LLVM/bin'
 $clang = Join-Path $llvmTools 'clang-cl.exe'
 $linker = Join-Path $llvmTools 'lld-link.exe'
@@ -60,7 +65,7 @@ $cmakeOptions = @(
     '-DBUILD_SHARED_LIBS=OFF'
     '-DLLVM_BUILD_LLVM_C_DYLIB=OFF'
     '-DLLVM_ENABLE_PROJECTS=lld'
-    '-DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-pc-windows-msvc'
+    "-DLLVM_DEFAULT_TARGET_TRIPLE=$triple"
     '-DLLVM_TARGETS_TO_BUILD=all'
     '-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=Xtensa'
     '-DLLVM_BUILD_TOOLS=OFF'
@@ -79,6 +84,13 @@ $cmakeOptions = @(
     '-DLLVM_ENABLE_ZSTD=OFF'
     '-DLLVM_PARALLEL_LINK_JOBS=1'
 )
+if ($Architecture -eq 'arm64') {
+    $cmakeOptions += @(
+        "-DCMAKE_C_COMPILER_TARGET=$triple"
+        "-DCMAKE_CXX_COMPILER_TARGET=$triple"
+        '-DCMAKE_EXE_LINKER_FLAGS=/machine:arm64'
+    )
+}
 cmake -G Ninja -S (Join-Path $source 'llvm') -B $build @cmakeOptions
 
 # Check the generated compile commands, so a CMake or toolset change cannot
@@ -120,6 +132,20 @@ $opt = Join-Path $bin 'opt.exe'
 $llc = Join-Path $bin 'llc.exe'
 $objcopy = Join-Path $bin 'llvm-objcopy.exe'
 $readobj = Join-Path $bin 'llvm-readobj.exe'
+if ($Architecture -eq 'arm64') {
+    $members = 0
+    foreach ($library in Get-ChildItem (Join-Path $bundle 'lib') -Filter '*.lib') {
+        $headers = & $readobj --file-headers $library.FullName
+        $machines = @($headers | Where-Object { $_ -match '^\s*Machine:' })
+        if (!$machines.Count -or ($machines | Where-Object { $_ -notmatch "\b$machine\b" })) {
+            throw "Expected ARM64 COFF in each member of $($library.Name)"
+        }
+        $members += $machines.Count
+    }
+    if (!$members) { throw 'Found no ARM64 COFF archive members' }
+    Write-Host "Verified $members ARM64 COFF archive members"
+}
+
 $optDriver = (& $readobj --symbols (Join-Path $bundle 'lib/LLVMOptDriver.lib')) -join "`n"
 if ($optDriver -cnotmatch '(?m)^\s+Name: optMainUtf8\s*$') {
     throw 'LLVMOptDriver.lib is missing the optMainUtf8 entry'
@@ -142,7 +168,7 @@ if ((Get-Content $optimized -Raw) -cnotmatch '(?m)^\s+ret double (?:\+qnan|0x7FF
 }
 Write-Host 'opt: fdiv fixture folds to NaN'
 
-& $llc -O2 -mtriple=x86_64-pc-windows-msvc -filetype=obj $optimized -o $coff
+& $llc -O2 "-mtriple=$triple" -filetype=obj $optimized -o $coff
 @'
 #include <math.h>
 extern double f(long long n);
@@ -150,26 +176,26 @@ int main(void) {
     return isnan(f(5)) && isnan(f(-5)) && isnan(f(0)) ? 0 : 1;
 }
 '@ | Set-Content -Encoding ascii $probeSource
-& $clang /nologo /MT /fp:precise /c "/Fo$probeObject" $probeSource
-& $clang /nologo "/Fe$probe" $probeObject $coff -fuse-ld=lld
+& $clang "--target=$triple" /nologo /MT /fp:precise /c "/Fo$probeObject" $probeSource
+& $clang "--target=$triple" /nologo /MT "/Fe$probe" $probeObject $coff -fuse-ld=lld /link "/machine:$Architecture"
 & $probe
-Write-Host 'llc: the x64 COFF fixture returns NaN for positive, negative and zero inputs'
+Write-Host "llc: the $Architecture COFF fixture returns NaN for positive, negative and zero inputs"
 
 $shim = Join-Path $work 'abla_lld_shim.obj'
 $include = Join-Path $bundle 'include'
-& $clang /nologo /MT /std:c++17 /EHsc /c "/I$include" "/Fo$shim" (Join-Path $root 'runtime/abla_lld_shim.cpp')
+& $clang "--target=$triple" /nologo /MT /std:c++17 /EHsc /c "/I$include" "/Fo$shim" (Join-Path $root 'runtime/abla_lld_shim.cpp')
 $shimInfo = (& $readobj --file-headers --coff-directives $shim) -join "`n"
-if ($shimInfo -notmatch 'IMAGE_FILE_MACHINE_AMD64' -or $shimInfo -notmatch 'DEFAULTLIB:"?libcmt\b') {
-    throw 'Expected an x64 COFF shim object with the static CRT directive'
+if ($shimInfo -notmatch "\b$machine\b" -or $shimInfo -notmatch 'DEFAULTLIB:"?libcmt\b') {
+    throw "Expected a $Architecture COFF shim object with the static CRT directive"
 }
-Write-Host 'shim: x64 COFF, static CRT'
+Write-Host "shim: $Architecture COFF, static CRT"
 
 foreach ($exe in @($probe, $opt, $llc, $objcopy, $readobj)) {
     $imports = (& $readobj --file-headers --coff-imports $exe) -join "`n"
-    if ($imports -notmatch 'IMAGE_FILE_MACHINE_AMD64' -or $imports -notmatch '(?m)^\s+Name: .+\.dll\s*$' -or
+    if ($imports -notmatch "\b$machine\b" -or $imports -notmatch '(?m)^\s+Name: .+\.dll\s*$' -or
         $imports -match '(?mi)^\s+Name: (?:api-ms-win-crt-[^\s]+|ucrtbased?\.dll|msvc[pr][^\s]*\.dll|vcruntime[^\s]*\.dll)\s*$') {
         Write-Host $imports
-        throw "Expected an x64 executable with no dynamic CRT imports: $exe"
+        throw "Expected a $Architecture executable with no dynamic CRT imports: $exe"
     }
 }
 Write-Host 'CRT: no dynamic MSVC or UCRT imports in the probe or LLVM tools'
@@ -182,7 +208,7 @@ $optPatchHash = (Get-FileHash -Algorithm SHA256 $optPatch).Hash.ToLowerInvariant
     "abla-commit=$env:GITHUB_SHA"
     "fdiv-patch-sha256=$patchHash"
     "opt-utf8-patch-sha256=$optPatchHash"
-    'target=x86_64-pc-windows-msvc'
+    "target=$triple"
     'crt=MT'
     "msvc-toolset=$env:VCToolsVersion"
     "windows-sdk=$($env:WindowsSDKVersion.TrimEnd('\'))"
