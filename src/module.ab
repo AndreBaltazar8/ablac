@@ -1470,8 +1470,10 @@ fun bootstrapManifestCompileCapabilities(
 // the package's content digest. Before, one set was granted to the whole program: the union of every module's
 // requests ∩ the root's list, so a dependency that declared nothing got whatever the root granted its own code.
 
-/** The capabilities a dependency gets only when the root names it in [dependencyCompileCapabilities]. */
-val BOOTSTRAP_COMPILE_NAMED_ONLY: int = 512
+/** The capabilities a dependency gets only when the root names it in [dependencyCompileCapabilities]: process.io (32),
+ *  network (64) and trusted.native (512) (decisions #111 B, #112 A). A dependency's filesystem.read by default reaches
+ *  only its own tree; an absolute path needs filesystem.read by name (ctNativeAbsoluteReadAllowed). */
+val BOOTSTRAP_COMPILE_NAMED_ONLY: int = 32 + 64 + 512
 
 /** The effects in `left` and not in `right`. */
 fun bootstrapCompileEffectWithout(left: int, right: int): int {
@@ -1725,6 +1727,9 @@ fun bootstrapPlanCompilePackageGrants(
     // what the root allows it; nothing for a module of no package.
     val limits: array<int> = []
     val declarations: array<int> = []
+    // Whether a package's code may read an absolute path: the root's, and a dependency's only with filesystem.read by
+    // name (#112 A); else its reads stay in its own tree.
+    val absoluteReads: array<bool> = []
     val owners: array<int> = []
     var ownedIndex = 0
     for (snapshot in snapshots) {
@@ -1736,16 +1741,21 @@ fun bootstrapPlanCompilePackageGrants(
         if (index == packages.size) {
             var declared = 0
             var limit = 0
+            var absolute = false
             if (package == "") {
                 declared = authorized
                 limit = authorized
+                absolute = true
             } else if (package != "?") {
                 declared = bootstrapCompileEffectsOfNames(bootstrapPackageManifestStringArray(
                     "${bootstrapCompilePackageDirectory(rootDirectory, package)}/abla.toml", "compileCapabilities"))
                 var allowed = bootstrapCompileEffectWithout(authorized, BOOTSTRAP_COMPILE_NAMED_ONLY)
                 var named = 0
                 while (named < namedPackages.size) {
-                    if (namedPackages[named] == package) allowed = bootstrapCompileEffectMerge(allowed, namedEffects[named])
+                    if (namedPackages[named] == package) {
+                        allowed = bootstrapCompileEffectMerge(allowed, namedEffects[named])
+                        if (bootstrapCompileEffectHas(namedEffects[named], 4)) absolute = true
+                    }
                     named = named + 1
                 }
                 limit = bootstrapBuildCompileEffectGrants(declared, allowed)
@@ -1754,6 +1764,7 @@ fun bootstrapPlanCompilePackageGrants(
             requests.append(0)
             limits.append(limit)
             declarations.append(declared)
+            absoluteReads.append(absolute)
         }
         owners.append(index)
         requests[index] = bootstrapCompileEffectMerge(requests[index], requested)
@@ -1788,7 +1799,8 @@ fun bootstrapPlanCompilePackageGrants(
         val package = owners[module]
         val grants = bootstrapBuildCompileEffectGrants(requests[package], limits[package])
         ctNativeSetModuleGrants(snapshots[module].path, grants)
-        fingerprint = (fingerprint * 31 + grants + package) % 1000000007
+        ctNativeSetModuleAbsoluteRead(snapshots[module].path, absoluteReads[package])
+        fingerprint = (fingerprint * 31 + grants + package + (if (absoluteReads[package]) 4096 else 0)) % 1000000007
         module = module + 1
     }
     BootstrapCompilePackagePlan(errors, diagnostics, fingerprint)

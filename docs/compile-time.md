@@ -409,7 +409,8 @@ package (`name = ...`; a manifest that only grants capabilities bounds nothing),
 else the working directory. A relative path that leaves it, and a write, move or removal of an absolute path outside
 it, is `E_BUILD_PATH_OUTSIDE` and the operation fails: a library's compile-time code, called for a program, writes
 only inside that program's project. An absolute path is read as given, wherever it is (an SDK in `/nix/store`, a
-toolchain, `/proc/self/exe`): `filesystem.read` is what grants that. A `trusted.native`
+toolchain, `/proc/self/exe`): `filesystem.read` is what grants that, for a dependency's code only when the root names it
+for that package ([grants per package](#grants-per-package)). A `trusted.native`
 site's own raw system calls (`linuxOpen` and the like) are not resolved, as nothing else of its native access is
 checked.
 
@@ -478,14 +479,19 @@ Capabilities are granted per package, not per program. A `#` site gets what its 
 - ∩ what the package declares: for a dependency, the `compileCapabilities` of its own `abla.toml`; for the root,
   its authorization,
 - ∩ what the root allows that package. For the root's own code that is its `compileCapabilities`. A dependency
-  gets the same list without `trusted.native`, which it gets only by name:
+  gets the same list without `process.io`, `network` and `trusted.native`, which it gets only by name:
 
 ```toml
-compileCapabilities = ["filesystem.read", "trusted.native"]   # the root's own `#` code, and the ceiling for all
+compileCapabilities = ["filesystem.read", "network", "trusted.native"]   # the root's own `#` code, and the ceiling for all
 
 [dependencyCompileCapabilities]                                # named grants, one line per locked package
 fast-json = ["trusted.native"]
+schema-fetch = ["network", "filesystem.read"]
 ```
+
+A dependency's `filesystem.read` without a name reads only inside its own tree, as its relative paths do: an absolute
+path outside it is `E_BUILD_PATH_OUTSIDE`. Naming `filesystem.read` for the package lets it read absolute paths (a
+toolchain, an SDK), as the root's own code may.
 
 A named grant holds only while `abla.lock` pins that package's content digest (else
 `E_PACKAGE_CAPABILITY_UNPINNED`), and never beyond the root's own list (`E_PACKAGE_CAPABILITY_DENIED`).

@@ -16,6 +16,10 @@
 #   - path-escape: a file only a dependency reaches (a path out of its copy) is the dependency's: refused as undeclared;
 #   - jit-reader, jit-native: with the root's environment and trusted.native in the native tier's generation, a
 #     dependency's site that reads the environment or calls C is refused in analysis, before anything runs.
+#   - process, network: process.io and network are named-only too (#112 A): declared and authorized, still refused
+#     without the named line; process.io granted with it;
+#   - absolute, own-tree: a dependency's filesystem.read reads its own tree; an absolute path outside it is
+#     E_BUILD_PATH_OUTSIDE unless the root names filesystem.read for it.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -239,4 +243,63 @@ EOF
     ABLA_COMPILE_EVAL=jit refused "$case" compile.effect-denied
 done
 
-echo "compile-package-grants: a dependency's compile capabilities are its own package's (direct and transitive, declared or refused); trusted.native only by a named, pinned grant"
+# process.io and network, like trusted.native, only by name (#112 A): declared by the dependency and authorized by the
+# root, still refused without the named line; process.io granted with it.
+runner='import "abla/compiler"
+#compilerGrant("process.io")
+val status = #compilerRunProcess(["true"])
+fun dependencyValue: string = "ran ${status}"'
+repository "$out/process/process-dep" process-dep '"process.io"' "$runner"
+commit "$out/process/process-dep" dependency
+application process '"process.io"' process-dep
+build process
+[[ $status != 0 ]] && grep -q 'effect-denied:process.io' "$out/process.log" ||
+    fail "process: a dependency got process.io without a named grant (status $status)"
+cp -r "$out/process" "$out/process-named"
+rm -rf "$out/process-named/application/.abla" "$out/process-named/application/abla.lock"
+application process-named '"process.io"' process-dep "$(printf '[dependencyCompileCapabilities]\nprocess-dep = ["process.io"]')"
+granted process-named 'ran 0'
+
+caller='import "abla/compiler"
+#compilerGrant("network")
+val reply = #compilerTcpExchange("127.0.0.1", 9, "probe", 16, 100)
+fun dependencyValue: string = "called"'
+repository "$out/network/network-dep" network-dep '"network"' "$caller"
+commit "$out/network/network-dep" dependency
+application network '"network"' network-dep
+build network
+[[ $status != 0 ]] && grep -q 'effect-denied:network' "$out/network.log" ||
+    fail "network: a dependency got network without a named grant (status $status)"
+
+# A dependency's filesystem.read reaches its own tree; an absolute path outside it only by name (#112 A). The secret is
+# a file of the machine outside every project here; the dependency also reads its own src/own.txt by a relative path.
+printf 'absolute-secret-5d2' > "$out/absolute-secret.txt"
+reader_of() {
+    printf 'import "abla/compiler"\nimport "abla/fs"\n#compilerGrant("filesystem.read")\ncompile fun take(): string = path("own.txt").readText() + "+" + path("%s").readText()\nval taken = #take()\nfun dependencyValue: string = taken\n' "$1"
+}
+repository "$out/absolute/read-dep" read-dep '"filesystem.read"' "$(reader_of "$out/absolute-secret.txt")"
+printf 'own' > "$out/absolute/read-dep/src/own.txt"
+commit "$out/absolute/read-dep" dependency
+application absolute '"filesystem.read"' read-dep
+build absolute
+[[ $status != 0 ]] && grep -q 'E_BUILD_PATH_OUTSIDE' "$out/absolute.log" && grep -q 'dependencyCompileCapabilities' "$out/absolute.log" ||
+    fail "absolute: a dependency read an absolute path without a named filesystem.read (status $status): $(grep -m3 'error\|value' "$out/absolute.log")"
+! grep -rq 'absolute-secret-5d2' "$out/absolute.log" "$out/absolute/application/build" 2>/dev/null ||
+    fail "absolute: the secret reached the build"
+cp -r "$out/absolute" "$out/absolute-named"
+rm -rf "$out/absolute-named/application/.abla" "$out/absolute-named/application/abla.lock"
+application absolute-named '"filesystem.read"' read-dep "$(printf '[dependencyCompileCapabilities]\nread-dep = ["filesystem.read"]')"
+granted absolute-named 'own+absolute-secret-5d2'
+# Its own tree without a name: the relative read alone is granted.
+repository "$out/own-tree/read-dep" read-dep '"filesystem.read"' 'import "abla/compiler"
+import "abla/fs"
+#compilerGrant("filesystem.read")
+compile fun take(): string = path("own.txt").readText()
+val taken = #take()
+fun dependencyValue: string = taken'
+printf 'own' > "$out/own-tree/read-dep/src/own.txt"
+commit "$out/own-tree/read-dep" dependency
+application own-tree '"filesystem.read"' read-dep
+granted own-tree own
+
+echo "compile-package-grants: a dependency's compile capabilities are its own package's (direct and transitive, declared or refused); process.io, network and trusted.native only by a named, pinned grant; a dependency's absolute reads only by a named filesystem.read"
