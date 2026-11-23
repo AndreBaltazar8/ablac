@@ -46,7 +46,12 @@ if output=$(ABLA_FUZZ_BUILD_PATHS=1 ABLA_FUZZ_BUILD_PATHS_PLANT=behaviour fuzz -
     exit 1
 fi
 [[ $output == *"build-paths"* ]] || { echo "fuzz: build-paths control: $output" >&2; exit 1; }
-echo "fuzz: the build-paths axis agrees with the other modes and reports a planted difference"
+if output=$(ABLA_FUZZ_BUILD_PATHS=1 ABLA_FUZZ_BUILD_PATHS_PLANT=bytes fuzz --program "$controls/paths.ab"); then
+    echo "fuzz: a planted build-paths byte difference was not reported: $output" >&2
+    exit 1
+fi
+[[ $output == *"build-paths"* ]] || { echo "fuzz: build-paths bytes control: $output" >&2; exit 1; }
+echo "fuzz: the build-paths axis agrees with the other modes and reports a planted difference in behaviour and in bytes"
 
 fuzz --seeds 100000-100001 --checks 12
 fuzz --replay

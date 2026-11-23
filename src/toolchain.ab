@@ -2107,6 +2107,18 @@ fun bootstrapOwnOrPathToolCommand(name: string): LinuxCommand =
     if (bootstrapInProcessToolInstalled && bootstrapInProcessEmitterOn()) bootstrapOwnToolCommand(name)
     else linuxCommand(name)
 
+/** The name an object written under a temporary path (`prog.exe.o.tmp.<pid>`, or a part of one such as
+ *  `prog.exe.o.tmp.<pid>.program.o`) is published as: its file name up to `.tmp.` (`prog.exe.o`). */
+fun bootstrapPublishedObjectName(path: string): string {
+    val name = Path(path).name()
+    var index = 0
+    while (index + 5 <= name.size) {
+        if (name.slice(index, index + 5) == ".tmp.") return name.slice(0, index)
+        index = index + 1
+    }
+    name
+}
+
 fun bootstrapCrossCommand(own: bool, tools: BootstrapXtensaTools, name: string): LinuxCommand =
     if (own) bootstrapOwnToolCommand(name) else bootstrapXtensaCommand(tools, name)
 
@@ -2243,11 +2255,27 @@ fun bootstrapExternalEmitObjectForTargetWithTools(
             emitObject.argument("--function-sections")
             emitObject.argument("--data-sections")
         }
-        emitObject.argument(inputPath)
+        // A COFF object's CodeView names the object file as llc was given it (S_OBJNAME), and this build writes it under a
+        // temporary name with the process id in it: llc writes it in a private directory under its published name
+        // (`prog.exe.o`, given relative), so that the same build gives the same object (#1090).
+        val coffDirectory = if (tools.root == "" && bootstrapTextContains(llvmTriple, "windows"))
+            "$objectPath.coff" else ""
+        val coffName = bootstrapPublishedObjectName(objectPath)
+        if (coffDirectory != "") {
+            Path(coffDirectory).createDirectories()
+            emitObject.directory(coffDirectory)
+            emitObject.argument(bootstrapBuildCallAbsolute(inputPath))
+        } else emitObject.argument(inputPath)
         emitObject.argument("-o")
         val assemblyPath = "$objectPath.xtensa.s"
-        emitObject.argument(if (tools.root != "") assemblyPath else objectPath)
+        emitObject.argument(if (tools.root != "") assemblyPath
+            else if (coffDirectory != "") coffName else objectPath)
         status = emitObject.run()
+        if (coffDirectory != "") {
+            if (status == 0 && !Path("$coffDirectory/$coffName").moveTo(Path(objectPath))) status = 145
+            Path("$coffDirectory/$coffName").remove()
+            Path(coffDirectory).remove()
+        }
         if (status == 0 && tools.root != "") {
             val emitted = Path(assemblyPath).readText()
             // Literal placement is required even with instruction narrowing off:

@@ -3,9 +3,9 @@
 # the child of a build file in a generated project; the build file's relative entry and output are chosen from the program's
 # checksum (depth of the build file below the project root, the entry's form, the output's form), and the same build is run
 # from the project root, from the build file's own directory, from a directory with a decoy of the entry and from the
-# directory above the project. The four must give an artifact at the same place, no warning, and artifacts that behave alike
-# (the same output and exit status; not the same bytes: an executable names its source file as the build was given it, so
-# the same program built from two working directories differs in that string, as a plain `ablac build` does); the artifact is
+# directory above the project. The four must give an artifact at the same place, no warning, and the same artifact: the
+# same output and exit status, and the same bytes (#1090: a build names its sources relative to the entry's directory, so
+# the working directory it ran from leaves no trace); the artifact is
 # a program whose output is the axis's result, which the fuzzer compares with every other mode's. Two more cases per program:
 # an entry spelled from the working directory (refused since #1044: not found, nothing written)
 # and paths that leave the project (E_BUILD_PATH_OUTSIDE, nothing written).
@@ -87,12 +87,16 @@ for index in 0 1 2 3; do
     fi
     [[ -x $artifact ]] || { cat "$work/build.$index.log" >> "$log"; violation "no artifact at $artifact from ${from_names[$index]} (entry $entry, output $output, depth $depth)"; }
     behaviour "$artifact" > "$work/behaviour.$index"
-    # The control (tools/test-fuzz-abla.sh): a planted difference between the builds must be reported.
+    cp "$artifact" "$work/artifact.$index"
+    # The controls (tools/test-fuzz-abla.sh): a planted difference between the builds must be reported.
     [[ ${ABLA_FUZZ_BUILD_PATHS_PLANT:-} == behaviour && $index == 2 ]] && echo planted >> "$work/behaviour.$index"
+    [[ ${ABLA_FUZZ_BUILD_PATHS_PLANT:-} == bytes && $index == 2 ]] && printf 'x' >> "$work/artifact.$index"
 done
 for index in 1 2 3; do
     cmp -s "$work/behaviour.0" "$work/behaviour.$index" ||
         violation "the artifact built from ${from_names[$index]} behaves differently from the one built from the root (entry $entry, output $output, depth $depth)"
+    cmp -s "$work/artifact.0" "$work/artifact.$index" ||
+        violation "the artifact built from ${from_names[$index]} is not byte for byte the one built from the root (#1090; entry $entry, output $output, depth $depth)"
 done
 
 # An entry spelled from the working directory (the project root), not next to the build file: since the old reading went
