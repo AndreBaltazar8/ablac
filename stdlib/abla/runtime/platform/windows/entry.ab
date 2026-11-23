@@ -1600,6 +1600,74 @@ private trusted fun __ablaRuntimeWindowsWatch(request: int): int {
     0
 }
 
+// --- the compile-time guard's faults (docs/design/windows-jit.md §4) --------------------------------------------------------
+// Linux catches a bad access in a compile-time call with a SIGSEGV handler that jumps back to the guard with 4. Call 4004 arms
+// the same for the calling thread on Windows: a vectored exception handler, ahead of the crash report's, sends an access
+// violation (0xC0000005) or a stack overflow (0xC00000FD) to the target, the slice's fault handler, as the signal would: with
+// (11, info), the faulting address at info + 16 where siginfo's si_addr is. Only a fault in JIT'd code (no loaded image holds
+// the program counter) or in the program's own image is taken: an exception a system DLL raises is often one it handles
+// itself, and goes on to the next handler. The thread reserves 64 KiB for the handler first (SetThreadStackGuarantee), so it
+// runs even on a stack that overflowed. A fault is taken once: the target jumps back, and the guard arms the next call again.
+
+/** kernel32 AddVectoredExceptionHandler: adds handler to the vectored exception handlers (first: ahead of the others); returns a handle, or 0 when it fails. */
+private trusted noescape extern:"c" fun AddVectoredExceptionHandler(first: int, handler: int): int
+/** kernel32 SetThreadStackGuarantee: sets the calling thread's stack kept for its exception handlers to the size at size (the previous one is stored there); returns non-zero on success. */
+private trusted noescape extern:"c" fun SetThreadStackGuarantee(size: int): int
+/** kernel32 GetModuleHandleW: the base of a loaded module by name (0: the process's executable), or 0 when none is loaded. */
+private trusted noescape extern:"c" fun GetModuleHandleW(name: int): int
+
+// The calling thread's fault target (0: none armed) and its info block, and RtlPcToFileHeader's out parameter.
+private trusted fun __ablaRuntimeWindowsFaultCell(): int =
+    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+
+// Whether the process's vectored handler is installed (0: not yet).
+private trusted fun __ablaRuntimeWindowsFaultInstalled(): int = nativeStaticAllocate(8)
+
+// The vectored handler's entry. As with the watchdog's (__ablaRuntimeWindowsWatchdogEntry), it reaches the handler only
+// through the translation (call 4005), so a build for another target has no kernel32 reference.
+private trusted fun __ablaRuntimeWindowsFaultEntry(pointers: int): int = ablaLinuxSyscall(4005, pointers, 0, 0, 0, 0, 0)
+
+// The vectored handler: -1 (EXCEPTION_CONTINUE_EXECUTION) when it sent the thread to its target, 0 to let the next handler
+// look. EXCEPTION_POINTERS {ExceptionRecord, ContextRecord}; the record's ExceptionCode at 0, ExceptionInformation[1] (the
+// address a bad access touched) at 40.
+private trusted fun __ablaRuntimeWindowsFault(pointers: int): int {
+    val cell = __ablaRuntimeWindowsFaultCell()
+    val target = ablaRuntimeLoadI64(cell)
+    if (target == 0) return 0
+    val record = ablaRuntimeLoadI64(pointers)
+    val context = ablaRuntimeLoadI64(pointers + 8)
+    val code = ablaRuntimeLoadI32(record) & 4294967295
+    if (code != 3221225477 && code != 3221225725) return 0
+    val image = RtlPcToFileHeader(abla_windows_context_pc(context), cell + 16)
+    if (image != 0 && image != GetModuleHandleW(0)) return 0
+    val info = ablaRuntimeLoadI64(cell + 8)
+    ablaRuntimeStoreI64(info + 16, ablaRuntimeLoadI64(record + 40))
+    ablaRuntimeStoreI64(cell, 0)
+    abla_windows_redirect(context, target, 11, info)
+    -1
+}
+
+// faults(request): request = {the target (0: disarm), its info block (24 bytes or more)}, for the calling thread. Returns 0,
+// or -errno.
+private trusted fun __ablaRuntimeWindowsFaults(request: int): int {
+    val cell = __ablaRuntimeWindowsFaultCell()
+    val target = ablaRuntimeLoadI64(request)
+    ablaRuntimeStoreI64(cell, 0)
+    if (target == 0) return 0
+    val installed = __ablaRuntimeWindowsFaultInstalled()
+    if (ablaRuntimeAtomicLoadI64(installed) == 0) {
+        if (AddVectoredExceptionHandler(1, nativeFunctionAddress(__ablaRuntimeWindowsFaultEntry)) == 0) return __ablaRuntimeWindowsErrno()
+        ablaRuntimeAtomicStoreI64(installed, 1)
+    }
+    // 64 KiB kept for the handler on an overflowed stack (a guarantee is never lowered: a larger one set before stays).
+    val scratch = __ablaRuntimeWindowsScratch()
+    ablaRuntimeStoreI64(scratch, 65536)
+    SetThreadStackGuarantee(scratch)
+    ablaRuntimeStoreI64(cell + 8, ablaRuntimeLoadI64(request + 8))
+    ablaRuntimeStoreI64(cell, target)
+    0
+}
+
 // The process calls: -1000 when `number` is none of them.
 private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: int, a2: int, a3: int): int {
     // wait4(pid, status, options, usage)
@@ -1623,6 +1691,10 @@ private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: in
     if (number == 4002) return __ablaRuntimeWindowsWatch(a0)
     // the watchdog thread itself (its entry, __ablaRuntimeWindowsWatchdogEntry): does not return
     if (number == 4003) return __ablaRuntimeWindowsWatchdog(a0)
+    // faults(request): the compile-time guard's fault target for the calling thread
+    if (number == 4004) return __ablaRuntimeWindowsFaults(a0)
+    // the vectored handler itself (its entry, __ablaRuntimeWindowsFaultEntry)
+    if (number == 4005) return __ablaRuntimeWindowsFault(a0)
     -1000
 }
 
@@ -1753,7 +1825,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 89 91 97 109 121 131 186 202 204 217 228 231 257 262 263 288 293 318 4001 4002 4003"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 16 21 25 28 35 39 41 42 43 44 45 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 89 91 97 109 121 131 186 202 204 217 228 231 257 262 263 288 293 318 4001 4002 4003 4004 4005"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;

@@ -76,6 +76,14 @@ tools/windows/wine-run.sh "$out/interrupt.exe" > "$out/interrupt.out" 2> "$out/i
 [[ $status == 0 ]] || fail "interrupt.exe exited $status: $(head -3 "$out/interrupt.out" "$out/interrupt.err")"
 [[ "$(cat "$out/interrupt.out")" == $'interrupted sleep -4\ninterrupted poll -4\ninterrupted socket poll -4\ninterrupted futex wait -4\ninterrupted wait4 -4\ncollected true\nplain sleep 0' ]] || fail "interrupt.exe printed: $(cat "$out/interrupt.out" "$out/interrupt.err")"
 (( SECONDS - started < 25 )) || fail "interrupt.exe took $((SECONDS - started)) s: the interrupted sleep ran its time"
+# The fault target (fault-guard.ab, call 4004, §4): an access violation in VirtualAlloc'd code and one in the program's own
+# code each go to the target with SIGSEGV's number and the address touched, which jumps back with 4.
+"$compiler" build tests/cases/windows/fault-guard.ab --target x86_64-windows-hosted -o "$out/fault-guard.exe" --fast --no-cache \
+    > "$out/fault-guard.log" 2>&1 || { cat "$out/fault-guard.log" >&2; fail "fault-guard.ab did not build for Windows"; }
+status=0
+timeout 60 tools/windows/wine-run.sh "$out/fault-guard.exe" > "$out/fault-guard.out" 2> "$out/fault-guard.err" || status=$?
+[[ $status == 0 ]] || fail "fault-guard.exe exited $status: $(head -5 "$out/fault-guard.out" "$out/fault-guard.err")"
+[[ "$(cat "$out/fault-guard.out")" == $'armed 0, JIT fault back with 4, signal 11, address 16\nown fault back with 4, address 24' ]] || fail "fault-guard.exe printed: $(cat "$out/fault-guard.out" "$out/fault-guard.err")"
 # The runtime's watchdog (watchdog.ab, call 4002): armed for the calling thread, it redirects it out of executable memory from
 # VirtualAlloc, never out of a loaded image (a runtime sleep gets EINTR instead), interrupts a deferred stop's sleep and an
 # interpreted site's pipe read with EINTR, and does nothing once disarmed. The whole program takes seconds, not the 30-second

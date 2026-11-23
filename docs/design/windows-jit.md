@@ -91,6 +91,15 @@ handler `longjmp`s to it with how the call stopped.
   the CRT's `_resetstkoflw` does the same).
 - **`abort`** in the slice (a fatal handler) becomes the same jump with 1, as it is.
 
+Built: the runtime's call 4004 (`__ablaRuntimeWindowsFaults`, platform/windows) arms the calling thread's fault target, and
+ct_eval.ab's bootstrapCtArmFaults uses it in place of sigaction: its own vectored handler (installed on first use, ahead of
+the crash report's) sends an access violation or stack overflow in JIT'd code or the compiler's image to the slice's fault
+handler with (11, info) and the touched address at info + 16, where the handler reads si_addr; an exception in a system DLL
+goes on to the next handler. It reserves 64 KiB with SetThreadStackGuarantee at arming. tests/cases/windows/fault-guard.ab
+checks it under Wine **[checked]**; a stack overflow, and putting the guard page back after one, are not tested yet
+**[confirm]**. The illegal-instruction code is not taken (the slice turns `llvm.trap` into its own jump with 2), nor yet the
+integer-division ones **[confirm]**.
+
 ## 5. Interrupting a running compile-time call (the time limit)
 
 Linux arms SIGALRM: its handler runs on the target thread and jumps to the guard (3), unless the thread is in the compiler's own

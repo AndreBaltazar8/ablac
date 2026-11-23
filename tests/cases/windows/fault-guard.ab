@@ -1,0 +1,71 @@
+// The runtime's fault target for compile-time calls (call 4004, docs/design/windows-jit.md §4), armed as the compiler arms it
+// around a call: a bad access sends the thread to the target with (11, info) and the address it touched at info + 16, as a
+// SIGSEGV handler gets si_addr, and the target jumps back to the guard with 4:
+// - in executable memory from VirtualAlloc (as JIT'd code runs): a load from address 16;
+// - in the program's own code: a load from address 24.
+// A fault is taken once: the target is disarmed by it, as the guard arms each call again.
+import "abla/io"
+import "abla/text"
+import "abla/sys/linux"
+import "abla/runtime/platform/windows"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/native/function-address"
+
+trusted noescape extern:"c" fun abla_setjmp(buffer: int): int
+trusted noescape extern:"c" fun abla_longjmp(buffer: int, value: int): void
+
+trusted fun load(address: int): int = ablaUnsafeLoadI64(nativePointerFromAddress(address))
+trusted fun store(address: int, value: int): void = ablaUnsafeStoreI64(nativePointerFromAddress(address), value)
+
+// The jump buffer the target jumps back to, and the signal and address it was given.
+var jumpBuffer: int = 0
+var signalSeen: int = 0
+var addressSeen: int = -1
+
+// The fault target: called on the faulting thread with (11, info), as the slice's fault handler is.
+trusted fun onFault(signal: int, info: int): void {
+    signalSeen = signal
+    addressSeen = load(info + 16)
+    abla_longjmp(jumpBuffer, 4)
+}
+
+// Arms the target (0 disarms) with `info` for the address.
+trusted fun faults(request: int, target: int, info: int): int {
+    store(request, target)
+    store(request + 8, info)
+    linuxSyscall1(4004, request)
+}
+
+trusted fun main: int {
+    val storage = "0123456789abcdef".repeat(40)
+    jumpBuffer = nativeStringAddress(storage)
+    val scratchStorage = "0123456789abcdef".repeat(8)
+    val scratch = nativeStringAddress(scratchStorage)
+    val request = scratch + 64
+    val info = scratch
+    // mov rax, [16]; ret (48 8B 04 25 10 00 00 00 C3) in read-write-execute memory.
+    val code = VirtualAlloc(0, 4096, 12288, 64)
+    val bytes = [72, 139, 4, 37, 16, 0, 0, 0, 195]
+    var at = 0
+    while (at < bytes.size) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(code + at), bytes[at])
+        at += 1
+    }
+    val armed = faults(request, nativeFunctionAddress(onFault), info)
+    val how = abla_setjmp(jumpBuffer)
+    if (how == 0) {
+        println("not reached ${callNativeMain(code)}")
+        return 1
+    }
+    println("armed $armed, JIT fault back with $how, signal $signalSeen, address $addressSeen")
+    addressSeen = -1
+    faults(request, nativeFunctionAddress(onFault), info)
+    val again = abla_setjmp(jumpBuffer)
+    if (again == 0) {
+        println("not reached ${load(24)}")
+        return 1
+    }
+    println("own fault back with $again, address $addressSeen")
+    faults(request, 0, 0)
+    0
+}
