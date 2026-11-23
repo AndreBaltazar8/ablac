@@ -51,12 +51,16 @@ for program in "${programs[@]}"; do
         count=$((count + 1))
     done
 done
-# A wrong hint is found by the build it prunes. The hints here come from builds made with the trace, as the cache's do.
+# Use the demand recorded for the application. A cold trace can also include
+# the separate build that seeds the prebuilt fast runtime.
 hint() { # program -> a hint file of its demand
-    local program=$1 trace=$out/hint-$(basename -- "$1" .ab).trace file=$out/hint-$(basename -- "$1" .ab).txt
-    ABLA_COMPILER_DEMAND_TRACE=1 "$compiler" build "$program" -o "$out/hint.bin" --no-cache --fast > /dev/null 2> "$trace" || fail "$program did not build for its hint"
-    { echo abla-runtime-demand-1; awk '$1 == "abla-demanded" && $3 == "fun" && $4 ~ /^\./ && ($2 ~ /abla\/runtime\/platform\/(host|host_os|wasm)\.ab$/ || $2 ~ /abla\/runtime\/self\/entry\.ab$/ || $2 ~ /darwin\/entry\.ab$/) { n = $4; sub(/^\./, "", n); print n }' "$trace" | sort -u; } > "$file"
-    echo "$file"
+    local program=$1 cache=$out/hint-$(basename -- "$1" .ab).cache
+    ABLA_PRUNE_RUNTIME=1 ABLA_CACHE_DIR="$PWD/$cache" \
+        "$compiler" build "$program" -o "$out/hint.bin" --fast >/dev/null 2>&1 ||
+        fail "$program did not build for its hint"
+    local hints=("$cache"/runtime-demand/*)
+    [[ ${#hints[@]} == 1 && -s ${hints[0]} ]] || fail "$program did not record one runtime hint"
+    printf '%s\n' "${hints[0]}"
 }
 small=$(hint tests/cases/libc-imports/hello.ab)
 large=$(hint tests/cases/modules/http-event.ab)
