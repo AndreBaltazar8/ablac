@@ -509,15 +509,19 @@ static int abla_llvm_ar(const std::vector<std::string> &arguments) {
 }
 
 // llvm-mc's job for the one thing the compiler needs it for: an assembly file to a relocatable object, without an assembler on the machine (the generated libc-data file of
-// the static compiler's own link, src/toolchain.ab). Arguments, one a line: -triple=<triple>, -filetype=obj, -o <object>, the input. Exit code 0, or 1 with the diagnostics on standard error.
+// the static compiler's own link, src/toolchain.ab). Arguments, one a line:
+// -triple=<triple>, optional -mattr= and -target-abi=, -filetype=obj, -o <object>, and the input.
+// Exit code 0, or 1 with the diagnostics on standard error.
 static int abla_llvm_mc(const std::vector<std::string> &arguments) {
     abla_initialize_targets();
-    std::string input, output, triple;
+    std::string input, output, triple, features, abi;
     for (size_t index = 0; index < arguments.size(); index++) {
         const std::string &argument = arguments[index];
         if (argument == "-o" && index + 1 < arguments.size()) output = arguments[++index];
         else if (argument.rfind("-triple=", 0) == 0) triple = argument.substr(8);
         else if (argument.rfind("--triple=", 0) == 0) triple = argument.substr(9);
+        else if (argument.rfind("-mattr=", 0) == 0) features = argument.substr(7);
+        else if (argument.rfind("-target-abi=", 0) == 0) abi = argument.substr(12);
         else if (argument.rfind("-filetype=", 0) == 0 || argument.rfind("--filetype=", 0) == 0) { /* only objects */ }
         else if (!argument.empty() && argument[0] != '-') input = argument;
         else { llvm::errs() << "llvm-mc: unsupported option " << argument << "\n"; return 1; }
@@ -532,10 +536,11 @@ static int abla_llvm_mc(const std::vector<std::string> &arguments) {
     llvm::SourceMgr sourceManager;
     sourceManager.AddNewSourceBuffer(std::move(*buffer), llvm::SMLoc());
     llvm::MCTargetOptions options;
+    options.ABIName = abi;
     std::unique_ptr<llvm::MCRegisterInfo> registers(target->createMCRegInfo(parsed));
     std::unique_ptr<llvm::MCAsmInfo> asmInfo(target->createMCAsmInfo(*registers, parsed, options));
     std::unique_ptr<llvm::MCInstrInfo> instructions(target->createMCInstrInfo());
-    std::unique_ptr<llvm::MCSubtargetInfo> subtarget(target->createMCSubtargetInfo(parsed, "", ""));
+    std::unique_ptr<llvm::MCSubtargetInfo> subtarget(target->createMCSubtargetInfo(parsed, "", features));
     if (!registers || !asmInfo || !instructions || !subtarget) { llvm::errs() << "llvm-mc: no machine code layer for " << triple << "\n"; return 1; }
     llvm::MCContext context(parsed, *asmInfo, *registers, *subtarget, &sourceManager);
     std::unique_ptr<llvm::MCObjectFileInfo> objectInfo(target->createMCObjectFileInfo(context, /*PIC=*/true));
