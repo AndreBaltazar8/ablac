@@ -1,0 +1,62 @@
+// Our side of the TLS resumption differential (tools/tls-diff, #1139 area 3, TLS round 4): abla/tls/pure as a TLS 1.3 server with ticket keys, listening on
+// 127.0.0.1:PORT, one connection at a time, no output, until it is killed. After a handshake it reads until 450 ms pass without data (so what the client sends next
+// is processed) and closes. It sends a NewSessionTicket after a full handshake and accepts one on the next connection (psk_dhe_ke, no 0-RTT). Arguments: the
+// certificate (PEM), the key (PEM), the port.
+import "abla/io"
+import "abla/text"
+import "abla/integer"
+import "abla/net"
+import "abla/sys/linux"
+import "abla/process/time"
+import "abla/process/arguments"
+import "abla/tls/pure"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/server"
+import "abla/tls/pure/resume"
+import "abla/tls/pure/client"
+import "../fuzz/prng.ab"
+import "./common.ab"
+
+var srGenerator: Prng = prngSeeded(1)
+
+fun srRandom(count: int): string = diffBytes(srGenerator, count)
+
+fun srNow(): int = realtimeMilliseconds() / 1000
+
+fun main: int {
+    val port = processArgument(2).parseInt() ?? 0
+    val identity = tlsClientIdentityFromPem(linuxReadFile(processArgument(0), 65536), linuxReadFile(processArgument(1), 65536))
+    if (!identity.ok()) {
+        println("FAIL identity: ${identity.error}")
+        return 1
+    }
+    srGenerator = prngSeeded(realtimeMilliseconds())
+    val tickets = tlsTicketKeysNew(srRandom, srNow)
+    val config = TlsServerConfig(identity, [TLS_SUITE_AES_128_GCM_SHA256, TLS_SUITE_AES_256_GCM_SHA384, TLS_SUITE_CHACHA20_POLY1305_SHA256], tlsDefaultGroups(), [],
+        srRandom, false, false, tlsServerRefuseClients, [], tickets)
+    var listener = tcpListenAddress(ipv4Loopback(port))
+    println("listening $port")
+    while (true) {
+        var connection = listener.accept()
+        var server = tlsServerNew(config)
+        var idle = 0
+        var rounds = 0
+        while (!server.failed() && !server.closed() && idle < 2 && rounds < 40) {
+            rounds = rounds + 1
+            val incoming = connection.readWithTimeoutResult(65536, if (server.connected()) 450 else 400)
+            if (incoming.hasData()) {
+                idle = 0
+                server.feed(incoming.bytes)
+            } else if (incoming.timedOut()) {
+                idle = idle + 1
+                if (!server.connected()) idle = 2
+            } else {
+                idle = 2
+            }
+            val out = server.takeOutput()
+            if (out.size > 0) connection.write(out)
+        }
+        connection.close()
+    }
+    0
+}

@@ -1,0 +1,392 @@
+// The resumption side of the TLS handshake differential (#1139 area 3, TLS round 4): a hostile TLS 1.3 client that resumes. For each case it does a full handshake
+// with the server (X25519, AES-128-GCM), reads the NewSessionTicket the server sends (it decrypts it, and makes the PSK of RFC 8446 section 4.6.1 from the resumption
+// master secret), then opens a second connection whose ClientHello offers that ticket (identity, obfuscated age, binder), changed structurally by a generator seeded by
+// (SEED, i; the kinds come from one generator and the bytes from another, so a ticket size that differs between servers does not change which change is made): the ticket (a bit flipped, cut, extended, empty, random), the binder (a bit flipped, a byte short or long, all zero, wrong for the hello, one per identity),
+// the age, several identities (valid first or last, twice, a binder missing), psk_key_exchange_modes (left out, psk_ke only, both, empty, unknown), pre_shared_key not
+// last or twice, an early_data extension (with early data records under the early traffic key after it), the key_share left out, another server name or cipher suite
+// or ALPN than the first connection's, a session id echo, trailing bytes. The handshake then goes on as far as it can (the server's flight is read; a valid Finished is
+// sent; a probe of application data follows).
+// The class is R (the ServerHello selected the pre_shared_key: it resumed) or f (a full handshake), then what the server does: A<n> (an alert), C (it closed),
+// ok (nothing refused within the window); or the alert or close before any ServerHello. One line per case, "CASE i tags class", for cflight.sh to join.
+// A resumption that the other two servers refuse and ours takes is the line to read first: a forged ticket or binder that is accepted.
+//
+//   cresume PORT SEED COUNT [DUMP_INDEX]   (DUMP_INDEX: also print the hex of the second ClientHello of that case)
+import "abla/io"
+import "abla/text"
+import "abla/array"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/crypto/hkdf"
+import "abla/integer"
+import "abla/net"
+import "abla/process/arguments"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/keysched"
+import "abla/tls/pure/record"
+import "abla/tls/pure/client"
+import "../fuzz/prng.ab"
+import "./common.ab"
+
+var crGenerator: Prng = prngSeeded(1)
+
+fun crRandom(count: int): string = diffBytes(crGenerator, count)
+
+fun crU32(data: string, at: int): int = data[at] * 16777216 + data[at + 1] * 65536 + data[at + 2] * 256 + data[at + 3]
+
+/** What a handshake read off the wire left: why it stopped ("" when the server's Finished was read), whether the ServerHello selected the PSK, and the secrets. */
+class CrFlight(val failed: string, val resumed: bool, var transcript: TlsTranscript, val secrets: TlsHandshakeSecrets, var read: TlsRecordProtection, var write: TlsRecordProtection, val rest: string)
+
+/** Reads the ServerHello and the encrypted flight to the server's Finished after `hello` was sent. `psk` is "" for a full handshake's key schedule; the early secret
+ *  is made from it when the ServerHello selects the PSK. */
+fun crReadFlight(var connection: TcpConnection, hello: string, pair: TlsKeyPair, psk: string): CrFlight {
+    val hash = HKDF_SHA256
+    var transcript = tlsTranscript()
+    transcript.add(hello)
+    var read = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
+    var write = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
+    var secrets = TlsHandshakeSecrets("", "", "")
+    var state = 0
+    var resumed = false
+    var got = ""
+    var pending = ""
+    var tries = 0
+    var failed = ""
+    var finished = false
+    while (!finished && failed == "" && tries < 20) {
+        tries = tries + 1
+        val incoming = connection.readWithTimeoutResult(65536, if (tries == 1) 2500 else 400)
+        if (!incoming.hasData()) {
+            failed = if (incoming.timedOut()) "W" else "C"
+            break
+        }
+        got = got + incoming.bytes
+        while (got.size >= 5 && !finished && failed == "") {
+            val length = diffRd16(got, 3)
+            if (got.size < 5 + length) break
+            val record = got.slice(0, 5 + length)
+            got = got.slice(5 + length, got.size)
+            if (record[0] == 20) continue
+            if (record[0] == 21) {
+                failed = "A${if (record.size > 6) record[6] else 0}"
+                break
+            }
+            if (state == 0 && record[0] == 22) {
+                val serverHello = tlsParseServerHello(record.slice(9, record.size))
+                if (!serverHello.ok || serverHello.retryRequest) {
+                    failed = "nohello"
+                    break
+                }
+                transcript.add(record.slice(5, record.size))
+                resumed = serverHello.pskSelected >= 0
+                val shared = tlsAgree(pair, serverHello.shareKey)
+                if (!shared.ok) {
+                    failed = "noshare"
+                    break
+                }
+                secrets = tlsDeriveHandshakeSecrets(hash, tlsEarlySecret(hash, if (resumed) psk else ""), shared.bytes, transcript.hash(hash))
+                read = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, secrets.serverTraffic, 16), tlsTrafficIv(hash, secrets.serverTraffic))
+                write = tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(hash, secrets.clientTraffic, 16), tlsTrafficIv(hash, secrets.clientTraffic))
+                state = 1
+            } else if (state == 1 && record[0] == 23) {
+                val opened = tlsOpenRecord(read, record)
+                if (!opened.ok || opened.type != 22) {
+                    failed = "badflight"
+                    break
+                }
+                pending = pending + opened.content
+                while (pending.size >= 4 && 4 + (pending[1] * 65536 + pending[2] * 256 + pending[3]) <= pending.size && !finished) {
+                    val size = 4 + (pending[1] * 65536 + pending[2] * 256 + pending[3])
+                    val message = pending.slice(0, size)
+                    pending = pending.slice(size, pending.size)
+                    if (message[0] == 20) {
+                        transcript.add(cryptoByteString([20, 0, 0, 32]) + tlsFinishedVerifyData(hash, secrets.serverTraffic, transcript.hash(hash)))
+                        finished = true
+                    } else transcript.add(message)
+                }
+            } else {
+                failed = "unexpected"
+                break
+            }
+        }
+    }
+    CrFlight(failed, resumed, transcript, secrets, move(read), move(write), got)
+}
+
+/** The ClientHello's extensions as a list, and the part before them. */
+class CrHello(val head: string, val exts: array<DiffExt>)
+
+fun crSplit(hello: string): CrHello {
+    var at = 4 + 2 + 32
+    at = at + 1 + hello[at]
+    at = at + 2 + diffRd16(hello, at)
+    at = at + 1 + hello[at]
+    val head = hello.slice(0, at)
+    val exts: array<DiffExt> = []
+    var p = at + 2
+    while (p + 4 <= hello.size) {
+        val length = diffRd16(hello, p + 2)
+        exts.append(DiffExt(diffRd16(hello, p), hello.slice(p + 4, p + 4 + length), 0))
+        p = p + 4 + length
+    }
+    CrHello(head, exts)
+}
+
+fun crJoin(head: string, exts: array<DiffExt>, trailing: string): string {
+    var block = ""
+    for (e in exts) block = block + diffU16(e.type) + diffU16(e.body.size + e.delta) + e.body
+    block = block + trailing
+    val body = head.slice(4, head.size) + diffU16(block.size) + block
+    cryptoByteString([1, (body.size >> 16) & 255, (body.size >> 8) & 255, body.size & 255]) + body
+}
+
+fun crTypeIndex(exts: array<DiffExt>, type: int): int {
+    for (i in 0 until exts.size) if (exts[i].type == type) return i
+    -1
+}
+
+fun crRemove(exts: array<DiffExt>, type: int): array<DiffExt> {
+    val out: array<DiffExt> = []
+    for (e in exts) if (e.type != type) out.append(e)
+    out
+}
+
+fun crReaction(var connection: TcpConnection, var protection: TlsRecordProtection, milliseconds: int): string {
+    var got = ""
+    var closed = false
+    var rounds = 0
+    while (rounds < 4) {
+        val incoming = connection.readWithTimeoutResult(65536, milliseconds)
+        if (incoming.hasData()) got = got + incoming.bytes
+        else {
+            if (!incoming.timedOut()) closed = true
+            rounds = 4
+        }
+        rounds = rounds + 1
+    }
+    var at = 0
+    while (at + 5 <= got.size) {
+        val length = diffRd16(got, at + 3)
+        if (at + 5 + length > got.size) break
+        val type = got[at]
+        if (type == 21) return if (length >= 2) "A${got[at + 6]}" else "A?"
+        if (type == 23) {
+            val opened = tlsOpenRecord(protection, got.slice(at, at + 5 + length))
+            if (!opened.ok) return "BAD"
+            if (opened.type == 21) return if (opened.content.size >= 2) "A${opened.content[1]}" else "A?"
+        }
+        at = at + 5 + length
+    }
+    if (closed) "C" else "ok"
+}
+
+fun crAppProtection(secret: string): TlsRecordProtection =
+    tlsRecordProtection(TLS_AEAD_AES_128_GCM, tlsTrafficKey(HKDF_SHA256, secret, 16), tlsTrafficIv(HKDF_SHA256, secret))
+
+fun main: int {
+    if (processArgumentCount() < 3) {
+        println("usage: cresume PORT SEED COUNT")
+        return 2
+    }
+    val port = processArgument(0).parseInt() ?? 0
+    val seed = processArgument(1).parseInt() ?? 1
+    val count = processArgument(2).parseInt() ?? 1
+    val dump = if (processArgumentCount() > 3) processArgument(3).parseInt() ?? -1 else -1
+    val hash = HKDF_SHA256
+    for (i in 0 until count) {
+        var r = prngSeeded(seed * 100003 + i)
+        var p = prngSeeded(seed * 31337 + i)
+        crGenerator = prngSeeded(seed * 7919 + i)
+        // The first connection: a full handshake, a valid Finished, and the ticket the server sends.
+        var first = tcpConnect(ipv4Loopback(port), 1000)
+        if (first.descriptor < 0) {
+            println("CASE $i connect R")
+            continue
+        }
+        val pair1 = tlsGenerateKeyPair(29, crRandom) ?? continue
+        val hello1 = tlsBuildClientHello(crRandom(32), crRandom(32), [4865], "localhost", [29], [TlsKeyShare(29, pair1.publicKey)], [0x0403, 0x0804], [], "", [], false, [], 0, true)
+        first.write(tlsPlaintextRecord(22, 771, hello1))
+        var flight1 = crReadFlight(first, hello1, pair1, "")
+        if (flight1.failed != "") {
+            println("CASE $i first(${flight1.failed}) W")
+            first.close()
+            continue
+        }
+
+        val app1 = tlsDeriveApplicationSecrets(hash, flight1.secrets.handshakeSecret, flight1.transcript.hash(hash))
+        val finished1 = cryptoByteString([20, 0, 0, 32]) + tlsFinishedVerifyData(hash, flight1.secrets.clientTraffic, flight1.transcript.hash(hash))
+
+        val sealed1 = tlsProtectRecord(flight1.write, 22, finished1, 0)
+        first.write(tlsPlaintextRecord(20, 771, "\x01") + sealed1.bytes)
+        flight1.transcript.add(finished1)
+        val resumptionMaster = tlsResumptionMasterSecret(hash, app1.masterSecret, flight1.transcript.hash(hash))
+        var appRead1 = crAppProtection(app1.serverTraffic)
+        var ticket = ""
+        var ageAdd = 0
+        var nonce = ""
+        var got1 = flight1.rest
+        var tries1 = 0
+        while (ticket == "" && tries1 < 6) {
+            tries1 = tries1 + 1
+            if (tries1 > 1 || got1.size == 0) {
+                val incoming = first.readWithTimeoutResult(65536, 400)
+                if (!incoming.hasData()) break
+                got1 = got1 + incoming.bytes
+            }
+            while (got1.size >= 5 && ticket == "") {
+                val length = diffRd16(got1, 3)
+                if (got1.size < 5 + length) break
+                val record = got1.slice(0, 5 + length)
+                got1 = got1.slice(5 + length, got1.size)
+                if (record[0] != 23) continue
+                val opened = tlsOpenRecord(appRead1, record)
+                if (opened.ok && opened.type == 22 && opened.content.size > 13 && opened.content[0] == 4) {
+                    val body = opened.content.slice(4, opened.content.size)
+                    ageAdd = crU32(body, 4)
+                    nonce = body.slice(9, 9 + body[8])
+                    val at = 9 + body[8]
+                    ticket = body.slice(at + 2, at + 2 + diffRd16(body, at))
+                }
+            }
+        }
+        first.close()
+        if (ticket == "") {
+            println("CASE $i noticket W")
+            continue
+        }
+        val psk = tlsResumptionPsk(hash, resumptionMaster, nonce)
+        // The mutation.
+        var tags = ""
+        var identities: array<string> = [ticket]
+        val real: array<bool> = [true]
+        var ages: array<int> = [(ageAdd + 300) & 4294967295]
+        var binderMode = 0
+        var modes = "\x01"
+        var modesMode = 0
+        var pskPosition = 0
+        var pskTwice = false
+        var earlyMode = 0
+        var noKeyShare = false
+        var host = "localhost"
+        var suites: array<int> = [4865]
+        var alpn: array<string> = []
+        var sessionEmpty = false
+        var trailing = ""
+        val rounds = 1 + (if (r.below(5) == 0) 1 else 0)
+        for (k in 0 until rounds) {
+            val kind = r.below(30)
+            var tag = "?"
+            if (kind == 0) tag = "none"
+            else if (kind == 1) { val at = p.below(ticket.size); identities[0] = ticket.slice(0, at) + cryptoByteString([ticket[at] ^ (1 << p.below(8))]) + ticket.slice(at + 1, ticket.size); tag = "ticket-flip" }
+            else if (kind == 2) { identities[0] = ticket.slice(0, ticket.size - 1 - p.below(ticket.size / 2)); tag = "ticket-cut" }
+            else if (kind == 3) { identities[0] = ticket + diffBytes(p, 1 + p.below(8)); tag = "ticket-extended" }
+            else if (kind == 4) { identities[0] = ""; tag = "ticket-empty" }
+            else if (kind == 5) { identities[0] = diffBytes(p, ticket.size); tag = "ticket-random" }
+            else if (kind == 6) { binderMode = 1; tag = "binder-flip" }
+            else if (kind == 7) { binderMode = 2; tag = "binder-short" }
+            else if (kind == 8) { binderMode = 3; tag = "binder-long" }
+            else if (kind == 9) { binderMode = 4; tag = "binder-zero" }
+            else if (kind == 10) { binderMode = 5; tag = "binder-for-other-hello" }
+            else if (kind == 11) { ages[0] = diffPickInt(p, [0, 4294967295, 1, ageAdd, (ageAdd + 3600000) & 4294967295, (ageAdd + 604800000 * 2) & 4294967295]); tag = "age" }
+            else if (kind == 12) { identities = [ticket, diffBytes(p, 40)]; ages = [ages[0], 0]; tag = "identities-valid-garbage" }
+            else if (kind == 13) { identities = [diffBytes(p, 40), ticket]; ages = [0, ages[0]]; tag = "identities-garbage-valid" }
+            else if (kind == 14) { identities = [ticket, ticket]; ages = [ages[0], ages[0]]; tag = "identities-twice" }
+            else if (kind == 15) { modesMode = 1; tag = "modes-removed" }
+            else if (kind == 16) { modesMode = 2; tag = "modes-psk-ke" }
+            else if (kind == 17) { modesMode = 3; tag = "modes-both" }
+            else if (kind == 18) { modesMode = 4; tag = "modes-empty" }
+            else if (kind == 19) { modesMode = 5; tag = "modes-unknown" }
+            else if (kind == 20) { pskPosition = 1; tag = "psk-not-last" }
+            else if (kind == 21) { pskTwice = true; tag = "psk-twice" }
+            else if (kind == 22) { earlyMode = 1; tag = "early-data-ext" }
+            else if (kind == 23) { earlyMode = 2; tag = "early-data-records" }
+            else if (kind == 24) { noKeyShare = true; tag = "no-key-share" }
+            else if (kind == 25) { host = "other.example"; tag = "other-server-name" }
+            else if (kind == 26) { suites = [4866]; tag = "other-suite" }
+            else if (kind == 27) { alpn = ["h2"]; tag = "other-alpn" }
+            else if (kind == 28) { sessionEmpty = true; tag = "session-id-empty" }
+            else { trailing = diffBytes(p, 1 + p.below(3)); tag = "trailing" }
+            tags = tags + (if (k > 0) "+" else "") + tag
+        }
+        val pair2 = tlsGenerateKeyPair(29, crRandom) ?? continue
+        val base = tlsBuildClientHello(crRandom(32), if (sessionEmpty) "" else crRandom(32), suites, host, [29], [TlsKeyShare(29, pair2.publicKey)], [0x0403, 0x0804], alpn, "")
+        val split = crSplit(base)
+        var exts: array<DiffExt> = []
+        for (e in split.exts) exts.append(e)
+        if (noKeyShare) exts = crRemove(exts, 51)
+        if (modesMode != 1) {
+            var body = "\x01\x01"
+            if (modesMode == 2) body = "\x01\x00"
+            if (modesMode == 3) body = "\x02\x00\x01"
+            if (modesMode == 4) body = "\x00"
+            if (modesMode == 5) body = "\x01\x05"
+            exts.append(DiffExt(45, body, 0))
+        }
+        // The pre_shared_key extension, with binders of the right size to start with.
+        var identityBytes = ""
+        for (k in 0 until identities.size) identityBytes = identityBytes + diffU16(identities[k].size) + identities[k] + cryptoByteString([(ages[k] >> 24) & 255, (ages[k] >> 16) & 255, (ages[k] >> 8) & 255, ages[k] & 255])
+        val binderSize = if (binderMode == 2) 31 else if (binderMode == 3) 33 else 32
+        var placeholder = ""
+        for (k in 0 until identities.size) placeholder = placeholder + cryptoByteString([binderSize]) + "\x00".repeat(binderSize)
+        val pskBody = diffU16(identityBytes.size) + identityBytes + diffU16(placeholder.size) + placeholder
+        if (earlyMode > 0) exts.append(DiffExt(42, "", 0))
+        if (pskPosition == 1) exts = diffInsert(exts, 0, DiffExt(41, pskBody, 0)) else exts.append(DiffExt(41, pskBody, 0))
+        if (pskTwice) exts.append(DiffExt(41, pskBody, 0))
+        var hello2 = crJoin(split.head, exts, trailing)
+        // The binders: over the hello up to them, when pre_shared_key is last.
+        if (pskPosition == 0 && !pskTwice && trailing == "") {
+            val start = hello2.size - (2 + placeholder.size)
+            val partial = hello2.slice(0, start)
+            var binders = ""
+            for (k in 0 until identities.size) {
+                var binder = if (identities[k] == ticket) tlsBinderValue(hash, psk, partial) else diffBytes(r, 32)
+                if (k == 0 && binderMode == 1) binder = cryptoByteString([binder[0] ^ 1]) + binder.slice(1, binder.size)
+                if (k == 0 && binderMode == 2) binder = binder.slice(0, 31)
+                if (k == 0 && binderMode == 3) binder = binder + "\x00"
+                if (k == 0 && binderMode == 4) binder = "\x00".repeat(32)
+                if (k == 0 && binderMode == 5) binder = tlsBinderValue(hash, psk, partial + "x")
+                binders = binders + cryptoByteString([binder.size]) + binder
+            }
+            hello2 = hello2.slice(0, start) + diffU16(binders.size) + binders
+        }
+        if (i == dump) println("HELLO2 ${hexEncode(hello2)}")
+        var second = tcpConnect(ipv4Loopback(port), 1000)
+        if (second.descriptor < 0) {
+            println("CASE $i $tags connect R")
+            continue
+        }
+        var out2 = tlsPlaintextRecord(22, 771, hello2)
+        var sentCcs = false
+        if (earlyMode == 2) {
+            val early = tlsEarlySecret(hash, psk)
+            val clientEarly = tlsDeriveSecret(hash, early, "c e traffic", tlsHashOf(hash, hello2))
+            var earlyWrite = crAppProtection(clientEarly)
+            out2 = out2 + tlsPlaintextRecord(20, 771, "\x01")
+            sentCcs = true
+            for (k in 0 until 2) {
+                val sealed = tlsProtectRecord(earlyWrite, 23, "early data $k", 0)
+                if (sealed.ok) out2 = out2 + sealed.bytes
+            }
+        }
+        second.write(out2)
+        var flight2 = crReadFlight(second, hello2, pair2, psk)
+        var class2 = ""
+        if (flight2.failed != "") {
+            class2 = if (flight2.resumed) "R/${flight2.failed}" else flight2.failed
+        } else {
+
+            val app2 = tlsDeriveApplicationSecrets(hash, flight2.secrets.handshakeSecret, flight2.transcript.hash(hash))
+            val finished2 = cryptoByteString([20, 0, 0, 32]) + tlsFinishedVerifyData(hash, flight2.secrets.clientTraffic, flight2.transcript.hash(hash))
+
+            val sealed2 = tlsProtectRecord(flight2.write, 22, finished2, 0)
+            second.write((if (sentCcs) "" else tlsPlaintextRecord(20, 771, "\x01")) + sealed2.bytes)
+            var appWrite2 = crAppProtection(app2.clientTraffic)
+            val probe = tlsProtectRecord(appWrite2, 23, "ping", 0)
+            if (probe.ok) second.write(probe.bytes)
+            val reaction = crReaction(second, crAppProtection(app2.serverTraffic), 200)
+            class2 = (if (flight2.resumed) "R/" else "f/") + reaction
+        }
+        println("CASE $i $tags $class2")
+        second.close()
+    }
+    0
+}

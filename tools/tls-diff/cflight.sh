@@ -14,6 +14,8 @@ fi
 base=${CFLIGHT_PORT:-29500}
 client_program=cflight
 [[ -n ${CFLIGHT_TLS12:-} ]] && client_program=cflight12   # CFLIGHT_TLS12=1: the TLS 1.2 client (tools/tls-diff/cflight12.ab); no client certificates
+resume=${CFLIGHT_RESUME:-}   # CFLIGHT_RESUME=1: tools/tls-diff/cresume.ab resumes with changed tickets and binders against server-resume.ab (ours), s_server and Go
+[[ -n $resume ]] && client_program=cresume
 auth=${CFLIGHT_AUTH:-}   # CFLIGHT_AUTH=1: the servers require a client certificate (a CA and a client certificate are made in OUTDIR)
 openssl_auth=()
 ours_auth=()
@@ -31,7 +33,11 @@ if [[ -n $auth ]]; then
 fi
 pids=()
 trap 'for p in "${pids[@]}"; do kill "$p" 2> /dev/null || true; done' EXIT
-"$programs/server" "$cert" "$key" "$base" hold "${ours_auth[@]}" > "$out/ours.log" 2>&1 &
+if [[ -n $resume ]]; then
+    "$programs/server-resume" "$cert" "$key" "$base" > "$out/ours.log" 2>&1 &
+else
+    "$programs/server" "$cert" "$key" "$base" hold "${ours_auth[@]}" > "$out/ours.log" 2>&1 &
+fi
 pids+=("$!")
 (sleep 3000 | openssl s_server -accept 127.0.0.1:$((base + 1)) -cert "$cert" -key "$key" -quiet -www "${openssl_auth[@]}") > "$out/openssl.log" 2>&1 &
 pids+=("$!")
@@ -53,6 +59,16 @@ for index in 0 1 2; do
 done
 paste -d' ' <(grep '^CASE' "$out/cf-0.out" | sort -k2,2n) <(grep '^CASE' "$out/cf-1.out" | sort -k2,2n | awk '{print $NF}') \
     <(grep '^CASE' "$out/cf-2.out" | sort -k2,2n | awk '{print $NF}') | awk '{print $2, $3, $4, $5, $6}' > "$out/cflight.txt"
+if [[ -n $resume ]]; then
+    # Resumption: R = the ServerHello selected the PSK (ticket and binder were taken), anything else is not a resumption. LENIENT here is a forged or damaged
+    # resumption that ours accepts and both others do not: read those first.
+    awk 'function cls(x) { if (x ~ /^R\//) return "R"; return "n" }
+        { o = cls($3); s = cls($4); g = cls($5); key = o "/" s "/" g; n[key]++; if (!(key in first)) first[key] = $0
+          if (o == "R" && s == "n" && g == "n") print "LENIENT", $0
+          if (o == "n" && s == "R" && g == "R") print "STRICT", $0 }
+        END { for (k in n) print "COUNT", k, n[k], "e.g.", first[k] }' "$out/cflight.txt" | sort
+    exit 0
+fi
 awk 'function cls(x) { if (x == "F/ok") return "take"; if (x ~ /^F\/A/ || x ~ /^F\/C/ || x ~ /^A/ || x == "C") return "refuse"; return "other" }
     { o = cls($3); s = cls($4); g = cls($5); key = o "/" s "/" g; n[key]++; if (!(key in first)) first[key] = $0
       if (o == "take" && s == "refuse" && g == "refuse") print "LENIENT", $0
