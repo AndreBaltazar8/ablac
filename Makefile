@@ -197,6 +197,7 @@ test-serial: ablac
 	tools/test-wasm-imports.sh $(COMPILER)
 	tools/test-wasm-float-remainder.sh $(COMPILER)
 	tools/test-wasm-host.sh $(COMPILER)
+	tools/test-wasm-wasi.sh $(COMPILER)
 	tools/test-wasm-panic-message.sh $(COMPILER)
 	tools/test-release-scripts.sh $(COMPILER)
 	tools/test-siblings-tool.sh

@@ -2190,6 +2190,29 @@ fun bootstrapLlvmEmitFreestandingStart(backend: BootstrapLlvmBackend): void {
     return
 }
 
+// WASI commands enter without parameters. The Abla platform adapter provides
+// the C-style argv/envp block expected by the ordinary main wrapper.
+fun bootstrapLlvmEmitWasiStart(backend: BootstrapLlvmBackend, arguments: i64*, main: i64*): void {
+    LLVMSetVisibility(main, llvmHiddenVisibility())
+    val start = bootstrapLlvmDeclare(backend, "_start", backend.voidType, [], false, [])
+    val entry = LLVMAppendBasicBlockInContext(backend.context, start, "entry")
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    val slot = LLVMBuildAlloca(backend.builder, backend.i32Type, "argc.slot")
+    val slotAddress = LLVMBuildPtrToInt(backend.builder, slot, backend.i64Type, "argc.address")
+    val argv = bootstrapLlvmCall(backend, arguments, [slotAddress], "argv", false, [false])
+    val argc = LLVMBuildLoad2(backend.builder, backend.i32Type, slot, "argc")
+    val argvPointer = LLVMBuildIntToPtr(backend.builder, argv, backend.pointerType, "argv.pointer")
+    val status = bootstrapLlvmCall(backend, main, [argc, argvPointer], "status", false, [false, false])
+    val exit = bootstrapLlvmDeclare(backend, "__ablaWasiExit", backend.voidType,
+        [backend.i32Type], false, [false])
+    bootstrapLlvmAddStringFunctionAttribute(backend, exit, "wasm-import-module", "wasi_snapshot_preview1")
+    bootstrapLlvmAddStringFunctionAttribute(backend, exit, "wasm-import-name", "proc_exit")
+    val code = LLVMBuildAnd(backend.builder, status, LLVMConstInt(backend.i32Type, 255, 0), "exit.code")
+    bootstrapLlvmCall(backend, exit, [code], "", false, [false])
+    LLVMBuildUnreachable(backend.builder)
+    return
+}
+
 fun bootstrapLlvmEmitMain(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -2386,8 +2409,14 @@ fun bootstrapLlvmEmitMain(
         }
         if (requireMain && bootstrapLlvmWindowsArgumentsSymbol != "") bootstrapLlvmEmitWindowsStart(backend)
         if (bootstrapLlvmWindowsSyscallSymbol != "") bootstrapLlvmEmitWindowsLibc(backend)
+        if (requireMain && bootstrapLlvmTargetIsWasi(backend.targetTriple)) {
+            val arguments = functionIndex.find("__ablaRuntimeWasiArguments")
+            if (arguments >= 0) bootstrapLlvmEmitWasiStart(
+                backend, LLVMGetNamedFunction(backend.module, bootstrapLlvmDirectFunctionSymbol(identities.symbols[arguments])), main
+            )
+        }
     }
-    if (requireMain && mainId < 0 && exports.size == 0) {
+    if (requireMain && mainId < 0 && (exports.size == 0 || bootstrapLlvmTargetIsWasi(backend.targetTriple))) {
         bootstrapStageDriverDiagnostic(
             "error[E_NO_MAIN]: the program has no `fun main` (a module only imported by others is not built on its own)\n"
         )

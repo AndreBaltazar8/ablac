@@ -42,6 +42,7 @@ pkgs.mkShell {
     llvm.lld
     binaryen
     nodejs
+    wasmtime
     # tools/readiness.sh: saved release and measurement evidence.
     jq
     openssl

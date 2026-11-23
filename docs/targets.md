@@ -9,9 +9,10 @@ tools are installed. This page does not record a fresh run of those checks.
 ## Target selection
 
 The compiler's built-in `--target` list is exactly `x86_64-linux`,
-`aarch64-linux`, `x86_64-macos`, `arm64-macos` and `x86_64-windows` (a freestanding program only: see the Windows row); see `bootstrapSupportedTargets` and
+`aarch64-linux`, `x86_64-macos`, `arm64-macos`, `x86_64-windows` and
+`wasm32-wasi`. See `bootstrapSupportedTargets` and
 `bootstrapTargetDescriptor` in [src/toolchain.ab](../src/toolchain.ab).
-There is no built-in `arm64-linux`, Android, or Wasm alias; AArch64 Linux uses
+There is no built-in `arm64-linux` or Android alias. AArch64 Linux uses
 the spelling `aarch64-linux`. The [platform support matrix](platforms.md)
 records current CI coverage tiers and distinguishes source workflow artifacts
 from the assets actually published in v0.2.64.
@@ -33,6 +34,23 @@ Other targets come from two mechanisms:
 
 See [programmable builds](programmable-builds.md) for the build API and
 [the toolchain reference](toolchain.md) for CLI options.
+
+## WASI Preview 1 commands
+
+Build a source with `fun main` using
+`ablac build app.ab --target wasm32-wasi -o app.wasm`, then run
+`wasmtime run app.wasm`. Put Wasmtime options, such as `--env NAME=value`,
+before the module path and program arguments after it.
+
+This target uses the `wasi_snapshot_preview1` ABI directly and needs no WASI
+libc or SDK. The command receives arguments and environment variables from
+the host. Standard input/output, standard error, exit status, wall and
+monotonic clocks, and random bytes work through WASI. Filesystem access is
+not yet supported. Browser and hostless modules still use `wasm32-module`
+and their existing export and host-import contracts.
+
+[test-wasm-wasi.sh](../tools/test-wasm-wasi.sh) exercises development and
+release commands under Wasmtime when it is installed.
 
 ## Evidence matrix
 

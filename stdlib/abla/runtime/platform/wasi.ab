@@ -1,0 +1,140 @@
+// public: none
+import "wasm.ab"
+import "abla/runtime/scalar"
+import "abla/runtime/self"
+
+// The WASI Preview 1 command ABI uses wasm32 addresses and u32 sizes.
+/// Writes the command argument count and byte size, returning zero or a WASI error.
+@wasmImport(["wasi_snapshot_preview1", "args_sizes_get"])
+trusted noescape extern:"c" fun __ablaWasiArgsSizes(count: i32, size: i32): i32
+/// Writes the argument vector and its strings, returning zero or a WASI error.
+@wasmImport(["wasi_snapshot_preview1", "args_get"])
+trusted noescape extern:"c" fun __ablaWasiArgs(vector: i32, bytes: i32): i32
+/// Writes the environment entry count and byte size, returning zero or a WASI error.
+@wasmImport(["wasi_snapshot_preview1", "environ_sizes_get"])
+trusted noescape extern:"c" fun __ablaWasiEnvironmentSizes(count: i32, size: i32): i32
+/// Writes the environment vector and its strings, returning zero or a WASI error.
+@wasmImport(["wasi_snapshot_preview1", "environ_get"])
+trusted noescape extern:"c" fun __ablaWasiEnvironment(vector: i32, bytes: i32): i32
+/// Reads into guest buffers and writes the count, returning zero or a WASI error.
+@wasmImport(["wasi_snapshot_preview1", "fd_read"])
+trusted noescape extern:"c" fun __ablaWasiRead(fd: i32, iov: i32, count: i32, actual: i32): i32
+/// Writes guest buffers and stores the count, returning zero or a WASI error.
+@wasmImport(["wasi_snapshot_preview1", "fd_write"])
+trusted noescape extern:"c" fun __ablaWasiWrite(fd: i32, iov: i32, count: i32, actual: i32): i32
+/// Ends the command with the given process status.
+@wasmImport(["wasi_snapshot_preview1", "proc_exit"])
+trusted noescape extern:"c" fun __ablaWasiExit(status: i32): void
+/// Writes the clock time in nanoseconds, returning zero or a WASI error.
+@wasmImport(["wasi_snapshot_preview1", "clock_time_get"])
+trusted noescape extern:"c" fun __ablaWasiClock(clock: i32, precision: i64, time: i32): i32
+/// Fills the buffer with random bytes, returning zero or a WASI error.
+@wasmImport(["wasi_snapshot_preview1", "random_get"])
+trusted noescape extern:"c" fun __ablaWasiRandom(data: i32, size: i32): i32
+
+/// Returns the startup argv address, writes argc, and exits on a failed WASI host call.
+trusted fun __ablaRuntimeWasiArguments(argc: int): int {
+    val sizes = __ablaRuntimeWasmMalloc(16)
+    if (__ablaWasiArgsSizes(i32(sizes), i32(sizes + 4)) != 0 ||
+        __ablaWasiEnvironmentSizes(i32(sizes + 8), i32(sizes + 12)) != 0) {
+        __ablaWasiExit(1)
+        ablaRuntimeTrap()
+    }
+    val arguments = ablaRuntimeLoadI32(sizes)
+    val argumentBytes = ablaRuntimeLoadI32(sizes + 4)
+    val environment = ablaRuntimeLoadI32(sizes + 8)
+    val environmentBytes = ablaRuntimeLoadI32(sizes + 12)
+    __ablaRuntimeWasmMallocFree(sizes)
+    // Keep argv and envp adjacent, as expected by the ordinary main wrapper.
+    // Both vectors and their strings live until the command exits.
+    if (arguments < 0 || argumentBytes < 0 || environment < 0 || environmentBytes < 0) {
+        __ablaWasiExit(1)
+        ablaRuntimeTrap()
+    }
+    val argumentSlots = (arguments + 1) * 4
+    // The argv intrinsic uses the target pointer width. The Linux stdlib
+    // environment iterators use eight-byte cells, so widen WASI's envp in place.
+    val slots = argumentSlots + (environment + 1) * 8
+    val vector = __ablaRuntimeWasmMalloc(slots + argumentBytes + environmentBytes)
+    val bytes = vector + slots
+    val envp = vector + argumentSlots
+    if (__ablaWasiArgs(i32(vector), i32(bytes)) != 0 ||
+        __ablaWasiEnvironment(i32(envp), i32(bytes + argumentBytes)) != 0) {
+        __ablaWasiExit(1)
+        ablaRuntimeTrap()
+    }
+    var remaining = environment
+    while (remaining > 0) {
+        remaining -= 1
+        val address = ablaRuntimeLoadI32(envp + remaining * 4)
+        ablaRuntimeStoreI32(envp + remaining * 8, address)
+        ablaRuntimeStoreI32(envp + remaining * 8 + 4, 0)
+    }
+    ablaRuntimeStoreI32(envp - 4, 0)
+    ablaRuntimeStoreI32(vector + slots - 8, 0)
+    ablaRuntimeStoreI32(vector + slots - 4, 0)
+    ablaRuntimeStoreI32(argc, arguments)
+    vector
+}
+
+/// Returns the byte length of a live NUL-terminated guest string.
+trusted fun __ablaRuntimeWasiCStringLength(address: int): int {
+    var size = 0
+    while (ablaRuntimeLoadU8(address + size) != 0) size += 1
+    size
+}
+
+// The Abla syscall shim returns negative Linux errno, not WASI's errno enum.
+private fun wasiResult(error: i32): int {
+    if (error == 0) return 0
+    if (error == 8) return -9   // BADF
+    if (error == 6) return -11  // AGAIN
+    if (error == 27) return -4  // INTR
+    if (error == 28) return -22 // INVAL
+    if (error == 52) return -38 // NOSYS
+    if (error == 58) return -95 // NOTSUP
+    -5                         // I/O failure
+}
+
+private trusted fun wasiTransfer(write: bool, fd: int, buffer: int, length: int): int {
+    if (length < 0 || length > 4294967295) return -22
+    val iov = __ablaRuntimeWasmMalloc(12)
+    ablaRuntimeStoreI32(iov, buffer)
+    ablaRuntimeStoreI32(iov + 4, length)
+    val error = if (write) __ablaWasiWrite(i32(fd), i32(iov), 1, i32(iov + 8))
+        else __ablaWasiRead(i32(fd), i32(iov), 1, i32(iov + 8))
+    val result = if (error == 0) ablaRuntimeLoadI32(iov + 8) & 4294967295
+        else wasiResult(error)
+    __ablaRuntimeWasmMallocFree(iov)
+    result
+}
+
+/// Translates standard I/O, exits, clocks and randomness to WASI. Other calls return ENOSYS.
+trusted fun __ablaRuntimeWasiSyscall(number: int, a0: int, a1: int, a2: int): int {
+    if (number == 0 || number == 1) {
+        if (a0 < 0 || a0 > 2) return -9
+        return wasiTransfer(number == 1, a0, a1, a2)
+    }
+    if (number == 60 || number == 231) {
+        __ablaWasiExit(i32(a0 & 255))
+        ablaRuntimeTrap()
+    }
+    if (number == 228) {
+        if (a0 < 0 || a0 > 1) return -22
+        val time = __ablaRuntimeWasmMalloc(8)
+        val error = __ablaWasiClock(i32(a0), i64(1), i32(time))
+        if (error == 0) {
+            val now = ablaRuntimeLoadI64(time)
+            ablaRuntimeStoreI64(a1, now / 1000000000)
+            ablaRuntimeStoreI64(a1 + 8, now % 1000000000)
+        }
+        __ablaRuntimeWasmMallocFree(time)
+        return wasiResult(error)
+    }
+    if (number == 318) {
+        if (a1 < 0 || a1 > 4294967295) return -22
+        val error = __ablaWasiRandom(i32(a0), i32(a1))
+        return if (error == 0) a1 else wasiResult(error)
+    }
+    -38
+}
