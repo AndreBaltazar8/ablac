@@ -1,5 +1,5 @@
-# The Xtensa LLVM from a release of the fork (docs/llvm-xtensa.md), so it isn't
-# compiled for over an hour wherever it is needed. x86_64 Linux only.
+# The fork's prebuilt LLVM for x86_64 Linux and the static SDK for Windows
+# (docs/llvm-xtensa.md).
 #
 # The archive holds the build's out, lib and dev outputs. These outputs have the
 # same names, so their store paths are the same length: the old hashes are
@@ -41,6 +41,20 @@ rec {
     dontFixup = true;
     installPhase = "mkdir -p $out/lib && cp lib/libLLVM*.a $out/lib/";
   };
+
+  # x64 COFF LLVM and lld archives built with /MT, plus their headers and tools.
+  # The JSON pin is also readable by native Windows tooling.
+  windowsStatic =
+    let pin = builtins.fromJSON (builtins.readFile ./llvm-windows-static-pin.json); in
+    assert builtins.hashFile "sha256" ./llvm-instcombine-fdiv-zero.patch == pin.patchSha256;
+    pkgs.runCommand "llvm-23.1.3-x86_64-windows-msvc-static" {
+      src = pkgs.fetchurl { inherit (pin) url sha256; };
+      nativeBuildInputs = [ pkgs.gnutar pkgs.xz ];
+    } ''
+      mkdir -p "$out"
+      tar -xJf "$src" -C "$out" --strip-components=1
+      test -s "$out/lib/LLVMOptDriver.lib" && test -s "$out/lib/lldCOFF.lib"
+    '';
 
   llvm = pkgs.stdenv.mkDerivation {
     name = "llvm-23.1.3";
