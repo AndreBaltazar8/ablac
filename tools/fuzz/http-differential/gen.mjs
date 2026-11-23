@@ -4,6 +4,8 @@
 // endings, chunk sizes, extensions, trailers) followed by a marker request, so that a parser that ends the first request in another
 // place than the reference frames a different second request. The tags name the variants used, to group findings.
 //   node gen.mjs <seed> <count> > cases.tsv
+// Then node oracle-llhttp.mjs cases.tsv > llhttp.tsv (or, for a second reference, `go run ./oracle-go cases.tsv > go.tsv` in this directory), framing cases.tsv
+// > abla.tsv (framing.ab, built with ablac) and node compare.mjs cases.tsv llhttp.tsv abla.tsv; tools/test-http-differential.sh does it with llhttp.
 let state = Number(process.argv[2] ?? 1) >>> 0;
 const count = Number(process.argv[3] ?? 1000);
 const random = () => { state = (state + 0x6d2b79f5) >>> 0; let t = state; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
