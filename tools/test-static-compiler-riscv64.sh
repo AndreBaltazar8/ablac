@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # Cross-build the RV64 compiler with the real shim and test its native ELF path.
-# Supply the RV64 LLVM/lld archives and target libraries to build-static-compiler.sh.
+# Usage: tools/test-static-compiler-riscv64.sh [compiler] [deps]
+# deps is the result of nix/riscv64-static-native-deps.nix. Without it, supply
+# the RV64 archives and target headers through build-static-compiler.sh's environment.
 set -euo pipefail
 export LC_ALL=C
 ulimit -c 0
 unset ABLA_DEBUG ABLA_TEST_FAST_BUILDS
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
+if [[ -n ${2:-} ]]; then
+    deps=$(realpath -e -- "$2")
+    export ABLA_STATIC_LLVM_LIB="$deps/lib" ABLA_STATIC_LLD_LIB="$deps/lib"
+    export ABLA_STATIC_LLVM_INCLUDE="$deps/include" ABLA_STATIC_LLD_INCLUDE="$deps/include"
+    export ABLA_STATIC_TARGET_LIBS="$deps/sysroot/lib" ABLA_STATIC_CXX=clang++
+    ABLA_STATIC_CXXFLAGS=$(cat "$deps/cxx-flags")
+    export ABLA_STATIC_CXXFLAGS
+fi
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 qemu=$(command -v qemu-riscv64) || { echo 'static compiler riscv64: qemu-riscv64 is required' >&2; exit 1; }
