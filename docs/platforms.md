@@ -37,7 +37,7 @@ Checksums accompany the published compiler and toolchain assets.
 | WebAssembly hostless | T2 | No Wasm-hosted compiler gate | Import-free runtime fixtures and differential programs execute under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | Xtensa / ESP32 | T3 | No compiler hosted on the microcontroller | Object/assembly checks and optional companion integration; no required board run | No ablac ESP32 binary; separately versioned LLVM companion |
 | Windows x86-64 | T2 | The packaged `ablac.exe` is exercised on `windows-latest` in release runs (`windows: with` or `only`), not in push CI; no Windows self-rebuild or suite shard yet | Cross-built on Linux; selected programs run natively on `windows-latest` in CI (the freestanding exit-status program and the hosted crash program with its symbolized backtrace); the hosted file, process, socket and thread programs run under Wine on Linux only | None in v0.2.64; `abla-toolchain-x86_64-windows.zip` is built by the release workflow and not yet published |
-| Windows ARM64 | T2 | No Windows-hosted compiler | Hosted programs cross-built on Linux and run natively on `windows-11-arm` in CI | None for Windows ARM64 |
+| Windows ARM64 | T2 | Native compiler link and packaged smoke on `windows-11-arm` in release runs | Hosted programs cross-built on Linux and run natively on `windows-11-arm` in CI | None in v0.2.64. `ablac-windows-arm64.zip` starts with v0.2.69. |
 <!-- readiness-platforms:end -->
 
 `tools/readiness.sh` reads this marked table directly. Update
@@ -223,10 +223,21 @@ ARM64. Job `windows-arm64-cross` cross-builds hosted programs and
 `windows-arm64-run`, **Windows ARM64 program runtime**, runs the checked
 images on `windows-11-arm`.
 
-Gaps: no published Windows asset yet (the zip is prepared by the release
-workflow, after the v0.2.64 baseline); the Windows compiler is exercised in
-release runs, not in push CI; the Linux cross-builds link with the external
-`lld-link`, not the in-process one of the packaged toolchain. Of the
+The release workflow includes `ablac-windows-arm64.zip` from v0.2.69
+alongside the x86-64 zip introduced in v0.2.68. `windows_arm64: with`
+(the default) builds and checks the ARM64 zip before publication.
+`windows_arm64: only` exercises that toolchain by itself. Its Linux job
+emits ARM64 COFF and the native Windows job links LLVM, lld and the static
+MSVC runtime into `ablac.exe`. The package includes `llvm-objcopy.exe`
+for split debug information. The smoke builds and runs a hello world, a
+two-module project and a `--backtrace` build on `windows-11-arm`, with
+only System32 on `PATH` and from a moved toolchain in a path with a space.
+The release check validates the zip layout, size, version and console PE
+architecture and rejects a compiler with C runtime DLL imports.
+
+The ARM64 compiler still needs a native self-build and full standard-library
+suite. The release compiler runs the COFF linker in process. Development
+compilers built without lld invoke the external `lld-link`. Of the
 standard library's test programs (`tests/abla-tests.json`), those in
 `programs.txt` run on Windows; the rest of the survey is blocked by:
 Linux system calls the Windows runtime does not translate (`symlink` in

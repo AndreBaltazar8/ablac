@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # An SPDX 2.3 (JSON) software bill of materials for a release, from what the checkout of the release's commit
 # records: the release assets with their sha256, the compiler's own sources (standard library, runtime), the pinned
-# LLVM inputs (the fork's commit and patch, the prebuilt Linux and macOS archives, the Xtensa companion), the nixpkgs
+# LLVM inputs (the fork's commit and patch, the prebuilt Linux, macOS and Windows archives, the Xtensa companion), the nixpkgs
 # commit and the bootstrap seed. Nothing is fetched; no Python.
 #
 #   tools/release-sbom.sh TAG ASSETS_DIR OUTPUT.spdx.json
@@ -66,7 +66,7 @@ created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     printf '  "documentDescribes": ["SPDXRef-ablac"],\n'
     printf '  "packages": [\n'
     if [[ -n $windows_arm64_url ]]; then
-        printf '    {"SPDXID": "SPDXRef-llvm-windows-arm64", "name": "LLVM and lld for Windows ARM64 (static, /MT)", "versionInfo": "%s", "downloadLocation": "%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION"},\n' "$windows_arm64_tag" "$windows_arm64_url" "$windows_arm64_sha"
+        printf '    {"SPDXID": "SPDXRef-llvm-windows-arm64", "name": "LLVM and lld for Windows ARM64 (static, /MT)", "versionInfo": "%s", "downloadLocation": "%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION", "comment": "nix/llvm-windows-arm64-static-pin.json; LLVM and lld are linked into ablac.exe, and llvm-objcopy.exe is shipped beside it"},\n' "$windows_arm64_tag" "$windows_arm64_url" "$windows_arm64_sha"
     fi
     printf '    {"SPDXID": "SPDXRef-ablac", "name": "ablac", "versionInfo": "%s", "supplier": "Person: André Baltazar", "downloadLocation": "git+https://github.com/AndreBaltazar8/ablac@%s", "filesAnalyzed": false, "licenseConcluded": "MPL-2.0", "licenseDeclared": "MPL-2.0", "copyrightText": "NOASSERTION", "comment": "The compiler, its standard library and its runtime (all in this repository), as the release assets below."},\n' "$version" "$commit"
     printf '    {"SPDXID": "SPDXRef-llvm-fork", "name": "llvm-project (AndreBaltazar8 fork: Xtensa backend and the InstCombine fdiv fix)", "versionInfo": "%s", "downloadLocation": "https://github.com/AndreBaltazar8/llvm-project/archive/%s.tar.gz", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s", "comment": "nix fetchzip hash (nix base32) of the archive"}], "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION", "comment": "nix/llvm-fork.nix; patch nix/llvm-instcombine-fdiv-zero.patch sha256 %s"},\n' "$llvm_fork_commit" "$llvm_fork_commit" "$llvm_fork_sha" "$patch_sha"

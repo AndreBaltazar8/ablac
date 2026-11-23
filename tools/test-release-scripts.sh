@@ -10,6 +10,7 @@ fi
 check=$project_root/tools/release-check.sh
 convergence=$project_root/tools/release-convergence.sh
 pin=$project_root/tools/release-pin.sh
+compiler=${1:-build/ablac}
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 
@@ -102,6 +103,77 @@ mutated() { # name  -> a copy of the release in $work/m-<name>
     cp -r "$release" "$work/m-$1"
     echo "$work/m-$1"
 }
+
+# Exercise release-check with real PE files and the same PE reader it uses for a release.
+if command -v llvm-mc >/dev/null && command -v lld-link >/dev/null &&
+    command -v zip >/dev/null && command -v unzip >/dev/null && command -v jq >/dev/null; then
+    ABLA_SYSROOT="$project_root" "$compiler" build "$project_root/tools/pe-info/main.ab" -o "$work/pe-info" --fast --no-cache
+    pe_fixture() {
+        local arch=$1 machine=$2 version=$3 output=$4
+        shift 4
+        printf '.text\n.globl entry\nentry:\n  ret\n.section .rdata,"dr"\n.asciz "ablac %s"\n' "$version" |
+            llvm-mc -triple "$arch-pc-windows-msvc" -filetype=obj -o "$work/windows.obj"
+        lld-link /nologo /subsystem:console /entry:entry /nodefaultlib /opt:noref \
+            "/machine:$machine" "/out:$output" "$work/windows.obj" "$@"
+    }
+    package_fixture() {
+        local image=$1
+        cp "$image" "$windows_tree/$top/bin/ablac.exe"
+        rm -f "$directory/$asset"
+        (cd "$windows_tree" && zip -q -r "$directory/$asset" "$top")
+        (cd "$directory" && sha256sum "$asset" > "$asset.sha256")
+    }
+    check_windows() { ABLA_PE_INFO="$work/pe-info" run_check "$directory" v9.9.9 "$stage2"; }
+
+    directory=$(mutated windows-arm64)
+    asset=ablac-windows-arm64.zip
+    top=abla-toolchain-aarch64-windows
+    windows_tree=$work/windows-tree
+    mkdir -p "$windows_tree/$top"/{bin,share/abla/stdlib,share/abla/runtime/windows/imports,share/licenses}
+    touch "$windows_tree/$top/share/abla/runtime/windows/imports/kernel32.txt" "$windows_tree/$top/share/licenses/abla.txt"
+    pe_fixture aarch64 arm64 9.9.9 "$work/arm64.exe"
+    cp "$work/arm64.exe" "$windows_tree/$top/bin/llvm-objcopy.exe"
+    package_fixture "$work/arm64.exe"
+    output=$(check_windows) || { echo "$output" >&2; fail 'release-check rejected the ARM64 zip'; }
+    grep -q '^PASS  windows-arm64 ' <<< "$output" || fail 'no PASS for the ARM64 zip'
+
+    "$project_root/tools/release-sbom.sh" v9.9.9 "$directory" "$work/windows-arm64.spdx.json"
+    sdk_pin=$project_root/nix/llvm-windows-arm64-static-pin.json
+    jq --slurpfile pin "$sdk_pin" -e '
+        any(.packages[]; .SPDXID == "SPDXRef-llvm-windows-arm64"
+            and .downloadLocation == $pin[0].url
+            and any(.checksums[]; .algorithm == "SHA256" and .checksumValue == $pin[0].sha256))
+        and any(.relationships[]; .spdxElementId == "SPDXRef-ablac" and .relationshipType == "DEPENDS_ON"
+            and .relatedSpdxElement == "SPDXRef-llvm-windows-arm64")
+    ' "$work/windows-arm64.spdx.json" >/dev/null || fail 'the SBOM does not record the pinned ARM64 SDK'
+
+    pe_fixture x86_64 x64 9.9.9 "$work/x64.exe"
+    package_fixture "$work/x64.exe"
+    expect_fail 'an x64 executable in the ARM64 zip' check_windows
+    grep -q '^FAIL  windows-arm64.*expected console PE for aarch64' "$work/out.txt"
+
+    pe_fixture aarch64 arm64 9.9.90 "$work/wrong-version.exe"
+    package_fixture "$work/wrong-version.exe"
+    expect_fail 'an ARM64 executable for another release' check_windows
+    grep -q '^FAIL  windows-arm64.*does not carry.*ablac 9.9.9' "$work/out.txt"
+
+    ABLA_SYSROOT="$project_root" "$compiler" build "$project_root/tools/windows/implib.ab" -o "$work/implib" --fast --no-cache
+    printf 'puts\n' > "$work/msvcrt.txt"
+    "$work/implib" "$work/msvcrt.lib" msvcrt.dll aarch64 "$work/msvcrt.txt"
+    pe_fixture aarch64 arm64 9.9.9 "$work/crt.exe" /include:puts "$work/msvcrt.lib"
+    package_fixture "$work/crt.exe"
+    expect_fail 'an ARM64 executable with a dynamic CRT import' check_windows
+    grep -q '^FAIL  windows-arm64.*msvcrt.dll' "$work/out.txt"
+
+    rm "$windows_tree/$top/bin/llvm-objcopy.exe"
+    package_fixture "$work/arm64.exe"
+    expect_fail 'an ARM64 zip without llvm-objcopy.exe' check_windows
+    grep -q '^FAIL  windows-arm64.*no bin/llvm-objcopy.exe' "$work/out.txt"
+    echo 'release scripts: ARM64 zip and SDK SBOM passed, wrong machine/version, CRT import and missing tool refused'
+else
+    echo 'release scripts: skipped the Windows ARM64 fixtures (requires LLVM tools, jq, zip and unzip)'
+fi
+
 directory=$(mutated doctored-sha)
 doctor "$directory/ablac-x86_64-macos.sha256"
 expect_fail "a doctored sha256" run_check "$directory" v9.9.9 "$stage2"

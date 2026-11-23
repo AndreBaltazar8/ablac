@@ -19,8 +19,8 @@
 #               PT_INTERP or DT_NEEDED, no shared library or external LLVM tool, at most 60 MB (150 MB unpacked), its launcher runs with an empty PATH
 #   playground  (when the run ships abla-playground-<version>.tar.gz, the browser compiler of tools/build-playground.sh) its manifest names this
 #               version, its module matches the manifest's hash and is at most 8 MB, and its stdlib bundle carries its hash in its name
-#   windows     (when the run ships abla-toolchain-x86_64-windows.zip) the toolchain layout, size caps, and ablac.exe: an x86-64 console PE with no C
-#               runtime import (tools/pe-info) that carries this version's string
+#   windows     abla-toolchain-x86_64-windows.zip and (as windows-arm64) ablac-windows-arm64.zip, when shipped. Checks layout,
+#               size caps and an architecture-matched console ablac.exe carrying this version and importing no C runtime
 #   siblings    (with --siblings) the downstream repositories build and pass their tests with the candidate
 #               (tools/test-siblings.sh over tools/siblings.txt)
 #
@@ -451,6 +451,11 @@ for windows_machine in x86_64 aarch64; do
         check=windows-arm64
     fi
     [[ -f $zipfile ]] || continue
+    size=$(stat -c %s "$zipfile")
+    if ((size > 150 * 1048576)); then
+        report FAIL "$check" "the archive is $((size / 1048576)) MB (cap 150)"
+        continue
+    fi
     unpack=$(mktemp -d)
     bad=
     if ! command -v unzip > /dev/null; then
@@ -458,20 +463,20 @@ for windows_machine in x86_64 aarch64; do
     elif ! unzip -q "$zipfile" -d "$unpack"; then
         report FAIL "$check" "the archive does not unzip"
     else
-        size=$(stat -c %s "$zipfile")
-        ((size <= 150 * 1048576)) || bad="$bad the archive is $((size / 1048576)) MB (cap 150);"
         unpacked=$(du -sb "$unpack" | cut -f1)
         ((unpacked <= 400 * 1048576)) || bad="$bad unpacked it is $((unpacked / 1048576)) MB (cap 400);"
         outside=$(unzip -Z1 "$zipfile" | grep -v "^$top/" | head -3 | tr '\n' ' ' || true)
         [[ -z $outside ]] || bad="$bad entries outside $top/: ${outside% };"
-        for required in bin/ablac.exe bin/llvm-objcopy.exe share/abla/stdlib share/abla/runtime/windows/imports/kernel32.txt share/licenses/abla.txt; do
-            [[ -e $unpack/$top/$required ]] || bad="$bad no $required;"
+        [[ -d $unpack/$top/share/abla/stdlib ]] || bad="$bad no share/abla/stdlib directory;"
+        for required in bin/ablac.exe bin/llvm-objcopy.exe share/abla/runtime/windows/imports/kernel32.txt share/licenses/abla.txt; do
+            [[ -f $unpack/$top/$required ]] || bad="$bad no $required;"
         done
         metadata=$(unzip -Z1 "$zipfile" | grep -E '(^|/)\.git(/|$)|\.abla-' | head -3 | tr '\n' ' ' || true)
         [[ -z $metadata ]] || bad="$bad it carries repository or build metadata: ${metadata% };"
         exe=$unpack/$top/bin/ablac.exe
         if [[ -f $exe ]]; then
-            grep -q -a -F "ablac $version" "$exe" || bad="$bad ablac.exe does not carry the string 'ablac $version';"
+            version_pattern=${version//./\\.}
+            grep -azqE "ablac $version_pattern([[:space:]]|$)" "$exe" || bad="$bad ablac.exe does not carry the string 'ablac $version';"
             root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
             host=
             pe_info=${ABLA_PE_INFO:-$unpack/pe-info}
