@@ -14,7 +14,10 @@ export function createBase(stdlibFiles) {
 export async function compile(module, base, files, options = {}) {
     const vfs = new Vfs(base);
     const encoder = new TextEncoder();
-    for (const [path, data] of files) vfs.put(`/work/${path}`, typeof data === "string" ? encoder.encode(data) : data);
+    // The program lives in /work (its project, and the working directory) unless `root` says another directory; "/" puts it at the file system root.
+    const root = options.root ?? "/work"; // (`cwd` is the working directory, `root` by default)
+    const at = (path) => (root === "/" ? `/${path}` : `${root}/${path}`);
+    for (const [path, data] of files) vfs.put(at(path), typeof data === "string" ? encoder.encode(data) : data);
     let memory;
     const unknown = {};
     const output = { 1: "", 2: "" };
@@ -22,8 +25,8 @@ export async function compile(module, base, files, options = {}) {
     class Exit extends Error {
         constructor(code) { super(`exit ${code}`); this.code = code; }
     }
-    if (options.entry) vfs.put("/work/entry", encoder.encode(`/work/${options.entry}`));
-    const fileCalls = createSyscalls(vfs, () => memory, { cwd: "/work", stdin: options.stdin, unknown: (n) => { unknown[n] = (unknown[n] ?? 0) + 1; } });
+    if (options.entry) vfs.put("/work/entry", encoder.encode(at(options.entry)));
+    const fileCalls = createSyscalls(vfs, () => memory, { cwd: options.cwd ?? root, stdin: options.stdin, unknown: (n) => { unknown[n] = (unknown[n] ?? 0) + 1; } });
     const heap = () => new Uint8Array(memory.buffer);
     const address = (value) => Number(BigInt.asUintN(32, BigInt(value)));
     // The module's one host import, abla_host.syscall: the calls that leave the file system are the page's (output, exit, the clocks,

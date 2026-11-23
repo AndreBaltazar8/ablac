@@ -35,6 +35,14 @@ for (const [name, source] of [["hello", hello], ["compile-time site", staged]]) 
 const wrong = await compile(module, base, new Map([["main.ab", 'fun main: int = "wrong"\n']]));
 check("a wrong return type is an error", wrong.status === 1 && /E_SEMANTIC|error\[/.test(wrong.stderr), wrong.stderr.split("\n").find((line) => line.startsWith("error")) ?? "");
 
+// A program whose project is the file system root: compile-time code reads its own file there (a prefix test written "$root/" would be "//").
+for (const [root, cwd] of [["/work", "/work"], ["/", "/"], ["/work", "/"]]) {
+    const reader = 'import "abla/io"\nimport "abla/fs"\nimport "abla/compiler"\n\n#compilerGrant("filesystem.read")\n\nval text = #path("data.txt").readText()\n\nfun main: int {\n    println(text)\n    0\n}\n';
+    const project = new Map([["main.ab", reader], ["data.txt", "from the project\n"], ["abla.toml", 'compileCapabilities = ["filesystem.read"]\n']]);
+    const result = await compile(module, base, project, { root, cwd });
+    check(`a compile-time read, project at ${root}, working directory ${cwd}`, result.status === 0 && result.stdout === "" && /errors=0 /.test(result.stderr), result.stderr.split("\n").find((line) => line.startsWith("error")) ?? "");
+}
+
 const fib = 'import "abla/io"\n\nfun fib(n: int): int = if (n < 2) n else fib(n - 1) + fib(n - 2)\n\nfun main: int {\n    println("fib = ${fib(20)}")\n    3\n}\n';
 const ran = await run(module, base, new Map([["main.ab", fib]]));
 check("run: output and exit status", ran.ok && ran.stdout === "fib = 6765\n" && ran.status === 3, JSON.stringify({ status: ran.status, stdout: ran.stdout }));
