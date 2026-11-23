@@ -1,0 +1,120 @@
+// The grammar of abla.toml and abla.lock the readers understand (src/manifest_grammar.ab, #1139 area 2, round 2). With no argument: every minimal manifest the readers misread
+// (tools/fuzz/manifest) is refused, and the forms the repository's own manifests use are admitted; prints "manifest grammar ok". With file names: prints each file that is not
+// admitted, as "file: line N: why" (a name ending in .lock is read as a lock).
+import "abla/io"
+import "abla/sys/linux"
+import "abla/process/arguments"
+import "abla/text"
+import "../../../src/manifest_grammar.ab"
+
+var failures = 0
+
+fun accepted(text: string, what: string): void {
+    val problem = bootstrapManifestGrammarProblem(text, false)
+    if (problem != "") {
+        failures = failures + 1
+        println("FAIL $what: refused: $problem")
+    }
+    return
+}
+
+fun refused(text: string, what: string): void {
+    if (bootstrapManifestGrammarProblem(text, false) == "") {
+        failures = failures + 1
+        println("FAIL $what: admitted")
+    }
+    return
+}
+
+fun lockAccepted(text: string, what: string): void {
+    val problem = bootstrapManifestGrammarProblem(text, true)
+    if (problem != "") {
+        failures = failures + 1
+        println("FAIL $what: refused: $problem")
+    }
+    return
+}
+
+fun lockRefused(text: string, what: string): void {
+    if (bootstrapManifestGrammarProblem(text, true) == "") {
+        failures = failures + 1
+        println("FAIL $what: admitted")
+    }
+    return
+}
+
+fun main: int {
+    if (processArgumentCount() > 0) {
+        var bad = 0
+        for (i in 0 until processArgumentCount()) {
+            val path = processArgument(i)
+            val problem = bootstrapManifestGrammarProblem(linuxReadFile(path, 4194304), path.endsWith(".lock"))
+            if (problem != "") {
+                println("$path: $problem")
+                bad = bad + 1
+            }
+        }
+        return if (bad == 0) 0 else 1
+    }
+    // What the repository's manifests use.
+    accepted("name = \"abla-xml\"\nversion = \"0.3.0\"\nentry = \"src/xml.ab\"\n", "name, version, entry")
+    accepted("# a comment\n\nname = \"x\"\r\nentry = \"main.ab\"\r\n", "comments, blank lines, CRLF")
+    accepted("compileCapabilities = [\"filesystem.write\", \"environment\", \"filesystem.read\"]\nvisibility = \"imports\"\n", "capabilities and visibility")
+    accepted("nativeLibraries = [\"ssl\", \"ssl\"]\nwasmHostImports = [\"wasi_snapshot_preview1.*\", \"host.now_millis\"]\n", "libraries and wasm imports")
+    accepted("[imports]\n\"../../src/i2c/device.ab\" = \"../../src/esp32/i2c_esp32s3.ab\"\n", "[imports]")
+    accepted("[exports]\n\"wallet/evm\" = \"src/wallet/evm.ab\"\n\"wallet\" = \"src/wallet/entry.ab\"\n", "[exports]")
+    accepted("[dependencies]\nabla-mobile = { git = \"https://github.com/AndreBaltazar8/abla-mobile.git\", rev = \"6d9cfaf574031729d2426565c47bad9c20712a47\" }\n", "[dependencies]")
+    accepted("[dependencyCompileCapabilities]\nalpha = [\"network\", \"process.io\"]\n", "[dependencyCompileCapabilities]")
+    accepted("[project]\nname = \"p\"\nnativeLibraries = [\"vulkan\", \"X11\"]\n", "[project]")
+    accepted("[package]\nname = \"p\"\nversion = \"0.1.0\"\n\n[build]\nroot = \"main.ab\"\n", "[package] and [build]")
+    accepted("", "an empty manifest")
+    accepted("compileCapabilities = [\n    \"filesystem.read\",\n    \"environment\", # deterministic named input\n    # a whole-line comment with \"quotes\" and ]\n    \"network\",\n]\nname = \"x\"\n", "a multi-line list with comments")
+    accepted("nativeLibraries = [\r\n  \"ssl\"\r\n]\r\n", "a multi-line list with CRLF")
+    lockAccepted("version = 2\n\n[[package]]\nname = \"a\"\nprovider = \"git\"\nidentity = \"github:x/a\"\nsource = \"https://github.com/x/a.git\"\nselector-kind = \"head\"\nselector = \"HEAD\"\nrevision = \"0123456789abcdef0123456789abcdef01234567\"\ndigest = \"0123456789abcdef0123456789abcdef01234567\"\nentry = \"src/a.ab\"\n", "a lock")
+    // What the readers read differently from TOML (the minimal files of tools/fuzz/manifest): a key under another table, in a multi-line string, a dependency or a grant in a
+    // string, escapes, trailing comments, multi-line arrays, quoted and dotted keys, duplicates, literal strings.
+    refused("[extra]\ncompileCapabilities = [\"process.io\"]\n", "a capability under another table")
+    refused("[imports]\nentry = \"a b\"\n", "entry under [imports]")
+    refused("[extra]\nnativeLibraries = [\"x\"]\n", "nativeLibraries under another table")
+    refused("description = '''\nversion = \"x\"\n'''\n", "a key in a multi-line literal string")
+    refused("description = \"\"\"\nversion = \"x\"\n\"\"\"\n", "a key in a multi-line basic string")
+    refused("[dependencies]\nnote = '''\nevil = { git = \"https://example.test/e.git\", rev = \"abc\" }'''\n", "a dependency in a string")
+    refused("[dependencyCompileCapabilities]\nnote = \"\"\"\nevil = [\"network\"]\n\"\"\"\n", "a grant in a string")
+    refused("entry = \"q\\\"r\"\n", "an escape")
+    refused("[exports]\n\"e\" = \"x.ab\" # \"\n", "a trailing comment")
+    refused("name = \"x\" # c\n", "a trailing comment on a root key")
+    refused("compileCapabilities = [\n  \"process.io\" \"network\"\n]\n", "a list without a comma")
+    refused("compileCapabilities = [\n  \"process.io\",,\n]\n", "a list with an empty item")
+    refused("compileCapabilities = [\n  \"\"\"process.io\"\"\"\n]\n", "a multi-line string in a list")
+    refused("compileCapabilities = [\n  \"a\\\\nb\"\n]\n", "an escape in a list")
+    refused("compileCapabilities = [\n  \"a\"\n] # c\n", "a trailing comment after a list")
+    refused("compileCapabilities = [\n  \"a\"\n", "an unterminated list")
+    refused("[dependencyCompileCapabilities]\nx = [\n  \"network\"\n]\n", "a multi-line grant")
+    refused("\"name\" = \"x\"\n", "a quoted known key")
+    refused("name.sub = \"x\"\n", "a dotted key")
+    refused("name = \"x\"\nname = \"y\"\n", "a duplicate key")
+    refused("[project]\nname = \"x\"\n[package]\nname = \"y\"\n", "a key in two tables")
+    refused("name = 'x'\n", "a literal string")
+    refused("name = \"x\"\nname = \"\"\"\ny\"\"\"\n", "a duplicate with a multi-line string")
+    refused("\xEF\xBB\xBFname = \"x\"\n", "a byte order mark")
+    refused("name = \"x\"\rentry = \"y\"\n", "a bare carriage return")
+    refused("name = \"x\x00\"\n", "a NUL")
+    refused("[[extra]]\nname = \"x\"\n", "an array of tables")
+    refused("[dependencies]\nx = \"y\"\n", "a dependency that is not an inline table")
+    refused("[dependencies]\nx = { git = \"a\", path = \"b\" }\n", "an inline table with another key")
+    refused("[dependencies]\nx = { git = \"a\", rev = \"b\" }\nx = { git = \"c\", rev = \"d\" }\n", "a dependency twice")
+    refused("[exports]\nx = \"y\"\n", "an unquoted export key")
+    refused("meta = { name = \"x\" }\n", "an inline table that is not a dependency")
+    refused("[ dependencies ]\n", "a table header with spaces")
+    refused("[dependencies] # c\n", "a table header with a comment")
+    refused("[a]\n[a]\n", "a table twice")
+    lockRefused("version = 2\n[[package]]\nname = \"a\"\nnote = '''\nsource = \"https://x\"\n'''\n", "a lock key in a multi-line string")
+    lockRefused("[[package]]\nname = \"a\"\nname = \"b\"\n", "a lock key twice in a record")
+    lockRefused("[[package]]\nname = \"a\"\n[package.extra]\nsource = \"x\"\n", "a lock subtable")
+    lockRefused("[[package]]\nname = \"a\" # c\n", "a lock trailing comment")
+    lockRefused("[[package]]\nextra = { source = \"x\" }\n", "a lock inline table")
+    lockRefused("name = \"a\"\n", "a lock key before the first record")
+    lockRefused("[[package]]\nname.sub = \"a\"\n", "a lock dotted key")
+    if (failures == 0) println("manifest grammar ok")
+    if (failures == 0) 0 else 1
+}

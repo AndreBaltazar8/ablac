@@ -1,0 +1,293 @@
+// The grammar of abla.toml and abla.lock that the compiler's line-based readers (src/package.ab, src/module.ab, src/import_remap.ab, src/ct_native.ab) understand, and nothing else.
+//
+// Those readers are not TOML parsers: they look at one line at a time, so a key inside a multi-line string, under another table, behind a comment or in a spelling they do not
+// know was read differently from what a TOML parser (or a person reading the file with TOML in mind) sees (#1139 area 2, round 2: tools/fuzz/manifest). Rather than list the
+// constructs that fool them, this admits only the lines they model. A file with any other line is refused with the line number, and the readers see an empty file.
+//
+// A manifest line is one of
+//   - blank, or a whole-line comment (`# ...`);
+//   - a table header `[name]` (bare name, nothing after it);
+//   - `key = value` with a bare key (`[A-Za-z0-9_-]+`) or, in [exports] and [imports], a quoted one, and a value that is a basic string without escapes (`"..."`), a one-line
+//     array of those, an integer or true / false, and in [dependencies] an inline table `{ git = "...", rev = "..." }` (the keys git, rev, tag, branch), and nothing after the value
+//     (a trailing comment is not read the same way by every reader, so there is none).
+// The keys the readers look for (name, version, entry, visibility, compileCapabilities, wasmHostImports, nativeLibraries) are admitted only before the first table or in
+// [project] or [package], once in the file, with a string (an array for the capability, import and library lists). [dependencies] holds dependencies, [exports] and [imports] pairs of
+// quoted strings, [dependencyCompileCapabilities] names with arrays of strings; any other table holds keys the readers do not look for.
+// A lock line is blank, a comment, `version = <integer>` before the first record, `[[package]]`, or `key = "string"` inside a record with one of the nine keys, once.
+import "abla/text"
+
+class ManifestValue(val kind: int, val end: int)
+
+val MANIFEST_VALUE_STRING = 1
+val MANIFEST_VALUE_ARRAY = 2
+val MANIFEST_VALUE_INLINE_TABLE = 3
+val MANIFEST_VALUE_SCALAR = 4
+val MANIFEST_VALUE_BAD = 0
+
+private fun manifestBlank(byte: int): bool = byte == 32 || byte == 9
+
+private fun manifestBareChar(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 45 || byte == 95
+
+private fun manifestSkip(line: string, at: int): int {
+    var index = at
+    while (index < line.size && manifestBlank(line[index])) index = index + 1
+    index
+}
+
+/** The end (after the closing quote) of the basic string that starts at `at` with no backslash and no control character in it, or -1. */
+private fun manifestStringEnd(line: string, at: int): int {
+    if (at >= line.size || line[at] != 34) return -1
+    var index = at + 1
+    while (index < line.size && line[index] != 34) {
+        if (line[index] == 92 || line[index] < 32 && line[index] != 9 || line[index] == 127) return -1
+        index = index + 1
+    }
+    if (index >= line.size) -1 else index + 1
+}
+
+private fun manifestBareEnd(line: string, at: int): int {
+    var index = at
+    while (index < line.size && manifestBareChar(line[index])) index = index + 1
+    if (index == at) -1 else index
+}
+
+/** The value of kind `kind` (string, one-line array of strings, inline table of the dependency keys, integer, boolean) that starts at `at`. */
+private fun manifestValue(line: string, at: int): ManifestValue {
+    if (at >= line.size) return ManifestValue(MANIFEST_VALUE_BAD, at)
+    val first = line[at]
+    if (first == 34) {
+        val end = manifestStringEnd(line, at)
+        return if (end < 0) ManifestValue(MANIFEST_VALUE_BAD, at) else ManifestValue(MANIFEST_VALUE_STRING, end)
+    }
+    if (first == 91) {
+        var index = manifestSkip(line, at + 1)
+        var expectItem = true
+        while (index < line.size) {
+            if (line[index] == 93) return ManifestValue(MANIFEST_VALUE_ARRAY, index + 1)
+            if (!expectItem) {
+                if (line[index] != 44) return ManifestValue(MANIFEST_VALUE_BAD, index)
+                index = manifestSkip(line, index + 1)
+                expectItem = true
+            } else {
+                val end = manifestStringEnd(line, index)
+                if (end < 0) return ManifestValue(MANIFEST_VALUE_BAD, index)
+                index = manifestSkip(line, end)
+                expectItem = false
+            }
+        }
+        return ManifestValue(MANIFEST_VALUE_BAD, index)
+    }
+    if (first == 123) {
+        var index = manifestSkip(line, at + 1)
+        var seen = ""
+        var expectKey = true
+        while (index < line.size) {
+            if (line[index] == 125 && !expectKey) return ManifestValue(MANIFEST_VALUE_INLINE_TABLE, index + 1)
+            if (!expectKey) {
+                if (line[index] != 44) return ManifestValue(MANIFEST_VALUE_BAD, index)
+                index = manifestSkip(line, index + 1)
+                expectKey = true
+            } else {
+                val keyEnd = manifestBareEnd(line, index)
+                if (keyEnd < 0) return ManifestValue(MANIFEST_VALUE_BAD, index)
+                val key = line.slice(index, keyEnd)
+                if (!(key == "git" || key == "rev" || key == "tag" || key == "branch") || seen.contains(",$key,")) return ManifestValue(MANIFEST_VALUE_BAD, index)
+                seen = "$seen,$key,"
+                index = manifestSkip(line, keyEnd)
+                if (index >= line.size || line[index] != 61) return ManifestValue(MANIFEST_VALUE_BAD, index)
+                index = manifestSkip(line, index + 1)
+                val end = manifestStringEnd(line, index)
+                if (end < 0) return ManifestValue(MANIFEST_VALUE_BAD, index)
+                index = manifestSkip(line, end)
+                expectKey = false
+            }
+        }
+        return ManifestValue(MANIFEST_VALUE_BAD, index)
+    }
+    // An integer, or true or false.
+    var index = at
+    if (line[index] == 45) index = index + 1
+    val digits = index
+    while (index < line.size && line[index] >= 48 && line[index] <= 57) index = index + 1
+    if (index > digits) return ManifestValue(MANIFEST_VALUE_SCALAR, index)
+    if (line.slice(at, line.size).startsWith("true")) return ManifestValue(MANIFEST_VALUE_SCALAR, at + 4)
+    if (line.slice(at, line.size).startsWith("false")) return ManifestValue(MANIFEST_VALUE_SCALAR, at + 5)
+    ManifestValue(MANIFEST_VALUE_BAD, at)
+}
+
+/** The end (after the closing bracket) of the array of basic strings that starts with the `[` at `at` in `text`, which may go over several lines and hold whole-line or after-comma
+ *  comments (a list the readers read, as in compileCapabilities = [ "a", # why / "b", ]), or -1 when it is anything else: an item that is not a string without escapes, two items
+ *  without a comma between them, a control character, a bare carriage return, no closing bracket. */
+private fun manifestArrayEnd(text: string, at: int): int {
+    var index = at + 1
+    var expectItem = true
+    while (index < text.size) {
+        val byte = text[index]
+        if (byte == 32 || byte == 9 || byte == 10) {
+            index = index + 1
+        } else if (byte == 13) {
+            if (index + 1 >= text.size || text[index + 1] != 10) return -1
+            index = index + 1
+        } else if (byte == 35) {
+            while (index < text.size && text[index] != 10) {
+                if (text[index] == 13 && (index + 1 >= text.size || text[index + 1] != 10)) return -1
+                if (text[index] == 0 || text[index] < 32 && text[index] != 9 && text[index] != 13 || text[index] == 127) return -1
+                index = index + 1
+            }
+        } else if (byte == 93) {
+            return index + 1
+        } else if (byte == 44) {
+            if (expectItem) return -1
+            expectItem = true
+            index = index + 1
+        } else {
+            if (!expectItem) return -1
+            val end = manifestStringEnd(text, index)
+            if (end < 0) return -1
+            expectItem = false
+            index = end
+        }
+    }
+    -1
+}
+
+private fun manifestKnownKey(key: string): bool =
+    key == "name" || key == "version" || key == "entry" || key == "visibility" || key == "compileCapabilities" || key == "wasmHostImports" || key == "nativeLibraries"
+
+private fun manifestListKey(key: string): bool = key == "compileCapabilities" || key == "wasmHostImports" || key == "nativeLibraries"
+
+private fun manifestLockKey(key: string): bool =
+    key == "name" || key == "provider" || key == "identity" || key == "source" || key == "selector-kind" || key == "selector" || key == "revision" || key == "digest" || key == "entry"
+
+/** "" when `text` is a manifest (or, with `lock`, a lock) the readers read exactly as written, else the first line that is not, as "line N: why". */
+fun bootstrapManifestGrammarProblem(text: string, lock: bool): string {
+    if (text.size >= 3 && text[0] == 239 && text[1] == 187 && text[2] == 191) return "line 1: a byte order mark"
+    var table = ""
+    var kind = "root"
+    var known = ","
+    var recordKeys = ","
+    var inRecord = false
+    var names = ","
+    var number = 0
+    var begin = 0
+    while (begin < text.size) {
+        number = number + 1
+        var end = begin
+        while (end < text.size && text[end] != 10) end = end + 1
+        var contentEnd = end
+        if (contentEnd > begin && text[contentEnd - 1] == 13) contentEnd = contentEnd - 1
+        val line = text.slice(begin, contentEnd)
+        val lineStart = begin
+        begin = end + 1
+        var index = 0
+        while (index < line.size) {
+            if (line[index] == 13) return "line $number: a carriage return that does not end the line"
+            if (line[index] == 0 || line[index] < 32 && line[index] != 9 || line[index] == 127) return "line $number: a control character"
+            index = index + 1
+        }
+        val start = manifestSkip(line, 0)
+        if (start >= line.size || line[start] == 35) continue
+        var stop = line.size
+        while (stop > start && manifestBlank(line[stop - 1])) stop = stop - 1
+        val trimmed = line.slice(start, stop)
+        if (trimmed[0] == 91) {
+            if (lock) {
+                if (trimmed != "[[package]]") return "line $number: a lock holds only [[package]] records"
+                inRecord = true
+                recordKeys = ","
+                continue
+            }
+            if (trimmed.startsWith("[[")) return "line $number: an array of tables"
+            if (trimmed.size < 3 || trimmed[trimmed.size - 1] != 93) return "line $number: a table header must be a bare [name]"
+            val name = trimmed.slice(1, trimmed.size - 1)
+            var good = true
+            for (b in name) if (!(manifestBareChar(b) || b == 46)) good = false
+            if (!good) return "line $number: a table header must be a bare [name]"
+            if (names.contains(",$name,")) return "line $number: the table [$name] a second time"
+            names = "$names$name,"
+            table = name
+            kind = if (name == "project" || name == "package") "identity" else if (name == "dependencies") "dependencies" else if (name == "exports") "exports" else if (name == "imports") "imports" else if (name == "dependencyCompileCapabilities") "grants" else "other"
+            continue
+        }
+        // key = value
+        var quotedKey = false
+        var key = ""
+        var after = 0
+        if (trimmed[0] == 34) {
+            val keyEnd = manifestStringEnd(trimmed, 0)
+            if (keyEnd < 0) return "line $number: a quoted key with a backslash, or without its closing quote"
+            quotedKey = true
+            key = trimmed.slice(1, keyEnd - 1)
+            after = keyEnd
+        } else {
+            val keyEnd = manifestBareEnd(trimmed, 0)
+            if (keyEnd < 0) return "line $number: not a comment, a table header or key = value"
+            key = trimmed.slice(0, keyEnd)
+            after = keyEnd
+        }
+        after = manifestSkip(trimmed, after)
+        if (after >= trimmed.size || trimmed[after] != 61) return "line $number: not a comment, a table header or key = value"
+        after = manifestSkip(trimmed, after + 1)
+        var value = manifestValue(trimmed, after)
+        if (!lock && !quotedKey && manifestListKey(key) && (kind == "root" || kind == "identity") && after < trimmed.size && trimmed[after] == 91) {
+            // A list the readers read may go over several lines, with comments.
+            val absolute = lineStart + start + after
+            val arrayEnd = manifestArrayEnd(text, absolute)
+            if (arrayEnd < 0) return "line $number: the array is not strings without escapes, separated by commas, with nothing but comments between"
+            var lineEnd = arrayEnd
+            while (lineEnd < text.size && text[lineEnd] != 10) {
+                if (!manifestBlank(text[lineEnd]) && text[lineEnd] != 13) return "line $number: something after the array"
+                lineEnd = lineEnd + 1
+            }
+            var scan = absolute
+            while (scan < arrayEnd) {
+                if (text[scan] == 10) number = number + 1
+                scan = scan + 1
+            }
+            begin = lineEnd + 1
+            value = ManifestValue(MANIFEST_VALUE_ARRAY, trimmed.size)
+        }
+        if (value.kind == MANIFEST_VALUE_BAD) return "line $number: the value is not a string without escapes, an array of them, an integer or a boolean on one line"
+        if (manifestSkip(trimmed, value.end) != trimmed.size) return "line $number: something after the value (a trailing comment is not read)"
+        if (lock) {
+            if (!inRecord) {
+                if (key != "version" || value.kind != MANIFEST_VALUE_SCALAR || quotedKey) return "line $number: before the first [[package]] only version = <integer>"
+                continue
+            }
+            if (quotedKey || !manifestLockKey(key)) return "line $number: '$key' is not a key of a lock record"
+            if (value.kind != MANIFEST_VALUE_STRING) return "line $number: '$key' is a string"
+            if (recordKeys.contains(",$key,")) return "line $number: '$key' a second time in the record"
+            recordKeys = "$recordKeys$key,"
+            continue
+        }
+        if (kind == "exports" || kind == "imports") {
+            if (!quotedKey || value.kind != MANIFEST_VALUE_STRING) return "line $number: [$table] holds \"name\" = \"target\" pairs"
+            if (names.contains("\x01$table:$key\x01")) return "line $number: '$key' a second time in [$table]"
+            names = "$names\x01$table:$key\x01"
+            continue
+        }
+        if (quotedKey) return "line $number: a quoted key outside [exports] and [imports]"
+        if (kind == "dependencies") {
+            if (value.kind != MANIFEST_VALUE_INLINE_TABLE) return "line $number: a dependency is name = { git = \"...\", rev = \"...\" }"
+            if (names.contains("\x01dependencies:$key\x01")) return "line $number: the dependency '$key' a second time"
+            names = "$names\x01dependencies:$key\x01"
+            continue
+        }
+        if (kind == "grants") {
+            if (value.kind != MANIFEST_VALUE_ARRAY) return "line $number: [dependencyCompileCapabilities] holds name = [\"capability\", ...]"
+            if (names.contains("\x01grants:$key\x01")) return "line $number: '$key' a second time in [dependencyCompileCapabilities]"
+            names = "$names\x01grants:$key\x01"
+            continue
+        }
+        if (manifestKnownKey(key)) {
+            if (kind != "root" && kind != "identity") return "line $number: '$key' is read from the top of the file, [project] or [package], not from [$table]"
+            if (manifestListKey(key) != (value.kind == MANIFEST_VALUE_ARRAY) || (!manifestListKey(key) && value.kind != MANIFEST_VALUE_STRING)) return "line $number: '$key' has the wrong kind of value"
+            if (known.contains(",$key,")) return "line $number: '$key' a second time"
+            known = "$known$key,"
+        } else if (value.kind == MANIFEST_VALUE_INLINE_TABLE) {
+            return "line $number: an inline table is only a dependency's value"
+        }
+    }
+    ""
+}
