@@ -128,7 +128,6 @@ if [[ -e $out ]]; then
     rm -rf -- "$out"
 fi
 mkdir -p -- "$out"
-: >"$out/.release-check"
 
 # Collect the artifacts in one flat directory.
 if [[ -n $artifacts ]]; then
@@ -258,6 +257,8 @@ if [[ -f $out/SHA256SUMS || -f $out/SHA256SUMS.sig ]]; then
 else
     report SKIP signature "unsigned before publish (the publish job signs SHA256SUMS)"
 fi
+# Verify all collected files before adding the marker that lets a later run reuse --out.
+[[ -f $out/.release-check ]] || : >"$out/.release-check"
 
 # 3. version: the Linux binary prints the tag's version.
 linux=$out/ablac-x86_64-linux

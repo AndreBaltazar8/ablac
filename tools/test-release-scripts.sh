@@ -79,8 +79,7 @@ done
 grep -q '^RESULT: PASS' <<<"$output" || fail "no RESULT: PASS"
 grep -q '^SKIP  signature' <<<"$output" || { echo "$output" >&2; fail "an unsigned run's artifacts: no SKIP for the signature check"; }
 grep -q 'tools/sign-release.sh' <<<"$output" || fail "a passing unsigned release names no next step (sign it)"
-# A directory signed by a key that is not release-signing.pub fails the signature check (a locally signed one with the
-# project key passes: tools/test-release-signing.sh covers the signer, the verifier is the same code).
+# A directory signed by a key that is not release-signing.pub fails the signature check.
 ssh-keygen -q -t ed25519 -N '' -C stranger -f "$work/stranger" >/dev/null
 signed_dir=$work/signed-by-stranger
 cp -r "$release" "$signed_dir"
@@ -432,5 +431,16 @@ expect_fail "a binary changed after signing" "$pin" v9.9.9 --dir "$work/signed-r
 signed_release
 "$pin" v9.9.9 --dir "$work/signed-release" --root "$signed_root" >"$work/out.txt" 2>&1 || { cat "$work/out.txt" >&2; fail "release-pin refused a good signed release"; }
 grep -q '^version=v9.9.9$' "$signed_root/tools/bootstrap-compiler.sh" || fail "the signed release was not pinned"
+
+# release-check flattens the same signed artifacts and creates its own output marker.
+cp "$check" "$convergence" "$signed_root/tools/"
+output=$(check="$signed_root/tools/release-check.sh" run_check "$work/signed-release" v9.9.9 "$stage2" \
+    --out "$work/signed-check-out") || { echo "$output" >&2; fail "release-check refused a good signed release"; }
+grep -q '^PASS  signature' <<<"$output" || { echo "$output" >&2; fail "no PASS line for the signature"; }
+[[ -f $work/signed-check-out/.release-check ]] || fail "release-check did not mark its output directory"
+printf 'extra\n' >"$work/signed-release/.unlisted"
+check="$signed_root/tools/release-check.sh" expect_fail "a signed release containing an unlisted file" \
+    run_check "$work/signed-release" v9.9.9 "$stage2" --out "$work/signed-check-out"
+grep -q '^FAIL  signature.*\.unlisted is not listed' "$work/out.txt" || fail "signature check did not reject the unlisted file"
 
 echo "release scripts: a good release is accepted; a doctored sha256, a changed asset, a missing or extra asset, a wrong version and another stage 2 are refused; a pin moves the version and three sha256s and refuses a bad .sha256"
