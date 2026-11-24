@@ -74,6 +74,55 @@ if $self; then
 fi
 
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
+
+# A private class in a standard-library module initially carries the absolute
+# module path. Relocating the stdlib must preserve both the runtime descriptor
+# and the type check, without losing the module's identity.
+cp -a "$project_root/stdlib" "$one/stdlib"
+module=stdlib/abla/repro-private
+mkdir -p "$one/$module"
+cat > "$one/$module/entry.ab" <<'ABLA'
+interface ReproValue {
+    fun number(): int
+}
+
+private class ReproMarker(val value: int) : ReproValue {
+    fun number(): int = this.value
+}
+
+private class ReproOther : ReproValue {
+    fun number(): int = 0
+}
+
+@noinline
+fun reproValue(which: bool): ReproValue =
+    if (which) ReproMarker(42) else ReproOther()
+
+@noinline
+fun reproPrivateClass(value: ReproValue): int = when (value) {
+    is ReproMarker -> value.number()
+    else -> 0
+}
+ABLA
+cat > "$one/private.ab" <<'ABLA'
+import "abla/repro-private"
+
+fun main: int =
+    if (reproPrivateClass(reproValue(false)) == 0) reproPrivateClass(reproValue(true)) else 1
+ABLA
+cp -a "$one/stdlib" "$two/stdlib"
+cp "$one/private.ab" "$two/private.ab"
+for directory in "$one" "$two"; do
+    ABLA_STDLIB="$directory/stdlib" build "$directory" 1 UTC C "$compiler" \
+        build private.ab -o private-program --fast --no-cache
+done
+cmp "$one/private-program" "$two/private-program" ||
+    fail "a private stdlib class changes the binary when the stdlib moves"
+status=0
+"$one/private-program" || status=$?
+[[ $status -eq 42 ]] || fail "the private class type check program exits with $status"
+echo 'reproducible build: the private class and its type check agree across absolute stdlib paths'
+
 # Each function's own arithmetic keeps LLVM from folding them into one another.
 generate() {
     # Unused boxed wrappers are omitted and discarded joins aren't boxed; keep
