@@ -343,6 +343,7 @@ private trusted fun __ablaRuntimeWindowsOpenFd(handle: int, kind: int, extra: in
             ablaRuntimeStoreI64(entry + 24, 0)
             ablaRuntimeStoreI64(entry + 32, 0)
             ablaRuntimeStoreI64(entry + 40, 0)
+            ablaRuntimeStoreI64(entry + 48, 0)
             return fd
         }
         fd = fd + 1
@@ -471,6 +472,10 @@ private trusted fun __ablaRuntimeWindowsReadLink(path: int, buffer: int, size: i
     val offset = if (printLength > 0) ablaRuntimeLoadU8(data + 12) + ablaRuntimeLoadU8(data + 13) * 256
         else ablaRuntimeLoadU8(data + 8) + ablaRuntimeLoadU8(data + 9) * 256
     val length = if (printLength > 0) printLength else ablaRuntimeLoadU8(data + 10) + ablaRuntimeLoadU8(data + 11) * 256
+    // The offset and the length come from the link's own data (a crafted volume says what it likes): the name must lie inside the bytes
+    // the call returned, which it filled, not past them (an offset and a length of 65535 each read up to 128 KiB past the buffer).
+    val returnedBytes = ablaRuntimeLoadI32(returned) & 4294967295
+    if (returnedBytes > 16384 || 20 + offset + length > returnedBytes) return -5
     // as UTF-8 in the first half, which the path no longer needs
     val text = __ablaRuntimeWindowsPathBuffer()
     val bytes = if (length > 0) WideCharToMultiByte(65001, 0, data + 20 + offset, length / 2, text, 65536, 0, 0) else 0
@@ -734,15 +739,19 @@ private trusted fun __ablaRuntimeWindowsOpenWide(wide: int, flags: int, anchored
         return -20
     }
     var extra = 0
+    var dataOffset = 0
     if (kind == 2) {
-        // a page for the pattern (the path and "\*") and the find data
-        extra = VirtualAlloc(0, 4096, 12288, 4)
+        // a page for the pattern (the path and "\*") and the find data, which follows the pattern at the next 16 bytes (its offset is word 6 of the
+        // entry): the page holds the whole path, which may be up to 32767 characters (before, a fixed 4096 bytes took one of more than 2040
+        // characters past its end: a write of the path's bytes into whatever followed, an access violation at the page's end under Wine)
+        var length = 0
+        while (ablaRuntimeLoadU8(wide + length) != 0 || ablaRuntimeLoadU8(wide + length + 1) != 0) length = length + 2
+        dataOffset = ((length + 8 + 15) / 16) * 16
+        extra = VirtualAlloc(0, dataOffset + 1024, 12288, 4)
         if (extra == 0) {
             CloseHandle(handle)
             return -12
         }
-        var length = 0
-        while (ablaRuntimeLoadU8(wide + length) != 0 || ablaRuntimeLoadU8(wide + length + 1) != 0) length = length + 2
         var copy = 0
         while (copy < length) {
             ablaRuntimeStoreU8(extra + copy, ablaRuntimeLoadU8(wide + copy))
@@ -762,7 +771,7 @@ private trusted fun __ablaRuntimeWindowsOpenWide(wide: int, flags: int, anchored
     if (fd < 0) {
         CloseHandle(handle)
         if (extra != 0) VirtualFree(extra, 0, 32768)
-    }
+    } else if (kind == 2) ablaRuntimeStoreI64(__ablaRuntimeWindowsFds() + fd * 64 + 48, dataOffset)
     fd
 }
 
@@ -774,17 +783,20 @@ private trusted fun __ablaRuntimeWindowsClose(fd: int): int {
     val entry = table + fd * 64
     val handle = ablaRuntimeAtomicLoadI64(entry)
     if (handle == 0) return -9
-    if (ablaRuntimeLoadI64(entry + 8) == 2) {
-        val search = ablaRuntimeLoadI64(entry + 24)
+    // What the entry holds is read first, and the descriptor then claimed by one compare-and-exchange of its handle word: of two threads that
+    // close the same descriptor at once only one gets past it (the other is EBADF, as on Linux). Before, both closed the handle: the second
+    // CloseHandle could land on a handle another thread had been given the same value in the meantime.
+    val kind = ablaRuntimeLoadI64(entry + 8)
+    val search = ablaRuntimeLoadI64(entry + 24)
+    val page = ablaRuntimeLoadI64(entry + 16)
+    if (ablaRuntimeAtomicCompareExchangeI64(entry, handle, 0) != handle) return -9
+    if (kind == 2) {
         if (search != 0 && search != -1) FindClose(search)
-        val page = ablaRuntimeLoadI64(entry + 16)
         if (page != 0) VirtualFree(page, 0, 32768)
     }
-    if (ablaRuntimeLoadI64(entry + 8) == 4) {
-        val registry = ablaRuntimeLoadI64(entry + 16)
-        if (registry != 0) VirtualFree(registry, 0, 32768)
-    } else if (ablaRuntimeLoadI64(entry + 8) == 3) closesocket(handle) else CloseHandle(handle)
-    ablaRuntimeAtomicStoreI64(entry, 0)
+    if (kind == 4) {
+        if (page != 0) VirtualFree(page, 0, 32768)
+    } else if (kind == 3) closesocket(handle) else CloseHandle(handle)
     0
 }
 
@@ -796,7 +808,7 @@ private trusted fun __ablaRuntimeWindowsDirectoryEntries(fd: int, buffer: int, c
     val entry = table + fd * 64
     if (ablaRuntimeLoadI64(entry + 8) != 2) return -20
     val page = ablaRuntimeLoadI64(entry + 16)
-    val data = page + 2048
+    val data = page + ablaRuntimeLoadI64(entry + 48)
     var written = 0
     var more = true
     while (more) {
@@ -1181,7 +1193,8 @@ private trusted fun __ablaRuntimeWindowsSocketTimeout(set: bool, socket: int, op
         val seconds = ablaRuntimeLoadI64(value)
         val microseconds = ablaRuntimeLoadI64(value + 8)
         if (seconds < 0 || microseconds < 0 || microseconds >= 1000000) return -33
-        var milliseconds = seconds * 1000 + microseconds / 1000
+        // (a number of seconds that would overflow the product is the longest wait there is, not a wrapped one)
+        var milliseconds = if (seconds > 4294967) 4294967294 else seconds * 1000 + microseconds / 1000
         // under a millisecond is a millisecond, not for ever; past a DWORD, the longest wait there is
         if (milliseconds == 0 && microseconds > 0) milliseconds = 1
         if (milliseconds > 4294967294) milliseconds = 4294967294
@@ -1210,7 +1223,9 @@ private trusted fun __ablaRuntimeWindowsPoll(fds: int, count: int, timeout: int)
     var index = 0
     while (index < count) {
         val entry = fds + index * 8
-        val fd = ablaRuntimeLoadI32(entry)
+        // (a 32-bit field: -1 is read as 4294967295)
+        var fd = ablaRuntimeLoadI32(entry) & 4294967295
+        if (fd >= 2147483648) fd = fd - 4294967296
         val events = ablaRuntimeLoadU8(entry + 4) + ablaRuntimeLoadU8(entry + 5) * 256
         val socket = __ablaRuntimeWindowsSocketOf(fd)
         if (socket != 0) {
@@ -1228,8 +1243,9 @@ private trusted fun __ablaRuntimeWindowsPoll(fds: int, count: int, timeout: int)
             ablaRuntimeStoreU8(entry + 6, 0)
             ablaRuntimeStoreU8(entry + 7, 0)
         } else {
-            // a file or a standard stream: ready for what was asked (input, output)
-            val answer = events & 5
+            // a file or a standard stream: ready for what was asked (input, output); a negative descriptor is ignored, as Linux ignores it (its
+            // revents is 0 and it is not counted: the callers use -1 for an entry to skip)
+            val answer = if (fd < 0) 0 else events & 5
             ablaRuntimeStoreU8(entry + 6, answer)
             ablaRuntimeStoreU8(entry + 7, 0)
             if (answer != 0) ready = ready + 1
@@ -1836,8 +1852,9 @@ private trusted fun __ablaRuntimeWindowsProcessEntry(pid: int): int {
 
 // Appends the C string at `argument` to the UTF-8 command line at `out` + `at` as one argument by the rules of CommandLineToArgvW
 // (quoted when it is empty or has a space, tab or quote; the backslashes before a quote doubled, and one more for the quote);
-// the new length.
-private trusted fun __ablaRuntimeWindowsQuoteArgument(argument: int, out: int, at: int): int {
+// the new length, or -1 when the command line would pass `capacity` bytes (nothing is stored past it: an argument of a few megabytes
+// was written past the 2 MiB the spawn keeps for it, and the length was checked afterwards).
+private trusted fun __ablaRuntimeWindowsQuoteArgument(argument: int, out: int, at: int, capacity: int): int {
     var length = 0
     var plain = true
     while (ablaRuntimeLoadU8(argument + length) != 0) {
@@ -1848,6 +1865,7 @@ private trusted fun __ablaRuntimeWindowsQuoteArgument(argument: int, out: int, a
     if (length == 0) plain = false
     var position = at
     if (plain) {
+        if (position + length > capacity) return -1
         var copy = 0
         while (copy < length) {
             ablaRuntimeStoreU8(out + position, ablaRuntimeLoadU8(argument + copy))
@@ -1856,6 +1874,7 @@ private trusted fun __ablaRuntimeWindowsQuoteArgument(argument: int, out: int, a
         }
         return position
     }
+    if (position >= capacity) return -1
     ablaRuntimeStoreU8(out + position, 34)
     position = position + 1
     var index = 0
@@ -1868,6 +1887,7 @@ private trusted fun __ablaRuntimeWindowsQuoteArgument(argument: int, out: int, a
         var emit = slashes
         if (index == length) emit = slashes * 2
         else if (ablaRuntimeLoadU8(argument + index) == 34) emit = slashes * 2 + 1
+        if (position + emit + 2 > capacity) return -1
         while (emit > 0) {
             ablaRuntimeStoreU8(out + position, 92)
             position = position + 1
@@ -1879,8 +1899,140 @@ private trusted fun __ablaRuntimeWindowsQuoteArgument(argument: int, out: int, a
             index = index + 1
         }
     }
+    if (position >= capacity) return -1
     ablaRuntimeStoreU8(out + position, 34)
     position + 1
+}
+
+// True when the program named by the C string at `name` is a batch file: it ends in .bat or .cmd, ignoring case, after the spaces and dots
+// Windows drops from the end of a name ("x.bat." and "x.BAT " are batch files too).
+private trusted fun __ablaRuntimeWindowsIsBatch(name: int): bool {
+    var end = 0
+    while (ablaRuntimeLoadU8(name + end) != 0) end = end + 1
+    while (end > 0 && (ablaRuntimeLoadU8(name + end - 1) == 32 || ablaRuntimeLoadU8(name + end - 1) == 46)) end = end - 1
+    if (end < 4 || ablaRuntimeLoadU8(name + end - 4) != 46) return false
+    val first = ablaRuntimeLoadU8(name + end - 3) | 32
+    val second = ablaRuntimeLoadU8(name + end - 2) | 32
+    val third = ablaRuntimeLoadU8(name + end - 1) | 32
+    (first == 98 && second == 97 && third == 116) || (first == 99 && second == 109 && third == 100)
+}
+
+// True when the argument at `argument` has a character cmd.exe reads as more than text: a quote, a percent sign, ^ & | < > ( ) !, or a line
+// break. A batch file's command line goes through cmd.exe, which splits it by rules of its own, not by CommandLineToArgvW's, so that
+// the quoting of __ablaRuntimeWindowsQuoteArgument does not keep such an argument one argument: `a" & echo x` ran `echo x`.
+private trusted fun __ablaRuntimeWindowsBatchUnsafe(argument: int): bool {
+    var at = 0
+    var byte = ablaRuntimeLoadU8(argument)
+    while (byte != 0) {
+        if (byte == 34 || byte == 37 || byte == 94 || byte == 38 || byte == 124 || byte == 60 || byte == 62 || byte == 40 || byte == 41 ||
+            byte == 33 || byte == 13 || byte == 10) return true
+        at = at + 1
+        byte = ablaRuntimeLoadU8(argument + at)
+    }
+    false
+}
+
+// A UTF-16 unit at `at` (bytes) of the buffer `wide`.
+private trusted fun __ablaRuntimeWindowsStoreWide(wide: int, at: int, unit: int): void {
+    ablaRuntimeStoreU8(wide + at, unit & 255)
+    ablaRuntimeStoreU8(wide + at + 1, unit / 256)
+    return
+}
+
+// The unit at `at` (bytes) of `wide`.
+private trusted fun __ablaRuntimeWindowsLoadWide(wide: int, at: int): int = ablaRuntimeLoadU8(wide + at) + ablaRuntimeLoadU8(wide + at + 1) * 256
+
+// Tries the file `name` (`nameUnits` UTF-16 units at `nameWide`; ".exe" added when `!hasDot`) in the directory of `directoryUnits` units read from `source` at
+// byte `sourceAt`: the path made in `out`, true when it is a file that exists.
+private trusted fun __ablaRuntimeWindowsCandidate(out: int, source: int, sourceAt: int, directoryUnits: int, nameWide: int, nameUnits: int, hasDot: bool): bool {
+    if (directoryUnits <= 0 || directoryUnits >= 8000) return false
+    var copy = 0
+    while (copy < directoryUnits) {
+        __ablaRuntimeWindowsStoreWide(out, copy * 2, __ablaRuntimeWindowsLoadWide(source, sourceAt + copy * 2))
+        copy = copy + 1
+    }
+    var units = directoryUnits
+    val last = __ablaRuntimeWindowsLoadWide(out, (units - 1) * 2)
+    if (last != 92 && last != 47) {
+        __ablaRuntimeWindowsStoreWide(out, units * 2, 92)
+        units = units + 1
+    }
+    copy = 0
+    while (copy < nameUnits) {
+        __ablaRuntimeWindowsStoreWide(out, units * 2, __ablaRuntimeWindowsLoadWide(nameWide, copy * 2))
+        units = units + 1
+        copy = copy + 1
+    }
+    if (!hasDot) {
+        __ablaRuntimeWindowsStoreWide(out, units * 2, 46)
+        __ablaRuntimeWindowsStoreWide(out, units * 2 + 2, 101)
+        __ablaRuntimeWindowsStoreWide(out, units * 2 + 4, 120)
+        __ablaRuntimeWindowsStoreWide(out, units * 2 + 6, 101)
+        units = units + 4
+    }
+    __ablaRuntimeWindowsStoreWide(out, units * 2, 0)
+    val attributes = GetFileAttributesW(out) & 4294967295
+    attributes != 4294967295 && (attributes & 16) == 0
+}
+
+// The file the program `name` (a C string with no separator and no colon) names, as the UTF-16 path in `out` (64 KiB: the path in the first 32 KiB, the name
+// after it, the running program's own path in the last 16), or 0 when there is none. It is looked for where CreateProcessW looks first and last, and not in
+// between: the directory the running program was loaded from (the compiler's toolchain lies beside it: `lld-link`), then the directories PATH lists, in
+// order, as execvp reads them. Not the current directory, which CreateProcessW tries before PATH: a program found there is whatever the working directory
+// holds (a checkout built in CI could carry a git.exe). A name with no extension is tried with ".exe", as CreateProcessW does.
+private trusted fun __ablaRuntimeWindowsSearchPath(name: int, out: int): int {
+    val nameWide = out + 32768
+    val nameUnits = MultiByteToWideChar(65001, 0, name, -1, nameWide, 4000) - 1
+    if (nameUnits <= 0) return 0
+    var hasDot = false
+    var position = 0
+    while (position < nameUnits) {
+        if (__ablaRuntimeWindowsLoadWide(nameWide, position * 2) == 46) hasDot = true
+        position = position + 1
+    }
+    // the directory of the running program
+    val module = out + 49152
+    val moduleUnits = GetModuleFileNameW(0, module, 8000)
+    if (moduleUnits > 0 && moduleUnits < 8000) {
+        var end = moduleUnits
+        while (end > 0 && __ablaRuntimeWindowsLoadWide(module, (end - 1) * 2) != 92 && __ablaRuntimeWindowsLoadWide(module, (end - 1) * 2) != 47) end = end - 1
+        if (__ablaRuntimeWindowsCandidate(out, module, 0, end, nameWide, nameUnits, hasDot)) return out
+    }
+    val environment = GetEnvironmentStringsW()
+    if (environment == 0) return 0
+    var found = 0
+    var at = 0
+    var scanning = true
+    while (scanning && found == 0) {
+        if (__ablaRuntimeWindowsLoadWide(environment, at) == 0) {
+            scanning = false
+        } else {
+            // the entry: PATH= in any case, then the value
+            var length = 0
+            while (__ablaRuntimeWindowsLoadWide(environment, at + length * 2) != 0) length = length + 1
+            if (length >= 5 && (__ablaRuntimeWindowsLoadWide(environment, at) | 32) == 112 && (__ablaRuntimeWindowsLoadWide(environment, at + 2) | 32) == 97 &&
+                (__ablaRuntimeWindowsLoadWide(environment, at + 4) | 32) == 116 && (__ablaRuntimeWindowsLoadWide(environment, at + 6) | 32) == 104 &&
+                __ablaRuntimeWindowsLoadWide(environment, at + 8) == 61) {
+                var index = 5
+                while (index <= length && found == 0) {
+                    // a directory: up to the next ';', without the quotes around it
+                    var begin = index
+                    while (index < length && __ablaRuntimeWindowsLoadWide(environment, at + index * 2) != 59) index = index + 1
+                    var end = index
+                    if (end - begin >= 2 && __ablaRuntimeWindowsLoadWide(environment, at + begin * 2) == 34 &&
+                        __ablaRuntimeWindowsLoadWide(environment, at + (end - 1) * 2) == 34) {
+                        begin = begin + 1
+                        end = end - 1
+                    }
+                    if (__ablaRuntimeWindowsCandidate(out, environment, at + begin * 2, end - begin, nameWide, nameUnits, hasDot)) found = out
+                    index = index + 1
+                }
+            }
+            at = at + (length + 1) * 2
+        }
+    }
+    FreeEnvironmentStringsW(environment)
+    found
 }
 
 // The handle for one standard stream of the child: the file at `path` opened with the access and disposition (inheritable), else the
@@ -1915,7 +2067,8 @@ private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
     if (argv == 0 || ablaRuntimeLoadI64(argv) == 0) return -22
     // 2 MiB of scratch: UTF-8 command (256 KiB), UTF-16 command (256 KiB), UTF-8 environment (512 KiB), UTF-16 environment (1 MiB), and
     // the STARTUPINFOW, PROCESS_INFORMATION and SECURITY_ATTRIBUTES.
-    val region = VirtualAlloc(0, 2101248, 12288, 4)
+    // (and 64 KiB after them for the program's own path when it is searched for)
+    val region = VirtualAlloc(0, 2166784, 12288, 4)
     if (region == 0) return -12
     val commandBytes = region
     val commandWide = region + 262144
@@ -1924,6 +2077,8 @@ private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
     val startup = region + 2097152
     val information = startup + 128
     val security = startup + 160
+    val applicationWide = region + 2101248
+    var program = 0
     var length = 0
     var index = 0
     while (ablaRuntimeLoadI64(argv + index * 8) != 0) {
@@ -1938,12 +2093,41 @@ private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
             VirtualFree(region, 0, 32768)
             return -2
         }
-        length = __ablaRuntimeWindowsQuoteArgument(named, commandBytes, length)
-        if (length > 250000) {
+        if (index == 0) program = named
+        length = __ablaRuntimeWindowsQuoteArgument(named, commandBytes, length, 250000)
+        if (length < 0) {
             VirtualFree(region, 0, 32768)
             return -7
         }
         index = index + 1
+    }
+    // The program: a name with no separator is looked for in the directories of PATH only, never in the current directory (CreateProcessW's own search
+    // would try it first); the file found is what runs. A batch file is run by cmd.exe, which does not split a command line as the quoting above does:
+    // none is started with an argument it would read as more than text (BatBadBut: `a" & echo x` ran `echo x`).
+    var application = 0
+    var hasSeparator = false
+    var scan = 0
+    while (ablaRuntimeLoadU8(program + scan) != 0) {
+        val byte = ablaRuntimeLoadU8(program + scan)
+        if (byte == 47 || byte == 92 || byte == 58) hasSeparator = true
+        scan = scan + 1
+    }
+    if (!hasSeparator) {
+        application = __ablaRuntimeWindowsSearchPath(program, applicationWide)
+        if (application == 0) {
+            VirtualFree(region, 0, 32768)
+            return -2
+        }
+    }
+    if (__ablaRuntimeWindowsIsBatch(program)) {
+        var checked = 1
+        while (ablaRuntimeLoadI64(argv + checked * 8) != 0) {
+            if (__ablaRuntimeWindowsBatchUnsafe(ablaRuntimeLoadI64(argv + checked * 8))) {
+                VirtualFree(region, 0, 32768)
+                return -22
+            }
+            checked = checked + 1
+        }
     }
     ablaRuntimeStoreU8(commandBytes + length, 0)
     if (MultiByteToWideChar(65001, 0, commandBytes, length + 1, commandWide, 131072) <= 0) {
@@ -2019,7 +2203,7 @@ private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
     ablaRuntimeStoreI64(startup + 88, output)
     ablaRuntimeStoreI64(startup + 96, error)
     // CREATE_UNICODE_ENVIRONMENT, and its own process group so that a group-wide kill reaches only it
-    val created = CreateProcessW(0, commandWide, 0, 0, 1, 1024 + 512, environment, directoryWide, startup, information)
+    val created = CreateProcessW(application, commandWide, 0, 0, 1, 1024 + 512, environment, directoryWide, startup, information)
     val failure = if (created != 0) 0 else __ablaRuntimeWindowsErrno()
     // the handles the child inherited are the parent's no more: opened files closed, descriptor handles private again
     if (inputPath != 0 && input > 0) CloseHandle(input)

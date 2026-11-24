@@ -251,6 +251,13 @@ prints under Wine with the Linux run, and
 reports, the system calls the compiler makes and the compiler's image against
 a stub LLVM.
 
+Starting a program on Windows is one `CreateProcessW` call (the runtime's system call 4001), with these rules, each tested by
+[spawn-safety.ab](../tests/cases/windows/spawn-safety.ab): a name with no separator is looked for in the directory the running program was loaded from
+(the compiler's toolchain lies beside it) and then in the directories `PATH` lists, never in the current directory, which `CreateProcessW`'s own search
+tries between the two; a command line over 250,000 bytes is refused (E2BIG) before anything is written; and a batch file (`.bat` or `.cmd`) is not started
+with an argument that has a quote, `%`, `^`, `&`, `|`, `<`, `>`, `(`, `)`, `!` or a line break (EINVAL), because `cmd.exe` splits its command line by rules
+the argument quoting does not follow. Pass such an argument through a file or the environment instead, or start the program the batch file wraps.
+
 [Windows x64 toolchain smoke](../.github/workflows/windows-x64-ci.yml) runs
 nightly on master and can be started manually from the Actions run list.
 It calls the same [Windows x64 toolchain workflow](../.github/workflows/windows-x64-toolchain.yml)

@@ -1,0 +1,53 @@
+// What a hosted Windows program starts: (1) a command line too long for the room the spawn keeps for it is refused, as Linux's execve refuses a vector
+// of megabytes (E2BIG), and the argument's bytes were written past the 2 MiB of the region before the length was looked at (a crash at three
+// megabytes); (2) a batch file is not started with an argument cmd.exe would read as more than text (`a" & echo x` ran `echo x`); (3) a name
+// with no separator is looked for beside the running program and in the directories of PATH, not in the working directory (CreateProcessW tries it between
+// the two: a git.exe in a checkout ran in place of the one on PATH; the Windows runner shows it, Wine does not search the directory). Each prints what the same program prints on Linux, where the batch file and the copy of this program in
+// the working directory are not started either.
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/command"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+fun isWindows(): bool = linuxHostIsWindows()
+
+fun main: int {
+    if (linuxArgumentCount() > 0 && linuxArgument(0) == "child") {
+        println("CHILD RAN")
+        return 0
+    }
+    // (1)
+    val big = "x".repeat(3000000)
+    val status = if (isWindows()) command("cmd").argument("/c").argument("exit 0 $big").run() else command("sh").argument("-c").argument("exit 0 $big").run()
+    println("long argument refused: ${status != 0}")
+    // (2)
+    path("spawn-safety.bat").writeText("@echo off\r\necho got:%1\r\n")
+    val batch = command("./spawn-safety.bat").argument("a\" & echo INJECTED").captureText()
+    println("batch argument injected: ${batch.contains("INJECTED")}")
+    // (3) a copy of this program in the working directory, which is not on PATH: CreateProcessW tries the working directory right after the program's own
+    // directory, so the copy ran by its bare name (on a Windows runner; Wine does not search the working directory). The program's own directory is searched
+    // still (the compiler's toolchain lies beside it: `lld-link`).
+    val image = linuxReadFile("/proc/self/exe", 67108864)
+    val tool = if (isWindows()) "spawn-safety-tool.exe" else "spawn-safety-tool"
+    path(tool).writeText(image)
+    val found = command("spawn-safety-tool").argument("child").captureText()
+    println("program in the working directory ran: ${found.contains("CHILD RAN")}")
+    // and a copy beside this program, which is where the compiler's own toolchain lies: Windows starts it by its bare name (on Linux nothing beside the program is on PATH)
+    val link = nativeByteBuffer(4096)
+    val linkLength = linuxSyscall3(89, nativeCStringAddress("/proc/self/exe"), nativePointerAddress(link.address), 4096)
+    val imagePath = link.adoptString(if (linkLength > 0) linkLength else 0)
+    var slash = imagePath.size
+    while (slash > 0 && imagePath[slash - 1] != 47) slash = slash - 1
+    val beside = imagePath.slice(0, slash) + tool
+    path(beside).writeText(image)
+    val nearby = command("spawn-safety-tool").argument("child").captureText()
+    println("program beside this one found as Windows finds it: ${nearby.contains("CHILD RAN") == isWindows()}")
+    path(beside).remove()
+    path("spawn-safety.bat").remove()
+    path(tool).remove()
+    42
+}
