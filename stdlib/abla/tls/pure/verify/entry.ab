@@ -133,18 +133,32 @@ fun tlsChainVerdictAlert(kind: int): int {
  *  expired or not yet valid one, unsupported_certificate for a key or signature algorithm it cannot use, else
  *  bad_certificate). */
 fun tlsVerifyServerCertificate(chain: array<string>, host: string, scheme: int, content: string,
-    signature: string, store: X509TrustStore, now: int, allowAnyHost: bool = false): TlsVerdict {
+    signature: string, store: X509TrustStore, now: int, allowAnyHost: bool = false): TlsVerdict =
+    tlsVerifyServerCertificateKeepingPath(chain, host, scheme, content, signature, store, now, allowAnyHost).verdict
+
+/** A verdict with the path the chain verifier found (null when the chain did not verify). */
+class TlsPathVerdict(val verdict: TlsVerdict, val path: TlsVerifiedPath?)
+
+/** A chain and the path the chain verifier found for it. */
+class TlsVerifiedPath(val chain: array<string>, val path: array<X509Certificate>)
+
+/** Where a handshake's chain verifier leaves the path it verified, for the staple verifier of the same handshake (tlsX509RevocationVerifiers): that uses the path for the same chain and verifies afresh otherwise. */
+// (a TVar<TlsVerifiedPath?> holds it: a closure that changes captured state is not a plain function value)
+
+/** tlsVerifyServerCertificate that also returns the path it verified. */
+fun tlsVerifyServerCertificateKeepingPath(chain: array<string>, host: string, scheme: int, content: string,
+    signature: string, store: X509TrustStore, now: int, allowAnyHost: bool = false): TlsPathVerdict {
     // An empty host name would turn the name check off (abla/crypto/x509 reads "" as "no name to check"): refused
     // unless the caller says it wants a certificate for any name.
     if (host == "" && !allowAnyHost) {
-        return tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: no host name to verify the certificate for")
+        return TlsPathVerdict(tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: no host name to verify the certificate for"), null)
     }
     val verification = x509Verify(chain, store, X509Options(host, now))
     if (!verification.ok) {
-        return tlsRefused(tlsChainVerdictAlert(verification.kind), "certificate: ${verification.error}")
+        return TlsPathVerdict(tlsRefused(tlsChainVerdictAlert(verification.kind), "certificate: ${verification.error}"), null)
     }
-    if (verification.path.size == 0) return tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: no path")
-    tlsCheckSignature(verification.path[0], scheme, content, signature)
+    if (verification.path.size == 0) return TlsPathVerdict(tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: no path"), null)
+    TlsPathVerdict(tlsCheckSignature(verification.path[0], scheme, content, signature), TlsVerifiedPath(chain, verification.path))
 }
 
 /** The verification of a client's certificate chain for a server (extended key usage clientAuth), as
@@ -192,10 +206,26 @@ fun tlsX509Scope(store: X509TrustStore): string {
  *  OCSP_POLICY_REQUIRE of abla/crypto/ocsp; see ocspCheckPath). A revoked certificate answers certificate_revoked, any other refusal bad_certificate_status_response (a must-staple
  *  certificate without a staple: bad_certificate). */
 fun tlsOcspVerifier(store: X509TrustStore, host: string, now: () -> int, policy: int): (array<string>, array<string>) -> TlsVerdict =
-    tlsOcspVerifierLazy({ store }, host, now, policy)
+    tlsOcspVerifierLazy({ store }, host, now, policy, null)
+
+/** The two verifiers of a client that checks staples, made together (and as tlsX509VerifierLazy and tlsOcspVerifierLazy would be made apart): the chain verifier leaves the path it verified, and the staple verifier of the
+ *  same handshake uses it, so the chain's signatures are checked once. `verifier` is for TlsClientConfig.verifier, `stapleVerifier` for tlsClientConfigWithRevocation. */
+class TlsRevocationVerifiers(val verifier: (array<string>, string, int, string, string) -> TlsVerdict, val stapleVerifier: (array<string>, array<string>) -> TlsVerdict)
+
+fun tlsX509RevocationVerifiers(storeOf: () -> X509TrustStore, host: string, now: () -> int, policy: int): TlsRevocationVerifiers {
+    val cell = TVar<TlsVerifiedPath?>(null)
+    TlsRevocationVerifiers(tlsX509VerifierRecording(storeOf, now, cell), tlsOcspVerifierLazy(storeOf, host, now, policy, cell))
+}
+
+private fun tlsX509VerifierRecording(storeOf: () -> X509TrustStore, now: () -> int, cell: TVar<TlsVerifiedPath?>): (array<string>, string, int, string, string) -> TlsVerdict =
+    { chain: array<string>, host: string, scheme: int, content: string, signature: string ->
+        val result = tlsVerifyServerCertificateKeepingPath(chain, host, scheme, content, signature, storeOf(), now())
+        atomic { cell.setValue(result.path) }
+        result.verdict
+    }
 
 /** tlsOcspVerifier with the trust store read when the staples arrive (the system store is parsed only then, as tlsX509VerifierLazy does). */
-fun tlsOcspVerifierLazy(storeOf: () -> X509TrustStore, host: string, now: () -> int, policy: int): (array<string>, array<string>) -> TlsVerdict =
+fun tlsOcspVerifierLazy(storeOf: () -> X509TrustStore, host: string, now: () -> int, policy: int, shared: TVar<TlsVerifiedPath?>? = null): (array<string>, array<string>) -> TlsVerdict =
     { chain: array<string>, statuses: array<string> ->
         val moment = now()
         var stapled = false
@@ -209,7 +239,10 @@ fun tlsOcspVerifierLazy(storeOf: () -> X509TrustStore, host: string, now: () -> 
                 else tlsStapleVerdict(ocspCheckPath([leaf, leaf], [""], policy, moment))
             }
         } else {
-            val verification = x509Verify(chain, storeOf(), X509Options(host, moment))
+            // The path the chain verifier found for this chain in this handshake (shared), else a verification of its own.
+            val known = if (shared == null) null else atomic { shared.getValue() }
+            val reused = known != null && known.chain == chain
+            val verification = if (known != null && reused) X509Verification(true, "", known.path) else x509Verify(chain, storeOf(), X509Options(host, moment))
             if (!verification.ok) {
                 tlsRefused(tlsChainVerdictAlert(verification.kind), "certificate: ${verification.error}")
             } else {

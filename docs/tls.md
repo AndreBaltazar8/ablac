@@ -136,7 +136,7 @@ A server that staples a stale or wrong response, which a client without the chec
 To opt out, or to require a staple, build the configuration: `TlsClientConfig.revocation` is the policy (1 staple, 2 require, 0 off: no `status_request`, a staple is not looked at, as in v0.2.69), and
 `tlsClientConfigWithRevocation(config, policy, tlsOcspVerifier(store, host, now, policy))` sets it with its verifier (`tlsOcspVerifierLazy` takes the store when the staples arrive). The setting takes effect only with a staple
 verifier: a configuration made by hand with its own `verifier` has none and checks nothing until it is given one. The hosted (OpenSSL) client, which a program built for a platform with its own TLS library uses, has no revocation
-setting: the default covers the pure client only. The ClientHello is 9 bytes longer (the extension). A handshake with a server that sends no staple costs nothing measurable; one that staples costs about 0.6 ms more (a second path build and the response's signature check: 1.9 to 2.5 ms in a release build, one core, local server).
+setting: the default covers the pure client only. The ClientHello is 9 bytes longer (the extension). A handshake with a server that sends no staple costs nothing measurable; one that staples costs about 0.4 ms more (the response's signature check and parse: 1.7 to 2.1 ms in a release build, one core, local server).
 
 How it works. The ClientHello offers `status_request`; a server that staples an OCSP response (TLS 1.3: in the Certificate entry; TLS 1.2: a CertificateStatus message the
 ServerHello promised) has it judged by `abla/crypto/ocsp` after the chain and the signature have verified: the response must be for that certificate, signed by its issuer or by a
