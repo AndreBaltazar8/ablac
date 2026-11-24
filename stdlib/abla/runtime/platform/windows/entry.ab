@@ -176,6 +176,12 @@ trusted noescape extern:"c" fun GetCurrentThreadStackLimits(low: int, high: int)
 /** kernel32 GetModuleFileNameW: stores the path of a module's file (module 0: the process's executable) as UTF-16, terminated; returns the characters written without the terminator, `size` when the path was cut, 0 on failure. */
 trusted noescape extern:"c" fun GetModuleFileNameW(module: int, path: int, size: int): int
 /** kernel32 CreatePipe: makes an anonymous pipe, storing its read and write handles; returns non-zero on success. */
+/** kernel32 InitializeProcThreadAttributeList: prepares an attribute list for `count` attributes in the buffer at `list` (null: only the size in bytes it needs is stored at `size`); returns non-zero on success. */
+trusted noescape extern:"c" fun InitializeProcThreadAttributeList(list: int, count: int, flags: int, size: int): int
+/** kernel32 UpdateProcThreadAttribute: adds the attribute (0x20002 is the list of handles a child inherits) with `size` bytes at `value` to a list; returns non-zero on success. */
+trusted noescape extern:"c" fun UpdateProcThreadAttribute(list: int, flags: int, attribute: int, value: int, size: int, previous: int, returned: int): int
+/** kernel32 DeleteProcThreadAttributeList: releases an attribute list InitializeProcThreadAttributeList prepared. */
+trusted noescape extern:"c" fun DeleteProcThreadAttributeList(list: int): void
 trusted noescape extern:"c" fun CreatePipe(readHandle: int, writeHandle: int, security: int, size: int): int
 
 /** kernel32 WaitForSingleObject: waits up to milliseconds (0xFFFFFFFF: for ever) for an object to be signalled; returns 0 when it is, 258 on timeout. */
@@ -601,6 +607,49 @@ private trusted fun __ablaRuntimeWindowsStatPath(wide: int, output: int, link: b
 // its final path is the directory's and the name (a directory swapped in on the way leads elsewhere: ELOOP). A directory that is held is opened with no delete
 // sharing, so it cannot be renamed or replaced meanwhile. A name is one component: no separator, no ':' (a stream), not "." or "..".
 
+// True when the C string at `name` is a DOS device name: CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM1-9 or LPT1-9, in any case, alone or before a dot
+// (and trailing spaces): "nul", "Aux.txt", "com1 .log". Windows opens the device for any of these, in any directory.
+private trusted fun __ablaRuntimeWindowsDeviceName(name: int): bool {
+    var end = 0
+    while (ablaRuntimeLoadU8(name + end) != 0 && ablaRuntimeLoadU8(name + end) != 46) end = end + 1
+    while (end > 0 && ablaRuntimeLoadU8(name + end - 1) == 32) end = end - 1
+    if (end == 3 || end == 4) {
+        val a = ablaRuntimeLoadU8(name) | 32
+        val b = ablaRuntimeLoadU8(name + 1) | 32
+        val c = ablaRuntimeLoadU8(name + 2) | 32
+        if (end == 3) {
+            if (a == 99 && b == 111 && c == 110) return true
+            if (a == 112 && b == 114 && c == 110) return true
+            if (a == 97 && b == 117 && c == 120) return true
+            if (a == 110 && b == 117 && c == 108) return true
+        }
+        if (end == 4) {
+            val digit = ablaRuntimeLoadU8(name + 3)
+            if (digit >= 49 && digit <= 57) {
+                if (a == 99 && b == 111 && c == 109) return true
+                if (a == 108 && b == 112 && c == 116) return true
+            }
+        }
+    }
+    // CONIN$ and CONOUT$
+    if (end == 6 && __ablaRuntimeWindowsNameStarts(name, "conin$")) return true
+    if (end == 7 && __ablaRuntimeWindowsNameStarts(name, "conout$")) return true
+    false
+}
+
+// True when the C string at `name` begins with `lower`, ignoring case (the letters; a '$' stands for itself).
+private trusted fun __ablaRuntimeWindowsNameStarts(name: int, lower: string): bool {
+    var at = 0
+    while (at < lower.size) {
+        val byte = ablaRuntimeLoadU8(name + at)
+        if (lower[at] == 36) {
+            if (byte != 36) return false
+        } else if ((byte | 32) != lower[at]) return false
+        at = at + 1
+    }
+    true
+}
+
 // The thread's path buffer, in 16 KiB parts: the directory's final path (0); the joined path, the directory's and the name (`at`: 16384, or 49152 for a second one); the path checked (32768).
 private trusted fun __ablaRuntimeWindowsAnchoredWide(directoryFd: int, name: int, at: int): int {
     val handle = __ablaRuntimeWindowsHandle(directoryFd)
@@ -615,6 +664,9 @@ private trusted fun __ablaRuntimeWindowsAnchoredWide(directoryFd: int, name: int
     }
     if (index == 1 && ablaRuntimeLoadU8(name) == 46) return -22
     if (index == 2 && ablaRuntimeLoadU8(name) == 46 && ablaRuntimeLoadU8(name + 1) == 46) return -22
+    // A name Windows reads as another: with a trailing space or dot ("a." is "a"), or a DOS device (CON, NUL, COM1, "aux.txt": the device, whatever follows its dot)
+    if (ablaRuntimeLoadU8(name + index - 1) == 32 || ablaRuntimeLoadU8(name + index - 1) == 46) return -22
+    if (__ablaRuntimeWindowsDeviceName(name)) return -22
     val buffer = __ablaRuntimeWindowsPathBuffer()
     if (buffer == 0) return -12
     val directory = buffer
@@ -2052,6 +2104,18 @@ private trusted fun __ablaRuntimeWindowsChildStream(path: int, fd: int, which: i
     handle
 }
 
+// Adds `handle` to the array of the handles a child inherits, at `count` entries, unless it is none (0 or -1) or already there; the new count.
+private trusted fun __ablaRuntimeWindowsAddInherited(array: int, count: int, handle: int): int {
+    if (handle == 0 || handle == -1) return count
+    var index = 0
+    while (index < count) {
+        if (ablaRuntimeLoadI64(array + index * 8) == handle) return count
+        index = index + 1
+    }
+    ablaRuntimeStoreI64(array + count * 8, handle)
+    count + 1
+}
+
 // The Windows-only system call 4001: starts the process the eight-word block describes; the process id or -errno.
 private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
     // a null block is how the standard library asks whether this is Windows: EINVAL (every other target answers ENOSYS)
@@ -2067,8 +2131,8 @@ private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
     if (argv == 0 || ablaRuntimeLoadI64(argv) == 0) return -22
     // 2 MiB of scratch: UTF-8 command (256 KiB), UTF-16 command (256 KiB), UTF-8 environment (512 KiB), UTF-16 environment (1 MiB), and
     // the STARTUPINFOW, PROCESS_INFORMATION and SECURITY_ATTRIBUTES.
-    // (and 64 KiB after them for the program's own path when it is searched for)
-    val region = VirtualAlloc(0, 2166784, 12288, 4)
+    // (64 KiB after them for the program's own path when it is searched for, and 4 KiB for the attribute list and the handles the child inherits)
+    val region = VirtualAlloc(0, 2170880, 12288, 4)
     if (region == 0) return -12
     val commandBytes = region
     val commandWide = region + 262144
@@ -2078,6 +2142,8 @@ private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
     val information = startup + 128
     val security = startup + 160
     val applicationWide = region + 2101248
+    val attributeList = region + 2166784
+    val inheritedHandles = attributeList + 512
     var program = 0
     var length = 0
     var index = 0
@@ -2202,9 +2268,41 @@ private trusted fun __ablaRuntimeWindowsSpawn(block: int): int {
     ablaRuntimeStoreI64(startup + 80, input)
     ablaRuntimeStoreI64(startup + 88, output)
     ablaRuntimeStoreI64(startup + 96, error)
-    // CREATE_UNICODE_ENVIRONMENT, and its own process group so that a group-wide kill reaches only it
-    val created = CreateProcessW(application, commandWide, 0, 0, 1, 1024 + 512, environment, directoryWide, startup, information)
-    val failure = if (created != 0) 0 else __ablaRuntimeWindowsErrno()
+    // The child inherits its three standard streams and nothing else (PROC_THREAD_ATTRIBUTE_HANDLE_LIST): CreateProcessW with handle inheritance on
+    // gave it every inheritable handle of the process, so a socket or file another thread had made inheritable (or this call, for its own streams)
+    // for a moment of its own spawn went to a child it was not meant for. Each handle once (the list refuses a repeat).
+    var inheritedCount = 0
+    inheritedCount = __ablaRuntimeWindowsAddInherited(inheritedHandles, inheritedCount, input)
+    inheritedCount = __ablaRuntimeWindowsAddInherited(inheritedHandles, inheritedCount, output)
+    inheritedCount = __ablaRuntimeWindowsAddInherited(inheritedHandles, inheritedCount, error)
+    var created = 0
+    var failure = 0
+    var creationFlags = 1024 + 512
+    var inherit = 0
+    var prepared = inheritedCount == 0
+    if (inheritedCount > 0) {
+        val sizeCell = __ablaRuntimeWindowsScratch()
+        ablaRuntimeStoreI64(sizeCell, 0)
+        InitializeProcThreadAttributeList(0, 1, 0, sizeCell)
+        val needed = ablaRuntimeLoadI64(sizeCell)
+        if (needed > 0 && needed <= 400 && InitializeProcThreadAttributeList(attributeList, 1, 0, sizeCell) != 0) {
+            if (UpdateProcThreadAttribute(attributeList, 0, 131074, inheritedHandles, inheritedCount * 8, 0, 0) != 0) {
+                prepared = true
+                inherit = 1
+                // EXTENDED_STARTUPINFO_PRESENT: STARTUPINFOEXW's size (112) and its attribute list
+                creationFlags = creationFlags + 524288
+                ablaRuntimeStoreI32(startup, 112)
+                ablaRuntimeStoreI64(startup + 104, attributeList)
+            } else DeleteProcThreadAttributeList(attributeList)
+        }
+    }
+    // (a list that could not be made fails the spawn: the fallback of inheriting everything is the leak)
+    if (prepared) {
+        // CREATE_UNICODE_ENVIRONMENT, and its own process group so that a group-wide kill reaches only it
+        created = CreateProcessW(application, commandWide, 0, 0, inherit, creationFlags, environment, directoryWide, startup, information)
+        failure = if (created != 0) 0 else __ablaRuntimeWindowsErrno()
+        if (inherit == 1) DeleteProcThreadAttributeList(attributeList)
+    } else failure = -12
     // the handles the child inherited are the parent's no more: opened files closed, descriptor handles private again
     if (inputPath != 0 && input > 0) CloseHandle(input)
     if (outputPath != 0 && output > 0) CloseHandle(output)
