@@ -31,13 +31,16 @@ compile "$out/wasm-build.ab" -o "$out/wasm-builder" --fast --no-cache
 "$out/wasm-builder"
 node --input-type=module - "$out/primitives.wasm" <<'JS'
 import {readFileSync} from 'node:fs';
+import {randomFillSync} from 'node:crypto';
 const module=new WebAssembly.Module(readFileSync(process.argv[2]));
 for (const item of WebAssembly.Module.imports(module)) {
-    if(item.module!=="abla_host"||!["write","exit"].includes(item.name)||item.kind!=="function")
+    if(item.module!=="abla_host"||!["write","exit","random"].includes(item.name)||item.kind!=="function")
         throw new Error(`unexpected import ${JSON.stringify(item)}`);
 }
 const panic=()=>{throw new Error("unexpected Wasm panic/host I/O");};
-const instance=new WebAssembly.Instance(module,{abla_host:{write:panic,exit:panic}});
+let instance;
+const random=(pointer,count)=>{randomFillSync(new Uint8Array(instance.exports.memory.buffer,pointer,count));return count;};
+instance=new WebAssembly.Instance(module,{abla_host:{write:panic,exit:panic,random}});
 const value=instance.exports.check();
 if(value!==0&&value!==0n) throw new Error(`PBE Wasm ${value}`);
 JS
@@ -60,13 +63,16 @@ compile "$out/reader-wasm-build.ab" -o "$out/reader-wasm-builder" --fast --no-ca
 "$out/reader-wasm-builder"
 node --input-type=module - "$out/reader.wasm" <<'JS'
 import {readFileSync} from 'node:fs';
+import {randomFillSync} from 'node:crypto';
 const module=new WebAssembly.Module(readFileSync(process.argv[2]));
 for (const item of WebAssembly.Module.imports(module)) {
-    if(item.module!=="abla_host"||!["write","exit"].includes(item.name)||item.kind!=="function")
+    if(item.module!=="abla_host"||!["write","exit","random"].includes(item.name)||item.kind!=="function")
         throw new Error(`unexpected import ${JSON.stringify(item)}`);
 }
 const panic=()=>{throw new Error("unexpected Wasm panic/host I/O");};
-const instance=new WebAssembly.Instance(module,{abla_host:{write:panic,exit:panic}});
+let instance;
+const random=(pointer,count)=>{randomFillSync(new Uint8Array(instance.exports.memory.buffer,pointer,count));return count;};
+instance=new WebAssembly.Instance(module,{abla_host:{write:panic,exit:panic,random}});
 const value=instance.exports.check();
 if(value!==0&&value!==0n) throw new Error(`PKCS12 reader Wasm ${value}`);
 JS

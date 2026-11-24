@@ -37,6 +37,7 @@ openssl rsa -in tests/vectors/crypto/rsa-implicit-key.pem -text -noout > "$out/k
 
 node --input-type=module - "$out/main.wasm" "$out/key.txt" <<'JS'
 import {readFileSync} from 'node:fs';
+import {randomFillSync} from 'node:crypto';
 const module = new WebAssembly.Module(readFileSync(process.argv[2]));
 const text = readFileSync(process.argv[3], 'utf8');
 const integer = name => {
@@ -70,7 +71,9 @@ const count = (memory, needle) => {
 };
 const panic = () => { throw new Error('unexpected Wasm panic or host I/O'); };
 const scan = which => {
-    const instance = new WebAssembly.Instance(module, {abla_host: {write: panic, exit: panic}});
+    let instance;
+    const random = (pointer, count) => { randomFillSync(new Uint8Array(instance.exports.memory.buffer, pointer, count)); return count; };
+    instance = new WebAssembly.Instance(module, {abla_host: {write: panic, exit: panic, random}});
     const memory = () => Buffer.from(instance.exports.memory.buffer);
     const before = needles.map(([, needle]) => count(memory(), needle));
     const status = Number(instance.exports.run(BigInt(which)));
