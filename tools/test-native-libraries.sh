@@ -43,7 +43,8 @@ for invalid_project in native-library-malformed native-library-duplicate; do
         printf '%s unexpectedly built\n' "$invalid_project" >&2
         exit 1
     fi
-    rg -q 'error\[E_NATIVE_LIBRARY_MANIFEST\]' \
+    # A manifest the grammar of src/manifest_grammar.ab refuses (the unterminated list) never reaches the native library reader: E_PACKAGE_MANIFEST names its line.
+    rg -q 'error\[E_(NATIVE_LIBRARY|PACKAGE)_MANIFEST\]' \
         "$output_directory/$invalid_project.log"
 done
 

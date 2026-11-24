@@ -1,4 +1,5 @@
 import "abla/sys/linux/fs"
+import "manifest_grammar.ab"
 import "abla/sys/linux/process"
 import "eval.ab"
 import "module_paths.ab"
@@ -508,7 +509,10 @@ fun bootstrapPackageManifestDependencies(
     manifestPath: string
 ): BootstrapPackageDependencies {
     val dependencies: array<BootstrapPackageDependency> = []
-    val source = Path(manifestPath).readText()
+    // A manifest outside the grammar of src/manifest_grammar.ab is refused here, so every caller reports it (its other readers see an empty file).
+    val grammar = bootstrapManifestProblem(manifestPath, false)
+    if (grammar != "") return BootstrapPackageDependencies(dependencies, 1, grammar)
+    val source = bootstrapManifestText(manifestPath, false)
     var errors = 0
     var diagnostic = ""
     var inDependencies = false
@@ -635,8 +639,9 @@ fun bootstrapPackageAppendLockRecord(
 
 fun bootstrapPackageReadLock(lockPath: string): BootstrapPackageLock {
     val packages: array<BootstrapLockedPackage> = []
-    val text = Path(lockPath).readText()
-    var valid = Path(lockPath).exists()
+    val text = bootstrapManifestText(lockPath, true)
+    val grammar = bootstrapManifestProblem(lockPath, true)
+    var valid = Path(lockPath).exists() && grammar == ""
     var diagnostic = ""
     var name = ""
     var provider = ""
@@ -701,6 +706,8 @@ fun bootstrapPackageReadLock(lockPath: string): BootstrapPackageLock {
     if (!Path(lockPath).exists()) {
         diagnostic =
             "error[E_PACKAGE_LOCK_MISSING]: dependencies require checked-in lockfile $lockPath; run 'ablac package update --project ${Path(lockPath).parent().text}'\n"
+    } else if (grammar != "") {
+        diagnostic = grammar
     } else if (!valid) {
         diagnostic = "error[E_PACKAGE_LOCK_INVALID]: invalid package lockfile $lockPath\n"
     }
@@ -1142,6 +1149,15 @@ fun bootstrapPackageFetch(
         if (bootstrapPackageGitValue("$temporary/source", "HEAD") != revision) status = 1
         else digest = bootstrapPackageGitValue("$temporary/source", "HEAD^{tree}")
     }
+    // A dependency's abla.toml outside the grammar of src/manifest_grammar.ab is refused before it is cached or locked.
+    if (status == 0 && Path("$temporary/source/abla.toml").exists()) {
+        val grammar = bootstrapManifestGrammarProblem(Path("$temporary/source/abla.toml").readText(), false)
+        if (grammar != "") {
+            status = 1
+            diagnostic =
+                "error[E_PACKAGE_MANIFEST]: dependency '${dependency.name}', revision '$revision': its abla.toml, $grammar (the compiler reads only the lines of abla.toml it understands: one-line values, no multi-line strings, escapes or trailing comments, the known keys at the top, once)\n"
+        }
+    }
     // The checkout must be the revision's tree: on a file system that folds case or Unicode forms, two paths that
     // differ only so collapse to one file, and the digest (the tree's) would then name files the build never reads.
     if (status == 0) {
@@ -1267,7 +1283,7 @@ fun bootstrapPackagePublishContent(
 }
 
 fun bootstrapPackageManifestString(manifestPath: string, key: string): string {
-    val source = Path(manifestPath).readText()
+    val source = bootstrapManifestText(manifestPath, false)
     var result = ""
     var lineBegin = 0
     while (lineBegin < source.size && result == "") {
@@ -1289,7 +1305,7 @@ fun bootstrapPackageManifestStringArray(
     key: string
 ): array<string> {
     val values: array<string> = []
-    val source = Path(manifestPath).readText()
+    val source = bootstrapManifestText(manifestPath, false)
     var cursor = -1
     var lineBegin = 0
     while (lineBegin < source.size && cursor < 0) {
@@ -1466,7 +1482,7 @@ class BootstrapPackageExports(
 fun bootstrapPackageReadExports(manifestPath: string): BootstrapPackageExports {
     val names: array<string> = []
     val targets: array<string> = []
-    val source = Path(manifestPath).readText()
+    val source = bootstrapManifestText(manifestPath, false)
     var found = false
     var inExports = false
     var begin = 0
