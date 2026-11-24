@@ -11,6 +11,7 @@ import "abla/sys/linux"
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
 import "abla/unsafe/memory"
+import "abla/unsafe/native"
 import "abla/unsafe/memory/raw"
 
 // The calling thread's last error, as a code in thread-local storage (like
@@ -86,7 +87,12 @@ private trusted fun tlsAllocateConnection(
     ablaUnsafeStoreI64(
         ablaUnsafePointerOffset(control, 24), if (ownsContext) 1 else 0
     )
-    nativePointerAddress(control)
+    val handle = nativePointerAddress(control)
+    if (!tlsLiveAdd(handle, 32)) {
+        ablaUnsafeFree(control)
+        return -1
+    }
+    handle
 }
 
 // Returns a native listener control handle containing the TLS context and socket descriptor.
@@ -94,21 +100,120 @@ private trusted fun tlsAllocateListener(context: i64*, descriptor: int): int {
     val control = ablaUnsafeAllocate(16)
     ablaUnsafeStorePointer(control, context)
     ablaUnsafeStoreI64(ablaUnsafePointerOffset(control, 8), descriptor)
-    nativePointerAddress(control)
+    val handle = nativePointerAddress(control)
+    if (!tlsLiveAdd(handle, 16)) {
+        ablaUnsafeFree(control)
+        return -1
+    }
+    handle
 }
 
 // Returns the native control pointer represented by a valid handle.
 private trusted fun tlsControl(handle: int): i64* = nativePointerFromAddress(handle)
 
-// Returns the pointer stored at a valid byte offset within the handle's control block.
-// Takes a handle the hosted TLS layer returned; passing anything else is undefined: not a safe API (tools/test-trusted-raw-addresses.sh).
-trusted fun tlsControlPointer(handle: int, offset: int): i64* =
+// The handles this layer has made and not closed, with the size of each control block (32 for a connection, 16 for a listener), so that the public calls
+// below tell a handle of theirs from anything else. The layer's own calls go to the unchecked ones, which are on every read and write. The table is open
+// addressing in static storage, guarded by a spin lock held for a few instructions: a lock word, then SLOTS slots of the handle (0 empty, 1 removed) and the size.
+private val TLS_LIVE_SLOTS = 262144
+private fun tlsLiveBase(): int = nativeStaticAllocate(8 + 262144 * 16)
+
+private trusted fun tlsLiveLock(): void {
+    while (nativeAtomicCompareExchangeU32(tlsLiveBase(), u32(0), u32(1)) != u32(0)) {
+    }
+}
+
+private trusted fun tlsLiveUnlock(): void {
+    nativeAtomicCompareExchangeU32(tlsLiveBase(), u32(1), u32(0))
+    return
+}
+
+private fun tlsLiveSlot(handle: int, step: int): int = (((handle >> 4) ^ (handle >> 22)) + step) & (TLS_LIVE_SLOTS - 1)
+
+private trusted fun tlsLiveKey(slot: int): int = ablaUnsafeLoadI64(nativePointerFromAddress(tlsLiveBase() + 8 + slot * 16))
+private trusted fun tlsLiveInfo(slot: int): int = ablaUnsafeLoadI64(nativePointerFromAddress(tlsLiveBase() + 16 + slot * 16))
+private trusted fun tlsLiveSet(slot: int, key: int, info: int): void {
+    ablaUnsafeStoreI64(nativePointerFromAddress(tlsLiveBase() + 8 + slot * 16), key)
+    ablaUnsafeStoreI64(nativePointerFromAddress(tlsLiveBase() + 16 + slot * 16), info)
+}
+
+// Records a new handle; false when the table has no room (a quarter of a million live connections).
+private trusted fun tlsLiveAdd(handle: int, size: int): bool {
+    var added = false
+    tlsLiveLock()
+    var step = 0
+    while (step < TLS_LIVE_SLOTS && !added) {
+        val slot = tlsLiveSlot(handle, step)
+        val key = tlsLiveKey(slot)
+        if (key == 0 || key == 1) {
+            tlsLiveSet(slot, handle, size)
+            added = true
+        }
+        step = step + 1
+    }
+    tlsLiveUnlock()
+    added
+}
+
+// The size of the control block of a live handle, 0 for one that is not.
+private trusted fun tlsLiveSize(handle: int): int {
+    var size = 0
+    tlsLiveLock()
+    var step = 0
+    var done = false
+    while (step < TLS_LIVE_SLOTS && !done) {
+        val slot = tlsLiveSlot(handle, step)
+        val key = tlsLiveKey(slot)
+        if (key == handle) {
+            size = tlsLiveInfo(slot)
+            done = true
+        } else if (key == 0) done = true
+        step = step + 1
+    }
+    tlsLiveUnlock()
+    size
+}
+
+// Forgets a live handle of that size; false when there was none.
+private trusted fun tlsLiveRemove(handle: int, size: int): bool {
+    var removed = false
+    tlsLiveLock()
+    var step = 0
+    var done = false
+    while (step < TLS_LIVE_SLOTS && !done) {
+        val slot = tlsLiveSlot(handle, step)
+        val key = tlsLiveKey(slot)
+        if (key == handle) {
+            if (tlsLiveInfo(slot) == size) {
+                tlsLiveSet(slot, 1, 0)
+                removed = true
+            }
+            done = true
+        } else if (key == 0) done = true
+        step = step + 1
+    }
+    tlsLiveUnlock()
+    removed
+}
+
+private trusted fun tlsControlPointerUnchecked(handle: int, offset: int): i64* =
     ablaUnsafeLoadPointer(ablaUnsafePointerOffset(tlsControl(handle), offset))
 
-// Returns the integer stored at a valid byte offset within the handle's control block.
-// Takes a handle the hosted TLS layer returned; passing anything else is undefined: not a safe API (tools/test-trusted-raw-addresses.sh).
-trusted fun tlsControlInt(handle: int, offset: int): int =
+private trusted fun tlsControlWordUnchecked(handle: int, offset: int): int =
     ablaUnsafeLoadI64(ablaUnsafePointerOffset(tlsControl(handle), offset))
+
+/// The pointer stored at `offset` (a multiple of 8 inside the control block) of a handle this layer returned, or a null pointer for any other handle, a closed one, or an offset outside the block.
+trusted fun tlsControlPointer(handle: int, offset: int): i64* {
+    val size = tlsLiveSize(handle)
+    if (size == 0 || offset < 0 || offset % 8 != 0 || offset + 8 > size) return nativeNullPointer()
+    tlsControlPointerUnchecked(handle, offset)
+}
+
+/// The integer stored at `offset` (a multiple of 8 inside the control block) of a handle this layer returned, or -1 for any other handle, a closed one, or an offset outside the block.
+trusted fun tlsControlInt(handle: int, offset: int): int {
+    val size = tlsLiveSize(handle)
+    if (size == 0 || offset < 0 || offset % 8 != 0 || offset + 8 > size) return -1
+    tlsControlWordUnchecked(handle, offset)
+}
 
 // Handles hold a native control pointer, not a socket descriptor. Android's
 // tagged heap pointers may be negative; only -1 denotes a failed/closed handle.
@@ -595,7 +700,7 @@ trusted fun TlsConnection.setTimeouts(
     readMilliseconds: int,
     writeMilliseconds: int
 ): bool = this.handle != -1 && linuxSocketSetTimeouts(
-    tlsControlInt(this.handle, 16), readMilliseconds, writeMilliseconds
+    tlsControlWordUnchecked(this.handle, 16), readMilliseconds, writeMilliseconds
 )
 
 // A server context owns the loaded certificate and key. On failure no context
@@ -703,7 +808,7 @@ fun tlsListen(
 
 // Returns the bound listener port, or -1 if the listener is closed or the lookup fails.
 trusted fun TlsListener.localPort(): int = if (this.handle != -1) {
-    var listener = TcpListener(tlsControlInt(this.handle, 8))
+    var listener = TcpListener(tlsControlWordUnchecked(this.handle, 8))
     val port = listener.localPort()
     listener.descriptor = -1
     port
@@ -717,9 +822,9 @@ trusted fun TlsListener.accept(
 ): TlsConnection {
     var handle = -1
     if (this.handle != -1) {
-        val context = tlsControlPointer(this.handle, 0)
+        val context = tlsControlPointerUnchecked(this.handle, 0)
         val descriptor = linuxTcpAcceptDescriptor(
-            tlsControlInt(this.handle, 8)
+            tlsControlWordUnchecked(this.handle, 8)
         )
         handle = hostedTlsServerAccept(context, descriptor,
             handshakeTimeoutMilliseconds, readWriteTimeoutMilliseconds)
@@ -848,10 +953,10 @@ trusted fun TlsConnection.read(maximum: int = 65536): string {
     var result = ""
     if (this.handle != -1 && maximum > 0 && maximum <= 16777216) {
         val buffer = nativeByteBuffer(maximum + 1)
-        val session = tlsControlPointer(this.handle, 8)
+        val session = tlsControlPointerUnchecked(this.handle, 8)
         ERR_clear_error()
         val held = linuxBrokenPipeHold()
-        val wait = HostedTlsWait(tlsControlInt(this.handle, 16))
+        val wait = HostedTlsWait(tlsControlWordUnchecked(this.handle, 16))
         var measured: int = SSL_read(session, buffer.address, maximum)
         while (measured <= 0 && hostedTlsInterrupted(wait, session, measured)) {
             measured = SSL_read(session, buffer.address, maximum)
@@ -874,10 +979,10 @@ trusted fun TlsConnection.write(contents: string): int {
     while (writing && offset < contents.size) {
         var length = contents.size - offset
         if (length > 2147483647) length = 2147483647
-        val session = tlsControlPointer(this.handle, 8)
+        val session = tlsControlPointerUnchecked(this.handle, 8)
         ERR_clear_error()
         val held = linuxBrokenPipeHold()
-        val wait = HostedTlsWait(tlsControlInt(this.handle, 16))
+        val wait = HostedTlsWait(tlsControlWordUnchecked(this.handle, 16))
         val chunk = contents.slice(offset, offset + length)
         var written: int = SSL_write(session, chunk, length)
         while (written <= 0 && hostedTlsInterrupted(wait, session, written)) {
@@ -894,26 +999,29 @@ trusted fun TlsConnection.write(contents: string): int {
 }
 
 // Shuts down and frees an open TLS connection handle and returns whether its socket closed.
-// Takes a handle the hosted TLS layer returned; passing anything else is undefined: not a safe API (tools/test-trusted-raw-addresses.sh).
+// A handle this layer did not return, or one already closed, is refused: nothing is read from it.
 trusted fun tlsCloseHandle(handle: int): bool {
-    val session = tlsControlPointer(handle, 8)
+    // A handle this layer did not return, or already closed, is left alone: nothing is read from it and false is the answer.
+    if (!tlsLiveRemove(handle, 32)) return false
+    val session = tlsControlPointerUnchecked(handle, 8)
     ERR_clear_error()
     val held = linuxBrokenPipeHold()
     SSL_shutdown(session)
     linuxBrokenPipeRelease(held)
     SSL_free(session)
-    if (tlsControlInt(handle, 24) != 0) {
-        SSL_CTX_free(tlsControlPointer(handle, 0))
+    if (tlsControlWordUnchecked(handle, 24) != 0) {
+        SSL_CTX_free(tlsControlPointerUnchecked(handle, 0))
     }
-    val closed = linuxTcpCloseDescriptor(tlsControlInt(handle, 16))
+    val closed = linuxTcpCloseDescriptor(tlsControlWordUnchecked(handle, 16))
     ablaUnsafeFree(tlsControl(handle))
     closed
 }
 
 // Frees the open listener handle and returns whether its listening socket closed.
 private trusted fun tlsCloseListenerHandle(handle: int): bool {
-    val closed = linuxTcpCloseDescriptor(tlsControlInt(handle, 8))
-    SSL_CTX_free(tlsControlPointer(handle, 0))
+    if (!tlsLiveRemove(handle, 16)) return false
+    val closed = linuxTcpCloseDescriptor(tlsControlWordUnchecked(handle, 8))
+    SSL_CTX_free(tlsControlPointerUnchecked(handle, 0))
     ablaUnsafeFree(tlsControl(handle))
     closed
 }
