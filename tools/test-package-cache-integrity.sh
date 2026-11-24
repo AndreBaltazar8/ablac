@@ -42,11 +42,11 @@ for round in 1 2 3 4; do
     done
     bad=0
     for pid in "${pids[@]}"; do wait "$pid" || bad=$((bad + 1)); done
-    [ "$bad" = 0 ] || { fail "round $round: $bad of 8 parallel installs failed"; for k in 1 2 3 4 5 6 7 8; do [ -s "$t/p$round-$k.log" ] && { sed 's/^/    /' "$t/p$round-$k.log" | head -3; break; }; done; }
+    [ "$bad" = 0 ] || { fail "round $round: $bad of 8 parallel installs failed"; for k in 1 2 3 4 5 6 7 8; do [ -s "$t/p$round-$k.log" ] && { sed -n '1,3s/^/    /p' "$t/p$round-$k.log"; break; }; done; }
     leftovers=$(find "$cache" -name '*.tmp.*' | wc -l)
-    [ "$leftovers" = 0 ] || fail "round $round: $leftovers temporary entries left in the cache"
+    ((leftovers == 0)) || fail "round $round: $leftovers temporary entries left in the cache"
     entries=$(find "$cache/git" -mindepth 2 -maxdepth 2 -type d | wc -l)
-    [ "$entries" = 1 ] || fail "round $round: $entries cache entries for one revision"
+    ((entries == 1)) || fail "round $round: $entries cache entries for one revision"
     mkdir -p "$t/o$round"; cp "$t/seed/abla.toml" "$t/seed/main.ab" "$t/seed/abla.lock" "$t/o$round/"
     ABLA_PACKAGE_CACHE=$cache "$compiler" package install --offline --project "$t/o$round" > "$t/o$round.log" 2>&1 || fail "round $round: the entry left is not valid offline" "$t/o$round.log"
 done
@@ -74,12 +74,26 @@ rm -rf "$t/a3/.abla"
 install "$cache" "$t/a3" "$t/a3b.log" || true
 [ ! -e "$t/ran-fsmonitor" ] || fail "validating a cache entry ran the command in its .git/config (core.fsmonitor)"
 
-# 4. umask 000.
+# 4. Publish a fresh cache entry under umask 000. Use the system BSD chmod
+# on macOS and reject its incompatible argument order on GNU hosts too.
 cache=$t/umask
 mkdir -p "$t/a4"; cp "$t/seed/abla.toml" "$t/seed/main.ab" "$t/seed/abla.lock" "$t/a4/"
-( umask 000; install "$cache" "$t/a4" "$t/a4.log" ) || fail "the install under umask 000 failed" "$t/a4.log"
-writable=$(find "$cache" ! -type l -perm /022 | wc -l)
-[ "$writable" = 0 ] || fail "$writable files or directories of the cache are writable by group or others under umask 000 (e.g. $(find "$cache" ! -type l -perm /022 -print -quit))"
+chmod_tool=$(command -v chmod)
+if [[ $(uname -s) == Darwin ]]; then chmod_tool=/bin/chmod; fi
+mkdir -p "$t/bin"
+cat > "$t/bin/chmod" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${1-} == -R && ${2-} == go-w && ${3-} == -- ]]; then
+    echo "BSD chmod treats -- after the mode as a filename" >&2
+    exit 1
+fi
+exec "$PACKAGE_TEST_CHMOD" "$@"
+EOF
+chmod +x "$t/bin/chmod"
+( umask 000; PATH="$t/bin:$PATH" PACKAGE_TEST_CHMOD="$chmod_tool" install "$cache" "$t/a4" "$t/a4.log" ) ||
+    fail "the install under umask 000 failed" "$t/a4.log"
+writable=$(find "$cache" ! -type l \( -perm -020 -o -perm -002 \) -print -quit)
+[ -z "$writable" ] || fail "the cache entry is writable by group or others under umask 000 ($writable)"
 
 [ "$failures" = 0 ] || { printf 'package cache integrity: %d failure(s)\n' "$failures" >&2; exit 1; }
 echo "package cache integrity: parallel installs share one valid entry, a changed or reconfigured entry is not trusted, and entries are not writable by others"
