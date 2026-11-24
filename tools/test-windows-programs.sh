@@ -24,6 +24,7 @@ ran=0
 skipped=0
 count=0
 runner=0
+wineonly=0
 while read -r source status where; do
     [[ -z $source || $source == '#'* ]] && continue
     [[ -f $source ]] || fail "$source (tests/cases/windows/programs.txt) does not exist"
@@ -61,6 +62,11 @@ while read -r source status where; do
     cmp -s "$out/$name.expected" "$out/$name.actual" ||
         { diff "$out/$name.expected" "$out/$name.actual" >&2 || true; fail "$name: the output under Wine differs from the native Linux run"; }
     ran=$((ran + 1))
+    # A program marked `wine` passes under Wine only: it is not left for the Windows runner.
+    if [[ $where == wine ]]; then
+        rm -f "$exe" "$out/$name.expected" "$out/$name.status"
+        wineonly=$((wineonly + 1))
+    fi
 done < tests/cases/windows/programs.txt
 ((count > 0)) || fail 'tests/cases/windows/programs.txt lists no program'
 (cd "$out" && sha256sum -- ./*.exe ./*.expected ./*.status | sed 's|  \./|  |' > SHA256SUMS)
