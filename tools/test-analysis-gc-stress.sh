@@ -15,6 +15,9 @@
 # Mutation check (2026-11-22, cx2's control): dropping the last live slot from the hosted boxed-array owner scan (host.ab,
 # __ablaRuntimeHostTraceMarkedAllocations and the parallel trace) fails this session, and the session passes without stress.
 set -euo pipefail
+# The editor service answers a request that outruns ABLA_ANALYSIS_BUDGET_MS (60 s by default) with an incomplete result. These analyse the compiler's own source and run
+# beside other tests, so they give it the longest budget: a loaded run would otherwise compare an incomplete answer with a complete one (#1206).
+export ABLA_ANALYSIS_BUDGET_MS=${ABLA_ANALYSIS_BUDGET_MS:-600000}
 compiler=${1:-build/ablac}
 # The normal suite collects thousands of times per session. The release suite
 # uses the denser historical schedule.

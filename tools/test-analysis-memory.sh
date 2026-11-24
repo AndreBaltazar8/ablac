@@ -57,6 +57,9 @@
 # The resident size is only a loose sanity ceiling now (2,600,000 kB). Mutation check: one 450-character string per occurrence in resolvedNames
 # (analysis_graph.ab) adds about 140 MB of reachable heap and fails the ratio.
 set -euo pipefail
+# The editor service answers a request that outruns ABLA_ANALYSIS_BUDGET_MS (60 s by default) with an incomplete result. These analyse the compiler's own source and run
+# beside other tests, so they give it the longest budget: a loaded run would otherwise compare an incomplete answer with a complete one (#1206).
+export ABLA_ANALYSIS_BUDGET_MS=${ABLA_ANALYSIS_BUDGET_MS:-600000}
 
 compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

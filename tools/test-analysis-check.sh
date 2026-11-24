@@ -4,6 +4,9 @@
 # of the compiler's own source (and abla-one in the full form). The seeds are fixed so a failure repeats; ANALYSIS_CHECK_SEED and
 # ANALYSIS_CHECK_EDITS change them (a longer loop for a change to the analysis).
 set -euo pipefail
+# The editor service answers a request that outruns ABLA_ANALYSIS_BUDGET_MS (60 s by default) with an incomplete result. These analyse the compiler's own source and run
+# beside other tests, so they give it the longest budget: a loaded run would otherwise compare an incomplete answer with a complete one (#1206).
+export ABLA_ANALYSIS_BUDGET_MS=${ABLA_ANALYSIS_BUDGET_MS:-600000}
 compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $compiler == /* ]] || compiler="$PWD/$compiler"
