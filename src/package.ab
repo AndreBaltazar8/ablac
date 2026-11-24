@@ -821,6 +821,11 @@ fun bootstrapPackageGit(): LinuxCommand {
     command.argument("core.hooksPath=/dev/null")
     command.argument("-c")
     command.argument("protocol.ext.allow=never")
+    // What is read from a checkout is the blob the digest covers: no user setting or attribute rewrites line endings, expands $Id$ or runs a filter.
+    for (setting in ["core.autocrlf=false", "core.safecrlf=false", "core.attributesFile=/dev/null"]) {
+        command.argument("-c")
+        command.argument(setting)
+    }
     command
 }
 
@@ -1082,6 +1087,80 @@ fun bootstrapPackageImportThroughEscapingLink(path: string): bool {
     escapes
 }
 
+class BootstrapPackageTreeVerdict(val code: string, val reason: string)
+
+val BOOTSTRAP_PACKAGE_TREE_MAX_FILES = 50000
+val BOOTSTRAP_PACKAGE_TREE_MAX_PATH = 1024
+val BOOTSTRAP_PACKAGE_TREE_MAX_DEPTH = 64
+val BOOTSTRAP_PACKAGE_TREE_LISTING_KIB = 65536
+
+// Whether the tree of `revision` in the fetched repository at `repository` may be checked out, decided from the tree's own objects before a byte of it is
+// written (a blob of zeros is a few kilobytes in a pack and gigabytes on disk; one tree listed from many parents is a billion files). The listing is
+// written to `listingPath` by a git process whose files cannot grow past 32 MiB, so a tree that expands without bound ends the listing, not the build. A
+// package's checkout holds at most 50,000 files of at most 128 MiB together, regular files and symbolic links only (a submodule would be an empty directory
+// the digest names a commit for), paths of at most 1024 bytes and 64 components with no control character in them.
+fun bootstrapPackageTreeVerdict(repository: string, revision: string, listingPath: string): BootstrapPackageTreeVerdict {
+    val git = bootstrapPackageGit()
+    git.argument("-C")
+    git.argument(repository)
+    git.argument("ls-tree")
+    git.argument("-r")
+    git.argument("-l")
+    git.argument("-z")
+    git.argument(revision)
+    git.output(listingPath)
+    var status = 0
+    if (linuxHostIsWindows()) {
+        status = git.run()
+    } else {
+        val wrapped = LinuxCommand(["sh", "-c", "ulimit -f ${BOOTSTRAP_PACKAGE_TREE_LISTING_KIB}; exec \"\$@\"", "sh"], git.overrides, "", "", listingPath, "", git.removed)
+        for (argument in git.arguments) wrapped.arguments.append(argument)
+        status = wrapped.run()
+    }
+    if (status != 0) {
+        return BootstrapPackageTreeVerdict("E_PACKAGE_SIZE", "has a listing that cannot be read or is larger than 32 MiB")
+    }
+    val records = bootstrapPackageSplitNul(Path(listingPath).readText())
+    var files = 0
+    var total = 0
+    for (record in records) {
+        val tab = record.indexOf("\t")
+        if (tab < 0) return BootstrapPackageTreeVerdict("E_PACKAGE_TREE", "has an entry git does not list as mode, type, object, size and path")
+        val fields = bootstrapPackageTrim(record.slice(0, tab)).split(" ")
+        val path = record.slice(tab + 1, record.size)
+        val mode = if (fields.size > 0) fields[0] else ""
+        if (mode == "160000") return BootstrapPackageTreeVerdict("E_PACKAGE_TREE", "has a submodule ('$path'); a package holds its own files only")
+        if (mode != "100644" && mode != "100755" && mode != "120000") {
+            return BootstrapPackageTreeVerdict("E_PACKAGE_TREE", "has an entry of mode $mode ('$path'); only regular files and symbolic links are packages' files")
+        }
+        var depth = 1
+        var index = 0
+        while (index < path.size) {
+            val byte = path[index]
+            if (byte < 32 || byte == 127) return BootstrapPackageTreeVerdict("E_PACKAGE_TREE", "has a path with a control character in it")
+            if (byte == 47) depth = depth + 1
+            index = index + 1
+        }
+        if (path.size > BOOTSTRAP_PACKAGE_TREE_MAX_PATH || depth > BOOTSTRAP_PACKAGE_TREE_MAX_DEPTH) {
+            return BootstrapPackageTreeVerdict("E_PACKAGE_SIZE", "has a path of more than ${BOOTSTRAP_PACKAGE_TREE_MAX_PATH} bytes or ${BOOTSTRAP_PACKAGE_TREE_MAX_DEPTH} levels")
+        }
+        files = files + 1
+        if (files > BOOTSTRAP_PACKAGE_TREE_MAX_FILES) {
+            return BootstrapPackageTreeVerdict("E_PACKAGE_SIZE", "has more than ${BOOTSTRAP_PACKAGE_TREE_MAX_FILES} files")
+        }
+        val sizeText = if (fields.size > 3) fields[fields.size - 1] else ""
+        var size = 0
+        var place = 0
+        while (place < sizeText.size && sizeText[place] >= 48 && sizeText[place] <= 57 && size <= 134217728) {
+            size = size * 10 + sizeText[place] - 48
+            place = place + 1
+        }
+        total = total + size
+        if (total > 134217728) return BootstrapPackageTreeVerdict("E_PACKAGE_SIZE", "holds more than 128 MiB of files")
+    }
+    BootstrapPackageTreeVerdict("", "")
+}
+
 fun bootstrapPackageFetch(
     dependency: BootstrapPackageDependency,
     revision: string
@@ -1106,6 +1185,11 @@ fun bootstrapPackageFetch(
         if (init.run() != 0) status = 1
     }
     if (status == 0) {
+        // info/attributes outranks the tree's own .gitattributes: the checkout is the blobs as they are.
+        if (!Path("$temporary/source/.git/info").createDirectories() ||
+            !Path("$temporary/source/.git/info/attributes").writeText("* -text -eol -ident -filter -working-tree-encoding\n")) status = 1
+    }
+    if (status == 0) {
         val remote = bootstrapPackageGit()
         remote.argument("-C")
         remote.argument("$temporary/source")
@@ -1120,6 +1204,8 @@ fun bootstrapPackageFetch(
         val fetch = bootstrapPackageGit()
         fetch.argument("-C")
         fetch.argument("$temporary/source")
+        fetch.argument("-c")
+        fetch.argument("transfer.fsckObjects=true")
         fetch.argument("fetch")
         fetch.argument("--quiet")
         fetch.argument("--depth")
@@ -1133,6 +1219,14 @@ fun bootstrapPackageFetch(
             else bootstrapPackageCaptureGit(fetch, seconds)
         if (fetched.status != 0) status = 1
         if (fetched.timedOut) diagnostic = bootstrapPackageGitTimeout(dependency, "fetch", seconds)
+    }
+    if (status == 0) {
+        val verdict = bootstrapPackageTreeVerdict("$temporary/source", revision, "$temporary/listing")
+        if (verdict.code != "") {
+            status = 1
+            diagnostic = "error[${verdict.code}]: dependency '${dependency.name}', revision '$revision': its tree ${verdict.reason}\n"
+        }
+        bootstrapPackageRemoveTree("$temporary/listing")
     }
     if (status == 0) {
         val checkout = bootstrapPackageGit()
