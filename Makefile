@@ -261,6 +261,7 @@ test-serial: ablac
 	tools/test-workflow-syntax.sh $(COMPILER)
 	tools/test-workflow-security.sh
 	tools/test-workflow-security.sh --controls
+	tools/test-darwin-syscall-coverage.sh
 	tools/test-gzip-inflate.sh $(COMPILER)
 	tools/test-gzip-stream.sh $(COMPILER)
 	tools/test-gzip-compress.sh $(COMPILER)
