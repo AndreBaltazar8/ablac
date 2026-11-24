@@ -25,7 +25,9 @@ for manifests, resolving the initial lock, vendoring and offline builds.
 
 [Runnable source](../../tests/cases/tour/10-modules.ab):
 
-Save this helper beside the main file as `pricing.ab`:
+Save this helper beside the main file as `pricing.ab`. To run this example,
+save both files and use `ablac run main.ab` from their directory. The
+one-file playground editor only sends the entry file.
 
 ```abla file=pricing.ab source=../../tests/cases/tour/pricing.ab
 fun withTax(price: int, percent: int): int = price + price * percent / 100

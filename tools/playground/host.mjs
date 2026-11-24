@@ -84,5 +84,8 @@ export async function run(module, base, files, { stdin = "" } = {}) {
     if (!ok && /^error\[E_SEMANTIC\]: compile\.(?:effect-denied|capability-not-authorized):/m.test(diagnostics)) {
         diagnostics += "\n\nThe browser playground supports standard input, clocks and random bytes. Run this program locally with ablac run main.ab. If it requests a compile-time capability, authorize it in your local project.";
     }
+    if (!ok && files.size === 1 && /^error\[E_IMPORT_NOT_FOUND\]: .* \(looked for \/work\/.+\)$/m.test(diagnostics)) {
+        diagnostics += "\n\nThis run received only the editor file. If the example has companion files, save them beside main.ab using the paths shown in the example, then run ablac run main.ab locally.";
+    }
     return { status: ok ? Number(exit[1]) : 1, stdout: result.stdout, stderr: result.stderr, diagnostics, ok, memoryBytes: result.memoryBytes };
 }

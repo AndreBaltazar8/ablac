@@ -60,6 +60,21 @@ try {
             fail(`missing local-run guidance for ${reason} in ${denied.diagnostics}`);
         }
     }
+    const importsPricing = 'import "pricing.ab" as pricing\nfun main(): int = pricing.price()\n';
+    const pricing = ["pricing.ab", "fun price(): int = 7\n"];
+    const hint = "This run received only the editor file";
+    const missing = await run(importsPricing);
+    if (missing.ok || !missing.diagnostics.includes("E_IMPORT_NOT_FOUND") || !missing.diagnostics.includes(hint)) {
+        fail(`missing companion-file guidance in ${missing.diagnostics}`);
+    }
+    const supplied = await run(importsPricing, [pricing]);
+    if (!supplied.ok || supplied.status !== 7 || supplied.diagnostics.includes(hint)) {
+        fail(`the companion file did not resolve: ${JSON.stringify(supplied)}`);
+    }
+    const missingStdlib = await run('import "abla/missing_playground_module"\nfun main: int = 0\n');
+    if (missingStdlib.ok || !missingStdlib.diagnostics.includes("E_IMPORT_NOT_FOUND") || missingStdlib.diagnostics.includes(hint)) {
+        fail(`unexpected companion-file guidance for a missing standard module: ${missingStdlib.diagnostics}`);
+    }
     console.log(`playground package ${manifest.version}: module ${(wasm.length / 1048576).toFixed(2)} MB (${(brotli / 1048576).toFixed(2)} MB brotli), stdlib bundle ${(manifest.stdlib.bytes / 1048576).toFixed(2)} MB; hashes match, the bundle loads over HTTP, a program runs`);
 } finally {
     server.close();
