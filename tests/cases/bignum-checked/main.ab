@@ -1,0 +1,153 @@
+// BigModulus and BigNumber (abla/crypto/bignum) against JavaScript's BigInt (vectors.txt, made by generate.mjs): add, sub, mul, square, pow, select, isEqual,
+// bitMask and toBytes at widths 4, 8, 32, 64 and 512 bytes, with zero, one, p - 1 and p - 2 among the values; the refusals (even modulus, wrong width, a value at
+// or above the modulus, little-endian bytes); and operations of two moduli refused. The directory of vectors.txt is argument 0. Prints "bignum-checked ok".
+import "abla/crypto"
+import "abla/crypto/bignum"
+import "abla/ct"
+import "abla/fs"
+import "abla/integer"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/text"
+
+var failures = 0
+
+fun check(what: string, ok: bool): void {
+    if (ok) return
+    failures = failures + 1
+    if (failures < 40) println("FAIL $what")
+}
+
+fun maskIsSet(mask: secretU32): bool = mask.declassify() == u32(4294967295)
+
+fun maskIsClear(mask: secretU32): bool = mask.declassify() == u32(0)
+
+fun vector(modulus: BigModulus, width: int, line: string): void {
+    val parts = line.split(" ")
+    val a = hexDecode(parts[1])
+    val b = hexDecode(parts[2])
+    val exponent = hexDecode(parts[3])
+    val label = "width $width a ${parts[1].slice(0, 8)} b ${parts[2].slice(0, 8)}"
+    val x = modulus.number(a) ?? return check("$label: a refused", false)
+    val y = modulus.number(b) ?? return check("$label: b refused", false)
+    check("$label: toBytes", x.toBytes() == a && y.toBytes() == b)
+    check("$label: add", x.add(y).toBytes() == hexDecode(parts[4]))
+    check("$label: sub", x.sub(y).toBytes() == hexDecode(parts[5]))
+    check("$label: mul", x.mul(y).toBytes() == hexDecode(parts[6]))
+    check("$label: square", x.square().toBytes() == hexDecode(parts[7]))
+    check("$label: pow", x.pow(exponent).toBytes() == hexDecode(parts[8]))
+    // select takes the first where the mask is all ones, the second where it is zero.
+    check("$label: select ones", x.select(y, ctFromLowBit(secretU32(u32(1)))).toBytes() == a)
+    check("$label: select zero", x.select(y, ctFromLowBit(secretU32(u32(0)))).toBytes() == b)
+    check("$label: isEqual self", maskIsSet(x.isEqual(x.copy())))
+    check("$label: isEqual other", (a == b) == maskIsSet(x.isEqual(y)))
+    check("$label: copy", x.copy().toBytes() == a)
+    // The same in place, with the destination apart from the operands and as each of them.
+    val spare = x.copy()
+    spare.setAdd(x, y)
+    check("$label: setAdd", spare.toBytes() == hexDecode(parts[4]))
+    spare.setSub(x, y)
+    check("$label: setSub", spare.toBytes() == hexDecode(parts[5]))
+    spare.setMul(x, y)
+    check("$label: setMul", spare.toBytes() == hexDecode(parts[6]))
+    val inPlace = x.copy()
+    inPlace.setMul(inPlace, inPlace)
+    check("$label: setMul squares in place", inPlace.toBytes() == hexDecode(parts[7]))
+    val left = x.copy()
+    left.setAdd(left, y)
+    check("$label: setAdd into the first operand", left.toBytes() == hexDecode(parts[4]))
+    val right = y.copy()
+    right.setSub(x, right)
+    check("$label: setSub into the second operand", right.toBytes() == hexDecode(parts[5]))
+    val chosen = y.copy()
+    chosen.setSelect(x, chosen, ctFromLowBit(secretU32(u32(1))))
+    check("$label: setSelect ones", chosen.toBytes() == a)
+    chosen.setSelect(y, x, ctFromLowBit(secretU32(u32(0))))
+    check("$label: setSelect zero", chosen.toBytes() == a)
+    spare.set(y)
+    check("$label: set", spare.toBytes() == b)
+    var at = 9
+    while (at < parts.size) {
+        val bit = parts[at].split(":")
+        val index = bit[0].parseInt() ?? 0
+        check("$label: bit $index", maskIsSet(x.bitMask(index)) == (bit[1] == "1") && maskIsSet(x.bitMask(index)) != maskIsClear(x.bitMask(index)))
+        at = at + 1
+    }
+    // The same through little-endian bytes.
+    val reversed = modulus.number(littleEndian(a), false) ?? return check("$label: little-endian refused", false)
+    check("$label: little-endian", reversed.toBytes(false) == littleEndian(a) && reversed.toBytes() == a)
+}
+
+fun littleEndian(bytes: string): string {
+    val out: array<int> = []
+    var at = bytes.size - 1
+    while (at >= 0) {
+        out.append(int(bytes[at]))
+        at = at - 1
+    }
+    cryptoByteString(out)
+}
+
+fun reduced(modulus: BigModulus, line: string): void {
+    val parts = line.split(" ")
+    val input = hexDecode(parts[1])
+    val made = modulus.reduce(input) ?? return check("reduce of ${input.size} bytes refused", false)
+    check("reduce ${input.size} bytes", made.toBytes() == hexDecode(parts[2]))
+    val little = modulus.reduce(littleEndian(input), false) ?? return check("little-endian reduce refused", false)
+    check("reduce little-endian ${input.size} bytes", little.toBytes() == hexDecode(parts[2]))
+}
+
+fun section(bytes: string, vectorLines: array<string>): int {
+    val modulus = bigModulus(bytes) ?? return 0
+    check("width", modulus.width() == bytes.size)
+    var count = 0
+    for (line in vectorLines) {
+        if (line.startsWith("v ")) {
+            vector(modulus, bytes.size, line)
+            count = count + 1
+        } else reduced(modulus, line)
+    }
+    count
+}
+
+fun main: int {
+    val lines = path("${processArgument(0)}/vectors.txt").readText().split("\n")
+    var vectors = 0
+    var bytes = ""
+    var pending: array<string> = []
+    for (line in lines) {
+        if (line.startsWith("m ")) {
+            if (bytes != "") vectors = vectors + section(bytes, pending)
+            bytes = hexDecode(line.slice(2, line.size))
+            pending = []
+            check("modulus of ${bytes.size} bytes is accepted", bigModulus(bytes) != null)
+        } else if (line.startsWith("v ") || line.startsWith("r ")) pending.append(line)
+    }
+    if (bytes != "") vectors = vectors + section(bytes, pending)
+    check("vectors read", vectors >= 100)
+
+    // Refusals.
+    check("an even modulus is refused", bigModulus(hexDecode("00000010")) == null)
+    check("a modulus of 3 bytes is refused", bigModulus(hexDecode("000101")) == null)
+    check("an empty modulus is refused", bigModulus("") == null)
+    check("a modulus above 512 bytes is refused", bigModulus(hexDecode("00" + "ff".repeat(515) + "01")) == null)
+    val seven = bigModulus(hexDecode("00000007")) ?? return 1
+    check("a value equal to the modulus is refused", seven.number(hexDecode("00000007")) == null)
+    check("a value above the modulus is refused", seven.number(hexDecode("00000008")) == null)
+    check("a value of the wrong width is refused", seven.number(hexDecode("0007")) == null)
+    check("reduce of nothing is refused", seven.reduce("") == null)
+    check("reduce of more than twice the width is refused", seven.reduce("a".repeat(9)) == null)
+    val six = seven.number(hexDecode("00000006")) ?? return 1
+    val five = seven.number(hexDecode("00000005")) ?? return 1
+    check("6 + 5 mod 7 is 4", six.add(five).toBytes() == hexDecode("00000004"))
+    check("5 - 6 mod 7 is 6", five.sub(six).toBytes() == hexDecode("00000006"))
+    check("6 * 5 mod 7 is 2", six.mul(five).toBytes() == hexDecode("00000002"))
+    check("5 ^ 3 mod 7 is 6", five.pow(hexDecode("03")).toBytes() == hexDecode("00000006"))
+    // Fermat: a ^ (p - 1) is one for a prime p and a not zero.
+    check("6 ^ 6 mod 7 is 1", six.pow(hexDecode("06")).toBytes() == hexDecode("00000001"))
+    check("zero and one", seven.zero().toBytes() == hexDecode("00000000") && seven.one().toBytes() == hexDecode("00000001"))
+    check("a ^ 0 is one", five.pow("").toBytes() == hexDecode("00000001"))
+    if (failures > 0) return 1
+    println("bignum-checked ok")
+    0
+}

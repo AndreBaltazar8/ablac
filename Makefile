@@ -564,6 +564,7 @@ test-serial: ablac
 	tools/test-gzip-inflate-diff.sh $(COMPILER)
 	tools/test-json-encode.sh $(COMPILER)
 	tools/test-json-decode.sh $(COMPILER)
+	tools/test-bignum-checked.sh $(COMPILER)
 	tools/test-utf8-fast.sh $(COMPILER)
 	tools/test-sha3-fast.sh $(COMPILER)
 	tools/test-chacha-simd.sh $(COMPILER)

@@ -143,6 +143,27 @@ for ML-KEM-768 (25 key generations, 25 encapsulations, 10 decapsulations with al
 `tests/vectors/crypto/mlkem768`), refusals, and round trips (`tools/test-crypto-pure.sh`), and by interoperating with `openssl s_server` and
 `s_client` in TLS (`tools/test-tls-pure-interop.sh`).
 
+## `abla/crypto/bignum`: numbers modulo a number, with no address
+
+Big-number arithmetic for code that signs or verifies on its own curve or field. A `BigModulus` is an odd modulus of 4 to 512 bytes; a `BigNumber` is a value modulo
+one, of that width. Both own their memory, wipe it when dropped, and borrow in every parameter, so `a.add(b)` leaves both alive and returns a number the caller owns. The
+arithmetic is in Montgomery form inside and constant time in the values: the same code runs for any values of one width, and none of it branches or indexes on one.
+
+| Call | Answers |
+|---|---|
+| `bigModulus(bytes, bigEndian = true)` | the modulus, or null: the size must be a multiple of 4 from 4 to 512 bytes and the value odd |
+| `m.width()`, `m.zero()`, `m.one()` | the width in bytes, 0 and 1 |
+| `m.number(bytes, bigEndian = true)` | the number, or null unless the bytes are exactly the width and below the modulus (the range is checked in constant time; only its answer is told) |
+| `m.reduce(bytes, bigEndian = true)` | the bytes (1 to twice the width) reduced modulo the modulus, in constant time, or null for another size |
+| `a.add(b)`, `a.sub(b)`, `a.mul(b)`, `a.square()`, `a.copy()` | the sum, difference and product modulo the modulus; numbers of two moduli in one operation stop the program |
+| `a.pow(exponent)` | `a` to the power of `exponent` (big-endian bytes, **public**: the work depends on it, never on `a`) |
+| `a.select(b, mask)` | `a` where `mask` (a `secretU32`) is all ones, `b` where it is zero |
+| `a.isEqual(b)`, `a.bitMask(index)` | all ones or zero, as a secret: equality, and bit `index` (0 is the least significant) of the value |
+| `a.toBytes(bigEndian = true)` | the value as `width` bytes: **the place where a secret leaves the type** |
+
+The raw `bn*` functions of the same module take the address of a work area as an integer and trust it: they are the engine of the library's RSA and curves, not a safe API.
+Tests: `tools/test-bignum-checked.sh` (JavaScript's BigInt as the oracle at 4, 8, 32, 64 and 512 bytes), and `tools/test-ct.sh` reads the code of the steps that touch a value.
+
 ## `abla/crypto/ed25519`
 
 Ed25519 ([RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) section 5.1) in Abla, no OpenSSL, on every target, over the

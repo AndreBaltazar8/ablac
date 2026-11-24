@@ -37,6 +37,7 @@ cp -R tests/cases/ct "$cases"
 # Keep the private implementation private: test the exact production source in
 # the generated fixture's own module, never through a public test hook.
 sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN BIGNUM CHECKED CORES$/,/^\/\/ END BIGNUM CHECKED CORES$/p' stdlib/abla/crypto/bignum/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN P256 SECRET CORES$/,/^\/\/ END P256 SECRET CORES$/p' stdlib/abla/crypto/p256/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE OWNER WIPE$/,/^\/\/ END PBE OWNER WIPE$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
@@ -75,6 +76,7 @@ fixtures=(
     ct_fix_poly_init:@1 ct_fix_poly_blocks:@0,@1 ct_fix_poly_update:@0,@1 ct_fix_poly_finish:@0
     ct_fix_aes_encrypt:@0,@1 ct_fix_aes_decrypt:@0,@1 ct_fix_aes_padding:@0 ct_fix_ghash:@0,@1
     ct_fix_montgomery:@0,@1,@2,@3 ct_fix_add_multiple:0,@1,@2 ct_fix_lookup:0,@1,@2
+    ct_fix_big_bit:@0 ct_fix_big_below:@0,@1
     ct_fix_rsa_pkcs1:@0 ct_fix_rsa_oaep:@0,@2
     ct_fix_rsa_implicit_length:@0 ct_fix_rsa_implicit_select:@1,@2
     ct_fix_secret_division:@0,@1 ct_fix_secret_exact:@0,@1 ct_fix_secret_reduce:@0,@1 ct_fix_secret_divsteps:@0,@1 ct_fix_secret_gcd:@0,@1 ct_fix_secret_inverse:@0,@1
@@ -96,7 +98,7 @@ done
 while IFS= read -r spec; do fixtures+=("$spec"); done < "$cases/crypto-generated.good"
 # Xtensa passes later pointer parameters on the stack; its checker cannot yet
 # taint those parameters, so this separate-pointer shape is read on these ABIs.
-host_fixtures=(ct_fix_wide_separate:@0,@1,@2,@3,@5 ct_fix_montgomery64:@0,@1,@2,@3 ct_fix_lookup64:0,@1,@2 ct_fix_residue64:@0,@1,@3 ct_fix_chacha_xor_vector:@0,@1)
+host_fixtures=(ct_fix_big_add:@0,@1,@2,@3,@5 ct_fix_big_sub:@0,@1,@2,@3 ct_fix_big_select:0,@1,@2,@3 ct_fix_wide_separate:@0,@1,@2,@3,@5 ct_fix_montgomery64:@0,@1,@2,@3 ct_fix_lookup64:0,@1,@2 ct_fix_residue64:@0,@1,@3 ct_fix_chacha_xor_vector:@0,@1)
 leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_trap:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0 ct_x25519_leak_branch:0,@1,@2 ct_x25519_leak_index:@0,@1 ct_ed25519_leak_branch:0,@1,@2 ct_ed25519_leak_index:@0,@1 ct_leak_chacha_index:@0,@1 ct_leak_poly_branch:@0,@1 ct_leak_sha256:@0,@1,@2 ct_leak_sha512:@0,@1,@2)
 while IFS= read -r spec; do leaks+=("$spec"); done < "$cases/crypto-generated.leaks"
 

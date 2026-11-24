@@ -3,8 +3,10 @@
 // bnMontgomeryMultiplyBody, bnLookupBody, bnConditionalSubtractBody and bnAddMultipleBody on each
 // target (and the 64-bit forms bnMontgomeryMultiply64Body, bnLookup64Body and bnResidueSquare64Body on x86-64 and AArch64). What's public here: the lengths, and in bnExpPublic the exponent.
 
+import "abla/crypto"
 import "abla/crypto/alloc"
 import "abla/ct"
+import "abla/process/exit"
 import "abla/uint128"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
@@ -548,4 +550,406 @@ fun bnPublicInverse(value: array<int>, modulus: array<int>): array<int> {
     val result: array<int> = []
     for (i in 0 until size) result.append(answer[i])
     result
+}
+
+// --- BigModulus and BigNumber: big-number arithmetic that takes no address -----------------------------------------
+// The functions above take the address of a work area as an integer and trust it, so a program that passes a wrong
+// one writes or frees memory it doesn't own. These two types own their memory (a NativeByteBuffer, checked against
+// the width on every use) and wipe it when dropped. A BigNumber is a value modulo its BigModulus, a fixed number of
+// bytes wide, kept in Montgomery form inside: the same code runs for any values of the same width, none of it branches
+// or indexes on a value, and what leaves is only what toBytes, isEqual and bitMask are asked for. Every parameter
+// borrows, so `a.add(b)` leaves both alive and returns a new value the caller owns. The prepared modulus is shared by
+// reference counting, read-only once made: numbers keep it alive, and each number carries the scratch its own operation uses,
+// so numbers of one modulus may be used from several threads.
+
+private val BIG_MAXIMUM_WORDS = 128
+
+// Limbs in the block of a modulus: the value, the inverse word, R^2, one (bnModulusFrom's layout, whose scratch this does not use).
+private fun bigBlockWords(words: int): int = words * 3 + 1 + bnScratchWords(words)
+
+// A number: its value, then the scratch its own operations work in.
+private fun bigNumberWords(words: int): int = words + bnScratchWords(words)
+
+private fun bigWordsValid(words: int): bool = words >= 1 && words <= BIG_MAXIMUM_WORDS
+
+/// The prepared form of a modulus, shared by the numbers made from it. Wiped and freed when the last of them is gone.
+resource class BigModulusData(val storage: NativeByteBuffer, val words: int) {
+    // Wipes the prepared modulus before the buffer is freed.
+    trusted fun drop(): void {
+        if (!this.storage.closed && bigWordsValid(this.words) && this.storage.capacity >= bigBlockWords(this.words) * 4) {
+            bnClear(nativePointerAddress(this.storage.address), bigBlockWords(this.words))
+        }
+    }
+}
+
+/// An odd modulus of a fixed width, prepared for Montgomery arithmetic; a BigNumber is made by it.
+class BigModulus(val data: Shared<BigModulusData>)
+
+/// A value modulo a BigModulus, of that modulus's width. Dropped, its memory is wiped and freed.
+resource class BigNumber(val modulus: Shared<BigModulusData>, val storage: NativeByteBuffer, val words: int) {
+    // Wipes the value and its scratch before the buffer is freed.
+    trusted fun drop(): void {
+        if (!this.storage.closed && bigWordsValid(this.words) && this.storage.capacity >= bigNumberWords(this.words) * 4) {
+            bnClear(nativePointerAddress(this.storage.address), bigNumberWords(this.words))
+        }
+    }
+}
+
+// BEGIN BIGNUM CHECKED CORES
+// What touches a value of a BigNumber, in functions of plain integers (addresses and counts) that call nothing but bn* steps and allocate nothing:
+// tools/test-ct.sh reads this region as written, in a module of its own. No conditional branch, memory index or division comes from a value.
+
+// `out` = a + b modulo the modulus (`words` limbs at `modulus`, `scratch` of bnScratchWords).
+private @inline trusted fun bigAddBody(out: int, a: int, b: int, modulus: int, words: int, scratch: int): void {
+    var carry = secretU64(u64(0))
+    for (j in 0 until words) {
+        val sum = bnLoad(a + j * 4).widen() + bnLoad(b + j * 4).widen() + carry
+        bnStore(out + j * 4, sum.low())
+        carry = sum.high().widen()
+    }
+    bnConditionalSubtractBody(out, out, carry.low(), modulus, words, scratch)
+}
+
+// `out` = a - b modulo the modulus.
+private @inline trusted fun bigSubBody(out: int, a: int, b: int, modulus: int, words: int): void {
+    var borrow = secretU32(u32(0))
+    for (j in 0 until words) {
+        val x = bnLoad(a + j * 4)
+        val y = bnLoad(b + j * 4)
+        val difference = x - y - borrow
+        borrow = ((~x & y) | ((~x | y) & difference)) >> 31
+        bnStore(out + j * 4, difference)
+    }
+    val adding = ctIsNonZero(borrow)
+    var carry = secretU64(u64(0))
+    for (j in 0 until words) {
+        val sum = bnLoad(out + j * 4).widen() + (bnLoad(modulus + j * 4) & adding).widen() + carry
+        bnStore(out + j * 4, sum.low())
+        carry = sum.high().widen()
+    }
+}
+
+// `out` is `a` where the mask has ones, `b` where it has zeros.
+private @inline trusted fun bigSelectBody(out: int, a: int, b: int, mask: secretU32, words: int): void {
+    for (j in 0 until words) bnStore(out + j * 4, ctSelect(mask, bnLoad(a + j * 4), bnLoad(b + j * 4)))
+}
+
+// All ones or zeros from one bit of a little-endian number.
+private @inline trusted fun bigBitMaskBody(scalar: int, bit: int): secretU32 = ctFromLowBit(bnLoad(scalar + (bit / 32) * 4) >> (bit % 32))
+
+// The borrow of value - modulus over all the limbs: set when value < modulus.
+private @inline trusted fun bigBelowBody(value: int, modulus: int, words: int): secretU32 {
+    var borrow = secretU32(u32(0))
+    for (j in 0 until words) {
+        val x = bnLoad(value + j * 4)
+        val y = bnLoad(modulus + j * 4)
+        val difference = x - y - borrow
+        borrow = ((~x & y) | ((~x | y) & difference)) >> 31
+    }
+    borrow
+}
+// END BIGNUM CHECKED CORES
+
+// The memory of a modulus's block, after checking that it is as large as its width needs (a forged object is a panic, not a wild access).
+private trusted fun bigDataAddress(data: BigModulusData): int {
+    if (data.storage.closed || !bigWordsValid(data.words) || data.storage.capacity < bigBlockWords(data.words) * 4) {
+        panic("BigModulus: its storage does not fit its width")
+    }
+    nativePointerAddress(data.storage.address)
+}
+
+// The memory of a number, after checking its storage and that it belongs to a modulus of its width.
+private trusted fun bigNumberAddress(number: BigNumber): int {
+    if (number.storage.closed || !bigWordsValid(number.words) || number.storage.capacity < bigNumberWords(number.words) * 4) {
+        panic("BigNumber: its storage does not fit its width")
+    }
+    if (number.modulus.get().words != number.words) panic("BigNumber: its width is not its modulus's")
+    nativePointerAddress(number.storage.address)
+}
+
+// What a prepared modulus block holds: where.
+private fun bigInverseAddress(block: int, words: int): int = block + words * 4
+private fun bigSquareAddress(block: int, words: int): int = block + words * 4 + 4
+private fun bigOneAddress(block: int, words: int): int = block + words * 8 + 4
+
+// Where a number's scratch is, after its value.
+private fun bigScratchAddress(number: int, words: int): int = number + words * 4
+
+// `out` = a * b in Montgomery form, in `scratch` of bnScratchWords(words).
+private trusted fun bigMultiply(out: int, a: int, b: int, block: int, words: int, scratch: int): void {
+    if (words >= 12 && bnWideLimbs(words)) bnMontgomeryMultiply64(out, a, b, block, bigInverseAddress(block, words), words, scratch)
+    else bnMontgomeryMultiply(out, a, b, block, bigInverseAddress(block, words), words, scratch)
+}
+
+// Temporary work: `count` limbs of zeroed memory, wiped and freed by bnRelease.
+private fun bigTemporaryWords(words: int): int = 2 * words + bnScratchWords(words)
+
+// Both numbers are well formed and the moduli are the same (the same prepared block, or the same width and value: a modulus is public).
+// Returns the address of the first number's modulus block.
+private trusted fun bigPair(a: BigNumber, b: BigNumber): int {
+    bigNumberAddress(a)
+    bigNumberAddress(b)
+    val x = bigDataAddress(a.modulus.get())
+    val y = bigDataAddress(b.modulus.get())
+    if (x != y && (a.words != b.words || !bnEqual(x, y, a.words))) panic("BigNumber: the two numbers belong to different moduli")
+    x
+}
+
+// A new number of `words` limbs, zero, of the modulus `data`.
+private trusted fun bigNewNumber(data: Shared<BigModulusData>, words: int): BigNumber {
+    val storage = nativeByteBuffer(bigNumberWords(words) * 4 + 8)
+    // Only the value is cleared: the scratch is written before it is read by every step that uses it.
+    bnClear(nativePointerAddress(storage.address), words)
+    BigNumber(data.clone(), move(storage), words)
+}
+
+private fun bigReversed(bytes: string): string {
+    val out: array<int> = []
+    var at = bytes.size - 1
+    while (at >= 0) {
+        out.append(int(bytes[at]))
+        at = at - 1
+    }
+    cryptoByteString(out)
+}
+
+/// The modulus whose value is `bytes` (big-endian unless `bigEndian` is false), or null: the size must be a multiple of 4 from 4 to 512 bytes and the value odd. The modulus is public.
+fun bigModulus(bytes: string, bigEndian: bool = true): BigModulus? {
+    if (bytes.size < 4 || bytes.size > BIG_MAXIMUM_WORDS * 4 || bytes.size % 4 != 0) return null
+    val words = bytes.size / 4
+    val last = if (bigEndian) int(bytes[bytes.size - 1]) else int(bytes[0])
+    if ((last & 1) == 0) return null
+    val ordered = if (bigEndian) bytes else bigReversed(bytes)
+    bigModulusFromBytes(ordered, words)
+}
+
+private trusted fun bigModulusFromBytes(bigEndian: string, words: int): BigModulus {
+    val storage = nativeByteBuffer(bigBlockWords(words) * 4 + 8)
+    val address = nativePointerAddress(storage.address)
+    val prepared = bnModulusFrom(nativeStringAddress(bigEndian), bigEndian.size, words)
+    bnCopy(address, prepared.memory, bigBlockWords(words))
+    bnModulusRelease(prepared)
+    BigModulus(Shared(BigModulusData(move(storage), words)))
+}
+
+/// The width of the modulus in bytes.
+fun BigModulus.width(): int = this.data.get().words * 4
+
+/// Zero.
+trusted fun BigModulus.zero(): BigNumber {
+    val words = this.data.get().words
+    bigDataAddress(this.data.get())
+    bigNewNumber(this.data, words)
+}
+
+/// One.
+trusted fun BigModulus.one(): BigNumber {
+    val words = this.data.get().words
+    val block = bigDataAddress(this.data.get())
+    val result = bigNewNumber(this.data, words)
+    bnCopy(nativePointerAddress(result.storage.address), bigOneAddress(block, words), words)
+    result
+}
+
+/// The number whose value is `bytes` (big-endian unless `bigEndian` is false), or null unless the bytes are exactly the width of the modulus and the value is below it. The check reads every byte whatever they are and only its answer (in range or not) is told, so the bytes may be a secret that is known to be in range or is refused. Bytes that may be any value of that width, or twice that, are made a number with reduce.
+trusted fun BigModulus.number(bytes: string, bigEndian: bool = true): BigNumber? {
+    val words = this.data.get().words
+    if (bytes.size != words * 4) return null
+    val block = bigDataAddress(this.data.get())
+    val ordered = if (bigEndian) bytes else bigReversed(bytes)
+    val result = bigNewNumber(this.data, words)
+    val value = nativePointerAddress(result.storage.address)
+    bnFromBytes(value, words, nativeStringAddress(ordered), ordered.size)
+    // Below the modulus: the borrow of value - modulus is set, found over all the limbs.
+    if (bigBelowBody(value, block, words).declassify() == u32(0)) return null
+    bigMultiply(value, value, bigSquareAddress(block, words), block, words, bigScratchAddress(value, words))
+    result
+}
+
+/// The number whose value is `bytes` (big-endian unless `bigEndian` is false) reduced modulo the modulus, in constant time, or null unless there are 1 to twice the width of them. For a hash or a clamped key of any size up to that.
+trusted fun BigModulus.reduce(bytes: string, bigEndian: bool = true): BigNumber? {
+    val words = this.data.get().words
+    if (bytes.size < 1 || bytes.size > words * 8) return null
+    val block = bigDataAddress(this.data.get())
+    val ordered = if (bigEndian) bytes else bigReversed(bytes)
+    val wide = bnAllocate(words * 2)
+    bnFromBytes(wide, words * 2, nativeStringAddress(ordered), ordered.size)
+    val result = bigNewNumber(this.data, words)
+    val value = nativePointerAddress(result.storage.address)
+    val scratch = bigScratchAddress(value, words)
+    val square = bigSquareAddress(block, words)
+    // low + high * R is low * R + (high * R) * R in Montgomery form: the encoding of low, and the encoding of the encoding of high.
+    val high = bnAllocate(words)
+    val low = bnAllocate(words)
+    val summed = bnAllocate(words)
+    bigMultiply(low, wide, square, block, words, scratch)
+    bigMultiply(high, wide + words * 4, square, block, words, scratch)
+    bigMultiply(high, high, square, block, words, scratch)
+    var carry = secretU64(u64(0))
+    for (j in 0 until words) {
+        val sum = bnLoad(low + j * 4).widen() + bnLoad(high + j * 4).widen() + carry
+        bnStore(summed + j * 4, sum.low())
+        carry = sum.high().widen()
+    }
+    bnConditionalSubtractBody(value, summed, carry.low(), block, words, scratch)
+    bnRelease(wide, words * 2)
+    bnRelease(high, words)
+    bnRelease(low, words)
+    bnRelease(summed, words)
+    result
+}
+
+/// A copy of the number.
+trusted fun BigNumber.copy(): BigNumber {
+    val address = bigNumberAddress(this)
+    bigDataAddress(this.modulus.get())
+    val result = bigNewNumber(this.modulus, this.words)
+    bnCopy(nativePointerAddress(result.storage.address), address, this.words)
+    result
+}
+
+/// This + other modulo the modulus. Both must belong to the same modulus.
+trusted fun BigNumber.add(other: BigNumber): BigNumber {
+    val block = bigPair(this, other)
+    val result = bigNewNumber(this.modulus, this.words)
+    val out = nativePointerAddress(result.storage.address)
+    bigAddBody(out, nativePointerAddress(this.storage.address), nativePointerAddress(other.storage.address), block, this.words, bigScratchAddress(out, this.words))
+    result
+}
+
+/// This - other modulo the modulus. Both must belong to the same modulus.
+trusted fun BigNumber.sub(other: BigNumber): BigNumber {
+    val block = bigPair(this, other)
+    val result = bigNewNumber(this.modulus, this.words)
+    bigSubBody(nativePointerAddress(result.storage.address), nativePointerAddress(this.storage.address), nativePointerAddress(other.storage.address), block, this.words)
+    result
+}
+
+/// This * other modulo the modulus. Both must belong to the same modulus.
+trusted fun BigNumber.mul(other: BigNumber): BigNumber {
+    val block = bigPair(this, other)
+    val result = bigNewNumber(this.modulus, this.words)
+    val out = nativePointerAddress(result.storage.address)
+    bigMultiply(out, nativePointerAddress(this.storage.address), nativePointerAddress(other.storage.address), block, this.words, bigScratchAddress(out, this.words))
+    result
+}
+
+/// This * this modulo the modulus.
+fun BigNumber.square(): BigNumber = this.mul(this)
+
+/// This raised to the power `exponent` (big-endian bytes) modulo the modulus. The exponent is public: the work depends on it, never on the number.
+trusted fun BigNumber.pow(exponent: string): BigNumber {
+    val a = bigNumberAddress(this)
+    val words = this.words
+    val block = bigDataAddress(this.modulus.get())
+    val result = bigNewNumber(this.modulus, words)
+    val out = nativePointerAddress(result.storage.address)
+    val scratch = bigScratchAddress(out, words)
+    bnCopy(out, bigOneAddress(block, words), words)
+    for (at in 0 until exponent.size) {
+        val byte = int(exponent[at])
+        var bit = 7
+        while (bit >= 0) {
+            bigMultiply(out, out, out, block, words, scratch)
+            if (((byte >> bit) & 1) == 1) bigMultiply(out, out, a, block, words, scratch)
+            bit = bit - 1
+        }
+    }
+    result
+}
+
+/// This where `mask` is all ones, other where it is zero (the mask comes from isEqual, bitMask or abla/ct). Both must belong to the same modulus.
+trusted fun BigNumber.select(other: BigNumber, mask: secretU32): BigNumber {
+    bigPair(this, other)
+    val result = bigNewNumber(this.modulus, this.words)
+    bigSelectBody(nativePointerAddress(result.storage.address), nativePointerAddress(this.storage.address), nativePointerAddress(other.storage.address), mask, this.words)
+    result
+}
+
+/// All ones when the two numbers are equal, zero when not, as a secret. Both must belong to the same modulus.
+trusted fun BigNumber.isEqual(other: BigNumber): secretU32 {
+    bigPair(this, other)
+    val a = nativePointerAddress(this.storage.address)
+    val b = nativePointerAddress(other.storage.address)
+    val words = this.words
+    var difference = secretU32(u32(0))
+    for (j in 0 until words) difference = difference | (bnLoad(a + j * 4) ^ bnLoad(b + j * 4))
+    ctIsZero(difference)
+}
+
+// The value out of Montgomery form, in a temporary the caller releases with bnRelease(address, bigTemporaryWords(words)).
+private trusted fun bigPlain(number: BigNumber): int {
+    val a = bigNumberAddress(number)
+    val words = number.words
+    val block = bigDataAddress(number.modulus.get())
+    val work = bnAllocate(bigTemporaryWords(words))
+    // work: the plain value, then 1, then the scratch.
+    ablaUnsafeStoreU32(bnPointer(work + words * 4), 1)
+    bigMultiply(work, a, work + words * 4, block, words, work + words * 8)
+    work
+}
+
+/// All ones when bit `index` (0 is the least significant) of the value is set, else zero, as a secret. `index` is public and below 8 * width.
+trusted fun BigNumber.bitMask(index: int): secretU32 {
+    if (index < 0 || index >= this.words * 32) panic("BigNumber.bitMask: the bit is outside the width")
+    val work = bigPlain(this)
+    val mask = bigBitMaskBody(work, index)
+    bnRelease(work, bigTemporaryWords(this.words))
+    mask
+}
+
+/// The value as `width` bytes (big-endian unless `bigEndian` is false). This is where a secret leaves the type: what is returned is no longer protected.
+trusted fun BigNumber.toBytes(bigEndian: bool = true): string {
+    val words = this.words
+    val work = bigPlain(this)
+    val out: array<int> = []
+    for (i in 0 until words * 4) {
+        val at = if (bigEndian) words * 4 - 1 - i else i
+        out.append(int((bnLoad(work + (at / 4) * 4) >> ((at % 4) * 8)).declassify() & u32(255)))
+    }
+    bnRelease(work, bigTemporaryWords(words))
+    cryptoByteString(out)
+}
+
+// --- In place: the same steps into a number that exists already ----------------------------------------------------
+// A loop that does the same operation thousands of times (a scalar multiplication) makes a number for every step with the functions above.
+// These write their result into `this` instead, which may be one of the operands.
+
+// This and both operands belong to one modulus; returns its block.
+private trusted fun bigTriple(target: BigNumber, a: BigNumber, b: BigNumber): int {
+    val block = bigPair(a, b)
+    bigPair(target, a)
+    block
+}
+
+/// This = a * b modulo the modulus. This may be a or b; the three must belong to the same modulus.
+trusted fun BigNumber.setMul(a: BigNumber, b: BigNumber): void {
+    val block = bigTriple(this, a, b)
+    val out = nativePointerAddress(this.storage.address)
+    bigMultiply(out, nativePointerAddress(a.storage.address), nativePointerAddress(b.storage.address), block, this.words, bigScratchAddress(out, this.words))
+}
+
+/// This = a + b modulo the modulus. This may be a or b; the three must belong to the same modulus.
+trusted fun BigNumber.setAdd(a: BigNumber, b: BigNumber): void {
+    val block = bigTriple(this, a, b)
+    val out = nativePointerAddress(this.storage.address)
+    bigAddBody(out, nativePointerAddress(a.storage.address), nativePointerAddress(b.storage.address), block, this.words, bigScratchAddress(out, this.words))
+}
+
+/// This = a - b modulo the modulus. This may be a or b; the three must belong to the same modulus.
+trusted fun BigNumber.setSub(a: BigNumber, b: BigNumber): void {
+    val block = bigTriple(this, a, b)
+    bigSubBody(nativePointerAddress(this.storage.address), nativePointerAddress(a.storage.address), nativePointerAddress(b.storage.address), block, this.words)
+}
+
+/// This = a where `mask` is all ones, b where it is zero. This may be a or b; the three must belong to the same modulus.
+trusted fun BigNumber.setSelect(a: BigNumber, b: BigNumber, mask: secretU32): void {
+    bigTriple(this, a, b)
+    bigSelectBody(nativePointerAddress(this.storage.address), nativePointerAddress(a.storage.address), nativePointerAddress(b.storage.address), mask, this.words)
+}
+
+/// This = a. The two must belong to the same modulus.
+trusted fun BigNumber.set(a: BigNumber): void {
+    bigPair(this, a)
+    bnCopy(nativePointerAddress(this.storage.address), nativePointerAddress(a.storage.address), this.words)
 }
