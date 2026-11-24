@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# abla/unsafe's raw-address functions and raw constructors can be used only from trusted code (#1226, decision #130 A):
-# the standard library marks them `@__abla_trusted_only("<phase>[ <release>]: <help>")` (src/sema.ab), as
-# tools/unsafe-trusted-only.tsv lists them. Checked here:
-#   - the marks and the list agree: every restricted declaration that is not already a trusted extern carries the marker, and
-#     no other declaration of abla/unsafe does;
+# abla/unsafe's raw-address functions and raw constructors (#1226, decision #130 A) and abla/sys's raw system calls (decision
+# #133 A) can be used only from trusted code: the standard library marks them
+# `@__abla_trusted_only("<phase>[ <release>]: <help>")` (src/sema.ab), as tools/unsafe-trusted-only.tsv and
+# tools/sys-trusted-only.tsv list them. Checked here:
+#   - the marks and the lists agree: every restricted declaration that is not already a trusted extern carries the marker, and
+#     no other declaration of abla/unsafe or abla/sys does;
 #   - with the standard library as it is (phase "warn"), a call from code that is not trusted builds and warns
 #     (warning[E_SEMANTIC]: native.trust:...), and stdlib-heavy programs build with no such warning (the library's own uses
 #     are trusted);
@@ -23,18 +24,22 @@ mkdir -p "$out"
 fail() { echo "unsafe trusted-only: $1" >&2; exit 1; }
 cases=tests/cases/trusted-only
 
-# The list and the marks.
-expected=$(awk -F'\t' 'NR > 1 && $6 == "restricted" && $2 != "trusted extern fun" { print $3 }' tools/unsafe-trusted-only.tsv | sort)
-marked=$(awk 'previous ~ /^@__abla_trusted_only/ {
-        line = $0
-        sub(/^(private |trusted |noescape |inline )*/, "", line)
-        sub(/^(resource class|class|fun|(noescape )?extern(:"[a-z]+")? fun) /, "", line)
-        sub(/[(<].*/, "", line)
-        print line
-    } { previous = $0 }' $(find stdlib/abla/unsafe -name '*.ab') | sort)
-[[ -n $expected ]] || fail 'no restricted declarations in tools/unsafe-trusted-only.tsv'
-[[ $expected == "$marked" ]] || fail "the marks and tools/unsafe-trusted-only.tsv differ: $(diff <(echo "$expected") <(echo "$marked") | head -6)"
-count=$(wc -l <<< "$expected")
+# The lists and the marks: tools/unsafe-trusted-only.tsv for abla/unsafe, tools/sys-trusted-only.tsv for abla/sys (#133 A).
+count=0
+for pair in unsafe-trusted-only.tsv:unsafe sys-trusted-only.tsv:sys; do
+    IFS=: read -r list module <<< "$pair"
+    expected=$(awk -F'\t' 'NR > 1 && $6 == "restricted" && $2 != "trusted extern fun" { print $3 }' "tools/$list" | sort)
+    marked=$(awk 'previous ~ /^@__abla_trusted_only/ {
+            line = $0
+            sub(/^(private |trusted |noescape |inline )*/, "", line)
+            sub(/^(resource class|class|fun|(noescape )?extern(:"[a-z]+")? fun) /, "", line)
+            sub(/[(<].*/, "", line)
+            print line
+        } { previous = $0 }' $(find "stdlib/abla/$module" -name '*.ab') | sort)
+    [[ -n $expected ]] || fail "no restricted declarations in tools/$list"
+    [[ $expected == "$marked" ]] || fail "the marks and tools/$list differ: $(diff <(echo "$expected") <(echo "$marked") | head -6)"
+    count=$((count + $(wc -l <<< "$expected")))
+done
 
 # build <stdlib> <name>: the program's build output in $out/<name>.log, its status in $status.
 build() {
@@ -57,9 +62,9 @@ done
 # Phase "error": every marker flipped, in a copy of the standard library.
 mkdir -p "$out/stdlib"
 cp -R stdlib/. "$out/stdlib/"
-find "$out/stdlib/abla/unsafe" -name '*.ab' -exec sed -i 's/^@__abla_trusted_only("warn 0.2.73/@__abla_trusted_only("error/' {} +
+find "$out/stdlib/abla/unsafe" "$out/stdlib/abla/sys" -name '*.ab' -exec sed -i 's/^@__abla_trusted_only("warn 0.2.73/@__abla_trusted_only("error/' {} +
 for refused in plain-call:nativePointerAddress constructor:NativeByteBuffer reference:nativePointerAddress \
-    compile-time:nativePointerAddress; do
+    compile-time:nativePointerAddress plain-syscall:linuxSyscall1; do
     IFS=: read -r name what <<< "$refused"
     build "$out/stdlib" "$name"
     [[ $status != 0 ]] || fail "$name built with the marker at error"
@@ -67,7 +72,8 @@ for refused in plain-call:nativePointerAddress constructor:NativeByteBuffer refe
 done
 grep -q 'help: allocate one with nativeByteBuffer(capacity)' "$out/constructor.log" || fail "constructor: no factory help: $(head -5 "$out/constructor.log")"
 grep -q 'help: wrap the call in a trusted function' "$out/plain-call.log" || fail "plain-call: no help: $(head -5 "$out/plain-call.log")"
-for accepted in trusted-call open; do
+grep -q 'help: call the abla/sys wrapper' "$out/plain-syscall.log" || fail "plain-syscall: no help: $(head -5 "$out/plain-syscall.log")"
+for accepted in trusted-call open trusted-syscall; do
     build "$out/stdlib" "$accepted"
     [[ $status == 0 ]] || fail "$accepted was refused: $(head -4 "$out/$accepted.log")"
     ! grep -q 'native.trust' "$out/$accepted.log" || fail "$accepted warned: $(head -3 "$out/$accepted.log")"
@@ -78,4 +84,4 @@ done
 build "$root/stdlib" reserved
 [[ $status != 0 ]] && grep -q 'annotation.reserved:__abla_trusted_only' "$out/reserved.log" ||
     fail "reserved: status $status: $(head -3 "$out/reserved.log")"
-echo "unsafe trusted-only: $count marks agree with the list; warn phase warns and builds, the standard library does not warn; at error a call, a constructor and a reference are refused, trusted code, factories and checked methods are not; the marker is the standard library's"
+echo "unsafe trusted-only: $count marks agree with the lists; warn phase warns and builds, the standard library does not warn; at error a call, a constructor, a reference and a raw system call are refused, trusted code, factories, checked methods and abla/sys's wrappers are not; the marker is the standard library's"
