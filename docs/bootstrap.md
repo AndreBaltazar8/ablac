@@ -213,6 +213,24 @@ Initially run it manually around releases, rather than adding five historical
 route builds to every push. Allow about 6–12 extra build minutes plus cold
 toolchain setup for route B; these are planning estimates, not a latency gate.
 
+## Windows release fixed points
+
+When [Release](../.github/workflows/release.yml) ships a Windows zip
+(`windows=with` for x64 or `windows_arm64=with` for ARM64), it runs the
+native fixed point on that architecture before publication. The packaged
+compiler builds stage 2, which then builds stage 3. The job compares their
+COFF objects, export definitions, and PE executables, runs hello with stage 3,
+and checks that a scalar compile-time probe runs natively in all three
+compilers. The dispatch-only `fixpoint` modes still let you choose the
+interpreter or native tier. The `only` modes exercise the packaged zip.
+
+For a publish-off run, [release-check.sh](../tools/release-check.sh) requires
+`PASS windows-fixpoint` or `PASS windows-arm64-fixpoint` for each Windows zip
+in the candidate assets. It reads that release run's job result and log,
+checks the digest of the zip the job used, and reports the matching stage 2
+and stage 3 PE SHA-256. Use the same release run ID when checking already
+downloaded or locally signed assets with `--artifacts`.
+
 ## Repository layout
 
 ```text

@@ -15,9 +15,11 @@ $sdk = (Resolve-Path -LiteralPath $LlvmRoot).Path
 $work = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildDirectory)
 $readobj = Join-Path $sdk 'bin/llvm-readobj.exe'
 $expected = (Get-Content "$archivePath.sha256" -Raw).Split(' ')[0]
-if ($expected -cnotmatch '^[0-9a-f]{64}$' -or (Get-FileHash $archivePath).Hash -ine $expected) {
+$archiveHash = (Get-FileHash $archivePath).Hash
+if ($expected -cnotmatch '^[0-9a-f]{64}$' -or $archiveHash -ine $expected) {
     throw 'The Windows toolchain zip does not match its SHA-256'
 }
+Write-Host "Windows fixed-point zip SHA-256: $archiveHash"
 
 New-Item -ItemType Directory -Path $work | Out-Null
 $seedRoot = Join-Path $work 'seed'

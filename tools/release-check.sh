@@ -21,6 +21,8 @@
 #               version, its module matches the manifest's hash and is at most 8 MB, and its stdlib bundle carries its hash in its name
 #   windows     abla-toolchain-x86_64-windows.zip and (as windows-arm64) ablac-windows-arm64.zip, when shipped. Checks layout,
 #               size caps and an architecture-matched console ablac.exe carrying this version and importing no C runtime
+#   windows-fixpoint / windows-arm64-fixpoint
+#               for each Windows zip, its native fixpoint job in <run-id> passed with equal stage 2 and 3 PE hashes
 #   siblings    (with --siblings) the downstream repositories build and pass their tests with the candidate
 #               (tools/test-siblings.sh over tools/siblings.txt)
 #
@@ -35,7 +37,7 @@
 #                         <tag> already names; while the tag does not exist yet, the head sha of the run <run-id>)
 #   --convergence-run ID  the bootstrap-convergence workflow run to check (default: the newest green one that matches)
 #   --convergence-comparison FILE
-#                         a downloaded comparison.json to check instead (with --lineage, no gh is needed)
+#                         a downloaded comparison.json to check instead (with --lineage, convergence needs no gh)
 #   --lineage TAG         the convergence lineage to expect (default: the highest published release below <tag>)
 #   --siblings TREE       the downstream step: check 6, siblings, runs tools/test-siblings.sh with TREE (the candidate's
 #                         tree, build/ablac built) over tools/siblings.txt; its summary goes to <out>/siblings
@@ -135,10 +137,12 @@ if [[ -n $artifacts ]]; then
 else
     source_dir=$(mktemp -d)
     trap 'rm -rf -- "$source_dir"' EXIT
-    if ! gh run download "$run_id" -R "$repo" -D "$source_dir" >/dev/null 2>&1; then
+    # Use the publish job's artifact set. Fixed-point logs and other diagnostics are checked separately.
+    if ! gh run download "$run_id" -R "$repo" --pattern 'ablac-*' -D "$source_dir" >/dev/null 2>&1; then
         echo "release-check: gh run download $run_id -R $repo failed" >&2
         exit 2
     fi
+    find "$source_dir" -type f -name static-suite-source.sha -delete
 fi
 # Two artifacts holding a file of the same name would overwrite each other in the flat directory:
 # list the names first and report a repeat.
@@ -441,16 +445,59 @@ fi
 # directory holding bin/ablac.exe, bin/llvm-objcopy.exe (--backtrace), share/abla/{runtime,stdlib} (with runtime/windows/imports/*.txt) and share/licenses; no repository or build
 # metadata; at most 150 MB as an archive and 400 MB unpacked; ablac.exe carries this version's string and, read by tools/pe-info (built by the
 # release's Linux compiler), is a console PE32+ image for the selected architecture with no C runtime import. The Windows job
-# of the release exercises it on a Windows runner.
+# of the release exercises it on a Windows runner. Check its native self-build in the same run against this exact zip.
+windows_jobs=
+if [[ -f $out/abla-toolchain-x86_64-windows.zip || -f $out/ablac-windows-arm64.zip ]]; then
+    windows_jobs=$(gh run view "$run_id" -R "$repo" --json workflowName,jobs --jq \
+        'select(.workflowName == "Release") | .jobs[] | [.name, .status, .conclusion, .databaseId] | @tsv' 2>/dev/null) || windows_jobs=
+fi
+
+check_windows_fixpoint() {
+    local label=$1 archive=$2 job_name=$3 job log zip_hash stages
+    local job_pattern='^completed success ([1-9][0-9]*)$'
+    local stages_pattern='^([[:xdigit:]]{64}) ([[:xdigit:]]{64})$'
+    job=$(awk -F '\t' -v name="$job_name" '$1 == name { print $2, $3, $4 }' <<< "$windows_jobs")
+    if [[ ! $job =~ $job_pattern ]]; then
+        report FAIL "$label" "run $run_id has no unique successful $job_name job"
+        return
+    fi
+    if ! log=$(gh run view "$run_id" -R "$repo" --job "${BASH_REMATCH[1]}" --log 2>/dev/null); then
+        report FAIL "$label" "cannot read $job_name logs for run $run_id"
+        return
+    fi
+    log=${log//$'\r'/}
+    zip_hash=$(awk '/ Windows fixed-point zip SHA-256: / { print $NF }' <<< "$log")
+    if [[ ! $zip_hash =~ ^[[:xdigit:]]{64}$ || ${zip_hash,,} != "$(sha256 "$archive")" ]]; then
+        report FAIL "$label" "$job_name did not verify this Windows zip"
+        return
+    fi
+    stages=$(awk '/ ablac\.exe stage2 / && $(NF-1) == "stage3" {
+        sub(/,$/, "", $(NF-2)); print $(NF-2), $NF
+    }' <<< "$log")
+    if [[ ! $stages =~ $stages_pattern || ${BASH_REMATCH[1],,} != "${BASH_REMATCH[2],,}" ]]; then
+        report FAIL "$label" "$job_name has missing or different stage 2/3 PE hashes"
+        return
+    fi
+    local fixed_pe=${BASH_REMATCH[1],,}
+    if ! grep -qE ' Windows stage2 == stage3 \(native\)$' <<< "$log"; then
+        report FAIL "$label" "$job_name did not complete the native tier"
+        return
+    fi
+    report PASS "$label" "run $run_id native stage 2/3 PE SHA-256 $fixed_pe"
+}
+
 for windows_machine in x86_64 aarch64; do
     top=abla-toolchain-$windows_machine-windows
     zipfile=$out/$top.zip
     check=windows
+    job_name=windows-fixpoint
     if [[ $windows_machine == aarch64 ]]; then
         zipfile=$out/ablac-windows-arm64.zip
         check=windows-arm64
+        job_name='windows-arm64 / Compare two native ARM64 compiler self-builds'
     fi
     [[ -f $zipfile ]] || continue
+    check_windows_fixpoint "$check-fixpoint" "$zipfile" "$job_name"
     size=$(stat -c %s "$zipfile")
     if ((size > 150 * 1048576)); then
         report FAIL "$check" "the archive is $((size / 1048576)) MB (cap 150)"

@@ -79,6 +79,9 @@ for name in assets sha256 version stage2 convergence; do
 done
 grep -q '^RESULT: PASS' <<<"$output" || fail "no RESULT: PASS"
 grep -q '^SKIP  signature' <<<"$output" || { echo "$output" >&2; fail "an unsigned run's artifacts: no SKIP for the signature check"; }
+if grep -qE '^(PASS|FAIL)  windows(-arm64)?-fixpoint' <<<"$output"; then
+    fail "a release without Windows zips required Windows fixed points"
+fi
 grep -q 'tools/sign-release.sh' <<<"$output" || fail "a passing unsigned release names no next step (sign it)"
 # A directory signed by a key that is not release-signing.pub fails the signature check.
 ssh-keygen -q -t ed25519 -N '' -C stranger -f "$work/stranger" >/dev/null
@@ -123,7 +126,39 @@ if command -v llvm-mc >/dev/null && command -v lld-link >/dev/null &&
         (cd "$windows_tree" && zip -q -r "$directory/$asset" "$top")
         (cd "$directory" && sha256sum "$asset" > "$asset.sha256")
     }
-    check_windows() { ABLA_PE_INFO="$work/pe-info" run_check "$directory" v9.9.9 "$stage2"; }
+    windows_gh=$work/windows-gh
+    mkdir "$windows_gh"
+    cat > "$windows_gh/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == run && $3 == 1 && $4 == -R && $5 == AndreBaltazar8/ablac ]] || exit 2
+if [[ $2 == download ]]; then
+    [[ $6 == --pattern && $7 == 'ablac-*' && $8 == -D ]] || exit 2
+    cp -p "$FIXPOINT_ASSETS/"* "$9/"
+    touch "$9/static-suite-source.sha"
+    exit 0
+fi
+[[ $2 == view ]] || exit 2
+case $6 in
+    --json) [[ $7 == workflowName,jobs ]] && cat "$FIXPOINT_RESPONSE/jobs" ;;
+    --job) [[ $8 == --log ]] && cat "$FIXPOINT_RESPONSE/job-$7" ;;
+    *) exit 2 ;;
+esac
+SH
+    chmod +x "$windows_gh/gh"
+    windows_jobs() {
+        printf 'windows-fixpoint\tcompleted\t%s\t11\n' "$1"
+        printf 'windows-arm64 / Compare two native ARM64 compiler self-builds\tcompleted\t%s\t22\n' "$2"
+    }
+    fixture_fixpoint_log() { # zip, stage 2, stage 3, tier
+        printf 'job\tstep\t2026-01-01T00:00:00Z Windows fixed-point zip SHA-256: %s\r\n' "$(sha "$1")"
+        printf 'job\tstep\t2026-01-01T00:00:00Z ablac.exe stage2 %s, stage3 %s\r\n' "$2" "$3"
+        printf 'job\tstep\t2026-01-01T00:00:00Z Windows stage2 == stage3 (%s)\r\n' "$4"
+    }
+    check_windows() {
+        PATH="$windows_gh:$PATH" FIXPOINT_RESPONSE="$windows_gh" ABLA_PE_INFO="$work/pe-info" \
+            run_check "$directory" v9.9.9 "$stage2"
+    }
 
     directory=$(mutated windows-arm64)
     asset=ablac-windows-arm64.zip
@@ -134,8 +169,48 @@ if command -v llvm-mc >/dev/null && command -v lld-link >/dev/null &&
     pe_fixture aarch64 arm64 9.9.9 "$work/arm64.exe"
     cp "$work/arm64.exe" "$windows_tree/$top/bin/llvm-objcopy.exe"
     package_fixture "$work/arm64.exe"
+    fixed_pe=$(hex64 0 a)
+    windows_jobs skipped success > "$windows_gh/jobs"
+    fixture_fixpoint_log "$directory/$asset" "$fixed_pe" "${fixed_pe^^}" native > "$windows_gh/job-22"
     output=$(check_windows) || { echo "$output" >&2; fail 'release-check rejected the ARM64 zip'; }
     grep -q '^PASS  windows-arm64 ' <<< "$output" || fail 'no PASS for the ARM64 zip'
+    grep -q "^PASS  windows-arm64-fixpoint .* $fixed_pe$" <<< "$output" || fail 'no matching ARM64 stage 2/3 PE hash'
+
+    # A two-architecture release must have independent green, native jobs for its exact zips.
+    arm_asset=$asset arm_top=$top
+    asset=abla-toolchain-x86_64-windows.zip
+    top=abla-toolchain-x86_64-windows
+    cp -R "$windows_tree/$arm_top" "$windows_tree/$top"
+    pe_fixture x86_64 x64 9.9.9 "$work/x64.exe"
+    cp "$work/x64.exe" "$windows_tree/$top/bin/llvm-objcopy.exe"
+    package_fixture "$work/x64.exe"
+    windows_jobs success success > "$windows_gh/jobs"
+    fixture_fixpoint_log "$directory/$asset" "$fixed_pe" "$fixed_pe" native > "$windows_gh/job-11"
+    output=$(PATH="$windows_gh:$PATH" FIXPOINT_RESPONSE="$windows_gh" FIXPOINT_ASSETS="$directory" \
+        ABLA_PE_INFO="$work/pe-info" "$check" v9.9.9 1 "$stage2" --assets-from "$work/names.txt" \
+        --out "$work/windows-both-out" "${convergence_flags[@]}") ||
+        { echo "$output" >&2; fail 'release-check rejected two green fixed points'; }
+    for label in windows-fixpoint windows-arm64-fixpoint; do
+        grep -q "^PASS  $label " <<< "$output" || fail "no PASS for $label"
+    done
+    windows_jobs success failure > "$windows_gh/jobs"
+    expect_fail 'a red ARM64 fixed point next to a green x64 one' check_windows
+    grep -q '^FAIL  windows-arm64-fixpoint .*no unique successful' "$work/out.txt"
+    windows_jobs success skipped > "$windows_gh/jobs"
+    expect_fail 'an ARM64 zip with a skipped fixed point' check_windows
+    grep -q '^FAIL  windows-arm64-fixpoint .*no unique successful' "$work/out.txt"
+    windows_jobs success success > "$windows_gh/jobs"
+    fixture_fixpoint_log "$directory/$asset" "$fixed_pe" "$(hex64 0 b)" native > "$windows_gh/job-11"
+    expect_fail 'different x64 stage 2/3 PE hashes' check_windows
+    grep -q '^FAIL  windows-fixpoint .*different stage 2/3 PE hashes' "$work/out.txt"
+    fixture_fixpoint_log "$directory/$asset" "$fixed_pe" "$fixed_pe" interp > "$windows_gh/job-11"
+    expect_fail 'a green interpreter run for a release zip' check_windows
+    grep -q '^FAIL  windows-fixpoint .*did not complete the native tier' "$work/out.txt"
+    fixture_fixpoint_log "$directory/$arm_asset" "$fixed_pe" "$fixed_pe" native > "$windows_gh/job-11"
+    expect_fail 'a fixed point for different zip bytes' check_windows
+    grep -q '^FAIL  windows-fixpoint .*did not verify this Windows zip' "$work/out.txt"
+    rm "$directory/$asset" "$directory/$asset.sha256"
+    asset=$arm_asset top=$arm_top
 
     "$project_root/tools/release-sbom.sh" v9.9.9 "$directory" "$work/windows-arm64.spdx.json"
     sdk_pin=$project_root/nix/llvm-windows-arm64-static-pin.json
@@ -169,7 +244,7 @@ if command -v llvm-mc >/dev/null && command -v lld-link >/dev/null &&
     package_fixture "$work/arm64.exe"
     expect_fail 'an ARM64 zip without llvm-objcopy.exe' check_windows
     grep -q '^FAIL  windows-arm64.*no bin/llvm-objcopy.exe' "$work/out.txt"
-    echo 'release scripts: ARM64 zip and SDK SBOM passed, wrong machine/version, CRT import and missing tool refused'
+    echo 'release scripts: Windows native fixed points, ARM64 zip and SDK SBOM passed; bad evidence and bad PE packages refused'
 else
     echo 'release scripts: skipped the Windows ARM64 fixtures (requires LLVM tools, jq, zip and unzip)'
 fi

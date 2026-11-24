@@ -36,8 +36,8 @@ Checksums accompany the published compiler and toolchain assets.
 | WebAssembly hosted | T2 | No Wasm-hosted compiler gate | Release/development modules execute with the `abla_host` ABI under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | WebAssembly hostless | T2 | No Wasm-hosted compiler gate | Import-free runtime fixtures and differential programs execute under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | Xtensa / ESP32 | T3 | No compiler hosted on the microcontroller | Object/assembly checks and optional companion integration; no required board run | No ablac ESP32 binary; separately versioned LLVM companion |
-| Windows x86-64 | T2 | The packaged `ablac.exe` is exercised on `windows-latest` in a nightly master smoke test, on manual dispatch, and in release runs; the Windows self-build is dispatch-only | Cross-built on Linux; the freestanding exit-status program, the hosted crash program with its symbolized backtrace, and selected hosted programs run natively on `windows-latest` in CI | None in v0.2.64; `abla-toolchain-x86_64-windows.zip` shipped in v0.2.68 |
-| Windows ARM64 | T2 | Native compiler link and packaged smoke on `windows-11-arm` in release runs | Hosted programs cross-built on Linux and run natively on `windows-11-arm` in CI | None in v0.2.64. `ablac-windows-arm64.zip` starts with v0.2.69. |
+| Windows x86-64 | T2 | Packaged compiler smoke on `windows-latest` nightly and on dispatch; native fixed point required when the zip ships | Cross-built on Linux; the freestanding exit-status program, the hosted crash program with its symbolized backtrace, and selected hosted programs run natively on `windows-latest` in CI | None in v0.2.64; `abla-toolchain-x86_64-windows.zip` shipped in v0.2.68 |
+| Windows ARM64 | T2 | Packaged compiler smoke and native fixed point on `windows-11-arm` required when the zip ships | Hosted programs cross-built on Linux and run natively on `windows-11-arm` in CI | None in v0.2.64. `ablac-windows-arm64.zip` starts with v0.2.69. |
 <!-- readiness-platforms:end -->
 
 `tools/readiness.sh` reads this marked table directly. Update
@@ -219,7 +219,8 @@ It checks the zip's checksum, then exercises the installed compiler on
 `windows-latest` with only System32 on `PATH`. The smoke test builds and runs
 hello and a program that imports a project module, checks `--backtrace`, and
 repeats the checks after moving the toolchain to a path with a space.
-In Release, `windows: fixpoint` adds the compiler's self-build on a Windows runner.
+Release runs the [native fixed point](bootstrap.md#windows-release-fixed-points)
+for each shipped Windows zip. `windows: fixpoint` exercises it on demand.
 
 ARM64. Job `windows-arm64-cross` cross-builds hosted programs and
 `windows-arm64-run`, **Windows ARM64 program runtime**, runs the checked
@@ -237,8 +238,8 @@ only System32 on `PATH` and from a moved toolchain in a path with a space.
 The release check validates the zip layout, size, version and console PE
 architecture and rejects a compiler with C runtime DLL imports.
 
-The ARM64 compiler still needs a native self-build and full standard-library
-suite. The release compiler runs the COFF linker in process. Development
+The ARM64 compiler still needs a full standard-library suite. The release
+compiler runs the COFF linker in process. Development
 compilers built without lld invoke the external `lld-link`. Of the
 standard library's test programs (`tests/abla-tests.json`), those in
 `programs.txt` run on Windows; the rest of the survey is blocked by:
