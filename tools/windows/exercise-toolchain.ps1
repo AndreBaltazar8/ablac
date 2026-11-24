@@ -2,7 +2,7 @@
 # abla-toolchain-x86_64-windows.zip, then with a PATH that holds nothing but System32 (no clang, no lld-link, no LLVM, no git, no
 # Windows SDK) from a directory that is not the toolchain's
 #   - `bin\ablac.exe --version` prints `ablac <version>` (the version the release was built as);
-#   - a hello-world program builds and runs and prints what it should;
+#   - a hello-world program builds and runs with the compiler's default cache;
 #   - a program that imports a project module builds and runs;
 #   - `--backtrace` builds (the packaged llvm-objcopy.exe is found beside ablac.exe, with no PATH to find it by);
 #   - the toolchain moved to another directory still works (it finds its sysroot beside its own image).
@@ -182,11 +182,12 @@ function Check-Toolchain([string]$root, [string]$label) {
     $work = Join-Path $temp "work-$label"
     New-Item -ItemType Directory -Path $work | Out-Null
     Set-Location $work
+    $env:ABLA_CACHE_DIR = Join-Path $work 'compiler-cache'
     Set-Content -Path hello.ab -Encoding ascii -Value @'
 import "abla/io"
 fun main { println("hello from abla on windows") }
 '@
-    Run $ablac @('build', 'hello.ab', '-o', 'hello.exe', '--no-cache') "$label build hello" | Out-Null
+    Run $ablac @('build', 'hello.ab', '-o', 'hello.exe') "$label build hello with default cache" | Out-Null
     Check-Arm64Image (Join-Path $work 'hello.exe')
     $said = (Run (Join-Path $work 'hello.exe') @() "$label run hello").Trim()
     if ($said -cne 'hello from abla on windows') { Fail "$label hello printed '$said'" }
@@ -200,7 +201,7 @@ fun main { println("answer ${answer()}") }
     Check-Arm64Image (Join-Path $work 'project.exe')
     $said = (Run (Join-Path $work 'project.exe') @() "$label run project").Trim()
     if ($said -cne 'answer 42') { Fail "$label project printed '$said'" }
-    Run $ablac @('build', 'hello.ab', '-o', 'hello-backtrace.exe', '--no-cache', '--backtrace') "$label build --backtrace" | Out-Null
+    Run $ablac @('build', 'hello.ab', '-o', 'hello-backtrace.exe', '--no-cache', '--backtrace') "$label build --no-cache --backtrace" | Out-Null
     Check-Arm64Image (Join-Path $work 'hello-backtrace.exe')
     if ($Architecture -eq 'arm64' -and !(Test-Path -LiteralPath (Join-Path $work 'hello-backtrace.exe.debug') -PathType Leaf)) {
         Fail "$label --backtrace did not produce split debug information"
@@ -215,4 +216,4 @@ $second = Join-Path $temp 'relocated\somewhere else'
 New-Item -ItemType Directory -Path (Split-Path -Parent $second) -Force | Out-Null
 Move-Toolchain $top $second
 Check-Toolchain $second 'moved'
-Write-Host "windows toolchain: ablac $Version builds and runs programs from the unpacked and the moved toolchain with only System32 on the PATH"
+Write-Host "windows toolchain: ablac $Version builds with the default cache and with --no-cache, and runs programs from the unpacked and moved toolchain with only System32 on the PATH"
