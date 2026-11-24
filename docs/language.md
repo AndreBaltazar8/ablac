@@ -2965,9 +2965,13 @@ trusted fun checkedRead(buffer: NativeBuffer, offset: int): int {
 
 Calling `platformRead` from an ordinary function is an error
 (`native.trust:platformRead`). Calling the checked wrapper is ordinary safe
-code: the `trusted` function is where the safety argument lives. The intended
-policy also requires a package-manifest grant before a non-platform package
-may define a trusted implementation. That manifest check is not enforced yet.
+code: the `trusted` function is where the safety argument lives. A dependency
+may define a `trusted` function, or declare an `extern`, only when the root
+manifest names it under `[dependencyCompileCapabilities]` as
+`name = ["trusted.native"]` and `abla.lock` pins its digest; otherwise the
+build fails with `E_PACKAGE_TRUSTED_DENIED`
+([packages.md](packages.md#trusted-and-extern-code-in-a-dependency)). The root
+project and the standard library define trusted code freely.
 
 Object addresses are runtime-internal. The intrinsics that yield the address of
 a value, an object, a field, a cell or an array (`ablaRuntimeValueAddress`,

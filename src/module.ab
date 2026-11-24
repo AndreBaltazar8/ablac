@@ -1658,6 +1658,48 @@ fun bootstrapCompilePackageOwners(
     owners
 }
 
+/**
+ * The definitions in `snapshot` that give a dependency raw memory or system access: each `trusted` function and each
+ * `extern` declaration but the compile-time `compiler` and `parser` ones, as "name\tline" (decision #122 A). The
+ * calling side needs no check: a trusted call is already refused outside trusted code (native.trust), and an
+ * `extern:"c"` declaration is callable from ordinary code, so the declaration is what the root has to allow.
+ */
+fun bootstrapPackageTrustedDefinitions(snapshot: BootstrapModuleSnapshot): array<string> {
+    val found: array<string> = []
+    for (declaration in snapshot.discovery.declarations) {
+        bootstrapPackageTrustedCollect(snapshot.source, declaration, found)
+        for (method in declaration.methods) bootstrapPackageTrustedCollect(snapshot.source, method, found)
+    }
+    found
+}
+
+/** Appends `declaration`'s "name\tline" to `found` when it is one of those (bootstrapPackageTrustedDefinitions). */
+fun bootstrapPackageTrustedCollect(source: string, declaration: BootstrapDeclaration, var found: array<string>) {
+    val external = declaration.kind == "extern" && declaration.externalLibrary != "compiler" &&
+        declaration.externalLibrary != "parser"
+    if (!declaration.isTrusted && !external) return
+    var line = 1
+    var at = 0
+    val limit = if (declaration.begin < source.size) declaration.begin else source.size
+    while (at < limit) {
+        if (source[at] == 10) line = line + 1
+        at = at + 1
+    }
+    // A module-private name carries its module's mangling: `__abla_module_<hex>__name`.
+    var name = declaration.name
+    if (name.startsWith("__abla_module_")) {
+        val separator = name.slice(14, name.size).indexOf("__")
+        if (separator >= 0) name = name.slice(14 + separator + 2, name.size)
+    }
+    found.append("$name\t$line")
+}
+
+/** Whether `list` holds `name`. */
+fun bootstrapPackageNameListed(list: array<string>, name: string): bool {
+    for (each in list) if (each == name) return true
+    false
+}
+
 class BootstrapCompilePackagePlan(
     val errors: int,
     val diagnostics: string,
@@ -1699,6 +1741,9 @@ fun bootstrapPlanCompilePackageGrants(
     // What the root allows each locked package by name, beyond the default.
     val namedPackages: array<string> = []
     val namedEffects: array<int> = []
+    // The pinned packages whose line holds trusted.native: they may define trusted code (#122 A), whatever the root's
+    // own compileCapabilities say; compile-time native code keeps that ceiling (namedEffects).
+    val trustedPackages: array<string> = []
     for (line in bootstrapManifestNamedCompileGrants(manifest)) {
         val tab = line.indexOf("\t")
         val name = line.slice(0, tab)
@@ -1710,7 +1755,8 @@ fun bootstrapPlanCompilePackageGrants(
         val names = line.slice(tab + 1, line.size).split(",")
         val effects = bootstrapCompileEffectsOfNames(names)
         for (capability in names) {
-            if (capability != "" && !bootstrapCompileEffectHas(authorized, bootstrapCompileEffectFromName(capability))) {
+            if (capability != "" && capability != "trusted.native" &&
+                !bootstrapCompileEffectHas(authorized, bootstrapCompileEffectFromName(capability))) {
                 errors = errors + 1
                 diagnostics = "${diagnostics}error[E_PACKAGE_CAPABILITY_DENIED]: root manifest '$manifest' grants dependency '$name' compile capability '$capability' by name, but not in its own compileCapabilities, which bound every package's\n"
             }
@@ -1722,6 +1768,7 @@ fun bootstrapPlanCompilePackageGrants(
         } else {
             namedPackages.append(name)
             namedEffects.append(bootstrapBuildCompileEffectGrants(effects, authorized))
+            if (bootstrapPackageNameListed(names, "trusted.native")) trustedPackages.append(name)
         }
     }
     val owned = bootstrapCompilePackageOwners(snapshots, importTargets, rootDirectory, entryAbsolute, locked)
@@ -1741,6 +1788,19 @@ fun bootstrapPlanCompilePackageGrants(
         val package = owned[ownedIndex]
         ownedIndex = ownedIndex + 1
         val requested = bootstrapBuildCompileEffectRequests(snapshot.discovery)
+        if (package != "") {
+            val definitions = if (bootstrapPackageNameListed(trustedPackages, package)) [] else bootstrapPackageTrustedDefinitions(snapshot)
+            for (definition in definitions) {
+                val tab = definition.indexOf("\t")
+                val function = definition.slice(0, tab)
+                val line = definition.slice(tab + 1, definition.size)
+                errors = errors + 1
+                diagnostics = if (package == "?")
+                    "${diagnostics}error[E_PACKAGE_TRUSTED_DENIED]: '$function' at ${snapshot.path}:$line defines trusted or extern code in a package copy the project at '$rootDirectory' doesn't lock; lock the package, then name it in the root manifest\n"
+                else
+                    "${diagnostics}error[E_PACKAGE_TRUSTED_DENIED]: dependency '$package' defines trusted or extern code ('$function' at ${snapshot.path}:$line) without a grant; to allow it, add to the root manifest '$manifest' under [dependencyCompileCapabilities]: $package = [\"trusted.native\"]\n"
+            }
+        }
         var index = 0
         while (index < packages.size && packages[index] != package) index = index + 1
         if (index == packages.size) {

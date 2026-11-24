@@ -533,6 +533,8 @@ toolchain, an SDK), as the root's own code may.
 
 A named grant holds only while `abla.lock` pins that package's content digest (else
 `E_PACKAGE_CAPABILITY_UNPINNED`), and never beyond the root's own list (`E_PACKAGE_CAPABILITY_DENIED`).
+The line for `trusted.native` also lets the dependency define trusted code, and that effect does not need the root's own
+list ([packages.md](packages.md#trusted-and-extern-code-in-a-dependency)).
 A dependency that requests a capability its `abla.toml` doesn't declare stops the build with
 `E_COMPILE_CAPABILITY_UNDECLARED`, naming the module and the capability. The check is the same for a
 dependency of a dependency.
@@ -1491,3 +1493,4 @@ The `source[...]` lines are the same places for tools, in byte offsets.
 | `E_EXT_SUBPARSER_REGISTRATION` | an invalid or duplicate subparser registration, or one made from compile-time code |
 | `E_EXT_GENERATED_MODULE_PHASE` | `compilerGenerateModule` ran after the program was analyzed (outside a transform) |
 | `E_PACKAGE_CAPABILITY_DENIED` | a dependency asks for a capability the root project doesn't authorize |
+| `E_PACKAGE_TRUSTED_DENIED` | a dependency defines a `trusted` function or declares an `extern` and the root's `[dependencyCompileCapabilities]` has no `trusted.native` line for it ([packages.md](packages.md#trusted-and-extern-code-in-a-dependency)) |

@@ -391,6 +391,22 @@ project's `abla.toml` authorizes them. Preparation fails before compilation
 with `E_PACKAGE_CAPABILITY_DENIED` naming the dependency, locked revision,
 source identity, requested capability, and root manifest.
 
+### Trusted and extern code in a dependency
+
+The one line `fast-json = ["trusted.native"]` in the root's `[dependencyCompileCapabilities]` has two separate effects:
+
+1. **Runtime code.** The dependency may define `trusted` functions and `extern` declarations (an `extern:"c"` declaration
+   can be called from ordinary code, so it is the way to raw memory and system calls without `trusted`). Without the
+   line, the build fails with `E_PACKAGE_TRUSTED_DENIED`, naming the dependency, the function, its file and line, and
+   the line to add. This needs only the line and a digest in `abla.lock`; the root's own `compileCapabilities` need not
+   list `trusted.native`. The root project and the standard library define such code freely. A dependency of a
+   dependency needs a line of its own: the root names every package that defines it.
+2. **Compile-time native code.** The dependency's `#` code may run native code only if the root also lists
+   `trusted.native` in its own `compileCapabilities`, which bound every package
+   ([compile-time.md](compile-time.md#grants-per-package)).
+
+A library that only defines trusted code needs the first effect alone.
+
 Legacy manifest `[dependencies]` entries using inline `git` plus exactly one
 of `rev`, `tag`, or `branch` remain accepted and share the same lock graph.
 Provider expressions are preferred because they are typed and composable Abla

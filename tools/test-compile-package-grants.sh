@@ -142,8 +142,8 @@ repository "$out/native/native-dep" native-dep '"trusted.native"' "$native"
 commit "$out/native/native-dep" dependency
 application native '"trusted.native"' native-dep
 build native
-[[ $status != 0 ]] && grep -q 'trusted.native' "$out/native.log" ||
-    fail "native: a dependency got trusted.native without a named grant (status $status)"
+[[ $status != 0 ]] && grep -q 'E_PACKAGE_TRUSTED_DENIED' "$out/native.log" ||
+    fail "native: a dependency got its C declaration without a named grant (status $status)"
 cp -r "$out/native" "$out/native-named"
 rm -rf "$out/native-named/application/.abla" "$out/native-named/application/abla.lock"
 application native-named '"trusted.native"' native-dep "$(printf '[dependencyCompileCapabilities]\nnative-dep = ["trusted.native"]')"
@@ -231,7 +231,11 @@ for kind in reader native; do
     [[ $kind == native ]] && source=$jit_native
     repository "$out/$case/quiet-dep" quiet-dep '' "$source"
     commit "$out/$case/quiet-dep" dependency
-    application "$case" '"environment", "trusted.native"' quiet-dep
+    # The dependency defines C declarations, so it holds the root's trusted.native line (#122 A); it still requests no
+    # compile capability, so its sites get none.
+    named=""
+    [[ $kind == native ]] && named=$(printf '[dependencyCompileCapabilities]\nquiet-dep = ["trusted.native"]')
+    application "$case" '"environment", "trusted.native"' quiet-dep "$named"
     # The root's own site holds both grants, so the generation is made with them.
     cat >> "$out/$case/application/src/main.ab" <<'EOF'
 import "abla/compiler"
