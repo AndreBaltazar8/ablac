@@ -1322,6 +1322,32 @@ fun bootstrapLlvmInlineLinuxSyscall(
     )
 }
 
+// A valgrind client request (`ablaValgrindRequest`, #1217): the special instruction sequence valgrind's valgrind.h
+// emits, which does nothing on the CPU (each register rotates by 128 bits in all, and the exchange or or is of a register
+// with itself) and which valgrind recognises: it reads the request and its five arguments from the six words at
+// `arguments` and answers in the result register, which holds `fallback` when no valgrind runs the program. x86-64:
+// arguments in rax, fallback and result in rdx. AArch64: arguments in x4, fallback and result in x3. Linux only (the
+// targets valgrind runs); elsewhere the answer is `fallback`.
+fun bootstrapLlvmValgrindTarget(backend: BootstrapLlvmBackend): bool =
+    !backend.macOS && bootstrapTextContains(backend.targetTriple, "linux") &&
+    !bootstrapTextContains(backend.targetTriple, "android") && !bootstrapTextContains(backend.targetTriple, "gnux32") &&
+    (bootstrapTextContains(backend.targetTriple, "x86_64") || bootstrapTextContains(backend.targetTriple, "aarch64"))
+
+fun bootstrapLlvmInlineValgrindRequest(backend: BootstrapLlvmBackend, arguments: i64*, fallback: i64*): i64* {
+    if (!bootstrapLlvmValgrindTarget(backend)) return fallback
+    val type = bootstrapLlvmFunctionType(backend, backend.i64Type, [backend.i64Type, backend.i64Type])
+    val arm = bootstrapTextContains(backend.targetTriple, "aarch64")
+    val assembly = if (arm) "ror x12, x12, #3\n\tror x12, x12, #13\n\tror x12, x12, #51\n\tror x12, x12, #61\n\torr x10, x10, x10"
+        else "rolq $$3, %rdi\n\trolq $$13, %rdi\n\trolq $$61, %rdi\n\trolq $$51, %rdi\n\txchgq %rbx, %rbx"
+    val constraints = if (arm) "={x3},{x4},{x3},~{memory},~{cc}"
+        else "={dx},{ax},{dx},~{memory},~{dirflag},~{fpsr},~{flags}"
+    bootstrapLlvmCallTyped(
+        backend, type,
+        LLVMGetInlineAsm(type, assembly, assembly.size, constraints, constraints.size, 1, 0, 0, 0),
+        [arguments, fallback], "valgrind.request"
+    )
+}
+
 // A macOS (not iOS) program issues BSD system calls with the instruction itself
 // (#811): arm64 `svc #0x80` with the number in x16, x86-64 `syscall` with the
 // number in rax or'ed with the 0x2000000 BSD class here. The kernel signals

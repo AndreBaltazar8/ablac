@@ -624,6 +624,7 @@ test-serial: ablac
 	tools/test-android-link.sh $(COMPILER)
 	tools/test-android-run.sh $(COMPILER)
 	tools/test-foreign-threads.sh $(COMPILER)
+	tools/test-valgrind.sh $(COMPILER)
 	tools/test-gc-threads.sh $(COMPILER)
 	tools/test-x64-library.sh $(COMPILER)
 	tools/test-android-rpc-example.sh $(COMPILER)

@@ -152,6 +152,8 @@ test_case() {
             if [[ $name == sysroot ]]; then after_env=("ABLA_SYSROOT=$directory/sysroot")
             else after_env=("ABLA_STDLIB=$directory/sysroot/stdlib"); fi ;;
         fast-prune) after_env=(ABLA_FAST_PRUNE=0) ;;
+        valgrind) after_env=(ABLA_VALGRIND=1) ;;
+        valgrind-flag) after_flags+=(--valgrind) ;;
         runtime-object) after_env=(ABLA_FAST_RUNTIME_OBJECT=0) ;;
         runtime-hint) after_env=(ABLA_PRUNE_RUNTIME=1) ;;
         keep-text) after_env=(ABLA_KEEP_LLVM_TEXT=1); sidecar=.ll; partition_layout=true ;;

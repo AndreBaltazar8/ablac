@@ -393,6 +393,45 @@ inside the code that filled it.
 ABLA_GC_POISON=1 ABLA_GC_GROWTH=1048576 build/app
 ```
 
+## valgrind, rr and perf (Linux)
+
+A program's heap is invisible to valgrind's memcheck by default: the runtime
+takes its memory from the system, not from a malloc valgrind replaces, so
+memcheck reports "no leaks are possible" and nothing about objects. A build
+made with `ablac build --valgrind` (or `ABLA_VALGRIND=1`, for the builds a build program
+starts; x86-64 and AArch64 Linux, another target is refused with
+`E_BUILD_VALGRIND_TARGET`) tells memcheck about it with valgrind's client requests,
+issued by the instruction sequence itself, not by a library. Each object is a
+malloc-like block from its allocation to its free, whether a call such as a
+buffer's `close()` or a collection frees it, so a read or write of a freed
+object, or past an object's end, is reported where it happens with the stacks
+of its allocation and its free. A small object waits on its size's free list and
+stays reported as freed until it is allocated again; a larger one goes back to the
+runtime's heap, whose chunk is then the heap's, so a use of it after that is not
+reported. The runtime marks the memory it takes back for itself, and such a build
+skips the collector's stack wipe and its poison (`ABLA_GC_POISON`), which memcheck
+would report as invalid writes. Any other build leaves the requests out entirely.
+
+```sh
+ablac build app.ab -o app --fast --valgrind
+valgrind --error-exitcode=9 --suppressions=tools/valgrind.supp ./app
+```
+
+`tools/test-valgrind.sh` runs standard-library programs this way, with and
+without `ABLA_GC_STRESS=1`, and requires that memcheck reports nothing. It
+also requires reports for two planted uses of freed memory read through the
+runtime's `memcpy` (`tests/cases/valgrind/use-after-free.ab`), and that a
+plain build next to a valgrind one shares no prebuilt runtime object.
+`tools/valgrind.supp` is where a runtime report that cannot be avoided would
+go, with its reason. There is none.
+
+A development build records and replays under rr as it is: `rr record ./app`,
+then `rr replay` gives gdb with breakpoints, source lines, backtraces and
+reverse execution (`reverse-next`, `reverse-continue`). Every function of a
+build with debug information keeps a frame pointer, so
+`perf record --call-graph fp ./app` gives whole stacks, named from
+`abla_start` down to the runtime function sampled.
+
 ## Cost
 
 Debug information leaves release builds untouched. In a development build of

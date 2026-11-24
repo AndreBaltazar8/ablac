@@ -1141,6 +1141,37 @@ fun bootstrapBackgroundFreeParse(parsed: BootstrapParseResult): BootstrapParseRe
     )
 }
 
+/** Set by the build driver for a build whose runtime tells valgrind about its heap (#1217, ABLA_VALGRIND=1): each object a
+ *  malloc-like block from allocation to free (stdlib/abla/runtime/platform/host.ab, __ablaRuntimeHostValgrind). */
+var bootstrapLlvmValgrind: bool = false
+
+/** `parsed` whose __ablaRuntimeHostValgrind answers true (the body of __ablaRuntimeHostValgrindOn), so the runtime's
+ *  valgrind requests are built in; any other build keeps its false, and the requests fold away. A target without the
+ *  host runtime has neither function and is left as it is; the host runtime with only one of them is an error. */
+fun bootstrapValgrindParse(parsed: BootstrapParseResult): BootstrapParseResult {
+    var body = BootstrapExpression("missing", "", 0, 0, [])
+    var target = false
+    for (declaration in parsed.declarations) {
+        if (declaration.kind == "fun" && declaration.name == "__ablaRuntimeHostValgrindOn") body = declaration.expression
+        if (declaration.kind == "fun" && declaration.name == "__ablaRuntimeHostValgrind") target = true
+    }
+    if (body.kind == "missing" && target) bootstrapRuntimeDeclarationMissing("a build for valgrind (ABLA_VALGRIND)",
+        "__ablaRuntimeHostValgrindOn")
+    if (body.kind != "missing" && !target) bootstrapRuntimeDeclarationMissing("a build for valgrind (ABLA_VALGRIND)",
+        "__ablaRuntimeHostValgrind")
+    if (body.kind == "missing") return parsed
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) declarations.append(
+        if (declaration.kind == "fun" && declaration.name == "__ablaRuntimeHostValgrind")
+            bootstrapDeclarationWithExpression(declaration, body)
+        else declaration
+    )
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+    )
+}
+
 // Rounds of lowering that commit compile-time code's edits, at most.
 val BOOTSTRAP_COMPILE_EDIT_ROUNDS = 8
 
@@ -1372,10 +1403,11 @@ private @noinline fun bootstrapPrepareLlvmCompilation(
     val globals = if (round == 0) bootstrapSnapshotCompileGlobals() else globalsBefore
     if (round > 0) bootstrapRestoreCompileGlobals(globals)
     val _earlierRoundEdits = bootstrapTakeCompileRoundEdits()
-    val program = bootstrapLowerParsedCached(
-        if (bootstrapLlvmWasmUnwinding) bootstrapWasmUnwindingParse(parsed)
+    val chosen = if (bootstrapLlvmWasmUnwinding) bootstrapWasmUnwindingParse(parsed)
         else if (bootstrapProgramWantsBackgroundFree(parsed)) bootstrapBackgroundFreeParse(parsed)
-        else parsed,
+        else parsed
+    val program = bootstrapLowerParsedCached(
+        if (bootstrapLlvmValgrind) bootstrapValgrindParse(chosen) else chosen,
         analyzed, cache, pruneUnused
     )
     bootstrapCompileEditRound = -1

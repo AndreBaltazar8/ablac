@@ -90,6 +90,94 @@ private noescape extern:"intrinsic" fun ablaHostIsIOS(): bool
 private noescape extern:"intrinsic" fun ablaHostOwnsRuntime(): bool
 // The stack wipe of abla/ct/scrub (4096 bytes below the caller's stack pointer), for the collection's own frames.
 private noescape extern:"intrinsic" fun ablaCtScrubStack4096(): void
+// A valgrind client request (#1217): the request and its five arguments are the six words at `arguments`; the answer is
+// valgrind's, or `fallback` when the program does not run under valgrind (and on a target valgrind does not run).
+private noescape extern:"intrinsic" fun ablaValgrindRequest(arguments: int, fallback: int): int
+
+// ---- valgrind (#1217) -----------------------------------------------------------------------------------------------
+// A build for valgrind (ABLA_VALGRIND=1) tells memcheck about the heap, which it cannot see otherwise: the runtime takes
+// its memory from the system, not from a malloc valgrind replaces. Each object is a malloc-like block from its allocation
+// to its free (the payload; the header before it stays the allocator's), so a read or write of a freed object, or past
+// an object's end, is reported where it happens. Any other build leaves every request out: the build swaps
+// __ablaRuntimeHostValgrindOn's body into __ablaRuntimeHostValgrind (bootstrapValgrindParse), which is false here.
+@inline
+trusted fun __ablaRuntimeHostValgrind(): bool = false
+
+/// What a build for valgrind makes __ablaRuntimeHostValgrind answer.
+trusted fun __ablaRuntimeHostValgrindOn(): bool = true
+
+/// Sends one client request with up to three arguments and returns valgrind's answer, 0 without valgrind.
+@noinline
+trusted fun __ablaRuntimeHostValgrindRequest(request: int, first: int, second: int, third: int): int {
+    val words = __ablaRuntimeHostValgrindWords()
+    ablaRuntimeStoreI64(words, request)
+    ablaRuntimeStoreI64(words + 8, first)
+    ablaRuntimeStoreI64(words + 16, second)
+    ablaRuntimeStoreI64(words + 24, third)
+    ablaRuntimeStoreI64(words + 32, 0)
+    ablaRuntimeStoreI64(words + 40, 0)
+    ablaValgrindRequest(words, 0)
+}
+
+// The six words of a request, per thread (requests come from every thread that allocates).
+@inline
+trusted fun __ablaRuntimeHostValgrindWords(): int =
+    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+
+// The hooks below make their requests unconditionally; each call site tests __ablaRuntimeHostValgrind() itself
+// (`if (__ablaRuntimeHostValgrind()) hook(...)`), so a build that is not for valgrind runs exactly the code it ran before
+// them, a --fast one too: neither the arguments nor the call are left in it. (A hook that tested the flag inside left its
+// arguments computed and, where it was not inlined, its call: 5% more instructions in a --fast binary-trees.)
+
+/// Tells valgrind that `size` bytes at `payload` are an allocated object, their contents not yet written.
+@noinline
+trusted fun __ablaRuntimeHostValgrindAllocated(payload: int, size: int): void {
+    // VG_USERREQ__MALLOCLIKE_BLOCK (0x1301): address, size, no red zone, not zeroed
+    __ablaRuntimeHostValgrindRequest(4865, payload, size, 0)
+    return
+}
+
+/// Tells valgrind that the object at `payload` is freed: any access to it from now on is reported.
+@noinline
+trusted fun __ablaRuntimeHostValgrindFreed(payload: int): void {
+    // VG_USERREQ__FREELIKE_BLOCK (0x1302): address, no red zone
+    __ablaRuntimeHostValgrindRequest(4866, payload, 0, 0)
+    return
+}
+
+/// Tells valgrind that `size` bytes at `address`, the runtime's own memory (not an object), are addressable: written
+/// (`defined`, a calloc's zeroes or a realloc's copy) or not yet.
+@noinline
+trusted fun __ablaRuntimeHostValgrindInternal(address: int, size: int, defined: bool): void {
+    // VALGRIND_MAKE_MEM_DEFINED and VALGRIND_MAKE_MEM_UNDEFINED (memcheck's 'M' 'C' + 2 and + 1)
+    if (address != 0 && size > 0) {
+        __ablaRuntimeHostValgrindRequest(if (defined) 1296236546 else 1296236545, address, size, 0)
+    }
+    return
+}
+
+/// Tells valgrind that the heap chunk at `address`, being returned to the runtime's heap, is the heap's again: the whole
+/// chunk with its own size word and the next chunk's, as a block's split, merge and free lists write them. A freed object's
+/// payload inside it stops being reported from here on; one kept on a small list (never returned) still is. The size word
+/// first (it may lie in a freed payload), then the extent it gives: a mapping of its own (bit 1, the length from 16 bytes
+/// before the address) or a chunk of the size classes.
+@noinline
+trusted fun __ablaRuntimeHostValgrindHeapChunk(address: int): void {
+    if (address == 0) return
+    __ablaRuntimeHostValgrindRequest(1296236546, address - 16, 16, 0)
+    val header = ablaRuntimeLoadI64(address - 8)
+    if ((header & 2) != 0) __ablaRuntimeHostValgrindRequest(1296236546, address - 16, header & -4096, 0)
+    else __ablaRuntimeHostValgrindRequest(1296236546, address - 8, (header & __ablaRuntimeHostHeapSizeMask) + 8, 0)
+    return
+}
+
+/// Tells valgrind that the `width` header bytes at `header` are the allocator's to write, wherever they lie.
+@noinline
+trusted fun __ablaRuntimeHostValgrindHeader(header: int, width: int): void {
+    // VALGRIND_MAKE_MEM_UNDEFINED (memcheck's 'M' 'C' + 1): addressable, contents not yet written
+    __ablaRuntimeHostValgrindRequest(1296236545, header, width, 0)
+    return
+}
 
 // x86-64 Linux locks and waits on futexes, not libpthread (#806). Each
 // function below tests `ablaHostOwnsRuntime()`
@@ -482,7 +570,10 @@ trusted fun __ablaRuntimeHostHeapZero(address: int, size: int): void {
 
 // Under ABLA_GC_STRESS=1 or ABLA_GC_POISON=1 the sweep fills each block it frees with 0xDB bytes first, so a use
 // after free reads garbage at once, not the old bytes a block keeps until it is reused (a C string, a path: #829).
+// A build for valgrind fills nothing: valgrind reports the use itself, and the whole words reach past an object whose size
+// is not a multiple of 8, which it reports as writes outside the object.
 trusted fun __ablaRuntimeHostHeapPoison(address: int, size: int): void {
+    if (__ablaRuntimeHostValgrind()) return
     val end = address + ((size + 7) & -8)
     var at = address
     while (at < end) {
@@ -892,6 +983,7 @@ trusted fun __ablaRuntimeHostHeapAllocate(size: int, zero: bool): int {
 // Free with the heap's lock held by the caller (a batch of frees takes it once): the body of __ablaRuntimeHostHeapFree.
 trusted fun __ablaRuntimeHostHeapFreeLocked(address: int): void {
     if (address == 0) return
+    if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindHeapChunk(address)
     val header = ablaRuntimeLoadI64(address - 8)
     if ((header & 2) != 0) {
         val length = header & -4096
@@ -917,6 +1009,7 @@ trusted fun __ablaRuntimeHostHeapFreeLocked(address: int): void {
 /// Returns an allocation to the native heap or unmaps it as appropriate.
 trusted fun __ablaRuntimeHostHeapFree(address: int): void {
     if (address == 0) return
+    if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindHeapChunk(address)
     val shared = __ablaRuntimeHostHeapShared
     val header = ablaRuntimeLoadI64(address - 8)
     if ((header & 2) != 0) {
@@ -968,10 +1061,25 @@ trusted fun __ablaRuntimeHostHeapResize(address: int, size: int): int {
 /// Returns an uninitialized native allocation or null on failure.
 @inline
 trusted fun __ablaRuntimeHostMalloc(size: int): i64* =
+    if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindMalloc(size)
+    else __ablaRuntimeHostMallocPlain(size)
+
+/// The host allocation itself: the runtime's own heap, or the C library's where the host has one.
+@inline
+trusted fun __ablaRuntimeHostMallocPlain(size: int): i64* =
     if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() &&
         !ablaHostIsIOS())) ablaRuntimePointerFromAddress(__ablaRuntimeHostHeapAllocate(size,
             false))
     else malloc(size)
+
+/// A build for valgrind's allocation: the runtime's heap hands out memory a freed object had (valgrind still holds it
+/// freed), which is the runtime's now.
+@noinline
+trusted fun __ablaRuntimeHostValgrindMalloc(size: int): i64* {
+    val result = __ablaRuntimeHostMallocPlain(size)
+    __ablaRuntimeHostValgrindInternal(ablaRuntimePointerAddress(result), size, false)
+    result
+}
 
 // The platform's release of free memory to the system (runtimeMemoryRelease): this heap's Trim. Other hosts have libc's
 // allocator, which a caller trims with malloc_trim itself (the compiler does).
@@ -1092,17 +1200,45 @@ trusted fun __ablaRuntimeHostHeapCallocate(count: int, size: int): i64* {
 // nested as in these four (a test through __ablaRuntimeHostHeapNative() is not folded, and a --fast
 // build would keep the imports): an x86-64 Linux program then names none of them, release or --fast.
 trusted fun __ablaRuntimeHostCalloc(count: int, size: int): i64* =
+    if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindCalloc(count, size)
+    else __ablaRuntimeHostCallocPlain(count, size)
+
+/// The host's zeroed allocation itself.
+@inline
+trusted fun __ablaRuntimeHostCallocPlain(count: int, size: int): i64* =
     if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() &&
         !ablaHostIsIOS())) __ablaRuntimeHostHeapCallocate(count, size)
     else calloc(count, size)
 
+/// A build for valgrind's zeroed allocation: written (zeroes), and the runtime's.
+@noinline
+trusted fun __ablaRuntimeHostValgrindCalloc(count: int, size: int): i64* {
+    val result = __ablaRuntimeHostCallocPlain(count, size)
+    __ablaRuntimeHostValgrindInternal(ablaRuntimePointerAddress(result), count * size, true)
+    result
+}
+
 /// Resizes an existing native allocation and returns its possibly moved address or null on failure.
 trusted fun __ablaRuntimeHostRealloc(pointer: i64*, size: int): i64* =
+    if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindRealloc(pointer, size)
+    else __ablaRuntimeHostReallocPlain(pointer, size)
+
+/// The host's resize itself.
+@inline
+trusted fun __ablaRuntimeHostReallocPlain(pointer: i64*, size: int): i64* =
     if (ablaHostOwnsRuntime() || (ablaHostIsMacOS() &&
         !ablaHostIsIOS())) ablaRuntimePointerFromAddress(
             __ablaRuntimeHostHeapResize(ablaRuntimePointerAddress(pointer), size)
         )
     else realloc(pointer, size)
+
+/// A build for valgrind's resize: written (what it holds was copied from the old block), and the runtime's.
+@noinline
+trusted fun __ablaRuntimeHostValgrindRealloc(pointer: i64*, size: int): i64* {
+    val result = __ablaRuntimeHostReallocPlain(pointer, size)
+    __ablaRuntimeHostValgrindInternal(ablaRuntimePointerAddress(result), size, true)
+    result
+}
 
 /// Releases a pointer allocated from the runtime's native heap or the selected host allocator.
 @inline
@@ -2549,12 +2685,16 @@ trusted fun __ablaRuntimeHostBlockAllocate(size: int, width: int): int {
         if (free != 0) {
             ablaRuntimeStoreI64(list, ablaRuntimeLoadI64(free))
             __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes - total
+            if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindHeader(free, width)
             return free
         }
     }
     val header = ablaRuntimePointerAddress(__ablaRuntimeHostMalloc(if (total <=
         512) total else size + width))
     if (header == 0) __ablaRuntimeHostOutOfMemory()
+    // Memory a freed object's payload had may come back here (a list keeps blocks by total size, and the two header widths
+    // split it differently): the header is the allocator's again.
+    if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindHeader(header, width)
     header
 }
 
@@ -2588,6 +2728,7 @@ trusted fun __ablaRuntimeHostTrackedAllocate(size: int, layout: int): int {
     }
     val payload = __ablaRuntimeHostBlockAllocate(size, width) + width
     __ablaRuntimeHostRegister(payload, size, layout, width)
+    if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindAllocated(payload, size)
     __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
     payload
 }
@@ -2654,8 +2795,10 @@ trusted fun __ablaRuntimePlatformAllocateLayout(
                 __ablaRuntimeHostRegionLoad() == 0) {
                 ablaRuntimeStoreI64(list, ablaRuntimeLoadI64(free))
                 __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes - total
+                if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindHeader(free, width)
                 val payload = free + width
                 __ablaRuntimeHostWriteHeader(payload, size, layout, slots, (32 - width) >> 2)
+                if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindAllocated(payload, size)
                 __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
                 return payload
             }
@@ -2685,6 +2828,7 @@ trusted fun __ablaRuntimeHostFreeUnlocked(address: int): void {
                 if (state == 10) ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostNativePressure(), size)
                 val entry = __ablaRuntimeHostUnregister(packed >>> 6)
                 val width = __ablaRuntimeHostEntryWidth(entry)
+                if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindFreed(address)
                 __ablaRuntimeHostBlockFree(address - width, size, width)
             }
             __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - size
@@ -4036,6 +4180,7 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
                 val size = ablaRuntimeLoadI64(payload - 16)
                 freedBytes = freedBytes + size
                 if (poison) __ablaRuntimeHostHeapPoison(payload, size)
+                if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindFreed(payload)
                 // __ablaRuntimeHostBlockFree, with its counters held here.
                 if (size <= 480 && smallBytes < keptLimit) {
                     val total = (size + width + 7) & -8
@@ -4673,6 +4818,7 @@ private trusted fun __ablaRuntimeHostSweepPassA(context: int): void {
                 val size = ablaRuntimeLoadI64(payload - 16)
                 freed = freed + size
                 if (poison) __ablaRuntimeHostHeapPoison(payload, size)
+                if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindFreed(payload)
                 if (size <= 480 && added < budget) {
                     val total = (size + width + 7) & -8
                     val heads = context + 64
@@ -5051,6 +5197,7 @@ trusted fun __ablaRuntimeHostBackgroundSweep(): void {
                 if (__ablaRuntimeHostGcStress || __ablaRuntimeHostGcPoison) {
                     __ablaRuntimeHostHeapPoison(payload, size)
                 }
+                if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindFreed(payload)
                 __ablaRuntimeHostFreeLater(header, size, width)
             } else {
                 ablaRuntimeStoreI64(payload - 8, (kept << 6) | (state & 15))
@@ -5207,7 +5354,11 @@ trusted fun __ablaRuntimeMemoryPressureLoop(): int {
 /// below the frame of the entry that allocated (a constant-time entry's own wipe, ctScrubStack, reaches its own work but not a collection's
 /// deeper frames, which hold words of the heap it walked). A function of its own, as in abla/ct/scrub, so the caller keeps nothing in a red zone.
 @noinline
-trusted fun __ablaRuntimeHostScrubCollectorStack(): void = ablaCtScrubStack4096()
+trusted fun __ablaRuntimeHostScrubCollectorStack(): void {
+    // Under valgrind the wipe would write below the stack pointer, where memcheck reports every store.
+    if (__ablaRuntimeHostValgrind()) return
+    ablaCtScrubStack4096()
+}
 
 /// Runs a collection at a pressure safe point and updates the threshold before returning zero.
 @noinline
