@@ -116,6 +116,16 @@ timeout 120 tools/windows/wine-run.sh "$out/watchdog.exe" > "$out/watchdog.out" 
 [[ $status == 0 ]] || fail "watchdog.exe exited $status: $(head -5 "$out/watchdog.out" "$out/watchdog.err")"
 [[ "$(cat "$out/watchdog.out")" == $'armed 0\nspin back with 3\nruntime sleep -4\ndeferred sleep -4, asked true\ninterpreted read -4\ndisarmed sleep 0' ]] || fail "watchdog.exe printed: $(cat "$out/watchdog.out" "$out/watchdog.err")"
 (( SECONDS - started < 25 )) || fail "watchdog.exe took $((SECONDS - started)) s: a stop was missed"
+# The watchdog takes no lock the thread it suspended may hold (watchdog-loader.ab): armed with a 1 ms deadline while the thread
+# takes and releases the loader lock 400000 times (GetModuleHandleW by name). Where its look at the program counter took the
+# loader lock (RtlPcToFileHeader), the program never ended; it takes about a second.
+"$compiler" build tests/cases/windows/watchdog-loader.ab --target x86_64-windows-hosted -o "$out/watchdog-loader.exe" --fast \
+    --no-cache > "$out/watchdog-loader.log" 2>&1 || { cat "$out/watchdog-loader.log" >&2; fail "watchdog-loader.ab did not build for Windows"; }
+status=0
+timeout 60 tools/windows/wine-run.sh "$out/watchdog-loader.exe" > "$out/watchdog-loader.out" 2> "$out/watchdog-loader.err" ||
+    status=$?
+[[ $status == 0 ]] || fail "watchdog-loader.exe exited $status (124: the watchdog waited on the loader lock): $(head -5 "$out/watchdog-loader.out" "$out/watchdog-loader.err")"
+[[ "$(cat "$out/watchdog-loader.out")" == $'armed 0\nfound 400000 of 400000, asked true' ]] || fail "watchdog-loader.exe printed: $(cat "$out/watchdog-loader.out" "$out/watchdog-loader.err")"
 # The watchdog's two stops (preempt.ab, §5), each from a second thread: a thread spinning in VirtualAlloc'd code is suspended,
 # its CONTEXT redirected to a jump back with 3, and resumed; a thread reading an empty pipe gets EINTR from CancelSynchronousIo.
 "$compiler" build tests/cases/windows/preempt.ab --target x86_64-windows-hosted -o "$out/preempt.exe" --fast --no-cache \

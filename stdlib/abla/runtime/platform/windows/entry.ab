@@ -1941,7 +1941,7 @@ private trusted fun __ablaRuntimeWindowsDuplicate(fd: int): int {
 // --- the compile-time watchdog (docs/design/windows-jit.md §5) ---------------------------------------------------------------
 // Windows has no SIGALRM to stop a compile-time call that runs past its time limit, so call 4002 arms a watchdog thread for the
 // calling thread instead. At the deadline the watchdog stops the thread in one of the ways the Linux alarm does:
-// - running JIT'd code (its program counter in no loaded image, RtlPcToFileHeader): suspended, its CONTEXT pointed at the
+// - running JIT'd code (its program counter in no loaded image: VirtualQuery, __ablaRuntimeWindowsImageOf): suspended, its CONTEXT pointed at the
 //   redirect target with (14, 0), as the alarm handler is called with SIGALRM, and resumed;
 // - anywhere else (the compiler's or the runtime's code, a system DLL): resumed as it was, its interrupt words set and its
 //   synchronous I/O cancelled (CancelSynchronousIo), so its waits and reads return EINTR, and tried again a millisecond later,
@@ -1964,8 +1964,18 @@ private trusted noescape extern:"c" fun GetThreadContext(target: int, context: i
 private trusted noescape extern:"c" fun SetThreadContext(target: int, context: int): int
 /** kernel32 CancelSynchronousIo: ends the thread's pending synchronous read or write with ERROR_OPERATION_ABORTED; returns non-zero when one was cancelled. */
 private trusted noescape extern:"c" fun CancelSynchronousIo(target: int): int
-/** kernel32 RtlPcToFileHeader: the base of the loaded image that holds the address pc (also stored at base), or 0 when no image does. */
-private trusted noescape extern:"c" fun RtlPcToFileHeader(pc: int, base: int): int
+/** kernel32 VirtualQuery: fills `size` bytes of MEMORY_BASIC_INFORMATION at `info` for the region holding `address`; returns the bytes written, 0 on failure. */
+private trusted noescape extern:"c" fun VirtualQuery(address: int, info: int, size: int): int
+
+// The base of the loaded image that holds `pc`, or 0 when none does (JIT'd code, a stack, the heap): VirtualQuery's
+// MEMORY_BASIC_INFORMATION (48 bytes at `scratch`: AllocationBase at 8, Type at 40, MEM_IMAGE 0x1000000). RtlPcToFileHeader
+// answered this before, but it takes the loader lock (Wine's does), which the thread the watchdog suspended may hold: the
+// watchdog then waited for ever (a gate under load). VirtualQuery is a system call and takes no lock.
+private trusted fun __ablaRuntimeWindowsImageOf(pc: int, scratch: int): int {
+    if (VirtualQuery(pc, scratch, 48) == 0) return 0
+    if ((ablaRuntimeLoadI32(scratch + 40) & 4294967295) != 16777216) return 0
+    ablaRuntimeLoadI64(scratch + 8)
+}
 /** kernel32 CreateThread: starts a thread at start with parameter; returns its handle, or 0 when it fails. */
 private trusted noescape extern:"c" fun CreateThread(attributes: int, stack: int, start: int, parameter: int, flags: int, id: int): int
 /** The Abla Windows routine (src/backend/llvm/windows.ab): sets a CONTEXT's ContextFlags to the control and integer registers. */
@@ -1978,8 +1988,9 @@ private trusted noescape extern:"c" fun abla_windows_redirect(context: int, targ
 // The watchdog's block (one for the process, zeroed): 0 the arming count (32 bits, what the watchdog waits on), 8 the deadline in
 // milliseconds of the performance counter (0: disarmed), 16 the watched thread's handle, 24 the check function, 32 the
 // redirect target, 40 another interrupt word to set (0: none), 48 the thread's own interrupt word, 56 the watchdog thread's
-// handle (0: not started), 64 and 72 the watchdog's clock scratch, 80 its copy of the arming count, 88 RtlPcToFileHeader's out
-// parameter, from 128 the CONTEXT (16-aligned, as GetThreadContext requires; x64's is 1232 bytes, ARM64's 912).
+// handle (0: not started), 64 and 72 the watchdog's clock scratch, 80 its copy of the arming count,
+// from 128 the CONTEXT (16-aligned, as GetThreadContext requires; x64's is 1232 bytes, ARM64's 912), from 1536 the
+// MEMORY_BASIC_INFORMATION __ablaRuntimeWindowsImageOf fills.
 private trusted fun __ablaRuntimeWindowsWatchBlock(): int = (nativeStaticAllocate(4096) + 15) / 16 * 16
 
 // Milliseconds of the performance counter, with `scratch` (16 bytes) for its out-parameters.
@@ -2007,7 +2018,7 @@ private trusted fun __ablaRuntimeWindowsWatchStop(block: int, armed: int): bool 
     val read = GetThreadContext(target, context) != 0
     val check = ablaRuntimeLoadI64(block + 24)
     val state = if (check == 0) 3 else ablaUnsafeCallMain(check)
-    if (read && state == 2 && RtlPcToFileHeader(abla_windows_context_pc(context), block + 88) == 0) {
+    if (read && state == 2 && __ablaRuntimeWindowsImageOf(abla_windows_context_pc(context), block + 1536) == 0) {
         abla_windows_redirect(context, ablaRuntimeLoadI64(block + 32), 14, 0)
         val set = SetThreadContext(target, context) != 0
         ResumeThread(target)
@@ -2112,10 +2123,11 @@ private trusted noescape extern:"c" fun SetThreadStackGuarantee(size: int): int
 /** kernel32 GetModuleHandleW: the base of a loaded module by name (0: the process's executable), or 0 when none is loaded. */
 private trusted noescape extern:"c" fun GetModuleHandleW(name: int): int
 
-// The calling thread's fault target (0: none armed) and its info block, RtlPcToFileHeader's out parameter, and whether a
-// stack overflow was taken since the guard page was last put back (1).
+// The calling thread's fault target (0: none armed) and its info block, a word unused, whether a stack overflow was taken
+// since the guard page was last put back (1), and from 32 the MEMORY_BASIC_INFORMATION __ablaRuntimeWindowsImageOf fills
+// (the handler's own: the thread's scratch belongs to the code it interrupted).
 private trusted fun __ablaRuntimeWindowsFaultCell(): int =
-    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 
 // Whether the process's vectored handler is installed (0: not yet).
 private trusted fun __ablaRuntimeWindowsFaultInstalled(): int = nativeStaticAllocate(8)
@@ -2135,7 +2147,7 @@ private trusted fun __ablaRuntimeWindowsFault(pointers: int): int {
     val context = ablaRuntimeLoadI64(pointers + 8)
     val code = ablaRuntimeLoadI32(record) & 4294967295
     if (code != 3221225477 && code != 3221225725) return 0
-    val image = RtlPcToFileHeader(abla_windows_context_pc(context), cell + 16)
+    val image = __ablaRuntimeWindowsImageOf(abla_windows_context_pc(context), cell + 32)
     if (image != 0 && image != GetModuleHandleW(0)) return 0
     val info = ablaRuntimeLoadI64(cell + 8)
     ablaRuntimeStoreI64(info + 16, ablaRuntimeLoadI64(record + 40))

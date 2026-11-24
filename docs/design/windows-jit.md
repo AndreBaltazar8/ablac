@@ -145,7 +145,7 @@ to the thread. The design:
 Built: the runtime's call 4002 (`__ablaRuntimeWindowsWatch`, platform/windows) is the watchdog, one thread for the process made on
 first use, armed for the calling thread by ct_eval.ab's bootstrapCtWindowsWatch in place of the alarm. Its check is the slice's
 `abla_ct_watch_<g>` (0 not armed, 1 deferred, 2 may jump), its redirect target the alarm handler, and "in JIT memory" is
-RtlPcToFileHeader finding no image for the program counter. An interpreted site arms it without a check: interrupts only, every
+VirtualQuery finding no image (MEM_IMAGE) at the program counter: RtlPcToFileHeader took the loader lock, which a suspended thread may hold. An interpreted site arms it without a check: interrupts only, every
 second. tests/cases/windows/watchdog.ab checks the runtime half under Wine **[checked]**; the compiler half waits for the real
 ablac.exe (C1) **[confirm]**. The thread's interrupt word is the compiler runtime's; whether JIT'd code that waits uses its own
 copy of the runtime (and so its own word) is for step 0 to read off **[confirm]**: CancelSynchronousIo and the retry

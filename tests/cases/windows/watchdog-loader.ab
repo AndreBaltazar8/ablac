@@ -1,0 +1,62 @@
+// The compile-time watchdog (call 4002, docs/design/windows-jit.md §5) stops a thread that holds the loader lock: armed with a
+// check that allows a redirect, its deadline passes while this thread asks GetModuleHandleW for a module by name, again and again
+// (the loader lock taken and released each time). The watchdog suspends the thread each millisecond and looks at where its
+// program counter is; that look must take no lock the suspended thread may hold. RtlPcToFileHeader took the loader lock, so a
+// thread suspended inside GetModuleHandleW left the watchdog waiting for ever, and this program never ended.
+import "abla/io"
+import "abla/text"
+import "abla/sys/linux"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/native/function-address"
+
+trusted noescape extern:"c" fun GetModuleHandleW(name: int): int
+
+trusted fun store(address: int, value: int): void = ablaUnsafeStoreI64(nativePointerFromAddress(address), value)
+
+var checks: int = 0
+
+// The check, called by the watchdog while this thread is suspended: 2, a redirect may be made (it is not: the thread is in a
+// loaded image).
+trusted fun mayJump(): int {
+    checks += 1
+    2
+}
+
+trusted fun onStop(signal: int, info: int): void {
+    println("redirected out of a loaded image")
+}
+
+// Arms the watch: the deadline in milliseconds, the check, the target; 0 milliseconds disarms.
+trusted fun watch(request: int, milliseconds: int, check: int): int {
+    store(request, milliseconds)
+    store(request + 8, check)
+    store(request + 16, nativeFunctionAddress(onStop))
+    store(request + 24, 0)
+    linuxSyscall1(4002, request)
+}
+
+trusted fun main: int {
+    val scratchStorage = "0123456789abcdef".repeat(8)
+    val request = nativeStringAddress(scratchStorage)
+    // "ntdll.dll" in UTF-16, null-terminated.
+    val nameStorage = "0123456789abcdef".repeat(2)
+    val name = nativeStringAddress(nameStorage)
+    val letters = "ntdll.dll"
+    var index = 0
+    while (index < letters.size) {
+        ablaUnsafeStoreU16(nativePointerFromAddress(name + index * 2), letters[index])
+        index += 1
+    }
+    ablaUnsafeStoreU16(nativePointerFromAddress(name + letters.size * 2), 0)
+    val armed = watch(request, 1, nativeFunctionAddress(mayJump))
+    var found = 0
+    var round = 0
+    while (round < 400000) {
+        if (GetModuleHandleW(name) != 0) found += 1
+        round += 1
+    }
+    watch(request, 0, 0)
+    println("armed $armed")
+    println("found $found of $round, asked ${checks > 0}")
+    0
+}
