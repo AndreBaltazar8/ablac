@@ -13,7 +13,7 @@ compiler=${1:-build/ablac}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 out=build/windows-stdlib
-rm -rf "$out"
+rm -rf "$out" build/windows-debug
 mkdir -p "$out"
 fail() { echo "windows-programs: $1" >&2; exit 1; }
 for tool in lld-link llvm-readobj; do
@@ -65,6 +65,14 @@ while read -r source status where; do
     # A program marked `wine` passes under Wine only: it is not left for the Windows runner.
     if [[ $where == wine ]]; then
         rm -f "$exe" "$out/$name.expected" "$out/$name.status"
+        # ... but a --backtrace build of it goes to build/windows-debug, and the Windows job runs that one and prints
+        # what happens to it (tools/windows/debug-programs.ps1: output, status, the symbolized stack of a crash).
+        mkdir -p build/windows-debug
+        "$compiler" build "$source" --target x86_64-windows-hosted -o "build/windows-debug/$name.exe" --fast --backtrace --no-cache \
+            > "build/windows-debug/$name.log" 2>&1 || { cat "build/windows-debug/$name.log" >&2; fail "$name did not build with --backtrace"; }
+        # --fast builds name the functions of a stack; a release one also has its file:line (<name>-release.exe.debug).
+        "$compiler" build "$source" --target x86_64-windows-hosted -o "build/windows-debug/$name-release.exe" --backtrace --no-cache \
+            > "build/windows-debug/$name-release.log" 2>&1 || { cat "build/windows-debug/$name-release.log" >&2; fail "$name did not build with --backtrace for release"; }
         wineonly=$((wineonly + 1))
     fi
 done < tests/cases/windows/programs.txt
