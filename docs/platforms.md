@@ -246,8 +246,7 @@ signals (`signal-watch.ab` needs `signalfd`: the runtime answers `rt_sigprocmask
 with an empty mask, and Windows has no POSIX signals to watch); `/bin/sh` for
 `ulimit -n` (`process-metrics.ab`, whose CPU times `getrusage` now gives); `HOME`
 from `/etc/passwd` (`path-home`: the runtime answers `geteuid` and the other ids
-with 0, and a Windows program has no `/etc/passwd` outside Wine); `linux-net.ab`,
-which times out under Wine (its `sendmsg` is translated now); the OpenSSL-backed `abla/tls/hosted` (`network-advanced.ab` fails to link
+with 0, and a Windows program has no `/etc/passwd` outside Wine); the OpenSSL-backed `abla/tls/hosted` (`network-advanced.ab` fails to link
 `OpenSSL_version_num`; the pure TLS of `abla/tls/pure`, which the HTTPS client uses, runs on Windows: see below);
 tests that fork (the WebSocket server tests; `dns-async.ab` and `http-async.ab` have thread-based
 copies in `tests/cases/windows`); tests that run POSIX tools
@@ -257,7 +256,8 @@ the host, see `module-path-identity`); and tests whose success depends on argume
 driver script sets up (`fs-tree`, `process-environment`, `path-file-mode`,
 `path-directory-mode`). `filesystem.ab` is in `programs.txt` for the Windows runner only: its symbolic link
 (`CreateSymbolicLinkW`) is one Wine reports made and does not make. `udp-ephemeral.ab` runs under Wine too
-(`SO_REUSEADDR` on a UDP socket now reaches Windows, which shares the port as Linux does). The rest of the compiler's own tests (`tests/cases`
+(`SO_REUSEADDR` on a UDP socket now reaches Windows, which shares the port as Linux does), and `linux-net.ab` (a send with
+`MSG_DONTWAIT` does not block, and a non-blocking one offers at most 64 KiB, so its deadline sees a partial write). The rest of the compiler's own tests (`tests/cases`
 programs driven by shell scripts) build and run on Linux only.
 
 Sockets and TLS on a hosted Windows program: the poller (`epoll_create1`, `epoll_ctl`, `epoll_wait`) is emulated over `WSAPoll`

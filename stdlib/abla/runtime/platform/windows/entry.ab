@@ -281,7 +281,8 @@ private trusted fun __ablaRuntimeWindowsRemap(base: int, before: int, after: int
 // ---- files: descriptors over handles, paths over UTF-16 ----
 // A Linux descriptor is an index into a table of 64-byte entries (word 0 the handle, 0 when free; word 1 the kind, 1 a file or
 // device, 2 a directory; for a directory word 2 the page holding its search pattern and find data, word 3 the search handle (0
-// before the first entry), word 4 non-zero when the find data waits to be returned); 0, 1 and 2 are the standard handles. Paths are
+// before the first entry), word 4 non-zero when the find data waits to be returned; for a socket word 5 non-zero while it is
+// non-blocking); 0, 1 and 2 are the standard handles. Paths are
 // converted to UTF-16 in a buffer of 128 KiB of the thread's own (64 KiB for each of two paths); "/" in a path is kept (kernel32
 // takes it), so the standard library's POSIX path syntax works unchanged.
 
@@ -327,6 +328,7 @@ private trusted fun __ablaRuntimeWindowsOpenFd(handle: int, kind: int, extra: in
             ablaRuntimeStoreI64(entry + 16, extra)
             ablaRuntimeStoreI64(entry + 24, 0)
             ablaRuntimeStoreI64(entry + 32, 0)
+            ablaRuntimeStoreI64(entry + 40, 0)
             return fd
         }
         fd = fd + 1
@@ -962,6 +964,29 @@ private trusted fun __ablaRuntimeWindowsSocketErrno(): int {
 }
 
 // The SOCKET of descriptor `fd`, or 0 when it is not an open socket.
+// Whether socket descriptor `fd` is non-blocking (O_NONBLOCK), word 5 of its entry: Windows cannot be asked, so each place that
+// sets it (socket's SOCK_NONBLOCK, accept4's, fcntl F_SETFL, ioctl FIONBIO) records it here.
+private trusted fun __ablaRuntimeWindowsIsNonBlocking(fd: int): bool {
+    if (fd < 3 || fd >= __ablaRuntimeWindowsFdCount) return false
+    val table = __ablaRuntimeWindowsFds()
+    table != 0 && ablaRuntimeLoadI64(table + fd * 64 + 40) != 0
+}
+
+private trusted fun __ablaRuntimeWindowsMarkNonBlocking(fd: int, on: bool): void {
+    if (fd < 3 || fd >= __ablaRuntimeWindowsFdCount) return
+    val table = __ablaRuntimeWindowsFds()
+    if (table != 0) ablaRuntimeStoreI64(table + fd * 64 + 40, if (on) 1 else 0)
+    return
+}
+
+// FIONBIO on `socket`: non-blocking when `on`.
+private trusted fun __ablaRuntimeWindowsSocketNonBlocking(socket: int, on: bool): void {
+    val scratch = __ablaRuntimeWindowsScratch()
+    ablaRuntimeStoreI32(scratch, if (on) 1 else 0)
+    ioctlsocket(socket, 2147772030, scratch)
+    return
+}
+
 private trusted fun __ablaRuntimeWindowsSocketOf(fd: int): int {
     if (fd < 3 || fd >= __ablaRuntimeWindowsFdCount) return 0
     val table = __ablaRuntimeWindowsFds()
@@ -1413,6 +1438,7 @@ private @noinline trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: in
         }
         if (a1 == 21537) {
             if (ioctlsocket(socket, 2147772030, a2) != 0) return __ablaRuntimeWindowsSocketErrno()
+            __ablaRuntimeWindowsMarkNonBlocking(a0, ablaRuntimeLoadI32(a2) != 0)
             return 0
         }
         return -22
@@ -1430,6 +1456,7 @@ private @noinline trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: in
         }
         val fd = __ablaRuntimeWindowsOpenFd(sock, 3, 0)
         if (fd < 0) closesocket(sock)
+        if (fd >= 0 && (a1 & 2048) != 0) __ablaRuntimeWindowsMarkNonBlocking(fd, true)
         return fd
     }
     // connect(fd, address, length), bind, getsockname, getpeername
@@ -1483,33 +1510,48 @@ private @noinline trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: in
         }
         val fd = __ablaRuntimeWindowsOpenFd(accepted, 3, 0)
         if (fd < 0) closesocket(accepted)
+        if (fd >= 0 && number == 288 && (a3 & 2048) != 0) __ablaRuntimeWindowsMarkNonBlocking(fd, true)
         return fd
     }
-    // sendto(fd, buffer, count, flags, address, length): without an address it is send
+    // sendto(fd, buffer, count, flags, address, length): without an address it is send. MSG_DONTWAIT (64), which Winsock does not
+    // take, makes a blocking socket non-blocking for this call only (a send that would block is EAGAIN, not a wait for ever).
     if (number == 44) {
         val socket = __ablaRuntimeWindowsSocketOf(a0)
         if (socket == 0) return -88
+        val once = (a3 & 64) != 0 && !__ablaRuntimeWindowsIsNonBlocking(a0)
+        if (once) __ablaRuntimeWindowsSocketNonBlocking(socket, true)
+        // A non-blocking send takes at most a send buffer's worth on Linux; Winsock (and Wine) would queue all of it, so a peer that
+        // never reads could take 16 MiB at once and a deadline never see a partial write. One non-blocking call offers at most 64 KiB
+        // (a datagram is never larger).
+        val count = if (((a3 & 64) != 0 || __ablaRuntimeWindowsIsNonBlocking(a0)) && a2 > 65536) 65536 else a2
         var sent = 0
-        if (a4 == 0) sent = send(socket, a1, a2, a3 & 3)
+        if (a4 == 0) sent = send(socket, a1, count, a3 & 3)
         else {
             __ablaRuntimeWindowsFamily(a4, true)
-            sent = sendto(socket, a1, a2, a3 & 3, a4, a5)
+            sent = sendto(socket, a1, count, a3 & 3, a4, a5)
             __ablaRuntimeWindowsFamily(a4, false)
         }
-        if (sent < 0) return __ablaRuntimeWindowsSocketErrno()
+        // (the error first: FIONBIO would replace it)
+        val failure = if (sent < 0) __ablaRuntimeWindowsSocketErrno() else 0
+        if (once) __ablaRuntimeWindowsSocketNonBlocking(socket, false)
+        if (sent < 0) return failure
         return sent
     }
-    // recvfrom(fd, buffer, count, flags, address, lengthPointer)
+    // recvfrom(fd, buffer, count, flags, address, lengthPointer), MSG_DONTWAIT as for sendto
     if (number == 45) {
         val socket = __ablaRuntimeWindowsSocketOf(a0)
         if (socket == 0) return -88
+        val once = (a3 & 64) != 0 && !__ablaRuntimeWindowsIsNonBlocking(a0)
+        if (once) __ablaRuntimeWindowsSocketNonBlocking(socket, true)
         var received = 0
         if (a4 == 0) received = recv(socket, a1, a2, a3 & 3)
         else {
             received = recvfrom(socket, a1, a2, a3 & 3, a4, a5)
             __ablaRuntimeWindowsFamily(a4, false)
         }
-        if (received < 0) return __ablaRuntimeWindowsSocketErrno()
+        val failure = if (received < 0) __ablaRuntimeWindowsSocketErrno() else 0
+        if (once) __ablaRuntimeWindowsSocketNonBlocking(socket, false)
+        if (received < 0) return failure
         return received
     }
     // shutdown(fd, how)
@@ -1553,16 +1595,18 @@ private @noinline trusted fun __ablaRuntimeWindowsSocketCall(number: int, a0: in
     }
     // fcntl(fd, F_DUPFD or F_DUPFD_CLOEXEC, minimum) duplicates the handle into a new descriptor
     if (number == 72 && (a1 == 0 || a1 == 1030)) return __ablaRuntimeWindowsDuplicate(a0)
-    // fcntl(fd, command, argument): F_GETFD/F_SETFD succeed, F_SETFL sets O_NONBLOCK (2048) on a socket, F_GETFL says 2 (O_RDWR)
+    // fcntl(fd, command, argument): F_GETFD/F_SETFD succeed, F_SETFL sets O_NONBLOCK (2048) on a socket, F_GETFL says 2 (O_RDWR),
+    // with O_NONBLOCK (2050) once it is set
     if (number == 72) {
         if (a1 == 1 || a1 == 2) return 0
-        if (a1 == 3) return 2
+        if (a1 == 3) return if (__ablaRuntimeWindowsIsNonBlocking(a0)) 2050 else 2
         if (a1 == 4) {
             val socket = __ablaRuntimeWindowsSocketOf(a0)
             if (socket == 0) return 0
             val scratch = __ablaRuntimeWindowsScratch()
             ablaRuntimeStoreI32(scratch, if ((a2 & 2048) != 0) 1 else 0)
             if (ioctlsocket(socket, 2147772030, scratch) != 0) return __ablaRuntimeWindowsSocketErrno()
+            __ablaRuntimeWindowsMarkNonBlocking(a0, (a2 & 2048) != 0)
             return 0
         }
         return -22
