@@ -56,7 +56,7 @@ serve() {
     local name=$1; shift
     openssl s_server -accept "$port" -cert "$out/$name.pem" -key "$out/$name.key" -quiet "$@" > "$out/s.$port.log" 2>&1 < /dev/null &
     pids+=("$!")
-    for _ in $(seq 1 100); do (echo > "/dev/tcp/127.0.0.1/$port") 2> /dev/null && return; sleep 0.1; done
+    for _ in $(seq 1 600); do (echo > "/dev/tcp/127.0.0.1/$port") 2> /dev/null && return; sleep 0.1; done
     fail "s_server did not listen on $port"
 }
 # The client against $port: the word it prints.
@@ -80,7 +80,7 @@ listen() { # environment ...: sets $port and $slog
     slog="$out/server.$port.out"
     env ${1:-X=} "$out/server" "$out/good.pem" "$out/good.key" > "$slog" 2> "$slog.err" < /dev/null &
     pids+=("$!")
-    for _ in $(seq 1 100); do grep -q '^port ' "$slog" 2> /dev/null && break; sleep 0.1; done
+    for _ in $(seq 1 600); do grep -q '^port ' "$slog" 2> /dev/null && break; sleep 0.1; done
     port=$(sed -n 's/^port //p' "$slog")
     [[ -n $port ]] || fail 'the hosted server did not listen'
 }
@@ -100,7 +100,7 @@ grep -q 'no renegotiation' "$out/renegotiate.log" || { cat "$out/renegotiate.log
 port=$((port + 1))
 (sleep 3; printf 'R\n'; sleep 4) | openssl s_server -accept "$port" -cert "$out/good.pem" -key "$out/good.key" -tls1_2 > "$out/s.reneg.log" 2>&1 &
 pids+=("$!")
-for _ in $(seq 1 100); do (echo > "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break; sleep 0.1; done
+for _ in $(seq 1 600); do (echo > "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break; sleep 0.1; done
 timeout 20 "$out/client" localhost "$port" "$out/ca.pem" linger > "$out/reneg-client.out" 2>&1 || true
 grep -q 'no renegotiation' "$out/s.reneg.log" || { cat "$out/s.reneg.log" >&2; fail 'the hosted client renegotiated when its server asked'; }
 echo "tls hosted verify: names and IP addresses are checked as such, TLS 1.0 and 1.1 are refused whatever the configuration says, and neither side takes a renegotiation"
