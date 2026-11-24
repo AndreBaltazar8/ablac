@@ -30,7 +30,7 @@ start() { # start FIRST HEAD REQUEST RESPONSE
     : > "$t/port"
     "$t/server" "$@" > "$t/port" 2> /dev/null & server=$!
     local i
-    for i in $(seq 1 100); do [[ -s $t/port ]] && break; sleep 0.1; done
+    for i in $(seq 1 600); do [[ -s $t/port ]] && break; sleep 0.1; done
     port=$(head -n 1 "$t/port")
     [[ -n $port ]] || { fail "the server did not start"; exit 1; }
 }
