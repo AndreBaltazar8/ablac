@@ -105,6 +105,27 @@ of:
 
 Error messages are diagnostic text and may improve; branch on the code.
 
+If malformed input should be treated exactly like JSON `null`, use
+`jsonParse(text).value` directly. The parser already returns JSON null on
+failure, so there is no need to check `succeeded` and supply `jsonNull()` again.
+Use the full result when you must distinguish an invalid document from a
+successful parse of `null`, report an error, or choose a different fallback.
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    println(jsonStringify(jsonParse("{\"a\":1}").value))
+    println(jsonStringify(jsonParse("null").value))
+    println(jsonStringify(jsonParse("{").value))
+}
+// output:
+// {"a":1}
+// null
+// null
+```
+
 Every parse is bounded by `JsonLimits`. `jsonDefaultLimits()` returns
 `jsonStandardLimits`:
 
