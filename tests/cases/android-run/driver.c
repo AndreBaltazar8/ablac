@@ -10,7 +10,7 @@
 //   driver <library> -j <libabla_jni.so> ...                the table installed by the generated libabla_jni.so's JNI_OnLoad
 //                                                           (linked against the library, as the app's CMake links it),
 //                                                           then any of the modes above
-// Before any export it installs the table of bionic functions the library calls through (abla-app.h, generated with the
+// On Android, before any export it installs the table of bionic functions the library calls through (abla-app.h, generated with the
 // library), as the app's libabla_jni.so does in JNI_OnLoad, and checks what abla_android_host_install answers.
 // The driver is linked with --export-dynamic: the library's undefined abla_test_host_hook is this file's.
 // Each call prints "<name> <result>"; the program exits 0 only when every result is the expected one.
@@ -18,7 +18,9 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #endif
+#ifdef __ANDROID__
 #include "abla-app.h"
+#endif
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -75,6 +77,9 @@ static void *run_job(void *argument) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __ANDROID__
+    // The host table is Android's (tools/test-android-run.sh); a Linux library (tools/test-foreign-threads.sh) imports what it
+    // calls, and neither the header nor -n and -j exist there.
     int install = 1;
     if (argc > 3 && strcmp(argv[2], "-n") == 0) {
         install = 0;
@@ -87,9 +92,11 @@ int main(int argc, char **argv) {
         for (int index = 2; index + 2 < argc; index++) argv[index] = argv[index + 2];
         argc -= 2;
     }
+#endif
     if (argc < 3) return 2;
     void *library = dlopen(argv[1], RTLD_NOW);
     if (!library) { printf("dlopen: %s\n", dlerror()); return 3; }
+#ifdef __ANDROID__
     if (jni) {
         void *adapter = dlopen(jni, RTLD_NOW);
         if (!adapter) { printf("dlopen %s: %s\n", jni, dlerror()); return 3; }
@@ -114,6 +121,7 @@ int main(int argc, char **argv) {
             (long long)unknown);
         if (first != 0 || again != 0 || second != 1 || unknown != -1) return 3;
     }
+#endif
     nested_function = (export_function)dlsym(library, "abla_run_nested");
     // A library has no process environment to read ABLA_GC_STRESS and ABLA_GC_TRACE from: pass them on as calls.
     const char *stress = getenv("ABLA_GC_STRESS"), *trace = getenv("ABLA_GC_TRACE");
