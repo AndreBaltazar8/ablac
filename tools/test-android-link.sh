@@ -58,6 +58,30 @@ check_no_imports() {
         return 1
     fi
 }
+# What the code generator must know of Android (#1139 area 9, the module triple): bionic before API 29 cannot load a library with native thread-locals (a PT_TLS segment), so
+# they are emulated (__emutls_v.* symbols); and x18 is the platform register, which Android code must not use. A compiler whose in-process code generation read the module's
+# triple "aarch64-linux-android24" un-normalized (v0.2.66 to v0.2.70) built libraries with PT_TLS and 24 uses of x18.
+objdump=$(command -v llvm-objdump || true)
+check_android_codegen() { # library has-thread-locals
+    local library=$1 threaded=$2 uses
+    if "$readelf" -lW "$library" | grep -qE '^ +TLS '; then
+        echo "android link: $library has a PT_TLS segment (native thread-locals: bionic before API 29 cannot load it)" >&2
+        return 1
+    fi
+    if [[ $threaded == 1 ]] && ! "$nm" "$library" | grep -q '__emutls_v\.'; then
+        echo "android link: $library has thread-locals and no emulated TLS (__emutls_v.*)" >&2
+        return 1
+    fi
+    if [[ -z $objdump ]]; then
+        [[ ${ABLA_REQUIRE_ANDROID_TESTS:-0} != 1 ]] || { echo 'android link: llvm-objdump is required' >&2; return 1; }
+        return 0
+    fi
+    uses=$("$objdump" -d --no-show-raw-insn "$library" | grep -cE '[[:space:],[]x18([],[:space:]]|$)' || true)
+    if [[ $uses != 0 ]]; then
+        echo "android link: $library uses x18, the platform register, in $uses instructions" >&2
+        return 1
+    fi
+}
 # label:build program:output directory:ABLA_DEBUG. The debug runtime is part of the set: it must not import a symbol
 # either (backtrace, bionic's write), and neither may a release build.
 count=0
@@ -73,6 +97,8 @@ for variant in small:small:small:0 threads:threads:threads:0 threads-debug:threa
     check_no_imports "$library" || { echo "android link: the $case library" >&2; exit 1; }
     grep -q ' T abla_android_host_install$' <<< "$("$nm" -D --defined-only "$library")" ||
         { echo "android link: the $case library does not export abla_android_host_install" >&2; exit 1; }
+    check_android_codegen "$library" $([[ $case == threads* || $case == rich* ]] && echo 1 || echo 0) ||
+        { echo "android link: the $case library" >&2; exit 1; }
     count=$((count + 1))
 done
 

@@ -219,7 +219,10 @@ extern "C" int abla_emit_object(const char *bitcode, const char *object, int ver
         diagnostic.print("abla", llvm::errs());
         return 1;
     }
-    llvm::Triple triple(module->getTargetTriple());
+    // The triple as `llc -mtriple` reads it: normalized. The compiler writes "aarch64-linux-android24", which Triple(string) reads position by position (vendor "linux", no
+    // Android environment), so an un-normalized module got none of the Android rules (emulated TLS below API 29, x18 reserved); the external llc normalizes its -mtriple.
+    llvm::Triple triple(llvm::Triple::normalize(module->getTargetTriple().str()));
+    module->setTargetTriple(triple);
     llvm::TargetOptions options = llvm::codegen::InitTargetOptionsFromCodeGenFlags(triple);
     if (sections) {
         options.FunctionSections = true;
@@ -330,9 +333,9 @@ static int abla_llc(const std::vector<std::string> &arguments) {
         diagnostic.print("llc", llvm::errs());
         return 1;
     }
-    llvm::Triple triple;
-    if (!triplePrefix.empty()) module->setTargetTriple(llvm::Triple(triplePrefix));
-    triple = module->getTargetTriple();
+    // As llc: -mtriple (normalized) replaces the module's, and the module's own is normalized too, so both mean what the external llc reads from them.
+    llvm::Triple triple(llvm::Triple::normalize(triplePrefix.empty() ? module->getTargetTriple().str() : llvm::StringRef(triplePrefix)));
+    module->setTargetTriple(triple);
     std::string error;
     const llvm::Target *target = llvm::TargetRegistry::lookupTarget(triple, error);
     if (!target) {
@@ -527,7 +530,7 @@ static int abla_llvm_mc(const std::vector<std::string> &arguments) {
         else { llvm::errs() << "llvm-mc: unsupported option " << argument << "\n"; return 1; }
     }
     if (input.empty() || output.empty() || triple.empty()) { llvm::errs() << "llvm-mc: needs -triple=, -o and an input\n"; return 1; }
-    llvm::Triple parsed(triple);
+    llvm::Triple parsed(llvm::Triple::normalize(triple));
     std::string error;
     const llvm::Target *target = llvm::TargetRegistry::lookupTarget(parsed, error);
     if (!target) { llvm::errs() << "llvm-mc: " << error << "\n"; return 1; }
