@@ -472,6 +472,7 @@ test-serial: ablac
 	tools/test-compile-time-cell-capture.sh $(COMPILER)
 	tools/test-hosted-network.sh $(COMPILER)
 	tools/test-tls-hosted-mix.sh $(COMPILER)
+	tools/test-tls-hosted-verify.sh $(COMPILER)
 	tools/test-module-siblings.sh $(COMPILER)
 	tools/test-device-serial.sh $(COMPILER)
 	tools/test-uuid.sh $(COMPILER)

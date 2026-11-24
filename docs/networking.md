@@ -663,6 +663,11 @@ Client connections of both modules enable peer verification, system trust, SNI, 
 CA-file connector and certificate/private-key listener support local and private PKI deployments. `abla/http/tls` and
 `abla/websocket/tls` provide the HTTPS and WSS client transports, over `abla/tls/pure`.
 
+The hosted module sets, on every context of its own whatever the system's OpenSSL configuration says: TLS 1.2 as the oldest version (a client and a server both),
+no renegotiation in either direction, a host name matched against the certificate's DNS SANs only (never the subject's common name, as `abla/tls/pure`), an IP address
+matched against its IP SANs (and not sent as the server name). A verification failure is a failed connect (handle -1, `tlsLastError()`), never an unverified session;
+[test-tls-hosted-verify.sh](../tools/test-tls-hosted-verify.sh) checks each against `openssl s_server` and `s_client`.
+
 `ablac build` links OpenSSL for a program that uses `abla/tls/hosted`.
 When linking an object emitted with `--emit object` by hand, add
 `-lssl -lcrypto` to the link line. `abla/random/hosted` supplies

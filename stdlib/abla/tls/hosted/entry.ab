@@ -277,6 +277,15 @@ private fun hostedTlsDeadlineWait(deadline: int, timeout: int): int {
     if (left <= 0) 0 else if (timeout < left) timeout else left
 }
 
+// What every context of this file sets, whatever the system's OpenSSL configuration says (an openssl.cnf may lower the minimum to TLS 1.0 and the security level to 0):
+// TLS 1.2 is the oldest version a client offers or a server takes (SSL_CTRL_SET_MIN_PROTO_VERSION, 0x0303), and a peer cannot renegotiate (SSL_OP_NO_RENEGOTIATION, bit 30):
+// a TLS 1.2 client could ask a server for a new full handshake again and again, a cost the server pays for each. False when the minimum could not be set.
+private trusted fun hostedTlsHarden(context: i64*): bool {
+    if (SSL_CTX_ctrl(context, 123, 771, nativeNullPointer()) != 1) return false
+    SSL_CTX_set_options(context, 1073741824)
+    true
+}
+
 // Returns a verified hosted TLS handle or -1 for invalid settings, connection failure, or a failed handshake.
 trusted fun tlsOpen(
     host: string,
@@ -339,7 +348,7 @@ trusted fun tlsUpgradeHandle(
     if (ready) {
         stage = "context_create"
         context = SSL_CTX_new(TLS_client_method())
-        ready = !pointerIsNull(context)
+        ready = !pointerIsNull(context) && hostedTlsHarden(context)
     }
     if (ready) {
         stage = "trust_store"
@@ -362,13 +371,20 @@ trusted fun tlsUpgradeHandle(
         session = SSL_new(context)
         ready = !pointerIsNull(session)
     }
+    // An IP address is no server name (RFC 6066: not sent in the SNI) and is matched against the certificate's IP address SANs, never against a DNS name that spells it; a
+    // host name against its DNS SANs only, not the subject's common name (as the pure TLS client: subjectAltName only).
+    val address = linuxIpv4Octets(host).size == 4 || linuxIpv6Words(host).size == 8
     if (ready) {
         stage = "server_name"
-        ready = SSL_ctrl(session, 55, 0, host) == 1
+        ready = address || SSL_ctrl(session, 55, 0, host) == 1
     }
     if (ready) {
         stage = "host_verification_setup"
-        ready = SSL_set1_host(session, host) == 1
+        if (address) ready = X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(session), host) == 1
+        else {
+            SSL_set_hostflags(session, 32)
+            ready = SSL_set1_host(session, host) == 1
+        }
     }
     if (ready) {
         stage = "socket_attach"
@@ -566,7 +582,7 @@ trusted fun TlsConnection.setTimeouts(
 // escapes; callers keep their existing error reporting and socket ownership.
 private trusted fun hostedTlsServerContext(certificatePath: string, privateKeyPath: string): i64* {
     var context = SSL_CTX_new(TLS_server_method())
-    var ready = !pointerIsNull(context)
+    var ready = !pointerIsNull(context) && hostedTlsHarden(context)
     if (ready) ready = SSL_CTX_use_certificate_chain_file(context, certificatePath) == 1
     if (ready) ready = SSL_CTX_use_PrivateKey_file(context, privateKeyPath, 1) == 1
     if (ready) ready = SSL_CTX_check_private_key(context) == 1
