@@ -14,6 +14,10 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 unset ABLA_DEBUG
 [[ $(uname -s) == Linux ]] || { echo 'image identity: Linux only (the Mach-O LC_UUID is read by the same code)'; exit 0; }
+if [[ ${ABLA_TEST_FAST_BUILDS:-0} != 1 ]]; then
+    source "$root/tools/suite-wall-limit.sh"
+    extend_suite_wall_limit "image identity" 900 600
+fi
 out=build/image-identity
 rm -rf "$out"
 mkdir -p "$out"

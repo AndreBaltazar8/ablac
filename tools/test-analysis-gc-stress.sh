@@ -23,6 +23,10 @@ if [[ ${RUN_TESTS_FULL:-0} == 1 ]]; then default_stride=256; fi
 stride=${2:-$default_stride}
 min_collections=512
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ ${RUN_TESTS_FULL:-0} == 1 ]]; then
+    source "$project_root/tools/suite-wall-limit.sh"
+    extend_suite_wall_limit "analysis gc stress" 900 900
+fi
 [[ $compiler == /* ]] || compiler="$PWD/$compiler"
 out="$project_root/build/analysis-gc-stress"
 rm -rf "$out"; mkdir -p "$out"
@@ -51,7 +55,7 @@ const lines = [
 fs.writeFileSync(process.argv[2], lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
 ' "$root" "$out/input.jsonl"
 
-ABLA_COMPILER_GC_STRESS="analysis:$stride" ABLA_COMPILE_EVAL=jit ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=500 ABLA_MAX_CPU_SECONDS=900 \
+ABLA_COMPILER_GC_STRESS="analysis:$stride" ABLA_COMPILE_EVAL=jit ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-500} ABLA_MAX_CPU_SECONDS=${ABLA_MAX_CPU_SECONDS:-900} \
     "$project_root/tools/run-limited.sh" "$compiler" analyze --stdio < "$out/input.jsonl" > "$out/output.jsonl" 2> "$out/error.txt" || {
     echo "analysis gc stress: the session failed" >&2
     tr -d '\0' < "$out/error.txt" | sed -n '1,20p' >&2
