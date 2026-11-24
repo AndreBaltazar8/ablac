@@ -64,11 +64,11 @@ check_no_imports() {
 objdump=$(command -v llvm-objdump || true)
 check_android_codegen() { # library has-thread-locals
     local library=$1 threaded=$2 uses
-    if "$readelf" -lW "$library" | grep -qE '^ +TLS '; then
+    if "$readelf" -lW "$library" | grep -E '^ +TLS ' >/dev/null; then
         echo "android link: $library has a PT_TLS segment (native thread-locals: bionic before API 29 cannot load it)" >&2
         return 1
     fi
-    if [[ $threaded == 1 ]] && ! "$nm" "$library" | grep -q '__emutls_v\.'; then
+    if [[ $threaded == 1 ]] && ! "$nm" "$library" | grep '__emutls_v\.' >/dev/null; then
         echo "android link: $library has thread-locals and no emulated TLS (__emutls_v.*)" >&2
         return 1
     fi
