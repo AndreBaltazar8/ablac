@@ -55,7 +55,7 @@ done
 cache=$t/tamper
 mkdir -p "$t/a2"; cp "$t/seed/abla.toml" "$t/seed/main.ab" "$t/seed/abla.lock" "$t/a2/"
 install "$cache" "$t/a2" "$t/a2.log" || fail "the first install failed" "$t/a2.log"
-entry=$(find "$cache/git" -mindepth 2 -maxdepth 2 -type d | head -1)
+entry=$(find "$cache/git" -mindepth 2 -maxdepth 2 -type d -print -quit)
 git -C "$entry/source" update-index --assume-unchanged lib.ab
 printf 'fun depAnswer(): int = 43\n' > "$entry/source/lib.ab"
 rm -rf "$t/a2/.abla"
@@ -67,7 +67,7 @@ grep -q '= 42' "$entry/source/lib.ab" 2>/dev/null || [ "$(grep -c '= 42' "$t/a2/
 cache=$t/fsmonitor
 mkdir -p "$t/a3"; cp "$t/seed/abla.toml" "$t/seed/main.ab" "$t/seed/abla.lock" "$t/a3/"
 install "$cache" "$t/a3" "$t/a3.log" || fail "the first install failed" "$t/a3.log"
-entry=$(find "$cache/git" -mindepth 2 -maxdepth 2 -type d | head -1)
+entry=$(find "$cache/git" -mindepth 2 -maxdepth 2 -type d -print -quit)
 printf '#!/bin/sh\ntouch %s\n' "$t/ran-fsmonitor" > "$t/hook.sh"; chmod +x "$t/hook.sh"
 printf '[core]\n\tfsmonitor = %s\n' "$t/hook.sh" >> "$entry/source/.git/config"
 rm -rf "$t/a3/.abla"
@@ -79,7 +79,7 @@ cache=$t/umask
 mkdir -p "$t/a4"; cp "$t/seed/abla.toml" "$t/seed/main.ab" "$t/seed/abla.lock" "$t/a4/"
 ( umask 000; install "$cache" "$t/a4" "$t/a4.log" ) || fail "the install under umask 000 failed" "$t/a4.log"
 writable=$(find "$cache" ! -type l -perm /022 | wc -l)
-[ "$writable" = 0 ] || fail "$writable files or directories of the cache are writable by group or others under umask 000 (e.g. $(find "$cache" ! -type l -perm /022 | head -1))"
+[ "$writable" = 0 ] || fail "$writable files or directories of the cache are writable by group or others under umask 000 (e.g. $(find "$cache" ! -type l -perm /022 -print -quit))"
 
 [ "$failures" = 0 ] || { printf 'package cache integrity: %d failure(s)\n' "$failures" >&2; exit 1; }
 echo "package cache integrity: parallel installs share one valid entry, a changed or reconfigured entry is not trusted, and entries are not writable by others"
