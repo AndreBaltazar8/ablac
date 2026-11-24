@@ -5,13 +5,16 @@ import "abla/tls/pure"
 import "abla/websocket"
 import "abla/crypto"
 import "abla/http"
+import "abla/sys/linux/process"
 
 /// Owns the TLS stream and frame buffer for a WebSocket client connection.
 resource class TlsWebSocketConnection(
     val stream: TlsConnection,
     var buffered: string,
     val maskingKey: string,
-    var closed: bool
+    var closed: bool,
+    var readTimeoutMilliseconds: int = 0,
+    val writeTimeoutMilliseconds: int = 0
 )
 
 private fun webSocketTlsClientConfigured(
@@ -40,7 +43,10 @@ private fun webSocketTlsClientConfigured(
         if (stream.write(request) == request.size) {
             var response = ""
             var headerEnd = -1
-            while (headerEnd < 0 && response.size < 65536) {
+            // The whole upgrade response is bounded by the same limit as the connection (not a limit per read: a server that sends a byte at a time would hold it for 64 KiB of reads).
+            val responseStarted = linuxMonotonicMilliseconds()
+            while (headerEnd < 0 && response.size < 65536 &&
+                   (timeoutMilliseconds <= 0 || linuxMonotonicMilliseconds() - responseStarted < timeoutMilliseconds)) {
                 val chunk = stream.read(65536 - response.size)
                 if (chunk == "") headerEnd = response.size
                 else {
@@ -61,7 +67,9 @@ private fun webSocketTlsClientConfigured(
                         headerEnd, response.size
                     ) else "",
                     mask,
-                    false
+                    false,
+                    0,
+                    timeoutMilliseconds
                 )
             }
         }
@@ -104,20 +112,45 @@ fun TlsWebSocketConnection.sendBinary(payload: string): bool {
     !this.closed && this.stream.write(frame) == frame.size
 }
 
-/// Reads the next WebSocket frame and reports a parse error or end of stream when unsuccessful.
+/// Limits how long a read waits, for every later `readFrame` that does not name its own limit: the whole wait for a frame, from the call to its last byte, so a
+/// peer that sends a byte at a time cannot hold the reader for ever. 0 (the default) waits as long as it takes, which suits a connection that may stay quiet.
+fun TlsWebSocketConnection.setReadTimeout(milliseconds: int): void {
+    this.readTimeoutMilliseconds = if (milliseconds < 0) 0 else milliseconds
+}
+
+/// Reads the next WebSocket frame and reports a parse error, end of stream or (with a limit) a timeout when unsuccessful. `timeoutMilliseconds` bounds the
+/// whole wait for the frame (-1, the default, takes the connection's setReadTimeout limit; 0 waits as long as it takes); a frame that is not complete in time
+/// is `timedOut`, the connection stays open and the call can be repeated (the bytes read stay buffered).
 fun TlsWebSocketConnection.readFrame(
-    maximumPayload: int = 1048576
+    maximumPayload: int = 1048576,
+    timeoutMilliseconds: int = -1
 ): WebSocketReadResult {
     var decoded = webSocketDecodeFrame(this.buffered, maximumPayload, false)
     var eof = false
-    while (!decoded.complete && !eof && !this.closed) {
-        val chunk = this.stream.read(65536)
-        if (chunk == "") eof = true
-        else {
-            this.buffered = "${this.buffered}$chunk"
-            decoded = webSocketDecodeFrame(
-                this.buffered, maximumPayload, false
-            )
+    var timedOut = false
+    val limit = if (timeoutMilliseconds < 0) this.readTimeoutMilliseconds else timeoutMilliseconds
+    val started = linuxMonotonicMilliseconds()
+    var limited = false
+    while (!decoded.complete && !eof && !timedOut && !this.closed) {
+        if (limit > 0) {
+            val left = started + limit - linuxMonotonicMilliseconds()
+            if (left <= 0) {
+                timedOut = true
+            } else {
+                limited = this.stream.setTimeouts(left, this.writeTimeoutMilliseconds)
+            }
+        }
+        if (!timedOut) {
+            val chunk = this.stream.read(65536)
+            if (chunk == "") {
+                if (limit > 0 && tlsLastError() == "TLS read or write timed out") timedOut = true
+                else eof = true
+            } else {
+                this.buffered = "${this.buffered}$chunk"
+                decoded = webSocketDecodeFrame(
+                    this.buffered, maximumPayload, false
+                )
+            }
         }
     }
     if (decoded.succeeded()) {
@@ -125,9 +158,10 @@ fun TlsWebSocketConnection.readFrame(
             decoded.consumed, this.buffered.size
         )
     }
+    if (limited) this.stream.setTimeouts(0, this.writeTimeoutMilliseconds)
     if (eof) this.closed = true
     WebSocketReadResult(
-        decoded.frame, decoded.succeeded(), eof, false, decoded.error
+        decoded.frame, decoded.succeeded(), eof, timedOut, decoded.error
     )
 }
 

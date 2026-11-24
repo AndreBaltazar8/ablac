@@ -232,8 +232,10 @@ handler on the thread that accepts, so a session holds the server until it ends.
 sends nothing (10 s to the first byte), an upgrade head or request that does not arrive (30 s, 120 s), a response that is not taken (30 s), a read that waits
 for the next byte after the upgrade (30 s idle, restarting on every byte), a frame that takes too long from its first byte to its last (120 s), and a write that is
 not taken (30 s); 0 turns one off. A slow handler, or a peer that is slow within these bounds, still holds every other client: a service on an open network wants
-`abla/websocket/server` or `abla/websocket/event`, which read many connections at once and have deadlines of their own. The client of `abla/websocket/tls` reads
-the upgrade response and its frames with no deadline: a client of a server it does not trust applies one around it.
+`abla/websocket/server` or `abla/websocket/event`, which read many connections at once and have deadlines of their own. The client of `abla/websocket/tls` bounds the whole upgrade response by its connection timeout; reading frames waits as long as it takes
+unless a limit is set: `readFrame(maximumPayload, timeoutMilliseconds)` bounds the whole wait for one frame (a peer that sends a byte at a time cannot hold it), and
+`setReadTimeout` sets that limit for every read that names none (0, the default, is no limit). A read that times out reports `timedOut`, keeps the connection
+open and the bytes read, and can be repeated.
 
 `abla/websocket/json` adds bounded JSON text messages.
 `abla/websocket/rpc` adds a method router with `id`, `method`, `params`,

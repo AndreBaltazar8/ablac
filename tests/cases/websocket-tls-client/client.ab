@@ -1,0 +1,135 @@
+import "abla/websocket/server"
+import "abla/websocket/server/tls"
+import "abla/websocket/tls"
+import "abla/fs"
+import "abla/io"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+
+// The read deadline of the TLS WebSocket client (abla/websocket/tls, tools/test-websocket-tls-client.sh): a server in a forked child accepts
+// every connection and sends what its path says; the client reads with deadlines.
+//   /partial  the first 3 bytes of a text frame, the rest of it 1.2 s later
+//   /drip     a text frame of 8 bytes, one byte every 150 ms (1.2 s in all: a deadline per read never ends it)
+//   /silent   nothing
+// A TLS connection is made for each, so a deadline cannot be told apart from a refusal.
+
+val clientCertificate = "build/websocket-tls-client/certificate.pem"
+val clientPrivateKey = "build/websocket-tls-client/private-key.pem"
+
+// What the server has promised one connection: the bytes of a frame still to send, and when the next one is due.
+class ClientPlan(val id: int, val path: string, val frame: string, var sent: int, var due: int)
+
+fun clientServe(var server: WebSocketServer): void {
+    val plans: array<ClientPlan> = []
+    val end = linuxMonotonicMilliseconds() + 15000
+    while (linuxMonotonicMilliseconds() < end) {
+        server.step(5)
+        for (event in server.takeEvents()) {
+            if (event.isOpen()) {
+                val frame = webSocketServerEncode("abcdefgh", false)
+                val now = linuxMonotonicMilliseconds()
+                val path = event.path()
+                if (path == "/partial") {
+                    server.sendEncoded(event.id, frame.slice(0, 3))
+                    plans.append(ClientPlan(event.id, path, frame, 3, now + 1200))
+                } else if (path == "/drip") {
+                    plans.append(ClientPlan(event.id, path, frame, 0, now + 150))
+                } else plans.append(ClientPlan(event.id, path, frame, 0, now + 1000000))
+            }
+        }
+        val now = linuxMonotonicMilliseconds()
+        for (plan in plans) {
+            if (plan.sent < plan.frame.size && now >= plan.due) {
+                if (plan.path == "/partial") {
+                    server.sendEncoded(plan.id, plan.frame.slice(3, plan.frame.size))
+                    plan.sent = plan.frame.size
+                } else {
+                    server.sendEncoded(plan.id, plan.frame.slice(plan.sent, plan.sent + 1))
+                    plan.sent = plan.sent + 1
+                    plan.due = now + 150
+                }
+            }
+        }
+        server.flush()
+    }
+}
+
+fun clientConnect(port: int, path: string): TlsWebSocketConnection =
+    webSocketTlsClientWithCa("localhost", path, clientCertificate, port, 30000)
+
+fun fail(what: string): int {
+    println("websocket-tls-client: $what")
+    1
+}
+
+fun main: int {
+    val tls = webSocketServerTls(clientCertificate, clientPrivateKey, 4000)
+    var server = webSocketServerIpv6(ipv6Loopback(0), WebSocketServerOptions(tls = tls), false)
+    val port = server.localPort()
+    if (tls.error != "" || port <= 0) return fail("no server: '${tls.error}'")
+    val child = linuxSyscall0(57)
+    if (child == 0) {
+        clientServe(server)
+        linuxSyscall1(60, 0)
+    }
+    linuxSleep(300)
+    var result = 0
+
+    // A frame cut short: the deadline ends the wait, the connection stays open with the bytes kept, and the same read finishes the frame later.
+    var partial = clientConnect(port, "/partial")
+    if (partial.closed) return fail("no connection")
+    var started = linuxMonotonicMilliseconds()
+    val cut = partial.readFrame(1024, 400)
+    var elapsed = linuxMonotonicMilliseconds() - started
+    if (cut.available || !cut.timedOut || cut.closed || partial.closed) result = fail("a cut frame: available=${cut.available} timedOut=${cut.timedOut} closed=${cut.closed}")
+    if (result == 0 && (elapsed < 350 || elapsed > 1100)) result = fail("a cut frame waited $elapsed ms for 400")
+    if (result == 0 && partial.buffered.size != 3) result = fail("the bytes read were not kept: ${partial.buffered.size}")
+    if (result == 0) {
+        val whole = partial.readFrame(1024, 5000)
+        if (!whole.available || whole.frame.payload != "abcdefgh") result = fail("the rest of the frame: available=${whole.available} '${whole.frame.payload}' timedOut=${whole.timedOut}")
+    }
+
+    // The connection's own limit (setReadTimeout) applies to a read that names none; a quiet peer ends it, and 0 names no limit.
+    if (result == 0) {
+        partial.setReadTimeout(300)
+        started = linuxMonotonicMilliseconds()
+        val quiet = partial.readFrame(1024)
+        elapsed = linuxMonotonicMilliseconds() - started
+        if (quiet.available || !quiet.timedOut || partial.closed) result = fail("a quiet connection: timedOut=${quiet.timedOut} closed=${partial.closed}")
+        if (result == 0 && (elapsed < 250 || elapsed > 1500)) result = fail("a quiet connection waited $elapsed ms for 300")
+    }
+    if (result == 0) {
+        // 0 asks for no limit: the frame cut short is waited for as long as the server takes (it sends nothing more here: the read is stopped by a close).
+        val closed = partial.close()
+        if (!closed && !partial.closed) result = fail("close")
+    }
+
+    // A frame that drips in: every byte arrives in time, the whole frame does not.
+    if (result == 0) {
+        val drip = clientConnect(port, "/drip")
+        if (drip.closed) return fail("no connection for the drip")
+        started = linuxMonotonicMilliseconds()
+        val slow = drip.readFrame(1024, 500)
+        elapsed = linuxMonotonicMilliseconds() - started
+        if (slow.available || !slow.timedOut) result = fail("a dripped frame was read: available=${slow.available} timedOut=${slow.timedOut}")
+        if (result == 0 && (elapsed < 450 || elapsed > 1100)) result = fail("a dripped frame waited $elapsed ms for 500")
+        drip.close()
+    }
+
+    // The default is unchanged: no limit, so a read with no timeout and a connection with none waits for the frame the server sends.
+    if (result == 0) {
+        val patient = clientConnect(port, "/drip")
+        if (patient.closed) return fail("no connection for the patient read")
+        val whole = patient.readFrame(1024)
+        if (!whole.available || whole.frame.payload != "abcdefgh" || whole.timedOut) result = fail("the default read: available=${whole.available} timedOut=${whole.timedOut}")
+        patient.close()
+    }
+    linuxSyscall2(62, child, 9)
+    linuxWaitProcess(child, false)
+    if (result == 0) {
+        println("websocket-tls-client: ok")
+        return 42
+    }
+    result
+}
