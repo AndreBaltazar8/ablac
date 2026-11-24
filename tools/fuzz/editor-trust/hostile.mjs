@@ -104,6 +104,27 @@ const selfTrusting = (dir, canary) => ({
 add('self-trusting-project', selfTrusting);
 add('initialize-trust-flags', selfTrusting, { init: { trusted: true, trustedProject: true, trust: 'full', allowCompileTime: true, compileTime: true, policy: { compileTime: true, evaluate: true }, capabilities: ['process.io', 'filesystem.write'], initializationOptions: { trusted: true } } });
 add('initialize-without-mode', selfTrusting, { init: { analysisMode: undefined } });
+// Every compile-time site in one project, so one analysis session covers them (tools/test-editor-trust.sh): each module tries to create its own canary.
+add('combined', (dir, canary) => ({
+    'abla.toml': toml(['name = "evil"', 'entry = "main.ab"', 'nativeLibraries = ["evil"]', `compileCapabilities = ${ALL}`, '', '[editor]', 'trusted = true']),
+    '.vscode/settings.json': '{"abla.trustedProject": true, "abla.compiler.path": "./evil"}\n',
+    'libevil.so': '\x7fELF-not-a-library',
+    'build/main': `#!/bin/sh\ntouch ${canary}.build\n`,
+    'm1.ab': `import "abla/compiler"\n#compilerGrant("process.io")\n#compilerGrant("filesystem.write")\ncompile fun hostile(): int {\n    compilerRunProcess(["touch", "${canary}.expression"])\n    compilerWriteFile("${canary}.w", "x")\n    1\n}\nval x = #hostile()\n`,
+    'm2.ab': `import "abla/compiler"\n#compilerGrant("process.io")\nval s = #compilerRunProcess(["touch", "${canary}.action"])\n`,
+    'm3.ab': `import "abla/compiler"\n#compilerGrant("process.io")\ncompile fun hostile(): int {\n    compilerRunProcess(["touch", "${canary}.default"])\n    1\n}\nfun f(a: int = #hostile()): int = a\n`,
+    'ext.ab': `import "abla/compiler"\nimport "abla/compiler/parser"\n#compilerGrant("process.io")\ncompile fun evilHandler(cursor: ParserCursor): SyntaxExpression {\n    parserExpect(cursor, "x")\n    compilerRunProcess(["touch", "${canary}.subparser"])\n    syntaxInteger(1)\n}\n#compilerRegisterSubparser("evil", evilHandler)\n`,
+    'm4.ab': `import "ext.ab"\nfun sub: int = $evil x\n`,
+    'provider.ab': `import "abla/compiler"\n#compilerGrant("process.io")\ncompile fun resolveGen(): ResolvedImport {\n    compilerRunProcess(["touch", "${canary}.provider"])\n    resolvedImport("r1", "src/gen.ab", [importFile("abla.toml", "name = \\"gen\\"\\nentry = \\"src/gen.ab\\"\\n"), importFile("src/gen.ab", "fun genAnswer: int = 1\\n")])\n}\ncompile fun gen(): ImportSource = importSource("gen", "test:gen", "v1", resolveGen)\n`,
+    'm5.ab': `import "provider.ab"\nimport gen()\nfun g: int = genAnswer()\n`,
+    'm6.ab': `import github("evil/repo")\nimport gitImportSource("dep", "${dir}/dep.git", "branch", "main")\nfun h: int = 0\n`,
+    'cycle-a.ab': `import "cycle-b.ab"\nfun fa: int = 1\n`,
+    'cycle-b.ab': `import "cycle-a.ab"\nfun fb: int = 1\n`,
+    '@link:loop': '.',
+    '@link:zero.ab': '/dev/zero',
+    '@fifo:pipe.ab': '',
+    'main.ab': `import "m1.ab"\nimport "m2.ab"\nimport "m3.ab"\nimport "m4.ab"\nimport "m5.ab"\nimport "m6.ab"\nimport "cycle-a.ab"\nimport "loop/m1.ab"\nimport "zero.ab"\nimport "pipe.ab"\nimport "/etc/passwd"\nimport "../../../../../etc/hostname"\nfun main: int = 0\n`,
+}), { init: { trusted: true, trustedProject: true, trust: 'full', allowCompileTime: true, compileTime: true, policy: { compileTime: true, evaluate: true }, capabilities: ['process.io', 'filesystem.write'], initializationOptions: { trusted: true } }, minPending: 4 });
 // Resource bounds.
 add('deep-nesting', () => ({
     'abla.toml': toml(['name = "evil"', 'entry = "main.ab"']),
@@ -202,7 +223,7 @@ async function session(workspace, dir, env, timeoutMs, edit, extra = {}) {
         let r = await step('initialize', { workspaceRoots: [workspace], clientName: 'hostile', clientVersion: '1', analysisMode: 'graph-v2', ...extra });
         if (r.result) {
             r = await step('analyze', {});
-            if (r.result && r.result.documents) { const codes = new Set(); for (const d of r.result.documents) for (const x of d.diagnostics ?? []) codes.add(x.code); for (const p of r.result.pending ?? []) codes.add('pending:' + p.code); summary.codes = [...codes].slice(0, 4); }
+            if (r.result && r.result.documents) { const codes = new Set(); for (const d of r.result.documents) for (const x of d.diagnostics ?? []) codes.add(x.code); for (const p of r.result.pending ?? []) codes.add('pending:' + p.code); summary.pending = (r.result.pending ?? []).length; summary.codes = [...codes].slice(0, 4); }
             const main = path.join(dir, 'main.ab');
             if (r.result && edit && fs.existsSync(main)) {
                 const text = fs.readFileSync(main, 'utf8').slice(0, 4096);
@@ -243,16 +264,16 @@ for (const c of cases) {
     const before = tree(dir);
     if (CONTROL) {
         const built = spawnSync(compiler, c.name === 'import-provider' ? ['package', 'update', '--project', dir] : ['build', '--project', dir, '-o', path.join(dir, 'out-bin'), '--fast', '--no-cache'], { env, cwd: dir, encoding: 'utf8', timeout: 120000 });
-        const created = fs.existsSync(canary) || fs.existsSync(canary + '.w');
+        const created = fs.readdirSync(path.dirname(dir)).some((f) => f.startsWith(path.basename(canary)));
         report('control ' + c.name, true, 'ablac ' + (c.name === 'import-provider' ? 'package update' : 'build') + ' status ' + built.status + ', canary ' + (created ? 'CREATED (the site is live in a build)' : 'absent (this site does not act in a build either)'));
-        for (const s of ['', '.w']) try { fs.rmSync(canary + s); } catch {}
+        for (const f of fs.readdirSync(path.dirname(dir))) if (f.startsWith(path.basename(canary))) try { fs.rmSync(path.join(path.dirname(dir), f)); } catch {}
         continue;
     }
     const started = Date.now();
     const summary = await session(c.workspace ?? dir, dir, env, c.bound === 'respond' ? 60000 : 30000, true, c.init ?? {});
     const seconds = ((Date.now() - started) / 1000).toFixed(1);
     const problems = [];
-    for (const suffix of ['', '.w']) if (fs.existsSync(canary + suffix)) problems.push(`canary ${path.basename(canary + suffix)} exists (code ran)`);
+    for (const f of fs.readdirSync(path.dirname(dir))) if (f.startsWith(path.basename(canary))) problems.push(`canary ${f} exists (code ran)`);
     const ran = fs.existsSync(shimLog) ? fs.readFileSync(shimLog, 'utf8').trim().split('\n').filter((l) => l.includes(base)) : [];
     if (ran.length) problems.push(`shim tools ran: ${ran.slice(0, 3).join(' | ')}`);
     if (c.workspace === undefined && tree(dir) !== before) problems.push('the workspace changed');
@@ -260,6 +281,7 @@ for (const c of cases) {
     if (fs.existsSync(env.ABLA_CACHE_DIR) && fs.readdirSync(env.ABLA_CACHE_DIR).length) problems.push('ABLA_CACHE_DIR was written');
     if (summary.steps.some((s) => s.endsWith('timeout'))) problems.push('no answer in time');
     if (summary.killed) problems.push('had to be killed');
+    if (c.minPending !== undefined && (summary.pending ?? 0) < c.minPending) problems.push(`only ${summary.pending ?? 0} blocked compile-time sites reported (the workspace has more): the analysis stopped early`);
     if (summary.peakKiB > 6 * 1024 * 1024) problems.push(`peak ${Math.round(summary.peakKiB / 1024)} MiB`);
     fs.writeFileSync(shimLog, '');
     report(c.name, problems.length === 0, `${problems.join('; ') || summary.steps.join(' ')} codes=${(summary.codes ?? []).join(',')} [${seconds}s, ${Math.round(summary.peakKiB / 1024)} MiB, exit ${summary.exit?.code ?? summary.exit?.signal}]`);
