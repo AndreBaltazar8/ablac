@@ -9,6 +9,7 @@
 #   - trusted, extern: a dependency's definition without the line is refused naming dependency, function, line and
 #     the line to add; with the line it builds and runs;
 #   - transitive: a leaf's definition needs the root's line for the leaf, the middle package's line is not enough;
+#   - contract: the `#contract` twin of an out-of-tree module is the root's code (module.ab, bootstrapCompilePackageOwners), no line needed;
 #   - mutation: the check is what refuses (no line, no refusal is a failure of the test, see the final case).
 set -euo pipefail
 compiler=${1:-build/ablac}
@@ -132,4 +133,16 @@ build ceiling
 [[ $status != 0 ]] || fail "ceiling: compile-time native code ran without the root's own trusted.native"
 ! grep -q E_PACKAGE_TRUSTED_DENIED "$out/ceiling.log" || fail "ceiling: the definition was refused despite the line"
 ! grep -q "dependency value: '4'" "$out/ceiling.log" || fail "ceiling: the dependency's C call ran at compile time"
+
+# A contract twin (`import contract`, module path `<path>#contract`) is generated for a module outside the root's tree, with no import edge of its
+# own: it is that module's code, so it is the root's too and needs no line (abla-one's remote tests built before #122 and must still).
+mkdir -p "$out/contract/app" "$out/contract/backend"
+printf 'name = "contract-app"\nversion = "0.1.0"\nentry = "main.ab"\n' > "$out/contract/app/abla.toml"
+printf 'fun increment(value: int): int = value + 1\n' > "$out/contract/backend/counter.ab"
+printf 'import contract "../backend/counter.ab" as remote\n\nfun clientUnused: int = 0\n' > "$out/contract/app/client.ab"
+printf 'import "abla/io"\nimport "../backend/counter.ab" as backend\nimport "client.ab"\n\nfun main: int {\n    println("local ${backend.increment(41)} ${clientUnused()}")\n    0\n}\n' > "$out/contract/app/main.ab"
+status=0
+{ (cd "$out/contract/app" && "$compiler" build main.ab -o "$out/contract/app.bin" --fast --no-cache --offline) && "$out/contract/app.bin"; } > "$out/contract.log" 2>&1 || status=$?
+[[ $status == 0 ]] || fail "contract: the contract twin of a module outside the root was refused (status $status): $(grep -m2 'error' "$out/contract.log")"
+grep -q "local 42 0" "$out/contract.log" || fail "contract: not 'local 42 0': $(head -2 "$out/contract.log")"
 echo "package-trusted-grants: a dependency's trusted and extern definitions need the root's line; the root's own do not"
