@@ -1,0 +1,136 @@
+# A long `ablac analyze --stdio` session on both Macs, dispatched by hand: abla-lsp's compiler integration test (run 45320516454)
+# saw the released v0.2.68 service die with SIGBUS on macos-15 and macos-15-intel in a session Linux answers in 3 s. The session
+# is the one that test sends (tools/test-analysis-refactor-session.sh, tests/cases/analysis-service/refactor-session), its six
+# validations repeated `rounds` times. It runs with a released toolchain and, when `build` is on, with a compiler built from this
+# commit (stage 1 from the pinned seed); a crash is run again under lldb for every thread's backtrace and the registers, and the
+# system's crash reports are kept with the session's own files.
+name: macOS analysis session
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Released toolchain to replay with (its tag)
+        type: string
+        default: v0.2.68
+      rounds:
+        description: Times the six validations repeat in the one session
+        type: string
+        default: '20'
+      build:
+        description: Also build this commit's compiler (stage 1) and replay with it
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  session:
+    name: Analysis session (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      JOBS: '2'
+      ABLA_NATIVE_JOBS: '2'
+      ABLA_CODEGEN_JOBS: '2'
+      ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1200'
+    steps:
+      - name: Record the runner's hardware and limits
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          ulimit -a
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Fetch the released toolchain
+        env:
+          RELEASE: ${{ inputs.release }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          mkdir -p build/released
+          asset="abla-toolchain-$ARCHITECTURE-macos.tar.gz"
+          base="https://github.com/AndreBaltazar8/ablac/releases/download/$RELEASE"
+          curl -fsSL -o "build/released/$asset" "$base/$asset"
+          curl -fsSL -o "build/released/$asset.sha256" "$base/$asset.sha256"
+          (cd build/released && shasum -a 256 -c "$asset.sha256")
+          tar -xzf "build/released/$asset" -C build/released
+          find build/released -name ablac -type f -perm -u+x -print
+      - name: Replay the session with the released compiler
+        id: released
+        continue-on-error: true
+        env:
+          ROUNDS: ${{ inputs.rounds }}
+        run: |
+          compiler=$(find "$PWD/build/released" -name ablac -type f -perm -u+x -print -quit)
+          mkdir -p build/macos-analyze
+          tools/test-analysis-refactor-session.sh "$compiler" "$ROUNDS" 2>&1 | tee build/macos-analyze/released.log
+          cp -R build/analysis-refactor-session build/macos-analyze/released-session
+      - name: The released compiler's crash, under lldb
+        if: steps.released.outcome == 'failure'
+        run: |
+          compiler=$(find "$PWD/build/released" -name ablac -type f -perm -u+x -print -quit)
+          cp -R build/analysis-refactor-session build/macos-analyze/released-session
+          tools/macos-analyze-lldb.sh "$compiler" build/analysis-refactor-session/session.jsonl \
+            > build/macos-analyze/released-lldb.txt 2>&1 || true
+          cat build/macos-analyze/released-lldb.txt
+      - name: Install the pinned patched native LLVM toolchain
+        if: inputs.build
+        run: tools/install-macos-llvm.sh
+      - name: Fetch the checksum-pinned bootstrap
+        if: inputs.build
+        run: tools/bootstrap-compiler.sh build/ci/bootstrap-ablac
+      - name: Build stage 1 from this commit
+        if: inputs.build
+        run: |
+          mkdir -p build/macos-analyze
+          tools/build-self-hosted-current.sh build/ci/bootstrap-ablac build/ci/ablac-stage1 \
+            2>&1 | tee build/macos-analyze/stage1.log
+      - name: Replay the session with this commit's compiler
+        id: built
+        if: inputs.build
+        continue-on-error: true
+        env:
+          ROUNDS: ${{ inputs.rounds }}
+        run: |
+          tools/test-analysis-refactor-session.sh build/ci/ablac-stage1 "$ROUNDS" 2>&1 | tee build/macos-analyze/built.log
+          cp -R build/analysis-refactor-session build/macos-analyze/built-session
+      - name: This commit's compiler's crash, under lldb
+        if: inputs.build && steps.built.outcome == 'failure'
+        run: |
+          cp -R build/analysis-refactor-session build/macos-analyze/built-session
+          tools/macos-analyze-lldb.sh "$PWD/build/ci/ablac-stage1" build/analysis-refactor-session/session.jsonl \
+            > build/macos-analyze/built-lldb.txt 2>&1 || true
+          cat build/macos-analyze/built-lldb.txt
+      - name: Keep the system's crash reports
+        if: always()
+        run: |
+          mkdir -p build/macos-analyze/crash-reports
+          find "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports -name 'ablac*' \
+            -exec cp {} build/macos-analyze/crash-reports/ \; 2>/dev/null || true
+          ls -la build/macos-analyze/crash-reports
+      - name: Retain the sessions, logs, backtraces and crash reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-analyze-session-${{ matrix.architecture }}
+          path: build/macos-analyze/
+          retention-days: 7
+      - name: Fail when a compiler crashed
+        if: always()
+        env:
+          RELEASED: ${{ steps.released.outcome }}
+          BUILT: ${{ steps.built.outcome }}
+        run: |
+          echo "released: $RELEASED, built: ${BUILT:-skipped}"
+          [[ $RELEASED == success && ( -z $BUILT || $BUILT == success || $BUILT == skipped ) ]]

@@ -158,6 +158,7 @@ test-serial: ablac
 	tools/test-version.sh $(COMPILER)
 	tools/test-coverage.sh $(COMPILER)
 	tools/test-analysis-service.sh $(COMPILER)
+	tools/test-analysis-refactor-session.sh $(COMPILER)
 	tools/test-frontend-analysis.sh $(COMPILER)
 	tools/test-analysis-graph.sh $(COMPILER)
 	tools/test-builtin-docs.sh $(COMPILER)
