@@ -19,6 +19,8 @@ import "module_paths.ab"
 import "json_construction.ab"
 import "lexer.ab"
 import "gc_stress_scope.ab"
+import "analysis_budget.ab"
+import "abla/integer"
 
 val ABLA_ANALYSIS_PROTOCOL_VERSION: int = 1
 val ABLA_ANALYSIS_MAX_DOCUMENTS: int = 20000
@@ -1393,6 +1395,8 @@ fun bootstrapAnalysisOwnedString(value: string): string = "$value"
 
 fun BootstrapAnalysisService.validateEdit(params: Json): Json {
     val graphBaseline = this.graphSnapshot()
+    if (bootstrapAnalysisBudgetExpired())
+        return $json {"valid": false, "reason": "analysis incomplete: request time budget exceeded"}
     var valid = params.getString("baseRevision") == "${this.revision}"
     var reason = if (valid) "" else "analysis revision is stale"
     val candidate = BootstrapAnalysisService([], [], this.revision, true, true)
@@ -1522,6 +1526,8 @@ fun BootstrapAnalysisService.validateEdit(params: Json): Json {
     candidate.graphEntries.truncate(0)
     candidate.graphEntries.append(baseline.getString("entry"))
     val prospective = if (valid) candidate.snapshot() else jsonNull()
+    if (bootstrapAnalysisBudgetExpired())
+        return $json {"valid": false, "reason": "analysis incomplete: request time budget exceeded"}
     if (valid && !prospective.get("complete").asBoolean()) {
         valid = false
         reason =
@@ -1677,7 +1683,13 @@ fun BootstrapAnalysisService.handle(request: Json): string {
             else snapshot
         val projected = if (params.has("fields")) bootstrapAnalysisGraphProjection(answer,
             params.get("fields")) else answer
-        this.graphWriteAnalysis(id, projected)
+        if (bootstrapAnalysisBudgetExpired() && projected.has("entry")) {
+            val incomplete = this.graphBudgetIncomplete()
+            val next = if (params.has("since")) this.graphSince(incomplete, params.getString("since"))
+                else incomplete
+            this.graphWriteAnalysis(id, if (params.has("fields")) bootstrapAnalysisGraphProjection(next,
+                params.get("fields")) else next)
+        } else this.graphWriteAnalysis(id, projected)
     } else if ((method == "query/definition" || method == "query/hover" ||
         method == "query/references")) {
         response = this.graphQuery(id, method, params)
@@ -1715,6 +1727,8 @@ fun bootstrapAnalysisService(): int {
     // The editor's collections stop the service while it answers: four threads mark and sweep (ABLA_GC_WORKERS overrides).
     runtimeMemorySetGcWorkers(4)
     val service = BootstrapAnalysisService([], [], 1, false, true)
+    val configured = linuxEnvironment("ABLA_ANALYSIS_BUDGET_MS").value.parseInt() ?? 0
+    val budget = if (configured > 0 && configured <= 600000) configured else 60000
     val standardInput = linuxStandardInput()
     // Analyze requests handled so far (ABLA_COMPILER_GC_STRESS=analysis-edit starts after the first).
     var analyses = 0
@@ -1735,9 +1749,13 @@ fun bootstrapAnalysisService(): int {
                 // analysis-edit: only once a first analysis is done, for the edits and reanalyses that follow it. The
                 // window's report names the request's method (src/gc_stress_scope.ab).
                 val method = parsed.value.getString("method")
+                if (method == "analyze" || method.startsWith("query/") || method == "refactor/validate") {
+                    bootstrapAnalysisDeadline = linuxMonotonicMilliseconds() + budget
+                }
                 val stress = bootstrapCompilerGcStressBegin("analysis") ||
                     analyses > 0 && bootstrapCompilerGcStressBegin("analysis-edit")
                 response = service.handle(parsed.value)
+                bootstrapAnalysisDeadline = 0
                 bootstrapCompilerGcStressEnd("analysis $method", stress)
                 if (method == "analyze") analyses = analyses + 1
                 bootstrapLexRequestEnd()

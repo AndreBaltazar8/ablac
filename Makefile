@@ -161,6 +161,7 @@ test-serial: ablac
 	tools/test-analysis-refactor-session.sh $(COMPILER)
 	tools/test-frontend-analysis.sh $(COMPILER)
 	tools/test-analysis-graph.sh $(COMPILER)
+	node tests/analysis-graph/scaling.mjs $(COMPILER)
 	tools/test-builtin-docs.sh $(COMPILER)
 	tools/test-analysis-memory.sh $(COMPILER)
 	tools/test-analysis-gc-stress.sh $(COMPILER)

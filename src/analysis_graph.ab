@@ -19,6 +19,7 @@ import "abla/text"
 import "abla/runtime/memory"
 import "abla/sys/linux/process"
 import "abla/sys/linux"
+import "analysis_budget.ab"
 
 // Compiler frontend globals are serial already. One process-local graph state
 // avoids handing an immutable field view to the mutable module-state API.
@@ -203,6 +204,23 @@ fun bootstrapAnalysisGraphIncomplete(revision: int, message: string, mode: strin
         "complete": false,
         "issues": [{"code": "E_ANALYSIS_SCOPE", "message": message}]
     }
+
+fun BootstrapAnalysisService.graphBudgetIncomplete(): Json {
+    // A request may have populated only part of a cache. Nothing from that
+    // candidate generation can be used for a query or an incremental replay.
+    if (bootstrapAnalysisGraphActiveEntry != "") {
+        bootstrapAnalysisGraphActiveEntry = ""
+        bootstrapAnalysisGraphModules = bootstrapModuleState()
+        this.graphParsed = Map()
+        this.graphQueryIndex = null
+        this.graphIndexRevision = -1
+        this.graphReplayInputs = null
+        this.graphReferences = Map()
+        this.graphReferencesRevision = -1
+    }
+    bootstrapAnalysisGraphIncomplete(this.revision,
+        "analysis incomplete: request time budget exceeded", this.graphModeName())
+}
 
 /** What a snapshot looks up many times: the document of a source identity, and a document's symbols by start and kind. */
 class BootstrapAnalysisGraphLookup(
@@ -821,6 +839,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     if (!bootstrapAnalysisCheckEnabled()) return this.graphSnapshotRun()
     val previousRevision = this.graphIndexRevision
     val result = this.graphSnapshotRun()
+    if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
     if (previousRevision == this.graphIndexRevision || this.graphQueryIndex == null) return result
     val incremental = bootstrapAnalysisCheckDigests(this.graphMaterialize(result))
     // ABLA_ANALYSIS_CHECK=2 (the check's own test): the incremental answer's first document is taken to differ, and the run must say so.
@@ -840,6 +859,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     this.graphQueryIndex = null
     this.graphIndexRevision = -1
     val cold = this.graphSnapshotRun(false)
+    if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
     val reference = bootstrapAnalysisCheckDigests(this.graphMaterialize(cold))
     this.graphParsed = keptParsed
     bootstrapAnalysisGraphModules = keptModules
@@ -1072,10 +1092,12 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
     bootstrapAnalysisGraphModules.captureSyntaxInputs = replay
     val project = bootstrapFrontendLoadHostProject(entry, bootstrapAnalysisGraphModules)
     bootstrapAnalysisGraphModules.captureSyntaxInputs = false
+    if (project == null || bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
     val syntax = if (replay) bootstrapAnalysisGraphModules.syntaxInputs.copy() else null
     if (replay) bootstrapAnalysisGraphModules.syntaxInputs = BootstrapModuleSyntaxInputs()
     bootstrapAnalysisSampleMemory("project loaded")
     this.graphObserveInputs(project, entry)
+    if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
     // The slot of `cached` is only set when this returns: on the way to a new generation nothing here holds the old one.
     if (this.graphIndexRevision == this.revision) {
         val cached = this.graphQueryIndex
@@ -1091,6 +1113,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
     // Only an analysis that follows another holds anything yet: the first has nothing to re-mark, and keeps the compiler's step.
     val holdsProject = this.graphParsed.size > 0
     for (module in project.modules) {
+        if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
         if (module.source != "" || bootstrapAnalysisGraphModules.sourceExists(module.path)) {
             var uri = bootstrapAnalysisGraphUri(module.path)
             var version = 0
@@ -1175,6 +1198,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
         val before = this.graphReplayInputs
         if (prior != null && before != null) {
             val reused = this.graphReplayBody(prior, documents, entry, before, replayInputs)
+            if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
             if (reused != null) {
                 this.graphReplayInputs = BootstrapAnalysisReplayInputs(replayInputs.syntax.copy(),
                     bootstrapModuleCopyStrings(replayInputs.metadata))
@@ -1202,6 +1226,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
     }
     bootstrapAnalysisSampleMemory("documents parsed")
     val analyzed = bootstrapFrontendTypeProject(project.written, begins, ends, kinds, sources)
+    if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
     if (replay) {
         this.graphReplayInputs = if (replayInputs != null && analyzed != null && analyzed.semantic.errors == 0 &&
             analyzed.semantic.extensionErrors == 0 && analyzed.semantic.diagnostics == "") {
@@ -1260,6 +1285,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
             semantic, builtinIds)
         bootstrapAnalysisSampleMemory("occurrence index")
         for (document in documents) {
+            if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
             // Kept compact for the queries, and in the answer as the text it encodes to: not a node per occurrence.
             val set = bootstrapAnalysisOccurrenceSet(document.document.text, document.document.path,
                 document.parsed, analyzed.parsed.declarations, semantic, aliases, true,
@@ -1280,6 +1306,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
         }
     } else {
         for (document in documents) {
+            if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
             val diagnostics = bootstrapAnalysisGraphDiagnostics(document, project, "")
             if (this.graphStableIds) {
                 fingerprints.set(document.document.uri,
@@ -1296,6 +1323,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
         this.revision, values, this.graphModeName(), analyzed != null && pending.size == 0, pending, entry
     )
     bootstrapAnalysisSampleMemory("answer built")
+    if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
     this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(result, this.revision, sets, generatedFields)
     this.graphIndexRevision = this.revision
     if (this.graphStableIds) this.graphRememberGeneration(BootstrapAnalysisGraphGeneration(
@@ -1330,6 +1358,7 @@ fun bootstrapAnalysisGraphQueryIndex(snapshot: Json, revision: int,
 fun bootstrapAnalysisGraphBuildReferences(index: BootstrapAnalysisGraphQueryIndex): Map<string, array<Json>> {
     val references: Map<string, array<Json>> = Map()
     for (document in index.snapshot.get("documents").values) {
+        if (bootstrapAnalysisBudgetExpired()) return references
         val uri = document.getString("uri")
         val set = index.occurrences.get(bootstrapAnalysisGraphPath(uri))
         if (set != null) {
@@ -1356,6 +1385,8 @@ fun BootstrapAnalysisService.graphQuery(id: int, method: string, params: Json): 
         params.getInt("offset") < 0) return bootstrapAnalysisError(id, "invalid_params",
             "queries require a local absolute file URI and a nonnegative UTF-8 byte offset")
     val snapshot = this.graphSnapshot()
+    if (bootstrapAnalysisBudgetExpired())
+        return bootstrapAnalysisError(id, "analysis_incomplete", "request time budget exceeded")
     val requestedRevision = params.get("revision")
     if (!requestedRevision.isNull() && (!requestedRevision.isString() ||
         requestedRevision.asString() != snapshot.getString("revision"))) {
@@ -1401,6 +1432,10 @@ fun BootstrapAnalysisService.graphQuery(id: int, method: string, params: Json): 
         // One location object per occurrence: only this query needs them, so they are made on its first use for a generation.
         if (this.graphReferencesRevision != this.revision) {
             this.graphReferences = bootstrapAnalysisGraphBuildReferences(index)
+            if (bootstrapAnalysisBudgetExpired()) {
+                val _incomplete = this.graphBudgetIncomplete()
+                return bootstrapAnalysisError(id, "analysis_incomplete", "request time budget exceeded")
+            }
             this.graphReferencesRevision = this.revision
         }
         val references = this.graphReferences.get(identity)

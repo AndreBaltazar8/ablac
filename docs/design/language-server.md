@@ -213,6 +213,16 @@ must carry partial-result/tainted-origin information; this is a compiler API gap
 not something the LSP adapter infers from error-message text. Generated definitions
 navigate to a recorded user origin, or have no definition; no fabricated offsets.
 
+The stdio service also checks a 60-second wall-clock budget while computing
+each analysis, query or refactor-validation request. An expired analysis
+returns `complete: false` with an issue in the same response format. The
+service discards any unfinished graph and keeps accepting requests. Set
+`ABLA_ANALYSIS_BUDGET_MS` in the service environment to a positive number
+of milliseconds up to 600,000 to override the default. This is a cooperative
+budget checked during graph loading, front-end passes, and answer assembly.
+It does not time out a blocked filesystem read or a client that stops reading
+the reply.
+
 Report parser/import/sema findings as such. Until the frontend entry also invokes
 all relevant IR ownership/region verification without emission, say explicitly
 that analysis is not a full build check. Never show a successful full-build status

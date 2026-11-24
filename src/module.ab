@@ -23,6 +23,7 @@ import "eval.ab"
 import "generic_types.ab"
 import "import_remap.ab"
 import "auto_copy.ab"
+import "analysis_budget.ab"
 
 fun bootstrapFrontendTraceMemory(label: string): void {
     val configured = linuxEnvironment("ABLA_COMPILER_MEMORY_TRACE")
@@ -401,6 +402,7 @@ fun bootstrapModuleFingerprint(
     var hash = seed
     var index = 0
     while (index < source.size) {
+        if ((index & 65535) == 0 && bootstrapAnalysisBudgetExpired()) return hash
         hash = hash * factor + source[index] + 1
         hash = hash - (hash / modulus) * modulus
         index = index + 1
@@ -683,7 +685,8 @@ var bootstrapModuleFreezeSnapshots: bool = false
 val BOOTSTRAP_ANALYSIS_FREEZE_MIN_BYTES = 1024
 
 fun bootstrapModuleSnapshotFrozen(snapshot: BootstrapModuleSnapshot): BootstrapModuleSnapshot =
-    if (bootstrapModuleFreezeSnapshots && snapshot.source.size >= BOOTSTRAP_ANALYSIS_FREEZE_MIN_BYTES)
+    if (bootstrapModuleFreezeSnapshots && snapshot.source.size >= BOOTSTRAP_ANALYSIS_FREEZE_MIN_BYTES &&
+        !bootstrapAnalysisBudgetExpired())
         Frozen(snapshot).get() else snapshot
 
 class BootstrapModuleSnapshot(
@@ -873,6 +876,7 @@ class BootstrapModuleState(
         source: string, modulePath: string, importErrors: int,
         first: int, second: int, mayUseRawProvider: bool
     ): BootstrapParseResult {
+        if (this.syntaxOnly && bootstrapAnalysisBudgetExpired()) return BootstrapParseResult([], [], 1, 0, [], [], "")
         var recordPath = ""
         if (source.size <= 4194304 && importErrors == 0 && !mayUseRawProvider) {
             if (this.shippedDiscoveryDirectory != "" &&
@@ -903,7 +907,7 @@ class BootstrapModuleState(
             }
         }
         val parsed = bootstrapModuleDiscovery(source, modulePath)
-        if (recordPath != "" && bootstrapDiscoveryEligible(parsed)) {
+        if (recordPath != "" && !bootstrapAnalysisBudgetExpired() && bootstrapDiscoveryEligible(parsed)) {
             val record = bootstrapDiscoveryRecord(
                 source, modulePath, parsed, this.discoveryIdentity
             )
@@ -5229,6 +5233,7 @@ class BootstrapModuleGraph(
     }
 
     fun loadContract(modulePath: string, typesOnly: bool = false): string {
+        if (this.state.syntaxOnly && bootstrapAnalysisBudgetExpired()) return ""
         val identity = bootstrapNormalizeModulePath(modulePath)
         if (!typesOnly) this.index.contractRoots.set(identity, 1)
         if (!this.contains(identity)) {
@@ -5436,6 +5441,7 @@ class BootstrapModuleGraph(
     }
 
     fun load(modulePath: string): string {
+        if (this.state.syntaxOnly && bootstrapAnalysisBudgetExpired()) return ""
         bootstrapLexMemoActive = true
         val identity = bootstrapNormalizeModulePath(modulePath)
         if (this.index.remapRoot == "" &&
@@ -5462,6 +5468,7 @@ class BootstrapModuleGraph(
             if (known) this.dropContractLoad(identity)
             this.checkModuleManifest(identity)
             val snapshot = this.rawSnapshot(this.state.acquire(identity))
+            if (this.state.syntaxOnly && bootstrapAnalysisBudgetExpired()) return ""
             bootstrapFrontendTraceMemory("graph.acquire:$identity")
             if (bootstrapJsonConstructionRequested) bootstrapJsonConstructionCapture(identity, snapshot.source, bootstrapStandardLibraryRoot())
             this.errors = this.errors + snapshot.importErrors
@@ -5472,6 +5479,7 @@ class BootstrapModuleGraph(
             if (!known) this.modules.append(BootstrapModule(identity, snapshot.source, snapshot.hostSource))
             var index = 0
             while (index < snapshot.importEdges.size) {
+                if (this.state.syntaxOnly && bootstrapAnalysisBudgetExpired()) return ""
                 val edge = snapshot.importEdges[index]
                 if (!edge.provider) {
                     // The portable implementation also serves older bootstrap
@@ -5596,6 +5604,12 @@ class BootstrapModuleGraph(
         val enclosingRoot = bootstrapModuleIdentityRoot
         val enclosingStdlib = bootstrapModuleIdentityStdlib
         val enclosingPrefixes = bootstrapModuleIdentityPrefixes
+        defer {
+            bootstrapLexMemoEnd()
+            bootstrapModuleIdentityRoot = enclosingRoot
+            bootstrapModuleIdentityStdlib = enclosingStdlib
+            bootstrapModuleIdentityPrefixes = enclosingPrefixes
+        }
         bootstrapModuleIdentityRoot = if (this.index.entryPath == "") ""
             else bootstrapModuleIdentityProjectRoot(this.index.entryPath)
         bootstrapModuleIdentityStdlib = bootstrapNormalizeModulePath(
@@ -5643,6 +5657,8 @@ class BootstrapModuleGraph(
         )
         var preparedIndex = 0
         while (preparedIndex < this.orderedSnapshots.size) {
+            if (this.state.syntaxOnly && bootstrapAnalysisBudgetExpired())
+                return BootstrapParseResult([], [], 1, 0, [], [], "")
             val prepared = bootstrapPrepareModuleSnapshot(
                 this.orderedSnapshots[preparedIndex],
                 this.aliases,
@@ -5715,6 +5731,8 @@ class BootstrapModuleGraph(
         var completeDeclarationFingerprint = 41
         var requestedModule = 0
         while (requestedModule < preparedSnapshots.size) {
+            if (this.state.syntaxOnly && bootstrapAnalysisBudgetExpired())
+                return BootstrapParseResult([], [], 1, 0, [], [], "")
             val requestedSnapshot = preparedSnapshots[requestedModule]
             requestedEffects = bootstrapCompileEffectMerge(
                 requestedEffects,
@@ -5780,6 +5798,8 @@ class BootstrapModuleGraph(
         var moduleIndex = 0
         var currentDeclarationBegin = 0
         while (moduleIndex < preparedSnapshots.size) {
+            if (this.state.syntaxOnly && bootstrapAnalysisBudgetExpired())
+                return BootstrapParseResult([], [], 1, 0, [], [], "")
             val snapshot = preparedSnapshots[moduleIndex]
             bootstrapFrontendTraceMemory(
                 "parse.module.begin:$moduleIndex:${snapshot.path}"
@@ -6021,10 +6041,6 @@ class BootstrapModuleGraph(
         val normalized = if (this.state.syntaxOnly) assembled
             else bootstrapNormalizeNamedArguments(assembled)
         bootstrapFrontendTraceMemory("parse.normalize.end")
-        bootstrapLexMemoEnd()
-        bootstrapModuleIdentityRoot = enclosingRoot
-        bootstrapModuleIdentityStdlib = enclosingStdlib
-        bootstrapModuleIdentityPrefixes = enclosingPrefixes
         normalized
     }
 }
