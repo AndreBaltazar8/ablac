@@ -87,6 +87,23 @@ status=0
 timeout 60 tools/windows/wine-run.sh "$out/fault-guard.exe" > "$out/fault-guard.out" 2> "$out/fault-guard.err" || status=$?
 [[ $status == 0 ]] || fail "fault-guard.exe exited $status: $(head -5 "$out/fault-guard.out" "$out/fault-guard.err")"
 [[ "$(cat "$out/fault-guard.out")" == $'armed 0, JIT fault back with 4, signal 11, address 16\nown fault back with 4, address 24\noverflow back with 4, signal 11\nsecond overflow back with 4, signal 11' ]] || fail "fault-guard.exe printed: $(cat "$out/fault-guard.out" "$out/fault-guard.err")"
+# The vectored handler runs on the faulting thread's stack, an overflowed one included, so what it reaches there is held small:
+# its entry (call 4005, as the watchdog's 4003) goes to __ablaRuntimeWindowsGuardSyscall, not to the system call dispatcher
+# whose frame grows with every call it translates (under Wine it outgrew the overflowed stack once), and that function's frame
+# (its x64 unwind codes: the allocation and the registers it pushes, with the handler inlined into it) stays within 128 bytes.
+# Built -g, so the object names the function.
+"$compiler" build tests/cases/windows/fault-guard.ab --target x86_64-windows-hosted -g -o "$out/fault-guard-named.exe" --no-cache \
+    > "$out/fault-guard-named.log" 2>&1 || { cat "$out/fault-guard-named.log" >&2; fail "fault-guard.ab did not build with -g"; }
+grep -q '@windows.__ablaRuntimeWindowsGuardSyscall(i64 4005,' "$out/fault-guard-named.exe.ll" ||
+    fail "the vectored handler's entry does not call __ablaRuntimeWindowsGuardSyscall"
+frame=$(llvm-readobj --unwind "$out/fault-guard-named.exe.o" | awk '
+    /StartAddress: windows\.__ablaRuntimeWindowsGuardSyscall / { found = 1; inside = 1; next }
+    /StartAddress:/ { inside = 0 }
+    inside && /ALLOC_(SMALL|LARGE) size=/ { match($0, /size=[0-9]+/); size += substr($0, RSTART + 5, RLENGTH - 5) }
+    inside && /PUSH_NONVOL/ { size += 8 }
+    END { print found ? size : -1 }')
+(( frame >= 0 )) || fail "no unwind data for __ablaRuntimeWindowsGuardSyscall in the -g object"
+(( frame <= 128 )) || fail "__ablaRuntimeWindowsGuardSyscall's frame is $frame bytes, over the 128 the vectored handler may take"
 # The runtime's watchdog (watchdog.ab, call 4002): armed for the calling thread, it redirects it out of executable memory from
 # VirtualAlloc, never out of a loaded image (a runtime sleep gets EINTR instead), interrupts a deferred stop's sleep and an
 # interpreted site's pipe read with EINTR, and does nothing once disarmed. The whole program takes seconds, not the 30-second
@@ -107,4 +124,4 @@ status=0
 timeout 60 tools/windows/wine-run.sh "$out/preempt.exe" > "$out/preempt.out" 2> "$out/preempt.err" || status=$?
 [[ $status == 0 ]] || fail "preempt.exe exited $status: $(head -5 "$out/preempt.out" "$out/preempt.err")"
 [[ "$(cat "$out/preempt.out")" == $'spinning\nback with 3, watchdog 1\ninterrupted pipe read -4\ncancelled true' ]] || fail "preempt.exe printed: $(cat "$out/preempt.out" "$out/preempt.err")"
-echo "windows-syscalls: the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame; a fault redirected with abla_windows_redirect jumps back too; a thread's interrupt word ends its wait with EINTR; another thread stops one spinning in executable memory with a CONTEXT redirect and one reading a pipe with CancelSynchronousIo"
+echo "windows-syscalls: the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame; a fault redirected with abla_windows_redirect jumps back too; a thread's interrupt word ends its wait with EINTR; another thread stops one spinning in executable memory with a CONTEXT redirect and one reading a pipe with CancelSynchronousIo; the vectored handler's entry takes $frame bytes of stack"
