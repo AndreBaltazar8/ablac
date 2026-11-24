@@ -43,7 +43,7 @@ EOF
 }
 build() {
     status=0
-    "$compiler" build --project "$out/$1/project" --fast --no-cache > "$out/$1.log" 2>&1 || status=$?
+    "$compiler" build --project "$out/$1/project" --fast --no-cache -o "$out/$1.program" > "$out/$1.log" 2>&1 || status=$?
 }
 refused() {
     build "$1"
@@ -82,4 +82,31 @@ build inside
 [[ $status == 0 ]] || fail "inside: a link within the project was refused (status $status): $(grep -m2 '^error' "$out/inside.log")"
 [[ $(< "$out/inside/project/data/ok.txt") == inside ]] || fail "inside: the write did not land where the link points"
 
-echo "compile-path-symlinks: links out of the project are outside it (through a directory, a parent, the last name, a read); link/.. is read as written; links within it are followed"
+# An operation on the link itself (a removal, a move, a link test) takes the link, not where it leads, as unlink, rename and
+# lstat do: removing a link removed its target before (the parity sample's module/filesystem, check 20), and a link that
+# points out of the project is still the project's own entry to remove.
+case_project removelink 'path("../link.txt").remove()'
+printf 'kept' > "$out/removelink/project/data/kept.txt"
+ln -s data/kept.txt "$out/removelink/project/link.txt"
+build removelink
+[[ $status == 0 ]] || fail "removelink: refused (status $status): $(grep -m2 '^error' "$out/removelink.log")"
+[[ ! -L $out/removelink/project/link.txt && -e $out/removelink/project/data/kept.txt ]] ||
+    fail "removelink: removing a link did not remove the link alone (its target removed, or the link kept)"
+case_project removeout 'path("../out.txt").remove()'
+ln -s "$out/removeout/outside/target.txt" "$out/removeout/project/out.txt"
+build removeout
+[[ $status == 0 && ! -L $out/removeout/project/out.txt && -e $out/removeout/outside/target.txt ]] ||
+    fail "removeout: a link out of the project was not removed alone (status $status)"
+case_project movelink 'path("../link.txt").moveTo(path("../moved.txt"))'
+printf 'kept' > "$out/movelink/project/data/kept.txt"
+ln -s data/kept.txt "$out/movelink/project/link.txt"
+build movelink
+[[ $status == 0 && -L $out/movelink/project/moved.txt && -e $out/movelink/project/data/kept.txt ]] ||
+    fail "movelink: moving a link did not move the link (status $status)"
+case_project islink 'path("../link.txt").isSymbolicLink()'
+printf 'kept' > "$out/islink/project/data/kept.txt"
+ln -s data/kept.txt "$out/islink/project/link.txt"
+build islink
+[[ $status == 0 && $("$out/islink.program") == 'result true' ]] || fail "islink: isSymbolicLink did not see the link (status $status)"
+
+echo "compile-path-symlinks: links out of the project are outside it (through a directory, a parent, the last name, a read); link/.. is read as written; links within it are followed; a removal, a move and a link test take the link itself"

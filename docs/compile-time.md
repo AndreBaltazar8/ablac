@@ -412,7 +412,9 @@ only inside that program's project. An absolute path is read as given, wherever 
 toolchain, `/proc/self/exe`): `filesystem.read` is what grants that, for a dependency's code only when the root names it
 for that package ([grants per package](#grants-per-package)). A `trusted.native`
 site's own raw system calls (`linuxOpen` and the like) are not resolved, as nothing else of its native access is
-checked.
+checked. A path is held inside by where it leads, not by its spelling: its symbolic links are followed (one inside the
+project that points out of it is outside), except the last name of a removal, a move or `isSymbolicLink()`, which act on
+the link itself, as `unlink`, `rename` and `lstat` do: removing a link removes the link, not its target.
 
 A tree built without its `.git` (a `git archive` export, a release tarball, a copy) has no repository root to find, so
 it is bounded by its working directory: built from a subdirectory, a read of `../assets` that works in the checkout
