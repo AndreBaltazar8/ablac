@@ -6,6 +6,7 @@
 #   - a bad store (address 16): "fatal signal: a bad memory access at 0x0000000000000010" from the vectored exception
 #     handler, then the stack from the faulting instruction (--backtrace: named, the handler's own frame not among them),
 #     and the access violation's status (0xC0000005, whose low byte Wine's exit status is), not winedbg;
+#   - a copy from address 16 inside memcpy: a --backtrace stack names its caller after the faulting instruction;
 #   - unbounded recursion: "panic: stack overflow", status 101;
 #   - a panic on a thread: a --backtrace stack through the thread's entry;
 #   - `ablac symbolize` on the stacks: file:line from the DWARF a --fast -g program keeps and a --backtrace one leaves in
@@ -84,6 +85,14 @@ run backtrace thread-panic
 [[ $status == 101 ]] || fail "a panic on a thread exited $status"
 stack_of backtrace thread-panic | grep '^0x[0-9a-f]* in abla_runtime_thread_entry$' > /dev/null ||
     fail "a --backtrace panic on a thread named no thread entry: $(head -12 "$out/backtrace-thread-panic.err")"
+# A fault inside memcpy (it pushes rdi and rsi): its unwind data takes the walk to the function that called it. Without it the
+# walk read the caller's saved rsi as a return address and named no caller.
+run backtrace copy
+[[ $status == 5 ]] || fail "a bad copy exited $status, not the access violation's 5"
+stack_of backtrace copy | sed -n 2p | grep -E ' \(the faulting instruction\)$' > /dev/null ||
+    fail "a --backtrace bad copy printed no faulting instruction: $(head -8 "$out/backtrace-copy.err")"
+stack_of backtrace copy | sed -n 3p | grep '^0x[0-9a-f]* in [^ ]*badCopy$' > /dev/null ||
+    fail "a --backtrace bad copy named no caller of memcpy: $(head -8 "$out/backtrace-copy.err")"
 
 # file:line: a --backtrace program ships without its DWARF or a symbol table, which are in crash-backtrace.exe.debug beside
 # it (its debug link); `ablac symbolize` reads that for the stack the program printed, and without it has no file:line.
