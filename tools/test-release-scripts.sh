@@ -221,6 +221,11 @@ SH
         and any(.relationships[]; .spdxElementId == "SPDXRef-ablac" and .relationshipType == "DEPENDS_ON"
             and .relatedSpdxElement == "SPDXRef-llvm-windows-arm64")
     ' "$work/windows-arm64.spdx.json" >/dev/null || fail 'the SBOM does not record the pinned ARM64 SDK'
+    nix_sha=$(sed -n 's/.*echo "\([0-9a-f]\{64\}\)  \$installer".*/\1/p' "$project_root/.github/actions/install-nix/action.yml" | head -n 1)
+    jq --arg sha "$nix_sha" -e '
+        any(.packages[]; .SPDXID == "SPDXRef-nix" and any(.checksums[]; .algorithm == "SHA256" and .checksumValue == $sha))
+        and any(.relationships[]; .spdxElementId == "SPDXRef-ablac" and .relationshipType == "DEPENDS_ON" and .relatedSpdxElement == "SPDXRef-nix")
+    ' "$work/windows-arm64.spdx.json" >/dev/null || fail 'the SBOM does not record the pinned Nix installer'
 
     pe_fixture x86_64 x64 9.9.9 "$work/x64.exe"
     package_fixture "$work/x64.exe"

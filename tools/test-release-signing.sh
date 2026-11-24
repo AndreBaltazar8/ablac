@@ -73,6 +73,8 @@ if command -v git >/dev/null 2>&1; then
     mkdir -p "$local_root/tools" "$local_root/nix"
     cp "$root/tools/bootstrap-compiler.sh" "$root/tools/xtensa-companions.json" "$root/tools/llvm-linux-portable-pins.sh" "$root/tools/llvm-macos-pins.sh" "$local_root/tools/"
     cp "$root/nix/llvm-fork.nix" "$root/nix/nixpkgs.nix" "$root/nix/llvm-instcombine-fdiv-zero.patch" "$root/nix/llvm-windows-static-pin.json" "$local_root/nix/"
+    mkdir -p "$local_root/.github/actions/install-nix"
+    cp "$root/.github/actions/install-nix/action.yml" "$local_root/.github/actions/install-nix/"
     git -C "$local_root" init -q -b master
     git -C "$local_root" -c user.name=t -c user.email=t@t add -A
     git -C "$local_root" -c user.name=t -c user.email=t@t commit -q -m start
@@ -89,6 +91,7 @@ if command -v git >/dev/null 2>&1; then
     grep -q ' abla-toolchain-x86_64-windows.zip$' "$work/rel/SHA256SUMS" || fail 'the Windows zip is not in SHA256SUMS'
     grep -q '"fileName": "abla-toolchain-x86_64-windows.zip"' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the Windows zip is not in the SBOM'
     grep -q 'SPDXRef-llvm-windows-x86-64' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM has no Windows LLVM package'
+    grep -q 'SPDXRef-nix' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM has no Nix installer package'
     accepts "$work/rel"
     printf 'x' > "$work/rel/static-suite-source.sha"
     if "$root/tools/sign-release.sh" "$work/rel" "$work/good" > "$work/out" 2>&1; then fail 'sign-release.sh signed a directory with static-suite-source.sha'; fi
