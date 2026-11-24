@@ -227,6 +227,19 @@ SH
         and any(.relationships[]; .spdxElementId == "SPDXRef-ablac" and .relationshipType == "DEPENDS_ON" and .relatedSpdxElement == "SPDXRef-nix")
     ' "$work/windows-arm64.spdx.json" >/dev/null || fail 'the SBOM does not record the pinned Nix installer'
 
+    # The artifacts of a release run (one directory each) become one directory for the signer; a file name two artifacts share is refused.
+    parts=$work/artifact-parts; flat=$work/artifact-flat
+    rm -rf "$parts" "$flat"; mkdir -p "$parts/ablac-a" "$parts/ablac-b"
+    printf one > "$parts/ablac-a/a.bin"; printf s > "$parts/ablac-a/a.bin.sha256"; printf two > "$parts/ablac-b/b.bin"
+    "$project_root/tools/release-flatten-artifacts.sh" "$parts" "$flat" > /dev/null || fail 'distinct artifacts were not flattened'
+    [[ $(cat "$flat/a.bin") == one && $(cat "$flat/b.bin") == two && -f $flat/a.bin.sha256 && ! -e $parts/ablac-a/a.bin ]] || fail 'the flattened release is not the artifacts'"'"' files'
+    expect_fail 'a flatten into a directory that exists' "$project_root/tools/release-flatten-artifacts.sh" "$parts" "$flat"
+    rm -rf "$parts" "$flat"; mkdir -p "$parts/ablac-a" "$parts/ablac-b"
+    printf one > "$parts/ablac-a/same"; printf two > "$parts/ablac-b/same"
+    expect_fail 'a file name two artifacts share' "$project_root/tools/release-flatten-artifacts.sh" "$parts" "$flat"
+    grep 'the same file name in two artifacts: same' "$work/out.txt" > /dev/null || fail 'the refusal does not name the shared file'
+    [[ ! -e $flat ]] || fail 'something was flattened before the refusal'
+
     pe_fixture x86_64 x64 9.9.9 "$work/x64.exe"
     package_fixture "$work/x64.exe"
     expect_fail 'an x64 executable in the ARM64 zip' check_windows

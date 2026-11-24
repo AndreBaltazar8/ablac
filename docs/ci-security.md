@@ -44,6 +44,9 @@ checks the rules below on every workflow (`--controls` shows each rule refusing 
 - Real cuts dispatch the Release workflow with `publish_release` off, and `source_ref` when the tag is not yet pushed, and publish from the
   maintainer's machine (docs/bootstrap.md, "Signed releases"). The refusal of `source_ref` with `publish_release` on applies to
   the workflow's own publish path, which that flow does not use.
+- The `bridge` job and its `bridge-assets` hand-off to the compiler jobs run only when a Release is dispatched with `bridge_release`, and no draft bridge
+  release exists to rehearse them with: that path is fixed but unverified until the next bridge is needed. The publish job's flatten step is
+  `tools/release-flatten-artifacts.sh`, tested on fixture directories by `tools/test-release-scripts.sh` (a shared file name is refused).
 
 ## Settings that are not in the repository
 
