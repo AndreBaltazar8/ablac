@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+[[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || {
+    echo 'inline blocks: x86-64 Linux only'
+    exit 0
+}
 compiler=${1:-build/ablac}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $compiler == /* || $compiler != */* ]] || compiler=$PWD/$compiler

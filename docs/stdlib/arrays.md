@@ -50,6 +50,25 @@ fun main {
 // none
 ```
 
+## Transforming each element
+
+`values.mapped { value -> ... }` returns a fresh array. It calls the block once
+per element in input order, and an empty input produces an empty result. Both
+element types must be copyable. Resource elements require a loop that transfers
+ownership explicitly.
+
+```abla
+import "abla/array"
+import "abla/io"
+
+fun main {
+    val sizes = ["pear", "fig", "apple"].mapped { word -> word.size }
+    println("${sizes[0]} ${sizes[1]} ${sizes[2]}")
+}
+// output:
+// 4 3 5
+```
+
 ## Sorting
 
 `import "abla/array"` also gives a stable merge sort, O(n log n), that returns a new array and leaves the receiver
