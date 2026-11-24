@@ -18,7 +18,7 @@ foreach ($image in (Get-ChildItem -LiteralPath $Programs -Filter '*.exe' | Sort-
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     if (-not $process.WaitForExit(120000)) { $process.Kill(); 'killed after 120 s' }
     $code = $process.ExitCode
-    "exit code $code ($('0x{0:X8}' -f ([uint32]($code -band 0xFFFFFFFF))))"
+    "exit code $code ($('0x{0:X8}' -f ([BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$code), 0))))"
     '--- stdout'
     Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue | ForEach-Object { "  $_" }
     '--- stderr'
