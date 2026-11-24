@@ -5883,8 +5883,9 @@ fun bootstrapCallersOf(
 // `heapFields` the `owner\nfield` pairs whose field holds heap memory
 // (bootstrapRegionHeapFields). `declaredMembers` holds `Class.method` for every
 // method a class declares and `Owner.name` for every extension function, and
-// `fieldTypes` maps `Class.field` to a constructor field's declared type:
-// with them a member call whose receiver is statically a class is decided by
+// `fieldTypes` maps `Class.field` to a constructor field's declared type.
+// An extension field without a resolved type still shadows a module value.
+// With these indexes, a member call whose receiver is statically a class is decided by
 // the declaration it resolves to (#827). Classes are final, so a class-typed
 // receiver reaches its own method or none; any other receiver (an interface,
 // an unknown type) falls back to the name, as any `….name` might answer it.
@@ -6063,7 +6064,8 @@ fun bootstrapRegionDeclaredMembers(
     members
 }
 
-// `Class.field` to the declared type of a class's constructor field.
+// `Class.field` to the declared type of a class's constructor field. Keep
+// names of extension fields as shadows without resolving their types here.
 fun bootstrapRegionFieldTypes(
     declarations: array<BootstrapDeclaration>
 ): Map<string, string> {
@@ -6076,6 +6078,12 @@ fun bootstrapRegionFieldTypes(
                     bootstrapNormalizeType(declaration.parameterTypes[field]))
                 field = field + 1
             }
+        }
+    }
+    for (declaration in declarations) {
+        if (bootstrapIsExtensionFieldKind(declaration.kind)) {
+            val key = "${declaration.extensionOwner}.${declaration.name}"
+            if (!types.has(key)) types.set(key, "")
         }
     }
     types
@@ -6152,8 +6160,8 @@ fun bootstrapRegionSummaryCallType(
 }
 
 // The static type of a member call's receiver before inference. Follow
-// declared fields and array elements rooted at `this`, a scoped binding or a
-// call whose declaration and result type are known.
+// declared fields and array elements rooted at `this`, a scoped binding,
+// a uniquely named module value, or a call with a known result type.
 fun bootstrapRegionSummaryReceiverType(
     receiver: BootstrapExpression,
     owner: string,
@@ -6163,7 +6171,16 @@ fun bootstrapRegionSummaryReceiverType(
     if (receiver.kind == "identifier") {
         if (receiver.text == "this") return owner
         val local = bootstrapRegionBindingIndex(bindings, receiver.text)
-        return if (local >= 0) bootstrapBorrowElementType(bindings.types[local]) else ""
+        if (local >= 0) return bootstrapBorrowElementType(bindings.types[local])
+        if (owner != "" && summary.fieldTypes.has("$owner.${receiver.text}")) return ""
+        val entry = summary.topLevelNames.find(receiver.text)
+        if (entry < 0 || summary.topLevelNames.counts[entry] != 1) return ""
+        val declaration = summary.declarations[summary.topLevelNames.firsts[entry]]
+        if (bootstrapDeclarationIsValue(declaration.kind) &&
+            declaration.resultType != "" && declaration.resultType != "inferred") {
+            return bootstrapBorrowElementType(bootstrapNormalizeType(declaration.resultType))
+        }
+        return ""
     }
     if (receiver.kind == "call")
         return bootstrapRegionSummaryCallType(receiver.text, owner, summary, bindings)
