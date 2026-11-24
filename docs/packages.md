@@ -333,6 +333,11 @@ case-folding file system or Windows reads as `.git`, two paths that differ only 
 `ABLA_PACKAGE_CHECKOUT_LIMIT_BYTES` and `ABLA_PACKAGE_GIT_MAX_BYTES` lower the 128 MiB and 1 GiB limits (tests use them). Project-local
 materialization under ignored `.abla/` is also transactional.
 
+The cache directory should be writable only by you, and may be shared by parallel builds. Each use revalidates an
+entry (its files are hashed and must be the lock's tree digest; nothing inside the entry, its `.git` included, is
+run) and the copy made for the build is hashed again, so a changed entry is refetched or refused; a directory others
+can write is still one where they can make builds fail.
+
 On Linux and macOS, Git reference lookups for `package update` and Git
 fetches for locked checkouts each have a 120-second process deadline. Set
 `ABLA_PACKAGE_GIT_TIMEOUT_SECONDS` to an integer from 1 to 3600 to override
