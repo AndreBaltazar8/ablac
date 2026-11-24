@@ -558,6 +558,7 @@ test-serial: ablac
 	tools/test-sha512-boundaries.sh $(COMPILER)
 	tools/test-hex-native.sh $(COMPILER)
 	tools/test-array-sort.sh $(COMPILER)
+	tools/test-inline-blocks.sh $(COMPILER)
 	tools/test-gzip-inflate-diff.sh $(COMPILER)
 	tools/test-json-encode.sh $(COMPILER)
 	tools/test-json-decode.sh $(COMPILER)
