@@ -672,6 +672,7 @@ test-serial: ablac
 	tools/test-package-case-fold.sh $(COMPILER)
 	tools/test-package-hostile-git.sh $(COMPILER)
 	tools/test-package-content-paths.sh $(COMPILER)
+	tools/test-package-cache-integrity.sh $(COMPILER)
 	tools/test-package-info.sh $(COMPILER)
 	tools/test-package-outdated.sh $(COMPILER)
 	tools/test-package-search.sh $(COMPILER)

@@ -835,6 +835,8 @@ fun bootstrapPackageGit(): LinuxCommand {
     command.argument("core.hooksPath=/dev/null")
     command.argument("-c")
     command.argument("protocol.ext.allow=never")
+    command.argument("-c")
+    command.argument("core.fsmonitor=false")
     // What is read from a checkout is the blob the digest covers: no user setting or attribute rewrites line endings, expands $Id$ or runs a filter.
     for (setting in ["core.autocrlf=false", "core.safecrlf=false", "core.attributesFile=/dev/null"]) {
         command.argument("-c")
@@ -995,43 +997,8 @@ fun bootstrapPackageCacheValid(package: BootstrapLockedPackage): bool {
             Path("$root/revision").readText() == package.revision &&
             Path("$root/source-url").readText() == package.source
     }
-    if (valid && package.provider == "git") {
-        valid = bootstrapPackageGitValue(source, "HEAD") == package.revision &&
-            bootstrapPackageGitValue(source, "HEAD^{tree}") == package.digest
-    }
-    if (valid && package.provider == "git") {
-        val command = bootstrapPackageGit()
-        command.argument("-C")
-        command.argument(source)
-        command.argument("status")
-        command.argument("--porcelain")
-        val status = command.capture()
-        valid = status.status == 0 && bootstrapPackageTrim(status.output) == ""
-    }
-    if (valid && package.provider == "content") {
-        val changed = bootstrapPackageGit()
-        changed.argument("-C")
-        changed.argument(source)
-        changed.argument("diff-files")
-        changed.argument("--quiet")
-        valid = changed.run() == 0
-        if (valid) {
-            val tree = bootstrapPackageGitWriteTree(source)
-            valid = tree == package.digest
-        }
-        if (valid) {
-            val untracked = bootstrapPackageGit()
-            untracked.argument("-C")
-            untracked.argument(source)
-            untracked.argument("ls-files")
-            untracked.argument("--others")
-            untracked.argument("--exclude-standard")
-            val observed = untracked.capture()
-            valid = observed.status == 0 &&
-                bootstrapPackageTrim(observed.output) == ""
-        }
-    }
-    valid
+    // The files are the tree the lock names. git inside the entry is not asked: its index, config (core.fsmonitor is a command) and objects are as writable as the files.
+    valid && bootstrapPackageDirectoryDigest(source, false) == package.digest
 }
 
 // Whether a symbolic link at `linkPath` (relative to the package root) pointing at `target` leaves the package: an
@@ -1078,6 +1045,37 @@ fun bootstrapPackageCopyRootOf(path: string): string {
         }
     }
     if (root == "") "" else root.slice(lead.size, root.size)
+}
+
+// Publishes the finished entry `temporary` as `root` (the cache path of `package`) by rename. An entry already there that is valid is another build's
+// identical one: it stays, and `temporary` is dropped (removing it first broke the build reading it, and made the loser of two parallel fills fail). One that
+// is not valid is moved aside, then removed. Group and others cannot write what is published, whatever the umask.
+fun bootstrapPackagePublishEntry(temporary: string, root: string, package: BootstrapLockedPackage): bool {
+    if (!linuxHostIsWindows()) {
+        val chmod = linuxCommand("chmod")
+        chmod.argument("-R")
+        chmod.argument("go-w")
+        chmod.argument("--")
+        chmod.argument(temporary)
+        if (chmod.run() != 0) return false
+    }
+    var aside = ""
+    if (Path(root).exists()) {
+        if (bootstrapPackageCacheValid(package)) {
+            bootstrapPackageRemoveTree(temporary)
+            return true
+        }
+        aside = "$root.old.${linuxProcessId()}"
+        bootstrapPackageRemoveTree(aside)
+        if (!Path(root).moveTo(Path(aside))) aside = ""
+    }
+    var moved = Path(temporary).moveTo(Path(root))
+    if (!moved && bootstrapPackageCacheValid(package)) {
+        bootstrapPackageRemoveTree(temporary)
+        moved = true
+    }
+    if (aside != "") bootstrapPackageRemoveTree(aside)
+    moved
 }
 
 // Whether the module at `path` is reached through a symbolic link of its dependency copy that leaves the package. An
@@ -1204,7 +1202,7 @@ fun bootstrapPackageFetch(
     bootstrapPackageRemoveTree(temporary)
     var status = 0
     var diagnostic = ""
-    if (!Path(temporary).parent().createDirectories()) status = 1
+    if (!Path(temporary).parent().createDirectories(0o755)) status = 1
     if (status == 0) {
         val init = bootstrapPackageGit()
         init.argument("init")
@@ -1324,8 +1322,11 @@ fun bootstrapPackageFetch(
         if (!written) status = 1
     }
     if (status == 0) {
-        if (Path(root).exists()) bootstrapPackageRemoveTree(root)
-        if (!Path(temporary).moveTo(Path(root))) status = 1
+        val published = BootstrapLockedPackage(
+            dependency.name, "git", dependency.identity, dependency.source,
+            dependency.selectorKind, dependency.selector, revision, digest, "entry.ab"
+        )
+        if (!bootstrapPackagePublishEntry(temporary, root, published)) status = 1
     }
     if (status != 0) {
         bootstrapPackageRemoveTree(temporary)
@@ -1416,8 +1417,11 @@ fun bootstrapPackagePublishContent(
     var source = ""
     if (status == 0) {
         val root = "$base/$digest"
-        if (Path(root).exists()) bootstrapPackageRemoveTree(root)
-        if (!Path(temporary).moveTo(Path(root))) status = 1
+        val published = BootstrapLockedPackage(
+            dependency.name, "content", dependency.identity, "", "", "",
+            dependency.resolvedRevision, digest, dependency.resolvedEntry
+        )
+        if (!bootstrapPackagePublishEntry(temporary, root, published)) status = 1
         if (status == 0) source = "$root/source"
     }
     if (status != 0) {
@@ -1514,44 +1518,7 @@ fun bootstrapPackageStringsContain(
 fun bootstrapPackageCheckoutValid(
     source: string,
     package: BootstrapLockedPackage
-): bool {
-    var valid = Path(source).info().isDirectory()
-    if (valid && package.provider == "git") {
-        valid = bootstrapPackageGitValue(source, "HEAD") == package.revision &&
-            bootstrapPackageGitValue(source, "HEAD^{tree}") == package.digest
-    }
-    if (valid && package.provider == "git") {
-        val command = bootstrapPackageGit()
-        command.argument("-C")
-        command.argument(source)
-        command.argument("status")
-        command.argument("--porcelain")
-        val observed = command.capture()
-        valid = observed.status == 0 &&
-            bootstrapPackageTrim(observed.output) == ""
-    }
-    if (valid && package.provider == "content") {
-        val changed = bootstrapPackageGit()
-        changed.argument("-C")
-        changed.argument(source)
-        changed.argument("diff-files")
-        changed.argument("--quiet")
-        valid = changed.run() == 0 &&
-            bootstrapPackageGitWriteTree(source) == package.digest
-        if (valid) {
-            val untracked = bootstrapPackageGit()
-            untracked.argument("-C")
-            untracked.argument(source)
-            untracked.argument("ls-files")
-            untracked.argument("--others")
-            untracked.argument("--exclude-standard")
-            val observed = untracked.capture()
-            valid = observed.status == 0 &&
-                bootstrapPackageTrim(observed.output) == ""
-        }
-    }
-    valid
-}
+): bool = Path(source).info().isDirectory() && bootstrapPackageDirectoryDigest(source, false) == package.digest
 
 fun bootstrapPackageValidateCapabilityPolicy(
     projectRoot: string,
@@ -2071,7 +2038,9 @@ fun bootstrapPackageValidateDependencies(
 // The tree hash of a vendored copy with its two marker files left out: what `git write-tree` gives for the same
 // files, so it is the digest abla.lock records. The markers say which revision a copy claims to be; this says
 // whether the files are the ones the lock was made from.
-fun bootstrapPackageVendorDigest(projectRoot: string, vendorRoot: string): string {
+// The tree digest of the files of `directory` (as `git add` makes it in a repository of ours with attributes unset, never by git inside the directory,
+// whose index, config and objects a writer of the files could set as it likes); `excludeMarkers` leaves out the two marker files of a vendored copy.
+fun bootstrapPackageDirectoryDigest(directory: string, excludeMarkers: bool): string {
     // git runs inside the vendored directory, so every path it is given must not depend on the working directory. The
     // scratch repository lives in the package cache: a build of a vendored project creates nothing in the project.
     val cacheRoot = bootstrapPackageCacheRoot()
@@ -2088,7 +2057,7 @@ fun bootstrapPackageVendorDigest(projectRoot: string, vendorRoot: string): strin
         init.argument(scratch)
         if (init.run() == 0 && bootstrapPackageRawAttributes(scratch)) {
             val add = bootstrapPackageGit()
-            add.workingDirectory = vendorRoot
+            add.workingDirectory = directory
             add.argument("--git-dir=$scratch")
             add.argument("--work-tree=.")
             add.argument("add")
@@ -2096,8 +2065,10 @@ fun bootstrapPackageVendorDigest(projectRoot: string, vendorRoot: string): strin
             add.argument("--force")
             add.argument("--")
             add.argument(".")
-            add.argument(":(exclude).abla-revision")
-            add.argument(":(exclude).abla-digest")
+            if (excludeMarkers) {
+                add.argument(":(exclude).abla-revision")
+                add.argument(":(exclude).abla-digest")
+            }
             if (add.run() == 0) {
                 val write = bootstrapPackageGit()
                 write.argument("--git-dir=$scratch")
@@ -2110,6 +2081,8 @@ fun bootstrapPackageVendorDigest(projectRoot: string, vendorRoot: string): strin
     bootstrapPackageRemoveTree(scratch)
     result
 }
+
+fun bootstrapPackageVendorDigest(projectRoot: string, vendorRoot: string): string = bootstrapPackageDirectoryDigest(vendorRoot, true)
 
 fun bootstrapPackageVendorMarked(vendorRoot: string, package: BootstrapLockedPackage): bool =
     Path("$vendorRoot/.abla-revision").readText() == package.revision &&
@@ -2341,7 +2314,21 @@ fun bootstrapPackageReadDependencyFile(
         return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNAVAILABLE", name, relative,
             "its locked revision '${package.revision}' is not prepared under the project (a build prepares it from the cache; this read never fetches)")
     }
-    bootstrapPackageTreeFile(["-C", source], package.digest, name, relative)
+    val scratch = bootstrapPackageVendorScratch(source)
+    if (scratch == "") {
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNAVAILABLE", name, relative, "the prepared copy cannot be read")
+    }
+    val write = bootstrapPackageGit()
+    write.argument("--git-dir=$scratch")
+    write.argument("write-tree")
+    val tree = write.capture()
+    if (tree.status != 0 || bootstrapPackageTrim(tree.output) != package.digest) {
+        bootstrapPackageRemoveTree(scratch)
+        return bootstrapPackageDependencyFileFailure("E_PACKAGE_FILE_UNAVAILABLE", name, relative, "the prepared copy of '${package.revision}' does not hold the locked files")
+    }
+    val read = bootstrapPackageTreeFile(["--git-dir=$scratch"], package.digest, name, relative)
+    bootstrapPackageRemoveTree(scratch)
+    read
 }
 
 // What a build journals for a dependency read: the lock's digest and the bytes, or the failure, so a cached build is
