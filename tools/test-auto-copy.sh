@@ -11,6 +11,14 @@ cd "$root/tests/cases/auto-copy"
 expected='7 true true true 7 keep 3 2 7 12 9 6 rnc'
 printf '%s\n%s\n' "$expected" "$expected" > "$out/expected"
 cmp "$out/expected" "$out/actual"
+ABLA_NAMED_PROBE_TRACE=1 "$compiler" build written-only.ab --fast --strict-imports \
+    --no-cache -o "$out/written-only" > "$out/written-only.log" 2>&1
+if grep -F 'named.probe:' "$out/written-only.log" >/dev/null; then
+    cat "$out/written-only.log" >&2
+    echo 'auto copy: ordinary calls to written methods required a typed probe' >&2
+    exit 1
+fi
+"$out/written-only"
 reject() {
     local fixture=$1 message=$2
     if "$compiler" build "$fixture.ab" --fast --strict-imports --no-cache -o "$out/$fixture" > "$out/$fixture.log" 2>&1; then

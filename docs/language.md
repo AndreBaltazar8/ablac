@@ -1209,7 +1209,7 @@ fun main {
 
 ### Copy with selected fields replaced
 
-A plain class without a `copy` member or extension supports
+A non-generic class without a `copy` member or extension supports
 `value.copy(field = replacement)` when the caller can name its primary
 constructor and every field can be copied from a borrowed receiver. The
 compiler supplies omitted fields from the receiver and calls the primary

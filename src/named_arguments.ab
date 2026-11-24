@@ -11,6 +11,7 @@ import "parser.ab"
 import "sema.ab"
 import "eval.ab"
 import "generic_types.ab"
+import "auto_copy.ab"
 import "abla/text"
 
 // The third child is compiler-generated metadata; parsed local declarations
@@ -134,7 +135,10 @@ class BootstrapNamedArgumentNormalizer(
     // call of one of them is that local's, not a constructor's or function's.
     var visibleLocals: array<string> = [],
     val actions: array<BootstrapExpression> = [],
-    val actionSources: array<string> = []
+    val actionSources: array<string> = [],
+    var copyWorld: BootstrapExpectedWorld? = null,
+    var trackCopyTypes: bool = false,
+    val copyTypes: array<string> = []
 ) {
     fun fail(code: string, message: string, expression: BootstrapExpression) {
         this.errors = this.errors + 1
@@ -889,17 +893,42 @@ class BootstrapNamedArgumentNormalizer(
         this.visibleLocals = kept
     }
 
+    fun normalizeRoot(expression: BootstrapExpression, parameters: array<string>): BootstrapExpression {
+        if (!bootstrapHasCopyCall(expression)) return this.normalize(expression)
+        if (this.copyWorld == null) this.copyWorld = bootstrapExpectedWorld(this.declarations)
+        val inherited = this.visibleLocals.size - parameters.size
+        for (index in 0 until this.visibleLocals.size)
+            this.copyTypes.append(if (index < inherited) "" else parameters[index - inherited])
+        this.trackCopyTypes = true
+        val result = this.normalize(expression)
+        this.trackCopyTypes = false
+        this.copyTypes.truncate(0)
+        result
+    }
+
+    fun writtenCopyType(expression: BootstrapExpression): string {
+        val world = this.copyWorld
+        if (world == null) return ""
+        bootstrapWrittenCopyType(this, world, expression)
+    }
+
     fun normalize(expression: BootstrapExpression): BootstrapExpression {
         val normalizedChildren: array<BootstrapExpression> = []
         val scope = this.visibleLocals.size
-        if (expression.kind == "for") this.visibleLocals.append(bootstrapForName(expression))
-        val lambda = (expression.kind == "lambda" || expression.kind == "lambda.move") &&
+        val trackCopyTypes = this.trackCopyTypes
+        if (expression.kind == "for") {
+            this.visibleLocals.append(bootstrapForName(expression))
+            if (trackCopyTypes) this.copyTypes.append("")
+        }
+        val lambda = (expression.kind == "lambda" || expression.kind == "lambda.move" ||
+            expression.kind == "lambda.generator") &&
             expression.children.size > 0
         var child = 0
         while (child < expression.children.size) {
             // A lambda's parameters are in scope in its body, its last child.
             if (lambda && child + 1 < expression.children.size) {
                 this.visibleLocals.append(expression.children[child].text)
+                if (trackCopyTypes) this.copyTypes.append("")
             }
             normalizedChildren.append(this.normalize(
                 expression.children[child]
@@ -908,11 +937,21 @@ class BootstrapNamedArgumentNormalizer(
             val statement = expression.children[child]
             if (expression.kind == "block" &&
                 (statement.kind == "local.val" || statement.kind == "local.var")) {
+                if (trackCopyTypes) {
+                    val typed = bootstrapExpectedLocalType(statement)
+                    val inferred = if (typed != "" || statement.kind != "local.val" ||
+                        statement.children.size == 0) typed else
+                        this.writtenCopyType(statement.children[0])
+                    this.copyTypes.append(inferred)
+                }
                 this.visibleLocals.append(statement.text)
             }
             child = child + 1
         }
-        if (this.visibleLocals.size > scope) this.leaveScope(scope)
+        if (this.visibleLocals.size > scope) {
+            this.leaveScope(scope)
+            if (trackCopyTypes) this.copyTypes.truncate(scope)
+        }
         var result = BootstrapExpression(
             expression.kind,
             expression.text,
@@ -921,6 +960,9 @@ class BootstrapNamedArgumentNormalizer(
             normalizedChildren
         )
         if (result.kind == "member.call" && result.text == "copy") {
+            if (trackCopyTypes && result.children.size == 1 &&
+                bootstrapWrittenCopyResult(this, this.writtenCopyType(expression.children[0])) != "")
+                return result
             if (this.typeProbe == null)
                 this.typeProbe = bootstrapBuildNamedProbe(this.declarations, this.actions, this.actionSources)
             val probe = this.typeProbe
@@ -1282,7 +1324,9 @@ class BootstrapNamedArgumentNormalizer(
                             val callerVisible: array<string> = []
                             for (name in this.visibleLocals) callerVisible.append(name)
                             this.visibleLocals = []
+                            this.trackCopyTypes = false
                             val calleeDefault = this.normalize(substituted)
+                            this.trackCopyTypes = trackCopyTypes
                             this.visibleLocals = callerVisible
                             var normalizedDefault = bootstrapNamedTypedLiteral(
                                 calleeDefault,
@@ -1531,8 +1575,8 @@ fun bootstrapNormalizeNamedDeclaration(
     val defaults: array<BootstrapExpression> = []
     var defaultIndex = 0
     while (defaultIndex < declaration.parameterDefaults.size) {
-        defaults.append(normalizer.normalize(
-            declaration.parameterDefaults[defaultIndex]
+        defaults.append(normalizer.normalizeRoot(
+            declaration.parameterDefaults[defaultIndex], []
         ))
         defaultIndex = defaultIndex + 1
     }
@@ -1552,7 +1596,8 @@ fun bootstrapNormalizeNamedDeclaration(
         for (name in declaration.parameters) visible.append(name)
         normalizer.visibleLocals = visible
     }
-    val body = normalizer.normalize(declaration.expression)
+    val body = normalizer.normalizeRoot(declaration.expression,
+        if (declaration.kind == "class") [] else declaration.parameterTypes)
     val restoredVisible: array<string> = []
     for (name in enclosingVisible) restoredVisible.append(name)
     normalizer.visibleLocals = restoredVisible
@@ -1707,7 +1752,7 @@ fun bootstrapNormalizeNamedArguments(
         if (normalizer.requiresNormalization(candidate)) {
             normalizer.sourceIdentity = if (action < parsed.actionSources.size)
                 parsed.actionSources[action] else ""
-            actions.append(normalizer.normalize(candidate))
+            actions.append(normalizer.normalizeRoot(candidate, []))
         } else actions.append(candidate)
         action = action + 1
     }

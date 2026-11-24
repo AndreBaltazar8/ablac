@@ -3,6 +3,88 @@ import "module_paths.ab"
 import "parser.ab"
 import "sema.ab"
 import "generic_types.ab"
+import "expected_types.ab"
+import "named_arguments.ab"
+import "receiver_names.ab"
+
+fun bootstrapHasCopyCall(expression: BootstrapExpression): bool {
+    if (expression.kind == "member.call" && expression.text == "copy") return true
+    for (child in expression.children) if (bootstrapHasCopyCall(child)) return true
+    false
+}
+
+// A syntax-only proof for ordinary zero-argument calls to a written member.
+// Unknown receiver expressions still use the typed probe.
+fun bootstrapWrittenCopyResult(normalizer: BootstrapNamedArgumentNormalizer, type: string): string {
+    val target = normalizer.targets.find(type)
+    if (target < 0 || normalizer.declarations[target].kind != "class") return ""
+    val owner = normalizer.declarations[target]
+    if (owner.typeParameters.size > 0) return ""
+    var result = ""
+    for (method in owner.methods) {
+        if (method.name != "copy") continue
+        if (result != "" || method.parameters.size != 0 || method.typeParameters.size > 0)
+            return ""
+        result = "${method.resultType}"
+    }
+    result
+}
+
+fun bootstrapWrittenCopyType(normalizer: BootstrapNamedArgumentNormalizer,
+    world: BootstrapExpectedWorld, expression: BootstrapExpression): string {
+    val names = normalizer.visibleLocals
+    val ownerName = normalizer.receiver
+    val kind = expression.kind
+    if (kind == "identifier") {
+        var local = names.size - 1
+        while (local >= 0) {
+            if (names[local] == expression.text) return "${normalizer.copyTypes[local]}"
+            local = local - 1
+        }
+        if (expression.text == "this") return "${ownerName}"
+        val owner = world.classes.find(ownerName)
+        if (owner >= 0 && world.classes.fields[owner].find(expression.text) >= 0)
+            return world.classes.fields[owner].typeOf(expression.text)
+        return world.globals.typeOf(expression.text)
+    }
+    if (kind == "call" && !bootstrapReceiverNameIn(names, expression.text)) {
+        val constructor = normalizer.targets.find(expression.text)
+        if (constructor < 0 || normalizer.declarations[constructor].kind != "class") return ""
+        if (ownerName != "") {
+            val receiver = normalizer.targets.find(ownerName)
+            if (receiver < 0 || normalizer.declarations[receiver].kind != "class") return ""
+            val fields = world.classes.find(ownerName)
+            if (fields < 0 || world.classes.fields[fields].find(expression.text) >= 0) return ""
+            for (method in normalizer.declarations[receiver].methods)
+                if (method.name == expression.text) return ""
+            for (extension in normalizer.declarations)
+                if (extension.extensionOwner != "" && extension.name == expression.text) return ""
+        }
+        return "${normalizer.declarations[constructor].name}"
+    }
+    if (kind == "member" && expression.children.size == 1) {
+        val owner = world.classes.find(bootstrapWrittenCopyType(normalizer, world, expression.children[0]))
+        if (owner >= 0) return world.classes.fields[owner].typeOf(expression.text)
+    }
+    if (kind == "member.call" && expression.text == "copy" && expression.children.size == 1)
+        return bootstrapWrittenCopyResult(normalizer,
+            bootstrapWrittenCopyType(normalizer, world, expression.children[0]))
+    if (kind == "if" && expression.children.size == 3 &&
+        expression.children[2].kind == "null") return bootstrapWrittenCopyType(normalizer, world, expression.children[1])
+    if (kind == "block" && expression.children.size > 0) {
+        // Resolve a branch result only if the block doesn't shadow it.
+        // The self-contained constructor expression needs no local lookup.
+        val result = expression.children[expression.children.size - 1]
+        if (result.kind == "call") {
+            for (statement in expression.children) {
+                if ((statement.kind == "local.val" || statement.kind == "local.var") &&
+                    statement.text == result.text) return ""
+            }
+            return bootstrapWrittenCopyType(normalizer, world, result)
+        }
+    }
+    ""
+}
 
 // The graph's resolved edges, used only when a copy call needs a fallback.
 var bootstrapAutoCopyImports: array<BootstrapModuleAlias> = []
