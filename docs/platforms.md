@@ -248,7 +248,7 @@ with an empty mask, and Windows has no POSIX signals to watch); `/bin/sh` for
 from `/etc/passwd` (`path-home`: the runtime answers `geteuid` and the other ids
 with 0, and a Windows program has no `/etc/passwd` outside Wine); the OpenSSL-backed `abla/tls/hosted` (`network-advanced.ab` fails to link
 `OpenSSL_version_num`; the pure TLS of `abla/tls/pure`, which the HTTPS client uses, runs on Windows: see below);
-tests that fork (the WebSocket server tests; `dns-async.ab` and `http-async.ab` have thread-based
+tests that fork, as they are (`dns-async.ab`, `http-async.ab`, `websocket-server.ab` and `websocket-server-protocol.ab` have thread-based
 copies in `tests/cases/windows`); tests that run POSIX tools
 (`printf`, `sh` in `process-capture.ab`, `host-process-configured.ab`,
 `inferred-command`); POSIX path semantics (`path-syntax`: `Path` follows
