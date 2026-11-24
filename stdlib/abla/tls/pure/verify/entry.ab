@@ -192,22 +192,41 @@ fun tlsX509Scope(store: X509TrustStore): string {
  *  OCSP_POLICY_REQUIRE of abla/crypto/ocsp; see ocspCheckPath). A revoked certificate answers certificate_revoked, any other refusal bad_certificate_status_response (a must-staple
  *  certificate without a staple: bad_certificate). */
 fun tlsOcspVerifier(store: X509TrustStore, host: string, now: () -> int, policy: int): (array<string>, array<string>) -> TlsVerdict =
+    tlsOcspVerifierLazy({ store }, host, now, policy)
+
+/** tlsOcspVerifier with the trust store read when the staples arrive (the system store is parsed only then, as tlsX509VerifierLazy does). */
+fun tlsOcspVerifierLazy(storeOf: () -> X509TrustStore, host: string, now: () -> int, policy: int): (array<string>, array<string>) -> TlsVerdict =
     { chain: array<string>, statuses: array<string> ->
         val moment = now()
-        val verification = x509Verify(chain, store, X509Options(host, moment))
-        if (!verification.ok) {
-            tlsRefused(tlsChainVerdictAlert(verification.kind), "certificate: ${verification.error}")
-        } else {
-            val staples: array<string> = []
-            for (certificate in verification.path) {
-                var staple = ""
-                for (j in 0 until chain.size) if (chain[j] == certificate.der && j < statuses.size) staple = statuses[j]
-                staples.append(staple)
+        var stapled = false
+        for (status in statuses) if (status != "") stapled = true
+        if (!stapled) {
+            // No staple: what is left to decide is the policy and must-staple, which the leaf alone tells. The chain verifier has judged the path already; a second full
+            // verification here (its signatures) would cost a third of a handshake.
+            if (chain.size == 0) tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "no certificate") else {
+                val leaf = x509ParseDer(chain[0])
+                if (!leaf.ok) tlsRefused(TLS_VERDICT_DECODE_ERROR, "certificate: ${leaf.error}")
+                else tlsStapleVerdict(ocspCheckPath([leaf, leaf], [""], policy, moment))
             }
-            val problem = ocspCheckPath(verification.path, staples, policy, moment)
-            if (problem == "") tlsAccepted()
-            else if (problem.indexOf("is revoked") >= 0) tlsRefused(TLS_VERDICT_CERTIFICATE_REVOKED, "certificate: $problem")
-            else if (problem.indexOf("requires an OCSP staple") >= 0 || problem.indexOf("no OCSP staple") >= 0) tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: $problem")
-            else tlsRefused(TLS_VERDICT_BAD_STATUS_RESPONSE, "certificate: $problem")
+        } else {
+            val verification = x509Verify(chain, storeOf(), X509Options(host, moment))
+            if (!verification.ok) {
+                tlsRefused(tlsChainVerdictAlert(verification.kind), "certificate: ${verification.error}")
+            } else {
+                val staples: array<string> = []
+                for (certificate in verification.path) {
+                    var staple = ""
+                    for (j in 0 until chain.size) if (chain[j] == certificate.der && j < statuses.size) staple = statuses[j]
+                    staples.append(staple)
+                }
+                tlsStapleVerdict(ocspCheckPath(verification.path, staples, policy, moment))
+            }
         }
     }
+
+// The verdict for what ocspCheckPath said ("" accepts): a revoked certificate is certificate_revoked, a missing required staple bad_certificate, any other refusal bad_certificate_status_response.
+private fun tlsStapleVerdict(problem: string): TlsVerdict =
+    if (problem == "") tlsAccepted()
+    else if (problem.indexOf("is revoked") >= 0) tlsRefused(TLS_VERDICT_CERTIFICATE_REVOKED, "certificate: $problem")
+    else if (problem.indexOf("requires an OCSP staple") >= 0 || problem.indexOf("no OCSP staple") >= 0) tlsRefused(TLS_VERDICT_BAD_CERTIFICATE, "certificate: $problem")
+    else tlsRefused(TLS_VERDICT_BAD_STATUS_RESPONSE, "certificate: $problem")

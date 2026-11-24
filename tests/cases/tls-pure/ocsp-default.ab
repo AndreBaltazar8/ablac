@@ -1,0 +1,62 @@
+// The stock pure TLS client (tlsConnectWithCa: no revocation setting made by the caller) checks OCSP staples, and a configuration with revocation 0 does not: one connection to an
+// `openssl s_server -status_file` (tools/test-tls-ocsp.sh makes the certificates and responses and runs one server per case, TLS 1.3 and TLS 1.2, and reads the server's log for the
+// extension the ClientHello carried and the alert it got). Arguments: the port, the trust anchor (PEM), the expectation ("ok" or "refused") and the mode ("default": tlsConnectWithCa;
+// "off": a configuration made by hand with revocation 0, through tlsPureConnect). Prints "tls-pure ocsp-default ok" or what went wrong.
+import "abla/io"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/tls/pure"
+import "abla/tls/pure/client"
+import "abla/tls/pure/connection"
+import "abla/tls/pure/verify"
+
+fun decimal(text: string): int {
+    var value = 0
+    for (i in 0 until text.size) value = value * 10 + (text[i] - 48)
+    value
+}
+
+fun now(): int = realtimeMilliseconds() / 1000
+
+fun main: int {
+    val port = decimal(processArgument(0))
+    val caPath = processArgument(1)
+    val expectation = processArgument(2)
+    val mode = processArgument(3)
+    var handle = -1
+    if (mode == "off") {
+        val store = x509TrustStoreFromPem(linuxReadFile(caPath, 1048576))
+        val config = tlsClientConfig("localhost", tlsX509Verifier(store, now), tlsPureRandom)
+        if (config.revocation != 1) {
+            println("FAIL the default revocation of a configuration is ${config.revocation}, expected 1")
+            return 1
+        }
+        val off = tlsClientConfigWithRevocation(config, 0, tlsOcspVerifier(store, "localhost", now, 1))
+        val connection = tlsPureConnect(off, port, 5000, 5000)
+        if (connection.ok()) {
+            connection.write("GET / HTTP/1.0\r\n\r\n")
+            connection.close()
+            handle = 0
+        }
+    } else {
+        val connection = tlsConnectWithCa("localhost", caPath, port, 5000, 5000)
+        handle = connection.handle
+        if (handle != -1) {
+            connection.write("GET / HTTP/1.0\r\n\r\n")
+            connection.read(4096)
+            connection.close()
+        }
+    }
+    if (expectation == "ok" && handle == -1) {
+        println("FAIL the connection was refused: ${tlsLastError()}")
+        return 1
+    }
+    if (expectation == "refused" && handle != -1) {
+        println("FAIL the connection was accepted, expected a refusal")
+        return 1
+    }
+    println("tls-pure ocsp-default ok")
+    0
+}

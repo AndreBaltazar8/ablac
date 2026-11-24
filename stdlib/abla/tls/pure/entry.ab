@@ -199,11 +199,18 @@ private fun pureTlsStore(caPath: string): X509TrustStore? {
 }
 
 private fun pureTlsConfig(host: string, store: X509TrustStore): TlsClientConfig =
-    tlsClientConfig(host, tlsX509Verifier(store, pureTlsNow), tlsPureRandom)
+    pureTlsWithRevocation(tlsClientConfig(host, tlsX509Verifier(store, pureTlsNow), tlsPureRandom), { store })
+
+// The stock clients check OCSP staples (TlsClientConfig.revocation, on by default): the staple verifier judges them against the same trust store as the chain.
+private fun pureTlsWithRevocation(config: TlsClientConfig, storeOf: () -> X509TrustStore): TlsClientConfig {
+    val policy = config.revocation
+    if (policy <= 0) return config
+    tlsClientConfigWithRevocation(config, policy, tlsOcspVerifierLazy(storeOf, config.host, pureTlsNow, policy))
+}
 
 // The system store is parsed when a certificate arrives, not when the connection starts.
 private fun pureTlsConfigSystem(host: string): TlsClientConfig =
-    tlsClientConfig(host, tlsX509VerifierLazy(pureTlsSystemStore, pureTlsNow), tlsPureRandom)
+    pureTlsWithRevocation(tlsClientConfig(host, tlsX509VerifierLazy(pureTlsSystemStore, pureTlsNow), tlsPureRandom), pureTlsSystemStore)
 
 private fun pureTlsFailed(host: string, stage: int): TlsConnection {
     val failed = tlsPureFailedConnection(pureTlsConfig(host, X509TrustStore([])), pureTlsErrorText(stage), stage)
@@ -640,7 +647,10 @@ private fun pureTlsSessionVerifier(mode: int, caPath: string): (array<string>, s
  *  system bundle, or what SSL_CERT_FILE and its friends name). A session that could not start is failed (`ok()` is false,
  *  `detail()` says why). */
 fun tlsSessionClient(descriptor: int, host: string, mode: int, caPath: string = "", sessions: TlsSessionCache? = null, alpn: array<string> = []): TlsSession {
-    val config = tlsClientConfigWithAlpn(tlsClientConfigWithSessions(tlsClientConfig(host, pureTlsSessionVerifier(mode, caPath), tlsPureRandom), sessions, pureTlsSessionScope(mode, caPath)), alpn)
+    // Only a session that verifies the host checks staples (a chain-only or no-verify session has no host to judge them for).
+    var base = tlsClientConfig(host, pureTlsSessionVerifier(mode, caPath), tlsPureRandom)
+    if (mode == TLS_VERIFY_HOST) base = pureTlsWithRevocation(base, { pureTlsSessionStore(caPath) })
+    val config = tlsClientConfigWithAlpn(tlsClientConfigWithSessions(base, sessions, pureTlsSessionScope(mode, caPath)), alpn)
     val client = tlsClientNew(config)
     val session = TlsSession(move(client), descriptor, "", 0, "", "", false)
     if (descriptor < 0 || host == "" || mode < TLS_VERIFY_NONE || mode > TLS_VERIFY_HOST) {

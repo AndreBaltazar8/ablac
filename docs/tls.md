@@ -124,12 +124,23 @@ RFC 6979 nonces: `p384EcdsaSign`; a server identity can be a P-384 key, in PKCS#
 the certificates a client accepts (RFC 8422 section 5.1.1): a client refuses an EC certificate whose curve it did not list (`bad_certificate`), and a
 server with a P-256 or P-384 key does not serve a TLS 1.2 client that lists no such curve (`handshake_failure`); TLS 1.3 has no such rule.
 
-## Revocation by OCSP stapling (client side, opt in)
+## Revocation by OCSP stapling (client side, on by default since v0.2.70)
 
-Off by default: a client accepts a certificate that is revoked until it expires, as before. `tlsClientConfigWithRevocation(config, policy, tlsOcspVerifier(store, host, now, policy))`
-turns it on. The ClientHello then offers `status_request`; a server that staples an OCSP response (TLS 1.3: in the Certificate entry; TLS 1.2: a CertificateStatus message the
+The pure TLS client checks OCSP staples by default (v0.2.68 and v0.2.69 had it opt in). Every stock client of `abla/tls/pure` does: `tlsConnect` and its relatives (`tlsConnectWithCa`,
+`tlsConnectWithIdentity`, the upgrade functions), `tlsSessionClient` with `TLS_VERIFY_HOST` (the asynchronous HTTP client), and so the HTTPS clients and the WebSocket TLS client built on them. Their ClientHello offers
+`status_request`, and a staple the server sends is judged after the chain verifies, against the same trust store; **a server that sends no staple connects as before** (policy 1, `OCSP_POLICY_STAPLE`). What a
+caller can newly see: a handshake that ends with `certificate_revoked` (the staple says the certificate is revoked), `bad_certificate_status_response` (a staple that is for another certificate, not signed by the
+issuer or an authorized responder, not fresh, or valid for more than ten days), or `bad_certificate` (the certificate is must-staple and the server sent none); `tlsLastError()` says "TLS failed at certificate_verification" for all of them.
+A server that staples a stale or wrong response, which a client without the check connected to, is now refused: the server's operator refreshes the staple.
+
+To opt out, or to require a staple, build the configuration: `TlsClientConfig.revocation` is the policy (1 staple, 2 require, 0 off: no `status_request`, a staple is not looked at, as in v0.2.69), and
+`tlsClientConfigWithRevocation(config, policy, tlsOcspVerifier(store, host, now, policy))` sets it with its verifier (`tlsOcspVerifierLazy` takes the store when the staples arrive). The setting takes effect only with a staple
+verifier: a configuration made by hand with its own `verifier` has none and checks nothing until it is given one. The hosted (OpenSSL) client, which a program built for a platform with its own TLS library uses, has no revocation
+setting: the default covers the pure client only. The ClientHello is 9 bytes longer (the extension). A handshake with a server that sends no staple costs nothing measurable; one that staples costs about 0.6 ms more (a second path build and the response's signature check: 1.9 to 2.5 ms in a release build, one core, local server).
+
+How it works. The ClientHello offers `status_request`; a server that staples an OCSP response (TLS 1.3: in the Certificate entry; TLS 1.2: a CertificateStatus message the
 ServerHello promised) has it judged by `abla/crypto/ocsp` after the chain and the signature have verified: the response must be for that certificate, signed by its issuer or by a
-certificate the issuer authorized to sign OCSP responses, and fresh (a nextUpdate that has not passed and at most seven days after thisUpdate). `OCSP_POLICY_STAPLE` (1) uses a
+certificate the issuer authorized to sign OCSP responses, and fresh (a nextUpdate that has not passed and at most ten days after thisUpdate, the Baseline Requirements' limit). `OCSP_POLICY_STAPLE` (1) uses a
 staple when there is one: a revoked certificate ends the handshake with `certificate_revoked`, an invalid or expired staple with `bad_certificate_status_response`, no staple is accepted,
 unless the certificate is must-staple (RFC 7633: the TLS Feature extension lists status_request), which is then refused. `OCSP_POLICY_REQUIRE` (2) refuses a certificate without a good staple.
 Nothing is fetched: a client that wants a response of its own gets one from the certificate's responder with `ocspRequestDer` and `ocspCheck`. Limits: a man in the middle can strip

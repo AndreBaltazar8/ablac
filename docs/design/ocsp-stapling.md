@@ -1,6 +1,6 @@
 # OCSP stapling: a minimal revocation check (design)
 
-Status: the client side is implemented (abla/crypto/ocsp, tlsClientConfigWithRevocation, tlsOcspVerifier; docs/tls.md describes it); the server side and everything marked "not implemented" below are not. Written for #1139 (TLS round 2), area 3.s known gap "revocation: no CRL or OCSP at all".
+Status: the client side is implemented, and on by default in the stock pure TLS clients since v0.2.70 (decision #120; revocation = 0 opts out) (abla/crypto/ocsp, tlsClientConfigWithRevocation, tlsOcspVerifier; docs/tls.md describes it); the server side and everything marked "not implemented" below are not. Written for #1139 (TLS round 2), area 3.s known gap "revocation: no CRL or OCSP at all".
 
 ## Where we are
 
@@ -51,7 +51,7 @@ a status (good, revoked, unknown) or an error, and checks, in this order:
    that has `id-kp-OCSPSigning` among its extended key usages and `digitalSignature` in its key usage, and that is valid at `now`. The signature over
    `tbsResponseData` is checked with the signer's key. No other certificate in `certs` is trusted.
 4. Freshness: `thisUpdate <= now + skew` (5 minutes), `nextUpdate` present and `now <= nextUpdate`, and `nextUpdate - thisUpdate` at most the policy's
-   maximum (7 days, as browsers); a response without `nextUpdate` is refused. `producedAt` is not trusted for anything.
+   maximum (10 days: the CA/B Forum Baseline Requirements limit for a subscriber certificate); a response without `nextUpdate` is refused. `producedAt` is not trusted for anything.
 5. `certStatus`: good, revoked (with the time and reason, always a failure), unknown (a failure under a require policy).
 
 It needs from x509: the signature check over arbitrary bytes. Today `x509CheckSignature(cert, issuer)` takes two certificates, so it is split into
@@ -100,7 +100,7 @@ to 64 KiB (`tlsMessageLimit`). Parsing is linear in the staple; the signature ch
 
 1. Vectors made with `openssl ocsp -respond` from a test CA (committed, with the tool that makes them, like `tools/gen-x509-fixtures.sh`): good, revoked (each
    reason), unknown, delegated responder, delegated without the EKU, responder signed by another CA, wrong serial, wrong issuer hashes, `nextUpdate` passed,
-   `thisUpdate` in the future, no `nextUpdate`, a window over 7 days, a bad signature, a status other than successful, a response type other than basic.
+   `thisUpdate` in the future, no `nextUpdate`, a window over 10 days, a bad signature, a status other than successful, a response type other than basic.
 2. Interop: our client against `openssl s_server -status_file` and a Go `tls.Server` with `Certificate.OCSPStaple` (good, revoked, expired, none, must-staple
    leaf with and without); our server against `openssl s_client -status` and a Go client reading `ConnectionState.OCSPResponse`. The BoGo runner has the
    OCSP cases (`-expect-ocsp-response`, `-ocsp-response`), which come off `tools/tls-bogo/expected-failures.txt` as they pass.
