@@ -234,9 +234,9 @@ and runs [test-windows-link.sh](../tools/test-windows-link.sh). Job
 crash program's access-violation report, its backtrace symbolized to file and
 line, the seven hosted programs in `tests/cases/windows/hosted` (hello,
 arguments, environment, files, processes, loopback sockets, threads; `--fast`
-and release) and the 68 standard-library programs listed in
+and release) and the 77 standard-library programs listed in
 [programs.txt](../tests/cases/windows/programs.txt) (collections, text, date,
-files, process exit, loopback HTTP and WebSocket, threads, ...). The Linux job
+files, `homePath` (`USERPROFILE` where there is no `HOME`), process exit, loopback HTTP and WebSocket, threads, ...). The Linux job
 leaves each image with the output and exit status the same program has built
 natively for Linux and their hashes;
 [test-hosted.ps1](../tools/windows/test-hosted.ps1) compares what the runner's
@@ -287,9 +287,8 @@ standard library's test programs (`tests/abla-tests.json`), those in
 `programs.txt` run on Windows; the rest of the survey is blocked by:
 signals (`signal-watch.ab` needs `signalfd`: the runtime answers `rt_sigprocmask`
 with an empty mask, and Windows has no POSIX signals to watch); `/bin/sh` for
-`ulimit -n` (`process-metrics.ab`, whose CPU times `getrusage` now gives); `HOME`
-from `/etc/passwd` (`path-home`: the runtime answers `geteuid` and the other ids
-with 0, and a Windows program has no `/etc/passwd` outside Wine); the OpenSSL-backed `abla/tls/hosted` (`network-advanced.ab` fails to link
+`ulimit -n` (`process-metrics.ab`, whose CPU times `getrusage` now gives);
+the OpenSSL-backed `abla/tls/hosted` (`network-advanced.ab` fails to link
 `OpenSSL_version_num`; the pure TLS of `abla/tls/pure`, which the HTTPS client uses, runs on Windows: see below);
 tests that fork, as they are (`dns-async.ab`, `http-async.ab`, `websocket-server.ab` and `websocket-server-protocol.ab` have thread-based
 copies in `tests/cases/windows`); tests that run POSIX tools
