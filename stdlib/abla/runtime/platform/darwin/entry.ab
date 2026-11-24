@@ -452,6 +452,25 @@ trusted fun __ablaRuntimeDarwinAddressCall(number: int, descriptor: int, address
 }
 
 // sendto 44: the destination address (argument4, length argument5) is optional.
+// Darwin's send ignores MSG_DONTWAIT: send(2) takes only MSG_OOB and MSG_DONTROUTE (recv(2) honours MSG_DONTWAIT, which
+// is why a nonblocking receive worked and a nonblocking send to a peer that read nothing waited out SO_SNDTIMEO on the
+// macOS Intel runner, master CI 45468121280). A send with Linux's MSG_DONTWAIT (64) on a blocking socket makes the socket
+// nonblocking for that one call (fcntl 92: F_GETFL 3, F_SETFL 4, Darwin's O_NONBLOCK 4), as the Windows runtime does, and
+// __ablaRuntimeDarwinSendNonblockEnd puts its mode back. The socket's previous flags + 1 when they were changed, else 0.
+trusted fun __ablaRuntimeDarwinSendNonblockBegin(descriptor: int, flags: int): int {
+    if ((flags & 64) == 0) return 0
+    val current = ablaDarwinSyscall(92, descriptor, 3, 0, 0, 0, 0)
+    if (current < 0 || (current & 4) != 0) return 0
+    if (ablaDarwinSyscall(92, descriptor, 4, current | 4, 0, 0, 0) < 0) return 0
+    current + 1
+}
+
+/// Restores the file status flags __ablaRuntimeDarwinSendNonblockBegin changed for one send.
+trusted fun __ablaRuntimeDarwinSendNonblockEnd(descriptor: int, saved: int): void {
+    if (saved != 0) ablaDarwinSyscall(92, descriptor, 4, saved - 1, 0, 0, 0)
+    return
+}
+
 trusted fun __ablaRuntimeDarwinSendto(
     descriptor: int,
     buffer: int,
@@ -464,13 +483,17 @@ trusted fun __ablaRuntimeDarwinSendto(
         val converted = __ablaRuntimeDarwinSockaddrLength(address, size)
         if (converted < 0) return converted
         val saved = __ablaRuntimeDarwinSockaddrMark(address, converted)
+        val mode = __ablaRuntimeDarwinSendNonblockBegin(descriptor, flags)
         val raw = ablaDarwinSyscall(133, descriptor, buffer, length,
             __ablaRuntimeDarwinMessageFlags(flags), address, converted)
+        __ablaRuntimeDarwinSendNonblockEnd(descriptor, mode)
         __ablaRuntimeDarwinSockaddrRestore(address, saved)
         return __ablaRuntimeDarwinResult(raw)
     }
-    __ablaRuntimeDarwinResult(ablaDarwinSyscall(133, descriptor, buffer, length,
-        __ablaRuntimeDarwinMessageFlags(flags), 0, 0))
+    val mode = __ablaRuntimeDarwinSendNonblockBegin(descriptor, flags)
+    val raw = ablaDarwinSyscall(133, descriptor, buffer, length, __ablaRuntimeDarwinMessageFlags(flags), 0, 0)
+    __ablaRuntimeDarwinSendNonblockEnd(descriptor, mode)
+    __ablaRuntimeDarwinResult(raw)
 }
 
 // recvfrom 45: the kernel writes the source address into the caller's buffer (length word
@@ -503,16 +526,20 @@ trusted fun __ablaRuntimeDarwinSendmsg(descriptor: int, header: int, flags: int)
     val name = ablaRuntimeLoadI64(header)
     val nameLength = ablaRuntimeLoadI32(header + 8) & 4294967295
     if (name == 0 || nameLength == 0) {
-        return __ablaRuntimeDarwinResult(ablaDarwinSyscall(28, descriptor, header,
-            __ablaRuntimeDarwinMessageFlags(flags), 0, 0, 0))
+        val plainMode = __ablaRuntimeDarwinSendNonblockBegin(descriptor, flags)
+        val plain = ablaDarwinSyscall(28, descriptor, header, __ablaRuntimeDarwinMessageFlags(flags), 0, 0, 0)
+        __ablaRuntimeDarwinSendNonblockEnd(descriptor, plainMode)
+        return __ablaRuntimeDarwinResult(plain)
     }
     val converted = __ablaRuntimeDarwinSockaddrLength(name, nameLength)
     if (converted < 0) return converted
     val saved = __ablaRuntimeDarwinSockaddrMark(name, converted)
     ablaRuntimeStoreI32(header + 8, converted)
+    val mode = __ablaRuntimeDarwinSendNonblockBegin(descriptor, flags)
     val raw = ablaDarwinSyscall(28, descriptor, header, __ablaRuntimeDarwinMessageFlags(flags), 0,
         0,
         0)
+    __ablaRuntimeDarwinSendNonblockEnd(descriptor, mode)
     ablaRuntimeStoreI32(header + 8, nameLength)
     __ablaRuntimeDarwinSockaddrRestore(name, saved)
     __ablaRuntimeDarwinResult(raw)
