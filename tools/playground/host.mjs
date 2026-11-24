@@ -71,7 +71,7 @@ export async function compile(module, base, files, options = {}) {
 export async function run(module, base, files, { stdin = "" } = {}) {
     const source = files.get("main.ab");
     const text = typeof source === "string" ? source : new TextDecoder().decode(source);
-    const returnsInt = /^fun\s+main\s*(\(\s*\))?\s*:\s*int\b/m.test(text);
+    const returnsInt = /^fun\s+main\s*(?:\(\s*\))?\s*:\s*(?:int|i64)\b/m.test(text);
     const call = returnsInt ? "val result = user.main()\n    eprintln(\"exit=$result\")\n    result" : "user.main()\n    eprintln(\"exit=0\")\n    0";
     const wrapper = `import "abla/io"\nimport "abla/compiler"\n#compilerGrant("clock")\n#compilerGrant("random")\n#compilerGrant("process.io")\nimport "./main.ab" as user\n\nfun evalWrap: int {\n    ${call}\n}\n\nval evalCode = #evalWrap()\n\nfun main: int = 0\n`;
     const all = new Map(files);

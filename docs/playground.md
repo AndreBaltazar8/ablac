@@ -23,7 +23,7 @@ symbol and has no native compile-time tier:
 ## Running a program
 
 `run()` in `tools/playground/host.mjs` wraps the program: a module that imports its `main.ab` calls `main` at compile time (a `#` site), so the
-compiler's evaluator runs the program. Its output is on descriptors 1 and 2, its `int` result is the exit status, and a runtime error is a
+compiler's evaluator runs the program. Its output is on descriptors 1 and 2, its `int` (or `i64`) result is the exit status, and a runtime error is a
 compiler diagnostic with source frames (`E_EVAL_OUT_OF_BOUNDS: index 5 out of bounds…`). Standard input is the bytes the page gives. The grants
 are the clock, random bytes and `process.io` (standard input; no process can start: `fork` fails); files, the network and native code are not
 granted. The step limit (`ABLA_EVAL_STEP_LIMIT`, 50 million by default) and the page's `terminate()` watchdog bound a run.

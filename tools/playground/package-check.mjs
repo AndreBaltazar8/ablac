@@ -50,6 +50,12 @@ try {
     const run = (source, files = []) => host.run(module, base, new Map([["main.ab", source], ...files]));
     const result = await run(source);
     if (!result.ok || result.stdout !== "package ok\n" || result.status !== 7) fail(`the program ran as ${JSON.stringify({ ok: result.ok, status: result.status, stdout: result.stdout, diagnostics: result.diagnostics.slice(0, 200) })}`);
+    for (const [signature, tail, status] of [["fun main(): i64", "7", 7], ["fun main", "return", 0]]) {
+        const output = await run(`import "abla/io"\n${signature} { println("main ran"); ${tail} }\n`);
+        if (!output.ok || output.status !== status || output.stdout !== "main ran\n") {
+            fail(`${signature} should report status ${status}: ${JSON.stringify(output)}`);
+        }
+    }
     for (const [source, reason] of [
         ['import "abla/fs"\nfun main(): int = path("notes.txt").readText().size\n', "compile.effect-denied:"],
         ['import "abla/compiler"\n#compilerGrant("filesystem.read")\nfun main: int = 0\n', "compile.capability-not-authorized:filesystem.read"],
