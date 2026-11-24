@@ -64,7 +64,23 @@ if [[ ${1:-} == --controls ]]; then
     rm -rf "$work/w"; mkdir "$work/w"; release_workflow '' > "$work/w/release.yml"
     if "$0" "$work/w" > "$work/out" 2>&1; then echo "workflow security control 'release environment': accepted" >&2; exit 1; fi
     grep -q 'without environment: release' "$work/out" || { cat "$work/out" >&2; echo "workflow security control 'release environment': wrong refusal" >&2; exit 1; }
-    echo 'workflow security controls: every rule refuses a workflow that breaks it'
+    # Evaluate the job's actual routing condition for the ARM64 fixed-point dispatch.
+    arm64_route=$(awk '
+        /^  windows-arm64:$/ { arm64=1; next }
+        arm64 && /^    if:/ { sub(/^    if: \$\{\{ /, ""); sub(/ \}\}$/, ""); print; exit }
+        arm64 && /^  [^ ]/ { exit }
+    ' "$root/.github/workflows/release.yml")
+    arm64_route=${arm64_route//inputs.windows_arm64/\'fixpoint\'}
+    arm64_route=${arm64_route//inputs.windows/\'with\'}
+    # Only the dispatch mode literals and comparison/boolean operators can reach eval.
+    syntax=$arm64_route
+    for mode in off with only fixpoint; do syntax=${syntax//\'$mode\'/}; done
+    route_operators='^[[:space:]()&|=!]+$'
+    if [[ ! $syntax =~ $route_operators ]] || ! eval "[[ $arm64_route ]]"; then
+        echo 'workflow control: windows_arm64=fixpoint did not select windows-arm64' >&2
+        exit 1
+    fi
+    echo 'workflow controls: security rules and ARM64 fixed-point routing passed'
     exit 0
 fi
 dir=${1:-$root/.github/workflows}
