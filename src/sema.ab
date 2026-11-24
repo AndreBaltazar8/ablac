@@ -2348,7 +2348,9 @@ fun bootstrapCopyRegionCallSummary(
         bootstrapStringSetCopy(source.retainingParameters),
         bootstrapStringSetCopy(source.heapFields),
         bootstrapStringSetCopy(source.declaredMembers),
-        source.fieldTypes
+        source.fieldTypes,
+        source.declarations,
+        source.topLevelNames
     )
 }
 
@@ -5896,7 +5898,9 @@ class BootstrapRegionCallSummary(
     val retainingParameters: BootstrapStringSet,
     val heapFields: BootstrapStringSet,
     val declaredMembers: BootstrapStringSet,
-    val fieldTypes: Map<string, string>
+    val fieldTypes: Map<string, string>,
+    val declarations: array<BootstrapDeclaration>,
+    val topLevelNames: BootstrapTopLevelNameIndex
 )
 
 // A top-level body's name in the summary: an extension function's is
@@ -6115,17 +6119,41 @@ fun bootstrapRegionBindParameters(var bindings: BootstrapRegionBindings,
     return
 }
 
-fun bootstrapRegionBindingType(bindings: BootstrapRegionBindings, name: string): string {
+fun bootstrapRegionBindingIndex(bindings: BootstrapRegionBindings, name: string): int {
     var index = bindings.names.size - 1
     while (index >= 0) {
-        if (bindings.names[index] == name) return bootstrapBorrowElementType(bindings.types[index])
+        if (bindings.names[index] == name) return index
         index -= 1
+    }
+    -1
+}
+
+// Resolve only a unique named constructor or a function with a written
+// return type. A lexical binding or a callable field may supply the call.
+fun bootstrapRegionSummaryCallType(
+    name: string, owner: string, summary: BootstrapRegionCallSummary,
+    bindings: BootstrapRegionBindings
+): string {
+    val entry = summary.topLevelNames.find(name)
+    if (entry < 0 || summary.topLevelNames.counts[entry] != 1 ||
+        bootstrapRegionBindingIndex(bindings, name) >= 0 ||
+        (owner != "" && summary.fieldTypes.has("$owner.$name"))) return ""
+    val declaration = summary.declarations[summary.topLevelNames.firsts[entry]]
+    if (declaration.typeParameters.size > 0 ||
+        name == "Map" || name == "Cell" || name == "Shared" || name == "Mutex" ||
+        name == "move" || name == "filledArray" ||
+        bootstrapScalarTypeUnderlyingValid(bootstrapNormalizeType(name))) return ""
+    if (declaration.kind == "class") return bootstrapNormalizeType(declaration.name)
+    if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+        declaration.resultType != "" && declaration.resultType != "inferred") {
+        return bootstrapBorrowElementType(bootstrapNormalizeType(declaration.resultType))
     }
     ""
 }
 
 // The static type of a member call's receiver before inference. Follow
-// declared fields and array elements rooted at `this` or a scoped binding.
+// declared fields and array elements rooted at `this`, a scoped binding or a
+// call whose declaration and result type are known.
 fun bootstrapRegionSummaryReceiverType(
     receiver: BootstrapExpression,
     owner: string,
@@ -6133,8 +6161,12 @@ fun bootstrapRegionSummaryReceiverType(
     bindings: BootstrapRegionBindings
 ): string {
     if (receiver.kind == "identifier") {
-        return if (receiver.text == "this") owner else bootstrapRegionBindingType(bindings, receiver.text)
+        if (receiver.text == "this") return owner
+        val local = bootstrapRegionBindingIndex(bindings, receiver.text)
+        return if (local >= 0) bootstrapBorrowElementType(bindings.types[local]) else ""
     }
+    if (receiver.kind == "call")
+        return bootstrapRegionSummaryCallType(receiver.text, owner, summary, bindings)
     if (receiver.kind == "member" && receiver.children.size == 1) {
         val base = bootstrapRegionSummaryReceiverType(receiver.children[0], owner, summary, bindings)
         if (base != "") return bootstrapBorrowElementType(summary.fieldTypes.get("$base.${receiver.text}") ?? "")
@@ -6739,14 +6771,17 @@ fun bootstrapRegionCheckModuleStores(
 
 fun bootstrapBuildRegionCallSummary(
     declarations: array<BootstrapDeclaration>,
-    bodies: BootstrapBodyCalls
+    bodies: BootstrapBodyCalls,
+    topLevelNames: BootstrapTopLevelNameIndex
 ): BootstrapRegionCallSummary {
     val summary = BootstrapRegionCallSummary(
         [], [], [], bootstrapStringSet(), bootstrapStringSet(),
         bootstrapStringSet(), bootstrapStringSet(),
         bootstrapRegionHeapFields(declarations),
         bootstrapRegionDeclaredMembers(declarations),
-        bootstrapRegionFieldTypes(declarations)
+        bootstrapRegionFieldTypes(declarations),
+        declarations,
+        topLevelNames
     )
     var declarationIndex = 0
     while (declarationIndex < declarations.size) {
@@ -18083,8 +18118,9 @@ fun bootstrapAnalyzer(
     val mutableReceivers = bootstrapBuildMutableReceiverSummary(
         parsed.declarations, affineTypes, bodies
     )
-    val regionCalls = if (regions) bootstrapBuildRegionCallSummary(parsed.declarations, bodies)
-        else bootstrapBuildRegionCallSummary(none, bootstrapCallersOf(none))
+    val topLevelNames = bootstrapTopLevelNameIndex(parsed.declarations)
+    val regionCalls = if (regions) bootstrapBuildRegionCallSummary(parsed.declarations, bodies, topLevelNames)
+        else bootstrapBuildRegionCallSummary(none, bootstrapCallersOf(none), bootstrapTopLevelNameIndex(none))
     val compileEffects = bootstrapBuildCompileEffectSummary(
         if (effects) parsed.declarations else none
     )
@@ -18157,7 +18193,7 @@ fun bootstrapAnalyzer(
         0,
         "unknown",
         typedRequestBegins.size > 0,
-        bootstrapTopLevelNameIndex(parsed.declarations),
+        topLevelNames,
         overloads,
         [],
         "",
