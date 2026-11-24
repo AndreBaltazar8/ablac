@@ -1,8 +1,11 @@
 # Handling expected failures
 
 Represent an expected absence with a nullable result. Check for `null` before
-using the value, or supply a fallback with `??`. Here division by zero is a
-normal failure of our function, so the function returns null before dividing.
+using the value, or supply a fallback with `??`. Here `divide` returns null
+before dividing by zero. In `showAnswer`, `?? return` leaves the function
+when the result is absent. On the next line, `result` has type `int`.
+Inside a loop, use `?? continue` to skip an item or `?? break` to end the loop.
+Use a separate `if` when the missing case needs its own work.
 
 For richer failures, define a result class or interface carrying the value and
 error information. Check each API's contract: some functions return nullable
@@ -23,9 +26,14 @@ fun divide(numerator: int, denominator: int): int? {
     numerator / denominator
 }
 
+fun showAnswer(numerator: int, denominator: int): void {
+    val result = divide(numerator, denominator) ?? return
+    println("answer $result")
+}
+
 fun main {
-    val result = divide(12, 3)
-    if (result != null) println("answer $result")
+    showAnswer(12, 3)
+    showAnswer(12, 0)
     val missing = divide(12, 0)
     println("fallback ${missing ?? -1}")
 }

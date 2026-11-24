@@ -3,7 +3,9 @@
 An `array<T>` grows with `append`, has a `size`, and supports iteration. A
 `Map<K, V>` associates keys with values; `get` returns a nullable value because
 the key might not exist. Explicit type arguments keep an empty map's intended
-key and value types clear.
+key and value types clear. When a missing key means there is nothing more to
+do, bind it with `val count = counts.get(key) ?? return` in a function that
+returns `void`. Use `?? 0` when zero is the right fallback.
 
 The example uses integer values so iteration and map storage copy those values.
 Resources and borrowed views have additional ownership rules; do not assume
