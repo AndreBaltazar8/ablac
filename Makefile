@@ -359,6 +359,7 @@ test-serial: ablac
 	tools/test-thread-globals.sh $(COMPILER)
 	tools/test-compile-global-graph.sh $(COMPILER)
 	tools/test-compile-eval-jit.sh $(COMPILER)
+	tools/test-ct-region-scaling.sh $(COMPILER)
 	tools/test-nested-block-types.sh $(COMPILER)
 	tools/test-compile-eval-units.sh $(COMPILER)
 	tools/test-import-hints.sh $(COMPILER)
