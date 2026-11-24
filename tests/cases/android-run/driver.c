@@ -7,6 +7,10 @@
 //                                                           start (JNI-style), each passing its own number 1..N
 // The driver is linked with --export-dynamic: the library's undefined abla_test_host_hook is this file's.
 // Each call prints "<name> <result>"; the program exits 0 only when every result is the expected one.
+#ifdef TEST_DELAY_KEY
+#define _GNU_SOURCE
+#include <errno.h>
+#endif
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -38,8 +42,26 @@ struct job {
     int64_t result;
 };
 
+#ifdef TEST_DELAY_KEY
+static pthread_barrier_t start_jobs;
+
+// Widen the window between the library claiming initialization and publishing its bionic TLS key.
+int pthread_key_create(pthread_key_t *key, void (*destroy)(void *)) {
+    int (*create)(pthread_key_t *, void (*)(void *)) = dlsym(RTLD_NEXT, "pthread_key_create");
+    if (!create) return ENOSYS;
+    fputs("android test: delayed pthread_key_create\n", stderr);
+    struct timespec delay = { .tv_nsec = 125000000 };
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    return create(key, destroy);
+}
+#endif
+
 static void *run_job(void *argument) {
     struct job *job = argument;
+#ifdef TEST_DELAY_KEY
+    int status = pthread_barrier_wait(&start_jobs);
+    if (status != 0 && status != PTHREAD_BARRIER_SERIAL_THREAD) _Exit(4);
+#endif
     job->result = job->function(job->number);
     return 0;
 }
@@ -89,6 +111,9 @@ int main(int argc, char **argv) {
         int64_t expected = strtoll(argv[5], 0, 10);
         struct job *jobs = calloc(count, sizeof *jobs);
         pthread_t *threads = calloc(count, sizeof *threads);
+#ifdef TEST_DELAY_KEY
+        if (pthread_barrier_init(&start_jobs, 0, count) != 0) return 4;
+#endif
         for (int index = 0; index < count; index++) {
             jobs[index].function = function;
             jobs[index].number = index + 1;
@@ -98,6 +123,9 @@ int main(int argc, char **argv) {
             pthread_join(threads[index], 0);
             if (jobs[index].result != expected) failed = 1;
         }
+#ifdef TEST_DELAY_KEY
+        pthread_barrier_destroy(&start_jobs);
+#endif
         printf("%s x%d %s\n", argv[4], count, failed ? "failed" : "ok");
         return failed;
     }

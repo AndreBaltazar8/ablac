@@ -59,10 +59,11 @@ if [[ -n ${ABLA_AARCH64_RUN:-} ]]; then
         bionic_inputs+=(--input "bionic/$lib")
     done
 fi
-run_android() ( # timeout library arguments...
-    duration=$1
-    image=$2
-    shift 2
+run_android() ( # driver timeout library arguments...
+    driver=$1
+    duration=$2
+    image=$3
+    shift 3
     stress=()
     if [[ -v ABLA_GC_STRESS ]]; then stress=(--env "ABLA_GC_STRESS=$ABLA_GC_STRESS"); fi
     linker=$bionic/system/bin/bootstrap/linker64
@@ -70,17 +71,17 @@ run_android() ( # timeout library arguments...
         cd "$out"
         relative_image=${image#"$root/$out/"}
         aarch64_run --timeout "$duration" "${stress[@]}" "${bionic_inputs[@]}" \
-            --input driver --input "$relative_image" \
+            --input "$driver" --input "$relative_image" \
             --env 'LD_LIBRARY_PATH=/proc/self/cwd/bionic/lib64/bootstrap:/proc/self/cwd/bionic/lib64' \
-            -- "$linker" /proc/self/cwd/driver "/proc/self/cwd/$relative_image" "$@"
+            -- "$linker" "/proc/self/cwd/$driver" "/proc/self/cwd/$relative_image" "$@"
     else
         aarch64_run --timeout "$duration" "${stress[@]}" \
             --env "LD_LIBRARY_PATH=$bionic/system/lib64/bootstrap:$bionic/system/lib64" \
-            -- "$linker" "$PWD/$out/driver" "$image" "$@"
+            -- "$linker" "$PWD/$out/$driver" "$image" "$@"
     fi
 )
 status=0
-run_android 300 "$library" \
+run_android driver 300 "$library" \
     abla_run_random nonzero abla_run_heap 465 abla_run_thread 142 abla_run_threads_heap 1860 abla_run_seed 78 abla_run_nested 77 abla_run_collected 1 > "$out/run.out" 2> "$out/run.err" < /dev/null || status=$?
 if [[ $status -ne 0 ]]; then
     cat "$out/run.out" >&2
@@ -95,7 +96,7 @@ for stress in 0 1; do
     count=8
     [[ $stress -eq 0 ]] || count=4
     status=0
-    ABLA_GC_STRESS=$stress run_android 600 "$library" -t "$count" abla_run_churn 1 \
+    ABLA_GC_STRESS=$stress run_android driver 600 "$library" -t "$count" abla_run_churn 1 \
         > "$out/threads-$stress.out" 2> "$out/threads-$stress.err" < /dev/null || status=$?
     if [[ $status -ne 0 ]]; then
         cat "$out/threads-$stress.out" >&2
@@ -103,6 +104,19 @@ for stress in 0 1; do
         fail "calls from $count foreign threads (GC stress $stress) failed ($status)"
     fi
 done
+# Every worker starts from the barrier as a foreign caller. The interposed key creator pauses
+# while the library's first-use state is in progress, giving the other workers time to observe it.
+"$clang" -DTEST_DELAY_KEY tests/cases/android-run/driver.c -o "$out/driver-delayed-key" -ldl -Wl,--export-dynamic ||
+    fail 'the delayed-key driver did not build'
+status=0
+ABLA_GC_STRESS=0 run_android driver-delayed-key 60 "$library" -t 8 abla_run_churn 1 \
+    > "$out/delayed-key.out" 2> "$out/delayed-key.err" < /dev/null || status=$?
+if [[ $status -ne 0 ]] || ! grep -Fxq 'android test: delayed pthread_key_create' "$out/delayed-key.err" ||
+    ! grep -Fxq 'abla_run_churn x8 ok' "$out/delayed-key.out"; then
+    cat "$out/delayed-key.out" >&2
+    grep -v 'linkerconfig' "$out/delayed-key.err" >&2 || true
+    fail "calls during pthread key creation failed ($status)"
+fi
 # A panic in a debug build: the message, the stack header and the load address on standard error, then the process ends
 # with status 101 (qemu-user has no process_vm_readv, so the frames themselves show on hardware only).
 ABLA_DEBUG=1 "$compiler" build tests/cases/android-run/build-debug.ab -o "$out/build-debug" --fast --no-cache > "$out/build-debug.log" 2>&1 \
@@ -112,7 +126,7 @@ ABLA_DEBUG=1 "$out/build-debug" > "$out/generate-debug.log" 2>&1 || status=$?
 [[ $status -eq 37 ]] || { cat "$out/generate-debug.log" >&2; fail "building the debug library failed ($status)"; }
 debug_library=$PWD/$out/lib-debug/src/main/jniLibs/arm64-v8a/libabla_app.so
 status=0
-run_android 300 "$debug_library" abla_run_panic 0 \
+run_android driver 300 "$debug_library" abla_run_panic 0 \
     > "$out/panic.out" 2> "$out/panic.err" < /dev/null || status=$?
 [[ $status -eq 101 ]] && grep -qx 'panic: index 5 out of bounds for array of size 1' "$out/panic.err" &&
     grep -q '^stack (return addresses' "$out/panic.err" && grep -q '^load address 0x' "$out/panic.err" ||
