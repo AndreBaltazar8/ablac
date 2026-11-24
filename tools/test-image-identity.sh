@@ -12,14 +12,25 @@ compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
-unset ABLA_DEBUG ABLA_TEST_FAST_BUILDS
+unset ABLA_DEBUG
 [[ $(uname -s) == Linux ]] || { echo 'image identity: Linux only (the Mach-O LC_UUID is read by the same code)'; exit 0; }
 out=build/image-identity
 rm -rf "$out"
 mkdir -p "$out"
-"$compiler" build tests/cases/image-identity/main.ab -o "$out/one" --no-cache > "$out/one.log" 2>&1 || { cat "$out/one.log" >&2; echo 'image identity: the program failed to build' >&2; exit 1; }
-"$compiler" build tests/cases/image-identity/main.ab -o "$out/again" --no-cache > "$out/again.log" 2>&1
-"$compiler" build tests/cases/modules/native-function-address.ab -o "$out/other" --no-cache > "$out/other.log" 2>&1 || { cat "$out/other.log" >&2; echo 'image identity: the other program failed to build' >&2; exit 1; }
+build_image() {
+    local name=$1 source=$2 output=$3 status
+    if "$compiler" build "$source" -o "$output" --no-cache > "$out/$name.log" 2>&1; then
+        return 0
+    else
+        status=$?
+        cat "$out/$name.log" >&2
+        printf 'image identity: %s build failed (exit %s)\n' "$name" "$status" >&2
+        return "$status"
+    fi
+}
+build_image one tests/cases/image-identity/main.ab "$out/one"
+build_image again tests/cases/image-identity/main.ab "$out/again"
+build_image other tests/cases/modules/native-function-address.ab "$out/other"
 note=$(readelf -nW "$out/one" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
 [[ -n $note ]] || { echo 'image identity: a program that links LLVM has no GNU build-id' >&2; exit 1; }
 # (1) the program reads that id from its own image
@@ -28,7 +39,7 @@ note=$(readelf -nW "$out/one" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
 # (2) the id follows the bytes: the same program with one more string in it is another image with another id
 mkdir -p "$out/variant"
 sed 's|println(bootstrapRunningImageLinkerId())|println(bootstrapRunningImageLinkerId())\n    println("variant")|' tests/cases/image-identity/main.ab > "$out/variant/main.ab"
-"$compiler" build "$out/variant/main.ab" -o "$out/variant/prog" --no-cache > "$out/variant.log" 2>&1 || { cat "$out/variant.log" >&2; echo 'image identity: the variant failed to build' >&2; exit 1; }
+build_image variant "$out/variant/main.ab" "$out/variant/prog"
 variant=$(readelf -nW "$out/variant/prog" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
 [[ -n $variant && $variant != "$note" ]] || { echo 'image identity: an image that differs by a string has the same build-id' >&2; exit 1; }
 # (3) different programs, different ids; the same program twice, the same one
