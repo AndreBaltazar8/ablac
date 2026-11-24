@@ -28,6 +28,10 @@ compiler diagnostic with source frames (`E_EVAL_OUT_OF_BOUNDS: index 5 out of bo
 are the clock, random bytes and `process.io` (standard input; no process can start: `fork` fails); files, the network and native code are not
 granted. The step limit (`ABLA_EVAL_STEP_LIMIT`, 50 million by default) and the page's `terminate()` watchdog bound a run.
 
+When a browser run reports a denied operation or an unauthorized capability,
+save the source as `main.ab` and run `ablac run main.ab` locally. If it needs
+a compile-time capability, [authorize that capability in the local project](compile-time.md#capabilities-files-environment-processes-network).
+
 `compile()` lowers a program and reports its diagnostics without running it.
 
 Measured on the suite: of the 190 programs of `tests/cases/*/main.ab` that build and run natively, 145 give the same output and exit status under

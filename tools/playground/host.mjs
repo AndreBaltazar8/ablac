@@ -79,7 +79,10 @@ export async function run(module, base, files, { stdin = "" } = {}) {
     all.set("abla.toml", 'compileCapabilities = ["clock", "random", "process.io"]\n');
     const result = await compile(module, base, all, { entry: "eval.ab", stdin: typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin });
     const exit = /^exit=(-?\d+)$/m.exec(result.stderr);
-    const diagnostics = result.stderr.split("\n").filter((line) => !/^(exit=|lowered:|errors=)/.test(line)).join("\n").trim();
+    let diagnostics = result.stderr.split("\n").filter((line) => !/^(exit=|lowered:|errors=)/.test(line)).join("\n").trim();
     const ok = exit !== null && /errors=0 /.test(result.stderr);
+    if (!ok && /^error\[E_SEMANTIC\]: compile\.(?:effect-denied|capability-not-authorized):/m.test(diagnostics)) {
+        diagnostics += "\n\nThe browser playground supports standard input, clocks and random bytes. Run this program locally with ablac run main.ab. If it requests a compile-time capability, authorize it in your local project.";
+    }
     return { status: ok ? Number(exit[1]) : 1, stdout: result.stdout, stderr: result.stderr, diagnostics, ok, memoryBytes: result.memoryBytes };
 }

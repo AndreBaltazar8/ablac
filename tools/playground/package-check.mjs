@@ -46,8 +46,20 @@ try {
     const stdlib = await loadStdlib(`http://127.0.0.1:${server.address().port}/${manifest.stdlib.file}`);
     const module = await WebAssembly.compile(wasm);
     const source = 'import "abla/io"\n\nfun main: int {\n    println("package ok")\n    7\n}\n';
-    const result = await host.run(module, host.createBase(stdlib), new Map([["main.ab", source]]));
+    const base = host.createBase(stdlib);
+    const run = (source, files = []) => host.run(module, base, new Map([["main.ab", source], ...files]));
+    const result = await run(source);
     if (!result.ok || result.stdout !== "package ok\n" || result.status !== 7) fail(`the program ran as ${JSON.stringify({ ok: result.ok, status: result.status, stdout: result.stdout, diagnostics: result.diagnostics.slice(0, 200) })}`);
+    for (const [source, reason] of [
+        ['import "abla/fs"\nfun main(): int = path("notes.txt").readText().size\n', "compile.effect-denied:"],
+        ['import "abla/compiler"\n#compilerGrant("filesystem.read")\nfun main: int = 0\n', "compile.capability-not-authorized:filesystem.read"],
+    ]) {
+        const denied = await run(source);
+        if (denied.ok || denied.status !== 1 || !denied.diagnostics.includes(reason) ||
+            !denied.diagnostics.includes("Run this program locally with ablac run main.ab")) {
+            fail(`missing local-run guidance for ${reason} in ${denied.diagnostics}`);
+        }
+    }
     console.log(`playground package ${manifest.version}: module ${(wasm.length / 1048576).toFixed(2)} MB (${(brotli / 1048576).toFixed(2)} MB brotli), stdlib bundle ${(manifest.stdlib.bytes / 1048576).toFixed(2)} MB; hashes match, the bundle loads over HTTP, a program runs`);
 } finally {
     server.close();
