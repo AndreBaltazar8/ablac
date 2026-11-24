@@ -1087,6 +1087,27 @@ fun bootstrapPackageImportThroughEscapingLink(path: string): bool {
     escapes
 }
 
+// A limit from the environment that can only lower the default (the tests use small ones): a value outside 64 KiB .. the default is the default.
+private fun bootstrapPackageLimit(name: string, ceiling: int): int {
+    val configured = linuxEnvironment(name).value.parseInt() ?? 0
+    if (configured >= 65536 && configured <= ceiling) configured else ceiling
+}
+
+/** The most a package's files may add up to once checked out: 128 MiB, or ABLA_PACKAGE_CHECKOUT_LIMIT_BYTES when that is lower. */
+fun bootstrapPackageCheckoutLimit(): int = bootstrapPackageLimit("ABLA_PACKAGE_CHECKOUT_LIMIT_BYTES", 134217728)
+
+/** The most one file git writes while fetching a dependency may hold (the received pack is one file): 1 GiB, or ABLA_PACKAGE_GIT_MAX_BYTES when that is lower. */
+fun bootstrapPackageFetchLimit(): int = bootstrapPackageLimit("ABLA_PACKAGE_GIT_MAX_BYTES", 1073741824)
+
+/** `command` run by a shell that first stops it from writing a file of more than `bytes`: git then dies on the write instead of filling the disk (the units of
+ *  sh's ulimit -f are 512-byte blocks in POSIX shells). On Windows the command is as it was. */
+fun bootstrapPackageLimitedFiles(command: LinuxCommand, bytes: int): LinuxCommand {
+    val prefix: array<string> = if (linuxHostIsWindows()) [] else ["sh", "-c", "ulimit -f ${bytes / 512} 2>/dev/null; exec \"\$@\"", "sh"]
+    val wrapped = LinuxCommand(prefix, command.overrides, command.workingDirectory, command.inputPath, command.outputPath, command.errorPath, command.removed)
+    for (argument in command.arguments) wrapped.arguments.append(argument)
+    wrapped
+}
+
 class BootstrapPackageTreeVerdict(val code: string, val reason: string)
 
 val BOOTSTRAP_PACKAGE_TREE_MAX_FILES = 50000
@@ -1100,6 +1121,7 @@ val BOOTSTRAP_PACKAGE_TREE_LISTING_KIB = 65536
 // package's checkout holds at most 50,000 files of at most 128 MiB together, regular files and symbolic links only (a submodule would be an empty directory
 // the digest names a commit for), paths of at most 1024 bytes and 64 components with no control character in them.
 fun bootstrapPackageTreeVerdict(repository: string, revision: string, listingPath: string): BootstrapPackageTreeVerdict {
+    val limit = bootstrapPackageCheckoutLimit()
     val git = bootstrapPackageGit()
     git.argument("-C")
     git.argument(repository)
@@ -1109,14 +1131,7 @@ fun bootstrapPackageTreeVerdict(repository: string, revision: string, listingPat
     git.argument("-z")
     git.argument(revision)
     git.output(listingPath)
-    var status = 0
-    if (linuxHostIsWindows()) {
-        status = git.run()
-    } else {
-        val wrapped = LinuxCommand(["sh", "-c", "ulimit -f ${BOOTSTRAP_PACKAGE_TREE_LISTING_KIB}; exec \"\$@\"", "sh"], git.overrides, "", "", listingPath, "", git.removed)
-        for (argument in git.arguments) wrapped.arguments.append(argument)
-        status = wrapped.run()
-    }
+    val status = bootstrapPackageLimitedFiles(git, BOOTSTRAP_PACKAGE_TREE_LISTING_KIB * 512).run()
     if (status != 0) {
         return BootstrapPackageTreeVerdict("E_PACKAGE_SIZE", "has a listing that cannot be read or is larger than 32 MiB")
     }
@@ -1151,12 +1166,12 @@ fun bootstrapPackageTreeVerdict(repository: string, revision: string, listingPat
         val sizeText = if (fields.size > 3) fields[fields.size - 1] else ""
         var size = 0
         var place = 0
-        while (place < sizeText.size && sizeText[place] >= 48 && sizeText[place] <= 57 && size <= 134217728) {
+        while (place < sizeText.size && sizeText[place] >= 48 && sizeText[place] <= 57 && size <= limit) {
             size = size * 10 + sizeText[place] - 48
             place = place + 1
         }
         total = total + size
-        if (total > 134217728) return BootstrapPackageTreeVerdict("E_PACKAGE_SIZE", "holds more than 128 MiB of files")
+        if (total > limit) return BootstrapPackageTreeVerdict("E_PACKAGE_SIZE", "holds more than ${limit / 1048576} MiB of files")
     }
     BootstrapPackageTreeVerdict("", "")
 }
@@ -1206,6 +1221,10 @@ fun bootstrapPackageFetch(
         fetch.argument("$temporary/source")
         fetch.argument("-c")
         fetch.argument("transfer.fsckObjects=true")
+        fetch.argument("-c")
+        fetch.argument("fetch.unpackLimit=1")
+        fetch.argument("-c")
+        fetch.argument("transfer.unpackLimit=1")
         fetch.argument("fetch")
         fetch.argument("--quiet")
         fetch.argument("--depth")
@@ -1215,9 +1234,16 @@ fun bootstrapPackageFetch(
         fetch.argument("origin")
         fetch.argument(revision)
         val seconds = bootstrapPackageGitTimeoutSeconds()
-        val fetched = if (linuxHostIsWindows()) LinuxProcessResult(fetch.run(), "")
-            else bootstrapPackageCaptureGit(fetch, seconds)
-        if (fetched.status != 0) status = 1
+        val limited = bootstrapPackageLimitedFiles(fetch, bootstrapPackageFetchLimit())
+        val fetched = if (linuxHostIsWindows()) LinuxProcessResult(limited.run(), "")
+            else bootstrapPackageCaptureGit(limited, seconds)
+        if (fetched.status != 0) {
+            status = 1
+            // git was stopped by the file limit when what it received (one pack file) reached it.
+            if (!fetched.timedOut && bootstrapPackageDirectorySize(Path("$temporary/source/.git/objects"), bootstrapPackageFetchLimit()) >= bootstrapPackageFetchLimit() - 1024) {
+                diagnostic = "error[E_PACKAGE_SIZE]: dependency '${dependency.name}', revision '$revision': what the fetch received is larger than ${bootstrapPackageFetchLimit() / 1048576} MiB (ABLA_PACKAGE_GIT_MAX_BYTES lowers the limit)\n"
+            }
+        }
         if (fetched.timedOut) diagnostic = bootstrapPackageGitTimeout(dependency, "fetch", seconds)
     }
     if (status == 0) {
@@ -1268,8 +1294,8 @@ fun bootstrapPackageFetch(
         }
     }
     if (status == 0 && bootstrapPackageDirectorySize(
-        Path("$temporary/source"), 134217728
-    ) > 134217728) {
+        Path("$temporary/source"), bootstrapPackageCheckoutLimit()
+    ) > bootstrapPackageCheckoutLimit()) {
         status = 1
         diagnostic =
             "error[E_PACKAGE_SIZE]: dependency '${dependency.name}' at ${dependency.source} exceeds the 128 MiB checkout limit\n"

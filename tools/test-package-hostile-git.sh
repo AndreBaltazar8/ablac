@@ -3,7 +3,7 @@
 #   what the build reads must be the blobs the lock's digest covers (.gitattributes eol, ident, filter, user autocrlf must not change them);
 #   a tree that is too big, too many files, too deep, has a submodule, a name with a control character or is malformed (duplicate or unsorted entries, a
 #   .gitmodules link) is refused before anything is checked out, naming the dependency, and leaves no cache entry and no lock.
-# A file-size limit (ulimit -f) makes a checkout of a 600 MiB blob fail the test if the fetch still writes it.
+# Sizes are small: the limits are lowered with ABLA_PACKAGE_CHECKOUT_LIMIT_BYTES and ABLA_PACKAGE_GIT_MAX_BYTES, and ulimit -f makes a checkout that still happens fail.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -62,6 +62,13 @@ if [ "$status" != 0 ]; then fail "attributes: the fetch failed" "$t/log$n"; else
     if cmp -s "$source/abla.toml" <(g cat-file blob "$manifest"); then :; else fail "attributes: abla.toml as checked out is not the blob"; fi
 fi
 
+# 1b. working-tree-encoding: UTF-8 in the tree, UTF-16 on disk, is the strongest rewrite.
+newrepo
+attr=$(printf '*.ab working-tree-encoding=UTF-16LE\n' | g hash-object -w --stdin)
+commit "$(blobs_tree "100644 blob $attr\t.gitattributes" "100644 blob $manifest\tabla.toml" "100644 blob $lib\tlib.ab")"
+update "$t/log$n"
+if [ "$status" = 0 ] && ! cmp -s "$(cached)/lib.ab" <(g cat-file blob "$lib"); then fail "working-tree-encoding: lib.ab was checked out in another encoding"; fi
+
 # 2. A user's autocrlf alone, with no attributes at all.
 newrepo
 commit "$(blobs_tree "100644 blob $manifest\tabla.toml" "100644 blob $lib\tlib.ab")"
@@ -111,11 +118,18 @@ target=$(printf '/etc/passwd' | g hash-object -w --stdin)
 commit "$(blobs_tree "100644 blob $manifest\tabla.toml" "100644 blob $lib\tlib.ab" "120000 blob $target\t.gitmodules")"
 refused "a symbolic .gitmodules" E_PACKAGE_FETCH
 
-# 8. A blob that is small on the wire and 600 MiB checked out: refused from the tree's sizes, never written (ulimit -f stops a write of more than 400 MB).
+# 8. A blob that is small on the wire and over the checkout limit (here 3 MiB of zeros against a limit lowered to 1 MiB by ABLA_PACKAGE_CHECKOUT_LIMIT_BYTES, so the test stays
+#    small): refused from the tree's sizes, never written (ulimit -f stops a write of more than 2 MiB, so a checkout would fail with another diagnostic).
 newrepo
-big=$(head -c 629145600 /dev/zero | g hash-object -w --stdin)
+big=$(head -c 3145728 /dev/zero | g hash-object -w --stdin)
 commit "$(blobs_tree "100644 blob $manifest\tabla.toml" "100644 blob $lib\tlib.ab" "100644 blob $big\tbig.bin")"
-( ulimit -f 400000; refused "a 600 MiB blob" E_PACKAGE_SIZE )
+( export ABLA_PACKAGE_CHECKOUT_LIMIT_BYTES=1048576; ulimit -f 2048; refused "a 3 MiB blob over a 1 MiB limit" E_PACKAGE_SIZE )
+
+# 8b. What the fetch receives is capped too: 3 MiB that do not compress, against a limit of 1 MiB (ABLA_PACKAGE_GIT_MAX_BYTES), stops git on the write of the pack.
+newrepo
+noise=$(head -c 3145728 /dev/urandom | g hash-object -w --stdin)
+commit "$(blobs_tree "100644 blob $manifest\tabla.toml" "100644 blob $lib\tlib.ab" "100644 blob $noise\tnoise.bin")"
+( export ABLA_PACKAGE_GIT_MAX_BYTES=1048576; refused "a 3 MiB pack over a 1 MiB limit" E_PACKAGE_SIZE )
 
 # 9. The lock's digest is the repository's own tree.
 newrepo
@@ -127,4 +141,4 @@ if [ "$status" != 0 ]; then fail "the plain repository did not fetch" "$t/log$n"
 fi
 
 [ "$failures" = 0 ] || { printf 'package hostile git: %d failure(s)\n' "$failures" >&2; exit 1; }
-echo "package hostile git: attributes and autocrlf leave the blobs as locked; a submodule, control-character names, too many files, too deep, malformed trees and a 600 MiB blob are refused before checkout"
+echo "package hostile git: attributes and autocrlf leave the blobs as locked; a submodule, control-character names, too many files, too deep, malformed trees, a blob over the limit and a pack over the limit are refused before checkout"
