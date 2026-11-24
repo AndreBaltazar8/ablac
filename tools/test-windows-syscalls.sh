@@ -138,13 +138,14 @@ timeout 60 tools/windows/wine-run.sh "$out/preempt.exe" > "$out/preempt.out" 2> 
 # 4294967295, a count of bytes received that made httpAsyncPlainRead copy off the top of its stack on windows-latest.
 # SO_RCVTIMEO is converted from the Linux timeval to Winsock's milliseconds (passed through, 1.5 s waited 1 ms), and a read it
 # ends is EAGAIN. A peer's reset (SO_LINGER 0, close) makes read, readResult and a TLS session's read fail with ECONNRESET, and SO_LINGER is
-# converted between Linux's two ints and Winsock's two words (a linger time above 0 reads back).
+# converted between Linux's two ints and Winsock's two words (a linger time above 0 reads back). A silent peer: a TcpConnection.readResult
+# under its receive timeout waits it out and is EAGAIN with no bytes.
 "$compiler" build tests/cases/windows/socket-failure.ab --target x86_64-windows-hosted -o "$out/socket-failure.exe" --fast \
     --no-cache > "$out/socket-failure.log" 2>&1 || { cat "$out/socket-failure.log" >&2; fail "socket-failure.ab did not build for Windows"; }
 status=0
 timeout 60 tools/windows/wine-run.sh "$out/socket-failure.exe" > "$out/socket-failure.out" 2> "$out/socket-failure.err" || status=$?
 [[ $status == 0 ]] || fail "socket-failure.exe exited $status: $(head -5 "$out/socket-failure.out" "$out/socket-failure.err")"
-expected=$'recvfrom dontwait -11\ntimeout set 0\ntimeout read 0: 1 s 500000 us\nread until the timeout -11, waited at least 1.4 s true\nnonblocking 0\nread -11\nrecvfrom -11\nsend 1\nread after send 1\nread at the end 0\nsend after shutdown negative true\nlinger 7 s set 0\nlinger read 0: on 1 for 7 s\nlinger set 0\nread after a reset -104\nlinger set 0\nreadResult after a reset error 104 0\nlinger set 0\nTLS read after a reset -1 0'
+expected=$'recvfrom dontwait -11\ntimeout set 0\ntimeout read 0: 1 s 500000 us\nread until the timeout -11, waited at least 1.4 s true\nnonblocking 0\nread -11\nrecvfrom -11\nsend 1\nread after send 1\nread at the end 0\nsend after shutdown negative true\nlinger 7 s set 0\nlinger read 0: on 1 for 7 s\nlinger set 0\nread after a reset -104\nlinger set 0\nreadResult after a reset error 104 0\nlinger set 0\nTLS read after a reset -1 0\ntimeouts set true\nreadResult from a silent peer error 11 0, waited at least 0.4 s true'
 [[ "$(cat "$out/socket-failure.out")" == "$expected" ]] || fail "socket-failure.exe printed: $(cat "$out/socket-failure.out" "$out/socket-failure.err")"
 # What a child inherits (inherit.ab): an inheritable pipe end of the parent is not in the child, which has the three streams only.
 "$compiler" build tests/cases/windows/inherit.ab --target x86_64-windows-hosted -o "$out/inherit.exe" --fast --no-cache \
