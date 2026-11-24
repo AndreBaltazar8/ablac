@@ -10,9 +10,10 @@ import (
 )
 
 type gen struct {
-	r    *rand.Rand
-	tags map[string]bool
-	nl   string
+	r     *rand.Rand
+	tags  map[string]bool
+	nl    string
+	plain bool // only the forms the compiler's grammar admits: a positive control, readers and TOML should agree on every value
 }
 
 var values = []string{"lib", "a b", "x#y", "q\"r", "back\\slash", "é€😀", "tab\there", "key = \"inj\"", "[table]", "rev = \"abc\"", "", "main.ab", "../up", "a'b", "\u007f", "x=y", "p,q", "name"}
@@ -47,6 +48,12 @@ func basic(s string) string {
 
 // A string value in one of TOML's four string forms (or an invalid one), as the text after `key =`.
 func (g *gen) str(v string) string {
+	if g.plain {
+		if strings.ContainsAny(v, "\"\\\n\r\t\x7f") {
+			v = "x"
+		}
+		return `"` + v + `"`
+	}
 	switch g.r.Intn(12) {
 	case 0:
 		if !strings.ContainsAny(v, "'\n\r") && !strings.ContainsRune(v, 0x7f) {
@@ -85,6 +92,9 @@ func (g *gen) str(v string) string {
 
 // A key in one of its spellings.
 func (g *gen) key(k string) string {
+	if g.plain {
+		return k
+	}
 	switch g.r.Intn(14) {
 	case 0:
 		g.tag("quoted-key")
@@ -103,6 +113,9 @@ func (g *gen) key(k string) string {
 }
 
 func (g *gen) assign(k, value string) string {
+	if g.plain {
+		return k + " = " + value
+	}
 	switch g.r.Intn(8) {
 	case 0:
 		return g.key(k) + "=" + value
@@ -120,6 +133,9 @@ func (g *gen) array(items []string) string {
 	var parts []string
 	for _, it := range items {
 		parts = append(parts, g.str(it))
+	}
+	if g.plain {
+		return "[" + strings.Join(parts, ", ") + "]"
 	}
 	switch g.r.Intn(6) {
 	case 0:
@@ -140,8 +156,6 @@ func (g *gen) array(items []string) string {
 	}
 	return "[" + strings.Join(parts, ", ") + "]"
 }
-
-func (g *gen) scalarValue(k string) string { return g.str(g.pick(values)) }
 
 var stringKeys = []string{"name", "entry", "visibility", "version"}
 var arrayKeys = []string{"compileCapabilities", "wasmHostImports", "nativeLibraries"}
@@ -323,6 +337,10 @@ func (g *gen) grantsTable() string {
 
 func (g *gen) manifest() string {
 	g.nl = "\n"
+	if g.plain {
+		g.tag("plain")
+		return g.plainManifest()
+	}
 	switch g.r.Intn(12) {
 	case 0:
 		g.nl = "\r\n"
@@ -385,6 +403,10 @@ var lockPools = map[string][]string{
 
 func (g *gen) lock() string {
 	g.nl = "\n"
+	if g.plain {
+		g.tag("plain")
+		return g.plainLock()
+	}
 	if g.chance(10) {
 		g.nl = "\r\n"
 		g.tag("lock-crlf")
@@ -441,4 +463,96 @@ func (g *gen) lock() string {
 		parts = append(parts, "[package]"+g.nl+"name = "+basic("x"))
 	}
 	return strings.Join(parts, g.nl+g.nl) + g.nl
+}
+
+// plainManifest: a manifest made only of the forms the compiler's grammar admits (src/manifest_grammar.ab): the readers and TOML must agree on every value of it.
+func (g *gen) plainManifest() string {
+	g.nl = "\n"
+	if g.chance(20) {
+		g.nl = "\r\n"
+	}
+	simple := []string{"lib", "a b", "x#y", "main.ab", "../up", "a'b", "x=y", "p,q", "name", "src/x.ab", "é€"}
+	var lines []string
+	if g.chance(30) {
+		lines = append(lines, "# a comment with = and \"quotes\"")
+	}
+	table := ""
+	if g.chance(15) {
+		table = g.pick([]string{"project", "package"})
+		lines = append(lines, "["+table+"]")
+	}
+	for _, k := range stringKeys {
+		if g.chance(60) {
+			lines = append(lines, k+" = "+`"`+g.pick(simple)+`"`)
+		}
+	}
+	for _, k := range arrayKeys {
+		if g.chance(50) {
+			var items []string
+			for n := g.r.Intn(4); n >= 0; n-- {
+				items = append(items, `"`+g.pick(capabilityNames)+`"`)
+			}
+			if g.chance(30) {
+				lines = append(lines, k+" = [", "  "+strings.Join(items, ","+g.nl+"  ")+", # last", "]")
+			} else {
+				lines = append(lines, k+" = ["+strings.Join(items, ", ")+"]")
+			}
+		}
+	}
+	if table != "" {
+		table = ""
+	}
+	if g.chance(50) {
+		lines = append(lines, "", "[dependencies]")
+		used := map[string]bool{}
+		for n := g.r.Intn(3); n >= 0; n-- {
+			name := g.pick([]string{"alpha", "beta", "gamma", "d-e", "foo_bar"})
+			if used[name] {
+				continue
+			}
+			used[name] = true
+			selector := g.pick([]string{"rev", "tag", "branch"})
+			lines = append(lines, name+" = { git = \""+g.pick([]string{"https://example.test/a.git", "ssh://h/p", "../local"})+"\", "+selector+" = \""+g.pick([]string{"0123456789abcdef0123456789abcdef01234567", "v1.2", "main"})+"\" }")
+		}
+	}
+	for _, t := range []string{"exports", "imports"} {
+		if g.chance(30) {
+			lines = append(lines, "", "["+t+"]")
+			used := map[string]bool{}
+			for n := g.r.Intn(3); n >= 0; n-- {
+				k := g.pick([]string{"util", "text/json", "a.b", "x", "e é", "../../src/i2c/device.ab"})
+				if used[k] {
+					continue
+				}
+				used[k] = true
+				lines = append(lines, `"`+k+`" = "`+g.pick([]string{"util/entry.ab", "x.ab", "b.ab"})+`"`)
+			}
+		}
+	}
+	if g.chance(30) {
+		lines = append(lines, "", "[dependencyCompileCapabilities]")
+		used := map[string]bool{}
+		for n := g.r.Intn(3); n >= 0; n-- {
+			name := g.pick([]string{"alpha", "beta", "gamma"})
+			if used[name] {
+				continue
+			}
+			used[name] = true
+			lines = append(lines, name+" = [\""+g.pick(capabilityNames)+"\", \""+g.pick(capabilityNames)+"\"]")
+		}
+	}
+	return strings.Join(lines, g.nl) + g.nl
+}
+
+func (g *gen) plainLock() string {
+	g.nl = "\n"
+	fields := []string{"name", "provider", "identity", "source", "selector-kind", "selector", "revision", "digest", "entry"}
+	lines := []string{"version = 2"}
+	for n := 1 + g.r.Intn(3); n > 0; n-- {
+		lines = append(lines, "", "[[package]]")
+		for _, f := range fields {
+			lines = append(lines, f+` = "`+g.pick(lockPools[f])+`"`)
+		}
+	}
+	return strings.Join(lines, g.nl) + g.nl
 }

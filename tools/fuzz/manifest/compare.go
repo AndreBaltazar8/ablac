@@ -18,9 +18,12 @@ func compare(manifest, lock string, res *caseResult) (findings []finding, validM
 	if err == nil {
 		validManifest = 1
 		for _, k := range []string{"name", "entry", "visibility", "version"} {
-			truth, _ := asString(root[k])
+			truth, _ := asString(known(root, k))
 			got := res.str[k]
 			if got == truth {
+				if got != "" {
+					add("string:"+k, "agree", "")
+				}
 				continue
 			}
 			class := "different"
@@ -29,15 +32,18 @@ func compare(manifest, lock string, res *caseResult) (findings []finding, validM
 			} else if got == "" {
 				class = "missed"
 			}
-			add("string:"+k, class, fmt.Sprintf("reader %q, TOML %q (%T)", got, truth, root[k]))
+			add("string:"+k, class, fmt.Sprintf("reader %q, TOML %q (%T)", got, truth, known(root, k)))
 		}
 		for _, k := range []string{"compileCapabilities", "wasmHostImports", "nativeLibraries"} {
-			truth, ok := asStrings(root[k])
+			truth, ok := asStrings(known(root, k))
 			if !ok {
 				truth = nil
 			}
 			got := res.arr[k]
 			if equalStrings(got, truth) {
+				if len(got) > 0 {
+					add("array:"+k, "agree", "")
+				}
 				continue
 			}
 			class := "different"
@@ -83,6 +89,8 @@ func compare(manifest, lock string, res *caseResult) (findings []finding, validM
 			}
 			if !good {
 				add("dependencies", "ghost", fmt.Sprintf("reader accepts %q git=%q %s=%q; TOML has %v", name, git, kind, sel, deps[name]))
+			} else {
+				add("dependencies", "agree", "")
 			}
 		}
 		for _, pair := range []struct {
@@ -93,6 +101,8 @@ func compare(manifest, lock string, res *caseResult) (findings []finding, validM
 			for _, e := range pair.items {
 				if v, ok := asString(truth[e[0]]); !ok || v != e[1] {
 					add(pair.table, "ghost", fmt.Sprintf("reader has %q = %q; TOML has %v", e[0], e[1], truth[e[0]]))
+				} else {
+					add(pair.table, "agree", "")
 				}
 			}
 		}
@@ -103,6 +113,8 @@ func compare(manifest, lock string, res *caseResult) (findings []finding, validM
 			}
 			if v, ok := asString(imports[e[0]]); !ok || v != e[1] {
 				add("imports", "ghost", fmt.Sprintf("reader has %q = %q; TOML has %v", e[0], e[1], imports[e[0]]))
+			} else {
+				add("imports", "agree", "")
 			}
 		}
 		grants, _ := root["dependencyCompileCapabilities"].(map[string]any)
@@ -115,6 +127,8 @@ func compare(manifest, lock string, res *caseResult) (findings []finding, validM
 			joined := strings.Join(truth, ",")
 			if !ok || len(parts) < 2 || joined != parts[1] {
 				add("dependencyCompileCapabilities", "ghost", fmt.Sprintf("reader has %q; TOML has %v", g1, grants[parts[0]]))
+			} else {
+				add("dependencyCompileCapabilities", "agree", "")
 			}
 		}
 	} else {
@@ -151,6 +165,7 @@ func compare(manifest, lock string, res *caseResult) (findings []finding, validM
 					for f, field := range fieldsOf {
 						truth, _ := asString(records[r2][field])
 						if rec[f] == truth {
+							add("lock:"+field, "agree", "")
 							continue
 						}
 						class := "different"
@@ -168,4 +183,19 @@ func compare(manifest, lock string, res *caseResult) (findings []finding, validM
 		add("lock-not-toml", "taken", lerr.Error())
 	}
 	return
+}
+
+// known: a key the readers look for, from the top of the file, or [project] or [package] (the places the compiler's grammar admits it).
+func known(root map[string]any, key string) any {
+	if v, ok := root[key]; ok {
+		return v
+	}
+	for _, table := range []string{"project", "package"} {
+		if t, ok := root[table].(map[string]any); ok {
+			if v, ok := t[key]; ok {
+				return v
+			}
+		}
+	}
+	return nil
 }

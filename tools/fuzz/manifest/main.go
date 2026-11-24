@@ -166,6 +166,7 @@ func main() {
 	cases := make([]meta, *count)
 	for i := 0; i < *count; i++ {
 		g := &gen{r: rand.New(rand.NewSource(*seed*1000003 + int64(i))), tags: map[string]bool{}}
+		g.plain = g.r.Intn(100) < 35
 		manifest := g.manifest()
 		mtags := tagList(g.tags)
 		g.tags = map[string]bool{}
@@ -215,7 +216,25 @@ func main() {
 			findings = append(findings, f)
 		}
 	}
+	agreed := map[string]int{}
+	var differences []finding
+	for _, f := range findings {
+		if f.class == "agree" {
+			agreed[f.reader]++
+		} else {
+			differences = append(differences, f)
+		}
+	}
+	findings = differences
 	fmt.Printf("manifestdiff: %d cases (%d manifests and %d locks are valid TOML), %d differences\n", *count, validManifest, validLock, len(findings))
+	var agreedKeys []string
+	for k := range agreed {
+		agreedKeys = append(agreedKeys, k)
+	}
+	sort.Strings(agreedKeys)
+	for _, k := range agreedKeys {
+		fmt.Printf("agree %s: %d cases\n", k, agreed[k])
+	}
 	type key struct{ reader, class string }
 	groups := map[key][]finding{}
 	for _, f := range findings {
