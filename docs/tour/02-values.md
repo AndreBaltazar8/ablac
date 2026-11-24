@@ -9,6 +9,9 @@ holds `true` or `false`. String templates embed `$name` or `${expression}`.
 null. A `val` binding does not by itself freeze the object it refers to; the
 ownership chapter explains mutation and borrowing.
 
+Use `count += 1` to write `count = count + 1` and `count -= 1` to write
+`count = count - 1` when updating a mutable local.
+
 See [types](../language.md#types) and the [text API](../stdlib/text.md).
 
 [Runnable source](../../tests/cases/tour/02-values.ab):

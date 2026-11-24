@@ -12,6 +12,11 @@ Resources and borrowed views have additional ownership rules; do not assume
 that copying an integer and transferring a resource are the same operation.
 If an array can be empty, use the [checked first-element idiom](../stdlib/arrays.md#read-the-first-element-when-present).
 
+Use `for (n in numbers)` to read the values directly. When you also need the
+position, iterate over `0 until numbers.size` and bind `numbers[i]` inside
+the loop. The range stops before `numbers.size`, so the last index is one less
+than the size.
+
 See [arrays](../language.md#arrays), [maps](../language.md#maps), and
 [array operations](../stdlib/arrays.md).
 
@@ -29,10 +34,17 @@ fun main {
     counts.set("sum", sum)
     println("${numbers.size} items, sum ${counts.get("sum") ?? 0}")
     println("absent ${counts.get("absent") ?? -1}")
+    for (i in 0 until numbers.size) {
+        val n = numbers[i]
+        println("[$i] $n")
+    }
 }
 // output:
 // 3 items, sum 10
 // absent -1
+// [0] 2
+// [1] 3
+// [2] 5
 ```
 
 [Previous](06-errors.md) · [Tour](README.md) · [Next](08-compile-time.md)
