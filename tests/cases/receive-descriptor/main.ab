@@ -1,0 +1,73 @@
+// linuxTcpReceiveDescriptor: one read from a descriptor with its status (count, 0 at EOF, negative errno), the bounds on the capacity,
+// and the descriptor left open. On loopback.
+import "abla/io"
+import "abla/net"
+import "abla/text"
+
+fun main: int {
+    var failed = 0
+    val listener = tcpListen(0)
+    val client = tcpConnect(ipv4Loopback(listener.localPort()), 5000)
+    val server = listener.accept()
+    if (client.descriptor < 0 || server.descriptor < 0) {
+        println("no loopback connection")
+        return 1
+    }
+    val result = SocketReceiveResult("", 0)
+    // A capacity outside 1..1048576 reads nothing and reports EINVAL; the pending bytes stay.
+    client.write("hello")
+    for (capacity in [0, -4, 1048577, 2000000]) {
+        linuxTcpReceiveDescriptor(server.descriptor, capacity, result)
+        if (result.status != -22 || result.text != "") {
+            println("capacity $capacity: status ${result.status} text [${result.text}]")
+            failed = failed + 1
+        }
+    }
+    linuxTcpReceiveDescriptor(server.descriptor, 3, result)
+    if (result.status != 3 || result.text != "hel") {
+        println("capacity 3: status ${result.status} text [${result.text}]")
+        failed = failed + 1
+    }
+    linuxTcpReceiveDescriptor(server.descriptor, 1048576, result)
+    if (result.status != 2 || result.text != "lo") {
+        println("rest: status ${result.status} text [${result.text}]")
+        failed = failed + 1
+    }
+    // More than 64 KiB pending comes in pieces of at most 65536.
+    val big = "x".repeat(200000)
+    var sent = 0
+    while (sent < big.size) sent = sent + client.write(big.slice(sent, big.size))
+    linuxTcpReceiveDescriptor(server.descriptor, 1048576, result)
+    if (result.status < 1 || result.status > 65536 || result.text.size != result.status) {
+        println("large: status ${result.status} size ${result.text.size}")
+        failed = failed + 1
+    }
+    // The descriptor stays open after a read and a refusal.
+    if (server.descriptor < 0) failed = failed + 1
+    var received = result.status
+    while (received < big.size) {
+        linuxTcpReceiveDescriptor(server.descriptor, 1048576, result)
+        if (result.status <= 0) break
+        received = received + result.status
+    }
+    if (received != big.size) {
+        println("received $received of ${big.size}")
+        failed = failed + 1
+    }
+    // EOF: the peer closes, the read reports zero and an empty text.
+    client.close()
+    linuxTcpReceiveDescriptor(server.descriptor, 1024, result)
+    if (result.status != 0 || result.text != "") {
+        println("eof: status ${result.status} text [${result.text}]")
+        failed = failed + 1
+    }
+    // A closed descriptor is a negative errno.
+    server.close()
+    linuxTcpReceiveDescriptor(server.descriptor, 1024, result)
+    if (result.status >= 0) {
+        println("closed: status ${result.status}")
+        failed = failed + 1
+    }
+    if (failed == 0) println("receive-descriptor: ok")
+    failed
+}
