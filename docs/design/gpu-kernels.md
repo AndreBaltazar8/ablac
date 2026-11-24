@@ -29,12 +29,12 @@ all behind one interface. Model code never names a backend.
 | Tensor cores reachable from CUDA in our LLVM | the intrinsic names in libLLVM.so.23.1 | `llvm.nvvm.mma.m16n8k16` f16/bf16 and `m16n8k32 ... e4m3` (sm_89 FP8) are present, as are Blackwell's block-scaled `mxf8f6f4` e2m1 forms |
 | NVFP4 decode in hardware on the 4090 | the PTX conversions in LLVM (`cvt ... e2m1x2`) | only on sm_100a/sm_120a, not Ada: on the 4090 the decode is arithmetic (as in the prototype) |
 | Vulkan cooperative matrix on the 4090 | `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` | `VK_KHR_cooperative_matrix`: f16×f16→f16/f32, bf16×bf16→f32, s8/u8→s32/u32 tiles (16×16×16, 16×8×16, 16×16×32 ...). No FP8. The Intel iGPU in this machine reports 8×8×16 and 8×8×32 tiles |
-| SPIR-V cooperative matrix in our LLVM | the extension list of the SPIR-V backend | `SPV_KHR_cooperative_matrix` and `SPV_KHR_bfloat16` are known. Not tried through the Vulkan (logical) path |
+| SPIR-V cooperative matrix in our LLVM | a 16×16×16 f16→f32 `__spirv_CooperativeMatrix{Load,MulAdd,Store}KHR` module (`--spirv-ext=+SPV_KHR_cooperative_matrix`) under both triples | lowered to `OpCooperativeMatrix*KHR` for OpenCL (`spirv64-unknown-unknown`). For Vulkan (`spirv1.6-unknown-vulkan1.3-compute`) the types are emitted but the calls stay function calls, and spirv-val rejects the module (`Linkage`). LLVM 23 has no Vulkan path for tiles |
 | abla-graphics can run our SPIR-V | read its source | it has the Vulkan compute driver (`computePipelineNative`, `dispatch`), but the public layer takes GLSL only, the entry point is fixed to `main`, and it waits with `vkQueueWaitIdle` |
 | ablac today | read its source | runs `opt`/`llc` as separate processes for cross targets (`bootstrapExternalEmitObjectForTargetWithTools`); SPIRV is deliberately left out of the static compiler's LLVM; no f16/bf16; never emits an address space other than 0 |
 
-Not checked (no hardware or not tried): anything on Metal (no Mac here; the CI Macs could), SPIR-V cooperative matrix
-through LLVM's Vulkan path, barriers on the CPU, performance tuning beyond the two NVFP4 mappings.
+Not checked (no hardware or not tried): anything on Metal (no Mac here; the CI Macs could), barriers on the CPU,
+performance tuning beyond the two NVFP4 mappings.
 
 ## Prototype results (4090, driver 580.95)
 
@@ -205,9 +205,11 @@ a decode to e4m3, and native FP4 MMA on Blackwell. Exposing tiles is a later ste
 
 **Vulkan (SPIR-V), second.** Verified for vadd. It needs the typed-buffer lowering (handles in place of pointers),
 push-constant parameters, and abla-graphics' public SPIR-V path. Tensor cores go through `VK_KHR_cooperative_matrix`:
-present on the 4090 (f16, bf16, int8 tiles; no FP8) and on the Intel iGPU. `SPV_KHR_cooperative_matrix` is in LLVM's
-SPIR-V extension list, but I have not tried it through the Vulkan path. That is the first thing to check before
-promising tiles on Vulkan.
+present on the 4090 (f16, bf16, int8 tiles; no FP8) and on the Intel iGPU. LLVM 23 lowers the cooperative-matrix
+builtins only for OpenCL SPIR-V, not for Vulkan shaders (checked above). Tiles on Vulkan therefore need one of two
+things: a patch to our LLVM (we already carry patches) that enables the builtin lowering in the shader path, or ablac
+writing those five instructions into the SPIR-V itself after llc. Either is bounded, but neither comes for free.
+Scalar and subgroup kernels on Vulkan are unaffected.
 
 **Metal, third.** LLVM cannot emit Apple's AIR, so there are two routes:
 
