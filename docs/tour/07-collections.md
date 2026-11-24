@@ -10,6 +10,7 @@ returns `void`. Use `?? 0` when zero is the right fallback.
 The example uses integer values so iteration and map storage copy those values.
 Resources and borrowed views have additional ownership rules; do not assume
 that copying an integer and transferring a resource are the same operation.
+If an array can be empty, use the [checked first-element idiom](../stdlib/arrays.md#read-the-first-element-when-present).
 
 See [arrays](../language.md#arrays), [maps](../language.md#maps), and
 [array operations](../stdlib/arrays.md).

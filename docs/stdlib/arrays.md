@@ -29,6 +29,27 @@ val middle = values.takeAt(1) // 20; values now contains [10, 30]
 val last = values.removeLast() // 30; values now contains [10]
 ```
 
+## Read the first element when present
+
+Check `size` before indexing when an empty array is expected. For an array of
+non-nullable, copyable values, return null for the empty case and let each
+caller choose a fallback with `??`.
+
+```abla
+import "abla/io"
+
+fun firstOrNull(values: array<string>): string? =
+    if (values.size == 0) null else values[0]
+
+fun main {
+    println(firstOrNull(["draft", "sent"]) ?? "none")
+    println(firstOrNull([]) ?? "none")
+}
+// output:
+// draft
+// none
+```
+
 ## Sorting
 
 `import "abla/array"` also gives a stable merge sort, O(n log n), that returns a new array and leaves the receiver
