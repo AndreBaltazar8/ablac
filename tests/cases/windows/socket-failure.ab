@@ -5,12 +5,29 @@
 // made httpAsyncPlainRead copy 4 GiB from its 64 KiB stack buffer, off the top of the stack (CI run 45374103451).
 // SO_RCVTIMEO is a Linux timeval (1.5 s here), which Winsock takes as a DWORD of milliseconds: passed through, it read the
 // seconds as milliseconds and waited 1 ms; a read it ends is EAGAIN, as on Linux, not ETIMEDOUT.
+// A peer that resets the connection (SO_LINGER on with 0 seconds, then close: an RST) makes every kind of read fail with a negative
+// error, ECONNRESET (-104): read(2), TcpConnection.readResult and a TLS session's read, never a count (the stdlib readers also refuse
+// a count above their buffer: tests/cases/modules/read-count-guard.ab). SO_LINGER is two ints on Linux and two 16-bit words on Winsock:
+// the runtime converts it, so a linger time above 0 comes back as set.
 import "abla/io"
 import "abla/net"
+import "abla/tls/pure"
 import "abla/sys/linux"
 import "abla/sys/linux/process"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
+
+// A connected pair on loopback whose server end resets the connection: its close is an RST. The client end is returned.
+trusted fun resetClient(listener: TcpListener): TcpConnection {
+    val client = tcpConnectIpv4("127.0.0.1", listener.localPort(), 2000)
+    val server = listener.accept()
+    val linger = nativeByteBuffer(16)
+    ablaUnsafeStoreI64(linger.address, 1)
+    println("linger set ${linuxSyscall5(54, server.descriptor, 1, 13, nativePointerAddress(linger.address), 8)}")
+    server.close()
+    linger.close()
+    client
+}
 
 trusted fun main {
     val listener = tcpListenAddress(ipv4Loopback(0))
@@ -60,9 +77,41 @@ trusted fun main {
     }
     println("read at the end $count")
     // A send on the socket after shutting down its sending side fails, negative.
-    val refused = linuxSyscall6(44, server.descriptor, address, 1, 0, 0, 0)
+    val refused = linuxSyscall6(44, server.descriptor, address, 1, 16384, 0, 0)
     println("send after shutdown negative ${refused < 0}")
     buffer.close()
     client.close()
     server.close()
+    // A SO_LINGER with seconds above 0 reads back as set (two 32-bit ints on Linux, two 16-bit words on Winsock).
+    val lingered = tcpConnectIpv4("127.0.0.1", listener.localPort(), 2000)
+    val accepted = listener.accept()
+    val option = nativeByteBuffer(24)
+    val optionAddress = nativePointerAddress(option.address)
+    ablaUnsafeStoreI64(option.address, 1 + 7 * 4294967296)
+    println("linger 7 s set ${linuxSyscall5(54, lingered.descriptor, 1, 13, optionAddress, 8)}")
+    ablaUnsafeStoreI64(option.address, 0)
+    ablaUnsafeStoreI64(nativePointerFromAddress(optionAddress + 16), 8)
+    val lingerRead = linuxSyscall5(55, lingered.descriptor, 1, 13, optionAddress, optionAddress + 16)
+    val lingerWord = ablaUnsafeLoadI64(option.address)
+    println("linger read $lingerRead: on ${lingerWord % 4294967296} for ${lingerWord / 4294967296} s")
+    option.close()
+    lingered.close()
+    accepted.close()
+    // Resets: each kind of read fails with a negative error.
+    val resetRead = resetClient(listener)
+    val resetBuffer = nativeByteBuffer(64)
+    println("read after a reset ${linuxSyscall3(0, resetRead.descriptor, nativePointerAddress(resetBuffer.address), 64)}")
+    resetBuffer.close()
+    resetRead.close()
+    val resetResult = resetClient(listener)
+    val result = resetResult.readResult(64)
+    println("readResult after a reset ${result.status} ${result.errorCode} ${result.bytes.size}")
+    resetResult.close()
+    val resetTls = resetClient(listener)
+    val session = tlsSessionClient(resetTls.descriptor, "localhost", TLS_VERIFY_NONE)
+    val io = session.readReady(16384)
+    println("TLS read after a reset ${io.status} ${io.bytes.size}")
+    session.close()
+    resetTls.close()
+    listener.close()
 }
