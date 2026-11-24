@@ -19,7 +19,9 @@ import "backend/llvm/coverage.ab"
 import "ct_eval.ab"
 import "ct_reproducible.ab"
 import "backend/llvm/backend.ab"
+import "abla/llvm/aot"
 import "abla/llvm/orc"
+import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 import "parser.ab"
 import "sema.ab"
@@ -1308,6 +1310,25 @@ fun bootstrapCtHasWideAddBlock(program: BootstrapIrProgram): bool {
     false
 }
 
+// A wide dispatch can leave thousands of incoming values for the machine
+// register coalescer. Check branch counts before emitting LLVM. LLVM will
+// turn only eligible switches into lookups after the ordinary IR passes.
+fun bootstrapCtHasWideDispatch(program: BootstrapIrProgram): bool {
+    val limit = 1024
+    for (function in program.functions) {
+        if (function.instructions.size >= limit) {
+            var branches = 0
+            for (instruction in function.instructions) {
+                if (instruction.opcode == "branch") {
+                    branches += 1
+                    if (branches >= limit) return true
+                }
+            }
+        }
+    }
+    false
+}
+
 /** The IR pipeline of a lowered compile-time slice. Compile-time code that works hard (a loop over bytes: tests/cases/modules/
  *  json-ascii-spans) runs several times faster optimized, and a small slice (the usual one: 450 functions, 1 s of code generation)
  *  pays about 15% for it: that program's `#` build took 122 s with the fast pipeline and 21 s with this one. A large slice
@@ -1320,6 +1341,41 @@ fun bootstrapCtSlicePasses(program: BootstrapIrProgram): string {
             program.functions.size <= BOOTSTRAP_CT_BALANCED_SLICE_FUNCTIONS) llvmPassesBalanced()
         else llvmPassesFast()
     if (bootstrapCtHasWideAddBlock(program)) "$passes,function(reassociate,instcombine)" else passes
+}
+
+// SimplifyCFG needs target information to decide whether it can use lookup
+// tables. The normal JIT pipeline runs without a machine. Supply one only
+// for this cleanup, using the slice's triple even for a foreign dump.
+fun bootstrapCtOptimizeWideDispatch(module: i64*, options: i64*): int {
+    val nullPointer = nativeNullPointer()
+    val triple = LLVMNormalizeTargetTriple(bootstrapCtSliceTriple())
+    val target = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    var status = 0
+    if (!pointerIsNull(triple) && LLVMGetTargetFromTriple(triple, target.address, message.address) == 0) {
+        val machine = LLVMCreateTargetMachine(target.load(), triple, "", "", 2, 2, 0)
+        if (!pointerIsNull(machine)) {
+            status = llvmConsumeError(
+                LLVMRunPasses(module, "function(simplifycfg<switch-to-lookup>)", machine, options), 129
+            )
+            LLVMDisposeTargetMachine(machine)
+        }
+    }
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    if (!pointerIsNull(triple)) LLVMDisposeMessage(triple)
+    message.close()
+    target.close()
+    status
+}
+
+fun bootstrapCtOptimizeSlice(module: i64*, program: BootstrapIrProgram): int {
+    val options = LLVMCreatePassBuilderOptions()
+    var status = llvmConsumeError(
+        LLVMRunPasses(module, bootstrapCtSlicePasses(program), nativeNullPointer(), options), 129
+    )
+    if (status == 0 && bootstrapCtHasWideDispatch(program)) status = bootstrapCtOptimizeWideDispatch(module, options)
+    LLVMDisposePassBuilderOptions(options)
+    status
 }
 
 fun bootstrapCtSplice(
@@ -2783,10 +2839,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     if (bootstrapCtSliceForeign()) {
         bootstrapCtFailReady("the slice is for ${bootstrapCtSliceTriple()} (ABLA_CT_HOST_TRIPLE): written, not run")
         if (dump.found && dump.value != "") {
-            val options = LLVMCreatePassBuilderOptions()
-            val optimized = llvmConsumeError(LLVMRunPasses(module, bootstrapCtSlicePasses(program), nativeNullPointer(),
-                options), 129) == 0
-            LLVMDisposePassBuilderOptions(options)
+            val optimized = bootstrapCtOptimizeSlice(module, program) == 0
             if (optimized) {
                 val written = LlvmOwnedModule(context, module, 0, false)
                 val _optimizedText = written.writeText("${dump.value}/generation-$generation.optimized.ll")
@@ -2803,8 +2856,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     // symbols as the interpreter's calls find them (ct_native.ab). Else a site calling one failed the
     // generation: "Symbols not found".
     val _libraries = bootstrapCtNativeLibraries(parsed)
-    val added = bootstrapCtAddGeneration(context, module, bootstrapCtSlicePasses(program), generation,
-        program)
+    val added = bootstrapCtAddGeneration(context, module, generation, program)
     if (added.status != 0) {
         bootstrapCtFailReady("ORC rejected the slice (status ${added.status})")
         return
@@ -2893,7 +2945,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
 // 1.4 s. An ordinary build's minimum (150k) would leave the middle on one thread.
 val BOOTSTRAP_CT_UNITS_MINIMUM = 60000
 
-fun bootstrapCtAddGeneration(context: i64*, module: i64*, passes: string, generation: int,
+fun bootstrapCtAddGeneration(context: i64*, module: i64*, generation: int,
     program: BootstrapIrProgram): LlvmOrcGeneration {
     val configured = linuxEnvironment("ABLA_COMPILE_EVAL_UNITS")
     val wanted = !(configured.found && configured.value == "0")
@@ -2903,12 +2955,7 @@ fun bootstrapCtAddGeneration(context: i64*, module: i64*, passes: string, genera
         !bootstrapCodegenThreadLocalUsers(module).supported
     val started = linuxMonotonicMilliseconds()
     val nullPointer = nativeNullPointer()
-    var status = 0
-    if (passes != "") {
-        val options = LLVMCreatePassBuilderOptions()
-        status = llvmConsumeError(LLVMRunPasses(module, passes, nullPointer, options), 129)
-        LLVMDisposePassBuilderOptions(options)
-    }
+    var status = bootstrapCtOptimizeSlice(module, program)
     // After the passes, so the table holds the functions they kept: built before, it kept every function the slice
     // defined alive, and code generation took two thirds longer.
     if (status == 0) bootstrapCtInstallFunctionTable(context, module, generation, program)
