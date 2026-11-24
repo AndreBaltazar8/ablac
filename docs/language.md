@@ -1207,6 +1207,36 @@ fun main {
 // 54
 ```
 
+### Copy with selected fields replaced
+
+A plain class without a `copy` member or extension supports
+`value.copy(field = replacement)` when the caller can name its primary
+constructor and every field can be copied from a borrowed receiver. The
+compiler supplies omitted fields from the receiver and calls the primary
+constructor with all the values. Constructor defaults are therefore not run
+again. The new instance shares its untouched arrays, objects and callbacks.
+The receiver and each supplied argument are evaluated once, in source order.
+
+```abla
+import "abla/io"
+
+class Point(val x: int, val y: int = 0)
+
+fun main {
+    val original = Point(2, 9)
+    val shifted = original.copy(x = 7)
+    println("(${shifted.x}, ${shifted.y})")
+}
+// output:
+// (7, 9)
+```
+
+A written `copy` keeps its usual calling rules. A factory returning a value
+does not grant the caller access to a hidden constructor. Resource and
+affine values cannot be duplicated by this operation. A delegated field
+also needs an explicit copy method so that the class can define how its
+delegate is rebuilt.
+
 ### Interfaces
 
 An interface names a set of methods. A class conforms to it, and its values

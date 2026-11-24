@@ -1,0 +1,69 @@
+import "module.ab"
+import "module_paths.ab"
+import "parser.ab"
+import "sema.ab"
+import "generic_types.ab"
+
+// The graph's resolved edges, used only when a copy call needs a fallback.
+var bootstrapAutoCopyImports: array<BootstrapModuleAlias> = []
+
+private fun bootstrapCopyAliasExposes(
+    declarations: array<BootstrapDeclaration>, target: string, owner: BootstrapDeclaration
+): bool {
+    val source = bootstrapGenericSourceFile(owner.sourceIdentity)
+    val name = bootstrapSourceVisibleType(owner.name)
+    // Qualified source rewriting uses the target's own name first, then
+    // the first declaring module in the export traversal.
+    for (module in bootstrapAliasReachedModules(target, bootstrapAutoCopyImports)) {
+        for (declaration in declarations) {
+            if (declaration.extensionOwner == "" && !declaration.isPrivate &&
+                bootstrapGenericSourceFile(declaration.sourceIdentity) == module &&
+                bootstrapSourceVisibleType(declaration.name) == name) return module == source
+        }
+    }
+    false
+}
+
+private fun bootstrapCopyConstructorVisible(
+    declarations: array<BootstrapDeclaration>, caller: string, owner: BootstrapDeclaration
+): bool {
+    val from = bootstrapGenericSourceFile(caller)
+    val to = bootstrapGenericSourceFile(owner.sourceIdentity)
+    if (from == to) return true
+    if (owner.isPrivate) return false
+    // A qualification may expose a class that a bare import does not.
+    // Use the actual exported edges, not the wider extension visibility.
+    for (edge in bootstrapAutoCopyImports) {
+        if (edge.importer == from && edge.alias != "" &&
+            bootstrapCopyAliasExposes(declarations, edge.target, owner)) return true
+    }
+    val visibility = bootstrapStrictHidden(caller, owner.sourceIdentity)
+    if (visibility == 1) return false
+    if (owner.name == bootstrapSourceVisibleType(owner.name)) return true
+    for (edge in bootstrapAutoCopyImports) {
+        if (edge.importer == from && edge.alias == "" &&
+            bootstrapCopyAliasExposes(declarations, edge.target, owner)) return true
+    }
+    false
+}
+
+fun bootstrapAutoCopyUnavailable(analyzer: BootstrapAnalyzer, owner: BootstrapDeclaration): string {
+    if (!bootstrapCopyConstructorVisible(analyzer.declarations, analyzer.currentSourceIdentity, owner))
+        return "the primary constructor of `${bootstrapSourceVisibleType(owner.name)}` is not visible here"
+    if (owner.isResource)
+        return "the receiver has affine ownership"
+    if (owner.typeParameters.size != 0)
+        return "the receiver must be a non-generic class"
+    for (field in 0 until owner.parameters.size) {
+        val name = owner.parameters[field]
+        val type = owner.parameterTypes[field]
+        if (bootstrapIsAnyDelegatedProperty(owner, field))
+            return "delegated field `$name` is not a primary constructor argument"
+        if (owner.parameterKinds[field] == "own" || analyzer.typeIsAffine(type) || bootstrapIsBorrowType(type))
+            return "field `$name` cannot be copied from a borrowed receiver"
+        if (owner.parameterKinds[field] != "val" && owner.parameterKinds[field] != "var")
+            return "constructor parameter `$name` does not name a readable field"
+    }
+    if (analyzer.typeIsAffine(owner.name)) return "the receiver has affine ownership"
+    ""
+}

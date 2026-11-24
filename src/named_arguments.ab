@@ -701,6 +701,7 @@ class BootstrapNamedArgumentNormalizer(
     }
 
     fun requiresNormalization(expression: BootstrapExpression): bool {
+        if (expression.kind == "member.call" && expression.text == "copy") return true
         var required = false
         var child = 0
         while (!required && child < expression.children.size) {
@@ -849,6 +850,30 @@ class BootstrapNamedArgumentNormalizer(
             ]
         )
 
+    fun automaticCopy(call: BootstrapExpression, owner: BootstrapDeclaration): BootstrapExpression {
+        val parameters = this.suppliedParameters(owner, call)
+        val source = call.children[0]
+        val receiverName = "__abla_named_${call.begin}_copy_receiver"
+        val receiver = BootstrapExpression("identifier", receiverName, source.begin, source.end, [])
+        val statements = [this.local(receiverName, source)]
+        val values: array<BootstrapExpression> = []
+        for (field in owner.parameters) {
+            values.append(BootstrapExpression("member", field, source.begin, source.end, [receiver]))
+        }
+        for (index in 0 until parameters.size) {
+            val field = parameters[index]
+            if (field < 0 || field >= values.size) continue
+            val syntax = call.children[index + 1]
+            val value = if (syntax.kind == "named.argument" && syntax.children.size == 1)
+                syntax.children[0] else syntax
+            val name = "__abla_named_${call.begin}_copy_$index"
+            statements.append(this.local(name, bootstrapNamedTypedLiteral(value, owner.parameterTypes[field], false)))
+            values[field] = BootstrapExpression("identifier", name, value.begin, value.end, [])
+        }
+        statements.append(BootstrapExpression("call.top-level", owner.name, call.begin, call.end, values))
+        BootstrapExpression("block", "", call.begin, call.end, statements)
+    }
+
     // `visibleLocals` cut back to its first `size` names.
     fun leaveScope(size: int): void {
         val kept: array<string> = []
@@ -891,6 +916,17 @@ class BootstrapNamedArgumentNormalizer(
             expression.end,
             normalizedChildren
         )
+        if (result.kind == "member.call" && result.text == "copy") {
+            if (this.typeProbe == null) this.typeProbe = bootstrapBuildNamedProbe(this.declarations)
+            val probe = this.typeProbe
+            val choice = if (probe == null) null else probe.find(this.sourceIdentity, expression)
+            if (choice != null && choice.autoCopy) {
+                if (choice.copyUnavailable == "") return this.automaticCopy(result, this.declarations[choice.declaration])
+                this.errors = this.errors + 1
+                this.diagnostics = "${this.diagnostics}error[E_AUTO_COPY]: ${choice.copyUnavailable}\nsource[named-argument]:${this.sourceIdentity}:${result.begin}:${result.end}\n"
+                return result
+            }
+        }
         var hasNamed = false
         child = 0
         while ((result.kind == "call" || result.kind == "member.call") &&
