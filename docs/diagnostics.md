@@ -50,6 +50,7 @@ only its parse errors.
 | `E_PARSE_EXPRESSION` | expected an expression, found `X` |
 | `E_PARSE_STATEMENT_SEPARATOR` | expected a newline, `;`, or `}` after statement |
 | `E_PARSE_TOP_LEVEL_DECLARATION` | expected a top-level declaration or compile expression: statements must be inside a function |
+| `E_PARSE_NESTING` | expressions and blocks are nested more than 1000 deep, or an `else if` chain has more than 2500 links (one error, not a stack overflow) |
 | `E_PARSE_PARAMETER_SEPARATOR`, `E_PARSE_ARGUMENT_SEPARATOR`, `E_PARSE_ARRAY_SEPARATOR` | a missing `,` |
 | `E_PARSE_UNCLOSED_DELIMITER` | an unclosed `(`, `[` or `{` |
 | `E_PARSE_UNTERMINATED_COMMENT` | a block comment reaches the end of the file with no matching `*/` |

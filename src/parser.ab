@@ -764,6 +764,13 @@ fun bootstrapPlainStringByteSpans(source: string, origin: BootstrapExpression): 
     if (spans.begins.size == origin.text.size) spans else BootstrapDecodedByteSpans()
 }
 
+// How deep the parser is in expressions and blocks, which it enters recursively: past the limit it reports one error and ends the file instead of overflowing the stack
+// (a hostile or generated file of 5,000 open parentheses used to kill the compiler, and so an editor's analysis service, with "panic: stack overflow").
+var bootstrapParserNesting = 0
+val BOOTSTRAP_PARSER_NESTING_LIMIT = 1000
+var bootstrapParserChain = 0
+val BOOTSTRAP_PARSER_CHAIN_LIMIT = 2500
+
 class BootstrapParser(
     val sourceIdentity: string,
     val source: string,
@@ -1449,6 +1456,14 @@ class BootstrapParser(
     }
 
     fun parseBlock(): BootstrapExpression {
+        if (bootstrapParserNesting >= BOOTSTRAP_PARSER_NESTING_LIMIT) return this.nestingTooDeep()
+        bootstrapParserNesting = bootstrapParserNesting + 1
+        val result = this.parseBlockBody()
+        bootstrapParserNesting = bootstrapParserNesting - 1
+        result
+    }
+
+    fun parseBlockBody(): BootstrapExpression {
         val start = this.tokens[this.position]
         val bindings = this.bindingNames.size
         this.expect(BOOTSTRAP_TOKEN_LBRACE)
@@ -1662,7 +1677,23 @@ class BootstrapParser(
         )
         if (this.consume(BOOTSTRAP_TOKEN_ELSE)) {
             this.skipSeparators()
-            elseBranch = this.parseControlBody()
+            // A chain of `else if` is a loop in the source and not nesting: its links do not count (generated code has thousands).
+            val chained = this.at(BOOTSTRAP_TOKEN_IF)
+            if (chained) {
+                bootstrapParserNesting = bootstrapParserNesting - 1
+                bootstrapParserChain = bootstrapParserChain + 1
+            }
+            if (bootstrapParserChain > BOOTSTRAP_PARSER_CHAIN_LIMIT) {
+                // The links recurse like nesting does, and a hostile chain of thousands overflowed the stack: it is refused where the depth is still safe.
+                this.fail("NESTING", "an else-if chain of more than ${BOOTSTRAP_PARSER_CHAIN_LIMIT} links", "use `when`")
+                this.position = this.tokens.size - 1
+            } else {
+                elseBranch = this.parseControlBody()
+            }
+            if (chained) {
+                bootstrapParserNesting = bootstrapParserNesting + 1
+                bootstrapParserChain = bootstrapParserChain - 1
+            }
             this.position = this.position
         } else this.position = beforeElseSeparators
         BootstrapExpression(
@@ -2859,6 +2890,21 @@ class BootstrapParser(
     }
 
     fun parseExpression(): BootstrapExpression {
+        if (bootstrapParserNesting >= BOOTSTRAP_PARSER_NESTING_LIMIT) return this.nestingTooDeep()
+        bootstrapParserNesting = bootstrapParserNesting + 1
+        val result = this.parseExpressionBody()
+        bootstrapParserNesting = bootstrapParserNesting - 1
+        result
+    }
+
+    fun nestingTooDeep(): BootstrapExpression {
+        val token = this.tokens[this.position]
+        this.fail("NESTING", "expressions and blocks are nested more than ${BOOTSTRAP_PARSER_NESTING_LIMIT} deep", "split the expression into named parts")
+        this.position = this.tokens.size - 1
+        BootstrapExpression("invalid", "", token.begin, token.end, [])
+    }
+
+    fun parseExpressionBody(): BootstrapExpression {
         val expression = this.parseLogicalOr()
         if (this.consume(BOOTSTRAP_TOKEN_EQUAL)) {
             this.skipSeparators()
