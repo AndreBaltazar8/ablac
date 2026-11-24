@@ -458,6 +458,7 @@ test-serial: ablac
 	tools/test-trusted-raw-addresses.sh
 	tools/test-float-integer-saturation.sh $(COMPILER)
 	tools/test-named-method-arguments.sh $(COMPILER)
+	tools/test-auto-copy.sh $(COMPILER)
 	tools/test-named-overloads.sh $(COMPILER)
 	tools/test-ct-named-constructor.sh $(COMPILER)
 	tools/test-map-resources.sh $(COMPILER)
