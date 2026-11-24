@@ -19,7 +19,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 out=build/windows-stdlib
 [[ $target == aarch64-windows ]] && out=build/windows-arm64-stdlib
-rm -rf "$out" build/windows-debug
+rm -rf "$out" build/windows-debug build/windows-arm64-debug
 mkdir -p "$out"
 fail() { echo "windows-programs: $1" >&2; exit 1; }
 for tool in lld-link llvm-readobj; do
@@ -84,6 +84,13 @@ while read -r source status where; do
     done <<< "$imports"
     # A program marked `runner` (one Wine cannot check) is built and left for the Windows runner only; so is every program for ARM64.
     if [[ $target == aarch64-windows ]]; then
+        if grep -qxF "$source" tests/cases/windows/arm64-debug.txt; then
+            mkdir -p build/windows-arm64-debug
+            "$compiler" build "$source" --target "$target" -o "build/windows-arm64-debug/$name.exe" --fast --backtrace --no-cache \
+                > "build/windows-arm64-debug/$name.log" 2>&1 || { tail -5 "build/windows-arm64-debug/$name.log" >&2; fail "$name did not build with --backtrace for $target"; }
+            "$compiler" build "$source" --target "$target" -o "build/windows-arm64-debug/$name-release.exe" --backtrace --no-cache \
+                > "build/windows-arm64-debug/$name-release.log" 2>&1 || { tail -5 "build/windows-arm64-debug/$name-release.log" >&2; fail "$name did not build with --backtrace (release) for $target"; }
+        fi
         runner=$((runner + 1))
         continue
     fi
