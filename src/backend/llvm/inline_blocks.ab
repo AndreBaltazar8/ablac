@@ -1,0 +1,174 @@
+import "../../ir.ab"
+import "../../sema.ab"
+import "analysis.ab"
+import "abla/text"
+
+private class BootstrapLiteralBlockSite(val parameter: int, val calls: array<int>)
+
+// The block stays a value unless every use of its parameter is the target of
+// an ordinary indirect call. Passing it along, saving it, returning it, and
+// storage operations on the parameter keep the original path.
+private fun bootstrapLiteralBlockSite(function: BootstrapIrFunction): BootstrapLiteralBlockSite? {
+    if (!function.inlineHint || function.noinlineHint || function.naked ||
+        function.runtimeImplementation || function.section != "" ||
+        function.targetFeatures != "" || function.instructions.size > 256) return null
+    var parameter = -1
+    for (index in 0 until function.parameterTypes.size) {
+        val type = function.parameterTypes[index]
+        if (!bootstrapIsFunctionType(type)) continue
+        if (parameter >= 0 || !type.startsWith("function:")) return null
+        parameter = index
+    }
+    if (parameter < 0) return null
+    val name = function.parameters[parameter]
+    val arity = bootstrapFunctionParameterCount(function.parameterTypes[parameter])
+    val values: Map<int, bool> = Map()
+    for (instruction in function.instructions) {
+        if (instruction.text != name) continue
+        if (instruction.opcode != "parameter.load") return null
+        values.set(instruction.result, true)
+    }
+    if (values.get(function.result) != null) return null
+    val calls: array<int> = []
+    for (index in 0 until function.instructions.size) {
+        val instruction = function.instructions[index]
+        if (instruction.opcode == "call" && instruction.text == function.name) return null
+        val directUse = instruction.opcode == "call.indirect" &&
+            instruction.operands.size == arity + 1 && values.get(instruction.left) != null
+        if (!directUse && values.get(instruction.left) != null) return null
+        if (values.get(instruction.right) != null) return null
+        for (position in 0 until instruction.operands.size) {
+            if ((!directUse || position != 0) &&
+                values.get(instruction.operands[position]) != null) return null
+        }
+        if (directUse) calls.append(index)
+    }
+    if (calls.size == 0) null else BootstrapLiteralBlockSite(parameter, calls)
+}
+
+private fun bootstrapLiteralBlockClone(function: BootstrapIrFunction, name: string,
+    instructions: array<BootstrapInstruction>, result: string): BootstrapIrFunction =
+    BootstrapIrFunction(name, function.parameters, instructions, function.result,
+        function.blocks, function.locals, function.localTypes, function.parameterTypes,
+        result, true, false, false, "", "", function.verificationErrors, function.label, function.position)
+
+private fun bootstrapLiteralBlockCall(call: BootstrapInstruction, name: string,
+    operands: array<int>): BootstrapInstruction =
+    BootstrapInstruction("call", call.result,
+        if (operands.size > 0) operands[0] else -1,
+        if (operands.size > 1) operands[1] else -1,
+        name, call.target, call.alternate, operands, call.texts, call.position)
+
+private fun bootstrapLiteralBlockInstructions(function: BootstrapIrFunction,
+    site: BootstrapLiteralBlockSite, callback: string): array<BootstrapInstruction> {
+    val instructions: array<BootstrapInstruction> = []
+    var call = 0
+    for (index in 0 until function.instructions.size) {
+        val instruction = function.instructions[index]
+        if (call < site.calls.size && index == site.calls[call]) {
+            val arguments: array<int> = []
+            for (position in 1 until instruction.operands.size)
+                arguments.append(instruction.operands[position])
+            instructions.append(bootstrapLiteralBlockCall(instruction, callback, arguments))
+            call += 1
+        } else instructions.append(instruction)
+    }
+    instructions
+}
+
+private fun bootstrapLiteralBlockTypeMatches(callback: BootstrapIrFunction, type: string,
+    result: string): bool {
+    if (result == "" || result == "unknown" || result == "any" || result == "void" ||
+        result == "never" || bootstrapIsBorrowType(result) ||
+        result != bootstrapFunctionResultType(type) ||
+        callback.parameterTypes.size != bootstrapFunctionParameterCount(type) ||
+        callback.instructions.size > 128) return false
+    for (index in 0 until callback.parameterTypes.size)
+        if (callback.parameterTypes[index] != bootstrapFunctionParameterType(type, index))
+            return false
+    true
+}
+
+// Keep the ordinary function and closure entry points. Copies are local to
+// this emission, so incremental lowering retains its target-neutral IR.
+fun bootstrapLlvmSpecializeLiteralBlocks(program: BootstrapIrProgram): BootstrapIrProgram {
+    if (program.errors > 0) return program
+    val sites: Map<string, BootstrapLiteralBlockSite> = Map()
+    for (function in program.functions) {
+        val site = bootstrapLiteralBlockSite(function)
+        if (site != null) sites.set(function.name, site)
+    }
+    if (sites.size == 0) return program
+    val names: array<string> = []
+    for (function in program.functions) names.append(function.name)
+    val functions = bootstrapLlvmNameIndex(names)
+    val variants: Map<string, string> = Map()
+    val callbacks: Map<int, string> = Map()
+    val clones: array<BootstrapIrFunction> = []
+    val rewritten: array<BootstrapIrFunction> = []
+    var budget = 8192
+    for (function in program.functions) {
+        val replacements: Map<int, string> = Map()
+        val literals: Map<int, int> = Map()
+        for (index in 0 until function.instructions.size) {
+            val instruction = function.instructions[index]
+            if (instruction.opcode == "closure.create" && instruction.operands.size == 0 &&
+                instruction.texts.size == 1) literals.set(instruction.result, index)
+            if (instruction.opcode != "call") continue
+            val site = sites.get(instruction.text)
+            if (site == null || site.parameter >= instruction.operands.size) continue
+            val literal = literals.get(instruction.operands[site.parameter])
+            if (literal == null) continue
+            val closure = function.instructions[literal]
+            val callee = functions.find(instruction.text)
+            val block = functions.find(closure.text)
+            if (callee < 0 || block < 0) continue
+            val owner = program.functions[callee]
+            val callback = program.functions[block]
+            val result = closure.texts[0]
+            if (!bootstrapLiteralBlockTypeMatches(callback, owner.parameterTypes[site.parameter], result))
+                continue
+            val key = "${callee}_${block}"
+            var variant = variants.get(key) ?? ""
+            if (variant == "") {
+                val cost = owner.instructions.size + callback.instructions.size
+                if (cost > budget) continue
+                variant = "__abla_inline_callback_$key"
+                val target = "__abla_inline_block_$block"
+                if (functions.find(variant) >= 0 || functions.find(target) >= 0) continue
+                if (callbacks.get(block) == null) {
+                    clones.append(bootstrapLiteralBlockClone(callback, target,
+                        callback.instructions, result))
+                    callbacks.set(block, target)
+                }
+                val body = bootstrapLiteralBlockInstructions(owner, site, target)
+                clones.append(bootstrapLiteralBlockClone(owner, variant, body, owner.resultType))
+                variants.set(key, variant)
+                budget -= cost
+            }
+            replacements.set(index, variant)
+        }
+        if (replacements.size == 0) rewritten.append(function)
+        else {
+            val instructions: array<BootstrapInstruction> = []
+            for (index in 0 until function.instructions.size) {
+                val instruction = function.instructions[index]
+                val variant = replacements.get(index)
+                if (variant == null) instructions.append(instruction)
+                else instructions.append(bootstrapLiteralBlockCall(instruction, variant, instruction.operands))
+            }
+            rewritten.append(BootstrapIrFunction(
+                function.name, function.parameters, instructions, function.result,
+                function.blocks, function.locals, function.localTypes, function.parameterTypes,
+                function.resultType, function.inlineHint, function.noinlineHint, function.naked,
+                function.section, function.targetFeatures, function.verificationErrors,
+                function.label, function.position, function.runtimeImplementation))
+        }
+    }
+    if (clones.size == 0) return program
+    for (clone in clones) rewritten.append(clone)
+    BootstrapIrProgram(program.instructions, rewritten, program.classes, program.natives,
+        program.globalNames, program.globalTypes, program.globalKinds, program.compileInputPaths,
+        program.compileInputContents, program.errors, program.lookup, program.validationFailures,
+        program.extensionFields)
+}
