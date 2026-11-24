@@ -48,7 +48,9 @@ the ordinary rules when its last reference does.
   pointer into the heap (a byte buffer); otherwise `memoryFreeze` fails with a panic naming the object's class, so a cache
   that cannot be frozen says so at the call, not at the first collection. Weak, task, thread, generator, mutex and cell blocks
   (layouts 6, 7, 11 and the like) are refused for the same reason. Sharing and cycles are kept (a forwarding table during the
-  copy).
+  copy). A graph whose copy would not fit the window (a block larger than it, or a total past it) is refused, the value
+  returned whole (`memoryHeapStat(12)` reads 2): a rope counts its flat length, which no memory backs, and ropes of 2^62
+  bytes once summed past 2^64 to a few bytes, so the copy wrote past the group's pages (`tests/cases/frozen/huge.ab`).
 - **Roots on the stack.** Frames hold values the shadow stack describes exactly; they keep pointing at the originals until the
   code stores the copy. Nothing is conservative about the stack here, so there is nothing to pin. The copy itself runs under
   the heap lock with the other threads stopped (the same stop a collection uses), so it sees one consistent graph, and

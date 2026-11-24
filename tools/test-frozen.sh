@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Frozen groups (docs/design/frozen-heap.md): a graph copied into read-only memory the collector neither marks nor sweeps.
 # tests/cases/frozen: graph (sharing, a cycle, ropes, array slack, scalars; unchanged across collections), limits (more live groups than the table holds: refused, value returned whole), churn (groups
-# returned whole and their address space reused: more freezing than the window holds), threads (readers and a collector
+# returned whole and their address space reused: more freezing than the window holds), huge (a group larger than the window,
+# from ropes whose sizes summed past 2^64: refused), threads (readers and a collector
 # beside a freeze), fork (a child reads, collects and freezes), and fault (a store into a frozen object faults, never a silent
 # write). Each runs release and --fast; graph, threads and fork also under ABLA_GC_STRESS=1 (a collection at every safe point).
 set -euo pipefail
@@ -17,11 +18,11 @@ fail() { echo "frozen: $1" >&2; exit 1; }
 for mode in release fast; do
     flags=(--no-cache)
     [[ $mode == fast ]] && flags+=(--fast)
-    for name in graph churn limits threads fork fault; do
+    for name in graph churn limits threads fork fault huge; do
         "$compiler" build "tests/cases/frozen/$name.ab" -o "$out/$name.$mode" "${flags[@]}" > "$out/$name.$mode.build" 2>&1 \
             || { cat "$out/$name.$mode.build" >&2; fail "$name ($mode) did not build"; }
     done
-    for name in graph churn limits threads fork; do
+    for name in graph churn limits threads fork huge; do
         status=0
         result=$("$root/tools/run-limited.sh" "$out/$name.$mode" 2>&1) || status=$?
         [[ $status -eq 0 && $result == *"frozen $name ok"* ]] || fail "$name ($mode) failed ($status): $result"
@@ -40,4 +41,4 @@ for mode in release fast; do
         || fail "fault ($mode): a store into a frozen object did not fault (status $status): $result"
     echo "fault ($mode): the store faulted ($status)"
 done
-echo 'frozen: graph, churn, threads, fork and fault pass, release and --fast, and graph, threads and fork under GC stress'
+echo 'frozen: graph, churn, limits, threads, fork, huge and fault pass, release and --fast, and graph, threads and fork under GC stress'
