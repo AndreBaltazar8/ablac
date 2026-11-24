@@ -3,6 +3,7 @@
 # Windows SDK) from a directory that is not the toolchain's
 #   - `bin\ablac.exe --version` prints `ablac <version>` (the version the release was built as);
 #   - a hello-world program builds and runs with the compiler's default cache;
+#   - `--fast` builds and runs the same program twice using one cache;
 #   - a program that imports a project module builds and runs;
 #   - `--backtrace` builds (the packaged llvm-objcopy.exe is found beside ablac.exe, with no PATH to find it by);
 #   - the toolchain moved to another directory still works (it finds its sysroot beside its own image).
@@ -191,6 +192,14 @@ fun main { println("hello from abla on windows") }
     Check-Arm64Image (Join-Path $work 'hello.exe')
     $said = (Run (Join-Path $work 'hello.exe') @() "$label run hello").Trim()
     if ($said -cne 'hello from abla on windows') { Fail "$label hello printed '$said'" }
+    $fastHello = Join-Path $work 'hello-fast.exe'
+    foreach ($build in 'first', 'second') {
+        Run $ablac @('build', 'hello.ab', '--fast', '-o', 'hello-fast.exe') "$label $build --fast build with default cache" | Out-Null
+        Check-Arm64Image $fastHello
+        $said = (Run $fastHello @() "$label run $build --fast hello").Trim()
+        if ($said -cne 'hello from abla on windows') { Fail "$label $build --fast hello printed '$said'" }
+    }
+    Write-Host "Windows $Architecture $label passed both --fast builds with the default cache"
     Set-Content -Path helper.ab -Encoding ascii -Value 'fun answer(): int = 41 + 1'
     Set-Content -Path project.ab -Encoding ascii -Value @'
 import "abla/io"
