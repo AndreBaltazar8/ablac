@@ -39,12 +39,17 @@ for source in tests/cases/windows/hosted/*.ab; do
             { cat "$exe.log" >&2; fail "$name ($mode) did not build for Windows"; }
         imports=$(llvm-readobj --coff-imports "$exe" | awk '/^ *Name:/ { dll = $2 } /^ *Symbol:/ { print dll, $2 }')
         ! grep -qiE 'msvcrt|ucrtbase|vcruntime|api-ms-win-crt' <<< "$imports" || fail "$name ($mode): a C runtime import: $imports"
-        # A program that uses nothing of the optional DLLs imports the same ones as hello does (tools/windows-hello-dlls.txt): crypt32, which
-        # the system roots need, is loaded when they are first asked for (system call 4006), not linked into every program.
+        # A program that uses nothing of the optional DLLs imports no more than hello may (tools/windows-hello-dlls.txt): crypt32, which
+        # the system roots need, is loaded when they are first asked for (system call 4006), not linked into every program. Fewer is
+        # fine: a release build drops what the program never reaches (hello draws no random bytes, so no bcryptprimitives since the
+        # compile-time guard's calls stopped going through the dispatcher); kernel32 it always imports.
         if [[ $name == hello ]]; then
             dlls=$(awk '{ print $1 }' <<< "$imports" | sort -u)
-            [[ $dlls == "$(cat tools/windows-hello-dlls.txt)" ]] ||
-                fail "hello ($mode) imports other DLLs than tools/windows-hello-dlls.txt lists: $(tr '\n' ' ' <<< "$dlls")"
+            while read -r dll; do
+                grep -qxF "$dll" tools/windows-hello-dlls.txt ||
+                    fail "hello ($mode) imports $dll, which tools/windows-hello-dlls.txt does not list (imports: $(tr '\n' ' ' <<< "$dlls"))"
+            done <<< "$dlls"
+            grep -qx kernel32.dll <<< "$dlls" || fail "hello ($mode) imports no kernel32.dll"
         fi
         while read -r dll function; do
             [[ -z $dll ]] || grep -qxF "$dll $function" <<< "$allowed" ||
