@@ -1,0 +1,68 @@
+// A Windows socket call that fails returns -1 as a 32-bit C int; the runtime answers the Linux call with a negative errno, not
+// with the 4294967295 of a result read as 64 bits (tools/test-windows-syscalls.sh). A read of a nonblocking connected socket
+// with nothing to read fails with WSAEWOULDBLOCK, which is EAGAIN (-11), through read (0), recvfrom (45) and recvfrom with
+// MSG_DONTWAIT on a blocking socket, and a send on a closed socket is negative too. Read as 64 bits, the first read's count
+// made httpAsyncPlainRead copy 4 GiB from its 64 KiB stack buffer, off the top of the stack (CI run 45374103451).
+// SO_RCVTIMEO is a Linux timeval (1.5 s here), which Winsock takes as a DWORD of milliseconds: passed through, it read the
+// seconds as milliseconds and waited 1 ms; a read it ends is EAGAIN, as on Linux, not ETIMEDOUT.
+import "abla/io"
+import "abla/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun main {
+    val listener = tcpListenAddress(ipv4Loopback(0))
+    var client = tcpConnectIpv4("127.0.0.1", listener.localPort(), 2000)
+    var server = listener.accept()
+    val buffer = nativeByteBuffer(64)
+    val address = nativePointerAddress(buffer.address)
+    // recvfrom(fd, buffer, 64, MSG_DONTWAIT, 0, 0) on the blocking socket
+    println("recvfrom dontwait ${linuxSyscall6(45, client.descriptor, address, 64, 64, 0, 0)}")
+    // setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, {1, 500000}, 16), getsockopt of it, and a read it ends
+    val timeval = nativeByteBuffer(24)
+    val timevalAddress = nativePointerAddress(timeval.address)
+    ablaUnsafeStoreI64(timeval.address, 1)
+    ablaUnsafeStoreI64(nativePointerFromAddress(timevalAddress + 8), 500000)
+    println("timeout set ${linuxSyscall5(54, client.descriptor, 1, 20, timevalAddress, 16)}")
+    ablaUnsafeStoreI64(timeval.address, 0)
+    ablaUnsafeStoreI64(nativePointerFromAddress(timevalAddress + 8), 0)
+    ablaUnsafeStoreI64(nativePointerFromAddress(timevalAddress + 16), 16)
+    val asked = linuxSyscall5(55, client.descriptor, 1, 20, timevalAddress, timevalAddress + 16)
+    println("timeout read $asked: ${ablaUnsafeLoadI64(timeval.address)} s ${ablaUnsafeLoadI64(nativePointerFromAddress(timevalAddress + 8))} us")
+    val started = linuxMonotonicMilliseconds()
+    val timedOut = linuxSyscall3(0, client.descriptor, address, 64)
+    val waited = linuxMonotonicMilliseconds() - started
+    println("read until the timeout $timedOut, waited at least 1.4 s ${waited >= 1400}")
+    timeval.close()
+    // fcntl(fd, F_SETFL, O_NONBLOCK), then read and recvfrom
+    println("nonblocking ${linuxSyscall3(72, client.descriptor, 4, 2048)}")
+    println("read ${linuxSyscall3(0, client.descriptor, address, 64)}")
+    println("recvfrom ${linuxSyscall6(45, client.descriptor, address, 64, 0, 0, 0)}")
+    // Bytes the server sends are read as their count.
+    ablaUnsafeStoreU8(buffer.address, 33)
+    println("send ${linuxSyscall6(44, server.descriptor, address, 1, 0, 0, 0)}")
+    var count = -11
+    var attempt = 0
+    while (count == -11 && attempt < 1000) {
+        count = linuxSyscall3(0, client.descriptor, address, 64)
+        attempt = attempt + 1
+    }
+    println("read after send $count")
+    // shutdown(server, SHUT_WR): the read sees the end, 0
+    linuxSyscall2(48, server.descriptor, 1)
+    count = -11
+    attempt = 0
+    while (count == -11 && attempt < 100000) {
+        count = linuxSyscall3(0, client.descriptor, address, 64)
+        attempt = attempt + 1
+    }
+    println("read at the end $count")
+    // A send on the socket after shutting down its sending side fails, negative.
+    val refused = linuxSyscall6(44, server.descriptor, address, 1, 0, 0, 0)
+    println("send after shutdown negative ${refused < 0}")
+    buffer.close()
+    client.close()
+    server.close()
+}

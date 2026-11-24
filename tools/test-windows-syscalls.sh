@@ -134,4 +134,15 @@ status=0
 timeout 60 tools/windows/wine-run.sh "$out/preempt.exe" > "$out/preempt.out" 2> "$out/preempt.err" || status=$?
 [[ $status == 0 ]] || fail "preempt.exe exited $status: $(head -5 "$out/preempt.out" "$out/preempt.err")"
 [[ "$(cat "$out/preempt.out")" == $'spinning\nback with 3, watchdog 1\ninterrupted pipe read -4\ncancelled true' ]] || fail "preempt.exe printed: $(cat "$out/preempt.out" "$out/preempt.err")"
-echo "windows-syscalls: the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame; a fault redirected with abla_windows_redirect jumps back too; a thread's interrupt word ends its wait with EINTR; another thread stops one spinning in executable memory with a CONTEXT redirect and one reading a pipe with CancelSynchronousIo; the vectored handler's entry takes $frame bytes of stack"
+# A failed Winsock call is a negative errno (socket-failure.ab): ws2_32 returns -1 as a 32-bit int, and read as 64 bits it was
+# 4294967295, a count of bytes received that made httpAsyncPlainRead copy off the top of its stack on windows-latest.
+# SO_RCVTIMEO is converted from the Linux timeval to Winsock's milliseconds (passed through, 1.5 s waited 1 ms), and a read it
+# ends is EAGAIN.
+"$compiler" build tests/cases/windows/socket-failure.ab --target x86_64-windows-hosted -o "$out/socket-failure.exe" --fast \
+    --no-cache > "$out/socket-failure.log" 2>&1 || { cat "$out/socket-failure.log" >&2; fail "socket-failure.ab did not build for Windows"; }
+status=0
+timeout 60 tools/windows/wine-run.sh "$out/socket-failure.exe" > "$out/socket-failure.out" 2> "$out/socket-failure.err" || status=$?
+[[ $status == 0 ]] || fail "socket-failure.exe exited $status: $(head -5 "$out/socket-failure.out" "$out/socket-failure.err")"
+expected=$'recvfrom dontwait -11\ntimeout set 0\ntimeout read 0: 1 s 500000 us\nread until the timeout -11, waited at least 1.4 s true\nnonblocking 0\nread -11\nrecvfrom -11\nsend 1\nread after send 1\nread at the end 0\nsend after shutdown negative true'
+[[ "$(cat "$out/socket-failure.out")" == "$expected" ]] || fail "socket-failure.exe printed: $(cat "$out/socket-failure.out" "$out/socket-failure.err")"
+echo "windows-syscalls:the translated numbers are $tested; an untranslated call is refused with status 70 and its number; a program reads its limits, CPUs and own path; abla_setjmp and abla_longjmp jump back from a deeper frame; a fault redirected with abla_windows_redirect jumps back too; a thread's interrupt word ends its wait with EINTR; another thread stops one spinning in executable memory with a CONTEXT redirect and one reading a pipe with CancelSynchronousIo; a failed Winsock call is a negative errno and a receive timeout waits as long as Linux's; the vectored handler's entry takes $frame bytes of stack"
