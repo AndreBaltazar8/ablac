@@ -35,11 +35,11 @@ for (const [name, source] of [["hello", hello], ["compile-time site", staged]]) 
 const wrong = await compile(module, base, new Map([["main.ab", 'fun main: int = "wrong"\n']]));
 check("a wrong return type is an error", wrong.status === 1 && /E_SEMANTIC|error\[/.test(wrong.stderr), wrong.stderr.split("\n").find((line) => line.startsWith("error")) ?? "");
 
-// The parser stops at 100 levels of nesting in the browser (its stack is 1 MiB and it traps at about 160 blocks): a program that nests 40 blocks compiles, and one that nests 80 blocks or 300 parentheses is one E_PARSE_NESTING error, not a trap.
+// The parser stops at 128 levels of nesting in the browser (a nested block counts two): the module has a 4 MiB wasm stack, the release build's depth then ends at the engine's own stack near 450 and the development build traps near 180 nested parentheses (a 1 MiB stack trapped at about 160 blocks). A program that nests 50 blocks compiles, and one that nests 100 blocks or 300 parentheses is one E_PARSE_NESTING error, not a trap or a RangeError.
 const nestedBlocks = (n) => { let s = "fun nested(x: int): int {\n"; for (let l = 0; l < n; l++) s += `val a${l} = x + ${l}\nif (a${l} > ${l}) {\n`; s += "x\n"; for (let l = n - 1; l >= 0; l--) s += `} else a${l}\n`; return s + "}\nfun main: int = nested(1)\n"; };
-const shallow = await compile(module, base, new Map([["main.ab", nestedBlocks(40)]]));
-check("40 nested blocks compile", shallow.status === 0, shallow.stderr.slice(0, 150));
-for (const [name, source] of [["80 nested blocks", nestedBlocks(80)], ["300 nested parentheses", `fun main: int = ${"(".repeat(300)}1${")".repeat(300)}\n`]]) {
+const shallow = await compile(module, base, new Map([["main.ab", nestedBlocks(50)]]));
+check("50 nested blocks compile", shallow.status === 0, shallow.stderr.slice(0, 150));
+for (const [name, source] of [["100 nested blocks", nestedBlocks(100)], ["300 nested parentheses", `fun main: int = ${"(".repeat(300)}1${")".repeat(300)}\n`]]) {
     let outcome;
     try {
         const deep = await compile(module, base, new Map([["main.ab", source]]));

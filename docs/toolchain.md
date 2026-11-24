@@ -323,6 +323,10 @@ A release WebAssembly module ends with Binaryen's `wasm-opt -O3`, run with as ma
 workers as the online CPUs, up to 4 (its output does not depend on the count);
 `ABLA_WASM_OPT_CORES=<n>` sets it.
 
+A Wasm module links with a 1 MiB shadow stack, which keeps its committed memory floor low. `ABLA_WASM_STACK_BYTES=<n>` (65536 to 67108864, a multiple of 16) sets it for a
+build whose module recurses deeply; the browser compiler (`src/browser_main.ab`) is linked with 4 MiB wherever it is built (the tool chain knows the entry), which raises the depth its parser reaches from about
+160 nested blocks to the engine's own stack limit near 450 levels. It is a cache key.
+
 An extension-defined target with linker flavor and emulation `none` may use
 any object triple implemented by the installed LLVM and emit an `object` or
 `static-library`. LLVM target registration is not architecture-specific.

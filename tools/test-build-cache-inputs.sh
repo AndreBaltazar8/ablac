@@ -165,7 +165,7 @@ test_case() {
         inprocess-link) after_env=(ABLA_LINK_INPROCESS=0) ;;
         bundled-codegen) after_env=(ABLA_CODEGEN_INPROCESS=0) ;;
         collector) before_flags=(); after_flags=(); after_env=(ABLA_RELEASE_COLLECTOR_OBJECT=0) ;;
-        wasm-units|wasm-minimum|wasm-text|wasm-out-of-process|wasm-names|wasm-names-env|wasm-imports|inline-threshold|cross-tools)
+        wasm-units|wasm-minimum|wasm-text|wasm-out-of-process|wasm-names|wasm-names-env|wasm-stack|wasm-imports|inline-threshold|cross-tools)
             before_flags+=(--target wasm32-wasi)
             after_flags+=(--target wasm32-wasi)
             case "$name" in
@@ -177,6 +177,7 @@ test_case() {
                 wasm-out-of-process) after_env=(ABLA_LLVM_OUT_OF_PROCESS=1) ;;
                 wasm-names) after_flags+=(--wasm-names) ;;
                 wasm-names-env) after_env=(ABLA_WASM_NAMES=1) ;;
+                wasm-stack) after_env=(ABLA_WASM_STACK_BYTES=2097152) ;;
                 wasm-imports) after_flags+=(--wasm-imports) ;;
                 inline-threshold) before_env=(ABLA_FAST_INLINE_THRESHOLD=0)
                     after_env=(ABLA_FAST_INLINE_THRESHOLD=400) ;;
