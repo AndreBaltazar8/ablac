@@ -398,10 +398,11 @@ fun bootstrapPackageRelativePathValid(path: string): bool {
     var index = 0
     while (valid && index <= path.size) {
         if (index < path.size && path[index] == 0) valid = false
+        // A path is the same file on every host: no control character, backslash or colon (a Windows separator, a drive, a stream).
+        if (index < path.size && (path[index] < 32 || path[index] == 127 || path[index] == 92 || path[index] == 58)) valid = false
         if (index == path.size || path[index] == 47) {
             val component = path.slice(begin, index)
-            if (component == "" || component == "." || component == ".." ||
-                component == ".git") {
+            if (component == "" || component == "." || component == ".." || component.size > 255 || bootstrapPackageGitName(component)) {
                 valid = false
             }
             begin = index + 1
@@ -409,6 +410,14 @@ fun bootstrapPackageRelativePathValid(path: string): bool {
         index = index + 1
     }
     valid
+}
+
+// Whether `component` is what git, a case-folding file system or Windows reads as the repository directory: `.git` in any case, with trailing dots or spaces, or its 8.3 name.
+fun bootstrapPackageGitName(component: string): bool {
+    var end = component.size
+    while (end > 0 && (component[end - 1] == 46 || component[end - 1] == 32)) end = end - 1
+    val folded = component.slice(0, end).lowercase()
+    folded == ".git" || folded == "git~1"
 }
 
 // A git source is a place to fetch from, never an option for git: an allow-list of the forms a dependency can
@@ -809,6 +818,11 @@ fun bootstrapPackageCachePath(package: BootstrapLockedPackage): string {
 // Every git call of the package layer starts here: nothing a caller exported (GIT_DIR and the like) selects another
 // repository, git never prompts, hooks do not run, and only the transports a dependency source can name are allowed
 // (a `<transport>::` remote helper such as ext is refused).
+// A repository that digests or checks out package files reads them as bytes: its info/attributes (which outranks any .gitattributes in the files) unsets every attribute that rewrites content.
+fun bootstrapPackageRawAttributes(gitDirectory: string): bool =
+    Path("$gitDirectory/info").createDirectories() &&
+        Path("$gitDirectory/info/attributes").writeText("* -text -eol -ident -filter -working-tree-encoding\n")
+
 fun bootstrapPackageGit(): LinuxCommand {
     val command = linuxCommand("git")
     for (name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
@@ -1201,8 +1215,7 @@ fun bootstrapPackageFetch(
     }
     if (status == 0) {
         // info/attributes outranks the tree's own .gitattributes: the checkout is the blobs as they are.
-        if (!Path("$temporary/source/.git/info").createDirectories() ||
-            !Path("$temporary/source/.git/info/attributes").writeText("* -text -eol -ident -filter -working-tree-encoding\n")) status = 1
+        if (!bootstrapPackageRawAttributes("$temporary/source/.git")) status = 1
     }
     if (status == 0) {
         val remote = bootstrapPackageGit()
@@ -1339,13 +1352,15 @@ fun bootstrapPackagePublishContent(
     while (status == 0 && fileIndex < dependency.resolvedFiles.size) {
         val file = dependency.resolvedFiles[fileIndex]
         if (!bootstrapPackageRelativePathValid(file.path)) status = 1
+        if (dependency.resolvedFiles.size > BOOTSTRAP_PACKAGE_TREE_MAX_FILES) status = 1
+        val folded = file.path.lowercase()
         var previous = 0
         while (status == 0 && previous < fileIndex) {
-            if (dependency.resolvedFiles[previous].path == file.path) status = 1
+            if (dependency.resolvedFiles[previous].path == file.path || dependency.resolvedFiles[previous].path.lowercase() == folded) status = 1
             previous = previous + 1
         }
         total = total + file.path.size + file.contents.size
-        if (total > 134217728) status = 1
+        if (total > bootstrapPackageCheckoutLimit()) status = 1
         if (file.path == dependency.resolvedEntry) entryFound = true
         if (file.path == "abla.toml") manifestFound = true
         if (status == 0 && !Path("$temporary/source/${file.path}").writeText(
@@ -1363,6 +1378,7 @@ fun bootstrapPackagePublishContent(
         init.argument("$temporary/source")
         if (init.run() != 0) status = 1
     }
+    if (status == 0 && !bootstrapPackageRawAttributes("$temporary/source/.git")) status = 1
     if (status == 0) {
         val add = bootstrapPackageGit()
         add.argument("-C")
@@ -1370,6 +1386,16 @@ fun bootstrapPackagePublishContent(
         add.argument("add")
         add.argument("--all")
         if (add.run() != 0) status = 1
+    }
+    // Every file is where the provider put it: a host whose file system folds case or Unicode forms would otherwise hold fewer files than the digest names.
+    if (status == 0) {
+        val listed = bootstrapPackageGit()
+        listed.argument("-C")
+        listed.argument("$temporary/source")
+        listed.argument("ls-files")
+        listed.argument("-z")
+        val names = listed.capture()
+        if (names.status != 0 || bootstrapPackageSplitNul(names.output).size != dependency.resolvedFiles.size) status = 1
     }
     var digest = ""
     if (status == 0) digest = bootstrapPackageGitWriteTree(
@@ -2060,7 +2086,7 @@ fun bootstrapPackageVendorDigest(projectRoot: string, vendorRoot: string): strin
         init.argument("--bare")
         init.argument("--object-format=sha1")
         init.argument(scratch)
-        if (init.run() == 0) {
+        if (init.run() == 0 && bootstrapPackageRawAttributes(scratch)) {
             val add = bootstrapPackageGit()
             add.workingDirectory = vendorRoot
             add.argument("--git-dir=$scratch")
@@ -2233,6 +2259,7 @@ fun bootstrapPackageVendorScratch(vendorRoot: string): string {
     init.argument("--object-format=sha1")
     init.argument(scratch)
     if (init.run() != 0) return ""
+    if (!bootstrapPackageRawAttributes(scratch)) return ""
     val add = bootstrapPackageGit()
     add.workingDirectory = vendorRoot
     add.argument("--git-dir=$scratch")

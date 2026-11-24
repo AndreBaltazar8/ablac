@@ -323,7 +323,14 @@ Resolved content uses `$ABLA_PACKAGE_CACHE` when set, then
 `$XDG_CACHE_HOME/abla`, then `$HOME/.cache/abla`. Git fetches are shallow and
 content providers are materialized from their returned files. Both paths are
 bounded to 128 MiB, indexed by a deterministic tree digest, validated against
-the lock, and published by rename only after validation. Project-local
+the lock, and published by rename only after validation. A fetched tree is inspected before
+it is checked out: it is refused (`E_PACKAGE_TREE`, `E_PACKAGE_SIZE`) with a submodule, an entry that is not a
+regular file or symbolic link, a path of more than 1024 bytes or 64 levels or with a control character, more than
+50,000 files or more than 128 MiB of blobs, and the fetch itself stops at 1 GiB received. The files are checked out as
+the blobs the digest covers, whatever `.gitattributes` or the user's git settings say. A resolver's files may not
+have a path with a control character, backslash or colon, a component of more than 255 bytes or that git, a
+case-folding file system or Windows reads as `.git`, two paths that differ only in case, or more than 50,000 files.
+`ABLA_PACKAGE_CHECKOUT_LIMIT_BYTES` and `ABLA_PACKAGE_GIT_MAX_BYTES` lower the 128 MiB and 1 GiB limits (tests use them). Project-local
 materialization under ignored `.abla/` is also transactional.
 
 On Linux and macOS, Git reference lookups for `package update` and Git
