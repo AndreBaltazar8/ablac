@@ -2875,7 +2875,15 @@ fun main: int = nextId()
 - A name from a standard-library file that isn't a module's entry (`abla/tls/hosted/openssl.ab`, say) is internal: no import
   makes it visible, and the error names the public module(s) that offer the surface. That list is data in the file's
   header, a `// public: abla/tls/hosted, abla/tls/pure` comment (`none` when nothing public offers it); every such file
-  has one, and tools/test-strict-imports.sh checks that the modules it names exist.
+  has one, and tools/test-strict-imports.sh checks that the modules it names exist. This holds for flat modules too (a
+  dependency's `visibility = "flat"` doesn't open them). A function of the library that takes a raw address is kept this
+  way (`private`, or in a module's `raw.ab`/`core.ab`): `aesWipe(16, 8)` in a program is an `E_NAME_NOT_IMPORTED`, and
+  tools/test-trusted-raw-addresses.sh lists the few public exceptions. The library's own tests and tools import such a file
+  by name under `--stdlib-internals` ([toolchain](toolchain.md)).
+  Two traps when splitting a library module this way: a module imports its other file without an alias (an `as core` import
+  puts every name that file passes on with `export import` under the alias, program-wide, so a name such as `cryptoFailed` stops
+  resolving for the other modules), and the standard library's modules see the names of what the program imports even where they
+  don't import it themselves, so every module that uses the library must be built after a split, not only the one that moved.
 
 ### Contract imports
 

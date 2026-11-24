@@ -39,17 +39,19 @@ cp -R tests/cases/ct "$cases"
 sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN BIGNUM CHECKED CORES$/,/^\/\/ END BIGNUM CHECKED CORES$/p' stdlib/abla/crypto/bignum/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
-sed -n '/^\/\/ BEGIN P256 SECRET CORES$/,/^\/\/ END P256 SECRET CORES$/p' stdlib/abla/crypto/p256/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN P256 SECRET CORES$/,/^\/\/ END P256 SECRET CORES$/p' stdlib/abla/crypto/p256/core.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE OWNER WIPE$/,/^\/\/ END PBE OWNER WIPE$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN X25519 SECRET CORE$/,/^\/\/ END X25519 SECRET CORE$/p' stdlib/abla/crypto/x25519/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN ED25519 SECRET CORE$/,/^\/\/ END ED25519 SECRET CORE$/p' stdlib/abla/crypto/ed25519/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN SHA3 SECRET CORE$/,/^\/\/ END SHA3 SECRET CORE$/p' stdlib/abla/crypto/sha3/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN MLKEM SECRET CORE$/,/^\/\/ END MLKEM SECRET CORE$/p' stdlib/abla/crypto/mlkem/entry.ab >> "$cases/fixture.ab"
-sed -n '/^\/\/ BEGIN P384 SECRET CORES$/,/^\/\/ END P384 SECRET CORES$/p' stdlib/abla/crypto/p384/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN P384 SECRET CORES$/,/^\/\/ END P384 SECRET CORES$/p' stdlib/abla/crypto/p384/core.ab >> "$cases/fixture.ab"
 # Source-generated coverage for loops around the previously checked primitives.
 # No production edits or call exemptions: see generator's scope guards.
 # The AES functions that touch a key, as written (their allocating wrappers stay outside, see the generator).
 sed -n '/^\/\/ BEGIN AES KEY EXPANSION$/,/^\/\/ END AES KEY EXPANSION$/p' stdlib/abla/crypto/aes/entry.ab >> "$cases/fixture.ab"
+# aesWipe is in the library's internal file for the AES calls that take an address; the owner-wipe check reads it as written.
+sed -n '/^trusted fun aesWipe(/,/^}/p' stdlib/abla/crypto/aes/raw.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN CHACHA20 POLY1305 SECRET CORES$/,/^\/\/ END CHACHA20 POLY1305 SECRET CORES$/p' stdlib/abla/crypto/chacha20poly1305/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN SHA2 SECRET CORES$/,/^\/\/ END SHA2 SECRET CORES$/p' stdlib/abla/crypto/entry.ab >> "$cases/fixture.ab"
 "$tools_out/source-fixtures" "$project_root" "$cases/crypto-generated.ab"
@@ -415,7 +417,7 @@ header_allocator() {
 # (xtensa_residue_read) are read too.
 residue_read() {
     local entry object="$out/x86-residue.o"
-    "$compiler" build "$out/residue-cases/object-x86.ab" -o "$object" --emit object --no-cache
+    "$compiler" build "$out/residue-cases/object-x86.ab" -o "$object" --emit object --no-cache --stdlib-internals
     llvm-mc -triple x86_64-linux-gnu -filetype=obj "$cases/residue-x86.s" -o "$out/residue-x86.o"
     ld.lld -static -e residue_left "$out/residue-x86.o" -o "$out/residue-x86"
     for entry in residue_left:0 residue_unwiped:0 residue_short:0 residue_pushed:0 residue_clobbered:1 residue_above:0 residue_frame_secret:0 \
@@ -527,7 +529,7 @@ xtensa_residue_read() {
             extra=(--fast); known="$cases/residue-known-xtensa-fast.txt"; read_specs=("${fast_specs[@]}")
         fi
         abla_xtensa_test_build "$compiler" "$tools_directory" build "$out/residue-cases/object.ab" \
-            -o "$out/xtensa-residue-$mode.o" --no-cache --target-triple xtensa-esp-unknown-elf --object-format elf \
+            -o "$out/xtensa-residue-$mode.o" --no-cache --stdlib-internals --target-triple xtensa-esp-unknown-elf --object-format elf \
             --emit object "${extra[@]}"
         $check --follow-calls --residue xtensa "$out/xtensa-residue-$mode.o" "${read_specs[@]}" \
             > "$out/xtensa-residue-$mode.log" 2>&1 || true
@@ -566,7 +568,7 @@ scrub_available_read() {
     for mode in release fast; do
         local extra=()
         [[ $mode == fast ]] && extra=(--fast)
-        "$compiler" build "$cases/scrub-available.ab" -o "$out/scrub-available-$mode" --no-cache "${extra[@]}"
+        "$compiler" build "$cases/scrub-available.ab" -o "$out/scrub-available-$mode" --no-cache --stdlib-internals "${extra[@]}"
         [[ $("$out/scrub-available-$mode") == "scrub available: true" ]] || {
             echo "ct: ctScrubAvailable() isn't true on the host ($mode)" >&2; exit 1
         }
@@ -574,7 +576,7 @@ scrub_available_read() {
     local variant
     for variant in xtensa xtensa-defined; do
         abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/scrub-available-$variant.ab" \
-            -o "$out/scrub-available-$variant.o" --no-cache --target-triple xtensa-esp-unknown-elf --object-format elf \
+            -o "$out/scrub-available-$variant.o" --no-cache --stdlib-internals --target-triple xtensa-esp-unknown-elf --object-format elf \
             --emit object
         llvm-readelf -s "$out/scrub-available-$variant.o" > "$out/scrub-available-$variant.symbols"
         llvm-objdump -d --no-show-raw-insn --mcpu=esp32 --disassemble-symbols=scrub_available \
@@ -724,7 +726,7 @@ frame_view_read() {
 # deterministic worst case, since a collection in the middle of an entry makes it deeper. Controls: a byte left in the
 # red zone is found, and gone after ctScrubStack1024.
 real_entries_run() {
-    "$compiler" build "$cases/residue-run.ab" -o "$out/residue-run" --no-cache
+    "$compiler" build "$cases/residue-run.ab" -o "$out/residue-run" --no-cache --stdlib-internals
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$out/keys-3072.pem" 2> /dev/null
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$out/keys-4096.pem" 2> /dev/null
     # Every supported shape of the password-based entries: PBES2 with a SHA-256 and a SHA-1 PRF, AES-128 and AES-256, an
@@ -949,21 +951,21 @@ xtensa_follow_read() {
 if part x86; then
 # --- x86-64 ---------------------------------------------------------------------------
 for mode in "" --fast; do
-    "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache $mode
+    "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache --stdlib-internals $mode
     "$out/native" || { echo "ct native ${mode:-release}: check $? failed" >&2; exit 1; }
 done
-"$compiler" build "$cases/object-x86.ab" -o "$out/x86.o" --emit object --no-cache
+"$compiler" build "$cases/object-x86.ab" -o "$out/x86.o" --emit object --no-cache --stdlib-internals
 read_target x86_64 "$out/x86.o"
 owner_wipe_read x86_64 "$out/x86.o"
 # A --fast build keeps every Abla call as a call. The checker follows each one into its callee, which is
 # defined in the same object, with the argument secrecy the caller passes.
 # -g: the object is read for secret branches, and without debug information (tools/run-tests.sh builds
 # without it) the fast code differs and ct_fix_arithmetic_u32 reports a branch.
-"$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast.o" --emit object --no-cache --fast -g
+"$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast.o" --emit object --no-cache --stdlib-internals --fast -g
 fast_read x86_64 "$out/x86-fast.o"
 # Without debug info the symbols are hashed. Its findings may only be renamed, never added: each one of a branch
 # to a trap must be a finding the build with debug names as a tag check.
-"$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast-nodebug.o" --emit object --no-cache --fast --no-debug
+"$compiler" build "$cases/object-x86.ab" -o "$out/x86-fast-nodebug.o" --emit object --no-cache --stdlib-internals --fast --no-debug
 fast_read x86_64 "$out/x86-fast-nodebug.o" -nodebug trap
 cmp "$out/x86_64-fast.found" "$out/x86_64-fast-nodebug.found" || {
     echo "ct: the fast build without debug info has other findings than the one with" >&2; exit 1
@@ -985,7 +987,7 @@ division_read
 # the key and big-number allocations, calls the function in the section .text.abla_ct_allocate. (A function that
 # reaches no allocation must not pass, so the control is `main`.) x86-64, AArch64 and Xtensa (below); an unlinked Wasm
 # module has no section to mark the entry.
-"$compiler" build "$cases/alloc-probe.ab" -o "$out/alloc-probe.o" --emit object --no-cache
+"$compiler" build "$cases/alloc-probe.ab" -o "$out/alloc-probe.o" --emit object --no-cache --stdlib-internals
 $check --expect-allocator x86_64 "$out/alloc-probe.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe.log" 2>&1 || {
     cat "$out/alloc-probe.log" >&2; echo "ct: the allocation entry is inlined or not called in a release object" >&2; exit 1
 }
@@ -1006,7 +1008,7 @@ fi
 
 if part aarch64; then
 # --- AArch64 --------------------------------------------------------------------------
-"$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache
+"$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache --stdlib-internals
 llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s -o "$out/aarch64-start.o"
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
 aarch64_run --cpu max -- "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
@@ -1038,7 +1040,7 @@ fi
 
 if part wasm; then
 # --- Wasm: the final module ----------------------------------------------------------
-"$compiler" build "$cases/build.ab" -o "$out/wasm-driver" --no-cache 2> "$out/wasm.log" || { cat "$out/wasm.log" >&2; exit 1; }
+"$compiler" build "$cases/build.ab" -o "$out/wasm-driver" --no-cache --stdlib-internals 2> "$out/wasm.log" || { cat "$out/wasm.log" >&2; exit 1; }
 "$out/wasm-driver"
 node "$cases/run.mjs" "$out/ct.wasm"
 read_target wasm "$out/ct.wasm"
@@ -1055,7 +1057,7 @@ p384_read "$out/ct.wasm" wasm
 # The --fast module keeps every call. Its inline assembly (the barrier of the constant-time primitives) builds on the
 # default in-process route since the WebAssembly asm parser is registered there (tools/test-wasm-ct-barrier.sh);
 # ABLA_KEEP_LLVM_TEXT is unset so that a developer shell with it set cannot hide a regression.
-env -u ABLA_KEEP_LLVM_TEXT "$compiler" build "$cases/build-fast.ab" -o "$out/wasm-fast-driver" --no-cache 2> "$out/wasm-fast.log" || {
+env -u ABLA_KEEP_LLVM_TEXT "$compiler" build "$cases/build-fast.ab" -o "$out/wasm-fast-driver" --no-cache --stdlib-internals 2> "$out/wasm-fast.log" || {
     cat "$out/wasm-fast.log" >&2; exit 1
 }
 fast_read wasm "$out/ct-fast.wasm" "" "" "$cases/fast-known-wasm.txt"
@@ -1066,12 +1068,12 @@ if part xtensa; then
 tools_directory="$out/xtensa-tools"
 . "$project_root/tools/xtensa-test-tools.sh"
 abla_xtensa_test_prepare "$tools_directory"
-abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
+abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache --stdlib-internals \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 read_target xtensa "$out/xtensa.o"
 owner_wipe_read xtensa "$out/xtensa.o"
 # The same probe for Xtensa, whose calls name the entry by relocation against its section.
-abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/alloc-probe.ab" -o "$out/alloc-probe-xtensa.o" --no-cache \
+abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/alloc-probe.ab" -o "$out/alloc-probe-xtensa.o" --no-cache --stdlib-internals \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 $check --expect-allocator xtensa "$out/alloc-probe-xtensa.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe-xtensa.log" 2>&1 || {
     cat "$out/alloc-probe-xtensa.log" >&2; echo "ct: the allocation entry is inlined or not called in an Xtensa object" >&2; exit 1
@@ -1092,7 +1094,7 @@ p384_read "$out/xtensa.o" xtensa
 # The --fast object keeps every call, which the checker follows: all 63 fixtures come out clean (fast-known-xtensa.txt
 # is empty; a fixture the checker can't place would be listed there, class unplaced, see fast_class), and the 16 leak
 # controls are still found in unoptimised code.
-abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa-fast.o" --no-cache \
+abla_xtensa_test_build "$compiler" "$tools_directory" build "$cases/object.ab" -o "$out/xtensa-fast.o" --no-cache --stdlib-internals \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object --fast
 fast_read xtensa "$out/xtensa-fast.o" "" "" "$cases/fast-known-xtensa.txt"
 xtensa_place_read

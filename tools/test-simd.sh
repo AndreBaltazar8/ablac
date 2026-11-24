@@ -148,8 +148,11 @@ echo "ok   compile-time vectors: interp, jit and auto"
 
 for invalid in "$cases"/invalid-*.ab; do
     expected=$(sed -n '1s|^// *||p' "$invalid")
+    # invalid-compile-time names the library's address load (abla/simd/raw.ab), which only the library's own tests may import.
+    internals=()
+    [[ $invalid != */invalid-compile-time.ab ]] || internals=(--stdlib-internals)
     set +e
-    "$compiler" build "$invalid" -o "$out/invalid" --no-cache --fast > "$out/invalid.out" 2>&1
+    "$compiler" build "$invalid" -o "$out/invalid" --no-cache --fast ${internals[@]+"${internals[@]}"} > "$out/invalid.out" 2>&1
     status=$?
     set -e
     if [[ $status -eq 0 ]] || ! grep -qF "$expected" "$out/invalid.out"; then

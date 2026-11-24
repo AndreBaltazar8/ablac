@@ -7,6 +7,7 @@ import "abla/ct"
 import "abla/ct/scrub"
 import "abla/crypto"
 import "abla/crypto/bignum"
+import "raw.ab"
 import "abla/crypto/der"
 import "abla/random"
 import "abla/text"
@@ -476,13 +477,6 @@ trusted fun rsaPrivateOperation(key: RsaPrivateKey, value: string): CryptoResult
     result
 }
 
-/** `out` = a * b mod the modulus, all in plain form. */
-trusted fun rsaMultiplyPlain(modulus: BnModulus, out: int, a: int, b: int): void {
-    val encoded = bnAllocate(modulus.words)
-    bnEncode(modulus, encoded, a)
-    bnMultiply(modulus, out, encoded, b)
-    bnRelease(encoded, modulus.words)
-}
 
 /** A random factor and its inverse, without inverting anything secret: r * t, with t random, is what gets
  *  inverted, in variable time, and then r^-1 = (r * t)^-1 * t. False if there's no randomness. */
@@ -525,71 +519,13 @@ trusted fun rsaBlindingFactors(key: RsaPrivateKey, modulus: BnModulus, factor: i
 }
 
 // A value allowed to be known, as limbs for the variable-time inverse.
-trusted fun rsaPublicLimbs(address: int, words: int): array<int> {
+private trusted fun rsaPublicLimbs(address: int, words: int): array<int> {
     val limbs: array<int> = []
     for (i in 0 until words) limbs.append(ablaUnsafeLoadU32(bnPointer(address + i * 4)) &
         4294967295)
     limbs
 }
 
-/** `out` = `value` ^ d mod n, by CRT with fixed-window exponents. */
-trusted fun rsaCrt(key: RsaPrivateKey, modulus: BnModulus, out: int, value: int): void {
-    val words = key.primeWords
-    val p = rsaModulusFromLimbs(key.primeP(), words)
-    val q = rsaModulusFromLimbs(key.primeQ(), words)
-    val m1 = bnAllocate(words)
-    val m2 = bnAllocate(words)
-    val h = bnAllocate(words)
-    val wide = words * 2
-    val nWords = modulus.words
-    val padded = bnAllocate(wide)
-    bnCopy(padded, value, nWords)
-    rsaReduceWide(p, m1, padded)
-    rsaReduceWide(q, m2, padded)
-    bnExpSecret(p, m1, m1, key.exponentP(), words * 32)
-    bnExpSecret(q, m2, m2, key.exponentQ(), words * 32)
-    // h = qInverse * (m1 - m2) mod p, with m2 first reduced mod p: q may be the larger.
-    val m2p = bnAllocate(words)
-    bnEncode(p, m2p, m2)
-    bnDecode(p, m2p, m2p)
-    var borrow = secretU32(u32(0))
-    for (j in 0 until words) {
-        val x = bnLoad(m1 + j * 4)
-        val y = bnLoad(m2p + j * 4)
-        val difference = x - y - borrow
-        borrow = ((~x & y) | ((~x | y) & difference)) >> 31
-        bnStore(h + j * 4, difference)
-    }
-    // Add p back if that went below zero.
-    val negative = ctFromLowBit(borrow)
-    var carry = secretU32(u32(0))
-    for (j in 0 until words) {
-        val x = bnLoad(h + j * 4)
-        val y = bnLoad(p.value() + j * 4) & negative
-        val sum = x + y + carry
-        carry = ((x & y) | ((x | y) & ~sum)) >> 31
-        bnStore(h + j * 4, sum)
-    }
-    rsaMultiplyPlain(p, h, h, key.inverseQ())
-    // out = m2 + h * q, which is below the modulus, whatever room the product had.
-    bnMultiplyPlain(padded, h, words, key.primeQ(), words)
-    carry = secretU32(u32(0))
-    for (j in 0 until wide) {
-        val x = bnLoad(padded + j * 4)
-        val y = if (j < words) bnLoad(m2 + j * 4) else secretU32(u32(0))
-        val sum = x + y + carry
-        carry = ((x & y) | ((x | y) & ~sum)) >> 31
-        bnStore(padded + j * 4, sum)
-    }
-    bnCopy(out, padded, nWords)
-    bnRelease(padded, wide)
-    bnRelease(m1, words)
-    bnRelease(m2, words)
-    bnRelease(m2p, words)
-    bnRelease(h, words)
-    bnModulusRelease(p)
-    bnModulusRelease(q)
-}
 
 // Returns a bignum modulus from the specified readable limbs and clears the temporary byte encoding.
 trusted fun rsaModulusFromLimbs(limbs: int, words: int): BnModulus {
@@ -602,25 +538,6 @@ trusted fun rsaModulusFromLimbs(limbs: int, words: int): BnModulus {
     modulus
 }
 
-/** `out` = `value`, of 2 * words limbs, mod the modulus: low + high * 2^k, by multiplying each part. */
-trusted fun rsaReduceWide(modulus: BnModulus, out: int, value: int): void {
-    val words = modulus.words
-    val high = bnAllocate(words)
-    // A multiplication by 2^2k mod m is one by 2^k: high * 2^k as it stands, and low made plain again.
-    bnMultiply(modulus, high, value + words * 4, modulus.square())
-    bnEncode(modulus, out, value)
-    bnDecode(modulus, out, out)
-    var carry = secretU32(u32(0))
-    for (j in 0 until words) {
-        val x = bnLoad(out + j * 4)
-        val y = bnLoad(high + j * 4)
-        val sum = x + y + carry
-        carry = ((x & y) | ((x | y) & ~sum)) >> 31
-        bnStore(out + j * 4, sum)
-    }
-    bnConditionalSubtractBody(out, out, carry, modulus.value(), words, modulus.scratch())
-    bnRelease(high, words)
-}
 
 // --- EMSA-PKCS1-v1_5 --------------------------------------------------------------------------
 

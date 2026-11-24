@@ -435,13 +435,20 @@ three modes. A repository whose scripts call the compiler many times sets `visib
 in its abla.toml instead, which every one of those calls reads. Both are deprecated: each prints one
 `warning[W_FLAT_IMPORTS_DEPRECATED]` per build (the flag's even from the cache), naming the flag or the
 manifest, and `ABLA_ALLOW_FLAT_IMPORTS=1` silences it ([packages](packages.md)). An `E_NAME_NOT_IMPORTED` in a module strict only by default has a
-second `help:` line naming the opt-out. `build --strict-imports=warn` leaves those modules flat and prints,
+second `help:` line naming the opt-out. A standard-library module's other file than its entry (`// public: none`) is internal to the library
+in every mode, flat ones too: its names are not a program's, however it imports (language.md, "internal"). `build --strict-imports=warn` leaves those modules flat and prints,
 as a warning, each diagnostic `--strict-imports` would give them, with the
 same place and `help:` line: a name of a module they don't import, an
 extension function, operator or overload of one, a name two imports pass on
 through `export import`. Each is printed once, and the build doesn't use the
 cache (the warnings come from the front end). A package that sets
-`visibility` is not affected. `build --visibility-report <file>` builds as usual, without the
+`visibility` is not affected.
+
+`--stdlib-internals` (`build`, `run`, `test`) exists for the standard library's own tests and tools: with it, a program can `import "abla/crypto/p256/core.ab"`,
+a file of the library that no program may import otherwise, and sees what it declares. **Programs must not use it.** Only the
+command line sets it (no manifest key, environment variable or source comment, and the analysis service and the editor never
+see it); a build with it prints `stdlib internals visible: test/tool builds only` on stderr, never uses the build cache, and
+a dependency's own build doesn't inherit it. Without it the same program fails with `E_NAME_NOT_IMPORTED`. `build --visibility-report <file>` builds as usual, without the
 cache, and writes to `<file>` one tab-separated line per name a module would
 lose under strict imports: module, line, column, name, declaring module and
 the import to add, and a line with a seventh column, `member` or `overload`,

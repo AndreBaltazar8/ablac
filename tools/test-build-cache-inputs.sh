@@ -69,6 +69,13 @@ cat > "$out/flat.ab" <<'ABLA'
 import "flat-mid.ab"
 fun main: int = answer()
 ABLA
+cat > "$out/internals.ab" <<'ABLA'
+import "abla/crypto/aes/raw.ab"
+fun main: int {
+    aesWipe(0, 0)
+    42
+}
+ABLA
 cat > "$out/warnings.ab" <<'ABLA'
 private fun unused(): int = 1
 fun answer(ignored: int): int {
@@ -117,6 +124,10 @@ test_case() {
             expected=1; diagnostic=E_NAME_NOT_IMPORTED ;;
         strict-warn) input="$out/flat.ab"; before_flags+=(--flat-imports); after_flags+=(--strict-imports=warn)
             diagnostic='warning[E_NAME_NOT_IMPORTED]' ;;
+        # A build with --stdlib-internals is never cached (bypass): the same program built next without the flag, from the same cache, must
+        # not find it, and fail as the library's internal file it imports (no program may) does.
+        stdlib-internals) input="$out/internals.ab"; before_flags+=(--stdlib-internals)
+            expected=1; diagnostic=E_IMPORT_NOT_FOUND ;;
         warnings-env) input="$out/unused.ab"; before_env=(ABLA_WARN_UNUSED_IMPORTS=0); after_env=(ABLA_WARN_UNUSED_IMPORTS=1)
             diagnostic=W_UNUSED_IMPORT ;;
         warnings-flag) input="$out/unused.ab"; before_flags+=(--no-warn-unused-imports)

@@ -112,7 +112,7 @@ SHA-3 and SHAKE ([FIPS 202](https://csrc.nist.gov/pubs/fips/202/final)): the Kec
 |---|---|
 | `sha3256(input)`, `sha3512(input)` | the 32- and 64-byte digests |
 | `shake128(input, size)`, `shake256(input, size)` | `size` bytes of output |
-| `keccakSha3(rate)`, `keccakShake128()`, `keccakShake256()` | a `Keccak` sponge: `absorb(text)` / `absorbAt(address, count)`, then `squeeze(count)` / `squeezeTo(address, count)` as often as needed, and `close()` (wipes the state) |
+| `keccakSha3(rate)`, `keccakShake128()`, `keccakShake256()` | a `Keccak` sponge: `absorb(text)`, then `squeeze(count)` as often as needed (`absorbAt` and `squeezeTo`, which take an address, are the library's own, in `abla/crypto/sha3/raw.ab`), and `close()` (wipes the state) |
 
 The permutation is exclusive-or, and, not and rotation by constant amounts on 64-bit lanes: no table, branch or division on a lane,
 so it is constant time by construction; `tools/test-ct.sh` reads it (`BEGIN SHA3 SECRET CORE`), a leaky twin must be found.

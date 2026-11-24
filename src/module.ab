@@ -94,9 +94,11 @@ fun bootstrapResolveImport(importer: string, requested: string): string {
     var result = Path(importer).parent().child(requested).text
     if (Path(requested).isAbsolute()) result = requested
     if (requested.size >= 5 && requested.slice(0, 5) == "abla/") {
-        result = Path(bootstrapStandardLibraryRoot()).child(requested).child(
-            "entry.ab"
-        ).text
+        // `--stdlib-internals`: `import "abla/crypto/p256/core.ab"` is that file of the library (its tests and tools), which no
+        // program can import otherwise.
+        result = if (bootstrapStdlibInternals && requested.endsWith(".ab"))
+            Path(bootstrapStandardLibraryRoot()).child(requested).text
+            else Path(bootstrapStandardLibraryRoot()).child(requested).child("entry.ab").text
     }
     val package = bootstrapResolvePackageImport(importer, requested)
     if (package != "") result = package
@@ -3727,6 +3729,14 @@ fun bootstrapValidateStrictImports(
     // The modules `--strict-imports=warn` covers: checked as strict, warned about, built flat.
     val warned: array<bool> = []
     var anyStrict = false
+    // A flat module of the program is checked for the names of the library's internal files and for no others.
+    val flatInternal: array<bool> = []
+    var anyInternalFile = false
+    if (!bootstrapStdlibInternals) {
+        for (snapshot in snapshots) {
+            if (bootstrapStandardLibraryModuleSource(snapshot.path) && !snapshot.path.endsWith("/entry.ab")) anyInternalFile = true
+        }
+    }
     for (snapshot in snapshots) {
         val found = bootstrapModuleStrict(snapshot.path)
         val warn = !found && bootstrapModuleStrictWarned(snapshot.path)
@@ -3738,6 +3748,10 @@ fun bootstrapValidateStrictImports(
             !bootstrapStandardLibraryModuleSource(snapshot.path) &&
             !snapshot.path.startsWith("<")))
         if (found || warn) anyStrict = true
+        val flatChecked = anyInternalFile && !found && !warn && !asStrict[asStrict.size - 1] &&
+            !bootstrapStandardLibraryModuleSource(snapshot.path) && !snapshot.path.startsWith("<")
+        flatInternal.append(flatChecked)
+        if (flatChecked) anyStrict = true
     }
     if (!anyStrict && !report) return BootstrapImportAliasValidation(0, "")
     val strictSummary = bootstrapAliasSummary(aliases, snapshots, Map())
@@ -3826,10 +3840,9 @@ fun bootstrapValidateStrictImports(
     module = 0
     while (module < snapshots.size) {
         val snapshot = snapshots[module]
-        if (asStrict[module]) {
-            val visible = bootstrapStrictVisibleModules(
-                module, edges, snapshots, asStrict
-            )
+        if (asStrict[module] || flatInternal[module]) {
+            val visible = if (flatInternal[module]) bootstrapFlatVisibleModules(module, snapshots)
+                else bootstrapStrictVisibleModules(module, edges, snapshots, asStrict)
             tableVisible[module] = bootstrapStrictBits(visible)
             tableMemberVisible[module] = bootstrapStrictBits(
                 bootstrapStrictVisibleModules(module, edges, snapshots, asStrict, true)
@@ -3880,8 +3893,8 @@ fun bootstrapValidateStrictImports(
                     finding.declaring, aliases, snapshots
                 ) else spelling
                 // (A report-only module has no diagnostic: the report line is all it gives.)
-                val diagnostic = if (!strict[module] && !warned[module]) "" else if (internal)
-                    "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is internal to the standard library (declared in ${snapshots[finding.declaring].path}); no import makes it visible\n${bootstrapInternalPublicHint(snapshots[finding.declaring].source)}help: a library module that offers it would be a change to the standard library to request\n${bootstrapStrictOptOutHelp(snapshot.path)}source[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                val diagnostic = if (!strict[module] && !warned[module] && !flatInternal[module]) "" else if (internal)
+                    "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is internal to the standard library (declared in ${snapshots[finding.declaring].path}); no import makes it visible\n${bootstrapInternalPublicHint(snapshots[finding.declaring].source)}help: a library module that offers it would be a change to the standard library to request\nsource[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
                 else
                     "error[E_NAME_NOT_IMPORTED]: `${finding.name}` is declared in ${snapshots[finding.declaring].path}, which this module doesn't import\nhelp: add: import \"$spelling\"\n${bootstrapStrictOptOutHelp(snapshot.path)}source[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
                 val reportLine =
@@ -3889,11 +3902,11 @@ fun bootstrapValidateStrictImports(
                 if (finding.deferred) {
                     bootstrapStrictDeferredFindings.append(BootstrapStrictDeferredFinding(
                         snapshot.path, finding.name, finding.begin,
-                        if (strict[module]) 1 else if (warned[module]) 3 else 0,
+                        if (strict[module] || flatInternal[module]) 1 else if (warned[module]) 3 else 0,
                         diagnostic, reportLine
                     ))
                 } else {
-                    if (strict[module]) {
+                    if (strict[module] || flatInternal[module]) {
                         errors = errors + 1
                         diagnostics = "$diagnostics$diagnostic"
                     } else if (warned[module]) bootstrapStrictImportWarning(diagnostic)
@@ -4186,6 +4199,11 @@ fun bootstrapInternalPublicHint(source: string): string {
 fun bootstrapLibraryInternalFile(importer: string, target: string): bool =
     bootstrapStandardLibraryModuleSource(target) && !target.endsWith("/entry.ab") &&
         !bootstrapStandardLibraryModuleSource(importer)
+
+/** Whether a flat module of the program may not see `target`: a library's internal file is no API, however the program is built
+ *  (`--stdlib-internals` opens it for the library's own tests and tools). A module the compiler makes up (`<…>`) is the library's. */
+fun bootstrapFlatHidesInternal(importer: string, target: string): bool =
+    !bootstrapStdlibInternals && !importer.startsWith("<") && bootstrapLibraryInternalFile(importer, target)
 
 /** The import of the nearest standard-library entry module whose imports reach
  *  the library file `target`; the file's own name when none does. */
@@ -6078,3 +6096,15 @@ fun bootstrapSourceNamesWord(source: string, word: string): bool {
     false
 }
 
+
+/** What a flat module sees for the check of the library's internal files: every module of the program but those it may not see
+ *  (bootstrapFlatHidesInternal), so the names the check finds are the internal ones and no other. */
+fun bootstrapFlatVisibleModules(module: int, snapshots: array<BootstrapModuleSnapshot>): array<bool> {
+    val visible = filledArray(snapshots.size, true)
+    var index = 0
+    while (index < snapshots.size) {
+        if (bootstrapFlatHidesInternal(snapshots[module].path, snapshots[index].path)) visible[index] = false
+        index = index + 1
+    }
+    visible
+}

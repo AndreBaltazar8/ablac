@@ -1,4 +1,4 @@
-// AES-GCM with a key expanded once (aesGcmKeyNew, aesGcmSealWithKey, aesGcmOpenWithKey) against the call that expands it every time (aesGcmEncrypt, aesGcmDecrypt): the same bytes over random keys
+// AES-GCM with a key expanded once (aesGcmKeyOwner, its seal and open) against the call that expands it every time (aesGcmEncrypt, aesGcmDecrypt): the same bytes over random keys
 // (16, 24 and 32 bytes), lengths 0 to 300 and around the block and batch sizes, associated data of several lengths, one key used for many records; each opens the other's, and
 // an altered record, nonce, associated data or length is refused by both. Also the speed of a 32-byte record both ways. Prints "aes-gcm keyed ok".
 import "abla/io"
@@ -32,8 +32,8 @@ fun main: int {
     val lengths = [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129, 255, 256, 300, 1000, 4096, 16384]
     for (keySize in [16, 24, 32]) {
         val key = random(keySize)
-        val expanded = aesGcmKeyNew(key)
-        if (expanded == 0) continue
+        val expanded = aesGcmKeyOwner(key)
+        if (expanded == null) continue
         for (length in lengths) {
             for (aadSize in [0, 5, 16, 33]) {
                 val nonce = random(12)
@@ -43,12 +43,12 @@ fun main: int {
                 aesSetHardware(false)
                 val reference = aesGcmEncrypt(key, nonce, plain, aad)
                 aesSetHardware(true)
-                val keyed = aesGcmSealWithKey(expanded, keySize, nonce, plain, aad)
+                val keyed = sealWith(expanded, nonce, plain, aad)
                 if (!reference.ok || !keyed.ok || reference.bytes != keyed.bytes) {
                     fail("seal key $keySize length $length aad $aadSize")
                     continue
                 }
-                val opened = aesGcmOpenWithKey(expanded, keySize, nonce, reference.bytes, aad)
+                val opened = openWith(expanded, nonce, reference.bytes, aad)
                 if (!opened.ok || opened.bytes != plain) fail("open key $keySize length $length aad $aadSize")
                 aesSetHardware(false)
                 val other = aesGcmDecrypt(key, nonce, keyed.bytes, aad)
@@ -57,29 +57,34 @@ fun main: int {
                 // Refusals.
                 val at = next() % reference.bytes.size
                 val bent = reference.bytes.slice(0, at) + cryptoByteString([reference.bytes[at] ^ 1]) + reference.bytes.slice(at + 1, reference.bytes.size)
-                if (aesGcmOpenWithKey(expanded, keySize, nonce, bent, aad).ok || aesGcmDecrypt(key, nonce, bent, aad).ok) fail("an altered record was accepted: key $keySize length $length")
-                if (aesGcmOpenWithKey(expanded, keySize, random(12), reference.bytes, aad).ok) fail("another nonce was accepted")
-                if (aesGcmOpenWithKey(expanded, keySize, nonce, reference.bytes, aad + "x").ok) fail("other associated data was accepted")
-                if (reference.bytes.size > 16 && aesGcmOpenWithKey(expanded, keySize, nonce, reference.bytes.slice(0, reference.bytes.size - 1), aad).ok) fail("a short record was accepted")
+                if (openWith(expanded, nonce, bent, aad).ok || aesGcmDecrypt(key, nonce, bent, aad).ok) fail("an altered record was accepted: key $keySize length $length")
+                if (openWith(expanded, random(12), reference.bytes, aad).ok) fail("another nonce was accepted")
+                if (openWith(expanded, nonce, reference.bytes, aad + "x").ok) fail("other associated data was accepted")
+                if (reference.bytes.size > 16 && openWith(expanded, nonce, reference.bytes.slice(0, reference.bytes.size - 1), aad).ok) fail("a short record was accepted")
             }
         }
-        if (aesGcmSealWithKey(expanded, keySize, "short", "x", "").ok) fail("a nonce of the wrong size was accepted")
-        if (aesGcmOpenWithKey(expanded, keySize, random(12), "tiny", "").ok) fail("a record shorter than its tag was accepted")
-        aesGcmKeyFree(expanded, keySize)
+        if (sealWith(expanded, "short", "x", "").ok) fail("a nonce of the wrong size was accepted")
+        if (openWith(expanded, random(12), "tiny", "").ok) fail("a record shorter than its tag was accepted")
     }
     val key = random(16)
-    val expanded = aesGcmKeyNew(key)
+    val expanded = aesGcmKeyOwner(key)
     val nonce = random(12)
     val small = random(32)
     var t = monotonicNanoseconds()
     for (i in 0 until 2000) aesGcmEncrypt(key, nonce, small, "aad")
     val plainNanos = (monotonicNanoseconds() - t) / 2000
     t = monotonicNanoseconds()
-    for (i in 0 until 2000) aesGcmSealWithKey(expanded, 16, nonce, small, "aad")
+    for (i in 0 until 2000) sealWith(expanded, nonce, small, "aad")
     val keyedNanos = (monotonicNanoseconds() - t) / 2000
-    aesGcmKeyFree(expanded, 16)
     println("32-byte record: expanding each time $plainNanos ns, expanded once $keyedNanos ns")
     if (failures > 0) return 1
     println("aes-gcm keyed ok")
     0
 }
+
+// The kept key is read through a parameter (see tlsGcmSeal in abla/tls/pure/record): a resource field or local would be moved by the call.
+fun sealWith(key: AesGcmKey?, nonce: string, plaintext: string, aad: string): CryptoResult =
+    key?.seal(nonce, plaintext, aad) ?? CryptoResult("", false, "no key")
+
+fun openWith(key: AesGcmKey?, nonce: string, sealed: string, aad: string): CryptoResult =
+    key?.open(nonce, sealed, aad) ?? CryptoResult("", false, "no key")
