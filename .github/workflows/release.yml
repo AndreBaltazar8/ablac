@@ -48,10 +48,49 @@ permissions:
   contents: read
 
 jobs:
-  compiler:
-    if: ${{ inputs.windows != 'only' && inputs.windows != 'fixpoint' && inputs.windows_arm64 != 'only' && inputs.windows_arm64 != 'fixpoint' }}
+  # A draft bridge release is visible only to a token with push access. This job alone holds it: it copies the bridge assets into one
+  # artifact (it checks nothing out, so no script of any tree runs with the token), and the compiler jobs, which run the scripts of
+  # the tree they check out (the tag, or source_ref when testing), hold only contents: read and take the assets from the artifact.
+  bridge:
+    if: ${{ inputs.bridge_release != '' && inputs.windows != 'only' && inputs.windows != 'fixpoint' && inputs.windows_arm64 != 'only' && inputs.windows_arm64 != 'fixpoint' }}
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
+    steps:
+      - name: Download the bridge assets
+        env:
+          BRIDGE_RELEASE: ${{ inputs.bridge_release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir bridge
+          release_id=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$BRIDGE_RELEASE\") | .id" \
+            | sed -n '1p')
+          test -n "$release_id"
+          for asset_name in \
+            ablac-x86_64-linux.bridge ablac-x86_64-linux.bridge.sha256 \
+            ablac-x86_64-macos.o ablac-x86_64-macos.o.sha256 \
+            ablac-arm64-macos.o ablac-arm64-macos.o.sha256
+          do
+            asset_id=$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
+              --jq ".[] | select(.name == \"$asset_name\") | .id")
+            test -n "$asset_id"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              > "bridge/$asset_name"
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bridge-assets
+          path: bridge/*
+          if-no-files-found: error
+          retention-days: 1
+
+  compiler:
+    needs: bridge
+    if: ${{ !cancelled() && !failure() && inputs.windows != 'only' && inputs.windows != 'fixpoint' && inputs.windows_arm64 != 'only' && inputs.windows_arm64 != 'fixpoint' }}
     strategy:
       fail-fast: false
       matrix:
@@ -92,42 +131,26 @@ jobs:
       - if: matrix.platform == 'macos'
         name: Install the pinned patched native LLVM toolchain
         run: tools/install-macos-llvm.sh
+      - if: ${{ inputs.bridge_release != '' }}
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: bridge-assets
+          path: build/bridge
       - name: Prepare the bootstrap compiler
         env:
           BRIDGE_RELEASE: ${{ inputs.bridge_release }}
-          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           if [[ -z "$BRIDGE_RELEASE" ]]; then
             tools/bootstrap-compiler.sh build/bootstrap-ablac
           else
-            mkdir -p build/bridge
-            release_id=$(gh api --paginate \
-              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              --jq ".[] | select(.tag_name == \"$BRIDGE_RELEASE\") | .id" \
-              | sed -n '1p')
-            test -n "$release_id"
-            download_bridge_asset() {
-              local asset_name=$1
-              local asset_id
-              asset_id=$(gh api \
-                "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
-                --jq ".[] | select(.name == \"$asset_name\") | .id")
-              test -n "$asset_id"
-              gh api -H 'Accept: application/octet-stream' \
-                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
-                > "build/bridge/$asset_name"
-            }
+            test -d build/bridge
             if [[ "${{ matrix.platform }}" == linux ]]; then
               bridge=ablac-x86_64-linux.bridge
-              download_bridge_asset "$bridge"
-              download_bridge_asset "$bridge.sha256"
               (cd build/bridge && sha256sum --check "$bridge.sha256")
               cp "build/bridge/$bridge" build/bootstrap-ablac
             else
               bridge=${{ matrix.asset }}.o
-              download_bridge_asset "$bridge"
-              download_bridge_asset "$bridge.sha256"
               (cd build/bridge && shasum -a 256 --check "$bridge.sha256")
               llvm_prefix=$ABLA_LLVM
               openssl_prefix=$(brew --prefix openssl@3)
@@ -486,11 +509,12 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
           persist-credentials: false
+      # One directory per artifact (no merge-multiple: a file name two artifacts share would let the later one overwrite the earlier
+      # silently); the check step below refuses a shared name and then flattens them into release/.
       - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
         with:
           pattern: ablac-*
-          path: release
-          merge-multiple: true
+          path: release-parts
       - name: Check the build, make the bill of materials and sign the release
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -498,6 +522,10 @@ jobs:
           RELEASE_WINDOWS_ARM64: ${{ inputs.windows_arm64 }}
           ABLA_RELEASE_SIGNING_KEY: ${{ secrets.ABLA_RELEASE_SIGNING_KEY }}
         run: |
+          shared=$(find release-parts -type f -printf '%f\n' | sort | uniq -d)
+          test -z "$shared" || { printf 'the same file name in two artifacts: %s\n' "$shared" >&2; exit 1; }
+          mkdir release
+          find release-parts -type f -exec mv -t release {} +
           test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
           test "$(cat release/static-suite-source.sha)" = "$(git rev-parse HEAD)"
           (cd release && sha256sum -c ablac-x86_64-linux.sha256)

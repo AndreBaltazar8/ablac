@@ -13,6 +13,9 @@
 #      poison for a release to consume).
 #   9. release.yml: the `compiler` and `publish` jobs refuse `source_ref` (a branch or commit built to test the workflow) with
 #      `publish_release` on, as their first step: a published release is built from its tag only;
+#   3b. in release.yml only the bridge job (a draft release is visible to a push token only; it checks nothing out) and the publish job
+#      hold a write permission: the build jobs run the scripts of the tree they check out (the tag, or source_ref when testing);
+#  11. release.yml downloads its artifacts without merge-multiple (a file name two artifacts share would be overwritten silently);
 #  10. a Nix installer is fetched and checked against a pinned sha256 (the local action .github/actions/install-nix) in the
 #      workflows that build release assets (release.yml, static-suite.yml, windows-x64-toolchain.yml, windows-arm64-toolchain.yml),
 #      never by cachix/install-nix-action alone.
@@ -63,6 +66,13 @@ if [[ ${1:-} == --controls ]]; then
     workflow workflow_dispatch '  contents: read' '' cachix/install-nix-action "$pin" false '${{ inputs.x }}' 'echo "$X"' ubuntu-24.04 > "$cp_dir/windows-x64-toolchain.yml"
     if "$0" "$cp_dir" > "$work/out" 2>&1; then echo "workflow security control 'direct nix action': accepted" >&2; exit 1; fi
     grep -q 'used directly' "$work/out" || { cat "$work/out" >&2; echo "workflow security control 'direct nix action': wrong refusal" >&2; exit 1; }
+    rm -rf "$work/w"; mkdir "$work/w"
+    printf 'name: r\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  compiler:\n    permissions:\n      contents: write\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@%s\n        with:\n          persist-credentials: false\n' "$pin" > "$work/w/release.yml"
+    if "$0" "$work/w" > "$work/out" 2>&1; then echo "workflow security control 'compiler write': accepted" >&2; exit 1; fi
+    grep -q 'only the bridge and publish jobs' "$work/out" || { cat "$work/out" >&2; echo "workflow security control 'compiler write': wrong refusal" >&2; exit 1; }
+    printf 'name: r\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  publish:\n    runs-on: ubuntu-24.04\n    steps:\n      - env:\n          SOURCE_REF: ${{ inputs.source_ref }}\n        run: test -z "$SOURCE_REF"\n      - uses: actions/download-artifact@%s\n        with:\n          merge-multiple: true\n' "$pin" > "$work/w/release.yml"
+    if "$0" "$work/w" > "$work/out" 2>&1; then echo "workflow security control 'merge-multiple': accepted" >&2; exit 1; fi
+    grep -q 'merge-multiple hides' "$work/out" || { cat "$work/out" >&2; echo "workflow security control 'merge-multiple': wrong refusal" >&2; exit 1; }
     # The release environment rule: the signing key's job names it.
     release_workflow() { # environment-line
         printf 'name: r\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  publish:\n    runs-on: ubuntu-24.04\n%s    steps:\n      - env:\n          SOURCE_REF: ${{ inputs.source_ref }}\n        run: test -z "$SOURCE_REF"\n      - uses: actions/checkout@%s\n        with:\n          persist-credentials: false\n      - env:\n          ABLA_RELEASE_SIGNING_KEY: ${{ secrets.ABLA_RELEASE_SIGNING_KEY }}\n        run: test -n "$ABLA_RELEASE_SIGNING_KEY"\n' "$1" "$pin"
@@ -121,6 +131,11 @@ for file in "${files[@]}"; do
         else
             bad=$(grep -v -E '(contents|id-token|attestations):[[:space:]]*write' <<< "$writes" || true)
             [[ -z $bad ]] || fail "$name: a write permission other than contents, id-token, attestations: $bad"
+            wide=$(awk '
+                /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job = $1; sub(/:$/, "", job); next }
+                /^      [a-z-]+:[[:space:]]*write[[:space:]]*$/ { if (job != "bridge" && job != "publish") printf "%s ", job }
+            ' "$file")
+            [[ -z $wide ]] || fail "$name: job(s) $wide hold a write permission (only the bridge and publish jobs may)"
         fi
     fi
     # 4. pinned actions
@@ -166,6 +181,10 @@ for file in "${files[@]}"; do
             END { n = split("compiler publish", want, " "); for (i = 1; i <= n; i++) if ((want[i] in seen) && !(want[i] in checked)) printf "%s ", want[i] }
         ' "$file")
         [[ -z $unchecked ]] || fail "$name: job(s) $unchecked do not refuse source_ref with publish_release on"
+    fi
+    # 11. no merge-multiple in release.yml
+    if [[ $name == release.yml ]] && grep -n -E '^[[:space:]]+merge-multiple:' "$file" > /dev/null; then
+        fail "$name: merge-multiple hides a file name that two artifacts share"
     fi
     # 10. the workflows that build release assets install Nix through the hash-pinned local action
     case $name in

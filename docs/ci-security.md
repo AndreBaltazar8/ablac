@@ -14,6 +14,8 @@ checks the rules below on every workflow (`--controls` shows each rule refusing 
 | No `${{ inputs.* }}`, `github.event.*` or `github.head_ref` inside a `run:` script | The expression is pasted into the script before the shell parses it, so a value is code. Pass it through `env:`. |
 | No `actions/cache`, no `cache:` key, no self-hosted runner | Nothing a pull request writes is read back by a later run. Every runner is a fresh GitHub-hosted machine, and Nix builds from `cache.nixos.org` (the default key) with nixpkgs pinned to a commit (`nix/nixpkgs.nix`). |
 | `source_ref` is refused with `publish_release` on (`release.yml`, the `compiler` and `publish` jobs, first step) | `source_ref` builds a branch or commit to test the workflow, and the build jobs run the scripts of the tree they check out with a `contents: write` token; the publish job signs what those jobs uploaded. A published release is built from its tag, the tag ruleset's object. |
+| In `release.yml` only the `bridge` and `publish` jobs hold a write permission | The build jobs (`compiler` on three runners, the Windows toolchains) run the scripts of the tree they check out: the tag, or `source_ref` when testing. They hold `contents: read`. A draft bridge release is visible only to a token with push access, so the `bridge` job alone (no checkout, nothing of any tree runs in it) reads it and passes the assets on as the `bridge-assets` artifact. |
+| `release.yml` downloads artifacts without `merge-multiple` | Merging into one directory lets an artifact overwrite a file of another with the same name without a trace. The publish job downloads one directory per artifact, refuses a file name two artifacts share and then flattens them into `release/`. |
 | The workflows that build release assets install Nix through `./.github/actions/install-nix` (`release.yml`, `static-suite.yml`, `windows-x64-toolchain.yml`, `windows-arm64-toolchain.yml`) | `cachix/install-nix-action` pins the Nix version (2.35.2 in the pinned commit) but fetches the installer script over TLS. The script holds the sha256 of the Nix archive it installs, so the local action checks the script against a pinned sha256 and hands the checked file to the action (`install_url: file://...`); the SBOM records it. Bump the version, the hash and the action pin together. |
 
 ## What a release consumes
@@ -33,6 +35,15 @@ checks the rules below on every workflow (`--controls` shows each rule refusing 
     not what ships. Pinning a bottle by hand would make the build depend on a bottle Homebrew may withdraw.
 - `nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/<commit>.tar.gz` in the workflows is fetched without a hash
   for `<nixpkgs>` lookups; the build itself uses `nix/nixpkgs.nix`, which carries the hash.
+
+## Limits worth knowing
+
+- The local action `.github/actions/install-nix` and the `release.yml` of a tag come from the tag's own tree when a job checks it out: a tag made before
+  they existed (before v0.2.69) cannot be released again with this workflow (the job cannot find the action). Re-releasing an old tag uses the
+  workflow files of that tag's time, or a new tag.
+- Real cuts dispatch the Release workflow with `publish_release` off, and `source_ref` when the tag is not yet pushed, and publish from the
+  maintainer's machine (docs/bootstrap.md, "Signed releases"). The refusal of `source_ref` with `publish_release` on applies to
+  the workflow's own publish path, which that flow does not use.
 
 ## Settings that are not in the repository
 
