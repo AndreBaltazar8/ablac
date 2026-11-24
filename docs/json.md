@@ -22,6 +22,43 @@ fun main {
 // {"name":"Abla","versions":[1,2.5e1]}
 ```
 
+## Decoding with a typed outcome
+
+`jsonParse` answers with a `JsonParseResult` whose `value` is JSON null when the input is bad, so a caller that skips `succeeded` reads a null.
+`jsonDecode` answers with a sealed `JsonDecoded`, and a `when` over it has to say what each case does (a case left out is `when.non-exhaustive`):
+
+| Case | When | Fields |
+|---|---|---|
+| `JsonParsed` | one JSON value within the limits | `value: Json` |
+| `JsonMalformed` | not JSON, or against a rule the limits don't govern: `unexpected_token`, `unexpected_end`, `invalid_number`, `trailing_input`, `invalid_unicode`, `duplicate_key` | `error: JsonError` |
+| `JsonLimitExceeded` | more than `JsonLimits` allow, however well formed: `input_limit`, `node_limit`, `depth_limit` | `error: JsonError` |
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun describe(source: string): string {
+    val decoded = jsonDecode(source)
+    return when (decoded) {
+        is JsonParsed -> "a value of kind ${decoded.value.kind}"
+        is JsonMalformed -> "bad input: ${decoded.error.message}"
+        is JsonLimitExceeded -> "too large: ${decoded.error.message}"
+    }
+}
+
+fun main {
+    println(describe("[1,2]"))
+    println(describe("[1,"))
+}
+// output:
+// a value of kind 4
+// bad input: expected JSON value
+```
+
+The two failure cases carry the `JsonError` that `jsonParse` reports for the same input and limits (code, message, byte offset, line, column), so a server
+can answer 400 for malformed input and 413 for a limit. `jsonDecodeDocument` is the same for the tape document of `jsonDocument`
+(`JsonParsedDocument`, `JsonMalformed`, `JsonLimitExceeded`). `jsonParse` and `jsonDocument` stay.
+
 ## Values and numbers
 
 `Json.kind` has these stable values:
