@@ -6,6 +6,7 @@ import "abla/bytes"
 import "abla/crypto"
 import "abla/http"
 import "abla/net"
+import "abla/sys/linux/process"
 
 // Holds a frame's final flag, opcode, payload bytes, and masking state.
 class WebSocketFrame(
@@ -53,8 +54,29 @@ resource class WebSocketConnection(
     val outgoingMask: string,
     var closed: bool,
     var fragmentedOpcode: int,
-    var fragmentedPayload: string
+    var fragmentedPayload: string,
+    // How long one frame may take from its first byte to its last (0: no limit), and how long a write of one frame may take (0: no limit); see `WebSocketServeOptions`.
+    var frameTimeoutMilliseconds: int = 120000,
+    var writeTimeoutMilliseconds: int = 30000,
+    // How long a read waits for the next byte when the caller gives no timeout (it restarts on every byte); 0 is no limit.
+    var idleTimeoutMilliseconds: int = 30000
 )
+
+// Sets the deadlines of the blocking WebSocket server (`serveWebSockets`, `serveWebSocketOnce`), in milliseconds, 0 turning one off. `http` bounds the request that asks for
+// the upgrade (`HttpServeOptions`: a first byte, a head and a request that must arrive in time, the response written in time, the head and message size limits).
+// After the upgrade `idleTimeoutMilliseconds` is how long a read waits for the next byte (it restarts on every byte, so it does not end a peer that trickles),
+// `frameTimeoutMilliseconds` how long one frame may take from its first byte to its last (a peer that trickles one frame), `writeTimeoutMilliseconds` how long
+// one write may take (a peer that does not read). A connection that runs out of time is closed. The server runs the handler on the thread that accepts, so a
+// session holds the server until it ends: a service on an open network wants `abla/websocket/server` or `abla/websocket/event`, which read many connections at once.
+class WebSocketServeOptions(
+    val http: HttpServeOptions,
+    val idleTimeoutMilliseconds: int = 30000,
+    val frameTimeoutMilliseconds: int = 120000,
+    val writeTimeoutMilliseconds: int = 30000
+)
+
+// The options `serveWebSockets` uses: the defaults of `httpServeOptions()` for the upgrade request, 30 s idle, 120 s per frame, 30 s per write.
+fun webSocketServeOptions(): WebSocketServeOptions = WebSocketServeOptions(httpServeOptions())
 
 // Associates an HTTP path pattern with its WebSocket handler.
 class WebSocketRoute(
@@ -361,7 +383,10 @@ fun WebSocketConnection.sendFrame(
         val encoded = webSocketEncodeFrame(
             payload, opcode, final, this.outgoingMask
         )
-        if (encoded != "") sent = this.stream.write(encoded) == encoded.size
+        if (encoded != "") {
+            sent = if (this.writeTimeoutMilliseconds > 0) this.stream.writeNetwork(encoded, this.writeTimeoutMilliseconds).succeeded()
+                else this.stream.write(encoded) == encoded.size
+        }
     }
     sent
 }
@@ -412,7 +437,7 @@ fun WebSocketConnection.close(
 // Returns the next bounded frame or the closure, timeout, or protocol error encountered while reading.
 fun WebSocketConnection.readFrame(
     maximumPayload: int = 1048576,
-    timeoutMilliseconds: int = 30000
+    timeoutMilliseconds: int = -1
 ): WebSocketReadResult {
     var decoded = webSocketDecodeFrame(
         this.buffered, maximumPayload, this.expectMasked
@@ -420,11 +445,24 @@ fun WebSocketConnection.readFrame(
     var timedOut = false
     var peerClosed = this.closed
     var error = decoded.error
+    // The frame's clock starts when its first byte is in hand (it may have arrived with the previous frame).
+    var frameStarted = if (this.buffered.size > 0) linuxMonotonicMilliseconds() else 0
     while (!decoded.complete && !peerClosed && !timedOut && error == "") {
-        val incoming = this.stream.readWithTimeoutResult(
-            65536, timeoutMilliseconds
+        // No timeout given: the connection's idle timeout, where 0 is no limit (waited for a minute at a time).
+        val unlimited = timeoutMilliseconds < 0 && this.idleTimeoutMilliseconds <= 0
+        var wait = if (unlimited) 60000 else if (timeoutMilliseconds < 0) this.idleTimeoutMilliseconds else timeoutMilliseconds
+        if (frameStarted > 0 && this.frameTimeoutMilliseconds > 0) {
+            val left = frameStarted + this.frameTimeoutMilliseconds - linuxMonotonicMilliseconds()
+            if (left < 1) {
+                timedOut = true
+                wait = 0
+            } else if (left < wait || wait <= 0) wait = left
+        }
+        val incoming = if (timedOut) SocketReadResult("", "timeout", 0) else this.stream.readWithTimeoutResult(
+            65536, wait
         )
         if (incoming.hasData()) {
+            if (frameStarted == 0) frameStarted = linuxMonotonicMilliseconds()
             this.buffered = "${this.buffered}${incoming.bytes}"
             decoded = webSocketDecodeFrame(
                 this.buffered, maximumPayload, this.expectMasked
@@ -433,8 +471,9 @@ fun WebSocketConnection.readFrame(
             if (!decoded.complete && this.buffered.size > maximumPayload + 14) {
                 error = "buffer exceeds configured limit"
             }
-        } else if (incoming.timedOut()) timedOut = true
-        else {
+        } else if (incoming.timedOut()) {
+            if (!unlimited) timedOut = true
+        } else {
             peerClosed = incoming.reachedEof()
             if (incoming.failed()) error = "socket read failed"
         }
@@ -455,7 +494,7 @@ fun WebSocketConnection.readFrame(
 // Reads a complete text or binary message, handling fragmentation and control frames. Uses `maximumPayload` to bound frame and message size and `timeoutMilliseconds` for reads. The result distinguishes a message, closure, timeout, and protocol or I/O errors.
 fun WebSocketConnection.readMessage(
     maximumPayload: int = 1048576,
-    timeoutMilliseconds: int = 30000
+    timeoutMilliseconds: int = -1
 ): WebSocketMessage {
     var result = WebSocketMessage("", "", false, false, false, "")
     var waiting = true
@@ -591,12 +630,20 @@ private fun serveMatchedWebSocket(
     router: WebSocketRouter,
     routeIndex: int,
     request: HttpRequest,
-    own stream: TcpConnection
+    own stream: TcpConnection,
+    options: WebSocketServeOptions
 ): bool {
     var handled = false
     val response = webSocketUpgradeResponse(request).render()
-    if (stream.write(response) == response.size) {
+    val written = if (options.http.responseTimeoutMilliseconds > 0) {
+        val outcome = stream.writeNetwork(response, options.http.responseTimeoutMilliseconds)
+        if (outcome.succeeded()) outcome.written else -1
+    } else stream.write(response)
+    if (written == response.size) {
         val connection = webSocketConnection(move(stream))
+        connection.frameTimeoutMilliseconds = options.frameTimeoutMilliseconds
+        connection.writeTimeoutMilliseconds = options.writeTimeoutMilliseconds
+        connection.idleTimeoutMilliseconds = options.idleTimeoutMilliseconds
         val handler = router.routes[routeIndex].handler
         handler(router.routedRequest(routeIndex, request), connection)
         if (!connection.closed) connection.close()
@@ -608,68 +655,88 @@ private fun serveMatchedWebSocket(
 private fun serveWebSocketStream(
     router: WebSocketRouter,
     own stream: TcpConnection,
-    maximumHeader: int = 65536,
-    maximumMessage: int = 1048576
+    options: WebSocketServeOptions
 ): bool {
-    val request = httpRequestWithPeer(httpParseRequest(
-        httpReadRequest(stream, maximumHeader, maximumMessage)
-    ), stream.descriptor)
-    val routeIndex = router.find(request)
+    // The request that asks for the upgrade is read within the first-byte, head and request deadlines: a client that sends nothing, or a byte now and then, is
+    // closed without an answer instead of holding every other client.
+    val read = httpReadRequestWithin(stream, options.http)
     var handled = false
-    if (routeIndex >= 0 && webSocketIsUpgradeRequest(request)) {
-        handled = serveMatchedWebSocket(
-            router, routeIndex, request, move(stream)
-        )
-    } else {
-        val response = if (request.method == "") httpText("bad request", 400)
-            else if (routeIndex < 0) httpText("not found", 404)
-            else webSocketUpgradeResponse(request)
-        stream.write(response.render())
+    if (!read.timedOut) {
+        val request = httpRequestWithPeer(httpParseRequest(read.request), stream.descriptor)
+        val routeIndex = router.find(request)
+        if (routeIndex >= 0 && webSocketIsUpgradeRequest(request)) {
+            handled = serveMatchedWebSocket(
+                router, routeIndex, request, move(stream), options
+            )
+        } else {
+            val response = if (request.method == "") httpText("bad request", 400)
+                else if (routeIndex < 0) httpText("not found", 404)
+                else webSocketUpgradeResponse(request)
+            if (options.http.responseTimeoutMilliseconds > 0) stream.writeNetwork(response.render(), options.http.responseTimeoutMilliseconds)
+            else stream.write(response.render())
+        }
     }
     handled
 }
 
-// Accepts one client from `listener` and uses `router` to handle a WebSocket upgrade. `maximumHeader` and `maximumMessage` bound input sizes. Returns whether the upgrade was handled.
+// Accepts one client from `listener` and uses `router` to handle a WebSocket upgrade within the deadlines of `options`. Returns whether the upgrade was handled.
+fun serveWebSocketOnceWith(
+    router: WebSocketRouter,
+    var listener: TcpListener,
+    options: WebSocketServeOptions
+): bool {
+    val stream = listener.accept()
+    serveWebSocketStream(router, move(stream), options)
+}
+
+// Accepts one client from `listener` and uses `router` to handle a WebSocket upgrade. `maximumHeader` and `maximumMessage` bound input sizes. The deadlines are those of `webSocketServeOptions()`. Returns whether the upgrade was handled.
 fun serveWebSocketOnce(
     router: WebSocketRouter,
     var listener: TcpListener,
     maximumHeader: int = 65536,
     maximumMessage: int = 1048576
-): bool {
-    val stream = listener.accept()
-    serveWebSocketStream(
-        router, move(stream), maximumHeader, maximumMessage
-    )
+): bool = serveWebSocketOnceWith(router, listener, webSocketServeOptionsFor(maximumHeader, maximumMessage))
+
+// The default deadlines with the given input bounds.
+private fun webSocketServeOptionsFor(maximumHeader: int, maximumMessage: int): WebSocketServeOptions {
+    val http = httpServeOptions()
+    WebSocketServeOptions(HttpServeOptions(
+        http.firstByteTimeoutMilliseconds, http.requestHeadTimeoutMilliseconds, http.requestTimeoutMilliseconds, http.responseTimeoutMilliseconds,
+        maximumHeader, maximumMessage
+    ))
 }
 
-private fun serveWebSocketsOnListener(
+// Serves WebSocket upgrades from `listener` through `router` within the deadlines of `options` until graceful shutdown, and returns zero on graceful shutdown.
+fun serveWebSocketsOnListenerWith(
     router: WebSocketRouter,
     var listener: TcpListener,
-    maximumHeader: int = 65536,
-    maximumMessage: int = 1048576
+    options: WebSocketServeOptions
 ): int {
     tcpEnableGracefulShutdown()
     while (!tcpShutdownRequested()) {
         val stream = listener.acceptUntilShutdown()
         if (stream.descriptor >= 0) {
-            serveWebSocketStream(
-                router, move(stream), maximumHeader, maximumMessage
-            )
+            serveWebSocketStream(router, move(stream), options)
         }
     }
     listener.close()
     0
 }
 
-// Listens on the given TCP port and runs the WebSocket router, returning the listener loop's status.
+// Listens on the given TCP port and runs the WebSocket router within the deadlines of `options`, returning the listener loop's status.
+fun serveWebSocketsWith(
+    router: WebSocketRouter,
+    port: int,
+    options: WebSocketServeOptions
+): int {
+    val listener = tcpListen(port)
+    serveWebSocketsOnListenerWith(router, listener, options)
+}
+
+// Listens on the given TCP port and runs the WebSocket router with the deadlines of `webSocketServeOptions()`, returning the listener loop's status.
 fun serveWebSockets(
     router: WebSocketRouter,
     port: int,
     maximumHeader: int = 65536,
     maximumMessage: int = 1048576
-): int {
-    val listener = tcpListen(port)
-    serveWebSocketsOnListener(
-        router, listener, maximumHeader, maximumMessage
-    )
-}
+): int = serveWebSocketsWith(router, port, webSocketServeOptionsFor(maximumHeader, maximumMessage))

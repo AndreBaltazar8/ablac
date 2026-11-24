@@ -227,6 +227,14 @@ complete echo service. Server peers must send masked frames.
 `abla/websocket/client` obtains a fresh four-byte masking key from the bounded
 `abla/random` secure-entropy facade.
 
+The blocking server (`serveWebSockets`, `serveWebSocketOnce`, with `...With(router, ..., options)` forms and `webSocketServeOptions()` for the defaults) runs each
+handler on the thread that accepts, so a session holds the server until it ends. `WebSocketServeOptions` closes what would hold it for ever: a connection that
+sends nothing (10 s to the first byte), an upgrade head or request that does not arrive (30 s, 120 s), a response that is not taken (30 s), a read that waits
+for the next byte after the upgrade (30 s idle, restarting on every byte), a frame that takes too long from its first byte to its last (120 s), and a write that is
+not taken (30 s); 0 turns one off. A slow handler, or a peer that is slow within these bounds, still holds every other client: a service on an open network wants
+`abla/websocket/server` or `abla/websocket/event`, which read many connections at once and have deadlines of their own. The client of `abla/websocket/tls` reads
+the upgrade response and its frames with no deadline: a client of a server it does not trust applies one around it.
+
 `abla/websocket/json` adds bounded JSON text messages.
 `abla/websocket/rpc` adds a method router with `id`, `method`, `params`,
 `result`, and structured error envelopes. The RPC router is deliberately

@@ -623,6 +623,7 @@ test-serial: ablac
 	tools/test-orc-http.sh $(COMPILER)
 	tools/test-http-server.sh $(COMPILER)
 	tools/test-http-serve.sh $(COMPILER)
+	tools/test-websocket-serve.sh $(COMPILER)
 	tools/test-graceful-reload.sh $(COMPILER)
 	tools/test-direct-syscall.sh $(COMPILER)
 	tools/test-emitted-value-runtime.sh $(COMPILER)
