@@ -1,0 +1,111 @@
+// abla/process/metrics on a hosted Windows program (tools/test-windows-programs.sh), the module test without its shell: CPU time grows with work, memory and the heap are
+// positive, the descriptor count follows opened files, the descriptor limit
+// is consistent and the start time is a moment ago.
+import "abla/io"
+import "abla/memory"
+import "abla/process"
+import "abla/process/metrics"
+import "abla/sys/linux"
+
+fun metricsCheck(name: string, ok: bool): bool {
+    if (!ok) println("process metrics: $name failed")
+    ok
+}
+
+fun main: int {
+    val before = processMetrics()
+    var ok = true
+
+    // Busy work until it has used 150 ms of CPU, however long that takes on a
+    // loaded machine; a counter that doesn't grow gives up after 20 s.
+    val began = monotonicMilliseconds()
+    var spin = 0
+    var used = 0
+    while (used < 150000 && monotonicMilliseconds() - began < 20000) {
+        var step = 0
+        while (step < 1000) {
+            spin = spin + 1
+            step = step + 1
+        }
+        val cpu = processCpuMicroseconds()
+        used = cpu[0] + cpu[1] - before.cpuUserMicroseconds -
+            before.cpuSystemMicroseconds
+    }
+    ok = metricsCheck("cpu", spin > 0 && before.cpuUserMicroseconds >= 0 &&
+        used >= 150000) && ok
+    ok = metricsCheck("cpu seconds", before.cpuSeconds() >= 0.0) && ok
+
+    ok = metricsCheck("memory", before.residentBytes > 0 &&
+        before.virtualBytes >= before.residentBytes &&
+        processResidentBytes() > 0) && ok
+
+    val files: array<int> = []
+    var index = 0
+    while (index < 5) {
+        files.append(linuxOpen("/dev/null").descriptor)
+        index = index + 1
+    }
+    val opened = processOpenDescriptors()
+    for (descriptor in files) linuxSyscall1(3, descriptor)
+    val closed = processOpenDescriptors()
+    ok = metricsCheck("descriptors", before.openDescriptors >= 3 &&
+        opened == before.openDescriptors + 5 &&
+        closed == before.openDescriptors) && ok
+
+    // The limit: the shell's `ulimit -n` in tests/cases/modules/process-metrics.ab; a hosted Windows program has no shell to ask, so this
+    // checks that the two reads agree and that the limit is usable.
+    ok = metricsCheck("descriptor limit",
+        before.maximumDescriptors == processMaximumDescriptors() && processMaximumDescriptors() > 100) && ok
+
+    val now = realtimeMilliseconds()
+    ok = metricsCheck("start time", before.startTimeMilliseconds <= now &&
+        before.startTimeMilliseconds > now - 60000 &&
+        before.startTimeSeconds() > 0.0) && ok
+
+    // The CPU polling above allocates garbage. Compare live heaps after
+    // collection so a collection during this check cannot erase the baseline.
+    memoryCollect()
+    val heap = processHeapBytes()
+    val kept: array<string> = []
+    index = 0
+    while (index < 1000) {
+        kept.append("entry $index")
+        index = index + 1
+    }
+    // VmData on Linux; macOS has no counterpart.
+    val data = processDataBytes()
+    ok = metricsCheck("data", before.dataBytes == -1 && data == -1 ||
+        before.dataBytes > 0 && data > 0) && ok
+
+    memoryCollect()
+    ok = metricsCheck("heap", before.heapBytes > 0 &&
+        processHeapBytes() > heap && kept.size == 1000) && ok
+
+    // The Linux /proc parsers, as pure functions over captured text (they run
+    // on every host, so macOS checks them too).
+    val status = "Name:\tserver\nVmPeak:\t  320000 kB\nVmSize:\t  305748 kB\n" +
+        "VmRSS:\t    4256 kB\nVmData:\t   10340 kB\nThreads:\t1\n"
+    ok = metricsCheck("status parser",
+        processMetricsLineNumber(status, "VmRSS") == 4256 &&
+        processMetricsLineNumber(status, "VmSize") == 305748 &&
+        processMetricsLineNumber(status, "VmData") == 10340 &&
+        processMetricsLineNumber(status, "VmSwap") == -1 &&
+        processMetricsKilobytes(4256) == 4358144 &&
+        processMetricsKilobytes(-1) == -1) && ok
+    val stat = "cpu  10 0 5 100\nintr 1 2 3\nbtime 1792670000\nprocesses 99\n"
+    ok = metricsCheck("btime parser",
+        processMetricsLineNumber(stat, "btime") == 1792670000) && ok
+    // The command name may hold spaces and parentheses; starttime is field 22.
+    val self = "4242 (my (odd) server) S 1 4242 4242 0 -1 4194560 120 0 0 0 " +
+        "3 1 0 0 20 0 1 0 987654 315535360 1108 18446744073709551615"
+    ok = metricsCheck("stat parser",
+        processMetricsStatField(self, 22) == 987654 &&
+        processMetricsStatField(self, 3) == -1 &&
+        processMetricsStatField(self, 4) == 1 &&
+        processMetricsStatField("garbage", 22) == -1) && ok
+
+    if (ok) {
+        println("process metrics: ok")
+        42
+    } else 1
+}

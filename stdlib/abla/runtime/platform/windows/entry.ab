@@ -2416,6 +2416,38 @@ private trusted fun __ablaRuntimeWindowsResourceUsage(who: int, usage: int): int
     0
 }
 
+// The Windows-only system call 4008, `processInfo`: what /proc/self gives a Linux process (abla/process/metrics), as four 64-bit words at
+// `output`: the resident size (the working set), the virtual size (the commit charge, at least the working set), the descriptors
+// open (the table's used entries and the three standard ones: what /proc/self/fd lists) and the start time in milliseconds since 1970.
+// Returns 0, or -errno.
+private @noinline trusted fun __ablaRuntimeWindowsProcessInfo(output: int): int {
+    if (output == 0) return __ablaRuntimeWindowsEINVAL
+    val counters = __ablaRuntimeWindowsPathBuffer()
+    if (counters == 0) return __ablaRuntimeWindowsENOMEM
+    ablaRuntimeStoreI64(counters, 72)
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), counters, 72) == 0) return __ablaRuntimeWindowsEINVAL
+    // PROCESS_MEMORY_COUNTERS: WorkingSetSize at 16, PagefileUsage (the commit charge) at 64
+    val resident = ablaRuntimeLoadI64(counters + 16)
+    val committed = ablaRuntimeLoadI64(counters + 64)
+    ablaRuntimeStoreI64(output, resident)
+    ablaRuntimeStoreI64(output + 8, if (committed > resident) committed else resident)
+    var open = 3
+    val table = ablaRuntimeAtomicLoadI64(__ablaRuntimeWindowsFdCell())
+    if (table != 0) {
+        var fd = 3
+        while (fd < __ablaRuntimeWindowsFdCount) {
+            if (ablaRuntimeAtomicLoadI64(table + fd * 64) != 0) open = open + 1
+            fd = fd + 1
+        }
+    }
+    ablaRuntimeStoreI64(output + 16, open)
+    val times = __ablaRuntimeWindowsScratch()
+    if (GetProcessTimes(GetCurrentProcess(), times, times + 8, times + 16, times + 24) == 0) return __ablaRuntimeWindowsEINVAL
+    // the creation FILETIME: 100 ns intervals since 1601, 11644473600 seconds before the Unix epoch
+    ablaRuntimeStoreI64(output + 24, ablaRuntimeLoadI64(times) / 10000 - 11644473600000)
+    0
+}
+
 /** The compile-time guard's two entries that must not go through __ablaRuntimeWindowsSyscall: the backend sends a call whose
  *  number is a constant 4003 or 4005 here instead (src/backend/llvm/functions.ab). 4005 is the vectored handler, which runs on
  *  the stack of the thread that faulted, an overflowed one included (tests/cases/windows/fault-guard.ab): the dispatcher's frame,
@@ -2462,6 +2494,8 @@ private trusted fun __ablaRuntimeWindowsProcessCall(number: int, a0: int, a1: in
     if (number == 4006) return __ablaRuntimeWindowsSystemRoots(a0, a1)
     // dnsServers(buffer, size): resolv.conf's lines for the system's DNS servers
     if (number == 4007) return __ablaRuntimeWindowsDnsServers(a0, a1)
+    // processInfo(output): the memory, descriptors and start time of the process
+    if (number == 4008) return __ablaRuntimeWindowsProcessInfo(a0)
     -1000
 }
 
@@ -2616,7 +2650,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 14 16 21 25 28 35 39 41 42 43 44 45 46 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 88 89 91 97 98 102 104 107 108 109 121 131 186 202 204 217 228 231 232 233 257 258 262 263 264 288 291 293 318 4001 4002 4003 4004 4005 4006 4007"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 14 16 21 25 28 35 39 41 42 43 44 45 46 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 88 89 91 97 98 102 104 107 108 109 121 131 186 202 204 217 228 231 232 233 257 258 262 263 264 288 291 293 318 4001 4002 4003 4004 4005 4006 4007 4008"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;

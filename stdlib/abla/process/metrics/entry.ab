@@ -3,7 +3,8 @@
 // One processMetrics() call reads everything; the single reads below cost
 // one system call (or one /proc file) each.
 //
-// Linux reads raw system calls and /proc without libc. macOS reads the
+// Linux reads raw system calls and /proc without libc. A hosted Windows program asks its runtime (system call 4008: the working
+// set, the commit charge, the descriptors of its table, the creation time). macOS reads the
 // system library (getrusage, getrlimit, proc_pidinfo) behind
 // ablaHostIsMacOS(), a constant the backend folds, so the Darwin calls never
 // reach a Linux link. A value that cannot be read is -1.
@@ -36,6 +37,17 @@ trusted fun processMetricsPidInfo(flavor: int, buffer: i64*, size: int): int =
     if (ablaHostIsMacOS()) int(proc_pidinfo(
         i32(linuxProcessId()), i32(flavor), 0, buffer, i32(size)
     )) else -1
+
+// The Windows runtime's processInfo (system call 4008) as [resident, virtual, descriptors, start time in ms], or [] off Windows or when
+// it fails.
+trusted fun processMetricsWindows(): array<int> {
+    if (!linuxHostIsWindows()) return []
+    val info = nativeByteBuffer(32)
+    val status = linuxSyscall1(4008, nativePointerAddress(info.address))
+    val result: array<int> = if (status == 0) [info.loadI64(0), info.loadI64(8), info.loadI64(16), info.loadI64(24)] else []
+    info.close()
+    result
+}
 
 /// Stores CPU usage, memory, descriptor counts and start time for a process.
 class ProcessMetrics(
@@ -160,6 +172,12 @@ trusted fun processMemoryBytes(): array<int> {
             resident = info.loadI64(8)
         }
         info.close()
+    } else if (linuxHostIsWindows()) {
+        val info = processMetricsWindows()
+        if (info.size == 4) {
+            resident = info[0]
+            virtual = info[1]
+        }
     } else {
         val status = linuxReadFile("/proc/self/status")
         resident = processMetricsKilobytes(processMetricsLineNumber(status, "VmRSS"))
@@ -194,6 +212,9 @@ trusted fun processOpenDescriptors(): int {
             else if (read < capacity) result = read / 8
             else capacity = capacity * 2
         }
+    } else if (linuxHostIsWindows()) {
+        val info = processMetricsWindows()
+        if (info.size == 4) result = info[2]
     } else {
         // /proc/self/fd lists one entry per descriptor, including the one
         // reading the directory.
@@ -284,6 +305,9 @@ trusted fun processStartTimeMilliseconds(): int {
             result = info.loadI64(120) * 1000 + info.loadI64(128) / 1000
         }
         info.close()
+    } else if (linuxHostIsWindows()) {
+        val info = processMetricsWindows()
+        if (info.size == 4) result = info[3]
     } else {
         // starttime (field 22) counts clock ticks since boot; btime in
         // /proc/stat is the boot time in seconds since the epoch.
