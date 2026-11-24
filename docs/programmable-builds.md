@@ -179,8 +179,10 @@ architecture.
 runtime calls (`pthread_key_create` with a destructor for a thread's end, `pthread_getspecific`, `pthread_setspecific`,
 and `pthread_create` and `pthread_join` for its own threads) come from a table that the generated `libabla_jni.so`, which
 links bionic, installs in its `JNI_OnLoad` before Java can call an export: `abla_android_host_install`, declared with the
-table's layout in the generated `abla-app.h` (version 1, five entries). The table is published once with release and
-read with acquire. A program that loads `libabla_app.so` by itself calls `abla_android_host_install` with the same table
+table's layout in the generated `abla-app.h` (version 1, five entries, none null: a table with a null function answers -1 and
+installs nothing). The library copies the table into storage of its own, so a host's may be a local or be freed afterwards, and
+publishes the copy once with release and reads it with acquire. Installing again answers 0 for the same five functions and 1 for
+other ones (the first stay). A program that loads `libabla_app.so` by itself calls `abla_android_host_install` with the same table
 first; without it the library still loads, and its first call of one of the five writes why to standard error and ends
 the process with status 70.
 

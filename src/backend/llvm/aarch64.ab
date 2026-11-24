@@ -163,9 +163,11 @@ fun bootstrapLlvmEmitAarch64LibraryRoutines(backend: BootstrapLlvmBackend): void
 // pthread_getspecific, pthread_setspecific) and the threads it starts (pthread_create, pthread_join). The app's
 // generated libabla_jni.so, which links bionic, hands the library a table of them from JNI_OnLoad, before the first
 // Abla export runs: abla_android_host_install(table), table = {version 1, count 5, the five functions in that order}.
-// The table is published once (a compare-and-swap with release; each call loads it with acquire) and stays for the life
-// of the process. It returns 0 when the table is installed (or already was), 1 when another table was installed
-// first (that one stays), -1 for a table that is not version 1 with at least five entries. Each of the five names is a
+// The table is copied into the library's own storage (the host's may be a stack local or freed later) and published once
+// (a compare-and-swap claims the copy, a store-release publishes it; each call loads it with acquire) and stays for the life
+// of the process. It returns 0 when the table is installed (or its five functions are the installed ones), 1 when other
+// functions were installed first (those stay), -1 for a table that is not version 1 with at least five entries, or has a
+// null function among the five. Each of the five names is a
 // hidden function here that branches to its entry with the caller's arguments, so libabla_app.so leaves no symbol
 // undefined and needs no libc.so. A library loaded without the table (a plain dlopen) loads and initializes; its first
 // call of one of them writes `message` to standard error and ends the process with status 70, not a jump to null.
@@ -183,7 +185,9 @@ fun bootstrapLlvmAndroidHostAssembly(): string {
             "    mov x17, #${16 + 8 * index}\n    b abla_android_host_call\n" + ".size ${names[index]}, . - ${names[index]}\n"
         index = index + 1
     }
-    ".pushsection .bss\n.p2align 3\n.globl abla_android_host\n.hidden abla_android_host\nabla_android_host: .zero 8\n.popsection\n" +
+    ".pushsection .bss\n.p2align 3\n.globl abla_android_host\n.hidden abla_android_host\nabla_android_host: .zero 8\n" +
+    // 0 free, 1 claimed by an installer that is copying; the copy is version, count and the five functions
+    ".hidden abla_android_host_state\nabla_android_host_state: .zero 8\n.hidden abla_android_host_table\nabla_android_host_table: .zero 56\n.popsection\n" +
     ".pushsection .rodata\n.Labla_android_host_message: .ascii \"" +
     message.slice(0, message.size - 1) + "\\n\"\n.popsection\n" +
     ".text\n.p2align 2\n" +
@@ -192,9 +196,25 @@ fun bootstrapLlvmAndroidHostAssembly(): string {
     "    cbz x0, 3f\n" +
     "    ldr x1, [x0]\n    cmp x1, #1\n    b.ne 3f\n" +
     "    ldr x1, [x0, #8]\n    cmp x1, #5\n    b.lo 3f\n" +
-    "    adrp x2, abla_android_host\n    add x2, x2, :lo12:abla_android_host\n" +
-    "1:  ldaxr x1, [x2]\n    cbnz x1, 2f\n    stlxr w3, x0, [x2]\n    cbnz w3, 1b\n    mov x0, #0\n    ret\n" +
-    "2:  clrex\n    cmp x1, x0\n    cset x0, ne\n    ret\n" +
+    // the five functions are not null
+    "    ldp x1, x2, [x0, #16]\n    cbz x1, 3f\n    cbz x2, 3f\n" +
+    "    ldp x1, x2, [x0, #32]\n    cbz x1, 3f\n    cbz x2, 3f\n" +
+    "    ldr x1, [x0, #48]\n    cbz x1, 3f\n" +
+    // claim the copy (0 -> 1)
+    "    adrp x2, abla_android_host_state\n    add x2, x2, :lo12:abla_android_host_state\n" +
+    "1:  ldaxr x1, [x2]\n    cbnz x1, 4f\n    mov x3, #1\n    stlxr w4, x3, [x2]\n    cbnz w4, 1b\n" +
+    // copy the table, then publish the copy with release
+    "    adrp x5, abla_android_host_table\n    add x5, x5, :lo12:abla_android_host_table\n" +
+    "    ldp x6, x7, [x0]\n    stp x6, x7, [x5]\n    ldp x6, x7, [x0, #16]\n    stp x6, x7, [x5, #16]\n" +
+    "    ldp x6, x7, [x0, #32]\n    stp x6, x7, [x5, #32]\n    ldr x6, [x0, #48]\n    str x6, [x5, #48]\n" +
+    "    adrp x8, abla_android_host\n    add x8, x8, :lo12:abla_android_host\n    stlr x5, [x8]\n    mov x0, #0\n    ret\n" +
+    // another installer has the copy (or is making it): wait for it to be published, then 0 when the same five functions
+    "4:  clrex\n    adrp x8, abla_android_host\n    add x8, x8, :lo12:abla_android_host\n" +
+    "5:  ldar x5, [x8]\n    cbnz x5, 6f\n    yield\n    b 5b\n" +
+    "6:  ldp x6, x7, [x0, #16]\n    ldp x9, x10, [x5, #16]\n    cmp x6, x9\n    ccmp x7, x10, #0, eq\n    b.ne 7f\n" +
+    "    ldp x6, x7, [x0, #32]\n    ldp x9, x10, [x5, #32]\n    cmp x6, x9\n    ccmp x7, x10, #0, eq\n    b.ne 7f\n" +
+    "    ldr x6, [x0, #48]\n    ldr x9, [x5, #48]\n    cmp x6, x9\n    b.ne 7f\n    mov x0, #0\n    ret\n" +
+    "7:  mov x0, #1\n    ret\n" +
     "3:  mov x0, #-1\n    ret\n" +
     ".size abla_android_host_install, . - abla_android_host_install\n" +
     // x16 and x17 are the intra-procedure-call scratch registers: free at a call, the arguments in x0-x7 untouched.

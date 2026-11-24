@@ -7,6 +7,9 @@
 //                                                           start (JNI-style), each passing its own number 1..N
 //   driver <library> -n <export> <expected>                 without installing the host table first (a plain dlopen): the
 //                                                           export must end the process with status 70 and a message
+//   driver <library> -s ...                                 the table installed from a local that is overwritten right after: the library copied it,
+//                                                           so every call still works
+//   driver <library> -z ...                                 a table with a null function is refused (-1) and installs nothing; then the valid one installs
 //   driver <library> -j <libabla_jni.so> ...                the table installed by the generated libabla_jni.so's JNI_OnLoad
 //                                                           (linked against the library, as the app's CMake links it),
 //                                                           then any of the modes above
@@ -45,6 +48,11 @@ __attribute__((visibility("default"))) int64_t abla_test_host_block(int64_t mill
     nanosleep(&request, 0);
     return nested_function && nested_function(0) == 77 ? 1 : 0;
 }
+
+#ifdef __ANDROID__
+// A function of the table other than bionic's, for a second table that installs nothing (it answers 1).
+static int other_key_create(pthread_key_t *key, void (*destroy)(void *)) { return pthread_key_create(key, destroy); }
+#endif
 
 struct job {
     export_function function;
@@ -86,6 +94,14 @@ int main(int argc, char **argv) {
         for (int index = 2; index + 1 < argc; index++) argv[index] = argv[index + 1];
         argc--;
     }
+    int stack_table = 0, null_entry = 0;
+    for (int again = 0; again < 2; again++) {
+        if (install && argc > 3 && strcmp(argv[2], "-s") == 0) stack_table = 1;
+        else if (install && argc > 3 && strcmp(argv[2], "-z") == 0) null_entry = 1;
+        else break;
+        for (int index = 2; index + 1 < argc; index++) argv[index] = argv[index + 1];
+        argc--;
+    }
     const char *jni = 0;
     if (install && argc > 4 && strcmp(argv[2], "-j") == 0) {
         jni = argv[3];
@@ -113,13 +129,34 @@ int main(int argc, char **argv) {
         static const struct abla_android_host host = { ABLA_ANDROID_HOST_VERSION, ABLA_ANDROID_HOST_COUNT,
             pthread_key_create, pthread_getspecific, pthread_setspecific, pthread_create, pthread_join };
         struct abla_android_host other = host, newer = host;
+        other.key_create = other_key_create;
         newer.version = 2;
+        if (null_entry) {
+            // A null function is refused whole: nothing is installed (the valid table below still takes), not a jump to null at the first call.
+            struct abla_android_host bad = host;
+            bad.setspecific = 0;
+            int64_t refused = install_host(&bad);
+            fprintf(stderr, "null entry: %lld\n", (long long)refused);
+            if (refused != -1) return 3;
+        }
+        if (stack_table) {
+            // The table is a local of this frame, overwritten after the install and its frame reused: the library copied it.
+            struct abla_android_host local = host;
+            int64_t taken = install_host(&local);
+            memset(&local, 0xA5, sizeof local);
+            volatile char reuse[512];
+            for (int index = 0; index < 512; index++) reuse[index] = (char)0x5A;
+            int64_t same = install_host(&host);
+            fprintf(stderr, "stack table: %lld %lld\n", (long long)taken, (long long)same);
+            if (taken != 0 || same != 0) return 3;
+        } else {
         // The first table stays: installing it again answers 0, another one 1, one of a version the library does not know -1.
         int64_t first = install_host(&host), again = install_host(&host), second = install_host(&other),
             unknown = install_host(&newer);
         fprintf(stderr, "host table: %lld %lld %lld %lld\n", (long long)first, (long long)again, (long long)second,
             (long long)unknown);
         if (first != 0 || again != 0 || second != 1 || unknown != -1) return 3;
+        }
     }
 #endif
     nested_function = (export_function)dlsym(library, "abla_run_nested");

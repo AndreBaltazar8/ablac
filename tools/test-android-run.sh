@@ -109,6 +109,17 @@ status=0
 run_android driver 120 "$library" -n abla_run_heap 465 > "$out/no-table.out" 2> "$out/no-table.err" < /dev/null || status=$?
 [[ $status -eq 70 ]] && grep -q '^abla: this Android library was called before its host installed the thread table' "$out/no-table.err" ||
     { cat "$out/no-table.out" >&2; grep -v 'linkerconfig' "$out/no-table.err" >&2; fail "an export without the host table: status $status"; }
+# The library copies the host's table (the host's may be a local, freed or overwritten later) and refuses one with a null function (-1,
+# nothing installed): the driver installs from a local of its own frame and overwrites it, then calls exports that need the table (thread-locals,
+# threads); and offers a table with a null entry first, then the valid one.
+status=0
+run_android driver 120 "$library" -s abla_run_heap 465 abla_run_thread 142 abla_run_threads_heap 1860 > "$out/stack-table.out" 2> "$out/stack-table.err" < /dev/null || status=$?
+[[ $status -eq 0 ]] && grep -qx 'stack table: 0 0' "$out/stack-table.err" && grep -qx 'abla_run_thread 142' "$out/stack-table.out" ||
+    { cat "$out/stack-table.out" >&2; grep -v 'linkerconfig' "$out/stack-table.err" >&2; fail "exports after the host's table was overwritten: status $status"; }
+status=0
+run_android driver 120 "$library" -z abla_run_heap 465 abla_run_thread 142 > "$out/null-entry.out" 2> "$out/null-entry.err" < /dev/null || status=$?
+[[ $status -eq 0 ]] && grep -qx 'null entry: -1' "$out/null-entry.err" && grep -qx 'host table: 0 0 1 -1' "$out/null-entry.err" ||
+    { cat "$out/null-entry.out" >&2; grep -v 'linkerconfig' "$out/null-entry.err" >&2; fail "a table with a null function: status $status"; }
 # Threads the library did not start (JNI-style) call one export at the same time, under the collector's stress mode
 # (a collection at every safe point) and without: each export enters and leaves the runtime (heap lock live, a count of threads inside, the globals initialized once), and a
 # nested export runs while the globals initialize. Without that this crashes. The table comes from the driver (host) and
