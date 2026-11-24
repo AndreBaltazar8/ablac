@@ -24,6 +24,7 @@ reject() {
 }
 reject hidden-import 'the primary constructor of `Model` is not visible here'
 reject hidden-private 'the primary constructor of `Hidden` is not visible here'
+reject hidden-local 'a local binding hides the primary constructor here'
 reject affine 'the receiver has affine ownership'
 reject unknown-field 'E_NAMED_ARGUMENT_UNKNOWN'
 reject written-kind 'E_NAMED_ARGUMENT_TARGET'
