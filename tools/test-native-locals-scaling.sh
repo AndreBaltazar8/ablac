@@ -46,7 +46,16 @@ done
 for profile in release fast; do
     flags=(--no-cache --no-debug)
     if [[ $profile == fast ]]; then flags+=(--fast); fi
-    previous=0
+    span=2
+    max_ratio=3
+    if [[ $profile == release ]]; then
+        # Judge release over the whole fourfold increase. A single doubling can
+        # be noisy, while quadratic work grows 16x
+        # over this span. Keep the same overall allowance as two 3x bounds.
+        span=4
+        max_ratio=9
+    fi
+    cpu_by_count=()
     for count in 1000 2000 4000; do
         target="$out/$profile-$count"
         if ! "$timer" -p "$compiler" build "$out/$count.ab" -o "$target" "${flags[@]}" \
@@ -59,11 +68,13 @@ for profile in release fast; do
         cpu=$(awk '/^(user|sys) / { total += $2 } END { printf "%.0f\n", total * 100 }' "$target.time")
         printf 'native locals scaling: %s %d locals %d.%02d CPU s\n' \
             "$profile" "$count" "$((cpu / 100))" "$((cpu % 100))"
-        if ((previous > 0 && cpu > 3 * previous)); then
-            printf 'native locals scaling: %s %d locals took more than 3x the CPU of %d\n' \
-                "$profile" "$count" "$((count / 2))" >&2
+        reference_count=$((count / span))
+        reference_cpu=${cpu_by_count[$reference_count]:-0}
+        if ((reference_cpu > 0 && cpu > max_ratio * reference_cpu)); then
+            printf 'native locals scaling: %s %d locals took more than %dx the CPU of %d\n' \
+                "$profile" "$count" "$max_ratio" "$reference_count" >&2
             exit 1
         fi
-        previous=$cpu
+        cpu_by_count[$count]=$cpu
     done
 done
