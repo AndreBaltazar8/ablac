@@ -227,6 +227,17 @@ fun bootstrapCtCrossBuiltin(node: BootstrapExpression): bool {
         name == "removeLast" || name == "takeAt")
 }
 
+// The runtime's buckets are private. Integer and string keys compare the same
+// way in both tiers, and entry snapshots expose insertion order. Restrict the
+// first portable forms to scalar values without target layout or drop behavior.
+fun bootstrapCtCrossMapType(type: string): bool {
+    if (!bootstrapIsMapType(type)) return false
+    val key = bootstrapMapKeyType(type)
+    val value = bootstrapMapValueType(type)
+    (key == "string" || key == "i64") &&
+        (value == "string" || value == "i64" || value == "bool")
+}
+
 // ablaAtCompileTime is true in the evaluator and in its native bridge shim.
 // Ignore only code neither tier executes; the ordinary reach walk still keeps
 // full bodies for slice analysis and lowering. No target probe is folded here.
@@ -619,9 +630,24 @@ class BootstrapCtReach(
             val literal = node.kind == "string" || node.kind == "integer" ||
                 node.kind == "float" || node.kind == "float32" || node.kind == "char"
             if (!literal && node.text != "") {
-                // The built-in Map call has no user declaration to keep. The
-                // separate cross-target walk still checks portability.
-                if (!crossTarget && this.methodTargets.hasBuiltinMember(nodeSource, node)) continue
+                // An unqualified Map constructor creates empty storage and
+                // has no user callee. An untyped Map acquires its type at the
+                // binding, and each operation below checks that receiver.
+                if (node.kind == "call" && node.text == "Map") {
+                    if (crossTarget && node.children.size == 1 && node.children[0].kind == "type" &&
+                        !bootstrapCtCrossMapType(bootstrapNormalizeType(node.children[0].text))) {
+                        return "cross-target site reaches Map type ${node.children[0].text}: not proven portable"
+                    }
+                    continue
+                }
+                val builtinReceiver = this.methodTargets.builtinMemberReceiver(nodeSource, node)
+                if (builtinReceiver != "") {
+                    if (crossTarget && (!bootstrapIsMapBuiltinMethod(node.text) ||
+                        !bootstrapCtCrossMapType(builtinReceiver))) {
+                        return "cross-target site reaches Map receiver $builtinReceiver: not proven portable"
+                    }
+                    continue
+                }
                 var item = this.table.find(node.text, -1)
                 val exactTarget = this.exactMethodTarget(nodeSource, node)
                 if (crossTarget && item < 0 &&
