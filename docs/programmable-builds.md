@@ -175,9 +175,18 @@ output. Cross-target fast builds still run bounded O1/global-DCE before LLVM
 target lowering so dead host-runtime details cannot invalidate another
 architecture.
 
-The extension also finds the Android NDK, which the compiler does not: a library with a thread-local needs the NDK's
-compiler-rt builtins archive (`__emutls_get_address`), and bionic's linker needs the library to name `libc.so` as needed,
-which the NDK sysroot's API 24 stub does. `androidNdkLookup` reads `ABLA_ANDROID_NDK`, `ANDROID_NDK_ROOT`,
+`libabla_app.so` imports nothing from bionic and names no `libc.so` (decision #121). The five bionic functions its
+runtime calls (`pthread_key_create` with a destructor for a thread's end, `pthread_getspecific`, `pthread_setspecific`,
+and `pthread_create` and `pthread_join` for its own threads) come from a table that the generated `libabla_jni.so`, which
+links bionic, installs in its `JNI_OnLoad` before Java can call an export: `abla_android_host_install`, declared with the
+table's layout in the generated `abla-app.h` (version 1, five entries). The table is published once with release and
+read with acquire. A program that loads `libabla_app.so` by itself calls `abla_android_host_install` with the same table
+first; without it the library still loads, and its first call of one of the five writes why to standard error and ends
+the process with status 70.
+
+The extension also finds the Android NDK, which the compiler does not: a library with a thread-local and no import of
+`abla/android/emutls` needs the NDK's compiler-rt builtins archive (`__emutls_get_address`), and a user's native input
+may import bionic functions, which the NDK sysroot's API 24 `libc.so` stub supplies (linked as needed). `androidNdkLookup` reads `ABLA_ANDROID_NDK`, `ANDROID_NDK_ROOT`,
 `ANDROID_NDK_HOME` and, under `ANDROID_HOME` and `ANDROID_SDK_ROOT`, `ndk/<version>` and `ndk-bundle` (`Path.entries()`;
 the newest version wins; `ABLA_ANDROID_BUILTINS` names the archive itself), and passes what it finds to the link with
 `defineTargetLinkInput(target, path)`: an absolute, one-line path (at most 16 per target) that joins the target's

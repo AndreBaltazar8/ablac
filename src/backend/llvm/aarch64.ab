@@ -153,9 +153,60 @@ fun bootstrapLlvmAarch64OpenFlags(): string =
 // What a library for aarch64 Android carries: no start-up (bionic loaded it), no threads (bionic's), no stack guard.
 fun bootstrapLlvmEmitAarch64LibraryRoutines(backend: BootstrapLlvmBackend): void {
     val assembly = bootstrapLlvmAarch64SyscallAssembly() + bootstrapLlvmAarch64JumpAssembly() +
-        bootstrapLlvmAarch64MemoryAssembly()
+        bootstrapLlvmAarch64MemoryAssembly() + bootstrapLlvmAndroidHostAssembly()
     LLVMAppendModuleInlineAsm(backend.module, assembly, assembly.size)
     return
+}
+
+// The five bionic functions an Android library needs, without importing them (decision #121): the thread-specific key
+// behind its emulated thread-locals (pthread_key_create with a destructor that runs when a thread ends,
+// pthread_getspecific, pthread_setspecific) and the threads it starts (pthread_create, pthread_join). The app's
+// generated libabla_jni.so, which links bionic, hands the library a table of them from JNI_OnLoad, before the first
+// Abla export runs: abla_android_host_install(table), table = {version 1, count 5, the five functions in that order}.
+// The table is published once (a compare-and-swap with release; each call loads it with acquire) and stays for the life
+// of the process. It returns 0 when the table is installed (or already was), 1 when another table was installed
+// first (that one stays), -1 for a table that is not version 1 with at least five entries. Each of the five names is a
+// hidden function here that branches to its entry with the caller's arguments, so libabla_app.so leaves no symbol
+// undefined and needs no libc.so. A library loaded without the table (a plain dlopen) loads and initializes; its first
+// call of one of them writes `message` to standard error and ends the process with status 70, not a jump to null.
+fun bootstrapLlvmAndroidHostMessage(): string =
+    "abla: this Android library was called before its host installed the thread table " +
+    "(abla_android_host_install; the generated libabla_jni.so does it in JNI_OnLoad)\n"
+
+fun bootstrapLlvmAndroidHostAssembly(): string {
+    val message = bootstrapLlvmAndroidHostMessage()
+    val names = ["pthread_key_create", "pthread_getspecific", "pthread_setspecific", "pthread_create", "pthread_join"]
+    var trampolines = ""
+    var index = 0
+    while (index < names.size) {
+        trampolines = trampolines + bootstrapLlvmAssemblyHiddenFunction(names[index]) + "${names[index]}:\n" +
+            "    mov x17, #${16 + 8 * index}\n    b abla_android_host_call\n" + ".size ${names[index]}, . - ${names[index]}\n"
+        index = index + 1
+    }
+    ".pushsection .bss\n.p2align 3\n.globl abla_android_host\n.hidden abla_android_host\nabla_android_host: .zero 8\n.popsection\n" +
+    ".pushsection .rodata\n.Labla_android_host_message: .ascii \"" +
+    message.slice(0, message.size - 1) + "\\n\"\n.popsection\n" +
+    ".text\n.p2align 2\n" +
+    ".globl abla_android_host_install\n.type abla_android_host_install,@function\n" +
+    "abla_android_host_install:\n" +
+    "    cbz x0, 3f\n" +
+    "    ldr x1, [x0]\n    cmp x1, #1\n    b.ne 3f\n" +
+    "    ldr x1, [x0, #8]\n    cmp x1, #5\n    b.lo 3f\n" +
+    "    adrp x2, abla_android_host\n    add x2, x2, :lo12:abla_android_host\n" +
+    "1:  ldaxr x1, [x2]\n    cbnz x1, 2f\n    stlxr w3, x0, [x2]\n    cbnz w3, 1b\n    mov x0, #0\n    ret\n" +
+    "2:  clrex\n    cmp x1, x0\n    cset x0, ne\n    ret\n" +
+    "3:  mov x0, #-1\n    ret\n" +
+    ".size abla_android_host_install, . - abla_android_host_install\n" +
+    // x16 and x17 are the intra-procedure-call scratch registers: free at a call, the arguments in x0-x7 untouched.
+    bootstrapLlvmAssemblyHiddenFunction("abla_android_host_call") +
+    "abla_android_host_call:\n" +
+    "    adrp x16, abla_android_host\n    add x16, x16, :lo12:abla_android_host\n    ldar x16, [x16]\n" +
+    "    cbz x16, 1f\n    ldr x16, [x16, x17]\n    br x16\n" +
+    // write(2, message, size) and exit_group(70), by AArch64 numbers
+    "1:  mov x0, #2\n    adrp x1, .Labla_android_host_message\n    add x1, x1, :lo12:.Labla_android_host_message\n" +
+    "    mov x2, #${message.size}\n    mov x8, #64\n    svc #0\n" +
+    "    mov x0, #70\n    mov x8, #94\n    svc #0\n    b 1b\n" +
+    ".size abla_android_host_call, . - abla_android_host_call\n" + trampolines
 }
 
 fun bootstrapLlvmEmitAarch64Routines(backend: BootstrapLlvmBackend): void {

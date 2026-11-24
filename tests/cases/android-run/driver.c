@@ -5,12 +5,20 @@
 //                                                           stop it (abla_run_stops) and abandon nothing (abla_run_abandoned)
 //   driver <library> -t <threads> <export> <expected>       one export from <threads> pthreads the library did not
 //                                                           start (JNI-style), each passing its own number 1..N
+//   driver <library> -n <export> <expected>                 without installing the host table first (a plain dlopen): the
+//                                                           export must end the process with status 70 and a message
+//   driver <library> -j <libabla_jni.so> ...                the table installed by the generated libabla_jni.so's JNI_OnLoad
+//                                                           (linked against the library, as the app's CMake links it),
+//                                                           then any of the modes above
+// Before any export it installs the table of bionic functions the library calls through (abla-app.h, generated with the
+// library), as the app's libabla_jni.so does in JNI_OnLoad, and checks what abla_android_host_install answers.
 // The driver is linked with --export-dynamic: the library's undefined abla_test_host_hook is this file's.
 // Each call prints "<name> <result>"; the program exits 0 only when every result is the expected one.
 #ifdef TEST_DELAY_KEY
 #define _GNU_SOURCE
 #include <errno.h>
 #endif
+#include "abla-app.h"
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -67,9 +75,45 @@ static void *run_job(void *argument) {
 }
 
 int main(int argc, char **argv) {
+    int install = 1;
+    if (argc > 3 && strcmp(argv[2], "-n") == 0) {
+        install = 0;
+        for (int index = 2; index + 1 < argc; index++) argv[index] = argv[index + 1];
+        argc--;
+    }
+    const char *jni = 0;
+    if (install && argc > 4 && strcmp(argv[2], "-j") == 0) {
+        jni = argv[3];
+        for (int index = 2; index + 2 < argc; index++) argv[index] = argv[index + 2];
+        argc -= 2;
+    }
     if (argc < 3) return 2;
     void *library = dlopen(argv[1], RTLD_NOW);
     if (!library) { printf("dlopen: %s\n", dlerror()); return 3; }
+    if (jni) {
+        void *adapter = dlopen(jni, RTLD_NOW);
+        if (!adapter) { printf("dlopen %s: %s\n", jni, dlerror()); return 3; }
+        int32_t (*on_load)(void *, void *) = (int32_t (*)(void *, void *))dlsym(adapter, "JNI_OnLoad");
+        if (!on_load) { printf("dlsym JNI_OnLoad: %s\n", dlerror()); return 3; }
+        // JNI_VERSION_1_6; the generated JNI_OnLoad uses neither argument.
+        int32_t version = on_load(0, 0);
+        fprintf(stderr, "JNI_OnLoad 0x%x\n", (unsigned)version);
+        if (version != 0x10006) return 3;
+    } else if (install) {
+        int64_t (*install_host)(const struct abla_android_host *) =
+            (int64_t (*)(const struct abla_android_host *))dlsym(library, "abla_android_host_install");
+        if (!install_host) { printf("dlsym abla_android_host_install: %s\n", dlerror()); return 3; }
+        static const struct abla_android_host host = { ABLA_ANDROID_HOST_VERSION, ABLA_ANDROID_HOST_COUNT,
+            pthread_key_create, pthread_getspecific, pthread_setspecific, pthread_create, pthread_join };
+        struct abla_android_host other = host, newer = host;
+        newer.version = 2;
+        // The first table stays: installing it again answers 0, another one 1, one of a version the library does not know -1.
+        int64_t first = install_host(&host), again = install_host(&host), second = install_host(&other),
+            unknown = install_host(&newer);
+        fprintf(stderr, "host table: %lld %lld %lld %lld\n", (long long)first, (long long)again, (long long)second,
+            (long long)unknown);
+        if (first != 0 || again != 0 || second != 1 || unknown != -1) return 3;
+    }
     nested_function = (export_function)dlsym(library, "abla_run_nested");
     // A library has no process environment to read ABLA_GC_STRESS and ABLA_GC_TRACE from: pass them on as calls.
     const char *stress = getenv("ABLA_GC_STRESS"), *trace = getenv("ABLA_GC_TRACE");

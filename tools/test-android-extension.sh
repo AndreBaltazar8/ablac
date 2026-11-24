@@ -59,6 +59,13 @@ gradle="$output_directory/abla.gradle.kts"
 [[ -s $header && -s $jni && -s $kotlin && -s $cmake && -s $gradle ]] || exit 1
 grep -q 'int64_t abla_app_answer(void)' "$header"
 grep -q 'Java_org_abla_generated_AblaApp_answer' "$jni"
+# libabla_jni.so installs the bionic functions libabla_app.so calls through, in JNI_OnLoad (decision #121).
+grep -q 'JNIEXPORT jint JNICALL JNI_OnLoad' "$jni"
+grep -q 'abla_android_host_install(&abla_host)' "$jni"
+grep -q 'pthread_key_create, pthread_getspecific, pthread_setspecific, pthread_create, pthread_join' "$jni"
+grep -q 'int64_t abla_android_host_install(const struct abla_android_host \*host);' "$header"
+grep -q ' T abla_android_host_install$' <<<"$(llvm-nm -D --defined-only "$library")"
+[[ -z $(llvm-nm -D --undefined-only "$library") ]]
 grep -q 'external fun answer(): Long' "$kotlin"
 grep -q 'IMPORTED_LOCATION.*ANDROID_ABI.*libabla_app.so' "$cmake"
 grep -q 'IMPORTED_NO_SONAME TRUE' "$cmake"

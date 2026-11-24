@@ -170,8 +170,9 @@ The manually dispatched `android-pointer-tags-control` job, **AArch64
 tagged-pointer positive and negative controls**, is additional optional evidence.
 
 There is no Android entry in Release's `compiler` matrix, no Android compiler
-asset, and no required UI, lifecycle or physical-device gate. API 24 and bionic
-imports remain deliberate integration constraints; see [target details](targets.md).
+asset, and no required UI, lifecycle or physical-device gate. API 24 and the bionic
+thread functions the generated JNI adapter hands the library (the library itself imports nothing) remain
+deliberate integration constraints; see [target details](targets.md).
 
 ## iOS
 

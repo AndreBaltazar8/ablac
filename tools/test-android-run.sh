@@ -3,7 +3,9 @@
 # build step, loaded with dlopen by a small NDK-built driver running under bionic's own linker (linker64, libc, libm,
 # libdl of Google's arm64 Android 36 image) on AArch64, and its exports are called: getrandom (secureRandomBytes)
 # through the library's own system call routine, and heap, strings, maps and thread-locals (emulated TLS on bionic's
-# pthread keys). It catches what the link check (tools/test-android-link.sh) cannot: a library the dynamic linker
+# pthread keys, which the library calls through the table of bionic functions the driver installs first, as the app's
+# libabla_jni.so does; without the table an export ends the process with a message). It catches what the link check
+# (tools/test-android-link.sh) cannot: a library the dynamic linker
 # refuses (an import no needed library provides: no DT_NEEDED libc.so, a symbol newer than the API level), a crash
 # in the library's start-up (init arrays, relocations), a wrong system call number or translation, a TLS or heap
 # fault, a wrong result.
@@ -48,7 +50,14 @@ status=0
 [[ $status -eq 37 ]] || { cat "$out/generate.log" >&2; fail "building the library failed ($status)"; }
 library=$PWD/$out/lib/src/main/jniLibs/arm64-v8a/libabla_app.so
 [[ -f $library ]] || fail "no $library"
-"$clang" tests/cases/android-run/driver.c -o "$out/driver" -ldl -Wl,--export-dynamic || fail 'the driver did not build'
+"$clang" -I "$out/lib/src/main/cpp" tests/cases/android-run/driver.c -o "$out/driver" -ldl -Wl,--export-dynamic ||
+    fail 'the driver did not build'
+# The generated adapter (libabla_jni.so), compiled and linked as the app's CMake does: its DT_NEEDED libabla_app.so is the
+# library the driver loaded (the library's directory is on LD_LIBRARY_PATH); the -j runs install the table through its JNI_OnLoad.
+mkdir -p "$out/jni"
+"$clang" -shared -fPIC -I "$out/lib/src/main/cpp" "$out/lib/src/main/cpp/abla_jni.c" -o "$out/jni/libabla_jni.so" \
+    -L "${library%/*}" -l:libabla_app.so \
+    -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 || fail 'the generated libabla_jni.so did not build'
 bionic_inputs=()
 if [[ -n ${ABLA_AARCH64_RUN:-} ]]; then
     # The Android linker takes an absolute program path. /proc/self/cwd
@@ -64,6 +73,8 @@ run_android() ( # driver timeout library arguments...
     duration=$2
     image=$3
     shift 3
+    # @jni@ in the arguments: the generated adapter's path where the driver runs.
+    arguments=("$@")
     stress=()
     if [[ -v ABLA_GC_STRESS ]]; then stress=(--env "ABLA_GC_STRESS=$ABLA_GC_STRESS"); fi
     linker=$bionic/system/bin/bootstrap/linker64
@@ -71,13 +82,13 @@ run_android() ( # driver timeout library arguments...
         cd "$out"
         relative_image=${image#"$root/$out/"}
         aarch64_run --timeout "$duration" "${stress[@]}" "${bionic_inputs[@]}" \
-            --input "$driver" --input "$relative_image" \
-            --env 'LD_LIBRARY_PATH=/proc/self/cwd/bionic/lib64/bootstrap:/proc/self/cwd/bionic/lib64' \
-            -- "$linker" "/proc/self/cwd/$driver" "/proc/self/cwd/$relative_image" "$@"
+            --input "$driver" --input "$relative_image" --input jni/libabla_jni.so \
+            --env "LD_LIBRARY_PATH=/proc/self/cwd/bionic/lib64/bootstrap:/proc/self/cwd/bionic/lib64:/proc/self/cwd/${relative_image%/*}" \
+            -- "$linker" "/proc/self/cwd/$driver" "/proc/self/cwd/$relative_image" "${arguments[@]/#@jni@//proc/self/cwd/jni/libabla_jni.so}"
     else
         aarch64_run --timeout "$duration" "${stress[@]}" \
-            --env "LD_LIBRARY_PATH=$bionic/system/lib64/bootstrap:$bionic/system/lib64" \
-            -- "$linker" "$PWD/$out/$driver" "$image" "$@"
+            --env "LD_LIBRARY_PATH=$bionic/system/lib64/bootstrap:$bionic/system/lib64:${image%/*}" \
+            -- "$linker" "$PWD/$out/$driver" "$image" "${arguments[@]/#@jni@/$PWD/$out/jni/libabla_jni.so}"
     fi
 )
 status=0
@@ -89,24 +100,41 @@ if [[ $status -ne 0 ]]; then
     fail "the driver failed ($status)"
 fi
 grep -q '^abla_run_random ' "$out/run.out" && grep -qx 'abla_run_heap 465' "$out/run.out" && grep -qx 'abla_run_thread 142' "$out/run.out" && grep -qx 'abla_run_threads_heap 1860' "$out/run.out" && grep -qx 'abla_run_seed 78' "$out/run.out" || { cat "$out/run.out" >&2; fail 'unexpected output'; }
+# The driver installed the host table as libabla_jni.so does (decision #121): the first install takes, the same table again
+# answers 0, another table 1 (the first stays) and an unknown version -1.
+grep -qx 'host table: 0 0 1 -1' "$out/run.err" || { grep -v 'linkerconfig' "$out/run.err" >&2; fail 'the host table install answers'; }
+# A plain dlopen without the table loads the library (it imports nothing, its start-up needs no table); the first export
+# that needs a thread-local ends the process with status 70 and says why, instead of jumping to a null function.
+status=0
+run_android driver 120 "$library" -n abla_run_heap 465 > "$out/no-table.out" 2> "$out/no-table.err" < /dev/null || status=$?
+[[ $status -eq 70 ]] && grep -q '^abla: this Android library was called before its host installed the thread table' "$out/no-table.err" ||
+    { cat "$out/no-table.out" >&2; grep -v 'linkerconfig' "$out/no-table.err" >&2; fail "an export without the host table: status $status"; }
 # Threads the library did not start (JNI-style) call one export at the same time, under the collector's stress mode
 # (a collection at every safe point) and without: each export enters and leaves the runtime (heap lock live, a count of threads inside, the globals initialized once), and a
-# nested export runs while the globals initialize. Without that this crashes.
+# nested export runs while the globals initialize. Without that this crashes. The table comes from the driver (host) and
+# from the generated adapter's JNI_OnLoad (jni), as in an app.
+for mode in host jni; do
 for stress in 0 1; do
     count=8
     [[ $stress -eq 0 ]] || count=4
     status=0
-    ABLA_GC_STRESS=$stress run_android driver 600 "$library" -t "$count" abla_run_churn 1 \
-        > "$out/threads-$stress.out" 2> "$out/threads-$stress.err" < /dev/null || status=$?
+    adapter=()
+    [[ $mode == host ]] || adapter=(-j @jni@)
+    ABLA_GC_STRESS=$stress run_android driver 600 "$library" "${adapter[@]}" -t "$count" abla_run_churn 1 \
+        > "$out/threads-$mode-$stress.out" 2> "$out/threads-$mode-$stress.err" < /dev/null || status=$?
     if [[ $status -ne 0 ]]; then
-        cat "$out/threads-$stress.out" >&2
-        grep -v 'linkerconfig' "$out/threads-$stress.err" >&2 || true
-        fail "calls from $count foreign threads (GC stress $stress) failed ($status)"
+        cat "$out/threads-$mode-$stress.out" >&2
+        grep -v 'linkerconfig' "$out/threads-$mode-$stress.err" >&2 || true
+        fail "calls from $count foreign threads (GC stress $stress, table from the $mode) failed ($status)"
     fi
+    if [[ $mode == jni ]] && ! grep -qx 'JNI_OnLoad 0x10006' "$out/threads-$mode-$stress.err"; then
+        fail "the generated JNI_OnLoad did not install the table (GC stress $stress)"
+    fi
+done
 done
 # Every worker starts from the barrier as a foreign caller. The interposed key creator pauses
 # while the library's first-use state is in progress, giving the other workers time to observe it.
-"$clang" -DTEST_DELAY_KEY tests/cases/android-run/driver.c -o "$out/driver-delayed-key" -ldl -Wl,--export-dynamic ||
+"$clang" -DTEST_DELAY_KEY -I "$out/lib/src/main/cpp" tests/cases/android-run/driver.c -o "$out/driver-delayed-key" -ldl -Wl,--export-dynamic ||
     fail 'the delayed-key driver did not build'
 status=0
 ABLA_GC_STRESS=0 run_android driver-delayed-key 60 "$library" -t 8 abla_run_churn 1 \

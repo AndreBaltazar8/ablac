@@ -24,7 +24,9 @@ compile fun androidReplaceAll(
 // ---- the Android NDK lookup -------------------------------------------------------------------------------------
 // An arm64 Android library that has a thread-local calls __emutls_get_address (API 24 has no ELF TLS in a dlopen'd
 // library), which bionic does not export. LLVM can use the definition in abla/android/emutls or the NDK's
-// compiler-rt builtins archive. The NDK sysroot's API 24 libc.so stub supplies bionic symbols such as pthread_*.
+// compiler-rt builtins archive. The NDK sysroot's API 24 libc.so stub supplies the bionic symbols a user's native input
+// may import (the runtime imports none: the five pthread functions it calls come from the host's table, see
+// androidGenerateIntegration).
 // The link adds a libc.so dependency only if it resolves an import. This lookup supplies both files to the linker.
 //
 // The lookup reads the environment and lists directories, so a build script that builds an Android library grants
@@ -142,10 +144,30 @@ compile fun androidGenerateIntegration(
 ): bool {
     val packagePath = androidReplaceAll(packageName, ".", "/")
     val jniPackage = androidReplaceAll(packageName, ".", "_")
+    // libabla_app.so imports nothing from bionic (decision #121): this library, which links bionic, installs the five
+    // functions it needs in JNI_OnLoad, before Java can call an export (src/backend/llvm/aarch64.ab,
+    // bootstrapLlvmAndroidHostAssembly). A program loading libabla_app.so without this library calls
+    // abla_android_host_install itself with the same table first.
     val header =
-        "#ifndef ABLA_APP_H\n#define ABLA_APP_H\n#include <stdint.h>\nint64_t abla_app_answer(void);\n#endif\n"
+        "#ifndef ABLA_APP_H\n#define ABLA_APP_H\n#include <pthread.h>\n#include <stdint.h>\n" +
+        "// The bionic functions libabla_app.so calls through, in this order; version 1 has five.\n" +
+        "struct abla_android_host {\n    uint64_t version;\n    uint64_t count;\n" +
+        "    int (*key_create)(pthread_key_t *, void (*)(void *));\n    void *(*getspecific)(pthread_key_t);\n" +
+        "    int (*setspecific)(pthread_key_t, const void *);\n" +
+        "    int (*create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);\n" +
+        "    int (*join)(pthread_t, void **);\n};\n" +
+        "#define ABLA_ANDROID_HOST_VERSION 1\n#define ABLA_ANDROID_HOST_COUNT 5\n" +
+        "// Installs `host` once for the process, before the first call of an export: 0 when it is installed (or already\n" +
+        "// was), 1 when another table was installed first (that one stays), -1 when `host` is not version 1.\n" +
+        "int64_t abla_android_host_install(const struct abla_android_host *host);\n" +
+        "int64_t abla_app_answer(void);\n#endif\n"
     val jni =
-        "#include <jni.h>\n#include \"abla-app.h\"\nJNIEXPORT jlong JNICALL Java_${jniPackage}_AblaApp_answer(JNIEnv *environment, jclass type) {\n    (void)environment;\n    (void)type;\n    return (jlong)abla_app_answer();\n}\n"
+        "#include <jni.h>\n#include <pthread.h>\n#include \"abla-app.h\"\n" +
+        "static const struct abla_android_host abla_host = {\n    ABLA_ANDROID_HOST_VERSION, ABLA_ANDROID_HOST_COUNT,\n" +
+        "    pthread_key_create, pthread_getspecific, pthread_setspecific, pthread_create, pthread_join\n};\n" +
+        "JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {\n    (void)vm;\n    (void)reserved;\n" +
+        "    return abla_android_host_install(&abla_host) < 0 ? JNI_ERR : JNI_VERSION_1_6;\n}\n" +
+        "JNIEXPORT jlong JNICALL Java_${jniPackage}_AblaApp_answer(JNIEnv *environment, jclass type) {\n    (void)environment;\n    (void)type;\n    return (jlong)abla_app_answer();\n}\n"
     val kotlin =
         "package $packageName\n\nobject AblaApp {\n    init { System.loadLibrary(\"abla_jni\") }\n    @JvmStatic external fun answer(): Long\n}\n"
     val cmake =
