@@ -1,0 +1,176 @@
+import "../../ir.ab"
+import "debug.ab"
+import "abla/text"
+
+// A single final return can share the call site's continuation. Other
+// control, resource lifetimes and hidden name operands keep the separate
+// specialized function. Inlined declarations need ordinary, independent
+// local slots because the call can be in a loop.
+private fun bootstrapInlineBlockBodySupported(function: BootstrapIrFunction): bool {
+    val count = function.instructions.size
+    if (count == 0 || function.instructions[count - 1].opcode != "return" ||
+        function.instructions[count - 1].left < 0) return false
+    var accessesArray = false
+    for (i in 0 until count - 1) {
+        val instruction = function.instructions[i]
+        val opcode = instruction.opcode
+        if (opcode.startsWith("array.get")) accessesArray = true
+        if (opcode == "borrow.mutate") {
+            var isLocal = false
+            for (local in function.locals) {
+                if (local.name == instruction.text) isLocal = true
+            }
+            if (!isLocal) return false
+            continue
+        }
+        if (opcode == "parameter.load" || opcode == "local.declare" ||
+            opcode == "local.load" || opcode == "local.set" || opcode.startsWith("local.zero") ||
+            opcode.startsWith("const.") || opcode == "array.create" || opcode == "array.length" ||
+            opcode.startsWith("array.get") || opcode == "array.append" ||
+            opcode == "+" || opcode == "-" || opcode == "*" || opcode == "<" ||
+            opcode == "jump" || opcode == "branch" || opcode == "label" || opcode == "call")
+            continue
+        return false
+    }
+    accessesArray
+}
+
+private fun bootstrapInlineBlockOperand(values: Map<int, int>, value: int,
+    offset: int): int = if (value < 0) value else values.get(value) ?? (value + offset)
+
+// Bind a freshly constructed result directly to the caller's destination.
+// A separate rooted slot would retain a duplicate array across iterations.
+private fun bootstrapInlineBlockResultLocal(helper: BootstrapIrFunction): string {
+    val instructions = helper.instructions
+    val returned = instructions[instructions.size - 2]
+    if (returned.opcode != "local.load" ||
+        returned.result != instructions[instructions.size - 1].left) return ""
+    for (at in 1 until instructions.size - 2) {
+        val declaration = instructions[at]
+        val initializer = instructions[at - 1]
+        if (declaration.opcode == "local.declare" && declaration.text == returned.text &&
+            initializer.opcode == "array.create" && initializer.result == declaration.left)
+            return returned.text
+    }
+    ""
+}
+
+private fun bootstrapInlineBlockInstruction(instruction: BootstrapInstruction,
+    values: Map<int, int>, valueBase: int, labelBase: int, text: string): BootstrapInstruction {
+    val operands: array<int> = []
+    for (value in instruction.operands)
+        operands.append(bootstrapInlineBlockOperand(values, value, valueBase))
+    val opcode = instruction.opcode
+    val label = opcode == "label" || opcode == "branch" || opcode == "jump"
+    BootstrapInstruction(opcode,
+        if (instruction.result >= 0) instruction.result + valueBase else instruction.result,
+        bootstrapInlineBlockOperand(values, instruction.left, valueBase),
+        if (opcode == "parameter.default") instruction.right else
+            bootstrapInlineBlockOperand(values, instruction.right, valueBase),
+        text, if (label && instruction.target >= 0) instruction.target + labelBase else instruction.target,
+        if (opcode == "branch" && instruction.alternate >= 0) instruction.alternate + labelBase
+            else instruction.alternate,
+        if (operands.size == 0) instruction.operands else operands,
+        instruction.texts, instruction.position)
+}
+
+private fun bootstrapInlineBlockCaller(caller: BootstrapIrFunction,
+    functions: array<BootstrapIrFunction>, targets: Map<string, int>): BootstrapIrFunction {
+    var needed = false
+    for (instruction in caller.instructions) {
+        if (instruction.opcode == "call" && targets.get(instruction.text) != null) needed = true
+    }
+    if (!needed) return caller
+    val instructions: array<BootstrapInstruction> = []
+    val localNames: array<string> = []
+    val localTypes: array<string> = []
+    for (i in 0 until caller.locals.size) {
+        localNames.append(caller.locals[i].name)
+        localTypes.append(caller.localTypes[i])
+    }
+    var valueBase = caller.result + 1
+    var labelBase = 0
+    for (instruction in caller.instructions) {
+        if (instruction.result >= valueBase) valueBase = instruction.result + 1
+        if (instruction.opcode == "label" && instruction.target >= labelBase)
+            labelBase = instruction.target + 1
+    }
+    val aliases: Map<int, int> = Map()
+    var budget = 384
+    var movedDeclaration = -1
+    for (index in 0 until caller.instructions.size) {
+        if (index == movedDeclaration) continue
+        val instruction = caller.instructions[index]
+        val target = if (instruction.opcode == "call") targets.get(instruction.text) else null
+        if (target == null || functions[target].instructions.size > budget ||
+            functions[target].parameters.size != instruction.operands.size) {
+            instructions.append(bootstrapInlineBlockInstruction(instruction, aliases, 0, 0, instruction.text))
+            continue
+        }
+        val helper = functions[target]
+        val values: Map<int, int> = Map()
+        var nextValue = valueBase
+        var nextLabel = labelBase
+        val prefix = "__abla_inline_local_${index}_"
+        val next = if (index + 1 < caller.instructions.size) caller.instructions[index + 1] else null
+        val resultLocal = if (next != null && next.opcode == "local.declare" &&
+            next.left == instruction.result) bootstrapInlineBlockResultLocal(helper) else ""
+        val destination = if (resultLocal != "" && next != null) next.text else ""
+        if (destination != "") movedDeclaration = index + 1
+        for (local in 0 until helper.locals.size) {
+            if (destination != "" && helper.locals[local].name == resultLocal) continue
+            localNames.append(prefix + helper.locals[local].name)
+            localTypes.append(helper.localTypes[local])
+        }
+        for (part in helper.instructions) {
+            val opcode = part.opcode
+            if (opcode == "parameter.load") {
+                for (parameter in 0 until helper.parameters.size) {
+                    if (helper.parameters[parameter] == part.text) {
+                        values.set(part.result, bootstrapInlineBlockOperand(aliases,
+                            instruction.operands[parameter], 0))
+                        break
+                    }
+                }
+            } else if (opcode == "return") {
+                val returned = bootstrapInlineBlockOperand(values, part.left, valueBase)
+                aliases.set(instruction.result, returned)
+                if (destination != "" && next != null && next.result >= 0)
+                    aliases.set(next.result, returned)
+            } else {
+                val text = if (opcode.startsWith("local.") || opcode == "borrow.mutate")
+                    (if (destination != "" && part.text == resultLocal) destination
+                        else prefix + part.text) else part.text
+                instructions.append(bootstrapInlineBlockInstruction(part, values, valueBase, labelBase, text))
+                if (part.result >= 0 && valueBase + part.result >= nextValue)
+                    nextValue = valueBase + part.result + 1
+                if (opcode == "label" && labelBase + part.target >= nextLabel)
+                    nextLabel = labelBase + part.target + 1
+            }
+        }
+        valueBase = nextValue
+        labelBase = nextLabel
+        budget -= helper.instructions.size
+    }
+    if (aliases.size == 0) return caller
+    val result = bootstrapFinalizeIrFunction(caller.name, caller.parameters, instructions,
+        bootstrapInlineBlockOperand(aliases, caller.result, 0), caller.parameterTypes, caller.resultType,
+        localNames, localTypes, caller.inlineHint, caller.noinlineHint, caller.naked, caller.section,
+        caller.label, caller.position, caller.targetFeatures, caller.runtimeImplementation)
+    if (result.verificationErrors == 0) result else caller
+}
+
+fun bootstrapLlvmInlineBlockBodies(functions: array<BootstrapIrFunction>,
+    helperIndexes: array<int>): array<BootstrapIrFunction> {
+    val targets: Map<string, int> = Map()
+    for (index in helperIndexes) {
+        val function = functions[index]
+        if (bootstrapInlineBlockBodySupported(function)) targets.set(function.name, index)
+    }
+    val rewritten: array<BootstrapIrFunction> = []
+    for (function in functions) {
+        rewritten.append(if (bootstrapLlvmDebugInfo || targets.size == 0) function else
+            bootstrapInlineBlockCaller(function, functions, targets))
+    }
+    rewritten
+}

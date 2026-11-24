@@ -1,6 +1,7 @@
 import "../../ir.ab"
 import "../../sema.ab"
 import "analysis.ab"
+import "inline_block_body.ab"
 import "abla/text"
 
 private class BootstrapLiteralBlockSite(val parameter: int, val calls: array<int>)
@@ -89,6 +90,30 @@ private fun bootstrapLiteralBlockTypeMatches(callback: BootstrapIrFunction, type
     true
 }
 
+// A literal consisting of a call with its own parameters in order already
+// has a typed target. Keep its argument evaluation and omit the extra frame.
+private fun bootstrapLiteralBlockForwardTarget(callback: BootstrapIrFunction,
+    program: BootstrapIrProgram, functions: BootstrapLlvmNameIndex, result: string): string {
+    val arity = callback.parameters.size
+    if (callback.instructions.size != arity + 2) return ""
+    val call = callback.instructions[arity]
+    val returned = callback.instructions[arity + 1]
+    if (call.opcode != "call" || call.operands.size != arity ||
+        returned.opcode != "return" || returned.left != call.result) return ""
+    for (index in 0 until arity) {
+        val load = callback.instructions[index]
+        if (load.opcode != "parameter.load" || load.text != callback.parameters[index] ||
+            load.result != call.operands[index]) return ""
+    }
+    val target = functions.find(call.text)
+    if (target < 0 || target >= program.functions.size) return ""
+    val direct = program.functions[target]
+    if (direct.resultType != result || direct.parameterTypes.size != arity) return ""
+    for (index in 0 until arity)
+        if (direct.parameterTypes[index] != callback.parameterTypes[index]) return ""
+    call.text
+}
+
 // Keep the ordinary function and closure entry points. Copies are local to
 // this emission, so incremental lowering retains its target-neutral IR.
 fun bootstrapLlvmSpecializeLiteralBlocks(program: BootstrapIrProgram): BootstrapIrProgram {
@@ -105,6 +130,7 @@ fun bootstrapLlvmSpecializeLiteralBlocks(program: BootstrapIrProgram): Bootstrap
     val variants: Map<string, string> = Map()
     val callbacks: Map<int, string> = Map()
     val clones: array<BootstrapIrFunction> = []
+    val helperIndexes: array<int> = []
     val rewritten: array<BootstrapIrFunction> = []
     var budget = 8192
     for (function in program.functions) {
@@ -134,14 +160,20 @@ fun bootstrapLlvmSpecializeLiteralBlocks(program: BootstrapIrProgram): Bootstrap
                 val cost = owner.instructions.size + callback.instructions.size
                 if (cost > budget) continue
                 variant = "__abla_inline_callback_$key"
-                val target = "__abla_inline_block_$block"
-                if (functions.find(variant) >= 0 || functions.find(target) >= 0) continue
-                if (callbacks.get(block) == null) {
-                    clones.append(bootstrapLiteralBlockClone(callback, target,
-                        callback.instructions, result))
+                if (functions.find(variant) >= 0) continue
+                var target = callbacks.get(block) ?? ""
+                if (target == "") {
+                    target = bootstrapLiteralBlockForwardTarget(callback, program, functions, result)
+                    if (target == "") {
+                        target = "__abla_inline_block_$block"
+                        if (functions.find(target) >= 0) continue
+                        clones.append(bootstrapLiteralBlockClone(callback, target,
+                            callback.instructions, result))
+                    }
                     callbacks.set(block, target)
                 }
                 val body = bootstrapLiteralBlockInstructions(owner, site, target)
+                helperIndexes.append(program.functions.size + clones.size)
                 clones.append(bootstrapLiteralBlockClone(owner, variant, body, owner.resultType))
                 variants.set(key, variant)
                 budget -= cost
@@ -167,7 +199,8 @@ fun bootstrapLlvmSpecializeLiteralBlocks(program: BootstrapIrProgram): Bootstrap
     }
     if (clones.size == 0) return program
     for (clone in clones) rewritten.append(clone)
-    BootstrapIrProgram(program.instructions, rewritten, program.classes, program.natives,
+    val inlined = bootstrapLlvmInlineBlockBodies(rewritten, helperIndexes)
+    BootstrapIrProgram(program.instructions, inlined, program.classes, program.natives,
         program.globalNames, program.globalTypes, program.globalKinds, program.compileInputPaths,
         program.compileInputContents, program.errors, program.lookup, program.validationFailures,
         program.extensionFields)

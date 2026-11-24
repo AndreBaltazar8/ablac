@@ -7,7 +7,7 @@ out="$root/build/inline-blocks"
 mkdir -p "$out"
 cd "$root"
 
-for fixture in main fallback; do
+for fixture in main fallback array; do
     source="tests/cases/inline-blocks/$fixture.ab"
     "$compiler" --emit-llvm "$source" > "$out/$fixture.ir.ll"
     "$compiler" build "$source" --fast --no-cache -o "$out/$fixture"
@@ -16,8 +16,10 @@ done
 
 printf '22 51 18\n' > "$out/main.expected"
 printf '9 14 4\n' > "$out/fallback.expected"
+printf '3 18 6\n' > "$out/array.expected"
 cmp "$out/main.expected" "$out/main.actual"
 cmp "$out/fallback.expected" "$out/fallback.actual"
+cmp "$out/array.expected" "$out/array.actual"
 test -s "$out/main.ir.ll"
 test -s "$out/fallback.ir.ll"
 
@@ -44,6 +46,22 @@ fi
 if ! grep -E 'call .*@abla_llvm_call_indirect\(' "$out/fallback.ir.ll" >/dev/null ||
     grep -F '__abla_inline_callback_' "$out/fallback.ir.ll" >/dev/null; then
     echo 'inline blocks: capturing, forwarded and ordinary callbacks must retain dispatch' >&2
+    exit 1
+fi
+if ! awk '
+    /^define / {
+        attr=""
+        if (match($0, /#[0-9]+ \{/)) attr=substr($0,RSTART,RLENGTH-2)
+    }
+    attr!="" && /call (fastcc )?i64 @abla_fn_.*_direct\(i64/ { ++typed[attr] }
+    attr!="" && /^dense\.array\.checked/ { ++dense[attr] }
+    /^}/ { attr="" }
+    /^attributes / && /"abla.source"="main"/ && typed[$2] == 1 && dense[$2] >= 3 {
+        inlined = 1
+    }
+    END { exit !inlined }
+' "$out/array.ir.ll"; then
+    echo 'inline blocks: expected a typed callback and three dense array reads in the caller' >&2
     exit 1
 fi
 echo 'inline blocks: typed specializations and ordinary closure dispatch passed'
