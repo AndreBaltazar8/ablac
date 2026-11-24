@@ -3069,6 +3069,14 @@ build fails with `E_PACKAGE_TRUSTED_DENIED`
 ([packages.md](packages.md#trusted-and-extern-code-in-a-dependency)). The root
 project and the standard library define trusted code freely.
 
+A project's own `extern` declarations without `trusted` can be called from
+ordinary code (decision #139). They are the project's own unchecked boundary:
+nothing checks what the native function does with its arguments. For a native
+function that takes or returns an address, declare it `trusted extern` and call
+it through a trusted wrapper that checks its arguments, as `checkedRead` does
+above. A dependency's `extern` declarations need the root's `trusted.native`
+line ([packages.md](packages.md#trusted-and-extern-code-in-a-dependency)).
+
 The same rule covers the standard library's raw-address functions (decision
 #130, #1226): the declarations of `abla/unsafe` that take, make or call a raw
 address or pointer (`nativePointerAddress`, `nativePointerFromAddress`, the
