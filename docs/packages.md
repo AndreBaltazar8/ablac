@@ -405,7 +405,10 @@ The one line `fast-json = ["trusted.native"]` in the root's `[dependencyCompileC
    `trusted.native` in its own `compileCapabilities`, which bound every package
    ([compile-time.md](compile-time.md#grants-per-package)).
 
-A library that only defines trusted code needs the first effect alone.
+A library that only defines trusted code needs the first effect alone. A library that calls `abla/unsafe`'s raw-address
+functions or raw constructors (`nativePointerAddress`, `NativeByteBuffer(address, ...)`, ...) does so from trusted
+functions (a warning in v0.2.72, an error from v0.2.73: [language.md](language.md#trusted-native-implementations)), so
+it needs this line too.
 
 Legacy manifest `[dependencies]` entries using inline `git` plus exactly one
 of `rev`, `tag`, or `branch` remain accepted and share the same lock graph.

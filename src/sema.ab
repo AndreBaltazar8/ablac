@@ -1605,6 +1605,31 @@ fun bootstrapMutexElementType(type: string): string {
 fun bootstrapIsCellType(type: string): bool =
     type.size >= 5 && type.slice(0, 5) == "cell:"
 
+// ---- Trusted-only declarations (#1226, decision #130 A) ----
+// A standard-library declaration annotated `@__abla_trusted_only` (a function, an extension function, an extern, or a
+// class, whose constructor it restricts) can be used only from trusted code: a call, a constructor call or a reference to
+// it as a value from code that is not trusted is `native.trust:<name>`, as for a trusted extern. The annotation is the
+// standard library's alone (annotation.reserved elsewhere). Its argument, a string, is "<phase>[ <release>]: <help>": the
+// phase "warn" warns and builds ("error", the default, refuses), the release names when a warning becomes an error, and
+// the help names the safe way (a factory, a checked method), else the help says to wrap the use in a trusted function.
+// Flipping a declaration from warn to error is the standard library's change, not the compiler's.
+
+/** The `@__abla_trusted_only` argument of `declaration`: "error" when it has none, "" when it has no such annotation. */
+fun bootstrapTrustedOnlySpec(declaration: BootstrapDeclaration): string {
+    var index = 0
+    while (index < declaration.annotations.size) {
+        if (declaration.annotations[index] == "__abla_trusted_only") {
+            if (index < declaration.annotationArguments.size && declaration.annotationArguments[index].kind == "string") {
+                return if (declaration.annotationArguments[index].text == "") "error"
+                    else declaration.annotationArguments[index].text
+            }
+            return "error"
+        }
+        index = index + 1
+    }
+    ""
+}
+
 // ---- Runtime-valued classes ----
 // A class annotated `@__abla_runtime_value("<make> <method>:<function> …")`
 // (abla/stm's TVar; the annotation is the standard library's alone) has the
@@ -10460,6 +10485,38 @@ class BootstrapAnalyzer(
         requiresTrust
     }
 
+    // The `@__abla_trusted_only` spec (#1226) of the function, extern or class `name` resolves to, "" when it has none.
+    fun trustedOnlySpec(name: string): string {
+        val function = this.functionDeclarations.find(name)
+        if (function >= 0) return bootstrapTrustedOnlySpec(this.declarations[function])
+        val type = this.typeDeclarations.find(name)
+        if (type >= 0) return bootstrapTrustedOnlySpec(this.declarations[type])
+        ""
+    }
+
+    // A use of `name`, a trusted-only declaration (`spec` its marker), from code that is not trusted, at `begin`..`end`:
+    // `native.trust:<name>` in the "error" phase; in the "warn" phase a warning, once per place, and the build goes on.
+    fun reportTrustedOnly(name: string, spec: string, begin: int, end: int) {
+        val separator = spec.indexOf(":")
+        val head = if (separator >= 0) spec.slice(0, separator) else spec
+        val written = if (separator >= 0) spec.slice(separator + 1, spec.size).trim() else ""
+        val words = head.trim().split(" ")
+        val phase = if (words.size > 0 && words[0] != "") words[0] else "error"
+        val release = if (words.size > 1) words[1] else ""
+        val help = if (written != "") written
+            else "wrap the call in a trusted function (`trusted fun`) that keeps the address valid"
+        if (phase != "warn") {
+            bootstrapPendingTypedHelp = help
+            this.fail("native.trust:$name")
+            return
+        }
+        val timing = if (release != "") "from $release" else "in a later release"
+        bootstrapStrictImportWarning(
+            "error[E_SEMANTIC]: native.trust:$name: `$name` can be used only from trusted code $timing\n" +
+            "source[semantic]:${this.currentSourceIdentity}:$begin:${if (end > begin) end else begin + 1}\nhelp: $help\n"
+        )
+    }
+
     fun functionExternalLibrary(name: string): string {
         var library = ""
         val index = this.functionDeclarations.find(name)
@@ -13705,7 +13762,7 @@ class BootstrapAnalyzer(
             }
             // The standard library's own annotation (runtime-valued classes).
             for (annotation in declaration.annotations) {
-                if (annotation == "__abla_runtime_value" &&
+                if ((annotation == "__abla_runtime_value" || annotation == "__abla_trusted_only") &&
                     !bootstrapStandardLibraryModuleSource(bootstrapGenericSourceFile(declaration
                         .sourceIdentity))) {
                     this.failAtOffset("annotation.reserved:$annotation", declaration.begin)
@@ -14722,6 +14779,11 @@ fun bootstrapInferIdentifier(
     var result = initial
     result = analyzer.findType(expression.text)
     val kind = analyzer.findKind(expression.text)
+    // A trusted-only standard-library function taken as a value (#1226), which a call through the value would get around.
+    if (analyzer.trustedDepth == 0 && (kind == "fun" || kind == "extern") && analyzer.visibleLocalIndex(expression.text) < 0) {
+        val trustedOnly = analyzer.trustedOnlySpec(expression.text)
+        if (trustedOnly != "") analyzer.reportTrustedOnly(expression.text, trustedOnly, expression.begin, expression.end)
+    }
     // A local of the same name (in any module) is the local, not the global.
     if ((kind == "compile.val" || kind == "compile.var") &&
         analyzer.compileDepth == 0 && !analyzer.shadowsGlobal(expression.text)) {
@@ -15193,6 +15255,11 @@ fun bootstrapInferCall(
     if (!localCallable && analyzer.functionRequiresTrust(expression.text) &&
         analyzer.trustedDepth == 0) {
         analyzer.fail("native.trust:${expression.text}")
+    }
+    // A trusted-only standard-library function or constructor (#1226), from code that is not trusted.
+    if (!localCallable && analyzer.trustedDepth == 0 && !analyzer.functionRequiresTrust(expression.text)) {
+        val trustedOnly = analyzer.trustedOnlySpec(expression.text)
+        if (trustedOnly != "") analyzer.reportTrustedOnly(expression.text, trustedOnly, expression.begin, expression.end)
     }
     if (!localCallable) analyzer.validateSimdCall(expression)
     if (!localCallable && bootstrapRuntimeInternalFunction(expression.text) &&

@@ -3069,6 +3069,40 @@ build fails with `E_PACKAGE_TRUSTED_DENIED`
 ([packages.md](packages.md#trusted-and-extern-code-in-a-dependency)). The root
 project and the standard library define trusted code freely.
 
+The same rule covers the standard library's raw-address functions (decision
+#130, #1226): the declarations of `abla/unsafe` that take, make or call a raw
+address or pointer (`nativePointerAddress`, `nativePointerFromAddress`, the
+`callNative*` family, raw loads and stores, MMIO) and the raw constructors of
+`NativeByteBuffer`, `NativeI64Cell` and `NativePointerCell` can be used only
+from trusted code: a call, a constructor call or a reference to the function as
+a value from an ordinary function is `native.trust:<name>`, and the help names
+the safe way (`nativeByteBuffer(capacity)` for a buffer) or says to wrap the use
+in a trusted function. The allocating factories and the checked methods (`load`,
+`store`, `pointerAt`, `close`, ...) stay open to ordinary code, and so do the
+functions that only produce the address of storage or code that lives as long as
+the program (`nativeStaticAllocate`, `nativeStaticBytes`, `nativeStaticU32s` and
+their mutable, linked, section and thread-local forms, `nativeLinkerSymbolAddress`,
+`nativeFunctionAddress`), so a module value such as
+`val table = nativeStaticU32s([nativeFunctionAddress(handler)])` needs no trusted
+function: the address cannot dangle, and using it still needs trusted code. In
+v0.2.72 a restricted use is a warning (`warning[E_SEMANTIC]: native.trust:...`,
+"from 0.2.73"); from v0.2.73 it is an error. The full list is `tools/unsafe-trusted-only.tsv`; each of those
+declarations carries the standard library's own `@__abla_trusted_only` marker,
+which a program cannot use (`annotation.reserved`).
+
+```abla fragment
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun addressOf(buffer: NativeByteBuffer): int = nativePointerAddress(buffer.address)
+
+fun main {
+    val buffer = nativeByteBuffer(8)      // ordinary code: the factory
+    println("${addressOf(buffer) != 0}")  // the raw address, through a trusted function
+    buffer.close()
+}
+```
+
 Object addresses are runtime-internal. The intrinsics that yield the address of
 a value, an object, a field, a cell or an array (`ablaRuntimeValueAddress`,
 `ablaRuntimeValueWord0`, `__ablaRuntimeWord0`, `__ablaRuntimeWord1`,
