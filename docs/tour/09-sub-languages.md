@@ -60,8 +60,9 @@ fun main {
 
 ## Write JSON into an existing buffer
 
-Use `$json` when you want to read or transform the resulting JSON tree. With
-`$jsonw(buffer)`, the literal appends one encoded value to your `ByteBuffer`.
+Use `$json` to build a JSON tree. To send that value as text, pass it to
+`jsonStringify`. See [replacing parallel key and value arrays](../json.md#replace-parallel-key-and-value-arrays).
+With `$jsonw(buffer)`, the literal appends one encoded value to your `ByteBuffer`.
 Interpolated strings go through JSON escaping. For larger examples, see
 [writing directly to a buffer](../json.md#writing-directly-to-a-buffer).
 To spot manual JSON construction, build with `--warn-json-construction` and

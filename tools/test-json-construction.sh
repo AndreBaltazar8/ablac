@@ -13,7 +13,8 @@ fail() { printf 'json-construction: %s\n' "$1" >&2; [[ -z ${2:-} ]] || cat "$2" 
 cp "$work/program" "$work/baseline"
 "$work/program" > "$work/before.out"
 (cd "$work" && "$compiler" build main.ab -o program --fast --warn-json-construction) > "$work/on.log" 2>&1 || fail 'opt-in did not build' "$work/on.log"
-grep -q W_JSON_CONSTRUCTION "$work/on.log" || fail 'opt-in gave no suggestions' "$work/on.log"
+grep -F 'consider jsonStringify($json {…})' "$work/on.log" >/dev/null || fail 'missing string construction guidance' "$work/on.log"
+grep -F 'consider $jsonw(buffer)' "$work/on.log" >/dev/null || fail 'missing buffer construction guidance' "$work/on.log"
 cmp "$work/baseline" "$work/program" || fail 'lint changed emitted program bytes'
 "$work/program" > "$work/after.out"
 cmp "$work/before.out" "$work/after.out" || fail 'lint changed program behavior'

@@ -612,6 +612,48 @@ fun main {
 // {"event":"ready","attempt":1}
 ```
 
+### Replace parallel key and value arrays
+
+For a known set of fields, put each key next to its value. For example, a
+file-picker request can put its array of MIME types directly in the literal.
+Pass the resulting `Json` to `jsonStringify` if the receiving API expects text.
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val mime = ["image/png", "image/jpeg"]
+    val multiple = true
+
+    val types: array<Json> = []
+    for (item in mime) types.append(jsonString(item))
+    val before = jsonObject(["mime", "multiple"], [jsonArray(types), jsonBoolean(multiple)])
+
+    val request = $json {
+        "mime": mime,
+        "multiple": multiple,
+    }
+    val text = jsonStringify(request)
+    val equal = text == jsonStringify(before)
+    println("$equal")
+    println(text)
+}
+// output:
+// true
+// {"mime":["image/png","image/jpeg"],"multiple":true}
+```
+
+Keep `jsonObject` when the keys and values already arrive as separate arrays.
+When replacing existing code, check that keys stay in order and stay unique.
+If the bytes are part of a wire format or a fixture, compare the serialized
+output as well. Use [`$jsonw(buffer)`](#writing-directly-to-a-buffer) if the
+caller already writes into a `ByteBuffer`.
+
+The opt-in `--warn-json-construction` check suggests literals for JSON built
+with text concatenation, interpolation or buffer appends. Use the example
+above to review `jsonObject` calls with parallel arrays.
+
 ### Writing directly to a buffer
 
 `$jsonw(buffer) value` uses the same grammar as `$json`, appending one complete
