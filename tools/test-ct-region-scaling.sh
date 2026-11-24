@@ -23,7 +23,7 @@ codegen_time() {
         printf "fun main(): int = if (answer == %d) 0 else 1\n", 3 * n * (n - 1)
     }' > "$root/main.ab"
     if ! (cd "$root" &&
-        ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build main.ab --fast --no-cache -o program             > build.out 2> build.err); then
+        ABLA_CODEGEN_CACHE=0 ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build main.ab --fast --no-cache -o program             > build.out 2> build.err); then
         cat "$root/build.err" >&2
         return 1
     fi

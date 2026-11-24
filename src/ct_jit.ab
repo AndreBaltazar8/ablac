@@ -1288,16 +1288,38 @@ val BOOTSTRAP_CT_TEMPLATE_OFFSET = 2147483648
 /** Up to this many functions a slice is optimized with the --o1 pipeline (llvmPassesBalanced), above it with the fast one. */
 val BOOTSTRAP_CT_BALANCED_SLICE_FUNCTIONS = 700
 
-/** The IR pipeline of a slice of `functions` functions. Compile-time code that works hard (a loop over bytes: tests/cases/modules/
+// SelectionDAG's ADD combine repeatedly matches long, left-associated sums.
+// Reassociate a slice with a wide add block in LLVM IR before the machine
+// optimizer sees it. Count the lowered additions before emitting LLVM.
+fun bootstrapCtHasWideAddBlock(program: BootstrapIrProgram): bool {
+    val limit = 1024
+    for (function in program.functions) {
+        if (function.instructions.size >= limit) {
+            var adds = 0
+            for (instruction in function.instructions) {
+                if (instruction.opcode == "label") adds = 0
+                if (instruction.opcode == "+") {
+                    adds += 1
+                    if (adds >= limit) return true
+                }
+            }
+        }
+    }
+    false
+}
+
+/** The IR pipeline of a lowered compile-time slice. Compile-time code that works hard (a loop over bytes: tests/cases/modules/
  *  json-ascii-spans) runs several times faster optimized, and a small slice (the usual one: 450 functions, 1 s of code generation)
  *  pays about 15% for it: that program's `#` build took 122 s with the fast pipeline and 21 s with this one. A large slice
  *  (a TLS stack: 1,387 functions) pays twice, 3.6 s to 7.7 s of code generation, so keeps the fast one.
- *  `ABLA_COMPILE_EVAL_PASSES=fast|balanced` chooses for every slice. */
-fun bootstrapCtSlicePasses(functions: int): string {
+ *  `ABLA_COMPILE_EVAL_PASSES=fast|balanced` chooses the base pipeline for every slice. */
+fun bootstrapCtSlicePasses(program: BootstrapIrProgram): string {
     val chosen = linuxEnvironment("ABLA_COMPILE_EVAL_PASSES")
-    if (chosen.found && chosen.value == "fast") return llvmPassesFast()
-    if (chosen.found && chosen.value == "balanced") return llvmPassesBalanced()
-    if (functions <= BOOTSTRAP_CT_BALANCED_SLICE_FUNCTIONS) llvmPassesBalanced() else llvmPassesFast()
+    val passes = if (chosen.found && chosen.value == "fast") llvmPassesFast()
+        else if ((chosen.found && chosen.value == "balanced") ||
+            program.functions.size <= BOOTSTRAP_CT_BALANCED_SLICE_FUNCTIONS) llvmPassesBalanced()
+        else llvmPassesFast()
+    if (bootstrapCtHasWideAddBlock(program)) "$passes,function(reassociate,instcombine)" else passes
 }
 
 fun bootstrapCtSplice(
@@ -2762,7 +2784,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         bootstrapCtFailReady("the slice is for ${bootstrapCtSliceTriple()} (ABLA_CT_HOST_TRIPLE): written, not run")
         if (dump.found && dump.value != "") {
             val options = LLVMCreatePassBuilderOptions()
-            val optimized = llvmConsumeError(LLVMRunPasses(module, bootstrapCtSlicePasses(program.functions.size), nativeNullPointer(),
+            val optimized = llvmConsumeError(LLVMRunPasses(module, bootstrapCtSlicePasses(program), nativeNullPointer(),
                 options), 129) == 0
             LLVMDisposePassBuilderOptions(options)
             if (optimized) {
@@ -2781,7 +2803,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     // symbols as the interpreter's calls find them (ct_native.ab). Else a site calling one failed the
     // generation: "Symbols not found".
     val _libraries = bootstrapCtNativeLibraries(parsed)
-    val added = bootstrapCtAddGeneration(context, module, bootstrapCtSlicePasses(program.functions.size), generation,
+    val added = bootstrapCtAddGeneration(context, module, bootstrapCtSlicePasses(program), generation,
         program)
     if (added.status != 0) {
         bootstrapCtFailReady("ORC rejected the slice (status ${added.status})")
