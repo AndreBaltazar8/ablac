@@ -28,7 +28,7 @@ Checksums accompany the published compiler and toolchain assets.
 | Platform | Tier | Compiler host evidence | Program target evidence | Published v0.2.64 assets |
 |---|---|---|---|---|
 | Linux x86-64 | T1 | Native suite, dynamic self-build and static compiler fixpoint | Native executables; default libc-free link with explicit dependency exceptions | `ablac-x86_64-linux`, `ablac-static-x86_64-linux`, `abla-toolchain-x86_64-linux.tar.gz` |
-| Linux AArch64 | T2 | Cross-built static compiler executed under qemu; no native host full-suite gate | Static programs cross-built and selected programs executed under qemu | None; AArch64 static compiler not a v0.2.64 asset |
+| Linux AArch64 | T2 | Cross-built static compiler exercised under qemu in CI; native self-build and smoke on manual dispatch | Static programs cross-built and selected programs executed under qemu | None; AArch64 static compiler not a v0.2.64 asset |
 | macOS arm64 | T2 | Native compiler, selected host checks and self-rebuild | Native Mach-O; selected runtime paths, iOS Simulator integration | `ablac-arm64-macos`, `abla-toolchain-arm64-macos.tar.gz` |
 | macOS Intel | T2 | Native compiler and selected host checks; release self-rebuild | Native Mach-O; selected runtime paths | `ablac-x86_64-macos`, `abla-toolchain-x86_64-macos.tar.gz` |
 | Android arm64 | T2 | No Android-hosted compiler gate | Shared libraries checked against NDK; exports executed by bionic under qemu | None for Android |
@@ -86,9 +86,17 @@ has **Build and check the static compiler for AArch64 Linux**, producing
 `ablac-static-aarch64-linux`. It is absent from the v0.2.64 published snapshot.
 The artifact check runs under qemu on an x86-64 builder; it skips the compiler
 self-build fixpoint unless explicitly requested. There is no native AArch64
-full-suite job, no published v0.2.64 AArch64 toolchain archive, and no basis for
-calling this the same host coverage as x86-64. `--target aarch64-linux` is now
-a built-in target in [the compiler](../src/toolchain.ab).
+full-suite job. `--target aarch64-linux` is a built-in target in
+[the compiler](../src/toolchain.ab).
+
+The dispatch-only [AArch64 Linux native fixed point](../.github/workflows/aarch64-native-fixpoint.yml)
+cross-builds a static seed with the pinned LLVM and lld archives, then runs
+it on `ubuntu-24.04-arm`. With an empty `PATH`, the seed builds and runs
+hello and rebuilds the compiler until stage 2 and stage 3 match byte for byte.
+Stage 3 builds hello with `--fast` and builds the JWT fixture in release mode.
+The JWT result must match the x86-64 compiler's AArch64 cross-build. This
+exercises native compiler child processes and leaves Raspberry Pi hardware
+and older-kernel compatibility outside the check's coverage.
 
 ## macOS arm64 and Intel
 

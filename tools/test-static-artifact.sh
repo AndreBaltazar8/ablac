@@ -8,13 +8,19 @@
 #      assembly changed since the compiler that built it (that table comes from the BUILDING compiler's source: two passes before it
 #      holds), so pass 1 against pass 2 is reported, and only pass 2 against pass 3 fails the check.
 # It needs the static archives again for the self-builds (ABLA_STATIC_LLVM_LIB, ABLA_STATIC_ZLIB; eval "$(tools/static-llvm-env.sh)").
-# Usage: tools/test-static-artifact.sh <static-compiler> [expected-version] [--no-fixpoint]
+# --empty-path clears PATH for compiler and smoke-program invocations on a native runner.
+# Usage: tools/test-static-artifact.sh <static-compiler> [expected-version] [--no-fixpoint] [--empty-path]
 set -euo pipefail
 export LC_ALL=C
 fixpoint=1
+empty_path=0
 args=()
 for argument in "$@"; do
-    if [[ $argument == --no-fixpoint ]]; then fixpoint=0; else args+=("$argument"); fi
+    case $argument in
+        --no-fixpoint) fixpoint=0 ;;
+        --empty-path) empty_path=1 ;;
+        *) args+=("$argument") ;;
+    esac
 done
 artifact=${args[0]:?usage: tools/test-static-artifact.sh <static-compiler> [expected-version] [--no-fixpoint]}
 expected_version=${args[1]:-}
@@ -48,6 +54,11 @@ out=${STATIC_ARTIFACT_OUTPUT:-build/static-artifact}
 rm -rf "$out"
 mkdir -p "$out"
 fail() { echo "static artifact: $*" >&2; exit 1; }
+if ((empty_path)); then
+    ((${#runner[@]} == 0)) || fail "--empty-path requires a native runner"
+    runner=(env PATH=)
+    program_runner=("${runner[@]}")
+fi
 
 # 1. no interpreter, no needed library
 segments=$(readelf -lW "$artifact")

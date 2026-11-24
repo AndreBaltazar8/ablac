@@ -1,0 +1,101 @@
+name: AArch64 Linux native fixed point
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-build:
+    name: Cross-build the AArch64 compiler and reference program
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      ABLA_NATIVE_JOBS: '4'
+      ABLA_CODEGEN_JOBS: '4'
+      ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1200'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - name: Build the seed with the pinned AArch64 LLVM and lld SDK
+        run: |
+          ulimit -S -s 8192
+          # shellcheck disable=SC2016
+          nix-shell shell.nix --run '
+            set -euo pipefail
+            mkdir -p build/aarch64-seed
+            make ablac
+            deps=$(nix-build --no-out-link nix/aarch64-static-native-deps.nix)
+            export ABLA_STATIC_LLVM_LIB="$deps/llvm" ABLA_STATIC_TARGET_LIBS="$deps/libs" ABLA_STATIC_TARGET=aarch64-linux
+            export ABLA_STATIC_LLD_LIB="$deps/lld" ABLA_STATIC_LLD_INCLUDE="$deps/include/lld-only"
+            export ABLA_STATIC_LLVM_INCLUDE="$deps/include/llvm" ABLA_STATIC_CXX=clang++ ABLA_STATIC_CXXFLAGS="$(cat "$deps/cxx-flags")"
+            tools/build-static-compiler.sh build/ablac build/aarch64-seed/ablac
+            build/ablac build tests/cases/libc-imports/jwt-verify.ab --target aarch64-linux --no-cache -o build/aarch64-seed/jwt-reference
+          '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aarch64-fixpoint-seed
+          path: |
+            build/aarch64-seed/ablac
+            build/aarch64-seed/abla_lld_shim.o
+            build/aarch64-seed/jwt-reference
+          if-no-files-found: error
+          retention-days: 3
+
+  native:
+    name: AArch64 self-build and smoke with empty PATH
+    needs: cross-build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    env:
+      ABLA_NATIVE_JOBS: '2'
+      ABLA_CODEGEN_JOBS: '1'
+      ABLA_MAX_MEMORY_MB: '8192'
+      STATIC_ARTIFACT_FIXPOINT_AARCH64: '1'
+      STATIC_ARTIFACT_OUTPUT: build/aarch64-native
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: aarch64-fixpoint-seed
+          path: build/aarch64-seed
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
+      - name: Match the two native self-builds and run hello and JWT
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          ulimit -S -s 8192
+          deps=$(nix-build --no-out-link nix/aarch64-static-native-deps.nix)
+          seed=$PWD/build/aarch64-seed
+          out=$STATIC_ARTIFACT_OUTPUT
+          export ABLA_SYSROOT=$PWD
+          export ABLA_STATIC_LLVM_LIB="$deps/llvm" ABLA_STATIC_TARGET_LIBS="$deps/libs"
+          export ABLA_STATIC_LLD_LIB="$deps/lld" ABLA_STATIC_LLD_OBJECT="$seed/abla_lld_shim.o"
+          chmod +x "$seed/ablac" "$seed/jwt-reference"
+          tools/test-static-artifact.sh "$seed/ablac" --empty-path
+          sha256sum "$out/pass2" "$out/pass3" | tee "$out/stages.sha256"
+          env PATH= "$out/pass3" build tests/cases/libc-imports/hello.ab --fast --no-cache -o "$out/hello-fast" > "$out/hello-fast.log" 2>&1
+          test "$(env PATH= "$out/hello-fast")" = hello
+          env PATH= "$out/pass3" build tests/cases/libc-imports/jwt-verify.ab --no-cache -o "$out/jwt" > "$out/jwt.log" 2>&1
+          env PATH= "$seed/jwt-reference" > "$out/jwt-reference.txt"
+          env PATH= "$out/jwt" > "$out/jwt.txt"
+          diff -u "$out/jwt-reference.txt" "$out/jwt.txt"
+          grep -qx refused "$out/jwt.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: aarch64-fixpoint-logs
+          path: |
+            build/aarch64-native/*.log
+            build/aarch64-native/*.txt
+            build/aarch64-native/stages.sha256
+          retention-days: 7
