@@ -445,6 +445,7 @@ test-serial: ablac
 	tools/test-path-file-mode.sh $(COMPILER)
 	tools/test-open-nofollow.sh $(COMPILER)
 	tools/test-secure-fs.sh $(COMPILER)
+	tools/test-exec-path.sh $(COMPILER)
 	tools/test-xtensa-companion-offline.sh $(COMPILER)
 	tools/test-xtensa-native.sh $(COMPILER)
 	tools/test-xtensa-http-stream.sh $(COMPILER)
