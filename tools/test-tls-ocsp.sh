@@ -62,11 +62,13 @@ run_case() {
 # The stock client, no setting made: case VERSION LABEL CERTIFICATE STAPLE EXPECTATION(ok|refused) MODE(default|off) ALERT-in-the-server's-log ("-" for none) STATUS-REQUEST(yes|no)
 run_default_case() {
     local version=$1 label=$2 cert=$3 staple=$4 expect=$5 mode=$6 alert=$7 offered=$8
-    local options=(-cert "$cert.pem" -key "$cert.key" -$version -www -msg -tlsextdebug)
+    # -naccept 1: the server exits (and flushes its log) after this one connection; the checks below read the log only once it has, not when the client is done (the server may not have read the client's alert yet, on a loaded machine).
+    local options=(-cert "$cert.pem" -key "$cert.key" -$version -www -msg -tlsextdebug -naccept 1)
     [[ $staple == none ]] || options+=(-status_file "$staple.resp")
     openssl_server_start server.log '[::1]:0' "${options[@]}" || { echo "tls-ocsp: no server for $version default $label" >&2; failed=1; return; }
     local result status=0
     result=$(timeout 30 ./ocsp-default "$openssl_server_port" ca.pem "$expect" "$mode" 2>&1) || status=$?
+    for _ in $(seq 600); do kill -0 "$openssl_server_pid" 2> /dev/null || break; sleep 0.1; done
     kill "$openssl_server_pid" 2> /dev/null || true
     wait "$openssl_server_pid" 2> /dev/null || true
     if [[ $status -ne 0 || $result != "tls-pure ocsp-default ok" ]]; then
