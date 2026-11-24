@@ -1,5 +1,6 @@
 import "abla/io"
 import "abla/sys/linux"
+import "abla/sys/linux/process"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 import "abla/runtime/scalar"
@@ -257,6 +258,31 @@ trusted fun main: int {
     if (nullDevice >= 0) linuxSyscall1(3, nullDevice)
     // ---- clean up ----
     linuxSyscall1(3, receiver)
+    // MSG_DONTWAIT (Linux 0x40, Darwin 0x80; Darwin's 0x40 is MSG_WAITALL): a receive with nothing to read and a send to a
+    // peer that reads nothing return EAGAIN at once on these blocking sockets. Each has a 3 s timeout, so a flag lost on
+    // the way waits it out instead of hanging (and is too slow here).
+    val timeout = nativeStackAllocate(16)
+    ablaRuntimeStoreI64(timeout, 3)
+    ablaRuntimeStoreI64(timeout + 8, 0)
+    linuxSyscall5(54, tcpAccepted, 1, 20, timeout, 16)
+    linuxSyscall5(54, tcpClient, 1, 21, timeout, 16)
+    var started = linuxMonotonicMilliseconds()
+    val drained = linuxSyscall6(45, tcpAccepted, inbox, 64, 64, 0, 0)
+    good = report("recvfrom MSG_DONTWAIT with nothing to read", drained == -11 &&
+        linuxMonotonicMilliseconds() - started < 1000, drained) && good
+    val chunk = nativeByteBuffer(65536)
+    val chunkAddress = nativePointerAddress(chunk.address)
+    var flooded = 0
+    var rounds = 0
+    var waited = 0
+    while (flooded >= 0 && rounds < 4096) {
+        started = linuxMonotonicMilliseconds()
+        flooded = linuxSyscall6(44, tcpClient, chunkAddress, 65536, 16448, 0, 0)
+        waited = linuxMonotonicMilliseconds() - started
+        rounds = rounds + 1
+    }
+    good = report("sendto MSG_DONTWAIT to a peer that reads nothing", flooded == -11 && waited < 1000, flooded) && good
+    chunk.close()
     linuxSyscall1(3, sender)
     linuxSyscall1(3, tcpAccepted)
     linuxSyscall1(3, tcpClient)
