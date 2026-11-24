@@ -703,6 +703,7 @@ test-serial: ablac
 	tools/test-sysroot-path-symbols.sh $(COMPILER)
 	tools/test-project-path-symbols.sh $(COMPILER)
 	tools/test-frontend-call-chain-scaling.sh $(COMPILER)
+	tools/test-member-chain-scaling.sh $(COMPILER)
 	tools/test-recursive-class-types.sh $(COMPILER)
 	tools/test-compiler-memory-budget.sh $(COMPILER_PAYLOAD)
 	tools/test-gc-background-free.sh $(COMPILER)
