@@ -1,0 +1,95 @@
+// The descriptor calls of abla/sys/linux that the packages used to make with raw system calls (#1226): linuxTcpConnectStart (a numeric IPv4 address only, a connect in
+// progress or made), linuxSocketPendingError (SO_ERROR), linuxFileSync (fsync) and linuxReadAtDescriptor (pread into a {text, status} result), on loopback and a file.
+import "abla/io"
+import "abla/net"
+import "abla/fs"
+import "abla/text"
+import "abla/sys/linux"
+
+var failures = 0
+
+fun check(name: string, ok: bool): void {
+    if (ok) println("ok $name") else {
+        println("FAIL $name")
+        failures = failures + 1
+    }
+}
+
+fun main: int {
+    // linuxTcpConnectStart: a listener on loopback takes the connection
+    val listener = tcpListen(0)
+    val port = listener.localPort()
+    val started = linuxTcpConnectStart("127.0.0.1", port)
+    check("connect start gives a descriptor", started >= 0)
+    val wait = linuxPollSocket(started, false, true, 5000)
+    check("the descriptor becomes writable", wait.writable)
+    check("no pending error after a connect", linuxSocketPendingError(started) == 0)
+    var server = listener.accept()
+    var client = TcpConnection(started)
+    check("a message goes through the started connection", client.write("hello") == 5 && server.read(16) == "hello")
+    client.close()
+    server.close()
+    // a port nothing listens on: refused, at once or as the pending error
+    val closedPort = port
+    listener.close()
+    val refused = linuxTcpConnectStart("127.0.0.1", closedPort)
+    var refusedCode = refused
+    if (refused >= 0) {
+        linuxPollSocket(refused, false, true, 5000)
+        refusedCode = -linuxSocketPendingError(refused)
+        linuxTcpCloseDescriptor(refused)
+    }
+    check("a refused connect is ECONNREFUSED", refusedCode == -111)
+    // what is not a numeric IPv4 address, or a port, is refused with EINVAL and no socket made
+    check("a host name is EINVAL", linuxTcpConnectStart("localhost", 80) == -22)
+    check("a short address is EINVAL", linuxTcpConnectStart("1.2.3", 80) == -22)
+    check("an address of five parts is EINVAL", linuxTcpConnectStart("1.2.3.4.5", 80) == -22)
+    check("an octet over 255 is EINVAL", linuxTcpConnectStart("256.1.1.1", 80) == -22)
+    check("an IPv6 address is EINVAL", linuxTcpConnectStart("::1", 80) == -22)
+    check("the empty address is EINVAL", linuxTcpConnectStart("", 80) == -22)
+    check("port 0 is EINVAL", linuxTcpConnectStart("127.0.0.1", 0) == -22)
+    check("port 65536 is EINVAL", linuxTcpConnectStart("127.0.0.1", 65536) == -22)
+    check("a negative port is EINVAL", linuxTcpConnectStart("127.0.0.1", -5) == -22)
+    // linuxSocketPendingError on what is no socket
+    check("a bad descriptor is EBADF (9)", linuxSocketPendingError(-1) == 9)
+    // the file calls
+    val name = "build/net-apis-file.txt"
+    path("build").createDirectories()
+    check("a file is written", path(name).writeText("0123456789abcdef"))
+    val file = linuxOpen(name, 0)
+    val result = SocketReceiveResult("", 0)
+    linuxReadAtDescriptor(file.descriptor, 4, 5, result)
+    check("a read at an offset", result.status == 5 && result.text == "45678")
+    check("the file position did not move", file.read(3) == "012")
+    linuxReadAtDescriptor(file.descriptor, 14, 100, result)
+    check("a read that meets the end gives what is there", result.status == 2 && result.text == "ef")
+    linuxReadAtDescriptor(file.descriptor, 16, 10, result)
+    check("a read at the end is 0 and empty", result.status == 0 && result.text == "")
+    linuxReadAtDescriptor(file.descriptor, 100, 10, result)
+    check("a read past the end is 0 and empty", result.status == 0 && result.text == "")
+    linuxReadAtDescriptor(file.descriptor, -1, 5, result)
+    check("a negative offset is EINVAL and reads nothing", result.status == -22 && result.text == "")
+    linuxReadAtDescriptor(file.descriptor, 0, 0, result)
+    check("capacity 0 is EINVAL", result.status == -22)
+    linuxReadAtDescriptor(file.descriptor, 0, -1, result)
+    check("a negative capacity is EINVAL", result.status == -22)
+    linuxReadAtDescriptor(file.descriptor, 0, 16777217, result)
+    check("a capacity over 16 MiB is EINVAL", result.status == -22)
+    linuxReadAtDescriptor(file.descriptor, 0, 16, result)
+    check("the whole file at capacity 16", result.status == 16 && result.text == "0123456789abcdef")
+    linuxReadAtDescriptor(-1, 0, 5, result)
+    check("a bad descriptor is EBADF (-9)", result.status == -9 && result.text == "")
+    check("fsync of an open file", linuxFileSync(file.descriptor))
+    linuxSyscall1(3, file.descriptor)
+    check("fsync of a closed descriptor is false", !linuxFileSync(file.descriptor))
+    check("fsync of -1 is false", !linuxFileSync(-1))
+    val directory = linuxOpen("build", 65536)
+    check("fsync of a directory", linuxFileSync(directory.descriptor))
+    linuxSyscall1(3, directory.descriptor)
+    path(name).remove()
+    if (failures == 0) {
+        println("net-apis: ok")
+        return 42
+    }
+    1
+}

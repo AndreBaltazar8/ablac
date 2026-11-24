@@ -49,6 +49,53 @@ trusted fun linuxTcpReceiveDescriptor(descriptor: int, capacity: int, var result
     return
 }
 
+// Starts a nonblocking connection to `address`, which must be an IPv4 address in dotted-quad text ("127.0.0.1": a host name, an abbreviated or an IPv6 form is -22, never a
+// guess; so is a port outside 1..65535), with TCP_NODELAY set. The connection is made or in progress (EINPROGRESS: wait for the descriptor to become writable, then
+// linuxSocketPendingError says whether it succeeded). Returns the descriptor (SOCK_NONBLOCK | SOCK_CLOEXEC), or -errno; a failed connect closes it.
+trusted fun linuxTcpConnectStart(address: string, port: int): int {
+    val octets = linuxIpv4Octets(address)
+    if (octets.size != 4 || port < 1 || port > 65535) return -22
+    // AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
+    val descriptor = linuxSyscall3(41, 2, 526337, 0)
+    if (descriptor < 0) return descriptor
+    val socketAddress = nativeByteBuffer(16)
+    linuxNetStoreU16(socketAddress, 0, 2)
+    socketAddress.store(2, port / 256)
+    socketAddress.store(3, port - port / 256 * 256)
+    var octet = 0
+    while (octet < 4) {
+        socketAddress.store(4 + octet, octets[octet])
+        octet = octet + 1
+    }
+    var connected = linuxSyscall3(42, descriptor, nativePointerAddress(socketAddress.address), 16)
+    while (connected == -4) connected = linuxSyscall3(42, descriptor, nativePointerAddress(socketAddress.address), 16)
+    socketAddress.close()
+    if (connected == 0 || connected == -115) {
+        // TCP_NODELAY: a request is written in one piece.
+        val enabled = nativeByteBuffer(8)
+        linuxNetStoreU32(enabled, 0, 1)
+        linuxSyscall5(54, descriptor, 6, 1, nativePointerAddress(enabled.address), 4)
+        enabled.close()
+        return descriptor
+    }
+    linuxTcpCloseDescriptor(descriptor)
+    connected
+}
+
+// The pending error of a socket (SO_ERROR, which a read clears): zero when there is none, else a positive errno (ECONNREFUSED, ETIMEDOUT, ...); the errno of the failed
+// query itself, also positive, when the descriptor is no socket.
+trusted fun linuxSocketPendingError(descriptor: int): int {
+    val error = nativeByteBuffer(8)
+    val errorLength = nativeByteBuffer(8)
+    linuxNetStoreU32(error, 0, 0)
+    linuxNetStoreU32(errorLength, 0, 4)
+    val inspected = linuxSyscall5(55, descriptor, 1, 4, nativePointerAddress(error.address), nativePointerAddress(errorLength.address))
+    val result = if (inspected == 0) linuxNetReadNativeU32(error, 0) else -inspected
+    error.close()
+    errorLength.close()
+    result
+}
+
 // Holds read bytes, the completion status, and the errno for a failed read.
 class SocketReadResult(
     val bytes: string,
