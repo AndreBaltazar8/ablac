@@ -16,4 +16,12 @@ for mode in fast release; do
     result=$("$root/tools/run-limited.sh" "$out/ocsp.$mode" tests/cases/ocsp) || { echo "ocsp ($mode): $result" >&2; exit 1; }
     [[ $result == "ocsp ok" ]] || { echo "ocsp ($mode): $result" >&2; exit 1; }
 done
+# The staple verifier never uses a path recorded for another chain (tests/cases/tls-pure/ocsp-shared.ab, the same fixtures).
+for mode in fast release; do
+    flags=(--no-cache)
+    [[ $mode == fast ]] && flags+=(--fast)
+    "$compiler" build tests/cases/tls-pure/ocsp-shared.ab -o "$out/shared.$mode" "${flags[@]}" > "$out/build-shared.$mode.log" 2>&1 || { cat "$out/build-shared.$mode.log" >&2; exit 1; }
+    result=$("$root/tools/run-limited.sh" "$out/shared.$mode" tests/cases/ocsp) || { echo "ocsp-shared ($mode): $result" >&2; exit 1; }
+    [[ $result == "tls-pure ocsp-shared ok" ]] || { echo "ocsp-shared ($mode): $result" >&2; exit 1; }
+done
 echo "ocsp ok: responses judged for good, revoked, unknown, delegated and foreign signers, freshness, damage, the policy over a path and the request"

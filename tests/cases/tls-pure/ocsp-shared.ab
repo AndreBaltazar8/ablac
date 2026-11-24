@@ -1,0 +1,73 @@
+// The staple verifier of a client that checks staples (tlsX509RevocationVerifiers) uses the path its chain verifier found only for the same chain: handshakes that share one pair of
+// verifiers (one configuration used for several connections, their verifier calls interleaving) never judge a staple against another handshake's path. Two chains from the test CA of
+// tests/cases/ocsp (tools/gen-ocsp-fixtures.sh): leaf.pem with its good response and leafrevoked.pem with its revoked one. The chain verifier is called for either chain in either order
+// (its verdict is not looked at: the signature is not a real one; it records the path), then the staple verifier for one of them: the revoked chain with the revoked response must be
+// refused as revoked and the good chain with the good response accepted, in every interleaving, and a response for the other chain must be refused as not acceptable (not as revoked, which is what it would say against
+// the other chain's path). A threaded version cannot be written: a thread captures no closures. Argument 0 is the directory. Prints "tls-pure ocsp-shared ok".
+import "abla/io"
+import "abla/crypto/ocsp"
+import "abla/crypto/x509"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/tls/pure/handshake"
+import "abla/tls/pure/verify"
+
+var failures = 0
+
+fun check(ok: bool, what: string): void {
+    if (!ok) {
+        failures = failures + 1
+        println("FAIL $what")
+    }
+    return
+}
+
+fun certificate(directory: string, name: string): X509Certificate {
+    val parsed = x509ParsePem(linuxReadFile("$directory/$name", 65536))
+    if (parsed.certificates.size != 1) {
+        check(false, "$name does not parse")
+        return x509Failed("missing")
+    }
+    parsed.certificates[0]
+}
+
+var clock = 0
+fun now(): int = clock
+
+fun main: int {
+    val directory = processArgument(0)
+    val ca = certificate(directory, "ca.pem")
+    val good = certificate(directory, "leaf.pem")
+    val revoked = certificate(directory, "leafrevoked.pem")
+    val goodResponse = linuxReadFile("$directory/good.der", 65536)
+    val revokedResponse = linuxReadFile("$directory/revoked.der", 65536)
+    clock = ocspCheck(goodResponse, good, ca, 0).thisUpdate + 3600
+    val store = X509TrustStore([ca])
+    // The staple verifier's host is "": no name check of its own (each chain verifier call below names its own host).
+    val pair = tlsX509RevocationVerifiers({ store }, "", now, OCSP_POLICY_STAPLE)
+    val goodChain = [good.der]
+    val revokedChain = [revoked.der]
+    for (round in 0 until 100) {
+        // Both chain verifications, in either order, then the staples for both chains: the last recorded path is the other chain's for one of them.
+        if (round % 2 == 0) {
+            pair.verifier(goodChain, "ocsp.test", 0, "", "")
+            pair.verifier(revokedChain, "revoked.test", 0, "", "")
+        } else {
+            pair.verifier(revokedChain, "revoked.test", 0, "", "")
+            pair.verifier(goodChain, "ocsp.test", 0, "", "")
+        }
+        val a = pair.stapleVerifier(goodChain, [goodResponse])
+        check(a.accepted(), "round $round: the good chain with its good response: ${a.text}")
+        val b = pair.stapleVerifier(revokedChain, [revokedResponse])
+        check(!b.accepted() && b.text.indexOf("is revoked") >= 0, "round $round: the revoked chain with its revoked response: ${b.text}")
+        // A response for the other chain is not acceptable for this one, whichever path was recorded last.
+        val c = pair.stapleVerifier(goodChain, [revokedResponse])
+        check(!c.accepted() && c.text.indexOf("not acceptable") >= 0, "round $round: the good chain with the other chain's response: ${c.text}")
+        val d = pair.stapleVerifier(revokedChain, [goodResponse])
+        check(!d.accepted() && d.text.indexOf("not acceptable") >= 0, "round $round: the revoked chain with the other chain's response: ${d.text}")
+    }
+    if (failures > 0) return 1
+    println("tls-pure ocsp-shared ok")
+    0
+}
