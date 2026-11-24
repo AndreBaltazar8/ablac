@@ -64,7 +64,12 @@ class HttpCoreChunkDecode(
     val body: string,
     val consumed: int,
     val complete: bool,
-    val valid: bool
+    val valid: bool,
+    // For incomplete input: the offset of the first chunk element (a size line with its data, or the last chunk and its trailers) that is not complete;
+    // `body` holds everything before it, so a caller may drop those bytes and decode the rest when more arrives.
+    val resume: int = 0,
+    // For input that ends inside a chunk's data: the input size at which that chunk is complete (zero otherwise).
+    val need: int = 0
 )
 
 // A client with a Host authority, transport callback, response byte limit, and timeout. Use send to render requests and parse responses.
@@ -672,9 +677,15 @@ fun httpCoreDecodeChunked(
     var offset = 0
     var complete = false
     var valid = true
+    var resume = -1
+    var need = 0
     while (!complete && valid && offset < input.size) {
+        val elementStart = offset
         val lineEnd = httpLineEnd(input, offset)
-        if (lineEnd >= input.size) offset = input.size
+        if (lineEnd >= input.size) {
+            offset = input.size
+            resume = elementStart
+        }
         else {
             var extension = offset
             while (extension < lineEnd && input[extension] != 59) {
@@ -702,10 +713,17 @@ fun httpCoreDecodeChunked(
                 if (trailerEnd >= 0) {
                     offset = trailerEnd
                     complete = true
-                } else offset = input.size
+                } else {
+                    offset = input.size
+                    resume = elementStart
+                }
             } else {
                 val body = lineEnd + 2
-                if (body + length + 2 > input.size) offset = input.size
+                if (body + length + 2 > input.size) {
+                    offset = input.size
+                    resume = elementStart
+                    need = body + length + 2
+                }
                 else if (input[body + length] != 13 ||
                     input[body + length + 1] != 10) valid = false
                 else {
@@ -715,65 +733,17 @@ fun httpCoreDecodeChunked(
             }
         }
     }
-    HttpCoreChunkDecode(output, offset, complete, valid)
+    HttpCoreChunkDecode(output, offset, complete, valid, if (resume >= 0) resume else offset, need)
 }
 
-// Reads request bytes within the supplied bounds, returning empty text for rejected framing or partial bytes when the stream ends early.
+// Reads request bytes within the supplied bounds and the default deadlines of `httpServeOptions()`, returning empty text for rejected framing or a deadline, or partial bytes when the stream ends early.
 fun httpReadRequest(
     connection: TcpConnection,
     maximumHeader: int = 65536,
     maximumBody: int = 1048576
 ): string {
-    var input = connection.read(maximumHeader)
-    var headerEnd = httpHeaderEnd(input)
-    var readingHeaders = headerEnd < 0 && input.size < maximumHeader
-    while (readingHeaders) {
-        val remaining = maximumHeader - input.size
-        val chunk = connection.read(remaining)
-        if (chunk.size > 0) input = "$input$chunk"
-        headerEnd = httpHeaderEnd(input)
-        readingHeaders = headerEnd < 0 && chunk.size > 0 &&
-            input.size < maximumHeader
-    }
-
-    if (headerEnd >= 0) {
-        val preliminary = httpParseRequest(input)
-        val framing = httpRequestFraming(preliminary, false, maximumBody)
-        val contentLength = framing
-        if (framing == -1 || httpRequestLineVersion(input, preliminary, headerEnd) < 0) {
-            // Malformed framing or a line that is not a request (an empty or non-token method, no `HTTP/1.x`): nothing of what was
-            // read is returned, so the request is refused, as the event servers refuse it.
-            input = ""
-        } else if (framing == -2) {
-            var decoded = httpCoreDecodeChunked(
-                input.slice(headerEnd, input.size), maximumBody
-            )
-            var readingBody = decoded.valid && !decoded.complete &&
-                input.size < maximumHeader + maximumBody
-            while (readingBody) {
-                val remaining = maximumHeader + maximumBody - input.size
-                val chunk = connection.read(remaining)
-                if (chunk.size > 0) input = "$input$chunk"
-                decoded = httpCoreDecodeChunked(
-                    input.slice(headerEnd, input.size), maximumBody
-                )
-                readingBody = chunk.size > 0 && decoded.valid &&
-                    !decoded.complete && input.size < maximumHeader + maximumBody
-            }
-            if (decoded.complete && decoded.valid) {
-                input = "${input.slice(0, headerEnd)}${decoded.body}"
-            }
-        } else {
-            val expected = headerEnd + contentLength
-            var readingBody = input.size < expected
-            while (readingBody) {
-                val chunk = connection.read(expected - input.size)
-                if (chunk.size > 0) input = "$input$chunk"
-                readingBody = chunk.size > 0 && input.size < expected
-            }
-        }
-    }
-    input
+    val options = httpServeOptions()
+    httpReadRequestWithin(connection, HttpServeOptions(options.firstByteTimeoutMilliseconds, options.requestHeadTimeoutMilliseconds, options.requestTimeoutMilliseconds, options.responseTimeoutMilliseconds, maximumHeader, maximumBody)).request
 }
 
 // Parses the request line, headers, and available body bytes from `input`, without attaching a peer address. This parser can return partial requests. Use the framing checks when receiving a request from a connection.
@@ -1708,43 +1678,211 @@ fun HttpRouter.dispatch(request: HttpRequest): HttpResponse {
     response
 }
 
-// Accepts one connection on `listener`, dispatches through `router`, writes the response, and closes the connection. Returns the connection write result.
-fun serveHttpOnce(router: HttpRouter, var listener: TcpListener): int {
-    val connection = listener.accept()
-    val request = httpRequestWithPeer(httpParseRequest(httpReadRequest(connection)),
-        connection.descriptor)
+/// Sets the deadlines and bounds of the blocking server (`serveHttp`, `serveHttpOnListener`, `serveHttpOnce`), which reads one connection at a time. In
+/// milliseconds, 0 turning a deadline off: `firstByteTimeoutMilliseconds` closes a connection that sends nothing that long after it was accepted (a browser's
+/// speculative connection, a probe, an attacker: while a connection waits the server serves no other), `requestHeadTimeoutMilliseconds` one whose request head is
+/// not complete that long after its first byte, `requestTimeoutMilliseconds` one whose whole request (head and body) is not complete that long after its first
+/// byte, `responseTimeoutMilliseconds` one that does not take the whole response in that time. A connection that runs out of time is closed without an answer.
+/// The deadlines bound one connection, not the server: it still serves one connection at a time, so put it behind a proxy that limits connections per address, or use
+/// the event server (`abla/http/event`), which reads many connections at once.
+class HttpServeOptions(
+    val firstByteTimeoutMilliseconds: int = 10000,
+    val requestHeadTimeoutMilliseconds: int = 30000,
+    val requestTimeoutMilliseconds: int = 120000,
+    val responseTimeoutMilliseconds: int = 30000,
+    val maximumHeaderBytes: int = 65536,
+    val maximumBodyBytes: int = 1048576
+)
+
+/// The options `serveHttp` uses: ten seconds to a first byte, thirty to the end of the head, two minutes to the end of the request, thirty to take the response, a
+/// 64 KiB head and a 1 MiB body.
+fun httpServeOptions(): HttpServeOptions = HttpServeOptions()
+
+/// A request read from a connection (empty when its framing was refused, or when the stream ended before its head), and whether a deadline ended the reading.
+class HttpReadOutcome(val request: string, val timedOut: bool)
+
+// How much one read asks for: what is left to read, at most 64 KiB (a read of a socket is limited to 1 MiB).
+private fun httpServeReadSize(left: int): int = if (left > 65536) 65536 else if (left < 1) 1 else left
+
+// The shorter of `current` (-1: none yet) and what is left of `limit` since `since` (0: none left); a limit of 0 or less does not apply.
+private fun httpServeLeft(current: int, limit: int, since: int, now: int): int {
+    if (limit <= 0) return current
+    val remaining = since + limit - now
+    val left = if (remaining < 1) 0 else remaining
+    if (current < 0 || left < current) left else current
+}
+
+// How long the connection may wait for its next bytes: what is left before the earliest deadline that applies (0: one has passed), one second when none does.
+private fun httpServeWait(options: HttpServeOptions, accepted: int, firstByte: int, headSeen: bool, now: int): int {
+    var left = -1
+    if (firstByte == 0) left = httpServeLeft(left, options.firstByteTimeoutMilliseconds, accepted, now)
+    else {
+        if (!headSeen) left = httpServeLeft(left, options.requestHeadTimeoutMilliseconds, firstByte, now)
+        left = httpServeLeft(left, options.requestTimeoutMilliseconds, firstByte, now)
+    }
+    if (left < 0) 1000 else left
+}
+
+/// Reads one request from `connection` within the deadlines and bounds of `options`. The head is looked for only in the bytes that arrived since the last read, a
+/// body of known length is appended to one buffer, and a chunked body is decoded as its chunks complete (a chunk still arriving is not looked at until all of it has),
+/// so the work is proportional to the bytes received, however they are split. The text is empty when the framing is refused, a chunked body is not complete when the
+/// stream ends, or a deadline ended the reading; a body of known length that the stream ended early is returned as far as it came.
+fun httpReadRequestWithin(connection: TcpConnection, options: HttpServeOptions): HttpReadOutcome {
+    val maximumHeader = options.maximumHeaderBytes
+    val maximumBody = options.maximumBodyBytes
+    val accepted = linuxMonotonicMilliseconds()
+    var firstByte = 0
+    var timedOut = false
+    var ended = false
+    val buffer = byteBuffer()
+    var tail = ""
+    var headerEnd = -1
+    while (headerEnd < 0 && !ended && !timedOut && buffer.size() < maximumHeader) {
+        val wait = httpServeWait(options, accepted, firstByte, false, linuxMonotonicMilliseconds())
+        if (wait == 0) timedOut = true
+        else {
+            val incoming = connection.readWithTimeoutResult(httpServeReadSize(maximumHeader - buffer.size()), wait)
+            if (incoming.hasData()) {
+                if (firstByte == 0) {
+                    val stamp = linuxMonotonicMilliseconds()
+                    firstByte = if (stamp > 0) stamp else 1
+                }
+                val before = buffer.size()
+                buffer.appendText(incoming.bytes)
+                val window = "$tail${incoming.bytes}"
+                val at = httpHeaderEnd(window)
+                if (at >= 0) headerEnd = before - tail.size + at
+                tail = window.slice(if (window.size > 3) window.size - 3 else 0, window.size)
+            } else if (!incoming.timedOut()) ended = true
+        }
+    }
+    if (timedOut) return HttpReadOutcome("", true)
+    var request = buffer.toText()
+    if (headerEnd >= 0) {
+        val preliminary = httpParseRequest(request)
+        val framing = httpRequestFraming(preliminary, false, maximumBody)
+        if (framing == -1 || httpRequestLineVersion(request, preliminary, headerEnd) < 0) {
+            // Malformed framing or a line that is not a request (an empty or non-token method, no `HTTP/1.x`): nothing of what was
+            // read is returned, so the request is refused, as the event servers refuse it.
+            request = ""
+        } else if (framing == -2) {
+            val headText = request.slice(0, headerEnd)
+            val decodedBody = byteBuffer()
+            var pending = byteBuffer()
+            pending.appendText(request.slice(headerEnd, request.size))
+            var need = 0
+            var complete = false
+            var valid = true
+            var decodeNow = true
+            var received = request.size
+            while (valid && !complete && !timedOut && !ended) {
+                if (decodeNow) {
+                    val text = pending.toText()
+                    val decoded = httpCoreDecodeChunked(text, maximumBody - decodedBody.size())
+                    if (!decoded.valid) valid = false
+                    else {
+                        decodedBody.appendText(decoded.body)
+                        if (decoded.complete) complete = true
+                        else {
+                            pending = byteBuffer()
+                            pending.appendText(text.slice(decoded.resume, text.size))
+                            need = if (decoded.need > 0) decoded.need - decoded.resume else 0
+                            // One chunk element (a size line with its extensions, or the trailers) is no longer than a head.
+                            if (need == 0 && pending.size() > maximumHeader) valid = false
+                        }
+                    }
+                    decodeNow = false
+                }
+                if (valid && !complete) {
+                    val room = maximumHeader + maximumBody - received
+                    val wait = httpServeWait(options, accepted, firstByte, true, linuxMonotonicMilliseconds())
+                    if (room < 1) valid = false
+                    else if (wait == 0) timedOut = true
+                    else {
+                        val incoming = connection.readWithTimeoutResult(httpServeReadSize(room), wait)
+                        if (incoming.hasData()) {
+                            pending.appendText(incoming.bytes)
+                            received = received + incoming.bytes.size
+                            decodeNow = if (need > 0) pending.size() >= need else httpFindByte(incoming.bytes, 10, 0, incoming.bytes.size) >= 0
+                        } else if (!incoming.timedOut()) ended = true
+                    }
+                }
+            }
+            request = if (complete && valid && !timedOut) "$headText${decodedBody.toText()}" else ""
+        } else {
+            val expected = headerEnd + framing
+            var received = request.size
+            val body = byteBuffer()
+            body.appendText(request)
+            while (received < expected && !ended && !timedOut) {
+                val wait = httpServeWait(options, accepted, firstByte, true, linuxMonotonicMilliseconds())
+                if (wait == 0) timedOut = true
+                else {
+                    val incoming = connection.readWithTimeoutResult(httpServeReadSize(expected - received), wait)
+                    if (incoming.hasData()) {
+                        body.appendText(incoming.bytes)
+                        received = received + incoming.bytes.size
+                    } else if (!incoming.timedOut()) ended = true
+                }
+            }
+            request = if (timedOut) "" else body.toText()
+        }
+    }
+    HttpReadOutcome(request, timedOut)
+}
+
+// Reads one request from `connection`, answers it through `router` within the response deadline, and returns the bytes written (-1 when the write failed or ran out of
+// time); nothing is answered when a deadline ended the reading. The caller closes the connection.
+private fun httpServeConnection(router: HttpRouter, connection: TcpConnection, options: HttpServeOptions): int {
+    val read = httpReadRequestWithin(connection, options)
+    if (read.timedOut) return -1
+    val request = httpRequestWithPeer(httpParseRequest(read.request), connection.descriptor)
     val response = router.dispatch(request)
     var rendered = response.render()
     if (request.method == "HEAD") rendered = response.renderHead()
-    val written = connection.write(rendered)
+    if (options.responseTimeoutMilliseconds > 0) {
+        val outcome = connection.writeNetwork(rendered, options.responseTimeoutMilliseconds)
+        if (outcome.succeeded()) outcome.written else -1
+    } else connection.write(rendered)
+}
+
+/// Accepts one connection on `listener`, dispatches through `router` within the deadlines of `options`, writes the response, and closes the connection. Returns the
+/// bytes written, or -1 when the response was not written in full.
+fun serveHttpOnceWith(router: HttpRouter, var listener: TcpListener, options: HttpServeOptions): int {
+    val connection = listener.accept()
+    val written = httpServeConnection(router, connection, options)
     connection.close()
     written
 }
 
-// Listens on `port` and serves requests through `router` until graceful shutdown. Returns the listener loop's status.
-fun serveHttp(router: HttpRouter, port: int): int {
+/// Accepts one connection on `listener`, dispatches through `router`, writes the response, and closes the connection, with the deadlines of `httpServeOptions()`.
+fun serveHttpOnce(router: HttpRouter, var listener: TcpListener): int = serveHttpOnceWith(router, listener, httpServeOptions())
+
+/// Listens on `port` and serves requests through `router` with `options` until graceful shutdown. Returns the listener loop's status.
+fun serveHttpWith(router: HttpRouter, port: int, options: HttpServeOptions): int {
     val listener = tcpListen(port)
-    serveHttpOnListener(router, listener)
+    serveHttpOnListenerWith(router, listener, options)
 }
 
-// Serves requests from `listener` through `router` until graceful shutdown. Sends only headers on HEAD requests, closes each client and the listener, and returns zero on exit.
-fun serveHttpOnListener(router: HttpRouter, var listener: TcpListener): int {
+/// Listens on `port` and serves requests through `router`, with the deadlines of `httpServeOptions()`, until graceful shutdown. Returns the listener loop's status.
+fun serveHttp(router: HttpRouter, port: int): int = serveHttpWith(router, port, httpServeOptions())
+
+/// Serves requests from `listener` through `router` with `options` until graceful shutdown. Sends only headers on HEAD requests, closes each client and the listener, and returns zero on graceful shutdown.
+fun serveHttpOnListenerWith(router: HttpRouter, var listener: TcpListener, options: HttpServeOptions): int {
     tcpEnableGracefulShutdown()
     while (!tcpShutdownRequested()) {
         val connection = listener.acceptUntilShutdown()
         if (connection.descriptor >= 0) {
-            val request = httpRequestWithPeer(httpParseRequest(httpReadRequest(connection)),
-                connection.descriptor)
-            val response = router.dispatch(request)
-            var rendered = response.render()
-            if (request.method == "HEAD") rendered = response.renderHead()
-            connection.write(rendered)
+            httpServeConnection(router, connection, options)
             connection.close()
         }
     }
     listener.close()
     0
 }
+
+/// Serves requests from `listener` through `router` with the deadlines of `httpServeOptions()` until graceful shutdown. Sends only headers on HEAD requests, closes each client and the listener, and returns zero on graceful shutdown.
+fun serveHttpOnListener(router: HttpRouter, var listener: TcpListener): int = serveHttpOnListenerWith(router, listener, httpServeOptions())
 
 /** The request line must be `method SP target SP HTTP/1.x` and nothing else: returns 1 for HTTP/1.1, 0 for HTTP/1.0
  *  and -1 for anything else, which is refused (a line that is not a request is never routed). The target is an origin

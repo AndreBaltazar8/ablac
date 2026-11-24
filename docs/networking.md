@@ -153,7 +153,7 @@ fun main {
 | `httpText(body, status = 200)`, `httpJson(body, status = 200)` | responses with a content type |
 | `httpGet(path)`, `httpPost(path, body)`, `httpRequest(method, path, body, headers)` | build a request |
 | `httpParseRequest(text)`, `httpParseResponse(text)`, `response.render()` | parse and render the wire format |
-| `serveHttp(router, port)`, `serveHttpOnce`, `serveHttpOnListener` | serve over TCP, one request per connection, serially (persistent connections: `abla/http/event`) |
+| `serveHttp(router, port)`, `serveHttpOnce`, `serveHttpOnListener` (and `...With(..., options)`) | serve over TCP, one request per connection, serially, with deadlines (`HttpServeOptions`; persistent connections and many slow peers: `abla/http/event`) |
 | `httpIpv4Client(authority, address, port, maximumResponseBytes, timeoutMilliseconds, deadlineMilliseconds)`, `httpsClient(host, port, maximumResponseBytes, timeoutMilliseconds, deadlineMilliseconds)` (from `abla/http/tls`), `client.send(request)` | send requests. `timeoutMilliseconds` bounds each read and write. The optional `deadlineMilliseconds` bounds the whole exchange. |
 
 ### Portable sockets: `abla/net/hosted`
@@ -719,6 +719,13 @@ timeout (30 s), the gzip threshold (256 bytes; a huge value turns gzip off)
 and the drain time at SIGTERM. Handlers still run on the one loop thread, so
 a handler that blocks holds every connection, as it does in the blocking
 server.
+
+The blocking server reads one connection at a time, so a connection that sends nothing, or a byte now and then, would hold every other peer. It closes
+such a connection without an answer: `HttpServeOptions` (`httpServeOptions()` are the defaults, `serveHttpWith`, `serveHttpOnListenerWith` and
+`serveHttpOnceWith` take them) gives 10 s from accept to the first byte, 30 s from the first byte to the end of the head, 120 s to the end of the request and
+30 s to take the response (0 turns a deadline off), and bounds the head (64 KiB) and body (1 MiB). A deadline limits one connection, not the server: it still
+serves one at a time, so a service that faces the open network wants a proxy that limits connections per address, or the event server, which reads many
+connections at once and has the same deadlines (`HttpEventServerOptions`).
 
 A server that could not bind (the port is taken, the address is invalid, no permission) is still returned, with a
 listener that has no descriptor: `server.listenError()` is 0 while it listens and otherwise the errno (98 for an address
