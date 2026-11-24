@@ -22,6 +22,121 @@ function Run([string]$exe, [string[]]$arguments, [string]$step) {
     $output
 }
 
+function Test-SharingViolation([Exception]$errorCause) {
+    for ($cause = $errorCause; $null -ne $cause; $cause = $cause.InnerException) {
+        # HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION).
+        if ($cause -is [IO.IOException] -and $cause.HResult -in 0x80070020, 0x80070021) { return $true }
+    }
+    return $false
+}
+
+function Write-LockingProcesses([string]$directory) {
+    $locked = @(foreach ($file in Get-ChildItem -LiteralPath $directory -File -Force -Recurse) {
+        try {
+            [IO.File]::Open($file.FullName, 'Open', 'Read', 'None').Dispose()
+        } catch {
+            if (Test-SharingViolation $_.Exception) { $file.FullName }
+        }
+    })
+    if (!$locked.Count) {
+        Write-Warning "No file under $directory failed the exclusive-open probe. The lock may have cleared or may be on a directory."
+        return
+    }
+    foreach ($file in $locked) { Write-Warning "Cannot open without sharing: $file" }
+
+    # Restart Manager can identify applications using the files. Query only.
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class AblaToolchainFileUsers
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessIdentity
+    {
+        public uint Pid;
+        public System.Runtime.InteropServices.ComTypes.FILETIME Start;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ProcessInfo
+    {
+        public ProcessIdentity Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string Name;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string Service;
+        public uint ApplicationType, AppStatus, SessionId;
+        [MarshalAs(UnmanagedType.Bool)] public bool Restartable;
+    }
+
+    [DllImport("Rstrtmgr.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int RmStartSession(out uint session, uint flags, StringBuilder key);
+    [DllImport("Rstrtmgr.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int RmRegisterResources(uint session, uint fileCount,
+        [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr)] string[] files,
+        uint processCount, IntPtr processes, uint serviceCount, IntPtr services);
+    [DllImport("Rstrtmgr.dll", ExactSpelling = true)]
+    private static extern int RmGetList(uint session, out uint needed, ref uint count,
+        [In, Out] ProcessInfo[] applications, out uint rebootReasons);
+    [DllImport("Rstrtmgr.dll", ExactSpelling = true)]
+    private static extern int RmEndSession(uint session);
+
+    private static void Check(int status)
+    {
+        if (status != 0) throw new Win32Exception(status);
+    }
+
+    public static string[] List(string[] files)
+    {
+        Check(RmStartSession(out uint session, 0, new StringBuilder(33)));
+        try
+        {
+            Check(RmRegisterResources(session, (uint)files.Length, files, 0, IntPtr.Zero, 0, IntPtr.Zero));
+            uint count = 0;
+            int status = RmGetList(session, out uint needed, ref count, null, out _);
+            if (status == 0) return Array.Empty<string>();
+            if (status != 234) Check(status); // ERROR_MORE_DATA
+            count = needed;
+            var applications = new ProcessInfo[count];
+            Check(RmGetList(session, out _, ref count, applications, out _));
+            var names = new string[count];
+            for (int i = 0; i < names.Length; i++)
+                names[i] = applications[i].Name + " (PID " + applications[i].Process.Pid + ")";
+            return names;
+        }
+        finally
+        {
+            RmEndSession(session);
+        }
+    }
+}
+'@
+    $users = @([AblaToolchainFileUsers]::List($locked))
+    if (!$users.Count) { Write-Warning 'Windows Restart Manager did not identify a locking process.' }
+    foreach ($user in $users) { Write-Warning "Windows Restart Manager reports: $user" }
+}
+
+function Move-Toolchain([string]$source, [string]$destination) {
+    $delays = @(250, 500, 1000, 2000, 4000)
+    for ($attempt = 0; ; $attempt++) {
+        try {
+            Move-Item -LiteralPath $source -Destination $destination -ErrorAction Stop
+            return
+        } catch {
+            if (!(Test-SharingViolation $_.Exception)) { throw }
+            if ($attempt -eq $delays.Count) {
+                $moveError = $_
+                try { Write-LockingProcesses $source }
+                catch { Write-Warning "Could not identify locking processes: $_" }
+                throw $moveError
+            }
+            Write-Host "Toolchain move hit a sharing violation. Retrying in $($delays[$attempt]) ms."
+            Start-Sleep -Milliseconds $delays[$attempt]
+        }
+    }
+}
+
 $temp = Join-Path $env:RUNNER_TEMP ('toolchain-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temp | Out-Null
 $first = Join-Path $temp 'first'
@@ -98,6 +213,6 @@ Check-Toolchain $top 'unpacked'
 # Moved to another directory (and another name for the parent): the sysroot is found beside the image, not by where it was unpacked.
 $second = Join-Path $temp 'relocated\somewhere else'
 New-Item -ItemType Directory -Path (Split-Path -Parent $second) -Force | Out-Null
-Move-Item -LiteralPath $top -Destination $second
+Move-Toolchain $top $second
 Check-Toolchain $second 'moved'
 Write-Host "windows toolchain: ablac $Version builds and runs programs from the unpacked and the moved toolchain with only System32 on the PATH"
