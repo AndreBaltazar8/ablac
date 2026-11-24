@@ -7,12 +7,18 @@
 #     with a message when Wine is not installed; tools/windows/wine-run.sh runs it headless).
 # The images, the Linux outputs and statuses, and their hashes are left in build/windows-stdlib for the Windows runner
 # (tools/windows/test-hosted.ps1 -Programs build/windows-stdlib, the windows-run job in ci.yml), which is the truth Wine only approximates.
+#
+# tools/test-windows-programs.sh [compiler [target]]: with the target aarch64-windows (the ARM64 hosted runtime) the same programs are built for
+# ARM64 into build/windows-arm64-stdlib, and nothing runs here (Wine has no ARM64): the Windows ARM64 runner runs them
+# (the windows-arm64-run job). A program that does not build is reported at the end, and the others are still built.
 set -euo pipefail
 compiler=${1:-build/ablac}
+target=${2:-x86_64-windows-hosted}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 out=build/windows-stdlib
+[[ $target == aarch64-windows ]] && out=build/windows-arm64-stdlib
 rm -rf "$out" build/windows-debug
 mkdir -p "$out"
 fail() { echo "windows-programs: $1" >&2; exit 1; }
@@ -24,6 +30,7 @@ ran=0
 skipped=0
 count=0
 runner=0
+unbuilt=""
 # A program marked `wine` passes under Wine only: it is not left for the Windows runner (also when Wine is not installed here)...
 wine_only_finish() {
     [[ $where == wine ]] || return 0
@@ -52,15 +59,34 @@ while read -r source status where; do
     [[ $native == "$status" ]] || fail "$name: the Linux program exits $native, tests/cases/windows/programs.txt says $status"
     echo "$status" > "$out/$name.status"
     exe=$out/$name.exe
-    "$compiler" build "$source" --target x86_64-windows-hosted -o "$exe" --fast --no-cache > "$exe.log" 2>&1 ||
-        { cat "$exe.log" >&2; fail "$name did not build for Windows"; }
+    if [[ $target == aarch64-windows ]]; then
+        # Wine-only programs are not run on a runner, and ARM64 has no Wine
+        if [[ $where == wine ]]; then
+            rm -f "$out/$name.status" "$out/$name.expected"
+            continue
+        fi
+        "$compiler" build "$source" --target "$target" -o "$exe" --fast --no-cache > "$exe.log" 2>&1 || {
+            tail -5 "$exe.log" >&2
+            echo "windows-programs: $name did not build for $target" >&2
+            unbuilt="$unbuilt $name"
+            rm -f "$out/$name.status" "$out/$name.expected"
+            continue
+        }
+    else
+        "$compiler" build "$source" --target "$target" -o "$exe" --fast --no-cache > "$exe.log" 2>&1 ||
+            { cat "$exe.log" >&2; fail "$name did not build for Windows"; }
+    fi
     imports=$(llvm-readobj --coff-imports "$exe" | awk '/^ *Name:/ { dll = $2 } /^ *Symbol:/ { print dll, $2 }')
     ! grep -qiE 'msvcrt|ucrtbase|vcruntime|api-ms-win-crt' <<< "$imports" || fail "$name: a C runtime import: $imports"
     while read -r dll function; do
         [[ -z $dll ]] || grep -qxF "$dll $function" <<< "$allowed" ||
             fail "$name: import not in tools/windows-imports-allowlist.txt: $dll $function"
     done <<< "$imports"
-    # A program marked `runner` (one Wine cannot check) is built and left for the Windows runner only.
+    # A program marked `runner` (one Wine cannot check) is built and left for the Windows runner only; so is every program for ARM64.
+    if [[ $target == aarch64-windows ]]; then
+        runner=$((runner + 1))
+        continue
+    fi
     if [[ $where == runner ]]; then
         runner=$((runner + 1))
         continue
@@ -81,7 +107,13 @@ while read -r source status where; do
 done < tests/cases/windows/programs.txt
 ((count > 0)) || fail 'tests/cases/windows/programs.txt lists no program'
 (cd "$out" && sha256sum -- ./*.exe ./*.expected ./*.status | sed 's|  \./|  |' > SHA256SUMS)
-if ((skipped > 0)); then
+if [[ $target == aarch64-windows ]]; then
+    if [[ -n $unbuilt ]]; then
+        echo "windows-programs: not built for $target:$unbuilt" >&2
+        exit 1
+    fi
+    echo "windows-programs: $runner programs built for $target, imports within the allowlist, no C runtime; the ARM64 runner runs them"
+elif ((skipped > 0)); then
     echo "windows-programs: $count programs built, imports within the allowlist, no C runtime; $skipped runs skipped (Wine is not installed)"
 else
     echo "windows-programs: $ran programs under Wine exit and print what the native Linux programs do ($runner more for the Windows runner only); imports within the allowlist, no C runtime"
