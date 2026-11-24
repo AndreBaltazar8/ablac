@@ -7,7 +7,11 @@ import "abla/bytes"
 import "abla/fs"
 import "abla/net"
 import "abla/random"
+import "abla/process/environment"
+import "abla/sys/linux"
 import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
 
 // Holds a numeric IP address, its address family, and the DNS record's lifetime in seconds.
 class DnsAddress(
@@ -311,9 +315,43 @@ fun dnsParseConfiguration(text: string): DnsConfiguration {
     DnsConfiguration(nameservers, search, ndots)
 }
 
+// What a Windows host has where Linux has /etc/resolv.conf: the runtime's system call 4007 (iphlpapi's DNS servers and primary suffix, as
+// resolv.conf lines), asked again with a larger buffer when the first was too small; empty when it fails.
+private fun dnsWindowsConfigurationText(): string {
+    var size = 4096
+    var attempt = 0
+    while (attempt < 2) {
+        val buffer = nativeByteBuffer(size)
+        val used = linuxSyscall2(4007, nativePointerAddress(buffer.address), size)
+        if (used < 0) {
+            buffer.close()
+            return ""
+        }
+        if (used <= size) return buffer.adoptString(used)
+        buffer.close()
+        size = used
+        attempt = attempt + 1
+    }
+    ""
+}
+
+/** The text of the resolver configuration `file`: the file, except that the default /etc/resolv.conf on Windows is the system's DNS servers
+ *  (dnsWindowsConfigurationText). */
+fun dnsConfigurationText(file: string): string =
+    if (file == "/etc/resolv.conf" && linuxHostIsWindows()) dnsWindowsConfigurationText() else path(file).readText()
+
+/** The text of the hosts file `file`: the file, except that the default /etc/hosts on Windows is the one under %SystemRoot%/System32/drivers/etc. */
+fun dnsHostsText(file: string): string {
+    if (file == "/etc/hosts" && linuxHostIsWindows()) {
+        val root = processEnvironment("SystemRoot") ?? "C:/Windows"
+        return path(root + "/System32/drivers/etc/hosts").readText()
+    }
+    path(file).readText()
+}
+
 // Returns parsed resolver settings from the host file, with defaults when the file cannot be read.
 fun dnsReadConfiguration(path: string = "/etc/resolv.conf"): DnsConfiguration =
-    dnsParseConfiguration(path(path).readText())
+    dnsParseConfiguration(dnsConfigurationText(path))
 
 // The name server to ask: `server` when given, else the configuration's first,
 // else systemd-resolved's stub.
@@ -514,7 +552,7 @@ fun dnsResolveType(
 ): DnsResolution {
     val literal = dnsLiteral(host, recordType)
     if (literal != null) return literal
-    val listed = dnsHostsLookup(path(hostsPath).readText(), host, recordType)
+    val listed = dnsHostsLookup(dnsHostsText(hostsPath), host, recordType)
     if (listed.size > 0) return DnsResolution(listed, true, false, 0)
     val configuration = dnsReadConfiguration(configurationPath)
     val nameserver = dnsChooseServer(server, configuration)
