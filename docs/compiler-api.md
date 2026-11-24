@@ -347,6 +347,27 @@ from source modules become bounded no-ops in the child, preventing recursive
 self-emission, while actions explicitly declared in its own declaration block
 still execute.
 
+When a build action checks requirements of its own, call
+[`panic(message)` from `abla/process`](compile-time.md#what-works-at-compile-time-today)
+before emitting the artifact. For example, a browser client builder can pass
+the export name and its reflected result type to this check. The build fails
+with `E_CT_PANIC` and the builder's own message. An invalid reference is
+diagnosed by the compiler, so it cannot explain the builder's requirement.
+
+```abla error
+import "abla/process"
+
+compile fun requireClientResult(name: string, resultType: string): void {
+    if (resultType != "i64") panic("client export `$name` must return int")
+}
+
+#requireClientResult("showMessage", "string")
+
+fun main: int = 0
+// error: E_CT_PANIC
+// error: client export `showMessage` must return int
+```
+
 Top-level compile expressions are executable actions. A value binding is not
 required merely to retain the result, so `#buildTool()` intentionally evaluates
 and drops the returned value after its compile-time effects are staged.
