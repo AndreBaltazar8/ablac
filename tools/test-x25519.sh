@@ -21,7 +21,7 @@ for mode in release fast; do
     result=$(ABLA_MAX_SECONDS=3000 "$root/tools/run-limited.sh" "$out/main.$mode" "${extra[@]}") || { echo "x25519 ($mode): $result" >&2; exit 1; }
     [[ $result == 'x25519 ok' ]] || { echo "x25519 ($mode): $result" >&2; exit 1; }
     # The ten-limb field against the thirty-two-limb ladder it replaced (20,000 random inputs and the edge points).
-    "$compiler" build tests/cases/x25519/reference.ab -o "$out/reference.$mode" "${flags[@]}"
+    "$compiler" build tests/cases/x25519/reference.ab -o "$out/reference.$mode" "${flags[@]}" --stdlib-internals
     # The release run takes all 20,000 random inputs; the --fast one (about twelve times slower per input) 2,000, plus the edge and special inputs: the same code, another code generator.
     reference_arguments=()
     [[ $mode == fast ]] && reference_arguments=(2000)

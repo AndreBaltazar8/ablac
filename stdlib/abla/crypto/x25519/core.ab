@@ -1,0 +1,853 @@
+// public: none
+// X25519 (RFC 7748 section 5): Diffie-Hellman on Curve25519, in Abla, with no OpenSSL, on every target, and
+// constant-time: the Montgomery ladder runs all 255 steps and swaps by a mask on every bit, the field arithmetic has
+// no branch, memory index or division on a value, and the inverse is Fermat's. What is public: the lengths and the
+// loop counts. A scalar and the shared secret are secret; a point is public.
+//
+// The ladder works in ten limbs of 26 and 25 bits, a limb to a 32-bit word, a product a widening 32 x 32 -> 64-bit multiply
+// (x25519F...: 100 per field multiplication, the layout of curve25519-donna and ref10, and 11 times faster than the representation
+// below: 0.12 ms for a scalar multiplication, 1.3 ms before). Ed25519 (abla/crypto/ed25519) keeps the older representation, 32 limbs
+// of 8 bits, one limb per 32-bit word, little endian (128 bytes), so every product and sum fits in 32 bits and nothing wider is
+// needed on any target; 2^256 is 38 mod 2^255 - 19. tools/test-ct.sh reads the core below (between the BEGIN and END lines) as
+// written, in a module of its own. tests/cases/x25519/reference.ab keeps the old ladder as a reference for the new one.
+//
+// x25519 gives `ok` false, and no bytes, for a shared secret that is all zero (a point of small order, RFC 7748
+// section 6.1; TLS 1.3 requires the handshake to fail then).
+
+import "abla/crypto"
+import "abla/crypto/alloc"
+import "abla/ct"
+import "abla/ct/scrub"
+import "abla/simd/target"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/mmio"
+import "abla/crypto/result"
+
+// BEGIN X25519 SECRET CORE
+@inline trusted fun x25519Pointer(address: int): i64* =
+    ablaUnsafePointerOffset(ablaUnsafeNullPointer(), address)
+/// Loads a secret 32-bit word from a valid readable address.
+@inline trusted fun x25519Load(address: int): secretU32 =
+    secretU32(u32(ablaUnsafeLoadU32(x25519Pointer(address))))
+/// Stores a secret 32-bit word at a valid writable address.
+@inline trusted fun x25519Store(address: int, value: secretU32): void =
+    ablaUnsafeStoreU32(x25519Pointer(address), int(value.declassify()))
+
+/** One pass of carries over the 32 limbs at `a`: each limb keeps 8 bits, and the carry out of the top limb comes back
+ *  into the bottom one times 38. */
+@inline trusted fun x25519CarryPass(a: int): void {
+    val mask = secretU32(u32(255))
+    for (i in 0 until 31) {
+        val limb = x25519Load(a + i * 4)
+        x25519Store(a + i * 4, limb & mask)
+        x25519Store(a + (i + 1) * 4, x25519Load(a + (i + 1) * 4) + (limb >> 8))
+    }
+    val top = x25519Load(a + 124)
+    x25519Store(a + 124, top & mask)
+    x25519Store(a, x25519Load(a) + (top >> 8) * secretU32(u32(38)))
+}
+
+/** Two passes leave every limb at most 255, the bottom one at most 293, from limbs of up to 2^27. */
+@inline trusted fun x25519Carry(a: int): void {
+    x25519CarryPass(a)
+    x25519CarryPass(a)
+}
+
+/** `out` = `a` + `b`. `out` may be either. */
+@inline trusted fun x25519AddBody(out: int, a: int, b: int): void {
+    for (i in 0 until 32) x25519Store(out + i * 4, x25519Load(a + i * 4) + x25519Load(b + i * 4))
+    x25519Carry(out)
+}
+
+/** `out` = `a` - `b`, as `a` + 4p - `b` limb by limb (4p's limbs are all above 293), so nothing is negative. */
+@inline trusted fun x25519SubBody(out: int, a: int, b: int): void {
+    for (i in 0 until 32) {
+        val bias = if (i == 0) 948 else if (i == 31) 508 else 1020
+        x25519Store(out + i * 4, x25519Load(a + i * 4) + secretU32(u32(bias)) - x25519Load(b + i * 4))
+    }
+    x25519Carry(out)
+}
+
+/** `out` = `a` * `b`; `t` has 64 words of scratch. `out` may be `a` or `b`. Each output limb is one sum in a
+ *  register (at most 32 products of at most 293 * 293), then the high half folds down times 38. */
+@inline trusted fun x25519MulBody(out: int, a: int, b: int, t: int): void {
+    for (k in 0 until 63) {
+        var sum = secretU32(u32(0))
+        val first = if (k > 31) k - 31 else 0
+        val last = if (k < 31) k else 31
+        for (i in first until last + 1) sum = sum + x25519Load(a + i * 4) * x25519Load(b + (k - i) * 4)
+        x25519Store(t + k * 4, sum)
+    }
+    for (k in 0 until 31) {
+        x25519Store(out + k * 4, x25519Load(t + k * 4) + x25519Load(t + (k + 32) * 4) * secretU32(u32(38)))
+    }
+    x25519Store(out + 124, x25519Load(t + 124))
+    x25519Carry(out)
+}
+
+/** `out` = `a` * 121665, the curve constant (A - 2) / 4. */
+@inline trusted fun x25519MulConstantBody(out: int, a: int): void {
+    for (i in 0 until 32) x25519Store(out + i * 4, x25519Load(a + i * 4) * secretU32(u32(121665)))
+    x25519Carry(out)
+}
+
+/** Swaps the elements at `a` and `b` where `mask` has ones. */
+@inline trusted fun x25519SwapBody(mask: secretU32, a: int, b: int): void {
+    for (i in 0 until 32) {
+        val x = x25519Load(a + i * 4)
+        val y = x25519Load(b + i * 4)
+        val difference = (x ^ y) & mask
+        x25519Store(a + i * 4, x ^ difference)
+        x25519Store(b + i * 4, y ^ difference)
+    }
+}
+
+/// Writes the field sum of two 32-limb elements to `out`.
+@noinline trusted fun x25519Add(out: int, a: int, b: int): void = x25519AddBody(out, a, b)
+/// Writes the field difference `a - b` of two 32-limb elements to `out`.
+@noinline trusted fun x25519Sub(out: int, a: int, b: int): void = x25519SubBody(out, a, b)
+/// Writes the field product of two 32-limb elements to `out`, using `t` as scratch.
+@noinline trusted fun x25519Multiply(out: int, a: int, b: int, t: int): void = x25519MulBody(out, a, b, t)
+/// Writes the 32-limb field product of `a` and the curve constant 121665 to `out`.
+@noinline trusted fun x25519MultiplyConstant(out: int, a: int): void = x25519MulConstantBody(out, a)
+/// Swaps two 32-limb elements in place under an all-ones mask and leaves them in place under a zero mask.
+@noinline trusted fun x25519Swap(mask: secretU32, a: int, b: int): void = x25519SwapBody(mask, a, b)
+
+/// Squares the 32-limb field element in place `count` times, using `t` as scratch.
+@noinline trusted fun x25519SquareTimes(a: int, count: int, t: int): void {
+    for (i in 0 until count) x25519MulBody(a, a, a, t)
+}
+
+/// Copies 32 limbs from `from` to `to` in increasing address order.
+@noinline trusted fun x25519Copy(to: int, from: int): void {
+    for (i in 0 until 32) x25519Store(to + i * 4, x25519Load(from + i * 4))
+}
+
+/** `out` = `z` ^ (p - 2), the inverse (zero for zero), by the chain of 254 squarings and 11 multiplications of
+ *  Bernstein's ref10. `f` has four elements of scratch, `t` the multiplication's. */
+@noinline trusted fun x25519Invert(out: int, z: int, f: int, t: int): void {
+    val t0 = f
+    val t1 = f + 128
+    val t2 = f + 256
+    val t3 = f + 384
+    x25519MulBody(t0, z, z, t)                // z^2
+    x25519Copy(t1, t0)
+    x25519SquareTimes(t1, 2, t)               // z^8
+    x25519MulBody(t1, z, t1, t)               // z^9
+    x25519MulBody(t0, t0, t1, t)              // z^11
+    x25519MulBody(t2, t0, t0, t)              // z^22
+    x25519MulBody(t1, t1, t2, t)              // z^(2^5 - 1)
+    x25519Copy(t2, t1)
+    x25519SquareTimes(t2, 5, t)
+    x25519MulBody(t1, t2, t1, t)              // z^(2^10 - 1)
+    x25519Copy(t2, t1)
+    x25519SquareTimes(t2, 10, t)
+    x25519MulBody(t2, t2, t1, t)              // z^(2^20 - 1)
+    x25519Copy(t3, t2)
+    x25519SquareTimes(t3, 20, t)
+    x25519MulBody(t2, t3, t2, t)              // z^(2^40 - 1)
+    x25519SquareTimes(t2, 10, t)
+    x25519MulBody(t1, t2, t1, t)              // z^(2^50 - 1)
+    x25519Copy(t2, t1)
+    x25519SquareTimes(t2, 50, t)
+    x25519MulBody(t2, t2, t1, t)              // z^(2^100 - 1)
+    x25519Copy(t3, t2)
+    x25519SquareTimes(t3, 100, t)
+    x25519MulBody(t2, t3, t2, t)              // z^(2^200 - 1)
+    x25519SquareTimes(t2, 50, t)
+    x25519MulBody(t1, t2, t1, t)              // z^(2^250 - 1)
+    x25519SquareTimes(t1, 5, t)
+    x25519MulBody(out, t1, t0, t)             // z^(2^255 - 21)
+}
+
+/** Carries up through the limbs without wrapping: the top limb keeps what it gets. */
+@inline trusted fun x25519Chain(a: int): void {
+    val mask = secretU32(u32(255))
+    for (i in 0 until 31) {
+        val limb = x25519Load(a + i * 4)
+        x25519Store(a + i * 4, limb & mask)
+        x25519Store(a + (i + 1) * 4, x25519Load(a + (i + 1) * 4) + (limb >> 8))
+    }
+}
+
+/** The element at `a` reduced to its one value below p = 2^255 - 19, as 32 bytes at `out`. `s` and `bias` are elements of
+ *  scratch. */
+@noinline trusted fun x25519Pack(out: int, a: int, s: int, bias: int): void {
+    x25519Copy(s, a)
+    x25519Carry(s)
+    // Fold the bit 255 down twice (2^255 is 19): the value is below 2^255 after.
+    for (round in 0 until 2) {
+        val top = x25519Load(s + 124)
+        x25519Store(s + 124, top & secretU32(u32(127)))
+        x25519Store(s, x25519Load(s) + (top >> 7) * secretU32(u32(19)))
+        x25519Chain(s)
+    }
+    // Subtract p when the value is at least p: that is when adding 19 reaches 2^255.
+    x25519Copy(bias, s)
+    x25519Store(bias, x25519Load(bias) + secretU32(u32(19)))
+    x25519Chain(bias)
+    val reaches = ctFromLowBit(x25519Load(bias + 124) >> 7)
+    x25519Store(s, x25519Load(s) + (secretU32(u32(19)) & reaches))
+    x25519Chain(s)
+    x25519Store(s + 124, x25519Load(s + 124) & secretU32(u32(127)))
+    for (i in 0 until 32) ablaUnsafeStoreU8(x25519Pointer(out + i), int(x25519Load(s + i * 4).declassify()))
+}
+
+
+// ---- The field of X25519 in ten limbs of 26 and 25 bits (curve25519-donna's, ref10's radix 2^25.5) -------------------------
+// An element is ten 32-bit words, 40 bytes: limb i holds bits ceil(25.5 i) to ceil(25.5 (i + 1)) of the value, 26 bits in the
+// even limbs and 25 in the odd ones, little endian; 2^255 is 19. A product is a widening 32 x 32 -> 64-bit multiply of secretU32
+// (secretU32.widen() * secretU32.widen(), which the constant-time test reads on every target), 100 of them for a multiplication
+// (the 32 x 32 limbs of the other representation took 1024). Limbs of a result are below 2^26 (2^25 for the odd ones) plus a
+// few carries' worth; a sum has limbs below 2^27, which a multiplication takes (its sums of products stay below 2^64: at most
+// ten products of limbs below 1.5 * 2^27 and 19 times that, the odd ones doubled).
+@inline fun x25519M(a: secretU32, b: secretU32): secretU64 = a.widen() * b.widen()
+
+/** A u64 as two words at `address`, low first (and back): the sums of products wait there between the multiplication and its carries. */
+@inline trusted fun x25519Store64(address: int, value: secretU64): void =
+    ablaUnsafeStoreI64(x25519Pointer(address), int(value.declassify()))
+/// Loads a secret 64-bit word from a valid readable address.
+@inline trusted fun x25519Load64(address: int): secretU64 = secretU64(u64(ablaUnsafeLoadI64(x25519Pointer(address))))
+
+/** Carries the ten sums of products (u64, below 2^64: ten words of two at `t`) into limbs and stores the element at `out`: the ref10 order
+ *  of carries, the one out of limb 9 coming back into limb 0 times 19. */
+@noinline trusted fun x25519FFinish(out: int, t: int): void {
+    val h0 = x25519Load64(t)
+    val h1 = x25519Load64(t + 8)
+    val h2 = x25519Load64(t + 16)
+    val h3 = x25519Load64(t + 24)
+    val h4 = x25519Load64(t + 32)
+    val h5 = x25519Load64(t + 40)
+    val h6 = x25519Load64(t + 48)
+    val h7 = x25519Load64(t + 56)
+    val h8 = x25519Load64(t + 64)
+    val h9 = x25519Load64(t + 72)
+    val m26 = secretU64(u64(67108863))
+    val m25 = secretU64(u64(33554431))
+    val c0 = h0 >> 26
+    val i1 = h1 + c0
+    val j0 = h0 & m26
+    val c4 = h4 >> 26
+    val i5 = h5 + c4
+    val j4 = h4 & m26
+    val c1 = i1 >> 25
+    val i2 = h2 + c1
+    val j1 = i1 & m25
+    val c5 = i5 >> 25
+    val i6 = h6 + c5
+    val j5 = i5 & m25
+    val c2 = i2 >> 26
+    val i3 = h3 + c2
+    val j2 = i2 & m26
+    val c6 = i6 >> 26
+    val i7 = h7 + c6
+    val j6 = i6 & m26
+    val c3 = i3 >> 25
+    val k4 = j4 + c3
+    val j3 = i3 & m25
+    val c7 = i7 >> 25
+    val i8 = h8 + c7
+    val j7 = i7 & m25
+    val c4b = k4 >> 26
+    val k5 = j5 + c4b
+    val l4 = k4 & m26
+    val c8 = i8 >> 26
+    val i9 = h9 + c8
+    val j8 = i8 & m26
+    val c9 = i9 >> 25
+    val k0 = j0 + c9 * secretU64(u64(19))
+    val j9 = i9 & m25
+    val c0b = k0 >> 26
+    val k1 = j1 + c0b
+    val l0 = k0 & m26
+    x25519Store(out, l0.low())
+    x25519Store(out + 4, k1.low())
+    x25519Store(out + 8, j2.low())
+    x25519Store(out + 12, j3.low())
+    x25519Store(out + 16, l4.low())
+    x25519Store(out + 20, k5.low())
+    x25519Store(out + 24, j6.low())
+    x25519Store(out + 28, j7.low())
+    x25519Store(out + 32, j8.low())
+    x25519Store(out + 36, j9.low())
+}
+
+/** `out` = `a` * `b` (elements; `out` may be either). */
+/** The sum of products of row `k` (limbs i and j = k - i mod 10 of `a` and `b`; `k` is a literal at every call, so LLVM unrolls the loop): the odd by odd
+ *  products land one bit up (2^25.5 is not whole), so one factor doubles, and those past limb 9 wrap around times 19 (2^255 is 19). Stored as a u64 at `t + 8 k`. */
+@inline trusted fun x25519FRow(t: int, a: int, b: int, k: int): void {
+    val nineteen = secretU32(u32(19))
+    var sum = secretU64(u64(0))
+    for (i in 0 until 10) {
+        val j = (k - i + 10) % 10
+        var f = x25519Load(a + i * 4)
+        if ((i & 1) == 1 && (j & 1) == 1) f = f + f
+        var g = x25519Load(b + j * 4)
+        if (i + j >= 10) g = g * nineteen
+        sum = sum + x25519M(f, g)
+    }
+    x25519Store64(t + k * 8, sum)
+}
+
+// On Xtensa the rows are loops (x25519FRow, above): the unrolled code, ten rows of ten widening products in one function, is more than LLVM's
+// -O0 register scavenger can place on that target (the --fast build fails with "Incomplete scavenging after 2nd pass"), and a 32-bit CPU gains nothing from
+// the unrolling. Everywhere else the rows are written out, which is what LLVM's unrolling would make of them (it does not, at 100 products: 3 times slower).
+@noinline trusted fun x25519FProductsRows(t: int, a: int, b: int): void {
+    x25519FRow(t, a, b, 0)
+    x25519FRow(t, a, b, 1)
+    x25519FRow(t, a, b, 2)
+    x25519FRow(t, a, b, 3)
+    x25519FRow(t, a, b, 4)
+    x25519FRow(t, a, b, 5)
+    x25519FRow(t, a, b, 6)
+    x25519FRow(t, a, b, 7)
+    x25519FRow(t, a, b, 8)
+    x25519FRow(t, a, b, 9)
+}
+
+/// Writes ten 64-bit limb-product sums to `t` using the unrolled ten-limb implementation.
+@noinline trusted fun x25519FProductsUnrolled(t: int, a: int, b: int): void {
+    val f0 = x25519Load(a)
+    val f1 = x25519Load(a + 4)
+    val f2 = x25519Load(a + 8)
+    val f3 = x25519Load(a + 12)
+    val f4 = x25519Load(a + 16)
+    val f5 = x25519Load(a + 20)
+    val f6 = x25519Load(a + 24)
+    val f7 = x25519Load(a + 28)
+    val f8 = x25519Load(a + 32)
+    val f9 = x25519Load(a + 36)
+    val g0 = x25519Load(b + 0)
+    val g1 = x25519Load(b + 4)
+    val g2 = x25519Load(b + 8)
+    val g3 = x25519Load(b + 12)
+    val g4 = x25519Load(b + 16)
+    val g5 = x25519Load(b + 20)
+    val g6 = x25519Load(b + 24)
+    val g7 = x25519Load(b + 28)
+    val g8 = x25519Load(b + 32)
+    val g9 = x25519Load(b + 36)
+    val nineteen = secretU32(u32(19))
+    val g1x19 = g1 * nineteen
+    val g2x19 = g2 * nineteen
+    val g3x19 = g3 * nineteen
+    val g4x19 = g4 * nineteen
+    val g5x19 = g5 * nineteen
+    val g6x19 = g6 * nineteen
+    val g7x19 = g7 * nineteen
+    val g8x19 = g8 * nineteen
+    val g9x19 = g9 * nineteen
+    val f1x2 = f1 + f1
+    val f3x2 = f3 + f3
+    val f5x2 = f5 + f5
+    val f7x2 = f7 + f7
+    val f9x2 = f9 + f9
+    var h0 = x25519M(f0, g0)
+    h0 = h0 + x25519M(f1x2, g9x19)
+    h0 = h0 + x25519M(f2, g8x19)
+    h0 = h0 + x25519M(f3x2, g7x19)
+    h0 = h0 + x25519M(f4, g6x19)
+    h0 = h0 + x25519M(f5x2, g5x19)
+    h0 = h0 + x25519M(f6, g4x19)
+    h0 = h0 + x25519M(f7x2, g3x19)
+    h0 = h0 + x25519M(f8, g2x19)
+    h0 = h0 + x25519M(f9x2, g1x19)
+    x25519Store64(t + 0, h0)
+    var h1 = x25519M(f0, g1)
+    h1 = h1 + x25519M(f1, g0)
+    h1 = h1 + x25519M(f2, g9x19)
+    h1 = h1 + x25519M(f3, g8x19)
+    h1 = h1 + x25519M(f4, g7x19)
+    h1 = h1 + x25519M(f5, g6x19)
+    h1 = h1 + x25519M(f6, g5x19)
+    h1 = h1 + x25519M(f7, g4x19)
+    h1 = h1 + x25519M(f8, g3x19)
+    h1 = h1 + x25519M(f9, g2x19)
+    x25519Store64(t + 8, h1)
+    var h2 = x25519M(f0, g2)
+    h2 = h2 + x25519M(f1x2, g1)
+    h2 = h2 + x25519M(f2, g0)
+    h2 = h2 + x25519M(f3x2, g9x19)
+    h2 = h2 + x25519M(f4, g8x19)
+    h2 = h2 + x25519M(f5x2, g7x19)
+    h2 = h2 + x25519M(f6, g6x19)
+    h2 = h2 + x25519M(f7x2, g5x19)
+    h2 = h2 + x25519M(f8, g4x19)
+    h2 = h2 + x25519M(f9x2, g3x19)
+    x25519Store64(t + 16, h2)
+    var h3 = x25519M(f0, g3)
+    h3 = h3 + x25519M(f1, g2)
+    h3 = h3 + x25519M(f2, g1)
+    h3 = h3 + x25519M(f3, g0)
+    h3 = h3 + x25519M(f4, g9x19)
+    h3 = h3 + x25519M(f5, g8x19)
+    h3 = h3 + x25519M(f6, g7x19)
+    h3 = h3 + x25519M(f7, g6x19)
+    h3 = h3 + x25519M(f8, g5x19)
+    h3 = h3 + x25519M(f9, g4x19)
+    x25519Store64(t + 24, h3)
+    var h4 = x25519M(f0, g4)
+    h4 = h4 + x25519M(f1x2, g3)
+    h4 = h4 + x25519M(f2, g2)
+    h4 = h4 + x25519M(f3x2, g1)
+    h4 = h4 + x25519M(f4, g0)
+    h4 = h4 + x25519M(f5x2, g9x19)
+    h4 = h4 + x25519M(f6, g8x19)
+    h4 = h4 + x25519M(f7x2, g7x19)
+    h4 = h4 + x25519M(f8, g6x19)
+    h4 = h4 + x25519M(f9x2, g5x19)
+    x25519Store64(t + 32, h4)
+    var h5 = x25519M(f0, g5)
+    h5 = h5 + x25519M(f1, g4)
+    h5 = h5 + x25519M(f2, g3)
+    h5 = h5 + x25519M(f3, g2)
+    h5 = h5 + x25519M(f4, g1)
+    h5 = h5 + x25519M(f5, g0)
+    h5 = h5 + x25519M(f6, g9x19)
+    h5 = h5 + x25519M(f7, g8x19)
+    h5 = h5 + x25519M(f8, g7x19)
+    h5 = h5 + x25519M(f9, g6x19)
+    x25519Store64(t + 40, h5)
+    var h6 = x25519M(f0, g6)
+    h6 = h6 + x25519M(f1x2, g5)
+    h6 = h6 + x25519M(f2, g4)
+    h6 = h6 + x25519M(f3x2, g3)
+    h6 = h6 + x25519M(f4, g2)
+    h6 = h6 + x25519M(f5x2, g1)
+    h6 = h6 + x25519M(f6, g0)
+    h6 = h6 + x25519M(f7x2, g9x19)
+    h6 = h6 + x25519M(f8, g8x19)
+    h6 = h6 + x25519M(f9x2, g7x19)
+    x25519Store64(t + 48, h6)
+    var h7 = x25519M(f0, g7)
+    h7 = h7 + x25519M(f1, g6)
+    h7 = h7 + x25519M(f2, g5)
+    h7 = h7 + x25519M(f3, g4)
+    h7 = h7 + x25519M(f4, g3)
+    h7 = h7 + x25519M(f5, g2)
+    h7 = h7 + x25519M(f6, g1)
+    h7 = h7 + x25519M(f7, g0)
+    h7 = h7 + x25519M(f8, g9x19)
+    h7 = h7 + x25519M(f9, g8x19)
+    x25519Store64(t + 56, h7)
+    var h8 = x25519M(f0, g8)
+    h8 = h8 + x25519M(f1x2, g7)
+    h8 = h8 + x25519M(f2, g6)
+    h8 = h8 + x25519M(f3x2, g5)
+    h8 = h8 + x25519M(f4, g4)
+    h8 = h8 + x25519M(f5x2, g3)
+    h8 = h8 + x25519M(f6, g2)
+    h8 = h8 + x25519M(f7x2, g1)
+    h8 = h8 + x25519M(f8, g0)
+    h8 = h8 + x25519M(f9x2, g9x19)
+    x25519Store64(t + 64, h8)
+    var h9 = x25519M(f0, g9)
+    h9 = h9 + x25519M(f1, g8)
+    h9 = h9 + x25519M(f2, g7)
+    h9 = h9 + x25519M(f3, g6)
+    h9 = h9 + x25519M(f4, g5)
+    h9 = h9 + x25519M(f5, g4)
+    h9 = h9 + x25519M(f6, g3)
+    h9 = h9 + x25519M(f7, g2)
+    h9 = h9 + x25519M(f8, g1)
+    h9 = h9 + x25519M(f9, g0)
+    x25519Store64(t + 72, h9)
+}
+
+/// Writes ten 64-bit limb-product sums to `t` using the implementation selected for the target.
+@noinline trusted fun x25519FProducts(t: int, a: int, b: int): void {
+    if (simdTargetArch() == SIMD_ARCH_XTENSA) x25519FProductsRows(t, a, b) else x25519FProductsUnrolled(t, a, b)
+}
+
+/** The sums of products of the square of the element at `a` into `t` (as x25519FProducts with `b` = `a`, with 55 products, not 100: the product of limbs i and j is made once and
+ *  counted twice, and the doubling of two odd limbs and the 19 of a wrap are constants on the 64-bit product, which stays below 2^64 for limbs below 1.5 * 2^27). */
+@noinline trusted fun x25519FSquareProducts(t: int, a: int): void {
+    val f0 = x25519Load(a + 0)
+    val f1 = x25519Load(a + 4)
+    val f2 = x25519Load(a + 8)
+    val f3 = x25519Load(a + 12)
+    val f4 = x25519Load(a + 16)
+    val f5 = x25519Load(a + 20)
+    val f6 = x25519Load(a + 24)
+    val f7 = x25519Load(a + 28)
+    val f8 = x25519Load(a + 32)
+    val f9 = x25519Load(a + 36)
+    var h0 = x25519M(f0, f0)
+    h0 = h0 + x25519M(f1, f9) * secretU64(u64(76))
+    h0 = h0 + x25519M(f2, f8) * secretU64(u64(38))
+    h0 = h0 + x25519M(f3, f7) * secretU64(u64(76))
+    h0 = h0 + x25519M(f4, f6) * secretU64(u64(38))
+    h0 = h0 + x25519M(f5, f5) * secretU64(u64(38))
+    x25519Store64(t + 0, h0)
+    var h1 = (x25519M(f0, f1) + x25519M(f0, f1))
+    h1 = h1 + x25519M(f2, f9) * secretU64(u64(38))
+    h1 = h1 + x25519M(f3, f8) * secretU64(u64(38))
+    h1 = h1 + x25519M(f4, f7) * secretU64(u64(38))
+    h1 = h1 + x25519M(f5, f6) * secretU64(u64(38))
+    x25519Store64(t + 8, h1)
+    var h2 = (x25519M(f0, f2) + x25519M(f0, f2))
+    h2 = h2 + (x25519M(f1, f1) + x25519M(f1, f1))
+    h2 = h2 + x25519M(f3, f9) * secretU64(u64(76))
+    h2 = h2 + x25519M(f4, f8) * secretU64(u64(38))
+    h2 = h2 + x25519M(f5, f7) * secretU64(u64(76))
+    h2 = h2 + x25519M(f6, f6) * secretU64(u64(19))
+    x25519Store64(t + 16, h2)
+    var h3 = (x25519M(f0, f3) + x25519M(f0, f3))
+    h3 = h3 + (x25519M(f1, f2) + x25519M(f1, f2))
+    h3 = h3 + x25519M(f4, f9) * secretU64(u64(38))
+    h3 = h3 + x25519M(f5, f8) * secretU64(u64(38))
+    h3 = h3 + x25519M(f6, f7) * secretU64(u64(38))
+    x25519Store64(t + 24, h3)
+    var h4 = (x25519M(f0, f4) + x25519M(f0, f4))
+    h4 = h4 + x25519M(f1, f3) * secretU64(u64(4))
+    h4 = h4 + x25519M(f2, f2)
+    h4 = h4 + x25519M(f5, f9) * secretU64(u64(76))
+    h4 = h4 + x25519M(f6, f8) * secretU64(u64(38))
+    h4 = h4 + x25519M(f7, f7) * secretU64(u64(38))
+    x25519Store64(t + 32, h4)
+    var h5 = (x25519M(f0, f5) + x25519M(f0, f5))
+    h5 = h5 + (x25519M(f1, f4) + x25519M(f1, f4))
+    h5 = h5 + (x25519M(f2, f3) + x25519M(f2, f3))
+    h5 = h5 + x25519M(f6, f9) * secretU64(u64(38))
+    h5 = h5 + x25519M(f7, f8) * secretU64(u64(38))
+    x25519Store64(t + 40, h5)
+    var h6 = (x25519M(f0, f6) + x25519M(f0, f6))
+    h6 = h6 + x25519M(f1, f5) * secretU64(u64(4))
+    h6 = h6 + (x25519M(f2, f4) + x25519M(f2, f4))
+    h6 = h6 + (x25519M(f3, f3) + x25519M(f3, f3))
+    h6 = h6 + x25519M(f7, f9) * secretU64(u64(76))
+    h6 = h6 + x25519M(f8, f8) * secretU64(u64(19))
+    x25519Store64(t + 48, h6)
+    var h7 = (x25519M(f0, f7) + x25519M(f0, f7))
+    h7 = h7 + (x25519M(f1, f6) + x25519M(f1, f6))
+    h7 = h7 + (x25519M(f2, f5) + x25519M(f2, f5))
+    h7 = h7 + (x25519M(f3, f4) + x25519M(f3, f4))
+    h7 = h7 + x25519M(f8, f9) * secretU64(u64(38))
+    x25519Store64(t + 56, h7)
+    var h8 = (x25519M(f0, f8) + x25519M(f0, f8))
+    h8 = h8 + x25519M(f1, f7) * secretU64(u64(4))
+    h8 = h8 + (x25519M(f2, f6) + x25519M(f2, f6))
+    h8 = h8 + x25519M(f3, f5) * secretU64(u64(4))
+    h8 = h8 + x25519M(f4, f4)
+    h8 = h8 + x25519M(f9, f9) * secretU64(u64(38))
+    x25519Store64(t + 64, h8)
+    var h9 = (x25519M(f0, f9) + x25519M(f0, f9))
+    h9 = h9 + (x25519M(f1, f8) + x25519M(f1, f8))
+    h9 = h9 + (x25519M(f2, f7) + x25519M(f2, f7))
+    h9 = h9 + (x25519M(f3, f6) + x25519M(f3, f6))
+    h9 = h9 + (x25519M(f4, f5) + x25519M(f4, f5))
+    x25519Store64(t + 72, h9)
+}
+
+/** `out` = `a` * `a`, as x25519FMul(out, a, a, t) but with the dedicated products (on Xtensa, where the products are loops, the same call). */
+@noinline trusted fun x25519FSquare(out: int, a: int, t: int): void {
+    if (simdTargetArch() == SIMD_ARCH_XTENSA) x25519FProducts(t, a, a) else x25519FSquareProducts(t, a)
+    x25519FFinish(out, t)
+}
+
+/** `out` = `a` * `b` (elements; `out` may be either); `t` has 80 bytes of scratch. The sums of products and the carries are out of line,
+ *  so that the registers of a caller are not the ones of twenty limbs (see x25519FSquareTimes). */
+@inline trusted fun x25519FMulBody(out: int, a: int, b: int, t: int): void {
+    x25519FProducts(t, a, b)
+    x25519FFinish(out, t)
+}
+
+/** `out` = `a` * 121665, the curve constant (A - 2) / 4. */
+@inline trusted fun x25519FMulConstantBody(out: int, a: int, t: int): void {
+    val k = secretU64(u64(121665))
+    for (i in 0 until 10) x25519Store64(t + i * 8, x25519Load(a + i * 4).widen() * k)
+    x25519FFinish(out, t)
+}
+/** One pass of carries over the ten limbs at `a`: each limb keeps its 26 or 25 bits and the carry goes up, the one out of limb 9
+ *  coming back into limb 0 times 19. Limbs of up to 2^28 leave below 2^26 + 19 * 2^3 or so. */
+@inline trusted fun x25519FWeak(a: int): void {
+    for (i in 0 until 9) {
+        val bits = 26 - (i & 1)
+        val limb = x25519Load(a + i * 4)
+        x25519Store(a + i * 4, limb & secretU32(u32((1 << bits) - 1)))
+        x25519Store(a + (i + 1) * 4, x25519Load(a + (i + 1) * 4) + (limb >> bits))
+    }
+    val top = x25519Load(a + 36)
+    x25519Store(a + 36, top & secretU32(u32(33554431)))
+    x25519Store(a, x25519Load(a) + (top >> 25) * secretU32(u32(19)))
+}
+
+/** `out` = `a` + `b`, limb by limb: limbs below 2^27 from results of the other operations. */
+@inline trusted fun x25519FAddBody(out: int, a: int, b: int): void {
+    for (i in 0 until 10) x25519Store(out + i * 4, x25519Load(a + i * 4) + x25519Load(b + i * 4))
+}
+
+/** `out` = `a` - `b`, as `a` + 2p - `b` limb by limb (2p's limbs are above those of a result), then a pass of carries so that
+ *  the next multiplication finds limbs near 2^26. */
+@inline trusted fun x25519FSubBody(out: int, a: int, b: int): void {
+    for (i in 0 until 10) {
+        val bias = if (i == 0) 134217690 else if ((i & 1) == 0) 134217726 else 67108862
+        x25519Store(out + i * 4, x25519Load(a + i * 4) + secretU32(u32(bias)) - x25519Load(b + i * 4))
+    }
+    x25519FWeak(out)
+}
+
+/** Swaps the elements at `a` and `b` where `mask` has ones. */
+@inline trusted fun x25519FSwapBody(mask: secretU32, a: int, b: int): void {
+    for (i in 0 until 10) {
+        val x = x25519Load(a + i * 4)
+        val y = x25519Load(b + i * 4)
+        val difference = (x ^ y) & mask
+        x25519Store(a + i * 4, x ^ difference)
+        x25519Store(b + i * 4, y ^ difference)
+    }
+}
+
+/// Writes the field product of two ten-limb elements to `out`, using 80 bytes at `t` for scratch.
+@noinline trusted fun x25519FMul(out: int, a: int, b: int, t: int): void = x25519FMulBody(out, a, b, t)
+/// Writes the field sum of two ten-limb elements to `out`.
+@noinline trusted fun x25519FAdd(out: int, a: int, b: int): void = x25519FAddBody(out, a, b)
+/// Writes the field difference `a - b` of two ten-limb elements to `out`.
+@noinline trusted fun x25519FSub(out: int, a: int, b: int): void = x25519FSubBody(out, a, b)
+/// Writes the ten-limb field product of `a` and the curve constant 121665 to `out`, using `t` as scratch.
+@noinline trusted fun x25519FMulConstant(out: int, a: int, t: int): void = x25519FMulConstantBody(out, a, t)
+/// Swaps two ten-limb elements in place under an all-ones mask and leaves them in place under a zero mask.
+@noinline trusted fun x25519FSwap(mask: secretU32, a: int, b: int): void = x25519FSwapBody(mask, a, b)
+
+/// Copies ten limbs from `from` to `to` in increasing address order.
+@noinline trusted fun x25519FCopy(to: int, from: int): void {
+    for (i in 0 until 10) x25519Store(to + i * 4, x25519Load(from + i * 4))
+}
+// The inverse and the squarings call the multiplication out of line (and its sums of products and carries are separate calls too): twenty limbs in registers would spill the pointers of the caller, which the checker
+// then reads back after each call as unknown memory (the AArch64 read of ct_x25519_invert said so).
+
+/// Squares the ten-limb field element in place `count` times, using `t` as scratch.
+@noinline trusted fun x25519FSquareTimes(a: int, count: int, t: int): void {
+    for (i in 0 until count) x25519FSquare(a, a, t)
+}
+
+/** `out` = `z` ^ (p - 2), the inverse (zero for zero): the chain of x25519Invert. `f` has four elements of scratch. */
+@noinline trusted fun x25519FInvert(out: int, z: int, f: int, t: int): void {
+    val t0 = f
+    val t1 = f + 40
+    val t2 = f + 80
+    val t3 = f + 120
+    x25519FSquare(t0, z, t)                  // z^2
+    x25519FCopy(t1, t0)
+    x25519FSquareTimes(t1, 2, t)                 // z^8
+    x25519FMul(t1, z, t1, t)                 // z^9
+    x25519FMul(t0, t0, t1, t)                // z^11
+    x25519FMul(t2, t0, t0, t)                // z^22
+    x25519FMul(t1, t1, t2, t)                // z^(2^5 - 1)
+    x25519FCopy(t2, t1)
+    x25519FSquareTimes(t2, 5, t)
+    x25519FMul(t1, t2, t1, t)                // z^(2^10 - 1)
+    x25519FCopy(t2, t1)
+    x25519FSquareTimes(t2, 10, t)
+    x25519FMul(t2, t2, t1, t)                // z^(2^20 - 1)
+    x25519FCopy(t3, t2)
+    x25519FSquareTimes(t3, 20, t)
+    x25519FMul(t2, t3, t2, t)                // z^(2^40 - 1)
+    x25519FSquareTimes(t2, 10, t)
+    x25519FMul(t1, t2, t1, t)                // z^(2^50 - 1)
+    x25519FCopy(t2, t1)
+    x25519FSquareTimes(t2, 50, t)
+    x25519FMul(t2, t2, t1, t)                // z^(2^100 - 1)
+    x25519FCopy(t3, t2)
+    x25519FSquareTimes(t3, 100, t)
+    x25519FMul(t2, t3, t2, t)                // z^(2^200 - 1)
+    x25519FSquareTimes(t2, 50, t)
+    x25519FMul(t1, t2, t1, t)                // z^(2^250 - 1)
+    x25519FSquareTimes(t1, 5, t)
+    x25519FMul(out, t1, t0, t)               // z^(2^255 - 21)
+}
+
+/** Carries up through the limbs without wrapping: the top limb keeps what it gets. */
+@inline trusted fun x25519FChain(a: int): void {
+    for (i in 0 until 9) {
+        val bits = 26 - (i & 1)
+        val limb = x25519Load(a + i * 4)
+        x25519Store(a + i * 4, limb & secretU32(u32((1 << bits) - 1)))
+        x25519Store(a + (i + 1) * 4, x25519Load(a + (i + 1) * 4) + (limb >> bits))
+    }
+}
+
+/** The element at `a` reduced to its one value below p = 2^255 - 19, as 32 bytes at `out`. `s` and `t` are elements of scratch. */
+@noinline trusted fun x25519FPack(out: int, a: int, s: int, t: int): void {
+    x25519FCopy(s, a)
+    // Four passes bring every limb to its width and the value below 2^255 (a carry out of limb 9 comes back as 19 times it).
+    for (pass in 0 until 4) x25519FWeak(s)
+    // Subtract p when the value is at least p: that is when adding 19 reaches 2^255.
+    x25519FCopy(t, s)
+    x25519Store(t, x25519Load(t) + secretU32(u32(19)))
+    x25519FChain(t)
+    val reaches = ctFromLowBit(x25519Load(t + 36) >> 25)
+    x25519Store(s, x25519Load(s) + (secretU32(u32(19)) & reaches))
+    x25519FChain(s)
+    x25519Store(s + 36, x25519Load(s + 36) & secretU32(u32(33554431)))
+    // The 255 bits as 32 bytes: an accumulator takes each limb at its bit offset and gives up a byte whenever it holds eight bits.
+    var accumulated = secretU64(u64(0))
+    var held = 0
+    var written = 0
+    for (i in 0 until 10) {
+        accumulated = accumulated | (x25519Load(s + i * 4).widen() << held)
+        held = held + 26 - (i & 1)
+        while (held >= 8) {
+            ablaUnsafeStoreU8(x25519Pointer(out + written), int((accumulated & secretU64(u64(255))).low().declassify()))
+            accumulated = accumulated >> 8
+            held = held - 8
+            written = written + 1
+        }
+    }
+    ablaUnsafeStoreU8(x25519Pointer(out + written), int(accumulated.low().declassify()))
+}
+
+/** The 32 bytes at `bytes` as an element at `out`, the top bit dropped (RFC 7748 section 5): limb i is bits ceil(25.5 i) up. */
+@noinline trusted fun x25519FUnpack(out: int, bytes: int): void {
+    for (i in 0 until 10) {
+        val offset = (51 * i + 1) / 2
+        val width = 26 - (i & 1)
+        val first = offset >> 3
+        var gathered = secretU64(u64(0))
+        for (j in 0 until 5) {
+            if (first + j < 32) gathered = gathered | (secretU32(u32(ablaUnsafeLoadU8(x25519Pointer(bytes + first + j)))).widen() << (8 * j))
+        }
+        x25519Store(out + i * 4, ((gathered >> (offset & 7)) & secretU64(u64((1 << width) - 1))).low())
+    }
+}
+
+// The work area one scalar multiplication takes. All of it is secret memory.
+//   +0     the clamped scalar, 32 bytes
+//   +64    the point's u coordinate as given, 32 bytes
+//   +128   u (an element), then x1, x2, z2, x3, z3, A, AA, B, BB, E, C, D, DA, CB, tmp: fifteen elements of 40 bytes (+192 to +792)
+//   +800   the inverse's four elements (to +960)
+//   +960   the pack's two scratch elements (to +1040)
+//   +1040  the result, 32 bytes
+//   +1088  the multiplication's scratch: ten sums of products of 8 bytes (to +1168)
+fun x25519WorkSize(): int = 1168
+
+/** The Montgomery ladder of RFC 7748 section 5, 255 steps from bit 254 down, on the clamped scalar at `work` and the point at
+ *  `work + 128`, leaving x2 and z2 at `work + 232` and `work + 272`. */
+@noinline trusted fun x25519Ladder(work: int): void {
+    val k = work
+    val u = work + 128
+    val x1 = work + 192
+    val x2 = x1 + 40
+    val z2 = x1 + 80
+    val x3 = x1 + 120
+    val z3 = x1 + 160
+    val a = x1 + 200
+    val aa = x1 + 240
+    val b = x1 + 280
+    val bb = x1 + 320
+    val ee = x1 + 360
+    val c = x1 + 400
+    val d = x1 + 440
+    val da = x1 + 480
+    val cb = x1 + 520
+    val tmp = x1 + 560
+    val t = work + 1088
+    x25519FCopy(x1, u)
+    x25519FCopy(x3, u)
+    for (i in 0 until 10) {
+        x25519Store(x2 + i * 4, secretU32(u32(if (i == 0) 1 else 0)))
+        x25519Store(z2 + i * 4, secretU32(u32(0)))
+        x25519Store(z3 + i * 4, secretU32(u32(if (i == 0) 1 else 0)))
+    }
+    var swap = secretU32(u32(0))
+    for (step in 0 until 255) {
+        val position = 254 - step
+        val bit = (secretU32(u32(ablaUnsafeLoadU8(x25519Pointer(k + (position >> 3))))) >> (position & 7)) &
+            secretU32(u32(1))
+        swap = swap ^ bit
+        val mask = ctFromLowBit(swap)
+        x25519FSwap(mask, x2, x3)
+        x25519FSwap(mask, z2, z3)
+        swap = bit
+        x25519FAdd(a, x2, z2)
+        x25519FSquare(aa, a, t)
+        x25519FSub(b, x2, z2)
+        x25519FSquare(bb, b, t)
+        x25519FSub(ee, aa, bb)
+        x25519FAdd(c, x3, z3)
+        x25519FSub(d, x3, z3)
+        x25519FMul(da, d, a, t)
+        x25519FMul(cb, c, b, t)
+        x25519FAdd(tmp, da, cb)
+        x25519FSquare(x3, tmp, t)
+        x25519FSub(tmp, da, cb)
+        x25519FSquare(tmp, tmp, t)
+        x25519FMul(z3, x1, tmp, t)
+        x25519FMul(x2, aa, bb, t)
+        x25519FMulConstant(tmp, ee, t)
+        x25519FAdd(tmp, aa, tmp)
+        x25519FMul(z2, ee, tmp, t)
+    }
+    val mask = ctFromLowBit(swap)
+    x25519FSwap(mask, x2, x3)
+    x25519FSwap(mask, z2, z3)
+}
+
+/** The scalar (32 bytes at `work`, as given) times the point (32 bytes at `work + 64`, as given), result at `work + 1040`:
+ *  clamps the scalar, drops the point's top bit, runs the ladder and multiplies by the inverse of z2. */
+@noinline trusted fun x25519Compute(work: int): void {
+    val k = work
+    x25519FUnpack(work + 128, work + 64)
+    // Clamp the scalar: the low three bits clear, bit 255 clear and bit 254 set.
+    val first = secretU32(u32(ablaUnsafeLoadU8(x25519Pointer(k))))
+    ablaUnsafeStoreU8(x25519Pointer(k), int((first & secretU32(u32(248))).declassify()))
+    val last = secretU32(u32(ablaUnsafeLoadU8(x25519Pointer(k + 31))))
+    ablaUnsafeStoreU8(x25519Pointer(k + 31), int(((last & secretU32(u32(127))) | secretU32(u32(64))).declassify()))
+    x25519Ladder(work)
+    val x2 = work + 232
+    val z2 = work + 272
+    x25519FInvert(z2, z2, work + 800, work + 1088)
+    x25519FMulBody(x2, x2, z2, work + 1088)
+    x25519FPack(work + 1040, x2, work + 960, work + 1000)
+}
+
+/** All ones when the 32 bytes at `address` are all zero, else zero. */
+@noinline trusted fun x25519IsZero(address: int): secretU32 {
+    var accumulated = secretU32(u32(0))
+    for (i in 0 until 32) accumulated = accumulated | secretU32(u32(ablaUnsafeLoadU8(x25519Pointer(address + i))))
+    ctIsZero(accumulated)
+}
+// END X25519 SECRET CORE
+
+private trusted fun x25519Wipe(address: int, size: int): void {
+    for (at in 0 until size) ablaUnsafeVolatileStoreU8(address + at, 0)
+}
+
+private @noinline trusted fun x25519Work(scalar: string, point: string): CryptoResult {
+    val work = cryptoAllocate(x25519WorkSize())
+    x25519Wipe(work, x25519WorkSize())
+    ablaUnsafeCopyMemory(work, ablaUnsafeStringAddress(scalar), 32)
+    ablaUnsafeCopyMemory(work + 64, ablaUnsafeStringAddress(point), 32)
+    x25519Compute(work)
+    val zero = x25519IsZero(work + 1040).declassify() != u32(0)
+    var result = cryptoFailed("x25519: the shared secret is all zero (a point of small order)")
+    if (!zero) {
+        val bytes: array<int> = []
+        for (i in 0 until 32) bytes.append(ablaUnsafeLoadU8(ablaUnsafePointerOffset(ablaUnsafeNullPointer(), work + 1040 + i)))
+        result = CryptoResult(cryptoByteString(bytes), true, "")
+    }
+    x25519Wipe(work, x25519WorkSize())
+    ablaUnsafeFree(ablaUnsafePointerOffset(ablaUnsafeNullPointer(), work))
+    result
+}
+
+private fun x25519BasePoint(): string {
+    val bytes: array<int> = [9]
+    for (i in 1 until 32) bytes.append(0)
+    cryptoByteString(bytes)
+}
+
+/** The X25519 function (RFC 7748 section 5): `scalar` times `point`, both 32 bytes, the result 32 bytes. For a
+ *  key agreement, `scalar` is your private key and `point` the peer's public key. `ok` is false for a wrong length,
+ *  and for an all-zero result. */
+fun x25519(scalar: string, point: string): CryptoResult {
+    if (scalar.size != 32) return cryptoFailed("x25519: the scalar is 32 bytes")
+    if (point.size != 32) return cryptoFailed("x25519: the point is 32 bytes")
+    val result = x25519Work(scalar, point)
+    ctScrubStack2048()
+    return result
+}
+
+/** The public key of a private key: x25519 of it and the base point 9. */
+fun x25519PublicKey(scalar: string): CryptoResult = x25519(scalar, x25519BasePoint())

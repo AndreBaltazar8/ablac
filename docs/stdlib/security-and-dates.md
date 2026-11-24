@@ -98,7 +98,7 @@ point at or above 2^255 - 19 is taken mod p, as the RFC says.
 It is constant-time: the Montgomery ladder runs its 255 steps and swaps by a mask on every bit, the field arithmetic
 (32 limbs of 8 bits in `secretU32`, so nothing wider than 32 bits is needed on any target) has no branch, memory index or
 division on a value, and the inverse is Fermat's. `tools/test-ct.sh` reads the core (`BEGIN X25519 SECRET CORE` in
-`abla/crypto/x25519/entry.ab`) on x86-64, AArch64, Wasm and Xtensa, with deliberate leaks that it has to catch. The wrapper wipes its
+`abla/crypto/x25519/core.ab`) on x86-64, AArch64, Wasm and Xtensa, with deliberate leaks that it has to catch. The wrapper wipes its
 memory and the stack below it (2,048 bytes) after each call, and nothing else (the scalar a caller holds in a string stays
 there). Speed: about 1.4 ms per product on a current x86-64 core. Tested against RFC 7748 (section 5.2's two vectors, the
 iterated function after 1, 1,000 and, with `X25519_MILLION=1`, 1,000,000 rounds; section 6.1's Alice and Bob), the
@@ -182,7 +182,7 @@ the public key and R are public.
 Constant-time: the scalar multiplications that take a secret run 256 steps of a doubling, an addition (the unified,
 complete Edwards formula) and a masked select of the whole point, and the arithmetic modulo L is bit by bit with masked
 selects, so no branch, memory index or division depends on a secret. `tools/test-ct.sh` reads the core (`BEGIN ED25519
-SECRET CORE` in `abla/crypto/ed25519/entry.ab`) on x86-64, AArch64, Wasm and Xtensa, with deliberate leaks it has to catch.
+SECRET CORE` in `abla/crypto/ed25519/core.ab`) on x86-64, AArch64, Wasm and Xtensa, with deliberate leaks it has to catch.
 What it does not cover: the SHA-512 over strings (the seed's hash and the nonce's pass through ordinary strings, which
 are not wiped) and, as for X25519, a seed the caller holds in a string. Verification uses the same constant-time code for
 both products, so it is not faster than signing. Speed: about 8 ms to sign and 8 ms to verify on a current x86-64 core (a whole process run).

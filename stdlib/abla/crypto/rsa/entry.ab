@@ -480,7 +480,7 @@ trusted fun rsaPrivateOperation(key: RsaPrivateKey, value: string): CryptoResult
 
 /** A random factor and its inverse, without inverting anything secret: r * t, with t random, is what gets
  *  inverted, in variable time, and then r^-1 = (r * t)^-1 * t. False if there's no randomness. */
-trusted fun rsaBlindingFactors(key: RsaPrivateKey, modulus: BnModulus, factor: int,
+private trusted fun rsaBlindingFactors(key: RsaPrivateKey, modulus: BnModulus, factor: int,
     inverse: int): bool {
     val nWords = modulus.words
     val mask = bnAllocate(nWords)
@@ -527,16 +527,6 @@ private trusted fun rsaPublicLimbs(address: int, words: int): array<int> {
 }
 
 
-// Returns a bignum modulus from the specified readable limbs and clears the temporary byte encoding.
-trusted fun rsaModulusFromLimbs(limbs: int, words: int): BnModulus {
-    val bytes = nativeByteBuffer(words * 4 + 1)
-    val address = ablaUnsafePointerAddress(bytes.pointerAt(0))
-    bnToBytes(address, words * 4, limbs)
-    val modulus = bnModulusFrom(address, words * 4, words)
-    for (at in 0 until words * 4) ablaUnsafeStoreU8(bnPointer(address + at), 0)
-    bytes.close()
-    modulus
-}
 
 
 // --- EMSA-PKCS1-v1_5 --------------------------------------------------------------------------
@@ -701,44 +691,7 @@ fun RsaPublicKey.encryptPkcs1Legacy(plaintext: string): CryptoResult {
             "")
 }
 
-// The delimiter and validity remain secret until the whole block has been inspected.
-// A zero result means invalid; valid delimiters are at least byte 10.
-@inline trusted fun rsaPkcs1Delimiter(address: int, size: int): secretU32 {
-    var good = ctEq(secretU32(u32(ablaUnsafeLoadU8(bnPointer(address)))), secretU32(u32(0)))
-    good = good & ctEq(secretU32(u32(ablaUnsafeLoadU8(bnPointer(address + 1)))), secretU32(u32(2)))
-    var seen = secretU32(u32(0))
-    var delimiter = secretU32(u32(0))
-    for (i in 2 until size) {
-        val zero = ctIsZero(secretU32(u32(ablaUnsafeLoadU8(bnPointer(address + i)))))
-        delimiter = ctSelect(zero & ~seen, secretU32(u32(i)), delimiter)
-        seen = seen | zero
-    }
-    good = good & seen & ~ctLt(delimiter, secretU32(u32(10)))
-    ctSelect(good, delimiter, secretU32(u32(0)))
-}
 
-// `block` is OAEP DB; `expected` is lHash. Inspect every byte before revealing validity.
-@inline trusted fun rsaOaepDelimiter(block: int, size: int, expected: int, hashSize: int,
-    first: u8): secretU32 {
-    var difference = secretU32(u32(first))
-    for (i in 0 until hashSize) {
-        difference = difference | (secretU32(u32(ablaUnsafeLoadU8(bnPointer(block + i)))) ^
-            secretU32(u32(ablaUnsafeLoadU8(bnPointer(expected + i)))))
-    }
-    var seen = secretU32(u32(0))
-    var bad = secretU32(u32(0))
-    var delimiter = secretU32(u32(0))
-    for (i in hashSize until size) {
-        val byte = secretU32(u32(ablaUnsafeLoadU8(bnPointer(block + i))))
-        val zero = ctIsZero(byte)
-        val one = ctEq(byte, secretU32(u32(1)))
-        bad = bad | (~seen & ~(zero | one))
-        delimiter = ctSelect(one & ~seen, secretU32(u32(i)), delimiter)
-        seen = seen | one
-    }
-    val good = ctIsZero(difference) & ctIsZero(bad) & seen
-    ctSelect(good, delimiter, secretU32(u32(0)))
-}
 
 private val RSA_DECRYPT_FAILED = "RSA decryption failed"
 
@@ -819,38 +772,7 @@ fun rsaImplicitPrf(kdk: string, label: string, size: int): string {
     output.slice(0, size)
 }
 
-// Choose the last of 128 in-range lengths, without revealing which one qualified.
-@inline trusted fun rsaImplicitLength(candidates: int, size: int): secretU32 {
-    val limit = size - 10
-    var mask = limit
-    mask = mask | (mask >> 1)
-    mask = mask | (mask >> 2)
-    mask = mask | (mask >> 4)
-    mask = mask | (mask >> 8)
-    var chosen = secretU32(u32(0))
-    for (i in 0 until 128) {
-        val high = secretU32(u32(ablaUnsafeLoadU8(bnPointer(candidates + i * 2))))
-        val low = secretU32(u32(ablaUnsafeLoadU8(bnPointer(candidates + i * 2 + 1))))
-        val candidate = ((high << 8) | low) & secretU32(u32(mask))
-        chosen = ctSelect(ctLt(candidate, secretU32(u32(limit))), candidate, chosen)
-    }
-    chosen
-}
 
-// Read both complete blocks and select every byte before releasing the resulting length.
-@inline trusted fun rsaImplicitSelect(out: int, encoded: int, synthetic: int, size: int,
-    syntheticLength: secretU32): secretU32 {
-    val delimiter = rsaPkcs1Delimiter(encoded, size)
-    val good = ctIsNonZero(delimiter)
-    val start = ctSelect(good, delimiter + secretU32(u32(1)),
-        secretU32(u32(size)) - syntheticLength)
-    for (i in 0 until size) {
-        val actual = secretU32(u32(ablaUnsafeLoadU8(bnPointer(encoded + i))))
-        val fake = secretU32(u32(ablaUnsafeLoadU8(bnPointer(synthetic + i))))
-        ablaUnsafeStoreU8(bnPointer(out + i), int(ctSelect(good, actual, fake).declassify()))
-    }
-    start
-}
 
 /** RSAES-PKCS1-v1_5 with deterministic implicit rejection. Successful output still needs protocol validation. */
 trusted fun RsaPrivateKey.decryptPkcs1Legacy(ciphertext: string): CryptoResult {

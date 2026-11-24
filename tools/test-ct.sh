@@ -41,17 +41,15 @@ sed -n '/^\/\/ BEGIN BIGNUM CHECKED CORES$/,/^\/\/ END BIGNUM CHECKED CORES$/p' 
 sed -n '/^\/\/ BEGIN PBE SECRET CORES$/,/^\/\/ END PBE SECRET CORES$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN P256 SECRET CORES$/,/^\/\/ END P256 SECRET CORES$/p' stdlib/abla/crypto/p256/core.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN PBE OWNER WIPE$/,/^\/\/ END PBE OWNER WIPE$/p' stdlib/abla/crypto/pbe/entry.ab >> "$cases/fixture.ab"
-sed -n '/^\/\/ BEGIN X25519 SECRET CORE$/,/^\/\/ END X25519 SECRET CORE$/p' stdlib/abla/crypto/x25519/entry.ab >> "$cases/fixture.ab"
-sed -n '/^\/\/ BEGIN ED25519 SECRET CORE$/,/^\/\/ END ED25519 SECRET CORE$/p' stdlib/abla/crypto/ed25519/entry.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN X25519 SECRET CORE$/,/^\/\/ END X25519 SECRET CORE$/p' stdlib/abla/crypto/x25519/core.ab >> "$cases/fixture.ab"
+sed -n '/^\/\/ BEGIN ED25519 SECRET CORE$/,/^\/\/ END ED25519 SECRET CORE$/p' stdlib/abla/crypto/ed25519/core.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN SHA3 SECRET CORE$/,/^\/\/ END SHA3 SECRET CORE$/p' stdlib/abla/crypto/sha3/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN MLKEM SECRET CORE$/,/^\/\/ END MLKEM SECRET CORE$/p' stdlib/abla/crypto/mlkem/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN P384 SECRET CORES$/,/^\/\/ END P384 SECRET CORES$/p' stdlib/abla/crypto/p384/core.ab >> "$cases/fixture.ab"
 # Source-generated coverage for loops around the previously checked primitives.
 # No production edits or call exemptions: see generator's scope guards.
 # The AES functions that touch a key, as written (their allocating wrappers stay outside, see the generator).
-sed -n '/^\/\/ BEGIN AES KEY EXPANSION$/,/^\/\/ END AES KEY EXPANSION$/p' stdlib/abla/crypto/aes/entry.ab >> "$cases/fixture.ab"
-# aesWipe is in the library's internal file for the AES calls that take an address; the owner-wipe check reads it as written.
-sed -n '/^trusted fun aesWipe(/,/^}/p' stdlib/abla/crypto/aes/raw.ab >> "$cases/fixture.ab"
+# The AES key expansion and the wipe come from the library's internal aes/raw.ab, which the fixture imports (--stdlib-internals); the generator reads the same text.
 sed -n '/^\/\/ BEGIN CHACHA20 POLY1305 SECRET CORES$/,/^\/\/ END CHACHA20 POLY1305 SECRET CORES$/p' stdlib/abla/crypto/chacha20poly1305/entry.ab >> "$cases/fixture.ab"
 sed -n '/^\/\/ BEGIN SHA2 SECRET CORES$/,/^\/\/ END SHA2 SECRET CORES$/p' stdlib/abla/crypto/entry.ab >> "$cases/fixture.ab"
 "$tools_out/source-fixtures" "$project_root" "$cases/crypto-generated.ab"

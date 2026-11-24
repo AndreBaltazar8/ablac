@@ -11,7 +11,7 @@ rm -rf "$out"
 mkdir -p "$out"
 cd "$root"
 for mode in release fast; do
-    flags=(--no-cache)
+    flags=(--no-cache --stdlib-internals)
     [[ $mode == fast ]] && flags+=(--fast)
     "$compiler" build tests/cases/sha3-fast/reference.ab -o "$out/reference.$mode" "${flags[@]}"
     result=$("$root/tools/run-limited.sh" "$out/reference.$mode") || { echo "sha3-fast reference ($mode): $result" >&2; exit 1; }

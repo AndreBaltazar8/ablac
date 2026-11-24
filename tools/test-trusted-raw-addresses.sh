@@ -1,47 +1,67 @@
 #!/usr/bin/env bash
 # The trusted contract (docs/language.md, "Trusted native implementations") puts the safety argument inside a `trusted` function, so its callers stay
-# safe for any arguments. A public `trusted fun` that takes a raw address as an integer cannot make that argument: safe code could import and call it
-# (`aesWipe(16, 8)` wrote to address 16; #1139 area 7). The standard library therefore keeps such functions out of its public modules: `private`
-# when nothing outside the file calls them, and else in a file of the module that is not its entry (`// public: none`, docs/language.md: a name
-# from such a file is internal, no import makes it visible, and the error names the public surface). This test lists every `trusted fun` in an
-# ENTRY file of the library (outside abla/unsafe, abla/runtime and abla/sys) with an integer parameter named like an address, a pointer or a work
-# area, and compares the list with tools/trusted-raw-addresses.txt, the named exceptions: a new public one fails (take the address as a NativeBuffer
-# or a pointer type, make the function private, or move it to an internal file of its module), and so does an exception that is gone.
-# Exceptions (each needs its reason here):
-#   bnDecode, bnEncode, bnEqual, bnLessPublic, bnRelease (abla/crypto/bignum): the big-number engine works on raw work areas. No checked form
-#       exists yet (a BigNumber type is for André to decide) and abla-blockchain's wallet uses it; the module's header says it is not a safe API.
-#   tlsControlInt, tlsControlPointer, tlsCloseHandle (abla/tls/hosted): read a field of, or close, the control block a TLS connection's `handle` names. NovaKind and
-#       abla-postgres, abla-s3 and the crew plugin call them with the handle of a connection of their own; a checked form would need a registry of live handles.
-#   ablaCtBridgeArgHandle (abla/compiler/bridge): `handle` indexes the compiler's table of compile-time objects, and the host refuses one that
-#       is not in it (tests/cases/ct-bridge/invalid-arguments.ab): it is no address.
-# Usage: tools/test-trusted-raw-addresses.sh        (regenerate the list: tools/test-trusted-raw-addresses.sh --update)
+# safe for any arguments. A public `trusted` function that takes an address as an integer or a pointer cannot make that argument: safe code could import
+# and call it (`aesWipe(16, 8)` wrote to address 16; #1139 area 7). The standard library therefore keeps such functions out of its public modules:
+# `private` when nothing outside the file calls them, and else in a file of the module that is not its entry (`// public: none`, docs/language.md: a name
+# from such a file is internal, no import makes it visible, in strict and flat modules alike).
+# This test lists every public `trusted` function (any attributes, any name, signature over several lines too) of an ENTRY file of the library (outside
+# abla/unsafe, abla/runtime and abla/sys) with an int or a pointer parameter, and compares the list with tools/trusted-address-review.tsv, which classes each:
+#   a  not an address: a count, a flag, an offset the callee bounds, a descriptor, an index the host validates (the reason is in the table);
+#   c  an address with no safe alternative, a named exception: the bignum engine (needs the BigNumber API), the hosted TLS handle calls (need a registry
+#      of live handles), each with a "not a safe API" doc line;
+#   b  (the table keeps them for the record) an address with a safe alternative: must NOT be public.
+# A new public function that takes an int or a pointer fails until it is added to the table with its class; an (a) or (c) row whose function is gone fails
+# (drop the row); a (b) row that is public again fails.
+# Usage: tools/test-trusted-raw-addresses.sh
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
-list=tools/trusted-raw-addresses.txt
+table=tools/trusted-address-review.tsv
 out=build/trusted-raw-addresses
 mkdir -p "$out"
-names='address|pointer|ptr|memory|handle|work|out|input|output|table|buffer|src|dst|source|destination|f|m|a|b|p|q|base|state|key|curve'
 export LC_ALL=C
-grep -rEn "^trusted fun [A-Za-z0-9_.]+\(.*\b($names): int\b" stdlib --include='entry.ab' \
-    --exclude-dir=unsafe --exclude-dir=runtime --exclude-dir=sys |
-    sed -E 's|^stdlib/([^:]+):[0-9]+:trusted fun ([A-Za-z0-9_.]+)\(.*|\1 \2|' | sort -u > "$out/current.txt"
-if [[ ${1:-} == --update ]]; then
-    cp "$out/current.txt" "$list"
-    echo "trusted raw addresses: $(wc -l < "$list") entries written to $list"
-    exit 0
+git ls-files 'stdlib/*entry.ab' | grep -vE '^stdlib/abla/(unsafe|runtime|sys)/' | sort | while IFS= read -r file; do
+    awk -v file="$file" '
+        function flush(   params, depth, i, ch, p, n, hit, k) {
+            params = ""; depth = 0
+            for (i = 1; i <= length(sig); i++) {
+                ch = substr(sig, i, 1)
+                if (ch == "(") { depth++; if (depth == 1) continue }
+                if (ch == ")") { depth--; if (depth == 0) break }
+                if (depth >= 1) params = params ch
+            }
+            hit = (params ~ /:[ ]*int([^A-Za-z0-9_]|$)/) || (params ~ /:[ ]*[A-Za-z0-9_<>]+\*/)
+            if (hit) print file "\t" name
+        }
+        /^(@[A-Za-z]+(\([^)]*\))? )*(inline |noinline )?trusted( noescape)?( extern:"[a-z]+")? fun / {
+            line = $0
+            sub(/^(@[A-Za-z]+(\([^)]*\))? )*(inline |noinline )?trusted( noescape)?( extern:"[a-z]+")? fun /, "", line)
+            name = line; sub(/\(.*/, "", name)
+            sig = line; open = 1
+            if (balanced(sig)) { flush(); open = 0 }
+            next
+        }
+        open { sig = sig " " $0; if (balanced(sig)) { flush(); open = 0 } }
+        function balanced(s,   i, d, ch) { d = 0; for (i = 1; i <= length(s); i++) { ch = substr(s, i, 1); if (ch == "(") d++; if (ch == ")") d-- } return d == 0 && s ~ /\(/ }
+    ' "$file"
+done | sed -E 's|^stdlib/(abla/[^\t]*)/entry\.ab\t|\1\t|' | sort -u > "$out/current.tsv"
+awk -F'\t' 'NR > 1 && ($9 == "a" || $9 == "c") { print "abla/" $1 "\t" $2 }' "$table" | sort -u > "$out/allowed.tsv"
+awk -F'\t' 'NR > 1 && $9 == "b" { print "abla/" $1 "\t" $2 }' "$table" | sort -u > "$out/hidden.tsv"
+comm -13 "$out/allowed.tsv" "$out/current.tsv" > "$out/unlisted.tsv"
+comm -12 "$out/hidden.tsv" "$out/current.tsv" > "$out/leaked.tsv"
+comm -23 "$out/allowed.tsv" "$out/current.tsv" > "$out/gone.tsv"
+status=0
+if [[ -s $out/leaked.tsv ]]; then
+    echo "trusted raw addresses: these take an address, have a safe alternative (class b) and are public again; make them private or move them to the module's raw.ab:" >&2
+    cat "$out/leaked.tsv" >&2; status=1
 fi
-sort -c "$list"
-comm -13 "$list" "$out/current.txt" > "$out/new.txt"
-comm -23 "$list" "$out/current.txt" > "$out/resolved.txt"
-if [[ -s $out/new.txt ]]; then
-    echo "trusted raw addresses: a public trusted function that takes a raw address in an entry file (see the comment of this script):" >&2
-    cat "$out/new.txt" >&2
-    exit 1
+if [[ -s $out/unlisted.tsv ]]; then
+    echo "trusted raw addresses: a public trusted function with an int or pointer parameter that $table does not class (add a row: a = not an address, with why; or hide it):" >&2
+    cat "$out/unlisted.tsv" >&2; status=1
 fi
-if [[ -s $out/resolved.txt ]]; then
-    echo "trusted raw addresses: remove these resolved entries from $list:" >&2
-    cat "$out/resolved.txt" >&2
-    exit 1
+if [[ -s $out/gone.tsv ]]; then
+    echo "trusted raw addresses: rows of $table whose function is not public any more (drop them, or class them b):" >&2
+    cat "$out/gone.tsv" >&2; status=1
 fi
-echo "trusted raw addresses: $(wc -l < "$list") named exceptions, no other public trusted function of an entry file takes a raw address"
+((status == 0)) || exit 1
+echo "trusted raw addresses: $(wc -l < "$out/allowed.tsv") public functions with an int or pointer parameter, all classed (c: $(awk -F'\t' 'NR>1 && $9=="c"' "$table" | wc -l) named exceptions); none of the $(wc -l < "$out/hidden.tsv") that take an address with a safe alternative is public"
