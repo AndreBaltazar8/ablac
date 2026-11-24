@@ -235,7 +235,7 @@ and runs [test-windows-link.sh](../tools/test-windows-link.sh). Job
 crash program's access-violation report, its backtrace symbolized to file and
 line, the seven hosted programs in `tests/cases/windows/hosted` (hello,
 arguments, environment, files, processes, loopback sockets, threads; `--fast`
-and release) and the 78 standard-library programs listed in
+and release) and the 81 standard-library programs listed in
 [programs.txt](../tests/cases/windows/programs.txt) (collections, text, date,
 files, `homePath` (`USERPROFILE` where there is no `HOME`), process metrics (the runtime's system call 4008: working set, commit charge, the descriptor table's entries, the creation time; `tests/cases/windows/process-metrics.ab` is the module test without its `ulimit -n` shell), process exit, loopback HTTP and WebSocket, threads, ...). The Linux job
 leaves each image with the output and exit status the same program has built
@@ -268,7 +268,7 @@ for each shipped Windows zip. `windows: fixpoint` exercises it on demand.
 ARM64. Job `windows-arm64-cross` cross-builds hosted programs and
 `windows-arm64-run`, **Windows ARM64 program runtime**, runs the checked
 images on `windows-11-arm`. The same standard-library programs as on x64 (`tests/cases/windows/programs.txt`,
-`tools/test-windows-programs.sh <compiler> aarch64-windows`) are cross-built for ARM64 there: all 78 build, with the import allowlist and no C
+`tools/test-windows-programs.sh <compiler> aarch64-windows`) are cross-built for ARM64 there: all 81 build, with the import allowlist and no C
 runtime checked, and the runner runs them with `tools/windows/test-hosted.ps1` (the step reports and does not fail the job until the
 list has passed once on the runner; Wine has no ARM64, so nothing runs it before CI).
 
