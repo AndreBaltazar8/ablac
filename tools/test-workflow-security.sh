@@ -87,23 +87,38 @@ if [[ ${1:-} == --controls ]]; then
 ' | sed 's/run: test -z "$SOURCE_REF"/run: true/' > "$work/w/release.yml"
     if "$0" "$work/w" > "$work/out" 2>&1; then echo "workflow security control 'source_ref': accepted" >&2; exit 1; fi
     grep -q 'do not refuse source_ref' "$work/out" || { cat "$work/out" >&2; echo "workflow security control 'source_ref': wrong refusal" >&2; exit 1; }
-    # Evaluate the job's actual routing condition for the ARM64 fixed-point dispatch.
-    arm64_route=$(awk '
-        /^  windows-arm64:$/ { arm64=1; next }
-        arm64 && /^    if:/ { sub(/^    if: \$\{\{ /, ""); sub(/ \}\}$/, ""); print; exit }
-        arm64 && /^  [^ ]/ { exit }
-    ' "$root/.github/workflows/release.yml")
-    arm64_route=${arm64_route//inputs.windows_arm64/\'fixpoint\'}
-    arm64_route=${arm64_route//inputs.windows/\'with\'}
-    # Only the dispatch mode literals and comparison/boolean operators can reach eval.
-    syntax=$arm64_route
-    for mode in off with only fixpoint; do syntax=${syntax//\'$mode\'/}; done
-    route_operators='^[[:space:]()&|=!]+$'
-    if [[ ! $syntax =~ $route_operators ]] || ! eval "[[ $arm64_route ]]"; then
+    release_route() {
+        local name=$1 windows=$2 arm64=$3 ancestor=$4 route syntax literal
+        local operators='^[[:space:]()&|=!]+$'
+        route=$(awk -v name="$name" '
+            $0 == "  " name ":" { job=1; next }
+            job && /^    if:/ { sub(/^    if: \$\{\{ /, ""); sub(/ \}\}$/, ""); print; exit }
+            job && /^  [^ ]/ { exit }
+        ' "$root/.github/workflows/release.yml")
+        # GitHub inserts success() when the predicate has no status function.
+        if [[ $route != *'cancelled()'* && $route != *'failure()'* && $ancestor != success ]]; then
+            return 1
+        fi
+        route=${route//inputs.windows_arm64/"'$arm64'"}
+        route=${route//inputs.windows/"'$windows'"}
+        route=${route//'!cancelled()'/"('$ancestor' != 'cancelled')"}
+        route=${route//'!failure()'/"('$ancestor' != 'failure')"}
+        # Only known literals and comparison/boolean operators can reach eval.
+        syntax=$route
+        for literal in off with only fixpoint skipped success cancelled failure; do
+            syntax=${syntax//\'$literal\'/}
+        done
+        [[ $syntax =~ $operators ]] && eval "[[ $route ]]"
+    }
+    if ! release_route windows-arm64 with fixpoint success; then
         echo 'workflow control: windows_arm64=fixpoint did not select windows-arm64' >&2
         exit 1
     fi
-    echo 'workflow controls: security rules and ARM64 fixed-point routing passed'
+    if ! release_route static-suite with with skipped; then
+        echo 'workflow control: a skipped bridge suppressed the static suite for a full release' >&2
+        exit 1
+    fi
+    echo 'workflow controls: security rules and release routing passed'
     exit 0
 fi
 dir=${1:-$root/.github/workflows}
