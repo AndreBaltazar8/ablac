@@ -124,4 +124,11 @@ if (!document.symbols.some((symbol) => symbol.name === "Shape")) {
 }
 ' <<<"$rewrites"
 
-printf '%s\n' 'analysis service: protocol, overlays, UTF-8 spans, semantic calls/diagnostics, created documents, stale versions, build rewrites passed'
+
+# A long session, as abla-lsp's compiler integration test drives it (tests/cases/analysis-service/refactor-session, recorded from that test's own
+# requests: initialize in graph-v2, analyze, six refactor/validate, shutdown), its six validations repeated ANALYSIS_SESSION_ROUNDS times (default 10)
+# in the one session. The macOS lanes of ci.yml run that script directly (bash only, no node): the released v0.2.68 service died with SIGBUS in this session on both Macs
+# (found by abla-lsp's CI, not ours; #1207) while Linux answered it in 3 s. Every reply must come, each validation valid, the service exit 0.
+"$project_root/tools/test-analysis-refactor-session.sh" "$compiler" "${ANALYSIS_SESSION_ROUNDS:-10}"
+
+printf '%s\n' 'analysis service: protocol, overlays, UTF-8 spans, semantic calls/diagnostics, created documents, stale versions, build rewrites, a long refactor session passed'

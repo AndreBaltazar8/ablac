@@ -14,8 +14,9 @@ rounds=${2:-1}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 case_dir=tests/cases/analysis-service/refactor-session
-out=build/analysis-refactor-session
-rm -rf "$out"
+mkdir -p build
+out=$(mktemp -d build/analysis-refactor-session.XXXXXX)
+
 mkdir -p "$out/fixtures"
 fail() { echo "analysis-refactor-session: $1" >&2; exit 1; }
 cp "$case_dir/refactor.ab" "$case_dir/debug-app.ab" "$out/fixtures/"
@@ -50,4 +51,5 @@ while IFS= read -r reply; do
     fi
     id=$((id + 1))
 done < "$out/replies.jsonl"
+rm -rf "$out"
 echo "analysis-refactor-session: $requests requests ($rounds rounds of six validations) answered in $seconds s"
