@@ -24,6 +24,20 @@ ran=0
 skipped=0
 count=0
 runner=0
+# A program marked `wine` passes under Wine only: it is not left for the Windows runner (also when Wine is not installed here)...
+wine_only_finish() {
+    [[ $where == wine ]] || return 0
+        rm -f "$exe" "$out/$name.expected" "$out/$name.status"
+        # ... but a --backtrace build of it goes to build/windows-debug, and the Windows job runs that one and prints
+        # what happens to it (tools/windows/debug-programs.ps1: output, status, the symbolized stack of a crash).
+        mkdir -p build/windows-debug
+        "$compiler" build "$source" --target x86_64-windows-hosted -o "build/windows-debug/$name.exe" --fast --backtrace --no-cache \
+            > "build/windows-debug/$name.log" 2>&1 || { cat "build/windows-debug/$name.log" >&2; fail "$name did not build with --backtrace"; }
+        # --fast builds name the functions of a stack; a release one also has its file:line (<name>-release.exe.debug).
+        "$compiler" build "$source" --target x86_64-windows-hosted -o "build/windows-debug/$name-release.exe" --backtrace --no-cache \
+            > "build/windows-debug/$name-release.log" 2>&1 || { cat "build/windows-debug/$name-release.log" >&2; fail "$name did not build with --backtrace for release"; }
+        wineonly=$((wineonly + 1))
+}
 wineonly=0
 while read -r source status where; do
     [[ -z $source || $source == '#'* ]] && continue
@@ -56,25 +70,14 @@ while read -r source status where; do
     (cd "$out/$name.wine" && "$root/tools/windows/wine-run.sh" "$root/$exe" > "../$name.actual" 2> "../$name.err" < /dev/null) || code=$?
     if [[ $code == 125 ]]; then
         skipped=$((skipped + 1))
+        wine_only_finish
         continue
     fi
     [[ $code == "$status" ]] || { cat "$out/$name.err" >&2; fail "$name: exit status $code under Wine, expected $status"; }
     cmp -s "$out/$name.expected" "$out/$name.actual" ||
         { diff "$out/$name.expected" "$out/$name.actual" >&2 || true; fail "$name: the output under Wine differs from the native Linux run"; }
     ran=$((ran + 1))
-    # A program marked `wine` passes under Wine only: it is not left for the Windows runner.
-    if [[ $where == wine ]]; then
-        rm -f "$exe" "$out/$name.expected" "$out/$name.status"
-        # ... but a --backtrace build of it goes to build/windows-debug, and the Windows job runs that one and prints
-        # what happens to it (tools/windows/debug-programs.ps1: output, status, the symbolized stack of a crash).
-        mkdir -p build/windows-debug
-        "$compiler" build "$source" --target x86_64-windows-hosted -o "build/windows-debug/$name.exe" --fast --backtrace --no-cache \
-            > "build/windows-debug/$name.log" 2>&1 || { cat "build/windows-debug/$name.log" >&2; fail "$name did not build with --backtrace"; }
-        # --fast builds name the functions of a stack; a release one also has its file:line (<name>-release.exe.debug).
-        "$compiler" build "$source" --target x86_64-windows-hosted -o "build/windows-debug/$name-release.exe" --backtrace --no-cache \
-            > "build/windows-debug/$name-release.log" 2>&1 || { cat "build/windows-debug/$name-release.log" >&2; fail "$name did not build with --backtrace for release"; }
-        wineonly=$((wineonly + 1))
-    fi
+    wine_only_finish
 done < tests/cases/windows/programs.txt
 ((count > 0)) || fail 'tests/cases/windows/programs.txt lists no program'
 (cd "$out" && sha256sum -- ./*.exe ./*.expected ./*.status | sed 's|  \./|  |' > SHA256SUMS)
