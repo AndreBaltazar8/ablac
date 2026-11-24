@@ -687,8 +687,10 @@ private fun linuxForwardSlashes(text: string): string {
 // without following a link again: every directory of the path is opened from the root with openat and O_NOFOLLOW, and the last name is opened
 // or changed through the descriptor of its directory with O_NOFOLLOW or the *at calls. A link swapped in between the check and the use
 // then fails the operation (ELOOP, ENOTDIR) instead of leading out of the project. The operations are those of Path with the same results.
-// Only a relative path is walked (it is read against the working directory, which the system reports with no link in it); an absolute path,
-// and every path on a host whose raw calls are translated (Windows), is handed to the Path method as it is. Where the system does not
+// Only a relative path is walked (it is read against the working directory, which the system reports with no link in it); an absolute path is
+// handed to the Path method as it is. On Windows the runtime translates the same calls (abla/runtime/platform/windows: a name is opened from a held
+// directory handle and a reparse point is refused), from the root of the working directory's drive; a working directory on a network share (no drive)
+// and a system that cannot name a directory handle's path use the Path method too. Where the system does not
 // know openat (ENOSYS, asked once per process) the Path method is used too; no other error falls back.
 
 // A path that was resolved to the real one it names, used without following a link again: the operations of Path, walked from the root with O_NOFOLLOW.
@@ -698,14 +700,19 @@ class AnchoredPath(val text: string)
 private val anchoredLeafFlags = 655360
 private val anchoredDirectoryFlags = 720896
 
+// Whether `text` is an absolute path: it starts at the root (on Windows also with a drive, `C:`, or a backslash).
+private fun anchoredAbsolute(text: string): bool =
+    text.size > 0 && (text[0] == 47 || (pathHostIsWindows() && (text[0] == 92 || (text.size >= 2 && text[1] == 58))))
+
 // The directory names of the absolute path `text` reads against the working directory, "." and empty names left out.
 private fun anchoredNames(text: string): array<string> {
-    val whole = if (text.size > 0 && text[0] == 47) text else "${currentDirectory().text}/$text"
+    val whole = if (anchoredAbsolute(text)) text else "${currentDirectory().text}/$text"
+    val windows = pathHostIsWindows()
     val names: array<string> = []
     var begin = 0
     var index = 0
     while (index <= whole.size) {
-        if (index == whole.size || whole[index] == 47) {
+        if (index == whole.size || whole[index] == 47 || (windows && whole[index] == 92)) {
             val name = whole.slice(begin, index)
             if (name != "" && name != ".") names.append(name)
             begin = index + 1
@@ -718,8 +725,11 @@ private fun anchoredNames(text: string): array<string> {
 // The descriptor of the directory made of the first `count` names, each opened from the one before with O_NOFOLLOW (created with `mode` when
 // `create` and missing), or a negative errno.
 private fun anchoredOpenDirectory(names: array<string>, count: int, create: bool, mode: int): int {
-    var descriptor = linuxSyscall4(257, -100, nativeCStringAddress("/"), 589824, 0)
-    var index = 0
+    // The root: "/", or on Windows the working directory's drive (its first name, "C:"); a name that is no drive (a network share) is not walked.
+    val drive = pathHostIsWindows()
+    if (drive && (names.size == 0 || names[0].size != 2 || names[0][1] != 58)) return -38
+    var descriptor = linuxSyscall4(257, -100, nativeCStringAddress(if (drive) "${names[0]}/" else "/"), 589824, 0)
+    var index = if (drive) 1 else 0
     while (descriptor >= 0 && index < count) {
         var next = linuxSyscall4(257, descriptor, nativeCStringAddress(names[index]), anchoredDirectoryFlags, 0)
         if (next == -2 && create) {
@@ -752,7 +762,9 @@ private var anchoredSupport = 0
 // Whether the system has no openat (asked once per process, by opening "/").
 private fun anchoredMissing(): bool {
     if (anchoredSupport == 0) {
-        val root = linuxSyscall4(257, -100, nativeCStringAddress("/"), 589824, 0)
+        val working = currentDirectory().text
+        val rootText = if (!pathHostIsWindows()) "/" else if (working.size >= 2 && working[1] == 58) "${working.slice(0, 2)}/" else ""
+        val root = if (rootText == "") -38 else linuxSyscall4(257, -100, nativeCStringAddress(rootText), 589824, 0)
         if (root >= 0) linuxSyscall1(3, root)
         anchoredSupport = if (root == -38) 2 else 1
     }
@@ -783,8 +795,8 @@ private fun anchoredStat(directory: int, name: string, flags: int, filePath: Pat
     FileInfo(filePath, kind, size, revision, inode, changed)
 }
 
-// Whether `path` is handled by Path as it is (absolute, or a host whose calls are translated).
-private fun anchoredPlain(text: string): bool = pathHostIsWindows() || text.size == 0 || text[0] == 47 || anchoredMissing()
+// Whether `path` is handled by Path as it is (absolute, or a system with no directory-relative calls).
+private fun anchoredPlain(text: string): bool = text.size == 0 || anchoredAbsolute(text) || anchoredMissing()
 
 // The file's contents or why not, as Path.readTextResult, never through a link.
 fun AnchoredPath.readTextResult(): FileReadResult {
@@ -924,7 +936,7 @@ fun AnchoredPath.writeTextAtomic(contents: string, mode: int = 0o666): bool {
 
 // The replacement writeTextAtomic and a build's own files share: a new temporary named like the file's with the process id, O_EXCL, written, optionally
 // synced, renamed over the file. `exactMode` gives the file `mode` whatever it had; otherwise an existing file keeps its permissions
-// when `preserveExisting`. Not for an absolute path or on a translated host: those use the Path implementation.
+// when `preserveExisting`. Not for an absolute path or a system with no directory-relative calls: those use the Path implementation.
 fun AnchoredPath.replace(contents: string, mode: int, exactMode: bool, preserveExisting: bool, sync: bool): bool {
     if (mode < 0 || mode > 0o777) return false
     val leaf = anchoredLeaf(this.text, true)
@@ -944,7 +956,7 @@ fun AnchoredPath.replace(contents: string, mode: int, exactMode: bool, preserveE
     success
 }
 
-// Whether a relative path is walked by AnchoredPath (not an absolute path, not a translated host): the build's own file writes use it then.
+// Whether a relative path is walked by AnchoredPath (not an absolute path, not a system with no directory-relative calls): the build's own file writes use it then.
 fun anchoredApplies(text: string): bool = !anchoredPlain(text)
 
 // The permission bits of the file `name` in the directory `directory`, or -1.

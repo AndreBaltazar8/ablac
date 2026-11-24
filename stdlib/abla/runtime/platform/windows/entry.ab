@@ -87,6 +87,10 @@ trusted noescape extern:"c" fun SetEndOfFile(handle: int): int
 trusted noescape extern:"c" fun GetLastError(): int
 /** kernel32 MultiByteToWideChar: converts text of a code page (65001 is UTF-8) to UTF-16; returns the characters written or needed, 0 when it fails. */
 trusted noescape extern:"c" fun MultiByteToWideChar(page: int, flags: int, text: int, count: int, wide: int, wideCount: int): int
+/** kernel32 GetFinalPathNameByHandleW: stores the final path of an open file or directory (the `\\?\` form for flags 0) as UTF-16 at buffer, which holds size characters with the NUL; returns the length without the NUL, a larger number when the buffer is too small, or 0 on failure. */
+trusted noescape extern:"c" fun GetFinalPathNameByHandleW(handle: int, buffer: int, size: int, flags: int): int
+/** kernel32 CompareStringOrdinal: compares two UTF-16 strings of the given lengths in characters by code unit, ignoring case when ignoreCase is non-zero; returns 2 when they are equal, 1 or 3 when not, and 0 on failure. */
+trusted noescape extern:"c" fun CompareStringOrdinal(first: int, firstLength: int, second: int, secondLength: int, ignoreCase: int): int
 /** kernel32 FindFirstFileW: starts listing the directory entries that match the UTF-16 pattern, storing the first at data (a 592-byte WIN32_FIND_DATAW); returns a search handle, or -1 when it fails. */
 trusted noescape extern:"c" fun FindFirstFileW(pattern: int, data: int): int
 /** kernel32 FindNextFileW: stores the next directory entry of a search at data; returns non-zero on success, 0 at the end. */
@@ -574,12 +578,117 @@ private trusted fun __ablaRuntimeWindowsStatPath(wide: int, output: int, link: b
     0
 }
 
+// ---- anchored opens (#1201) ----
+// Linux and macOS open every directory of a compile-time path from the project root with openat and O_NOFOLLOW (abla/sys/linux/fs AnchoredPath), so that a
+// directory swapped for a link between the path check and the use cannot lead out of the project. Here the same calls take a directory descriptor: a name is
+// opened from the directory's handle as that directory's final path (GetFinalPathNameByHandleW) and the name, never following a reparse point
+// (FILE_FLAG_OPEN_REPARSE_POINT), and the object opened is then checked through its own handle: it is no reparse point (a symbolic link or a junction: ELOOP), and
+// its final path is the directory's and the name (a directory swapped in on the way leads elsewhere: ELOOP). A directory that is held is opened with no delete
+// sharing, so it cannot be renamed or replaced meanwhile. A name is one component: no separator, no ':' (a stream), not "." or "..".
+
+// The thread's path buffer, in 16 KiB parts: the directory's final path (0); the joined path, the directory's and the name (`at`: 16384, or 49152 for a second one); the path checked (32768).
+private trusted fun __ablaRuntimeWindowsAnchoredWide(directoryFd: int, name: int, at: int): int {
+    val handle = __ablaRuntimeWindowsHandle(directoryFd)
+    if (handle == 0) return -9
+    if (ablaRuntimeLoadU8(name) == 0) return -2
+    var index = 0
+    var byte = ablaRuntimeLoadU8(name)
+    while (byte != 0) {
+        if (byte == 47 || byte == 92 || byte == 58) return -22
+        index = index + 1
+        byte = ablaRuntimeLoadU8(name + index)
+    }
+    if (index == 1 && ablaRuntimeLoadU8(name) == 46) return -22
+    if (index == 2 && ablaRuntimeLoadU8(name) == 46 && ablaRuntimeLoadU8(name + 1) == 46) return -22
+    val buffer = __ablaRuntimeWindowsPathBuffer()
+    if (buffer == 0) return -12
+    val directory = buffer
+    val count = GetFinalPathNameByHandleW(handle, directory, 4000, 0)
+    // 0: the system cannot say (the callers fall back to the path call: ENOSYS); more than the buffer: a directory path of at most 4000 characters and a name of 254 are supported.
+    if (count == 0) return -38
+    if (count > 4000) return -36
+    val joined = buffer + at
+    var copy = 0
+    while (copy < count) {
+        ablaRuntimeStoreU8(joined + copy * 2, ablaRuntimeLoadU8(directory + copy * 2))
+        ablaRuntimeStoreU8(joined + copy * 2 + 1, ablaRuntimeLoadU8(directory + copy * 2 + 1))
+        copy = copy + 1
+    }
+    var length = count
+    if (ablaRuntimeLoadU8(directory + (count - 1) * 2) != 92 || ablaRuntimeLoadU8(directory + (count - 1) * 2 + 1) != 0) {
+        ablaRuntimeStoreU8(joined + length * 2, 92)
+        ablaRuntimeStoreU8(joined + length * 2 + 1, 0)
+        length = length + 1
+    }
+    if (MultiByteToWideChar(65001, 0, name, -1, joined + length * 2, 255) <= 0) return -36
+    joined
+}
+
+// The length in characters of the UTF-16 string at `wide`.
+private trusted fun __ablaRuntimeWindowsWideLength(wide: int): int {
+    var length = 0
+    while (ablaRuntimeLoadU8(wide + length * 2) != 0 || ablaRuntimeLoadU8(wide + length * 2 + 1) != 0) length = length + 1
+    length
+}
+
+// 0 when the open `handle` is the object at `joined`: not a reparse point (unless `link`: a link is itself what is asked about) and with that final path
+// (ignoring case); ELOOP when not, ENOSYS when the system cannot tell.
+private trusted fun __ablaRuntimeWindowsAnchoredVerify(handle: int, joined: int, link: bool): int {
+    val buffer = __ablaRuntimeWindowsPathBuffer()
+    if (buffer == 0) return -12
+    val info = buffer + 131072 - 64
+    if (GetFileInformationByHandle(handle, info) == 0) return -40
+    val reparse = (ablaRuntimeLoadI32(info) & 1024) != 0
+    if (reparse && !link) return -40
+    val checked = buffer + 32768
+    val count = GetFinalPathNameByHandleW(handle, checked, 4300, 0)
+    if (count == 0) return -38
+    if (count > 4300) return -40
+    val expected = __ablaRuntimeWindowsWideLength(joined)
+    if (count != expected) return -40
+    if (CompareStringOrdinal(joined, expected, checked, count, 1) != 2) return -40
+    0
+}
+
+// openat(directoryFd, name, flags) from a directory descriptor.
+private trusted fun __ablaRuntimeWindowsOpenAt(directoryFd: int, name: int, flags: int): int {
+    val joined = __ablaRuntimeWindowsAnchoredWide(directoryFd, name, 16384)
+    if (joined < 0) return joined
+    __ablaRuntimeWindowsOpenWide(joined, flags, true)
+}
+
+// newfstatat(directoryFd, name, buffer) of the name itself (a link is not followed).
+private trusted fun __ablaRuntimeWindowsStatAt(directoryFd: int, name: int, output: int): int {
+    val joined = __ablaRuntimeWindowsAnchoredWide(directoryFd, name, 16384)
+    if (joined < 0) return joined
+    val handle = CreateFileW(joined, 0, 7, 0, 3, 35651584, 0)
+    if (handle == -1) return __ablaRuntimeWindowsErrno()
+    val verdict = __ablaRuntimeWindowsAnchoredVerify(handle, joined, true)
+    if (verdict < 0) {
+        CloseHandle(handle)
+        return verdict
+    }
+    val info = __ablaRuntimeWindowsPathBuffer() + 131072 - 64
+    val ok = GetFileInformationByHandle(handle, info) != 0
+    val error = if (ok) 0 else __ablaRuntimeWindowsErrno()
+    CloseHandle(handle)
+    if (!ok) return error
+    __ablaRuntimeWindowsFillStat(info, output, true)
+    0
+}
+
 // open(path, flags, mode) as CreateFileW: the access, disposition and attributes from the Linux flags (O_WRONLY 1, O_RDWR 2, O_CREAT
 // 0x40, O_EXCL 0x80, O_TRUNC 0x200, O_APPEND 0x400, O_DIRECTORY 0x10000, O_NOFOLLOW 0x20000); a directory gets a descriptor that
 // getdents64 lists. A descriptor, or -errno.
 private trusted fun __ablaRuntimeWindowsOpen(text: int, flags: int): int {
     val wide = __ablaRuntimeWindowsWidePath(text, 0)
     if (wide == 0) return -2
+    return __ablaRuntimeWindowsOpenWide(wide, flags, false)
+}
+
+// The open of the UTF-16 path `wide`; `anchored` (an openat from a directory handle, below) never follows a reparse point and refuses one, and holds a
+// directory open with no delete sharing: the directory cannot be renamed or replaced while the walk below it goes on.
+private trusted fun __ablaRuntimeWindowsOpenWide(wide: int, flags: int, anchored: bool): int {
     val mode = flags & 3
     var access = 0
     if (mode == 0) access = 2147483648
@@ -596,9 +705,17 @@ private trusted fun __ablaRuntimeWindowsOpen(text: int, flags: int): int {
     else if (truncate) disposition = 5
     // 0x02000000 backup semantics (a directory may be opened), 0x00200000 reparse point for O_NOFOLLOW
     var attributes = 33554432
-    if ((flags & 131072) != 0) attributes = attributes + 2097152
-    val handle = CreateFileW(wide, access, 7, 0, disposition, attributes, 0)
+    if ((flags & 131072) != 0 || anchored) attributes = attributes + 2097152
+    val share = if (anchored && (flags & 65536) != 0) 3 else 7
+    val handle = CreateFileW(wide, access, share, 0, disposition, attributes, 0)
     if (handle == -1) return __ablaRuntimeWindowsErrno()
+    if (anchored) {
+        val verdict = __ablaRuntimeWindowsAnchoredVerify(handle, wide, false)
+        if (verdict < 0) {
+            CloseHandle(handle)
+            return verdict
+        }
+    }
     val info = __ablaRuntimeWindowsPathBuffer() + 131072 - 64
     var kind = 1
     if (GetFileInformationByHandle(handle, info) != 0 && (ablaRuntimeLoadI32(info) & 16) != 0) kind = 2
@@ -883,22 +1000,37 @@ private trusted fun __ablaRuntimeWindowsFileCall(number: int, a0: int, a1: int, 
     if (number == 88) return __ablaRuntimeWindowsSymlink(a0, a1)
     // getdents64(fd, buffer, count)
     if (number == 217) return __ablaRuntimeWindowsDirectoryEntries(a0, a1, a2)
-    // openat(directory, path, flags, mode): relative to the working directory (AT_FDCWD) only
+    // openat(directory, path, flags, mode): AT_FDCWD is the working directory; a directory descriptor opens the name from that directory, without following
+    // a reparse point (#1201, __ablaRuntimeWindowsOpenAt)
     if (number == 257) {
-        if (a0 != -100) return -38
+        if (a0 != -100) return __ablaRuntimeWindowsOpenAt(a0, a1, a2)
         return __ablaRuntimeWindowsOpen(a1, a2)
+    }
+    // mkdirat(directory, path, mode): a directory descriptor only
+    if (number == 258) {
+        if (a0 == -100) return -38
+        val joined = __ablaRuntimeWindowsAnchoredWide(a0, a1, 16384)
+        if (joined < 0) return joined
+        if (CreateDirectoryW(joined, 0) == 0) return __ablaRuntimeWindowsErrno()
+        return 0
     }
     // newfstatat(directory, path, buffer, flags): AT_EMPTY_PATH (0x1000) takes the descriptor, AT_SYMLINK_NOFOLLOW (0x100) the link
     if (number == 262) {
         if ((a3 & 4096) != 0 && ablaRuntimeLoadU8(a1) == 0) return __ablaRuntimeWindowsFileCall(5, a0, a2, 0, 0)
-        if (a0 != -100) return -38
+        if (a0 != -100) return __ablaRuntimeWindowsStatAt(a0, a1, a2)
         val wide = __ablaRuntimeWindowsWidePath(a1, 0)
         if (wide == 0) return -2
         return __ablaRuntimeWindowsStatPath(wide, a2, (a3 & 256) != 0)
     }
     // unlinkat(directory, path, flags): AT_REMOVEDIR (0x200) is rmdir
     if (number == 263) {
-        if (a0 != -100) return -38
+        if (a0 != -100) {
+            val joined = __ablaRuntimeWindowsAnchoredWide(a0, a1, 16384)
+            if (joined < 0) return joined
+            val removed = if ((a2 & 512) != 0) RemoveDirectoryW(joined) else DeleteFileW(joined)
+            if (removed == 0) return __ablaRuntimeWindowsErrno()
+            return 0
+        }
         return __ablaRuntimeWindowsFileCall(if ((a2 & 512) != 0) 84 else 87, a1, 0, 0, 0)
     }
     // getrandom(buffer, length, flags)
@@ -2312,6 +2444,16 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
         if (WriteFile(handle, a1, a2, scratch, 0) == 0) return __ablaRuntimeWindowsEIO
         return ablaRuntimeLoadI32(scratch) & 4294967295
     }
+    // renameat(oldDirectory, old, newDirectory, new, flags): directory descriptors only, no flags
+    if (number == 264) {
+        if (a0 == -100 || a2 == -100 || a4 != 0) return -38
+        val from = __ablaRuntimeWindowsAnchoredWide(a0, a1, 16384)
+        if (from < 0) return from
+        val to = __ablaRuntimeWindowsAnchoredWide(a2, a3, 49152)
+        if (to < 0) return to
+        if (MoveFileExW(from, to, 1) == 0) return __ablaRuntimeWindowsErrno()
+        return 0
+    }
     // mmap(address, length, protection, flags, fd, offset): anonymous memory only; MAP_FIXED (16) over an existing range is not
     // translated (the frozen groups' window needs it: a later step)
     if (number == 9) {
@@ -2431,7 +2573,7 @@ trusted fun __ablaRuntimeWindowsSyscall(number: int, a0: int, a1: int, a2: int, 
 
 // The numbers __ablaRuntimeWindowsSyscall translates, for tools/test-windows-syscalls.sh.
 /** The Linux system call numbers __ablaRuntimeWindowsSyscall translates, in order, separated by spaces (what tools/test-windows-syscalls.sh checks against the translation). */
-trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 14 16 21 25 28 35 39 41 42 43 44 45 46 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 88 89 91 97 98 102 104 107 108 109 121 131 186 202 204 217 228 231 232 233 257 262 263 288 291 293 318 4001 4002 4003 4004 4005 4006 4007"
+trusted fun __ablaRuntimeWindowsTranslated(): string = "0 1 3 4 5 6 7 8 9 10 11 14 16 21 25 28 35 39 41 42 43 44 45 46 48 49 50 51 52 54 55 56 57 58 59 60 61 62 72 74 77 79 80 82 83 84 87 88 89 91 97 98 102 104 107 108 109 121 131 186 202 204 217 228 231 232 233 257 258 262 263 264 288 291 293 318 4001 4002 4003 4004 4005 4006 4007"
 
 // argc and argv for main, from GetCommandLineW: the command line as UTF-8 and split by the rules of CommandLineToArgvW (a quoted
 // program name; backslashes are literal except before a quote; 2n backslashes and a quote make n and open or close a quoted run;

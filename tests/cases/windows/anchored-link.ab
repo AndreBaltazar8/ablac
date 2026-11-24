@@ -1,0 +1,66 @@
+import "abla/io"
+import "abla/sys/linux/fs"
+
+// AnchoredPath refuses a link on the way, where Path follows it (#1201): a directory that a link replaced after the path was checked, a link in the middle of the
+// path, and a link at its end. On Windows a symbolic link is a reparse point (the Windows runner makes them; Wine does not), and a name is opened from a held
+// directory handle that never follows one (stdlib/abla/runtime/platform/windows).
+
+val linkRoot = "build/anchored-links"
+val linkOutside = "build/anchored-outside"
+
+var linkFailures = 0
+
+fun linkCheck(name: string, ok: bool): void {
+    if (ok) println("ok $name") else {
+        println("FAIL $name")
+        linkFailures = linkFailures + 1
+    }
+}
+
+fun main: int {
+    Path(linkRoot).removeTree()
+    Path(linkOutside).removeTree()
+    AnchoredPath("$linkRoot/real").createDirectories()
+    AnchoredPath("$linkOutside").createDirectories()
+    AnchoredPath("$linkRoot/real/inner.txt").writeText("inside")
+    AnchoredPath("$linkOutside/secret.txt").writeText("secret")
+    val outside = currentDirectory().child(linkOutside).text
+
+    // A link in the middle of the path: Path follows it, AnchoredPath does not.
+    val linked = Path("$linkRoot/swap").linkTo(outside)
+    linkCheck("the link was made", linked && Path("$linkRoot/swap/secret.txt").readText() == "secret")
+    val read = AnchoredPath("$linkRoot/swap/secret.txt").readTextResult()
+    linkCheck("read through a link", !read.succeeded && read.text == "" && read.errorCode != 0)
+    linkCheck("write through a link", !AnchoredPath("$linkRoot/swap/new.txt").writeText("x") && !Path("$linkOutside/new.txt").exists())
+    linkCheck("create through a link", !AnchoredPath("$linkRoot/swap/made/deeper.txt").createParentDirectories() && !Path("$linkOutside/made").exists())
+    linkCheck("atomic write through a link", !AnchoredPath("$linkRoot/swap/atomic.txt").writeTextAtomic("x") && !Path("$linkOutside/atomic.txt").exists())
+    linkCheck("move through a link", !AnchoredPath("$linkRoot/real/inner.txt").moveTo(AnchoredPath("$linkRoot/swap/moved.txt")) && !Path("$linkOutside/moved.txt").exists() &&
+        AnchoredPath("$linkRoot/real/inner.txt").readText() == "inside")
+    linkCheck("remove through a link", !AnchoredPath("$linkRoot/swap/secret.txt").remove() && Path("$linkOutside/secret.txt").exists())
+    linkCheck("list through a link", AnchoredPath("$linkRoot/swap").entries().size == 0)
+    linkCheck("stat through a link", AnchoredPath("$linkRoot/swap/secret.txt").info().kind == 0)
+
+    // A directory that was checked, then replaced by a link to somewhere else.
+    AnchoredPath("$linkRoot/d").createDirectories()
+    linkCheck("the directory works first", AnchoredPath("$linkRoot/d/f.txt").writeText("one") && AnchoredPath("$linkRoot/d/f.txt").readText() == "one")
+    Path("$linkRoot/d").removeTree()
+    linkCheck("the link replaced it", Path("$linkRoot/d").linkTo(outside) && Path("$linkRoot/d/secret.txt").readText() == "secret")
+    linkCheck("the replacement is refused", !AnchoredPath("$linkRoot/d/f2.txt").writeText("two") && !Path("$linkOutside/f2.txt").exists() &&
+        !AnchoredPath("$linkRoot/d/secret.txt").readTextResult().succeeded)
+
+    // A link at the end: it is itself what is asked about; reading it is refused, and removing it removes the link, not the file.
+    linkCheck("the file link was made", Path("$linkRoot/leaf").linkTo("$outside/secret.txt") && Path("$linkRoot/leaf").readText() == "secret")
+    linkCheck("a link at the end is a link", AnchoredPath("$linkRoot/leaf").isSymbolicLink() && AnchoredPath("$linkRoot/leaf").info().kind == 4)
+    linkCheck("reading a link at the end is refused", !AnchoredPath("$linkRoot/leaf").readTextResult().succeeded)
+    linkCheck("removing a link removes the link", AnchoredPath("$linkRoot/leaf").remove() && !AnchoredPath("$linkRoot/leaf").info().exists() &&
+        Path("$linkOutside/secret.txt").readText() == "secret")
+    linkCheck("the directory link is removed as a link", AnchoredPath("$linkRoot/swap").remove() && Path("$linkOutside/secret.txt").exists())
+
+    Path(linkRoot).removeTree()
+    Path(linkOutside).removeTree()
+    if (linkFailures == 0) {
+        println("anchored-link: ok")
+        return 42
+    }
+    1
+}

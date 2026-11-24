@@ -416,7 +416,7 @@ checked. A path is held inside by where it leads, not by its spelling: its symbo
 project that points out of it is outside), except the last name of a removal, a move or `isSymbolicLink()`, which act on
 the link itself, as `unlink`, `rename` and `lstat` do: removing a link removes the link, not its target.
 
-The check and the use are one step on Linux and macOS: a path inside the working directory is held inside the project by the real path it
+The check and the use are one step on Linux, macOS and Windows: a path inside the working directory is held inside the project by the real path it
 leads to (every link followed), and then opened by walking that real path from the root with `O_NOFOLLOW` on each name (`AnchoredPath`
 in `abla/fs`, `openat`, `unlinkat`, `renameat` through the directory's descriptor). A directory swapped for a link to somewhere else between
 the check and the open (a racing process, or a second thread of the build) makes the operation fail instead of leading out of the project
@@ -424,8 +424,19 @@ the check and the open (a racing process, or a second thread of the build) makes
 fails without it within one build). This covers every compile-time file operation (`Path` reads, writes, moves, listings, metadata and
 `compilerReadFile`, `compilerWriteFile` and the like), not the toolchain's own outputs, whose build directory may legitimately be a link.
 It does not cover a project outside the working directory (its paths are absolute, so they are handled as an absolute path is: by the check
-alone), nor Windows, whose host layer translates only path-based calls; the Windows equivalent (opening each name relative to a directory handle
-with `FILE_OPEN_REPARSE_POINT` and refusing a reparse point) is not done.
+alone).
+
+On Windows the same calls take a directory descriptor (`openat`, `mkdirat`, `newfstatat`, `unlinkat`, `renameat` in the runtime's translation, stdlib/abla/runtime/platform/windows):
+a name is opened from the directory's handle as that directory's final path (`GetFinalPathNameByHandleW`) and the name, with `FILE_FLAG_OPEN_REPARSE_POINT` so that
+no link is followed, and the object opened is then checked through its own handle: it is no reparse point (a symbolic link or a junction: `ELOOP`), and its final
+path is exactly the directory's and the name (a directory swapped in on the way leads elsewhere: `ELOOP`). A directory that is held is opened with no delete
+sharing, so it cannot be renamed or replaced while the walk below it goes on. A name is one component (no separator, no `:` for a stream, not `.` or `..`).
+The walk starts at the root of the working directory's drive, and the working directory's own path is trusted as it is on Linux. The path-based calls
+stay for what cannot be anchored: a working directory on a network share (no drive), and a system whose `GetFinalPathNameByHandleW` cannot name a handle's
+path (the call answers `ENOSYS` and the operation is done by path, as before): there the check and the use are two steps. A directory path is limited to 4000
+characters and a name to 254. tests/cases/windows/anchored.ab runs every operation on a plain tree and prints what Linux prints (under Wine and on the
+Windows runner); tests/cases/windows/anchored-link.ab, which needs links Wine cannot make, refuses a link in the middle of a path, a directory replaced by a
+link and a link at the end on the Windows runner (marked `runner` in tests/cases/windows/programs.txt).
 
 A tree built without its `.git` (a `git archive` export, a release tarball, a copy) has no repository root to find, so
 it is bounded by its working directory: built from a subdirectory, a read of `../assets` that works in the checkout
