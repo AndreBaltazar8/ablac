@@ -179,17 +179,51 @@ fun linuxExactString(var buffer: NativeByteBuffer, length: int, capacity: int): 
     exact.adoptString(length)
 }
 
+/** The count of one read asked for `maximum` bytes: 0 for none or a negative count, at most 1 GiB (a read may return fewer
+ *  bytes than asked, so this keeps "up to `maximum`"). The buffer it sizes is the count + 1, which for the largest int
+ *  wrapped to a negative size and a 1-byte allocation, while the kernel was asked for 2^63 - 1 bytes. */
+fun linuxReadCount(maximum: int): int = if (maximum <= 0) 0 else if (maximum > 1073741824) 1073741824 else maximum
+
+/** How many bytes one read from a stream (a socket, a pipe, a terminal) asks for when the caller allows `count`
+ *  (linuxReadCount's): at most 1 MiB. A read may return fewer bytes than asked, so "up to `count`" holds, and the buffer is
+ *  not sized by a large maximum: a read allowed 1 GiB allocated 1 GiB before any byte arrived. */
+fun linuxStreamReadSize(count: int): int = if (count > 1048576) 1048576 else count
+
+/** How many bytes one read from `descriptor` asks for when the caller allows `count` (linuxReadCount's), so the buffer is
+ *  sized by what is there and not by the caller's maximum. For a regular file with a size: what is left of it after the
+ *  current position, plus one byte so the end shows as a short read, never more than `count`. For anything else (a socket,
+ *  a pipe, a terminal, a file whose size reads 0 such as /proc's, or when fstat fails): linuxStreamReadSize. */
+fun linuxReadSize(descriptor: int, count: int): int {
+    if (count <= 65536) return count
+    val status = nativeByteBuffer(144)
+    var size = -1
+    if (linuxSyscall2(5, descriptor, nativePointerAddress(status.address)) == 0 &&
+        ((status.load(24) + status.load(25) * 256) & 0o170000) == 0o100000) size = status.loadI64(48)
+    status.close()
+    var result = linuxStreamReadSize(count)
+    if (size > 0) {
+        val position = linuxSyscall3(8, descriptor, 0, 1)
+        if (position >= 0) {
+            val left = if (size > position) size - position + 1 else 1
+            result = if (left < count) left else count
+        }
+    }
+    result
+}
+
 // Attempts one read of up to `maximum` bytes. Returns the bytes read or an empty string on EOF or error.
 fun LinuxFileDescriptor.read(maximum: int = 65536): string {
-    val buffer = nativeByteBuffer(maximum + 1)
+    val limit = linuxReadSize(this.descriptor, linuxReadCount(maximum))
+    if (limit == 0) return ""
+    val buffer = nativeByteBuffer(limit + 1)
     val measured = linuxSyscall3(
         0,
         this.descriptor,
         nativePointerAddress(buffer.address),
-        maximum
+        limit
     )
     var result = ""
-    if (measured >= 0) result = linuxExactString(buffer, measured, maximum + 1)
+    if (measured >= 0) result = linuxExactString(buffer, measured, limit + 1)
     if (measured < 0) buffer.close()
     result
 }
