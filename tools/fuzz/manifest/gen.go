@@ -479,11 +479,11 @@ func (g *gen) plainManifest() string {
 	table := ""
 	if g.chance(15) {
 		table = g.pick([]string{"project", "package"})
-		lines = append(lines, "["+table+"]")
+		lines = append(lines, "["+table+"]"+g.cmt())
 	}
 	for _, k := range stringKeys {
 		if g.chance(60) {
-			lines = append(lines, k+" = "+`"`+g.pick(simple)+`"`)
+			lines = append(lines, k+" = "+g.enc(g.pick(simple))+g.cmt())
 		}
 	}
 	for _, k := range arrayKeys {
@@ -495,7 +495,7 @@ func (g *gen) plainManifest() string {
 			if g.chance(30) {
 				lines = append(lines, k+" = [", "  "+strings.Join(items, ","+g.nl+"  ")+", # last", "]")
 			} else {
-				lines = append(lines, k+" = ["+strings.Join(items, ", ")+"]")
+				lines = append(lines, k+" = ["+strings.Join(items, ", ")+"]"+g.cmt())
 			}
 		}
 	}
@@ -512,12 +512,12 @@ func (g *gen) plainManifest() string {
 			}
 			used[name] = true
 			selector := g.pick([]string{"rev", "tag", "branch"})
-			lines = append(lines, name+" = { git = \""+g.pick([]string{"https://example.test/a.git", "ssh://h/p", "../local"})+"\", "+selector+" = \""+g.pick([]string{"0123456789abcdef0123456789abcdef01234567", "v1.2", "main"})+"\" }")
+			lines = append(lines, name+" = { git = \""+g.pick([]string{"https://example.test/a.git", "ssh://h/p", "../local"})+"\", "+selector+" = \""+g.pick([]string{"0123456789abcdef0123456789abcdef01234567", "v1.2", "main"})+"\" }"+g.cmt())
 		}
 	}
 	for _, t := range []string{"exports", "imports"} {
 		if g.chance(30) {
-			lines = append(lines, "", "["+t+"]")
+			lines = append(lines, "", "["+t+"]"+g.cmt())
 			used := map[string]bool{}
 			for n := g.r.Intn(3); n >= 0; n-- {
 				k := g.pick([]string{"util", "text/json", "a.b", "x", "e é", "../../src/i2c/device.ab"})
@@ -525,7 +525,7 @@ func (g *gen) plainManifest() string {
 					continue
 				}
 				used[k] = true
-				lines = append(lines, `"`+k+`" = "`+g.pick([]string{"util/entry.ab", "x.ab", "b.ab"})+`"`)
+				lines = append(lines, g.enc(k)+" = "+g.enc(g.pick([]string{"util/entry.ab", "x.ab", "b.ab"}))+g.cmt())
 			}
 		}
 	}
@@ -538,7 +538,7 @@ func (g *gen) plainManifest() string {
 				continue
 			}
 			used[name] = true
-			lines = append(lines, name+" = [\""+g.pick(capabilityNames)+"\", \""+g.pick(capabilityNames)+"\"]")
+			lines = append(lines, name+" = [\""+g.pick(capabilityNames)+"\", \""+g.pick(capabilityNames)+"\"]"+g.cmt())
 		}
 	}
 	return strings.Join(lines, g.nl) + g.nl
@@ -549,10 +549,37 @@ func (g *gen) plainLock() string {
 	fields := []string{"name", "provider", "identity", "source", "selector-kind", "selector", "revision", "digest", "entry"}
 	lines := []string{"version = 2"}
 	for n := 1 + g.r.Intn(3); n > 0; n-- {
-		lines = append(lines, "", "[[package]]")
+		lines = append(lines, "", "[[package]]"+g.cmt())
 		for _, f := range fields {
-			lines = append(lines, f+` = "`+g.pick(lockPools[f])+`"`)
+			lines = append(lines, f+" = "+g.enc(g.pick(lockPools[f]))+g.cmt())
 		}
 	}
 	return strings.Join(lines, g.nl) + g.nl
+}
+
+// enc writes v as a basic string, with some of its characters as \uXXXX or \UXXXXXXXX escapes (the escapes the compiler decodes for the readers).
+func (g *gen) enc(v string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, c := range v {
+		if g.chance(12) && c != '"' && c != '\\' {
+			if c > 0xffff || g.chance(20) {
+				fmt.Fprintf(&b, `\U%08x`, c)
+			} else {
+				fmt.Fprintf(&b, `\u%04X`, c)
+			}
+			continue
+		}
+		b.WriteRune(c)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// cmt: a trailing comment (or none) after a value, with the characters that tempt a line reader: quotes, hashes, brackets, equals.
+func (g *gen) cmt() string {
+	if !g.chance(35) {
+		return ""
+	}
+	return g.pick([]string{" # c", "# x", "  # \"q\" 'r' [a] = { b }", " # name = \"z\"", "\t# [dependencies]"})
 }

@@ -161,9 +161,123 @@ private fun manifestListKey(key: string): bool = key == "compileCapabilities" ||
 private fun manifestLockKey(key: string): bool =
     key == "name" || key == "provider" || key == "identity" || key == "source" || key == "selector-kind" || key == "selector" || key == "revision" || key == "digest" || key == "entry"
 
-/** "" when `text` is a manifest (or, with `lock`, a lock) the readers read exactly as written, else the first line that is not, as "line N: why". */
-fun bootstrapManifestGrammarProblem(text: string, lock: bool): string {
-    if (text.size >= 3 && text[0] == 239 && text[1] == 187 && text[2] == 191) return "line 1: a byte order mark"
+class ManifestLine(val text: string, val problem: string, val lossy: bool)
+
+private fun manifestHexValue(byte: int): int =
+    if (byte >= 48 && byte <= 57) byte - 48 else if (byte >= 65 && byte <= 70) byte - 55 else if (byte >= 97 && byte <= 102) byte - 87 else -1
+
+/** One line of code with its trailing comment cut and the escapes of its basic strings decoded (the way a TOML 1.0 parser decodes them), or the problem. An escape that
+ *  decodes to a quote, a backslash or a control character other than a tab cannot be held by a line reader that looks for the closing quote: it becomes `?` and the line is
+ *  `lossy`, which the checker refuses wherever the compiler reads the value. */
+private fun manifestCanonicalLine(line: string): ManifestLine {
+    var out = ""
+    var run = 0
+    var lossy = false
+    var index = 0
+    while (index < line.size) {
+        val byte = line[index]
+        if (byte == 35) return ManifestLine(out + line.slice(run, index), "", lossy)
+        if (byte == 39) return ManifestLine(out + line.slice(run, line.size), "", lossy)
+        if (byte != 34) {
+            index = index + 1
+            continue
+        }
+        if (index + 2 < line.size && line[index + 1] == 34 && line[index + 2] == 34) return ManifestLine("", "a multi-line string", false)
+        out = out + line.slice(run, index + 1)
+        var at = index + 1
+        var chunk = at
+        while (true) {
+            if (at >= line.size) return ManifestLine("", "a string without its closing quote", false)
+            val c = line[at]
+            if (c == 34) break
+            if (c != 92) {
+                at = at + 1
+                continue
+            }
+            out = out + line.slice(chunk, at)
+            if (at + 1 >= line.size) return ManifestLine("", "a backslash at the end of the line", false)
+            val e = line[at + 1]
+            var scalar = -1
+            var length = 2
+            if (e == 98) scalar = 8
+            else if (e == 116) scalar = 9
+            else if (e == 110) scalar = 10
+            else if (e == 102) scalar = 12
+            else if (e == 114) scalar = 13
+            else if (e == 34) scalar = 34
+            else if (e == 92) scalar = 92
+            else if (e == 117 || e == 85) {
+                val digits = if (e == 117) 4 else 8
+                length = 2 + digits
+                if (at + length > line.size) return ManifestLine("", "a \\u or \\U escape without its hexadecimal digits", false)
+                scalar = 0
+                var d = 0
+                while (d < digits) {
+                    val h = manifestHexValue(line[at + 2 + d])
+                    if (h < 0) return ManifestLine("", "a \\u or \\U escape without its hexadecimal digits", false)
+                    scalar = scalar * 16 + h
+                    d = d + 1
+                }
+                if (scalar > 1114111 || (scalar >= 55296 && scalar <= 57343)) return ManifestLine("", "an escape that is not a Unicode scalar value", false)
+            } else {
+                return ManifestLine("", "a backslash escape TOML does not have", false)
+            }
+            if (scalar == 9 || (scalar >= 32 && scalar != 34 && scalar != 92 && scalar != 127)) {
+                out = out + utf8Encode(scalar)
+            } else {
+                out = out + "?"
+                lossy = true
+            }
+            at = at + length
+            chunk = at
+        }
+        out = out + line.slice(chunk, at) + "\""
+        index = at + 1
+        run = index
+    }
+    ManifestLine(out + line.slice(run, line.size), "", lossy)
+}
+
+class ManifestCanonical(val text: string, val problem: string, val lossy: string)
+
+/** The text with every trailing comment and whole-line comment gone and the escapes of the strings decoded, line for line (so a line number still names the
+ *  line of the file), the first problem as "line N: why", and the numbers of the lines that are `lossy` as ",N,". */
+private fun manifestCanonical(text: string): ManifestCanonical {
+    if (text.size >= 3 && text[0] == 239 && text[1] == 187 && text[2] == 191) return ManifestCanonical("", "line 1: a byte order mark", "")
+    var out = ""
+    var lossy = ","
+    var number = 0
+    var begin = 0
+    while (begin < text.size) {
+        number = number + 1
+        var end = begin
+        while (end < text.size && text[end] != 10) end = end + 1
+        var contentEnd = end
+        if (contentEnd > begin && text[contentEnd - 1] == 13) contentEnd = contentEnd - 1
+        val line = text.slice(begin, contentEnd)
+        val hasNewline = end < text.size
+        begin = end + 1
+        var index = 0
+        while (index < line.size) {
+            if (line[index] == 13) return ManifestCanonical("", "line $number: a carriage return that does not end the line", "")
+            if (line[index] == 0 || line[index] < 32 && line[index] != 9 || line[index] == 127) return ManifestCanonical("", "line $number: a control character", "")
+            index = index + 1
+        }
+        val start = manifestSkip(line, 0)
+        if (start >= line.size || line[start] == 35) {
+            if (hasNewline) out = out + "\n"
+            continue
+        }
+        val canonical = manifestCanonicalLine(line)
+        if (canonical.problem != "") return ManifestCanonical("", "line $number: ${canonical.problem}", "")
+        if (canonical.lossy) lossy = "$lossy$number,"
+        out = if (hasNewline) out + canonical.text + "\n" else out + canonical.text
+    }
+    ManifestCanonical(out, "", lossy)
+}
+
+/** "" when the canonical `text` of a manifest (or, with `lock`, a lock) holds only lines the readers read exactly as written, else the first line that does not, as "line N: why". */
+private fun manifestGrammarCheck(text: string, lock: bool, lossy: string): string {
     var table = ""
     var kind = "root"
     var known = ","
@@ -243,14 +357,18 @@ fun bootstrapManifestGrammarProblem(text: string, lock: bool): string {
             }
             var scan = absolute
             while (scan < arrayEnd) {
-                if (text[scan] == 10) number = number + 1
+                if (text[scan] == 10) {
+                    number = number + 1
+                    if (lossy.contains(",$number,")) return "line $number: an escape that makes a quote, a backslash or a control character, in a list the compiler reads"
+                }
                 scan = scan + 1
             }
             begin = lineEnd + 1
             value = ManifestValue(MANIFEST_VALUE_ARRAY, trimmed.size)
         }
         if (value.kind == MANIFEST_VALUE_BAD) return "line $number: the value is not a string without escapes, an array of them, an integer or a boolean on one line"
-        if (manifestSkip(trimmed, value.end) != trimmed.size) return "line $number: something after the value (a trailing comment is not read)"
+        if (manifestSkip(trimmed, value.end) != trimmed.size) return "line $number: something after the value"
+        if (lossy.contains(",$number,") && (lock || quotedKey || manifestKnownKey(key) || kind == "dependencies" || kind == "exports" || kind == "imports" || kind == "grants")) return "line $number: an escape that makes a quote, a backslash or a control character, in a value the compiler reads"
         if (lock) {
             if (!inRecord) {
                 if (key != "version" || value.kind != MANIFEST_VALUE_SCALAR || quotedKey) return "line $number: before the first [[package]] only version = <integer>"
@@ -294,16 +412,27 @@ fun bootstrapManifestGrammarProblem(text: string, lock: bool): string {
     ""
 }
 
+class ManifestScan(val problem: string, val text: string)
+
+/** Scans a manifest (or, with `lock`, a lock): `problem` is "" when every line is one the readers read as a TOML parser does, else "line N: why"; `text` is then the
+ *  canonical text the readers are given (comments cut, escapes decoded, same line numbers), else "". */
+fun bootstrapManifestScan(text: string, lock: bool): ManifestScan {
+    val canonical = manifestCanonical(text)
+    if (canonical.problem != "") return ManifestScan(canonical.problem, "")
+    val problem = manifestGrammarCheck(canonical.text, lock, canonical.lossy)
+    ManifestScan(problem, if (problem == "") canonical.text else "")
+}
+
+/** "" when `text` is a manifest (or, with `lock`, a lock) the readers read as a TOML parser does, else the first line that is not, as "line N: why". */
+fun bootstrapManifestGrammarProblem(text: string, lock: bool): string = bootstrapManifestScan(text, lock).problem
+
 /** The text of the manifest (or, with `lock`, the lock) at `path` when it is within the grammar, else "": a file with a line outside it reads as an empty one, so no reader sees
  *  what a TOML parser would not (`bootstrapManifestProblem` says why, where there is a diagnostic to put it in). */
-fun bootstrapManifestText(path: string, lock: bool): string {
-    val text = Path(path).readText()
-    if (bootstrapManifestGrammarProblem(text, lock) != "") "" else text
-}
+fun bootstrapManifestText(path: string, lock: bool): string = bootstrapManifestScan(Path(path).readText(), lock).text
 
 /** The diagnostic for the manifest or lock at `path` when it is outside the grammar, else "" (also for a file that is not there). */
 fun bootstrapManifestProblem(path: string, lock: bool): string {
     if (!Path(path).exists()) return ""
-    val problem = bootstrapManifestGrammarProblem(Path(path).readText(), lock)
-    if (problem == "") "" else "error[E_PACKAGE_MANIFEST]: $path: $problem (the compiler reads only the lines of abla.toml and abla.lock it understands: one-line values, no multi-line strings, escapes or trailing comments, the known keys at the top, once)\n"
+    val problem = bootstrapManifestScan(Path(path).readText(), lock).problem
+    if (problem == "") "" else "error[E_PACKAGE_MANIFEST]: $path: $problem (the compiler reads only the lines of abla.toml and abla.lock it understands: one-line values, no multi-line strings, no dotted or repeated keys, the known keys at the top, once)\n"
 }
