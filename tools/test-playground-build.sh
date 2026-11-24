@@ -11,6 +11,18 @@ out="$root/build/playground-test"
 rm -rf "$out"
 mkdir -p "$out"
 
+# The two release builds compete with the other suite commands on small runners.
+# Preserve each compiler invocation's CPU ceiling and allow more time for scheduling.
+suite_jobs=${ABLA_SUITE_JOBS:-0}
+if [[ -z ${ABLA_MAX_SECONDS:-} && $suite_jobs =~ ^[1-9][0-9]*$ ]]; then
+    cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo "$suite_jobs")
+    if [[ $cpus =~ ^[1-9][0-9]*$ ]] && (( suite_jobs > cpus )); then
+        export ABLA_MAX_SECONDS=900
+        export ABLA_MAX_CPU_SECONDS=${ABLA_MAX_CPU_SECONDS:-600}
+        echo "playground build: $suite_jobs suite jobs on $cpus CPUs, wall limit ${ABLA_MAX_SECONDS}s, CPU limit ${ABLA_MAX_CPU_SECONDS}s per process"
+    fi
+fi
+
 "$root/tools/build-playground.sh" "$compiler" "$out/one" > "$out/one.path" 2> "$out/one.log" &
 first=$!
 "$root/tools/build-playground.sh" "$compiler" "$out/two" > "$out/two.path" 2> "$out/two.log" &

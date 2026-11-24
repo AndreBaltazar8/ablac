@@ -7,7 +7,7 @@
 # shapes, both on util, which the session edits.
 #
 # The session: a cold analysis; util opened with `twice` renamed, so its dependents' uses no longer resolve; an analysis; util
-# changed back with a new body; an analysis. Each analysis must have collected the compiler's heap (its window's count, from
+# changed back with a new body; an analysis. Each request must repeatedly collect the compiler's heap (its window's count, from
 # the service's `abla-gc-stress analysis analyze` lines), the cold answer must name declarations in all three modules, the
 # middle one must report the unresolved `twice` in shapes.ab, a module the edit did not touch, and the last must carry util at
 # its last version with shapes.ab clean and its `twice` naming util's declaration again.
@@ -16,7 +16,12 @@
 # __ablaRuntimeHostTraceMarkedAllocations and the parallel trace) fails this session, and the session passes without stress.
 set -euo pipefail
 compiler=${1:-build/ablac}
-stride=${2:-256}
+# The normal suite collects thousands of times per session. The release suite
+# uses the denser historical schedule.
+default_stride=1024
+if [[ ${RUN_TESTS_FULL:-0} == 1 ]]; then default_stride=256; fi
+stride=${2:-$default_stride}
+min_collections=512
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $compiler == /* ]] || compiler="$PWD/$compiler"
 out="$project_root/build/analysis-gc-stress"
@@ -53,7 +58,7 @@ ABLA_COMPILER_GC_STRESS="analysis:$stride" ABLA_COMPILE_EVAL=jit ABLA_MAX_MEMORY
     exit 1
 }
 
-# One window per analyze request, each with at least one collection of the compiler's heap.
+# One window per analyze request, with a floor on how much stress each gets.
 mapfile -t windows < <(tr -d '\0' < "$out/error.txt" | awk '$1 == "abla-gc-stress" && $2 == "analysis" && $3 == "analyze" { print $5 }')
 if (( ${#windows[@]} != 3 )); then
     echo "analysis gc stress: ${#windows[@]} stressed analyze windows reported, expected 3" >&2
@@ -61,8 +66,8 @@ if (( ${#windows[@]} != 3 )); then
     exit 1
 fi
 for count in "${windows[@]}"; do
-    if (( count < 1 )); then
-        echo "analysis gc stress: an analyze window collected the compiler's heap $count times (windows: ${windows[*]})" >&2
+    if (( count < min_collections )); then
+        echo "analysis gc stress: an analyze window collected the compiler's heap $count times, expected at least $min_collections (windows: ${windows[*]})" >&2
         exit 1
     fi
 done
