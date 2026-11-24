@@ -73,7 +73,8 @@ v0.2.64 asset inventory above.
 
 [CI](../.github/workflows/ci.yml) job `libc-free-aarch64`, **Linux module
 programs link no libc (AArch64)**, cross-builds module programs and compares
-exceptions to the checked-in allowlist. This job alone is link evidence.
+exceptions to the checked-in allowlist. Its program parity step runs the
+selected images under QEMU.
 Job `static-compiler-aarch64`, **Static compiler for AArch64 under qemu**,
 cross-builds the compiler and executes its program builds, `ablac run`, and
 compile-time evaluation tiers under qemu. With `STATIC_AARCH64_MODULES=1`, it
@@ -97,6 +98,39 @@ Stage 3 builds hello with `--fast` and builds the JWT fixture in release mode.
 The JWT result must match the x86-64 compiler's AArch64 cross-build. This
 exercises native compiler child processes and leaves Raspberry Pi hardware
 and older-kernel compatibility outside the check's coverage.
+
+### Linux program parity on AArch64 and RISC-V 64
+
+The `libc-free-aarch64` and `libc-free-riscv64` CI jobs verify that 124
+selected programs have the expected exit status and byte-identical stdout
+on x86-64 and on their QEMU target. The jobs reuse the corresponding
+module images from the link check and build the remaining cases with
+`--fast`. Each execution starts in its own directory. All three kinds of
+image must be ELF for the intended architecture, with neither `PT_INTERP`
+nor `DT_NEEDED`. [Program list](../tests/cases/linux/programs.txt),
+[comparison runner](../tools/test-linux-programs.sh),
+[CI jobs](../.github/workflows/ci.yml).
+
+The survey covered 128 distinct sources from the direct build/run pairs
+in [tests/abla-tests.json](../tests/abla-tests.json) and the
+[Windows program list](../tests/cases/windows/programs.txt). Four cases
+need a different setup.
+
+- `host-runtime.ab` reads `tests/cases/bootstrap/value.ab` relative to
+  the repository root. All three images return 42 from that directory.
+- `network-advanced.ab` uses OpenSSL. The native image links shared
+  libraries and the cross links lack target `libssl` and `libcrypto`.
+- `unsafe-boundary.ab` calls `dlsym`. The native image links a C library
+  and the libc-free cross links have no definition for that symbol.
+- `https-loopback.ab` starts its TLS server by executing
+  `/proc/self/exe`. Both guest runs time out waiting for the server when
+  QEMU user mode cannot re-execute the guest image.
+
+Configured recipes such as the GC-stress map differential, process
+environment, flat imports and retained LLVM text use their own harnesses.
+The module link lane also includes build fixtures and expected compile
+failures. Its cross-link exceptions are recorded separately.
+[Module link allowlist](../tools/libc-free-programs-allowlist.txt).
 
 ## macOS arm64 and Intel
 
