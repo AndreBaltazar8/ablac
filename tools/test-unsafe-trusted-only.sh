@@ -98,7 +98,8 @@ trusted fun NativeByteBuffer.trustedOnlyProbe(index: int): int = index + this.ca
 operator fun NativeByteBuffer.plus(index: int): int = index + this.capacity
 PROBE
 for refused in member-call:native.trust:NativeByteBuffer.trustedOnlyProbe member-operator:native.trust:NativeByteBuffer.plus \
-    member-alias:native.trust:.*NativeByteBuffer.trustedOnlyProbe member-value:member:NativeByteBuffer.trustedOnlyProbe \
+    member-alias:native.trust:NativeByteBuffer.trustedOnlyProbe alias-call:native.trust:nativePointerAddress \
+    member-value:member:NativeByteBuffer.trustedOnlyProbe \
     type-alias:type.underlying:Bytes indexer:operator.declaration:Box.get; do
     IFS=: read -r name rule what <<< "$refused"
     build "$out/probe-stdlib" "$name"
