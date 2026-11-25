@@ -178,7 +178,8 @@ field of `abla/crypto/x25519`.
 | `ed25519Verify(publicKey, message, signature)` | whether it verifies; `false` for any wrong length |
 
 Verification is the strict one: S is below L, the public key is a point with a canonical encoding, and the encoding of
-[S]B - [k]A is R's bytes (so a non-canonical R, or S + L, is refused). The key, the nonce and S are secret; the message,
+[S]B - [k]A is R's bytes (so a non-canonical R, or S + L, is refused), and the public key is not of small order (order 1, 2, 4 or 8: the identity
+key would verify a signature of any message with no secret; RFC 8032 does not require the refusal, Wycheproof accepts either answer). The key, the nonce and S are secret; the message,
 the public key and R are public.
 
 Constant-time: the scalar multiplications that take a secret run 256 steps of a doubling, an addition (the unified,
