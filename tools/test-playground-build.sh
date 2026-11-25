@@ -11,10 +11,12 @@ out="$root/build/playground-test"
 rm -rf "$out"
 mkdir -p "$out"
 
-# The two release builds compete with the other suite commands on small runners.
-# Preserve each compiler invocation's CPU ceiling and allow more time for scheduling.
+# On the four-CPU EPYC runner, the two builds had received only 605 CPU
+# seconds in total when the 900-second wall timer expired. Allow more
+# scheduling time when the suite oversubscribes the runner. Keep the
+# original CPU ceiling per process and both independent release builds.
 source "$root/tools/suite-wall-limit.sh"
-extend_suite_wall_limit "playground build" 900 600
+extend_suite_wall_limit "playground build" 1200 600
 
 "$root/tools/build-playground.sh" "$compiler" "$out/one" > "$out/one.path" 2> "$out/one.log" &
 first=$!
