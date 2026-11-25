@@ -779,61 +779,61 @@ trusted fun __ablaRuntimeWasmCollectionIndexInsert(header: int): void {
     __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionIndex, slot, header)
 }
 
-/// Swaps two entries in the guest collection range table.
-@inline
-trusted fun __ablaRuntimeWasmCollectionRangeSwap(
-    left: int,
-    right: int
-): void {
-    val temporary = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, left)
-    __ablaRuntimeWasmScratchPut(
-        __ablaRuntimeWasmCollectionRanges, left,
-        __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, right)
-    )
-    __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionRanges, right, temporary)
-}
-
-// Heap sort gives the marker an address-ordered allocation index without
-// recursion, so interior string/array pointers resolve in logarithmic time.
-trusted fun __ablaRuntimeWasmCollectionRangeSift(
-    rootIndex: int,
-    count: int
-): void {
-    var root = rootIndex
-    var searching = true
-    while (searching) {
-        val left = root * 2 + 1
-        if (left >= count) searching = false
-        else {
-            var largest = left
-            val right = left + 1
-            if (right < count && __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges,
-                right) > __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges,
-                    left)) largest = right
-            if (__ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges,
-                largest) <= __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges,
-                    root)) searching = false
-            else {
-                __ablaRuntimeWasmCollectionRangeSwap(root, largest)
-                root = largest
-            }
-        }
-    }
-}
-
-/// Sorts the filled range entries by allocation address for containment lookup.
+// Tracked headers are 16-byte aligned 32-bit addresses. Stable radix passes
+// order the remaining 28 bits for interior-pointer lookup. Until marking
+// starts, the empty worklist doubles as the scatter buffer.
+/// Sorts the range index by header address, borrowing the unfilled hash table for its histogram.
 trusted fun __ablaRuntimeWasmCollectionRangesSort(count: int): void {
-    var root = count / 2
-    while (root > 0) {
-        root = root - 1
-        __ablaRuntimeWasmCollectionRangeSift(root, count)
+    if (count < 2) return
+    val histogram = __ablaRuntimeWasmCollectionIndex
+    var width = 4
+    while (width < 10 && (1 << width) < __ablaRuntimeWasmCollectionIndexCapacity) {
+        width = width + 1
     }
-    var remaining = count
-    while (remaining > 1) {
-        remaining = remaining - 1
-        __ablaRuntimeWasmCollectionRangeSwap(0, remaining)
-        __ablaRuntimeWasmCollectionRangeSift(0, remaining)
+    var source = __ablaRuntimeWasmCollectionRanges
+    var target = __ablaRuntimeWasmCollectionWorklist
+    var shift = 4
+    while (shift < 32) {
+        val bits = if (shift + width > 32) 32 - shift else width
+        val buckets = 1 << bits
+        val mask = buckets - 1
+        var bucket = 0
+        while (bucket < buckets) {
+            __ablaRuntimeWasmScratchPut(histogram, bucket, 0)
+            bucket = bucket + 1
+        }
+        var index = 0
+        while (index < count) {
+            val header = __ablaRuntimeWasmScratchAt(source, index)
+            val digit = (header >> shift) & mask
+            val frequency = __ablaRuntimeWasmScratchAt(histogram, digit)
+            __ablaRuntimeWasmScratchPut(histogram, digit, frequency + 1)
+            index = index + 1
+        }
+        var offset = 0
+        bucket = 0
+        while (bucket < buckets) {
+            val frequency = __ablaRuntimeWasmScratchAt(histogram, bucket)
+            __ablaRuntimeWasmScratchPut(histogram, bucket, offset)
+            offset = offset + frequency
+            bucket = bucket + 1
+        }
+        index = 0
+        while (index < count) {
+            val header = __ablaRuntimeWasmScratchAt(source, index)
+            val digit = (header >> shift) & mask
+            val cursor = __ablaRuntimeWasmScratchAt(histogram, digit)
+            __ablaRuntimeWasmScratchPut(target, cursor, header)
+            __ablaRuntimeWasmScratchPut(histogram, digit, cursor + 1)
+            index = index + 1
+        }
+        val sorted = target
+        target = source
+        source = sorted
+        shift = shift + width
     }
+    __ablaRuntimeWasmCollectionRanges = source
+    __ablaRuntimeWasmCollectionWorklist = target
 }
 
 /// Returns the header of an allocation containing the address or zero when none matches.
@@ -1194,27 +1194,27 @@ trusted fun __ablaRuntimePlatformMemorySetLayout(
 
 /// Marks a tracked allocation reachable from the candidate address and returns whether a new mark was added.
 trusted fun __ablaRuntimeWasmMarkPointer(candidate: int): bool {
-    if (candidate == 0 || __ablaRuntimeWasmCollectionCount == 0) {
-        return false
-    }
-    val mask = __ablaRuntimeWasmCollectionIndexCapacity - 1
-    var slot = ((candidate >> 4) * -7046029254386353131) & mask
-    var header = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionIndex, slot)
-    while (header != 0 && header + 32 != candidate) {
-        slot = (slot + 1) & mask
+    if (__ablaRuntimeWasmCollectionCount == 0 ||
+        candidate < __ablaRuntimeWasmCollectionMinimum ||
+        candidate >= __ablaRuntimeWasmCollectionMaximum) return false
+    var header = 0
+    // Most traced references are aligned starts. An unaligned string view
+    // needs containment lookup and cannot hit an exact-payload hash entry.
+    if ((candidate & 15) == 0) {
+        val mask = __ablaRuntimeWasmCollectionIndexCapacity - 1
+        var slot = __ablaRuntimeWasmCollectionIndexSlot(candidate)
         header = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionIndex, slot)
+        while (header != 0 && header + 32 != candidate) {
+            slot = (slot + 1) & mask
+            header = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionIndex, slot)
+        }
     }
-    if (header == 0 &&
-        candidate >= __ablaRuntimeWasmCollectionMinimum &&
-        candidate < __ablaRuntimeWasmCollectionMaximum) {
-        header = __ablaRuntimeWasmCollectionContaining(candidate)
-    }
+    if (header == 0) header = __ablaRuntimeWasmCollectionContaining(candidate)
     if (header == 0) return false
-    val payload = header + 32
-    val size = ablaRuntimeLoadI64(header + 16)
     val layout = ablaRuntimeLoadI64(header + 24)
-    if (candidate < payload || candidate - payload >= size ||
-        layout < 0 || layout >= 16) return false
+    if (layout < 0 || layout >= 16) return false
+    // Containment lookup checked the range. A hash hit may be zero-sized.
+    if (ablaRuntimeLoadI64(header + 16) <= 0) return false
     ablaRuntimeStoreI64(header + 24, layout + 16)
     val work = __ablaRuntimeWasmCollectionWorklistCount
     if (work >= __ablaRuntimeWasmCollectionCount) ablaRuntimeTrap()
@@ -1387,23 +1387,29 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     __ablaRuntimeWasmCollectionIndex =
         __ablaRuntimeWasmCollectionRanges + allocationCount * 4
     __ablaRuntimeWasmCollectionIndexCapacity = indexCapacity
-    var indexSlot = 0
-    while (indexSlot < indexCapacity) {
-        __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionIndex, indexSlot, 0)
-        indexSlot = indexSlot + 1
-    }
     __ablaRuntimeWasmCollectionCount = allocationCount
     __ablaRuntimeWasmCollectionWorklistCount = 0
     var range = 0
     var indexedHeader = __ablaRuntimeWasmAllocationTail
     while (indexedHeader != 0) {
         __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionRanges, range, indexedHeader)
-        __ablaRuntimeWasmCollectionIndexInsert(indexedHeader)
         range = range + 1
         indexedHeader = ablaRuntimeLoadI64(indexedHeader)
     }
     if (range != allocationCount) ablaRuntimeTrap()
     __ablaRuntimeWasmCollectionRangesSort(allocationCount)
+    var indexSlot = 0
+    while (indexSlot < indexCapacity) {
+        __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionIndex, indexSlot, 0)
+        indexSlot = indexSlot + 1
+    }
+    range = 0
+    while (range < allocationCount) {
+        __ablaRuntimeWasmCollectionIndexInsert(
+            __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, range)
+        )
+        range = range + 1
+    }
     __ablaRuntimeWasmMarkRootValues()
     __ablaRuntimeWasmTraceMarkedAllocations()
     // Sweep: layout 10 allocations and checkpoint markers (12) are pinned;
