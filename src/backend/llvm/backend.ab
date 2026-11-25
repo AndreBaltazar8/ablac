@@ -1028,7 +1028,9 @@ fun bootstrapWasmUnwindingParse(parsed: BootstrapParseResult): BootstrapParseRes
     }
     BootstrapParseResult(
         declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
-        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics,
+        parsed.declarationEdits, parsed.stackDepthStoppedSources, parsed.subparserSpans, parsed.subparserUses,
+        parsed.actionSources
     )
 }
 
@@ -1141,7 +1143,9 @@ fun bootstrapBackgroundFreeParse(parsed: BootstrapParseResult): BootstrapParseRe
     )
     BootstrapParseResult(
         declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
-        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics,
+        parsed.declarationEdits, parsed.stackDepthStoppedSources, parsed.subparserSpans, parsed.subparserUses,
+        parsed.actionSources
     )
 }
 
@@ -1172,8 +1176,119 @@ fun bootstrapValgrindParse(parsed: BootstrapParseResult): BootstrapParseResult {
     )
     BootstrapParseResult(
         declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
-        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics,
+        parsed.declarationEdits, parsed.stackDepthStoppedSources, parsed.subparserSpans, parsed.subparserUses,
+        parsed.actionSources
     )
+}
+
+/** `parsed` without the runtime's valgrind requests, for a build that is not for valgrind: each
+ *  `if (__ablaRuntimeHostValgrind()) a [else b]` of the host runtime (stdlib/abla/runtime/platform/host.ab) becomes `b`, or
+ *  nothing. The hooks those sites call are then neither demanded nor analysed nor lowered; left to LLVM to fold, they cost
+ *  every build 1 to 2% of its compile (#1217 follow-up). Only the host runtime's own declarations are walked. */
+fun bootstrapValgrindStripParse(parsed: BootstrapParseResult): BootstrapParseResult {
+    var changed = false
+    val declarations: array<BootstrapDeclaration> = []
+    // The indices in `declarations` of the functions the strip changed.
+    val stripped: array<int> = []
+    for (declaration in parsed.declarations) {
+        // The hooks and the request intrinsic go too: once the guards are gone nothing refers to them, and a build without
+        // the runtime prune (--no-cache) would still analyse them.
+        if (bootstrapValgrindHostRuntime(declaration.sourceIdentity) &&
+            (declaration.name.startsWith("__ablaRuntimeHostValgrind") || declaration.name == "ablaValgrindRequest")) {
+            changed = true
+            continue
+        }
+        if (declaration.kind == "fun" && bootstrapValgrindHostRuntime(declaration.sourceIdentity) &&
+            bootstrapValgrindGuarded(declaration.expression)) {
+            declarations.append(bootstrapDeclarationWithExpression(declaration, bootstrapValgrindStrip(declaration.expression)))
+            stripped.append(declarations.size - 1)
+            changed = true
+        } else declarations.append(declaration)
+    }
+    if (!changed) return parsed
+    // A wrapper left forwarding to its plain body (`__ablaRuntimeHostMalloc(size) = __ablaRuntimeHostMallocPlain(size)`)
+    // takes that body, so the plain function is not demanded either: the wrappers compile as they did before valgrind.
+    for (index in stripped) {
+        val declaration = declarations[index]
+        val target = bootstrapValgrindForwardTarget(declaration, declarations)
+        if (target >= 0) {
+            val body = declarations[target].expression
+            declarations[index] = bootstrapDeclarationWithExpression(declaration, body)
+        }
+    }
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics,
+        parsed.declarationEdits, parsed.stackDepthStoppedSources, parsed.subparserSpans, parsed.subparserUses,
+        parsed.actionSources
+    )
+}
+
+/** The index in `declarations` of the host-runtime function `declaration`'s body only forwards to, passing its own
+ *  parameters in order to a function whose parameters have the same names; or -1. */
+fun bootstrapValgrindForwardTarget(declaration: BootstrapDeclaration, declarations: array<BootstrapDeclaration>): int {
+    val body = declaration.expression
+    if (body.kind != "call" || body.children.size != declaration.parameters.size) return -1
+    var position = 0
+    while (position < body.children.size) {
+        val argument = body.children[position]
+        if (argument.kind != "identifier" || argument.text != declaration.parameters[position]) return -1
+        position = position + 1
+    }
+    var index = 0
+    while (index < declarations.size) {
+        val candidate = declarations[index]
+        if (candidate.kind == "fun" && candidate.name == body.text && bootstrapValgrindHostRuntime(candidate.sourceIdentity) &&
+            candidate.parameters.size == declaration.parameters.size) {
+            var same = true
+            var parameter = 0
+            while (parameter < candidate.parameters.size) {
+                if (candidate.parameters[parameter] != declaration.parameters[parameter]) same = false
+                parameter = parameter + 1
+            }
+            return if (same) index else -1
+        }
+        index = index + 1
+    }
+    -1
+}
+
+/** Whether `identity` (a declaration's source) is the host runtime's file, the only one with valgrind guards. */
+fun bootstrapValgrindHostRuntime(identity: string): bool {
+    val suffix = "abla/runtime/platform/host.ab"
+    if (identity.size < suffix.size) return false
+    // Compared in place, from the end (most identities differ in their last bytes): every declaration of every build asks.
+    var index = 1
+    while (index <= suffix.size) {
+        if (identity[identity.size - index] != suffix[suffix.size - index]) return false
+        index = index + 1
+    }
+    true
+}
+
+/** Whether `expression` is the test `__ablaRuntimeHostValgrind()`. */
+fun bootstrapValgrindTest(expression: BootstrapExpression): bool =
+    expression.kind == "call" && expression.text == "__ablaRuntimeHostValgrind" && expression.children.size == 0
+
+/** Whether `expression` holds an `if` on the valgrind test anywhere. */
+fun bootstrapValgrindGuarded(expression: BootstrapExpression): bool {
+    if (expression.kind == "if" && expression.children.size == 3 && bootstrapValgrindTest(expression.children[0])) return true
+    for (child in expression.children) if (bootstrapValgrindGuarded(child)) return true
+    false
+}
+
+/** `expression` with each `if` on the valgrind test replaced by its `else` branch, or an empty block when it has none. */
+fun bootstrapValgrindStrip(expression: BootstrapExpression): BootstrapExpression {
+    if (expression.kind == "if" && expression.children.size == 3 && bootstrapValgrindTest(expression.children[0])) {
+        val alternative = expression.children[2]
+        return if (alternative.kind == "missing") BootstrapExpression("block", "", expression.begin, expression.end, [])
+            else bootstrapValgrindStrip(alternative)
+    }
+    if (!bootstrapValgrindGuarded(expression)) return expression
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapValgrindStrip(child))
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
 }
 
 // Rounds of lowering that commit compile-time code's edits, at most.
@@ -1285,10 +1400,12 @@ private @noinline fun bootstrapPrepareLlvmCompilation(
         for (name in BOOTSTRAP_WASM_UNWINDING) hookNames.append(name)
     }
     // (Not for a program that runs code at compile time: a fallback would run it twice.)
-    var prunedWritten = written
+    // A build that is not for valgrind loses the runtime's valgrind requests here, before the prune and the analysis see them.
+    val unguarded = if (bootstrapLlvmValgrind) written else bootstrapValgrindStripParse(written)
+    var prunedWritten = unguarded
     bootstrapRuntimePruned = false
     bootstrapRuntimeHint = []
-    if (!bootstrapProgramRunsCompileTimeCode(written)) prunedWritten = bootstrapPruneRuntime(written, hookNames)
+    if (!bootstrapProgramRunsCompileTimeCode(written)) prunedWritten = bootstrapPruneRuntime(unguarded, hookNames)
     else if (bootstrapPruneRuntimeTrace()) linuxWriteStandardError("abla-prune-runtime skipped: the program runs code at compile time\n")
     // (Locals: a compile-time site can build another program from inside the lowering, which prunes and records on its own.)
     val prunedHere = bootstrapRuntimePruned
