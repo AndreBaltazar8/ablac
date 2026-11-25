@@ -80,8 +80,38 @@ for accepted in trusted-call open trusted-syscall; do
     "$out/$accepted" > "$out/$accepted.out" || fail "$accepted did not run"
 done
 
+# Member calls (no extension function of the standard library is marked outside abla/kernel, so a copy adds two probes):
+# a marked extension function called as a method, a marked operator function used as an operator and a method of a value
+# from an aliased import are refused (they reach the declaration by a member call, not a plain call); the same calls in a
+# trusted function are accepted. A method is not a value, a type alias names no class and indexing is no operator
+# function, so those routes do not exist.
+mkdir -p "$out/probe-stdlib"
+cp -R stdlib/. "$out/probe-stdlib/"
+cat >> "$out/probe-stdlib/abla/unsafe/memory/entry.ab" <<'PROBE'
+
+/** A probe for the trusted-only check on member calls. */
+@__abla_trusted_only("error: call the probe's checked form")
+trusted fun NativeByteBuffer.trustedOnlyProbe(index: int): int = index + this.capacity
+
+/** A probe for the trusted-only check on operators. */
+@__abla_trusted_only("error: call the probe's checked form")
+operator fun NativeByteBuffer.plus(index: int): int = index + this.capacity
+PROBE
+for refused in member-call:native.trust:NativeByteBuffer.trustedOnlyProbe member-operator:native.trust:NativeByteBuffer.plus \
+    member-alias:native.trust:.*NativeByteBuffer.trustedOnlyProbe member-value:member:NativeByteBuffer.trustedOnlyProbe \
+    type-alias:type.underlying:Bytes indexer:operator.declaration:Box.get; do
+    IFS=: read -r name rule what <<< "$refused"
+    build "$out/probe-stdlib" "$name"
+    [[ $status != 0 ]] || fail "$name built"
+    grep -q "error\[E_SEMANTIC\]: $rule:$what" "$out/$name.log" || fail "$name: no $rule:$what: $(head -4 "$out/$name.log")"
+done
+grep -q "help: call the probe's checked form" "$out/member-call.log" || fail "member-call: no help: $(head -5 "$out/member-call.log")"
+build "$out/probe-stdlib" trusted-member
+[[ $status == 0 ]] || fail "trusted-member was refused: $(head -4 "$out/trusted-member.log")"
+[[ $("$out/trusted-member") == 19 ]] || fail "trusted-member did not print 19"
+
 # The marker on a program's own declaration.
 build "$root/stdlib" reserved
 [[ $status != 0 ]] && grep -q 'annotation.reserved:__abla_trusted_only' "$out/reserved.log" ||
     fail "reserved: status $status: $(head -3 "$out/reserved.log")"
-echo "unsafe trusted-only: $count marks agree with the lists; warn phase warns and builds, the standard library does not warn; at error a call, a constructor, a reference and a raw system call are refused, trusted code, factories, checked methods and abla/sys's wrappers are not; the marker is the standard library's"
+echo "unsafe trusted-only: $count marks agree with the lists; warn phase warns and builds, the standard library does not warn; at error a call, a constructor, a reference, a raw system call and a member call or operator reaching a marked extension are refused, trusted code, factories, checked methods and abla/sys's wrappers are not; the marker is the standard library's"
