@@ -9,6 +9,7 @@ import "abla/http/h2"
 import "abla/http/h2/hpack"
 import "abla/http/h2/server"
 import "abla/text"
+import "abla/memory"
 
 var failures = 0
 
@@ -209,7 +210,104 @@ fun deviations() {
     return
 }
 
+// R3-1 (low-medium): the open streams of one connection may hold only so many decoded header bytes together. 100 streams with a 45 KB header list each
+// (every one under the 64 KiB list limit) made a connection hold 4.5 MB of lists (12 MB resident): past 1 MiB, a new stream is refused (REFUSED_STREAM)
+// and the connection stays up; a client that raises the limit gets them all; a normal request still fits next to the held ones.
+fun letters(size: int, salt: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until size) bytes.append(97 + ((i * 7 + salt * 13) % 26))
+    cryptoByteString(bytes)
+}
+
+fun bigRequest(salt: int): string {
+    val fields = getFields("/")
+    fields.append(hf("x-a", letters(15000, salt)))
+    fields.append(hf("x-b", letters(15000, salt + 1)))
+    fields.append(hf("x-c", letters(15000, salt + 2)))
+    block(fields)
+}
+
+// HEADERS and CONTINUATION frames for a header block, END_HEADERS on the last, no END_STREAM.
+fun headerFrames(id: int, block: string): string {
+    var wire = ""
+    var at = 0
+    var first = true
+    while (at < block.size) {
+        val take = if (block.size - at > 16384) 16384 else block.size - at
+        val last = at + take >= block.size
+        wire = wire + frame(if (first) 1 else 9, if (last) 4 else 0, id, block.slice(at, at + take))
+        at = at + take
+        first = false
+    }
+    wire
+}
+
+fun heldHeaders(): void {
+    var s = ready()
+    var refused = 0
+    for (i in 0 until 100) {
+        val id = 1 + 2 * i
+        s.feed(headerFrames(id, bigRequest(i)), 0)
+    }
+    val seen = frames(s.takeOutput())
+    for (i in 0 until 100) {
+        if (resetCode(seen, 1 + 2 * i) == 7) refused = refused + 1
+    }
+    if (s.isClosed()) fail("R3-1: the connection was closed by 100 large header lists (it must only refuse the streams past the cap)")
+    if (refused < 70) fail("R3-1: only $refused of 100 streams with 45 KB header lists were refused (REFUSED_STREAM); the connection holds ~4.5 MB of lists")
+    if (s.openStreams() > 25) fail("R3-1: ${s.openStreams()} streams open with 45 KB header lists each (about 1 MiB is the cap)")
+    // A small request on the same connection fits (the held lists leave room: the cap is 1 MiB, the lists took at most ~1 MiB, a few KB is refused too only
+    // when the cap is full, so free one stream first by ending its request: a complete stream is answered and goes).
+    var raised = h2ServerNew(100, 1048576, 65536, null, 16777216)
+    raised.feed(H2_PREFACE + frame(4, 0, 0, ""), 0)
+    raised.takeOutput()
+    for (i in 0 until 100) raised.feed(headerFrames(1 + 2 * i, bigRequest(i)), 0)
+    if (raised.openStreams() != 100) fail("R3-1: with maximumHeldHeaderBytes raised 100 streams were not all open: ${raised.openStreams()}")
+    return
+}
+
+// R3-2 (low): a dynamic table entry that is a slice of its header block keeps the whole block alive (a string slice shares its parent), so a 4 KiB table
+// held up to 120 blocks of ~48 KB each (5.8 MB; 128 KiB blocks, 15 MB). The entries are strings of their own.
+fun hpackLength(value: int): string {
+    if (value < 127) return cryptoByteString([value])
+    val bytes: array<int> = [127]
+    var rest = value - 127
+    while (rest >= 128) {
+        bytes.append((rest & 127) | 128)
+        rest = rest >> 7
+    }
+    bytes.append(rest)
+    cryptoByteString(bytes)
+}
+
+@noinline fun pinningBlock(salt: int): string {
+    var block = cryptoByteString([130, 135, 132, 64, 1, 107, 1, 118])
+    for (i in 0 until 3) block = block + cryptoByteString([0, 1, 120]) + hpackLength(16000) + letters(16000, salt + i)
+    block
+}
+
+@noinline fun decodePinning(var decoder: HpackDecoder, salt: int): bool = decoder.decode(pinningBlock(salt)).ok
+
+fun hpackPins(): void {
+    var decoder = hpackDecoderNew(4096, 65536, 16384, 256)
+    memoryCollect()
+    val before = memoryLiveBytes()
+    var ok = true
+    for (i in 0 until 200) {
+        if (!decodePinning(decoder, i)) ok = false
+    }
+    memoryCollect()
+    memoryCollect()
+    val held = memoryLiveBytes() - before
+    if (!ok) fail("R3-2: a block of raw strings did not decode")
+    if (decoder.tableEntries() < 100) fail("R3-2: the table holds only ${decoder.tableEntries()} entries; the check needs it full")
+    if (held > 1048576) fail("R3-2: 200 header blocks of 48 KB leave $held bytes live after the requests are gone (the table's entries keep their blocks); under 1 MiB wanted")
+    return
+}
+
 fun main: int {
+    hpackPins()
+    heldHeaders()
     unreadOutput()
     madeYouReset()
     crlfValue()

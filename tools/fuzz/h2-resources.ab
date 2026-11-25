@@ -1,0 +1,190 @@
+// What a hostile HTTP/2 client can make the server hold (#1139 area 4, round 3): the memory one connection's H2Server keeps in a
+// worst state, measured as resident-set growth over many connections, and the flood cases that must end the connection or stay
+// bounded. `h2-resources SCENARIO [CONNECTIONS [STREAMS]]` prints one line per run:
+//   SCENARIO connections=N live-bytes-per-connection=L resident-bytes-per-connection=R closed=<true|false> output=<bytes> seconds=<cpu>
+// Scenarios: idle, headers (100 streams, each with a ~48 KB header list sent as HEADERS + CONTINUATION), body (headers, then request
+// bodies until the server stops granting credit), continuation (a header block of CONTINUATION frames without END_HEADERS), ping
+// (10000 PING frames in a row), hpackpin (complete requests whose tiny indexed fields sit in 48 KB raw blocks: what the dynamic table pins), settings (200 SETTINGS frames in a row), window (WINDOW_UPDATE past 2^31-1), priority (PRIORITY frames).
+import "abla/io"
+import "abla/memory"
+import "abla/crypto"
+import "abla/text"
+import "abla/integer"
+import "abla/http"
+import "abla/http/h2"
+import "abla/http/h2/server"
+import "abla/http/h2/hpack"
+import "abla/process/arguments"
+import "abla/process/metrics"
+
+fun filler(size: int, salt: int): string {
+    val bytes: array<int> = []
+    var state = salt * 2654435761 + 12345
+    for (i in 0 until size) {
+        state = (state * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+        bytes.append(97 + ((state >> 33) % 26))
+    }
+    cryptoByteString(bytes)
+}
+
+// A request header block with three fields of `valueSize` bytes each (distinct, so no table entry is reused).
+fun bigBlock(valueSize: int, salt: int): string {
+    val encoder = hpackEncoderNew(0)
+    encoder.encode([HpackField(":method", "POST"), HpackField(":scheme", "https"), HpackField(":path", "/"), HpackField(":authority", "x"),
+        HpackField("x-a", filler(valueSize, salt)), HpackField("x-b", filler(valueSize, salt + 1)), HpackField("x-c", filler(valueSize, salt + 2))])
+}
+
+// HEADERS (+ CONTINUATION) frames for `block` on `stream`, END_HEADERS on the last, END_STREAM never.
+fun headerFrames(stream: int, block: string, endHeaders: bool = true, endStream: bool = false): string {
+    var wire = ""
+    var at = 0
+    var first = true
+    while (at < block.size || first) {
+        val take = if (block.size - at > 16384) 16384 else block.size - at
+        val last = at + take >= block.size
+        val flags = (if (last && endHeaders) 4 else 0) | (if (first && endStream) 1 else 0)
+        wire = wire + h2Frame(if (first) 1 else 9, flags, stream, block.slice(at, at + take))
+        at = at + take
+        first = false
+        if (last) break
+    }
+    wire
+}
+
+fun connection(): H2Server {
+    val server = h2ServerNew()
+    server.feed(H2_PREFACE + h2Frame(4, 0, 0, ""), 1000)
+    server
+}
+
+// The credit a server has granted in the connection-level WINDOW_UPDATE frames of its output.
+fun grantedCredit(output: string): int {
+    var credit = 0
+    var at = 0
+    while (at + 9 <= output.size) {
+        val length = (output[at] << 16) | (output[at + 1] << 8) | output[at + 2]
+        val kind = output[at + 3]
+        val stream = (output[at + 5] << 24) | (output[at + 6] << 16) | (output[at + 7] << 8) | output[at + 8]
+        if (kind == 8 && stream == 0 && length == 4 && at + 13 <= output.size) {
+            credit = credit + ((output[at + 9] << 24) | (output[at + 10] << 16) | (output[at + 11] << 8) | output[at + 12])
+        }
+        at = at + 9 + length
+    }
+    credit
+}
+
+// An HPACK integer with a 7-bit prefix (the length of a string).
+fun hpackLength(value: int): string {
+    if (value < 127) return cryptoByteString([value])
+    val bytes: array<int> = [127]
+    var rest = value - 127
+    while (rest >= 128) {
+        bytes.append((rest & 127) | 128)
+        rest = rest >> 7
+    }
+    bytes.append(rest)
+    cryptoByteString(bytes)
+}
+
+// A header block of raw (not Huffman) strings: GET https /, one tiny field added to the dynamic table ("k: v"), then three 16000-byte fields
+// that are not (they only pad the block to ~48 KB). An entry that is a slice of the block keeps all of it alive.
+fun pinningBlock(salt: int): string {
+    var block = cryptoByteString([130, 135, 132, 64, 1, 107, 1, 118])
+    for (i in 0 until 3) block = block + cryptoByteString([0, 1, 120]) + hpackLength(16000) + filler(16000, salt + i)
+    block
+}
+
+fun hostile(scenario: string, salt: int, streams: int): H2Server {
+    val server = connection()
+    var now = 1000
+    if (scenario == "refused") server.maximumHeldHeaderBytes = 1
+    if (scenario == "headers" || scenario == "body" || scenario == "refused") {
+        for (i in 0 until streams) {
+            if (server.isClosed()) break
+            server.feed(headerFrames(1 + 2 * i, bigBlock(15000, salt * 1000 + i * 3)), now)
+        }
+        if (scenario == "body") {
+            var credit = 65535
+            var spent = 0
+            var round = 0
+            val chunk = filler(16384, salt)
+            // Send body bytes to the open streams for as long as the server grants credit (it takes some back at its buffer cap).
+            while (round < 4000 && !server.isClosed()) {
+                val stream = 1 + 2 * (round % 100)
+                if (credit < 16384) {
+                    credit = credit + grantedCredit(server.takeOutput())
+                    if (credit < 16384) break
+                }
+                server.feed(h2Frame(0, 0, stream, chunk), now)
+                credit = credit - 16384
+                spent = spent + 16384
+                round = round + 1
+            }
+        }
+    } else if (scenario == "hpackpin") {
+        // Complete requests (END_STREAM), taken at once: what stays is what the connection itself holds, the dynamic table.
+        for (i in 0 until streams) {
+            if (server.isClosed()) break
+            server.feed(headerFrames(1 + 2 * i, pinningBlock(salt * 1000 + i), true, true), now)
+            server.takeRequests()
+            server.takeOutput()
+        }
+    } else if (scenario == "continuation") {
+        // 40 frames of 16 KiB of filler (the server keeps the fragments until END_HEADERS; it decodes nothing before): the block limit is 32
+        // frames and 128 KiB.
+        val fragment = filler(16384, salt)
+        var wire = h2Frame(1, 0, 1, fragment)
+        for (i in 0 until 39) wire = wire + h2Frame(9, 0, 1, fragment)
+        // Send the frames one at a time without ever ending the block (no END_HEADERS).
+        var offset = 0
+        while (offset < wire.size && !server.isClosed()) {
+            val piece = if (wire.size - offset > 16393) 16393 else wire.size - offset
+            server.feed(wire.slice(offset, offset + piece), now)
+            offset = offset + piece
+        }
+    } else if (scenario == "ping") {
+        for (i in 0 until 10000) {
+            if (server.isClosed()) break
+            server.feed(h2Frame(6, 0, 0, "abcdefgh"), now)
+        }
+    } else if (scenario == "settings") {
+        for (i in 0 until 200) {
+            if (server.isClosed()) break
+            server.feed(h2Frame(4, 0, 0, h2Setting(3, 100)), now)
+        }
+    } else if (scenario == "window") {
+        server.feed(h2Frame(8, 0, 0, h2Be32(2147483647)), now)
+        server.feed(h2Frame(8, 0, 0, h2Be32(2147483647)), now)
+    } else if (scenario == "priority") {
+        for (i in 0 until 20000) {
+            if (server.isClosed()) break
+            server.feed(h2Frame(2, 0, 1 + 2 * (i % 5000), h2Be32(0) + "\x10"), now)
+        }
+    }
+    server
+}
+
+fun main: int {
+    val scenario = processArgument(0)
+    val count = if (processArgumentCount() > 1) processArgument(1).parseInt() ?? 20 else 20
+    val streams = if (processArgumentCount() > 2) processArgument(2).parseInt() ?? 100 else 100
+    val keep: array<H2Server> = []
+    memoryCollect()
+    val before = processResidentBytes()
+    val liveBefore = memoryLiveBytes()
+    val started = processCpuUserMicroseconds()
+    var output = 0
+    var closed = 0
+    for (i in 0 until count) {
+        val server = hostile(scenario, i + 1, streams)
+        output = output + server.outputBytes
+        if (server.isClosed()) closed = closed + 1
+        if (processArgumentCount() < 4) keep.append(server)
+    }
+    for (round in 0 until 6) memoryCollect()
+    val seconds = (processCpuUserMicroseconds() - started) / 1000
+    val after = processResidentBytes()
+    val liveAfter = memoryLiveBytes()
+    println("$scenario connections=$count live-bytes-per-connection=${(liveAfter - liveBefore) / count} resident-bytes-per-connection=${(after - before) / count} closed=$closed/$count output-per-connection=${output / count} cpu-ms=$seconds")
+    0
+}

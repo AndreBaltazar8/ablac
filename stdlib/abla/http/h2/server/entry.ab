@@ -24,6 +24,9 @@ val H2_MAX_RESETS_PER_SECOND = 200
 val H2_MAX_BUFFERED_BODY_BYTES = 8388608
 // Output queued and unread: new streams are refused at twice the output cap and the connection ends at three times it (a client that never reads).
 val H2_REFUSE_OUTPUT_BYTES = 524288
+// The decoded header bytes (names and values, and the request line's) the open streams of one connection hold: a stream whose request would take it past this is refused
+// (REFUSED_STREAM, which a client retries). A header list is bounded per stream, and a connection may have 100 streams open: without this a connection holds 100 lists at once.
+val H2_MAX_HELD_HEADER_BYTES = 1048576
 /// The queued output threshold that closes the connection when exceeded.
 val H2_MAX_OUTPUT_BYTES = 786432
 
@@ -54,6 +57,8 @@ class H2ServerStream(val id: int, var recvWindow: int = 0, var sendWindow: int =
     var authority: string = "", var scheme: string = "", var headers: array<HttpHeader> = [], var chunks: array<string> = [], var received: int = 0, var contentLength: int = -1,
     var requestDone: bool = false, var sawHeaders: bool = false, var responding: bool = false, var responseBody: string = "", var responsePosition: int = 0, var head: bool = false,
     var buffered: int = 0, var abandoned: bool = false,
+    // The decoded header bytes the stream holds (counted against H2_MAX_HELD_HEADER_BYTES).
+    var headerBytes: int = 0,
     // A streaming route's exchange (streamRoute): `bodyLimit` bytes of request body (0: no limit), the response body written with writeResponse until endResponse (`bodyFinished`), `blocked` a writeResponse
     // that took less than it was given, `endSent` the response's END_STREAM is out.
     var streaming: bool = false, var bodyLimit: int = 0, var bodyFinished: bool = true, var blocked: bool = false, var endSent: bool = false,
@@ -108,11 +113,15 @@ class H2Server(
     var overflow: bool = false,
     var events: array<H2ServerEvent> = [],
     var streamRoutes: array<string> = [],
-    var streamLimits: array<int> = [])
+    var streamLimits: array<int> = [],
+    // The decoded header bytes the open streams may hold together (H2_MAX_HELD_HEADER_BYTES by default; never below one stream's header list).
+    var maximumHeldHeaderBytes: int = H2_MAX_HELD_HEADER_BYTES)
 
 /** A connection with our SETTINGS queued; the peer's preface is expected first. `maximumBodyBytes` caps a request body, `maximumStreams` the concurrent streams. */
-fun h2ServerNew(maximumStreams: int = 100, maximumBodyBytes: int = 1048576, maximumHeaderListBytes: int = 65536, peer: SocketPeerAddress? = null): H2Server {
+fun h2ServerNew(maximumStreams: int = 100, maximumBodyBytes: int = 1048576, maximumHeaderListBytes: int = 65536, peer: SocketPeerAddress? = null,
+    maximumHeldHeaderBytes: int = H2_MAX_HELD_HEADER_BYTES): H2Server {
     var server = H2Server(
+        maximumHeldHeaderBytes = if (maximumHeldHeaderBytes < maximumHeaderListBytes) maximumHeaderListBytes else maximumHeldHeaderBytes,
         decoder = hpackDecoderNew(4096, maximumHeaderListBytes, H2_MAX_FIELD_BYTES, H2_MAX_FIELDS),
         encoder = hpackEncoderNew(4096),
         output = byteBuffer(),
@@ -873,6 +882,12 @@ private fun H2Server.finishBlock(): void {
         target = path.slice(0, q)
         query = path.slice(q + 1, path.size)
     }
+    var heldHeaderBytes = method.size + scheme.size + path.size + authority.size
+    for (h in headers) heldHeaderBytes = heldHeaderBytes + h.name.size + h.value.size
+    var otherStreams = 0
+    for (open in this.streams) otherStreams = otherStreams + open.headerBytes
+    if (otherStreams + heldHeaderBytes > this.maximumHeldHeaderBytes) { this.streamError(stream, H2_REFUSED_STREAM); return }
+    this.streams[at].headerBytes = heldHeaderBytes
     this.streams[at].sawHeaders = true
     this.streams[at].method = method
     this.streams[at].scheme = scheme
