@@ -464,6 +464,7 @@ test-serial: ablac
 	tools/test-probe-stack-targets.sh $(COMPILER)
 	tools/test-native-twins.sh $(COMPILER)
 	tools/test-trusted-raw-addresses.sh
+	tools/test-export-duplicate.sh $(COMPILER)
 	tools/test-tls-handle-registry.sh $(COMPILER)
 	tools/test-stdlib-internals.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)
