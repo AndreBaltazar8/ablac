@@ -1,0 +1,104 @@
+// Kernels written in Abla (#1233, docs/design/gpu-kernels.md). A `@kernel` function is ordinary Abla restricted to what a GPU
+// can run (scalars, the buffers below, arithmetic, branches, loops, calls to such functions); the compiler checks it
+// (`kernel.<rule>`) and also compiles it for each GPU backend (CUDA: kernelPtx()). The same function runs on the CPU through
+// kernelRunCpu, where this module answers the ids.
+//
+// A kernel reads and writes device memory only through KernelF32Buffer and KernelU32Buffer, each an address and an element
+// count: an index outside the buffer loads 0 and stores nothing, on every backend. On CUDA a buffer is two kernel parameters,
+// its device address and its count (u64 each).
+import "abla/float"
+import "abla/unsafe/memory/raw"
+
+/** A buffer of `count` f32 values at `address` (host memory on the CPU, device memory on a GPU), as a kernel sees it. */
+class KernelF32Buffer(val address: int, val count: int)
+
+/** A buffer of `count` u32 values at `address`, as a kernel sees it; its elements read as ints from 0 to 2^32 - 1. */
+class KernelU32Buffer(val address: int, val count: int)
+
+/** The number of elements of the buffer (0 for an empty one, which a kernel can take for "none"). */
+fun KernelF32Buffer.size(): int = this.count
+
+/** The number of elements of the buffer. */
+fun KernelU32Buffer.size(): int = this.count
+
+/** Element `index` of the buffer, or 0 when `index` is outside it. */
+trusted fun KernelF32Buffer.load(index: int): f32 =
+    if (index >= 0 && index < this.count) f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(this.address + index * 4)))) else f32(0.0)
+
+/** Stores `value` as element `index`; does nothing when `index` is outside the buffer. */
+trusted fun KernelF32Buffer.store(index: int, value: f32): void {
+    if (index >= 0 && index < this.count) ablaUnsafeStoreU32(nativePointerFromAddress(this.address + index * 4), int(f32ToBits(value)))
+    return
+}
+
+/** Element `index` of the buffer (0 to 2^32 - 1), or 0 when `index` is outside it. */
+trusted fun KernelU32Buffer.load(index: int): int =
+    if (index >= 0 && index < this.count) ablaUnsafeLoadU32(nativePointerFromAddress(this.address + index * 4)) else 0
+
+/** Stores the low 32 bits of `value` as element `index`; does nothing when `index` is outside the buffer. */
+trusted fun KernelU32Buffer.store(index: int, value: int): void {
+    if (index >= 0 && index < this.count) ablaUnsafeStoreU32(nativePointerFromAddress(this.address + index * 4), value)
+    return
+}
+
+/** Where the CPU backend is in a launch: the thread kernelRunCpu is running. One launch at a time. */
+class KernelCpuState(var group: int, var groupY: int, var local: int, var groupSize: int)
+
+/** The CPU backend's launch position. */
+val kernelCpuState = KernelCpuState(0, 0, 0, 1)
+
+/** The thread's index in the whole launch: group * group size + local index. */
+fun kernelGlobalId(): int = kernelCpuState.group * kernelCpuState.groupSize + kernelCpuState.local
+
+/** The thread's index in its group (workgroup, CUDA block). */
+fun kernelLocalId(): int = kernelCpuState.local
+
+/** The group's index in the launch (along x, the dimension the other ids count in). */
+fun kernelGroupId(): int = kernelCpuState.group
+
+/** The group's index along y in a two-dimensional launch (kernelRunCpuGrid; CUDA's blockIdx.y); 0 in a one-dimensional one. */
+fun kernelGroupIdY(): int = kernelCpuState.groupY
+
+/** The number of threads in a group. */
+fun kernelGroupSize(): int = kernelCpuState.groupSize
+
+/** The thread's lane in its subgroup (CUDA warp). On the CPU a subgroup is one thread: 0. */
+fun kernelSubgroupLane(): int = 0
+
+/** The number of threads in a subgroup: 32 on CUDA, 1 on the CPU. A kernel written for any size runs on every backend. */
+fun kernelSubgroupSize(): int = 1
+
+/** The sum of `value` over the thread's subgroup, in every lane. Every lane of the subgroup must call it together. On the
+ *  CPU, `value` itself. */
+fun kernelSubgroupSum(value: f32): f32 = value
+
+/** x * y + z: one rounding on a GPU; on the CPU the product is exact in f64 and the sum is rounded twice (to f64, then f32). */
+fun kernelFma(x: f32, y: f32, z: f32): f32 =
+    ablaConvertF64ToF32(ablaConvertF32ToF64(x) * ablaConvertF32ToF64(y) + ablaConvertF32ToF64(z))
+
+/** Runs `body` once per thread of `groups` groups of `groupSize` threads, in order, on this thread: the CPU backend. The
+ *  kernel's ids answer the thread being run. */
+fun kernelRunCpu(groups: int, groupSize: int, body: () -> void): void = kernelRunCpuGrid(groups, 1, groupSize, body)
+
+/** Runs `body` once per thread of a grid of `groups` x `groupsY` groups of `groupSize` threads, in order, on this thread. */
+fun kernelRunCpuGrid(groups: int, groupsY: int, groupSize: int, body: () -> void): void {
+    kernelCpuState.groupSize = groupSize
+    for (groupY in 0 until groupsY) {
+        kernelCpuState.groupY = groupY
+        for (group in 0 until groups) {
+            kernelCpuState.group = group
+            for (local in 0 until groupSize) {
+                kernelCpuState.local = local
+                body()
+            }
+        }
+    }
+    kernelCpuState.group = 0
+    kernelCpuState.groupY = 0
+    kernelCpuState.local = 0
+    kernelCpuState.groupSize = 1
+}
+
+/** The PTX of every `@kernel` function of the program, one entry per kernel under its name, for the CUDA driver
+ *  (cuModuleLoadData): made by the compiler at build time; "" when the program has no kernel. */
+noescape extern:"intrinsic" fun kernelPtx(): string

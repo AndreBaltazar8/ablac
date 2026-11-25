@@ -1,0 +1,67 @@
+// `@kernel` functions on abla/kernel's CPU backend (#1233): a vector add over two groups, a grid launch whose y index picks
+// a row, and a buffer's edges (a load past the end gives 0, a store past it does nothing); and the CUDA backend's
+// parameter words (no driver: a buffer is its address and count, an f32 its bits). Returns 0 when all hold.
+import "abla/kernel"
+import "abla/kernel/cuda"
+import "abla/float"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+@kernel
+fun addVectors(a: KernelF32Buffer, b: KernelF32Buffer, c: KernelF32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) c.store(i, a.load(i) + b.load(i))
+}
+
+/** Row kernelGroupIdY() of out gets the row index times the column (columns: the x threads). */
+@kernel
+fun fillRows(out: KernelU32Buffer, columns: int) {
+    val column = kernelGlobalId()
+    if (column < columns) out.store(kernelGroupIdY() * columns + column, kernelGroupIdY() * column)
+}
+
+/** c[i] = a[i + 1] for i < n: the last one reads past `a`. */
+@kernel
+fun shifted(a: KernelF32Buffer, c: KernelF32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) {
+        c.store(i, a.load(i + 1))
+        c.store(i + n, f32(9.0))
+    }
+}
+
+/** The checks above, in order: 0, or the number of the first that failed. */
+trusted fun runChecks(): int {
+    val n = 10
+    val memory = nativeByteBuffer(n * 4 * 3)
+    val base = nativePointerAddress(memory.address)
+    val a = KernelF32Buffer(base, n)
+    val b = KernelF32Buffer(base + n * 4, n)
+    val c = KernelF32Buffer(base + n * 8, n)
+    for (i in 0 until n) {
+        a.store(i, f32FromInt(i))
+        b.store(i, f32FromInt(100 * i + 7))
+    }
+    kernelRunCpu(2, 8) { addVectors(a, b, c, n) }
+    var status = 0
+    for (i in 0 until n) if (c.load(i) != f32FromInt(101 * i + 7)) status = 1
+
+    val grid = nativeByteBuffer(3 * 5 * 4)
+    val cells = KernelU32Buffer(nativePointerAddress(grid.address), 15)
+    kernelRunCpuGrid(1, 3, 8, { fillRows(cells, 5) })
+    for (row in 0 until 3) for (column in 0 until 5) if (cells.load(row * 5 + column) != row * column) status = 2
+
+    // `a` is followed by `b` in memory (b[0] is 7): a load past `a` must give 0; a store past `guarded` leaves `after` alone.
+    val guard = nativeByteBuffer(n * 4 * 2)
+    val guarded = KernelF32Buffer(nativePointerAddress(guard.address), n)
+    val after = KernelF32Buffer(nativePointerAddress(guard.address) + n * 4, n)
+    for (i in 0 until n) after.store(i, f32(5.0))
+    kernelRunCpu(1, n) { shifted(a, guarded, n) }
+    if (guarded.load(n - 1) != f32(0.0) || guarded.load(0) != f32(1.0)) status = 3
+    for (i in 0 until n) if (after.load(i) != f32(5.0)) status = 4
+    val words = cudaKernelArguments().buffer(a).integer(-3).float(f32(1.5)).words
+    if (words.size != 4 || words[0] != base || words[1] != n || words[2] != -3 || words[3] != 1069547520) status = 5
+    status
+}
+
+fun main: int = runChecks()

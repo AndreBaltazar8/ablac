@@ -1,0 +1,53 @@
+// abla-grad's NVFP4 matrix-vector product (GGML layout: 36-byte blocks of 64 weights, four UE4M3 scales in the first word,
+// then four groups of eight bytes of E2M1 pairs) as a `@kernel`, one subgroup per row, written for any subgroup size: lane
+// `l` takes the parts l, l + size, ... (eight parts per block, four bytes each) and the subgroup sum adds them.
+import "abla/kernel"
+import "abla/float"
+
+/** Half of the UE4M3 scale `code` (GGML gives 0x7f a zero scale). */
+fun nvfp4HalfScale(code: int): f32 {
+    if (code == 127) return f32(0.0)
+    val exponent = (code >> 3) & 15
+    val mantissa = code & 7
+    if (exponent == 0) return f32FromInt(mantissa) * f32(0.0009765625)
+    f32FromBits(u32(((exponent + 119) << 23) | (mantissa << 20)))
+}
+
+/** Twice the E2M1 value `code` (low four bits): 0, 1, 2, 3, 4, 6, 8, 12 with its sign. */
+fun nvfp4DoubleValue(code: int): f32 {
+    val magnitude = f32FromInt((0xc8643210 >> (4 * (code & 7))) & 15)
+    f32FromBits(u32(int(f32ToBits(magnitude)) | ((code & 8) << 28)))
+}
+
+/** y[row] = the dot product of row `row` of the NVFP4 matrix `w` (rows x cols, cols a multiple of 64) with `x`. */
+@kernel
+fun matvecNvfp4(w: KernelU32Buffer, x: KernelF32Buffer, y: KernelF32Buffer, rows: int, cols: int) {
+    val size = kernelSubgroupSize()
+    val lane = kernelSubgroupLane()
+    val row = kernelGlobalId() / size
+    if (row >= rows) return
+    val blocks = cols / 64
+    var sum = f32(0.0)
+    var part = lane
+    while (part < blocks * 8) {
+        val block = part / 8
+        val piece = part % 8
+        val group = piece / 2
+        val base = row * blocks * 9 + block * 9
+        val scale = nvfp4HalfScale((w.load(base) >> (group * 8)) & 255)
+        val quants = w.load(base + 1 + piece)
+        val start = block * 64 + group * 16 + (piece % 2) * 4
+        var sub = f32(0.0)
+        var i = 0
+        while (i < 4) {
+            val byte = (quants >> (i * 8)) & 255
+            sub = kernelFma(nvfp4DoubleValue(byte), x.load(start + i), sub)
+            sub = kernelFma(nvfp4DoubleValue(byte >> 4), x.load(start + i + 8), sub)
+            i = i + 1
+        }
+        sum = kernelFma(scale, sub, sum)
+        part = part + size
+    }
+    val total = kernelSubgroupSum(sum)
+    if (lane == 0) y.store(row, total)
+}

@@ -28,6 +28,7 @@ Contents: [design rules](#design-rules) ·
 [compile time](#compile-time-execution) ·
 [transactions](#transactions) · [modules](#modules-and-imports) ·
 [annotations](#annotations) ·
+[GPU kernels](#gpu-kernels) ·
 [trusted and native code](#trusted-native-implementations)
 
 ## Design rules
@@ -2942,6 +2943,7 @@ declaration may carry several, each at most once.
 | `@inline` | function, method | asks the backend to inline it |
 | `@noinline` | function, method | keeps it out of line (`noinline.function`, `noinline.inline` if combined with `@inline`) |
 | `@naked` | trusted function | emits the body as raw assembly without a prologue ([llvm-backend.md](llvm-backend.md)) |
+| `@kernel` | top-level function | a GPU kernel: checked against the kernel subset and also compiled for CUDA ([GPU kernels](#gpu-kernels)) |
 | `@section("name")` | function | places it in a linker section ([llvm-backend.md](llvm-backend.md)) |
 | `@wasmImport("module")` | `extern:"c"` declaration | imports it from that Wasm module; `["module", "field"]` also renames it ([toolchain.md](toolchain.md)) |
 | `@hostImport` | `extern:"c"` declaration | the application that loads the shared library defines it: a macOS dylib leaves it undefined (an ELF library leaves any undefined symbol to the loader), and any other symbol the library does not find fails its link |
@@ -2985,6 +2987,58 @@ Exports:
 - A program entered only through its exports never runs `main`, which is what
   publishes a program's globals to the collector. The first export that reaches
   a reference global does it instead, whether the initializer is constant or not.
+
+## GPU kernels
+
+A `@kernel` function is a GPU kernel written in ordinary Abla (#1233,
+[design/gpu-kernels.md](design/gpu-kernels.md)). It runs once per thread of a
+launch, finds its thread with abla/kernel's ids, and reads and writes memory
+only through `KernelF32Buffer` and `KernelU32Buffer`. A buffer is an address and
+an element count: an index outside it loads 0 and stores nothing, on every
+backend. The same function runs:
+
+- on the CPU through `kernelRunCpu(groups, groupSize) { kernel(...) }`, which
+  runs each thread in turn on the calling thread (a subgroup there is one
+  thread);
+- on CUDA from the PTX the compiler builds for every `@kernel` of the program,
+  which `kernelPtx()` returns and abla/kernel/cuda loads and launches (the
+  program lists `nativeLibraries = ["cuda"]`; the driver compiles the PTX, no
+  CUDA toolkit is needed; the build needs LLVM's `opt` and `llc`, as cross
+  targets do).
+
+A kernel, and every function it calls, may use: `bool`, the integer types,
+`f32` and `f64` scalars; arithmetic, comparison and bit operators;
+`if`/`when`, loops and `return`; calls to other such functions (not
+recursive); the buffers; `kernelGlobalId`, `kernelLocalId`, `kernelGroupId`, `kernelGroupIdY`,
+`kernelGroupSize`; `kernelSubgroupLane`, `kernelSubgroupSize` and
+`kernelSubgroupSum` (32 lanes on CUDA, 1 on the CPU, so a kernel written for
+any size runs on both); `kernelFma`; and abla/float's bit and conversion
+functions. Anything else (a string, an array, a class value, a closure, an
+allocation, I/O, a native call) is refused when the program is built, naming
+what and where:
+
+| Diagnostic | Meaning |
+|---|---|
+| `kernel.operation:<what>` | an operation outside the subset (a string, an allocation, ...) |
+| `kernel.call:<name>` | a call to something a kernel cannot run (an extern, a native intrinsic) |
+| `kernel.recursion:<name>` | a call back into a function the kernel is already in |
+| `kernel.type:<type>` | a value of a type a kernel cannot hold (a buffer in a local, a class) |
+| `kernel.signature:<detail>` | a kernel that returns a value, or that the program does not lower |
+| `kernel.toolchain:cuda` | `opt` or `llc` failed to build the PTX |
+
+Two differences from the CPU remain: on a GPU an integer division by zero
+gives 0 (the CPU stops the program), and `kernelFma` rounds once there (twice on
+the CPU). A kernel must not depend on either.
+
+```abla fragment
+import "abla/kernel"
+
+@kernel
+fun vadd(a: KernelF32Buffer, b: KernelF32Buffer, c: KernelF32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) c.store(i, a.load(i) + b.load(i))
+}
+```
 
 ## Trusted native implementations
 

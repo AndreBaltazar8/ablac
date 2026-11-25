@@ -1,0 +1,903 @@
+// Kernels written in Abla (#1233, docs/design/gpu-kernels.md): `@kernel` functions are checked against the subset a GPU runs
+// and compiled to PTX for CUDA from their lowered IR (one module for the whole program, one entry per kernel), which the
+// program reads with abla/kernel's kernelPtx().
+import "../../ir.ab"
+import "../../parser.ab"
+import "abla/sys/linux"
+import "abla/process"
+import "abla/text"
+import "abla/array"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
+import "abla/llvm/orc"
+import "abla/unsafe/memory"
+import "bindings.ab"
+import "../../codegen_units.ab"
+
+/** The names of the program's `@kernel` functions, in declaration order. */
+fun bootstrapKernelNames(parsed: BootstrapParseResult): array<string> {
+    val names: array<string> = []
+    for (declaration in parsed.declarations) {
+        if (declaration.kind == "fun" && bootstrapDeclarationHasAnnotation(declaration, "kernel")) names.append(declaration.name)
+    }
+    names
+}
+
+/** Whether the program declares abla/kernel's kernelPtx (so a call to it may need replacing) or any kernel. */
+fun bootstrapKernelWanted(parsed: BootstrapParseResult): bool {
+    for (declaration in parsed.declarations) {
+        if (declaration.name == "kernelPtx" || bootstrapDeclarationHasAnnotation(declaration, "kernel")) return true
+    }
+    false
+}
+
+/** One instruction of lowered IR in full, for ABLA_KERNEL_DUMP_IR. */
+fun bootstrapKernelInstructionText(instruction: BootstrapInstruction): string {
+    var text = "%${instruction.result} = ${instruction.opcode}"
+    if (instruction.text != "") text = "$text text=\"${instruction.text}\""
+    if (instruction.left >= 0) text = "$text left=%${instruction.left}"
+    if (instruction.right >= 0) text = "$text right=%${instruction.right}"
+    if (instruction.target >= 0) text = "$text target=${instruction.target}"
+    if (instruction.alternate >= 0) text = "$text alternate=${instruction.alternate}"
+    if (instruction.operands.size > 0) {
+        var operands = ""
+        for (operand in instruction.operands) operands = if (operands == "") "%$operand" else "$operands, %$operand"
+        text = "$text operands=[$operands]"
+    }
+    if (instruction.texts.size > 0) {
+        var texts = ""
+        for (item in instruction.texts) texts = if (texts == "") "\"$item\"" else "$texts, \"$item\""
+        text = "$text texts=[$texts]"
+    }
+    text
+}
+
+/** A lowered function in full: its signature, locals and instructions, for ABLA_KERNEL_DUMP_IR. */
+fun bootstrapKernelFunctionText(function: BootstrapIrFunction): string {
+    var text = "function ${function.name}("
+    var index = 0
+    while (index < function.parameters.size) {
+        val type = if (index < function.parameterTypes.size) function.parameterTypes[index] else "?"
+        text = if (index == 0) "$text${function.parameters[index]}: $type" else "$text, ${function.parameters[index]}: $type"
+        index = index + 1
+    }
+    text = "$text): ${function.resultType}\n"
+    index = 0
+    while (index < function.locals.size) {
+        val type = if (index < function.localTypes.size) function.localTypes[index] else "?"
+        text = "$text  local ${function.locals[index].name}: $type\n"
+        index = index + 1
+    }
+    for (instruction in function.instructions) text = "$text  ${bootstrapKernelInstructionText(instruction)}\n"
+    text
+}
+
+/** The lowered function named `name`, or -1. */
+fun bootstrapKernelFunctionIndex(program: BootstrapIrProgram, name: string): int {
+    var index = 0
+    while (index < program.functions.size) {
+        if (program.functions[index].name == name) return index
+        index = index + 1
+    }
+    -1
+}
+
+/** What building the program's kernels found: diagnostics (error[...] lines) and how many errors. */
+class BootstrapKernelResult(val diagnostics: string, val errors: int)
+
+/** Replaces every call of abla/kernel's kernelPtx() in `program` with the constant `ptx`. */
+fun bootstrapKernelReplacePtx(var program: BootstrapIrProgram, ptx: string): void {
+    var top = 0
+    while (top < program.instructions.size) {
+        val instruction = program.instructions[top]
+        if (instruction.opcode == "extern.intrinsic" && instruction.text == "kernelPtx") {
+            program.instructions[top] = BootstrapInstruction(
+                "const.string", instruction.result, -1, -1, ptx, -1, -1, [], [], instruction.position
+            )
+        }
+        top = top + 1
+    }
+    for (function in program.functions) {
+        var index = 0
+        while (index < function.instructions.size) {
+            val instruction = function.instructions[index]
+            if (instruction.opcode == "extern.intrinsic" && instruction.text == "kernelPtx") {
+                function.instructions[index] = BootstrapInstruction(
+                    "const.string", instruction.result, -1, -1, ptx, -1, -1, [], [], instruction.position
+                )
+            }
+            index = index + 1
+        }
+    }
+}
+
+/** Whether `names` holds `name`. */
+fun bootstrapKernelHas(names: array<string>, name: string): bool {
+    for (item in names) if (item == name) return true
+    false
+}
+
+// ---- The CUDA lowering: textual LLVM IR for nvptx64 from lowered IR ----
+
+/** A value in a kernel: its LLVM operand, its Abla type ("i64", "u32", "f32", "bool", "void", or "buffer.f32" /
+ *  "buffer.u32"), and for a buffer the operand of its element count. */
+class BootstrapKernelValue(val operand: string, val type: string, val count: string)
+
+/** One function being lowered: its text so far (after the allocas), the block it is in, and its values by IR result. */
+class BootstrapKernelFunctionState(
+    val name: string,
+    val entry: bool,
+    var text: string,
+    var allocas: string,
+    var block: string,
+    var terminated: bool,
+    var counter: int,
+    val values: array<BootstrapKernelValue>,
+    val localNames: array<string>,
+    val localTypes: array<string>,
+    val parameterNames: array<string>,
+    val parameterTypes: array<string>,
+    val resultType: string
+)
+
+/** The module being built: the functions lowered so far, the declarations they need, and what went wrong. */
+class BootstrapKernelEmitter(
+    val program: BootstrapIrProgram,
+    var functions: string,
+    val declarations: array<string>,
+    var diagnostics: string,
+    var errors: int,
+    val done: array<string>,
+    val active: array<string>,
+    val context: i64*
+)
+
+/** The LLVM type of the Abla scalar `type`, or "" when a kernel cannot hold it. */
+fun bootstrapKernelLlvmType(type: string): string {
+    if (type == "i64" || type == "u64" || type == "int") return "i64"
+    if (type == "i32" || type == "u32") return "i32"
+    if (type == "i16" || type == "u16") return "i16"
+    if (type == "i8" || type == "u8") return "i8"
+    if (type == "bool") return "i1"
+    if (type == "f32") return "float"
+    if (type == "f64") return "double"
+    ""
+}
+
+/** Whether the Abla scalar `type` is unsigned (bool counts as unsigned). */
+fun bootstrapKernelUnsigned(type: string): bool =
+    type == "u8" || type == "u16" || type == "u32" || type == "u64" || type == "bool"
+
+/** Whether the Abla scalar `type` is a float. */
+fun bootstrapKernelFloat(type: string): bool = type == "f32" || type == "f64"
+
+/** The bit width of the Abla scalar `type`. */
+fun bootstrapKernelBits(type: string): int {
+    val llvm = bootstrapKernelLlvmType(type)
+    if (llvm == "i64" || llvm == "double") return 64
+    if (llvm == "i32" || llvm == "float") return 32
+    if (llvm == "i16") return 16
+    if (llvm == "i8") return 8
+    1
+}
+
+/** The kernel value type of an abla/kernel buffer class, or "". */
+fun bootstrapKernelBufferType(type: string): string {
+    if (type == "KernelF32Buffer") return "buffer.f32"
+    if (type == "KernelU32Buffer") return "buffer.u32"
+    ""
+}
+
+/** `name` with every character outside [A-Za-z0-9_] replaced by '_', as PTX symbols need. */
+fun bootstrapKernelSymbol(name: string): string {
+    var result = ""
+    var index = 0
+    while (index < name.size) {
+        val byte = name[index]
+        val keep = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57) || byte == 95
+        result = if (keep) "$result${name.slice(index, index + 1)}" else "${result}_"
+        index = index + 1
+    }
+    result
+}
+
+/** Reports `rule` for `detail` in function `function` (a kernel or something one calls). */
+fun bootstrapKernelFail(var emitter: BootstrapKernelEmitter, function: string, rule: string, detail: string): void {
+    emitter.diagnostics = "${emitter.diagnostics}error[E_SEMANTIC]: kernel.$rule:$detail: `$function` is part of a @kernel " +
+        "function, which runs on a GPU: only scalars, abla/kernel's buffers and ids, arithmetic, branches, loops and calls " +
+        "to such functions\n"
+    emitter.errors = emitter.errors + 1
+}
+
+/** Adds the declaration `line` to the module once. */
+fun bootstrapKernelDeclare(var emitter: BootstrapKernelEmitter, line: string): void {
+    for (existing in emitter.declarations) if (existing == line) return
+    emitter.declarations.append(line)
+}
+
+/** A fresh LLVM value name in `state`. */
+fun bootstrapKernelFresh(var state: BootstrapKernelFunctionState): string {
+    state.counter = state.counter + 1
+    "%k${state.counter}"
+}
+
+/** Appends one instruction line to `state`. */
+fun bootstrapKernelLine(var state: BootstrapKernelFunctionState, line: string): void {
+    state.text = "${state.text}  $line\n"
+}
+
+/** Starts block `label` in `state` (after a branch to it when the current block falls through). */
+fun bootstrapKernelBlock(var state: BootstrapKernelFunctionState, label: string): void {
+    if (!state.terminated) bootstrapKernelLine(state, "br label %$label")
+    state.text = "${state.text}$label:\n"
+    state.block = label
+    state.terminated = false
+}
+
+/** Records `value` as the IR result `id`. */
+fun bootstrapKernelSet(var state: BootstrapKernelFunctionState, id: int, value: BootstrapKernelValue): void {
+    if (id < 0) return
+    while (state.values.size <= id) state.values.append(BootstrapKernelValue("", "none", ""))
+    state.values[id] = value
+}
+
+/** The value of IR result `id`, or one of type "none". */
+fun bootstrapKernelGet(state: BootstrapKernelFunctionState, id: int): BootstrapKernelValue =
+    if (id >= 0 && id < state.values.size) state.values[id] else BootstrapKernelValue("", "none", "")
+
+/** The operand of `value` converted to the Abla scalar `to` (wrapping between integers, saturating from floats to
+ *  integers, as the CPU backend does), or "" after reporting why it cannot be. */
+fun bootstrapKernelConvert(
+    var emitter: BootstrapKernelEmitter,
+    var state: BootstrapKernelFunctionState,
+    value: BootstrapKernelValue,
+    to: string
+): string {
+    val from = value.type
+    val fromLlvm = bootstrapKernelLlvmType(from)
+    val toLlvm = bootstrapKernelLlvmType(to)
+    if (fromLlvm == "" || toLlvm == "") {
+        bootstrapKernelFail(emitter, state.name, "type", if (fromLlvm == "") from else to)
+        return ""
+    }
+    if (fromLlvm == toLlvm && (from == "bool") == (to == "bool")) return value.operand
+    val result = bootstrapKernelFresh(state)
+    val fromFloat = bootstrapKernelFloat(from)
+    val toFloat = bootstrapKernelFloat(to)
+    if (!fromFloat && !toFloat) {
+        if (to == "bool") bootstrapKernelLine(state, "$result = icmp ne $fromLlvm ${value.operand}, 0")
+        else if (bootstrapKernelBits(to) < bootstrapKernelBits(from))
+            bootstrapKernelLine(state, "$result = trunc $fromLlvm ${value.operand} to $toLlvm")
+        else if (bootstrapKernelUnsigned(from))
+            bootstrapKernelLine(state, "$result = zext $fromLlvm ${value.operand} to $toLlvm")
+        else bootstrapKernelLine(state, "$result = sext $fromLlvm ${value.operand} to $toLlvm")
+    } else if (!fromFloat) {
+        val op = if (bootstrapKernelUnsigned(from)) "uitofp" else "sitofp"
+        bootstrapKernelLine(state, "$result = $op $fromLlvm ${value.operand} to $toLlvm")
+    } else if (toFloat) {
+        val op = if (bootstrapKernelBits(to) > bootstrapKernelBits(from)) "fpext" else "fptrunc"
+        bootstrapKernelLine(state, "$result = $op $fromLlvm ${value.operand} to $toLlvm")
+    } else {
+        val name = "llvm.fpto${if (bootstrapKernelUnsigned(to)) "u" else "s"}i.sat.$toLlvm.$fromLlvm"
+        bootstrapKernelDeclare(emitter, "declare $toLlvm @$name($fromLlvm)")
+        bootstrapKernelLine(state, "$result = call $toLlvm @$name($fromLlvm ${value.operand})")
+    }
+    result
+}
+
+/** The LLVM text of the float constant `text` (as lowered IR writes it, C99 hexadecimal) of Abla type `type`. */
+trusted fun bootstrapKernelFloatConstant(emitter: BootstrapKernelEmitter, type: string, text: string): string {
+    val llvmType = if (type == "f32") LLVMFloatTypeInContext(emitter.context) else LLVMDoubleTypeInContext(emitter.context)
+    val constant = LLVMConstRealOfStringAndSize(llvmType, text, i32(text.size))
+    val printed = LLVMPrintValueToString(constant)
+    val rendered = nativeCString(printed)
+    LLVMDisposeMessage(printed)
+    val space = rendered.indexOf(" ")
+    if (space < 0) rendered else rendered.slice(space + 1, rendered.size)
+}
+
+/** Reads a PTX special register (tid.x, ctaid.x, ntid.x, laneid) as an i64. */
+fun bootstrapKernelRegister(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState, register: string): string {
+    val name = "llvm.nvvm.read.ptx.sreg.$register"
+    bootstrapKernelDeclare(emitter, "declare i32 @$name()")
+    val raw = bootstrapKernelFresh(state)
+    bootstrapKernelLine(state, "$raw = call i32 @$name()")
+    val wide = bootstrapKernelFresh(state)
+    bootstrapKernelLine(state, "$wide = zext i32 $raw to i64")
+    wide
+}
+
+/** A binary operator of lowered IR. */
+fun bootstrapKernelBinary(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState, instruction: BootstrapInstruction): void {
+    val op = instruction.opcode
+    val left = bootstrapKernelGet(state, instruction.left)
+    val right = bootstrapKernelGet(state, instruction.right)
+    val type = if (left.type == "none" || left.type == "void") right.type else left.type
+    val ty = bootstrapKernelLlvmType(type)
+    if (ty == "") { bootstrapKernelFail(emitter, state.name, "type", "$type (operator $op)"); return }
+    val a = bootstrapKernelConvert(emitter, state, left, type)
+    val b = bootstrapKernelConvert(emitter, state, right, type)
+    if (a == "" || b == "") return
+    val float = bootstrapKernelFloat(type)
+    val unsigned = bootstrapKernelUnsigned(type)
+    val result = bootstrapKernelFresh(state)
+    var resultType = type
+    if (op == "+" || op == "-" || op == "*") {
+        val name = if (op == "+") "add" else if (op == "-") "sub" else "mul"
+        bootstrapKernelLine(state, "$result = ${if (float) "f" else ""}$name $ty $a, $b")
+    } else if ((op == "/" || op == "%") && float) {
+        bootstrapKernelLine(state, "$result = ${if (op == "/") "fdiv" else "frem"} $ty $a, $b")
+    } else if (op == "/" || op == "%") {
+        // A zero divisor gives 0 (the CPU backend stops the program instead); the minimum over -1 wraps.
+        val zero = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$zero = icmp eq $ty $b, 0")
+        val minusOne = bootstrapKernelFresh(state)
+        if (unsigned) bootstrapKernelLine(state, "$minusOne = icmp eq i1 0, 1")
+        else bootstrapKernelLine(state, "$minusOne = icmp eq $ty $b, -1")
+        val unsafe = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$unsafe = or i1 $zero, $minusOne")
+        val divisor = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$divisor = select i1 $unsafe, $ty 1, $ty $b")
+        val quotient = bootstrapKernelFresh(state)
+        val name = (if (unsigned) "u" else "s") + (if (op == "/") "div" else "rem")
+        bootstrapKernelLine(state, "$quotient = $name $ty $a, $divisor")
+        val negated = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$negated = sub $ty 0, $a")
+        val byMinusOne = if (op == "/") negated else "0"
+        val adjusted = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$adjusted = select i1 $minusOne, $ty $byMinusOne, $ty $quotient")
+        bootstrapKernelLine(state, "$result = select i1 $zero, $ty 0, $ty $adjusted")
+    } else if (op == "&" || op == "|" || op == "^" || op == "&&" || op == "||") {
+        val name = if (op == "&" || op == "&&") "and" else if (op == "|" || op == "||") "or" else "xor"
+        bootstrapKernelLine(state, "$result = $name $ty $a, $b")
+    } else if (op == "<<" || op == ">>" || op == ">>>") {
+        // A count below 0 or at least the width gives 0, as on the CPU.
+        val bits = bootstrapKernelBits(type)
+        val negative = bootstrapKernelFresh(state)
+        if (unsigned) bootstrapKernelLine(state, "$negative = icmp eq i1 0, 1")
+        else bootstrapKernelLine(state, "$negative = icmp slt $ty $b, 0")
+        val large = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$large = icmp ${if (unsigned) "uge" else "sge"} $ty $b, $bits")
+        val invalid = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$invalid = or i1 $negative, $large")
+        val count = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$count = select i1 $invalid, $ty 0, $ty $b")
+        val shifted = bootstrapKernelFresh(state)
+        val name = if (op == "<<") "shl" else if (op == ">>>" || unsigned) "lshr" else "ashr"
+        bootstrapKernelLine(state, "$shifted = $name $ty $a, $count")
+        bootstrapKernelLine(state, "$result = select i1 $invalid, $ty 0, $ty $shifted")
+    } else if (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") {
+        resultType = "bool"
+        val predicate = if (float) {
+            if (op == "==") "oeq" else if (op == "!=") "une" else if (op == "<") "olt" else if (op == "<=") "ole"
+                else if (op == ">") "ogt" else "oge"
+        } else {
+            val prefix = if (unsigned) "u" else "s"
+            if (op == "==") "eq" else if (op == "!=") "ne" else if (op == "<") "${prefix}lt" else if (op == "<=") "${prefix}le"
+                else if (op == ">") "${prefix}gt" else "${prefix}ge"
+        }
+        bootstrapKernelLine(state, "$result = ${if (float) "fcmp" else "icmp"} $predicate $ty $a, $b")
+    } else {
+        bootstrapKernelFail(emitter, state.name, "operation", op)
+        return
+    }
+    bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, resultType, ""))
+}
+
+/** A bounds-checked load from or store to a kernel buffer: an index outside it loads 0 and stores nothing. */
+fun bootstrapKernelBufferAccess(
+    var emitter: BootstrapKernelEmitter,
+    var state: BootstrapKernelFunctionState,
+    instruction: BootstrapInstruction,
+    store: bool
+): void {
+    if (instruction.operands.size < (if (store) 3 else 2)) {
+        bootstrapKernelFail(emitter, state.name, "operation", instruction.text)
+        return
+    }
+    val buffer = bootstrapKernelGet(state, instruction.operands[0])
+    if (bootstrapKernelBufferType(buffer.type) == "" && !buffer.type.startsWith("buffer.")) {
+        bootstrapKernelFail(emitter, state.name, "type", buffer.type)
+        return
+    }
+    val element = if (buffer.type == "buffer.f32") "float" else "i32"
+    val index = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
+    if (index == "") return
+    val inside = bootstrapKernelFresh(state)
+    bootstrapKernelLine(state, "$inside = icmp ult i64 $index, ${buffer.count}")
+    if (!store) {
+        // A load is predicated, not branched around: the address is formed for any index and `ld.global` runs only when
+        // the index is inside, else the result is 0. Without a branch per load, the loads of a loop can be in flight
+        // together (a branch each made the NVFP4 matvec latency-bound: 300 GB/s against the CUDA C kernel's 960).
+        val address = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$address = getelementptr $element, ptr addrspace(1) ${buffer.operand}, i64 $index")
+        val flag = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$flag = zext i1 $inside to i32")
+        val raw = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$raw = call i32 asm \"{ .reg .pred p; setp.ne.u32 p, \$2, 0; mov.b32 \$0, 0; @p ld.global.b32 \$0, [\$1]; }\", \"=r,l,r,~{memory}\"(ptr addrspace(1) $address, i32 $flag)")
+        val result = bootstrapKernelFresh(state)
+        if (element == "float") {
+            bootstrapKernelLine(state, "$result = bitcast i32 $raw to float")
+            bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, "f32", ""))
+        } else {
+            bootstrapKernelLine(state, "$result = zext i32 $raw to i64")
+            bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, "i64", ""))
+        }
+        return
+    }
+    state.counter = state.counter + 1
+    val label = "kb${state.counter}"
+    bootstrapKernelLine(state, "br i1 $inside, label %$label.in, label %$label.end")
+    state.terminated = true
+    bootstrapKernelBlock(state, "$label.in")
+    val address = bootstrapKernelFresh(state)
+    bootstrapKernelLine(state, "$address = getelementptr inbounds $element, ptr addrspace(1) ${buffer.operand}, i64 $index")
+    val stored = bootstrapKernelGet(state, instruction.operands[2])
+    val operand = bootstrapKernelConvert(emitter, state, stored, if (element == "float") "f32" else "u32")
+    if (operand == "") return
+    bootstrapKernelLine(state, "store $element $operand, ptr addrspace(1) $address, align 4")
+    bootstrapKernelBlock(state, "$label.end")
+    bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "void", ""))
+}
+
+/** A call to abla/kernel's ids, subgroup operations and fma, which each backend answers itself; false when `name` is
+ *  none of them. */
+fun bootstrapKernelBuiltin(
+    var emitter: BootstrapKernelEmitter,
+    var state: BootstrapKernelFunctionState,
+    instruction: BootstrapInstruction
+): bool {
+    val name = instruction.text
+    var result = ""
+    var type = "i64"
+    if (name == "kernelLocalId") result = bootstrapKernelRegister(emitter, state, "tid.x")
+    else if (name == "kernelGroupId") result = bootstrapKernelRegister(emitter, state, "ctaid.x")
+    else if (name == "kernelGroupIdY") result = bootstrapKernelRegister(emitter, state, "ctaid.y")
+    else if (name == "kernelGroupSize") result = bootstrapKernelRegister(emitter, state, "ntid.x")
+    else if (name == "kernelSubgroupLane") result = bootstrapKernelRegister(emitter, state, "laneid")
+    else if (name == "kernelSubgroupSize") result = "32"
+    else if (name == "kernelGlobalId") {
+        val local = bootstrapKernelRegister(emitter, state, "tid.x")
+        val group = bootstrapKernelRegister(emitter, state, "ctaid.x")
+        val size = bootstrapKernelRegister(emitter, state, "ntid.x")
+        val base = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$base = mul i64 $group, $size")
+        result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = add i64 $base, $local")
+    } else if (name == "kernelSubgroupSum") {
+        if (instruction.operands.size < 1) return false
+        var sum = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[0]), "f32")
+        if (sum == "") return true
+        bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.shfl.sync.bfly.f32(i32, float, i32, i32)")
+        for (width in [16, 8, 4, 2, 1]) {
+            val other = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$other = call float @llvm.nvvm.shfl.sync.bfly.f32(i32 -1, float $sum, i32 $width, i32 31)")
+            val next = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$next = fadd float $sum, $other")
+            sum = next
+        }
+        result = sum
+        type = "f32"
+    } else if (name == "kernelFma") {
+        if (instruction.operands.size < 3) return false
+        val x = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[0]), "f32")
+        val y = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "f32")
+        val z = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[2]), "f32")
+        if (x == "" || y == "" || z == "") return true
+        bootstrapKernelDeclare(emitter, "declare float @llvm.fma.f32(float, float, float)")
+        result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = call float @llvm.fma.f32(float $x, float $y, float $z)")
+        type = "f32"
+    } else if (name == "extension_KernelF32Buffer_size" || name == "extension_KernelU32Buffer_size") {
+        if (instruction.operands.size < 1) return false
+        val buffer = bootstrapKernelGet(state, instruction.operands[0])
+        if (!buffer.type.startsWith("buffer.")) { bootstrapKernelFail(emitter, state.name, "type", buffer.type); return true }
+        result = buffer.count
+    } else if (name == "extension_KernelF32Buffer_load" || name == "extension_KernelU32Buffer_load") {
+        bootstrapKernelBufferAccess(emitter, state, instruction, false)
+        return true
+    } else if (name == "extension_KernelF32Buffer_store" || name == "extension_KernelU32Buffer_store") {
+        bootstrapKernelBufferAccess(emitter, state, instruction, true)
+        return true
+    } else return false
+    bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, type, ""))
+    true
+}
+
+/** An abla/float or abla/core conversion intrinsic a kernel may reach (f32FromBits, f32FromInt, ...); false for any other. */
+fun bootstrapKernelIntrinsic(
+    var emitter: BootstrapKernelEmitter,
+    var state: BootstrapKernelFunctionState,
+    instruction: BootstrapInstruction
+): bool {
+    val name = instruction.text
+    if (instruction.operands.size != 1) return false
+    val operand = bootstrapKernelGet(state, instruction.operands[0])
+    // Conversions: the operand as `from`, the result as `to`.
+    var from = ""
+    var to = ""
+    if (name == "ablaConvertI64ToF64") { from = "i64"; to = "f64" }
+    else if (name == "ablaConvertF64ToF32") { from = "f64"; to = "f32" }
+    else if (name == "ablaConvertF32ToF64") { from = "f32"; to = "f64" }
+    else if (name == "ablaConvertU32ToF32") { from = "u32"; to = "f32" }
+    else if (name == "ablaConvertI32ToF32") { from = "i32"; to = "f32" }
+    else if (name == "ablaConvertF32ToU32") { from = "f32"; to = "u32" }
+    else if (name == "ablaConvertF32ToI32") { from = "f32"; to = "i32" }
+    else if (name == "ablaConvertF64ToI64") { from = "f64"; to = "i64" }
+    if (from != "") {
+        val input = bootstrapKernelConvert(emitter, state, operand, from)
+        if (input == "") return true
+        val output = bootstrapKernelConvert(emitter, state, BootstrapKernelValue(input, from, ""), to)
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(output, to, ""))
+        return true
+    }
+    // Bit casts: the operand as the integer of the float's width, or the float.
+    var integer = ""
+    var float = ""
+    var toFloat = false
+    if (name == "ablaBitI32ToF32") { integer = "i32"; float = "f32"; toFloat = true }
+    else if (name == "ablaBitF32ToI32") { integer = "i32"; float = "f32" }
+    else if (name == "ablaBitI64ToF64") { integer = "i64"; float = "f64"; toFloat = true }
+    else if (name == "ablaBitF64ToI64") { integer = "i64"; float = "f64" }
+    if (integer == "") return false
+    val result = bootstrapKernelFresh(state)
+    if (toFloat) {
+        val input = bootstrapKernelConvert(emitter, state, operand, integer)
+        if (input == "") return true
+        bootstrapKernelLine(state, "$result = bitcast ${bootstrapKernelLlvmType(integer)} $input to ${bootstrapKernelLlvmType(float)}")
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, float, ""))
+    } else {
+        val input = bootstrapKernelConvert(emitter, state, operand, float)
+        if (input == "") return true
+        bootstrapKernelLine(state, "$result = bitcast ${bootstrapKernelLlvmType(float)} $input to ${bootstrapKernelLlvmType(integer)}")
+        // The 32-bit pattern comes back as an int (sign-extended, as ablaBitF32ToI32 answers on the CPU).
+        val wide = if (integer == "i32") bootstrapKernelConvert(emitter, state, BootstrapKernelValue(result, "i32", ""), "i64") else result
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(wide, "i64", ""))
+    }
+    true
+}
+
+/** The index of local `name` in `state`, or -1. */
+fun bootstrapKernelLocal(state: BootstrapKernelFunctionState, name: string): int {
+    var index = 0
+    while (index < state.localNames.size) {
+        if (state.localNames[index] == name) return index
+        index = index + 1
+    }
+    -1
+}
+
+/** The index of parameter `name` in `state`, or -1. */
+fun bootstrapKernelParameter(state: BootstrapKernelFunctionState, name: string): int {
+    var index = 0
+    while (index < state.parameterNames.size) {
+        if (state.parameterNames[index] == name) return index
+        index = index + 1
+    }
+    -1
+}
+
+/** Whether local `index` holds a scalar (an untyped local, such as an `if` result in a function that returns nothing,
+ *  holds nothing a kernel reads). */
+fun bootstrapKernelLocalScalar(state: BootstrapKernelFunctionState, index: int): bool =
+    bootstrapKernelLlvmType(state.localTypes[index]) != ""
+
+/** A call to another function from a kernel: lowered once (internal, inlined by opt), recursion refused. */
+fun bootstrapKernelCall(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState, instruction: BootstrapInstruction): void {
+    val name = instruction.text
+    val index = bootstrapKernelFunctionIndex(emitter.program, name)
+    if (index < 0) { bootstrapKernelFail(emitter, state.name, "call", name); return }
+    val callee = emitter.program.functions[index]
+    if (bootstrapKernelHas(emitter.active, name)) { bootstrapKernelFail(emitter, state.name, "recursion", name); return }
+    if (!bootstrapKernelHas(emitter.done, name)) {
+        emitter.done.append(name)
+        bootstrapKernelEmitFunction(emitter, index, false)
+    }
+    var arguments = ""
+    var position = 0
+    while (position < callee.parameters.size) {
+        val parameterType = if (position < callee.parameterTypes.size) callee.parameterTypes[position] else "unknown"
+        val argument = if (position < instruction.operands.size) bootstrapKernelGet(state, instruction.operands[position])
+            else BootstrapKernelValue("", "none", "")
+        val buffer = bootstrapKernelBufferType(parameterType)
+        var text = ""
+        if (buffer != "") {
+            if (argument.type != buffer) { bootstrapKernelFail(emitter, state.name, "type", "${argument.type} for $buffer"); return }
+            text = "ptr addrspace(1) ${argument.operand}, i64 ${argument.count}"
+        } else {
+            val converted = bootstrapKernelConvert(emitter, state, argument, parameterType)
+            if (converted == "") return
+            text = "${bootstrapKernelLlvmType(parameterType)} $converted"
+        }
+        arguments = if (arguments == "") text else "$arguments, $text"
+        position = position + 1
+    }
+    val symbol = "abla_k_${bootstrapKernelSymbol(name)}"
+    val resultLlvm = bootstrapKernelLlvmType(callee.resultType)
+    if (resultLlvm == "") {
+        bootstrapKernelLine(state, "call void @$symbol($arguments)")
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "void", ""))
+    } else {
+        val result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = call $resultLlvm @$symbol($arguments)")
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, callee.resultType, ""))
+    }
+}
+
+/** Lowers one IR instruction of a kernel function. */
+fun bootstrapKernelInstruction(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState, instruction: BootstrapInstruction): void {
+    val op = instruction.opcode
+    if (op == "label") {
+        bootstrapKernelBlock(state, "L${instruction.target}")
+        return
+    }
+    if (state.terminated) {
+        // Code after a return or a jump that no label starts: unreachable, kept in a block of its own.
+        state.counter = state.counter + 1
+        state.text = "${state.text}kd${state.counter}:\n"
+        state.block = "kd${state.counter}"
+        state.terminated = false
+    }
+    if (op == "jump") {
+        bootstrapKernelLine(state, "br label %L${instruction.target}")
+        state.terminated = true
+    } else if (op == "branch") {
+        val condition = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.left), "bool")
+        if (condition == "") return
+        bootstrapKernelLine(state, "br i1 $condition, label %L${instruction.target}, label %L${instruction.alternate}")
+        state.terminated = true
+    } else if (op == "return") {
+        val resultLlvm = bootstrapKernelLlvmType(state.resultType)
+        if (state.entry || resultLlvm == "") bootstrapKernelLine(state, "ret void")
+        else {
+            val value = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.left), state.resultType)
+            if (value == "") return
+            bootstrapKernelLine(state, "ret $resultLlvm $value")
+        }
+        state.terminated = true
+    } else if (op == "parameter.load") {
+        val index = bootstrapKernelParameter(state, instruction.text)
+        if (index < 0) { bootstrapKernelFail(emitter, state.name, "operation", "parameter ${instruction.text}"); return }
+        val type = state.parameterTypes[index]
+        val symbol = bootstrapKernelSymbol(instruction.text)
+        val buffer = bootstrapKernelBufferType(type)
+        if (buffer != "") bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("%p.$symbol", buffer, "%p.$symbol.count"))
+        else bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("%p.$symbol", type, ""))
+    } else if (op == "local.declare" || op == "local.assign" || op == "local.set") {
+        val index = bootstrapKernelLocal(state, instruction.text)
+        if (index < 0 || !bootstrapKernelLocalScalar(state, index)) {
+            val value = bootstrapKernelGet(state, instruction.left)
+            if (value.type.startsWith("buffer.")) {
+                bootstrapKernelFail(emitter, state.name, "type", "a local holding a buffer")
+                return
+            }
+            // An untyped local (the result of an `if` used as a value) takes the type of the first scalar stored in it.
+            if (index < 0 || bootstrapKernelLlvmType(value.type) == "") return
+            state.localTypes[index] = value.type
+            state.allocas = "${state.allocas}  %l$index = alloca ${bootstrapKernelLlvmType(value.type)}\n"
+        }
+        val type = state.localTypes[index]
+        val value = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.left), type)
+        if (value == "") return
+        bootstrapKernelLine(state, "store ${bootstrapKernelLlvmType(type)} $value, ptr %l$index")
+    } else if (op == "local.zero" || op.startsWith("local.zero.")) {
+        val index = bootstrapKernelLocal(state, instruction.text)
+        // `local.zero.<type>` (the result of `&&`, `||` or an `if` used as a value) names the type of an untyped local.
+        val named = if (op.size > 11) op.slice(11, op.size) else ""
+        if (index >= 0 && !bootstrapKernelLocalScalar(state, index) && bootstrapKernelLlvmType(named) != "") {
+            state.localTypes[index] = named
+            state.allocas = "${state.allocas}  %l$index = alloca ${bootstrapKernelLlvmType(named)}\n"
+        }
+        if (index >= 0 && bootstrapKernelLocalScalar(state, index)) {
+            val llvm = bootstrapKernelLlvmType(state.localTypes[index])
+            val zero = if (bootstrapKernelFloat(state.localTypes[index])) "0.0" else if (llvm == "i1") "false" else "0"
+            bootstrapKernelLine(state, "store $llvm $zero, ptr %l$index")
+        }
+    } else if (op == "local.load") {
+        val index = bootstrapKernelLocal(state, instruction.text)
+        if (index < 0 || !bootstrapKernelLocalScalar(state, index)) {
+            bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "void", ""))
+            return
+        }
+        val type = state.localTypes[index]
+        val result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = load ${bootstrapKernelLlvmType(type)}, ptr %l$index")
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, type, ""))
+    } else if (op.startsWith("const.")) {
+        val type = op.slice(6, op.size)
+        if (type == "void") bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "void", ""))
+        else if (bootstrapKernelFloat(type))
+            bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(bootstrapKernelFloatConstant(emitter, type, instruction.text), type, ""))
+        else if (bootstrapKernelLlvmType(type) != "")
+            bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(instruction.text, type, ""))
+        else bootstrapKernelFail(emitter, state.name, "operation", type)
+    } else if (op == "scalar.cast") {
+        val value = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.left), instruction.text)
+        if (value != "") bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(value, instruction.text, ""))
+    } else if (op == "neg" || op == "bit.not" || op == "not") {
+        val value = bootstrapKernelGet(state, instruction.left)
+        val type = if (op == "not") "bool" else value.type
+        val ty = bootstrapKernelLlvmType(type)
+        val operand = bootstrapKernelConvert(emitter, state, value, type)
+        if (operand == "") return
+        val result = bootstrapKernelFresh(state)
+        if (op == "neg" && bootstrapKernelFloat(type)) bootstrapKernelLine(state, "$result = fneg $ty $operand")
+        else if (op == "neg") bootstrapKernelLine(state, "$result = sub $ty 0, $operand")
+        else if (op == "not") bootstrapKernelLine(state, "$result = xor i1 $operand, true")
+        else bootstrapKernelLine(state, "$result = xor $ty $operand, -1")
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, type, ""))
+    } else if (op == "call") {
+        if (!bootstrapKernelBuiltin(emitter, state, instruction)) bootstrapKernelCall(emitter, state, instruction)
+    } else if (op == "extern.intrinsic") {
+        if (!bootstrapKernelIntrinsic(emitter, state, instruction)) bootstrapKernelFail(emitter, state.name, "call", instruction.text)
+    } else if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^" ||
+        op == "<<" || op == ">>" || op == ">>>" || op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" ||
+        op == ">=" || op == "&&" || op == "||") {
+        bootstrapKernelBinary(emitter, state, instruction)
+    } else {
+        bootstrapKernelFail(emitter, state.name, "operation", op)
+    }
+}
+
+/** Lowers the program's function `functionIndex` into the module: a kernel entry (`ptx_kernel`, its buffers in global memory) when `entry`, else an
+ *  internal function a kernel calls. */
+fun bootstrapKernelEmitFunction(var emitter: BootstrapKernelEmitter, functionIndex: int, entry: bool): void {
+    val function = emitter.program.functions[functionIndex]
+    val localNames: array<string> = []
+    val localTypes: array<string> = []
+    var index = 0
+    while (index < function.locals.size) {
+        localNames.append(function.locals[index].name)
+        localTypes.append(if (index < function.localTypes.size) function.localTypes[index] else "unknown")
+        index = index + 1
+    }
+    val parameterTypes: array<string> = []
+    index = 0
+    while (index < function.parameters.size) {
+        parameterTypes.append(if (index < function.parameterTypes.size) function.parameterTypes[index] else "unknown")
+        index = index + 1
+    }
+    val state = BootstrapKernelFunctionState(
+        function.name, entry, "", "", "entry", false, 0, [], localNames, localTypes, function.parameters, parameterTypes,
+        function.resultType
+    )
+    // The signature: a buffer is its address in global memory and its element count.
+    var parameters = ""
+    index = 0
+    while (index < function.parameters.size) {
+        val type = parameterTypes[index]
+        val symbol = bootstrapKernelSymbol(function.parameters[index])
+        val buffer = bootstrapKernelBufferType(type)
+        var text = ""
+        if (buffer != "") text = "ptr addrspace(1) %p.$symbol, i64 %p.$symbol.count"
+        else if (bootstrapKernelLlvmType(type) != "") text = "${bootstrapKernelLlvmType(type)} %p.$symbol"
+        else {
+            bootstrapKernelFail(emitter, function.name, "type", "parameter ${function.parameters[index]}: $type")
+            return
+        }
+        parameters = if (parameters == "") text else "$parameters, $text"
+        index = index + 1
+    }
+    val resultLlvm = bootstrapKernelLlvmType(function.resultType)
+    if (entry && resultLlvm != "") {
+        bootstrapKernelFail(emitter, function.name, "signature", "a kernel returns nothing (it returns ${function.resultType})")
+        return
+    }
+    if (!entry && resultLlvm == "" && function.resultType != "void" && function.resultType != "unknown") {
+        bootstrapKernelFail(emitter, function.name, "type", "result ${function.resultType}")
+        return
+    }
+    // Locals live in allocas (opt's mem2reg makes them registers).
+    index = 0
+    while (index < localTypes.size) {
+        val llvm = bootstrapKernelLlvmType(localTypes[index])
+        if (llvm != "" && bootstrapKernelParameter(state, localNames[index]) < 0) state.allocas = "${state.allocas}  %l$index = alloca $llvm\n"
+        index = index + 1
+    }
+    emitter.active.append(function.name)
+    val errorsBefore = emitter.errors
+    for (instruction in function.instructions) {
+        bootstrapKernelInstruction(emitter, state, instruction)
+        if (emitter.errors > errorsBefore) break
+    }
+    val _left = emitter.active.removeLast()
+    if (emitter.errors > errorsBefore) return
+    if (!state.terminated) bootstrapKernelLine(state, if (entry || resultLlvm == "") "ret void" else "unreachable")
+    val head = if (entry) "define ptx_kernel void @${bootstrapKernelSymbol(function.name)}($parameters)"
+        else "define internal ${if (resultLlvm == "") "void" else resultLlvm} @abla_k_${bootstrapKernelSymbol(function.name)}($parameters) alwaysinline"
+    emitter.functions = "${emitter.functions}$head {\nentry:\n${state.allocas}${state.text}}\n\n"
+}
+
+/** The LLVM module (text) of the program's kernels for CUDA, or diagnostics in `emitter` when a kernel leaves the subset. */
+trusted fun bootstrapKernelCudaModule(var emitter: BootstrapKernelEmitter, names: array<string>): string {
+    for (name in names) {
+        val index = bootstrapKernelFunctionIndex(emitter.program, name)
+        if (index < 0) {
+            bootstrapKernelFail(emitter, name, "signature", "a @kernel function is a top-level function the program lowers")
+            continue
+        }
+        bootstrapKernelEmitFunction(emitter, index, true)
+    }
+    var declarations = ""
+    for (line in emitter.declarations) declarations = "$declarations$line\n"
+    "target triple = \"nvptx64-nvidia-cuda\"\n\n${emitter.functions}$declarations"
+}
+
+/** An LLVM tool for the kernel build: from ABLA_LLVM_TOOLS (shell.nix sets it), else found on PATH. NVPTX is not in the
+ *  compiler's own LLVM, so the kernels go through the host's opt and llc, as the cross targets do. */
+fun bootstrapKernelTool(name: string): string {
+    val configured = processEnvironmentOr("ABLA_LLVM_TOOLS", "")
+    if (configured != "" && Path("$configured/$name").exists()) "$configured/$name" else name
+}
+
+/** PTX for `module` (LLVM text for nvptx64): opt -O3 and llc for sm_80 (Ampere; the driver compiles it forward for
+ *  newer GPUs such as Ada's sm_89), or "" with `failure` set to what went wrong. */
+fun bootstrapKernelCompilePtx(module: string, var failure: array<string>): string {
+    val base = processEnvironmentOr("TMPDIR", "/tmp")
+    val directory = Path("$base/abla-kernel-${linuxProcessId()}")
+    if (!directory.createDirectories()) { failure.append("cannot create ${directory.text}"); return "" }
+    val source = directory.child("kernels.ll")
+    val optimized = directory.child("kernels.bc")
+    val output = directory.child("kernels.ptx")
+    val log = directory.child("tools.log")
+    var ptx = ""
+    if (!source.writeText(module)) failure.append("cannot write ${source.text}")
+    else {
+        val architecture = "sm_80"
+        val opt = linuxCommand(bootstrapKernelTool("opt")).argument("-O3").argument(source.text).argument("-o")
+            .argument(optimized.text).errors(log.text).run()
+        val llc = if (opt != 0) opt else linuxCommand(bootstrapKernelTool("llc")).argument("-O3")
+            .argument("-mcpu=$architecture").argument(optimized.text).argument("-o").argument(output.text).errors(log.text).run()
+        if (opt != 0 || llc != 0) {
+            val reason = log.readText()
+            failure.append("${if (opt != 0) "opt" else "llc"} exited ${if (opt != 0) opt else llc}: ${reason.slice(0, if (reason.size > 2000) 2000 else reason.size)} (module kept in ${source.text})")
+            return ""
+        }
+        ptx = output.readText()
+    }
+    if (processEnvironmentOr("ABLA_KERNEL_KEEP", "") == "") directory.removeTree()
+    ptx
+}
+
+/** Checks and builds the program's kernels and replaces each kernelPtx() call with the PTX (or "" when there are none). */
+trusted fun bootstrapKernelBuild(parsed: BootstrapParseResult, var program: BootstrapIrProgram): BootstrapKernelResult {
+    val names = bootstrapKernelNames(parsed)
+    if (processEnvironmentOr("ABLA_KERNEL_DUMP_IR", "") != "") {
+        for (function in program.functions) linuxWriteStandardError(bootstrapKernelFunctionText(function))
+    }
+    if (names.size == 0) {
+        bootstrapKernelReplacePtx(program, "")
+        return BootstrapKernelResult("", 0)
+    }
+    val context = LLVMContextCreate()
+    val emitter = BootstrapKernelEmitter(program, "", [], "", 0, [], [], context)
+    val module = bootstrapKernelCudaModule(emitter, names)
+    LLVMContextDispose(context)
+    if (emitter.errors > 0) return BootstrapKernelResult(emitter.diagnostics, emitter.errors)
+    if (processEnvironmentOr("ABLA_KERNEL_DUMP_LLVM", "") != "") linuxWriteStandardError(module)
+    var ptx = ""
+    if (bootstrapKernelPtxWanted(program)) {
+        val failure: array<string> = []
+        ptx = bootstrapKernelCompilePtx(module, failure)
+        if (failure.size > 0) {
+            return BootstrapKernelResult(
+                "error[E_SEMANTIC]: kernel.toolchain:cuda: the kernels' PTX could not be built: ${failure[0]}\n", 1
+            )
+        }
+    }
+    bootstrapKernelReplacePtx(program, ptx)
+    BootstrapKernelResult("", 0)
+}
+
+/** Whether the program calls kernelPtx() anywhere (only then is the PTX built). */
+fun bootstrapKernelPtxWanted(program: BootstrapIrProgram): bool {
+    for (instruction in program.instructions) {
+        if (instruction.opcode == "extern.intrinsic" && instruction.text == "kernelPtx") return true
+    }
+    for (function in program.functions) {
+        for (instruction in function.instructions) {
+            if (instruction.opcode == "extern.intrinsic" && instruction.text == "kernelPtx") return true
+        }
+    }
+    false
+}

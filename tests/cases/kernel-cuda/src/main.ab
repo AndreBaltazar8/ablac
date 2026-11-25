@@ -1,0 +1,149 @@
+// The same `@kernel` functions on the CPU backend (kernelRunCpu) and on CUDA (abla/kernel/cuda, the PTX the compiler built):
+// vadd gives the same floats on both; the NVFP4 matvec (abla-grad's) agrees within 1e-5 of its largest output (the GPU's fma
+// rounds once, the CPU's twice), and the rows past `rows` stay untouched on both. Without a CUDA driver or GPU it says so
+// and passes.
+import "vadd.ab"
+import "nvfp4.ab"
+import "edges.ab"
+import "abla/kernel"
+import "abla/kernel/cuda"
+import "abla/float"
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+/** Stores the low 32 bits of `value` little endian at byte `offset` of `buffer`. */
+fun storeWord(var buffer: NativeByteBuffer, offset: int, value: int): void {
+    for (k in 0 until 4) buffer.store(offset + k, (value >> (k * 8)) & 255)
+}
+
+/** A buffer of `count` f32 values, value(i) each. */
+fun floats(count: int, value: (int) -> f32): NativeByteBuffer {
+    val buffer = nativeByteBuffer(count * 4)
+    for (index in 0 until count) storeWord(buffer, index * 4, int(f32ToBits(value(index))))
+    buffer
+}
+
+/** Element `index` of a buffer of f32 values. */
+trusted fun floatAt(buffer: NativeByteBuffer, index: int): f32 =
+    KernelF32Buffer(nativePointerAddress(buffer.address), buffer.capacity / 4).load(index)
+
+/** NVFP4 weights for `rows` x `cols` (GGML blocks of 36 bytes), pseudo-random, with zero and subnormal scales. */
+fun nvfp4Weights(rows: int, cols: int): NativeByteBuffer {
+    val words = rows * cols / 64 * 9
+    val buffer = nativeByteBuffer(words * 4)
+    var seed = 12345
+    for (index in 0 until words) {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        var word = seed & 4294967295
+        if (index % 9 == 0) {
+            word = 0
+            for (s in 0 until 4) {
+                seed = (seed * 1103515245 + 12345) & 2147483647
+                var code = ((1 + seed % 9) << 3) | (seed >> 8 & 7)
+                if (seed % 17 == 0) code = seed >> 4 & 7
+                if (seed % 23 == 0) code = 127
+                word = word | (code << (s * 8))
+            }
+        }
+        storeWord(buffer, index * 4, word)
+    }
+    buffer
+}
+
+trusted fun main: int {
+    val device = cudaKernelDevice()
+    if (!device.ready()) {
+        println("kernel-cuda: skipped (${device.error})")
+        return 0
+    }
+    // vadd on both backends.
+    val n = 100000
+    val a = floats(n) { i -> f32FromInt(i) * f32(0.5) }
+    val b = floats(n) { i -> f32FromInt(1000 - i) }
+    val cpu = floats(n) { i -> f32(0.0) }
+    val cpuOut = KernelF32Buffer(nativePointerAddress(cpu.address), n)
+    val cpuA = KernelF32Buffer(nativePointerAddress(a.address), n)
+    val cpuB = KernelF32Buffer(nativePointerAddress(b.address), n)
+    kernelRunCpu((n + 255) / 256, 256) { vadd(cpuA, cpuB, cpuOut, n) }
+    val da = device.allocate(n * 4)
+    val db = device.allocate(n * 4)
+    val dc = device.allocate(n * 4)
+    if (da == null || db == null || dc == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val gpu = floats(n) { i -> f32(0.0) }
+    if (!device.upload(da, a) || !device.upload(db, b) ||
+        !device.launch("vadd", (n + 255) / 256, 256, cudaKernelArguments().buffer(da.floats()).buffer(db.floats())
+            .buffer(dc.floats()).integer(n)) || !device.download(dc, gpu)) {
+        println("kernel-cuda: vadd: ${device.error}")
+        return 1
+    }
+    var vaddEqual = true
+    for (i in 0 until n) if (floatAt(gpu, i) != floatAt(cpu, i)) vaddEqual = false
+    println("vadd: $n elements, GPU equal to CPU $vaddEqual")
+
+    // NVFP4 matvec: one subgroup per row on the GPU (8 warps per group), one thread per row on the CPU.
+    val rows = 1000
+    val cols = 512
+    val weights = nvfp4Weights(rows, cols)
+    val x = floats(cols) { i -> f32FromInt(i % 13 - 6) / f32(4.0) }
+    val cpuY = floats(rows + 8) { i -> f32(-7.0) }
+    val w = KernelU32Buffer(nativePointerAddress(weights.address), rows * cols / 64 * 9)
+    val cpuX = KernelF32Buffer(nativePointerAddress(x.address), cols)
+    val yOut = KernelF32Buffer(nativePointerAddress(cpuY.address), rows + 8)
+    kernelRunCpu(rows + 8, 1) { matvecNvfp4(w, cpuX, yOut, rows, cols) }
+    val dw = device.allocate(weights.capacity)
+    val dx = device.allocate(x.capacity)
+    val dy = device.allocate((rows + 8) * 4)
+    if (dw == null || dx == null || dy == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val gpuY = floats(rows + 8) { i -> f32(-7.0) }
+    val groups = (rows + 8 + 7) / 8
+    if (!device.upload(dw, weights) || !device.upload(dx, x) || !device.upload(dy, gpuY) ||
+        !device.launch("matvecNvfp4", groups, 256, cudaKernelArguments().buffer(dw.words()).buffer(dx.floats())
+            .buffer(dy.floats()).integer(rows).integer(cols)) || !device.download(dy, gpuY)) {
+        println("kernel-cuda: matvecNvfp4: ${device.error}")
+        return 1
+    }
+    var worst = 0.0
+    var largest = 0.0
+    for (row in 0 until rows) {
+        val got = f32ToF64(floatAt(gpuY, row))
+        val want = f32ToF64(floatAt(cpuY, row))
+        val difference = if (got > want) got - want else want - got
+        if (difference > worst) worst = difference
+        val magnitude = if (want < 0.0) -want else want
+        if (magnitude > largest) largest = magnitude
+    }
+    var untouched = true
+    for (row in rows until rows + 8) {
+        if (floatAt(gpuY, row) != f32(-7.0) || floatAt(cpuY, row) != f32(-7.0)) untouched = false
+    }
+    val agree = worst <= largest * 0.00001 && largest > 1.0
+    println("matvecNvfp4: $rows x $cols, GPU within 1e-5 of CPU $agree, rows past the end untouched $untouched")
+
+    // Buffer edges: `a` and `c` are 64 elements of memory that holds 128 (the rest 5.0, a guard): reading past `a` gives 0,
+    // not the guard, and storing past `c` leaves its guard alone, on both backends.
+    val m = 64
+    val edgeIn = floats(m * 2) { i -> if (i < m) f32FromInt(i) else f32(5.0) }
+    val cpuEdge = floats(m * 2) { i -> f32(5.0) }
+    val edgeA = KernelF32Buffer(nativePointerAddress(edgeIn.address), m)
+    val edgeC = KernelF32Buffer(nativePointerAddress(cpuEdge.address), m)
+    kernelRunCpu(1, m) { edges(edgeA, edgeC, m) }
+    val de = device.allocate(m * 8)
+    val dc2 = device.allocate(m * 8)
+    if (de == null || dc2 == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val gpuEdge = floats(m * 2) { i -> f32(5.0) }
+    if (!device.upload(de, edgeIn) || !device.upload(dc2, gpuEdge) ||
+        !device.launch("edges", 1, m, cudaKernelArguments().buffer(KernelF32Buffer(de.address, m))
+            .buffer(KernelF32Buffer(dc2.address, m)).integer(m)) || !device.download(dc2, gpuEdge)) {
+        println("kernel-cuda: edges: ${device.error}")
+        return 1
+    }
+    var edgesRight = true
+    for (i in 0 until m * 2) {
+        val want = if (i < m - 3) f32FromInt(i + 3) else if (i < m) f32(0.0) else f32(5.0)
+        if (floatAt(cpuEdge, i) != want || floatAt(gpuEdge, i) != want) edgesRight = false
+    }
+    println("edges: loads past a buffer give 0 and stores past it do nothing, on the GPU and the CPU $edgesRight")
+    device.close()
+    if (vaddEqual && agree && untouched && edgesRight) 0 else 1
+}

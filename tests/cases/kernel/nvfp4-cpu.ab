@@ -1,0 +1,89 @@
+// The NVFP4 matvec kernel (nvfp4.ab) on the CPU backend (kernelRunCpu) against an independent f64 reference of the GGML
+// layout: every row within 1e-5 of the reference (relative to the largest output), and a row past `rows` writes nothing.
+import "../kernel-cuda/src/nvfp4.ab"
+import "abla/kernel"
+import "abla/float"
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+fun referenceHalfScale(code: int): f64 {
+    if (code == 127) return 0.0
+    val exponent = (code >> 3) & 15
+    val mantissa = f64FromInt(code & 7)
+    if (exponent == 0) return mantissa / 1024.0
+    var power = 1.0
+    var e = exponent - 8
+    while (e > 0) { power = power * 2.0; e = e - 1 }
+    while (e < 0) { power = power / 2.0; e = e + 1 }
+    (1.0 + mantissa / 8.0) * power
+}
+
+fun referenceDoubleValue(code: int): f64 {
+    val magnitudes = [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]
+    val magnitude = magnitudes[code & 7]
+    if ((code & 8) != 0) -magnitude else magnitude
+}
+
+/** Stores the low 32 bits of `value` little endian at byte `offset` of `buffer`. */
+fun storeWord(var buffer: NativeByteBuffer, offset: int, value: int): void {
+    for (k in 0 until 4) buffer.store(offset + k, (value >> (k * 8)) & 255)
+}
+
+trusted fun main: int {
+    val rows = 37
+    val cols = 256
+    val blocks = cols / 64
+    val words = nativeByteBuffer(rows * blocks * 36)
+    var seed = 12345
+    for (index in 0 until rows * blocks * 9) {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        var word = seed & 4294967295
+        if (index % 9 == 0) {
+            // Four scales with exponents 1..9 (no 0x7f), and one subnormal and one zero code now and then.
+            word = 0
+            for (s in 0 until 4) {
+                seed = (seed * 1103515245 + 12345) & 2147483647
+                var code = ((1 + seed % 9) << 3) | (seed >> 8 & 7)
+                if (seed % 17 == 0) code = seed >> 4 & 7
+                if (seed % 23 == 0) code = 127
+                word = word | (code << (s * 8))
+            }
+        }
+        storeWord(words, index * 4, word)
+    }
+    val inputs = nativeByteBuffer(cols * 4)
+    for (index in 0 until cols) storeWord(inputs, index * 4, int(f32ToBits(f32FromInt(index % 13 - 6) / f32(4.0))))
+    val outputs = nativeByteBuffer((rows + 1) * 4)
+    for (index in 0 until rows + 1) storeWord(outputs, index * 4, int(f32ToBits(f32(-7.0))))
+    val w = KernelU32Buffer(nativePointerAddress(words.address), rows * blocks * 9)
+    val x = KernelF32Buffer(nativePointerAddress(inputs.address), cols)
+    val y = KernelF32Buffer(nativePointerAddress(outputs.address), rows + 1)
+    kernelRunCpu(rows + 1, 1) { matvecNvfp4(w, x, y, rows, cols) }
+
+    var worst = 0.0
+    var largest = 0.0
+    for (row in 0 until rows) {
+        var sum = 0.0
+        for (block in 0 until blocks) {
+            val base = (row * blocks + block) * 36
+            for (group in 0 until 4) {
+                val scale = referenceHalfScale(words.load(base + group))
+                for (k in 0 until 8) {
+                    val byte = words.load(base + 4 + group * 8 + k)
+                    val low = f32ToF64(x.load(block * 64 + group * 16 + k))
+                    val high = f32ToF64(x.load(block * 64 + group * 16 + k + 8))
+                    sum = sum + scale * (referenceDoubleValue(byte & 15) * low + referenceDoubleValue(byte >> 4) * high)
+                }
+            }
+        }
+        val got = f32ToF64(y.load(row))
+        val difference = if (got > sum) got - sum else sum - got
+        if (difference > worst) worst = difference
+        val magnitude = if (sum < 0.0) -sum else sum
+        if (magnitude > largest) largest = magnitude
+    }
+    val untouched = y.load(rows) == f32(-7.0)
+    println("rows $rows, largest ${largest > 1.0}, within ${worst <= largest * 0.00001}, past rows untouched $untouched")
+    if (worst <= largest * 0.00001 && largest > 1.0 && untouched) 0 else 1
+}
