@@ -944,7 +944,7 @@ fun bootstrapAnalysisReplayShiftedTemporary(before: Json, after: Json,
 
 // Reuse the previous checked graph for a single type-inert body splice.
 fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQueryIndex,
-    documents: array<BootstrapAnalysisGraphDocument>, entry: string,
+    documents: array<BootstrapAnalysisGraphDocument>, entry: string, project: BootstrapFrontendHostProject,
     before: BootstrapAnalysisReplayInputs, after: BootstrapAnalysisReplayInputs): BootstrapAnalysisReplaySnapshot? {
     if (!previous.snapshot.get("complete").asBoolean() ||
         previous.snapshot.getString("entry") != entry ||
@@ -953,7 +953,12 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
     for (index in 0 until documents.size) {
         val document = documents[index].document
         val old = previous.snapshot.get("documents").values[index]
-        if (old.getString("uri") != document.uri || old.get("diagnostics").values.size != 0) return bootstrapAnalysisRejectReplay("old document or diagnostics")
+        if (old.getString("uri") != document.uri) return bootstrapAnalysisRejectReplay("old document")
+        for (diagnostic in old.get("diagnostics").values) {
+            if (!this.graphUnusedImports || diagnostic.getString("code") != "W_UNUSED_IMPORT") {
+                return bootstrapAnalysisRejectReplay("old diagnostics")
+            }
+        }
         if (old.getString("text") != document.text) {
             if (changed >= 0) return bootstrapAnalysisRejectReplay("multiple changed sources")
             changed = index
@@ -1007,6 +1012,14 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
     val uris: array<string> = []
     val offsetIdPrefix = "abla:$changedPath:"
     val contractIdPrefix = "abla:$changedPath#contract:"
+    // The syntax-side use facts have been checked above. The proof preserves
+    // resolved names, so the checked use facts still describe this revision.
+    // Run the same warning pass against the new source and import locations.
+    val warnings = if (this.graphUnusedImports) {
+        val uses: Map<string, bool> = Map()
+        for (key in before.checkedImportUses) uses.set(key, true)
+        bootstrapUnusedImportWarnings(uses)
+    } else ""
     for (index in 0 until documents.size) {
         val document = documents[index]
         val uri = document.document.uri
@@ -1019,8 +1032,14 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
             if (id.startsWith(offsetIdPrefix) || id.startsWith(contractIdPrefix) || retired.has(id)) return bootstrapAnalysisRejectReplay("offset ID")
         }
         val old = previous.snapshot.get("documents").values[index]
+        val diagnostics = if (warnings == "") jsonArray([])
+            else bootstrapAnalysisGraphDiagnostics(document, project, "", warnings)
+        val diagnosticText = jsonStringify(diagnostics)
+        if (index != changed && diagnosticText != jsonStringify(old.get("diagnostics"))) {
+            return bootstrapAnalysisRejectReplay("untouched diagnostics changed")
+        }
         val fingerprint = if (index == changed)
-            "${document.document.version}|${document.key}|${bootstrapAnalysisGraphSetHash(updated)}|${bootstrapAnalysisGraphHash("[]")}"
+            "${document.document.version}|${document.key}|${bootstrapAnalysisGraphSetHash(updated)}|${bootstrapAnalysisGraphHash(diagnosticText)}"
             else this.graphFingerprint("${previous.revision}", uri)
         if (fingerprint == "") return bootstrapAnalysisRejectReplay("fingerprint missing")
         fingerprints.set(uri, fingerprint)
@@ -1028,7 +1047,7 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
         sets.set(key, set)
         values.append(if (index != changed) old else bootstrapAnalysisGraphDocumentJson(
             uri, document.document.version, document.document.text,
-            bootstrapAnalysisStableSymbols(document.symbols, document.stable), jsonNull(), old.get("diagnostics")
+            bootstrapAnalysisStableSymbols(document.symbols, document.stable), jsonNull(), diagnostics
         ))
     }
     val generated: Map<string, Json> = Map()
@@ -1084,7 +1103,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
     }
     val setting = linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TYPING")
     val replay = reuseTyping && this.graphStableIds && setting.value != "0" &&
-        !this.graphUnusedImports && !this.graphUnusedLocals && !this.graphUnusedParameters &&
+        !this.graphUnusedLocals && !this.graphUnusedParameters &&
         !this.graphUnusedDeclarations && !this.graphJsonConstruction
     if (!replay && this.graphIndexRevision != this.revision) this.graphQueryIndex = null
     bootstrapAnalysisSampleMemory("analysis begin")
@@ -1188,7 +1207,8 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
                 metadata.append(this.graphInputValues[index])
             }
         }
-        BootstrapAnalysisReplayInputs(syntax.copy(), metadata)
+        val syntaxImportUses: array<string> = if (this.graphUnusedImports) bootstrapImportUses.keys() else []
+        BootstrapAnalysisReplayInputs(syntax.copy(), metadata, syntaxImportUses)
     } else null
     if (replay && linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TRACE").value == "1" && syntax != null) {
         linuxPrintStandardError("abla-analysis-typing capture ready=${replayInputs != null} valid=${syntax.replayable} bytes=${syntax.expansionBytes} errors=${project.written.errors} diagnostics=${project.written.diagnostics.size} pending=${pending.size}\n")
@@ -1197,11 +1217,12 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
         val prior = this.graphQueryIndex
         val before = this.graphReplayInputs
         if (prior != null && before != null) {
-            val reused = this.graphReplayBody(prior, documents, entry, before, replayInputs)
+            val reused = this.graphReplayBody(prior, documents, entry, project, before, replayInputs)
             if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
             if (reused != null) {
                 this.graphReplayInputs = BootstrapAnalysisReplayInputs(replayInputs.syntax.copy(),
-                    bootstrapModuleCopyStrings(replayInputs.metadata))
+                    bootstrapModuleCopyStrings(replayInputs.metadata),
+                    replayInputs.syntaxImportUses, bootstrapModuleCopyStrings(before.checkedImportUses))
                 this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(reused.snapshot, this.revision, reused.sets, reused.generated)
                 this.graphIndexRevision = this.revision
                 this.graphRememberGeneration(BootstrapAnalysisGraphGeneration(reused.snapshot.getString("revision"), reused.fingerprints, reused.uris))
@@ -1230,7 +1251,8 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
     if (replay) {
         this.graphReplayInputs = if (replayInputs != null && analyzed != null && analyzed.semantic.errors == 0 &&
             analyzed.semantic.extensionErrors == 0 && analyzed.semantic.diagnostics == "") {
-            BootstrapAnalysisReplayInputs(replayInputs.syntax.copy(), bootstrapModuleCopyStrings(replayInputs.metadata))
+            BootstrapAnalysisReplayInputs(replayInputs.syntax.copy(), bootstrapModuleCopyStrings(replayInputs.metadata),
+                replayInputs.syntaxImportUses, if (this.graphUnusedImports) bootstrapImportUses.keys() else [])
         } else null
     }
     bootstrapAnalysisSampleMemory("typed")

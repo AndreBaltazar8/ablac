@@ -16,11 +16,12 @@ const uri = (file) => pathToFileURL(file).href;
 const bytes = (text) => Buffer.byteLength(text);
 
 class Session {
-    constructor(project, { mode = 'graph-v1', initialize = true, env = process.env, log = 'service.stderr' } = {}) {
+    constructor(project, { mode = 'graph-v1', initialize = true, env = process.env, log = 'service.stderr', unusedImports = false } = {}) {
         this.id = 0;
         this.project = project;
         this.mode = mode;
         this.initialize = initialize;
+        this.unusedImports = unusedImports;
         this.env = env;
         this.log = path.join(project, log);
     }
@@ -31,7 +32,7 @@ class Session {
         this.exit = new Promise((resolve) => this.process.on('close', resolve));
         this.lines = readline.createInterface({ input: this.process.stdout })[Symbol.asyncIterator]();
         if (!this.initialize) return this;
-        const params = { workspaceRoots: [this.project], clientName: 'graph-fixture', clientVersion: '1', analysisMode: this.mode };
+        const params = { workspaceRoots: [this.project], clientName: 'graph-fixture', clientVersion: '1', analysisMode: this.mode, unusedImports: this.unusedImports };
         const init = (await this.rpc('initialize', params)).result;
         assert.equal(init.protocolVersion, 1);
         assert.ok(init.capabilities.includes('module-graph-analysis-v1'));
@@ -1236,7 +1237,67 @@ async function incrementalBodyReplay() {
     }
 }
 
-const tests = { body_replay: incrementalBodyReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+async function incrementalUnusedImportReplay() {
+    const original = 'import "factory.ab"\nimport "method.ab"\nimport "unused.ab"\nfun answer: int {\n    val positive = makeProbe().valueNow()\n    42\n}\n';
+    const p = fixture('unused-import-replay', {
+        'abla.toml': 'name = "unused-import-replay"\nentry = "main.ab"\nvisibility = "imports"\n',
+        'main.ab': 'import "dep.ab"\nfun main: int = answer()\n',
+        'dep.ab': original,
+        'factory.ab': 'class Probe(val item: int)\nfun makeProbe(): Probe = Probe(1)\n',
+        'method.ab': 'import "factory.ab"\nfun Probe.valueNow(): int = this.item\n',
+        'unused.ab': 'fun anotherThing(): int = 0\n',
+    });
+    const file = path.join(p, 'dep.ab');
+    const options = { mode: 'graph-v2', unusedImports: true };
+    const env = { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TRACE: '1', ABLA_ANALYSIS_CHECK: '1' };
+    delete env.ABLA_ANALYSIS_INCREMENTAL_TYPING;
+    const replay = await start(p, { ...options, env, log: 'replay.stderr' });
+    const full = await start(p, { ...options, env: { ...env, ABLA_ANALYSIS_INCREMENTAL_TYPING: '0', ABLA_ANALYSIS_CHECK: '0' }, log: 'full.stderr' });
+    const sessions = [replay, full];
+    let revision;
+    const check = async (text, expectedHits, warnings) => {
+        const [snapshot, reference] = await Promise.all(sessions.map(s => s.analyze()));
+        assert.equal(snapshot.complete, true);
+        assert.deepEqual(snapshot, reference);
+        const edited = doc(snapshot, file);
+        assert.deepEqual(edited.diagnostics.map(d => d.code), Array(warnings).fill('W_UNUSED_IMPORT'));
+        const diagnostic = edited.diagnostics.find(d => d.message.includes('unused.ab'));
+        assert.ok(diagnostic, JSON.stringify(edited.diagnostics));
+        const [{ range, newText }] = diagnostic.fixes[0].edits;
+        assert.equal(newText, '');
+        const removed = Buffer.from(text).subarray(range.start, range.end).toString();
+        assert.equal(removed, 'import "unused.ab"\n');
+        if (revision !== undefined) {
+            const [actual, expected] = await Promise.all(sessions.map(s => s.rpc('analyze', { since: revision })));
+            assert.deepEqual(actual, expected);
+        }
+        revision = snapshot.revision;
+        const log = fs.readFileSync(replay.log, 'utf8');
+        assert.equal(log.match(/replayed a type-inert/g)?.length ?? 0, expectedHits, log);
+        assert.ok(!/abla-analysis-check.*(?:DIFFERENT|FAILED)/.test(log), log);
+    };
+    try {
+        await check(original, 0, 1);
+        const results = [765432, 9, 812, 4];
+        for (const [index, value] of results.entries()) {
+            const text = original.replace('    42\n', '    ' + value + '\n');
+            const params = { uri: uri(file), version: index + 1, text };
+            for (const session of sessions) {
+                assert.ok(!('error' in await session.rpc(index === 0 ? 'document/open' : 'document/change', params)));
+            }
+            await check(text, index + 1, 1);
+        }
+        const text = original.replace('makeProbe().valueNow()', '0');
+        for (const session of sessions) {
+            assert.ok(!('error' in await session.rpc('document/change', { uri: uri(file), version: results.length + 1, text })));
+        }
+        await check(text, results.length, 3);
+    } finally {
+        await Promise.all(sessions.map(session => session.close()));
+    }
+}
+
+const tests = { body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
