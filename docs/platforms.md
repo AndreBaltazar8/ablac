@@ -132,6 +132,38 @@ The module link lane also includes build fixtures and expected compile
 failures. Its cross-link exceptions are recorded separately.
 [Module link allowlist](../tools/libc-free-programs-allowlist.txt).
 
+#### Every module program under QEMU (#1208)
+
+Of the 553 programs in `tests/cases/modules`, 349 build for x86-64 (the others are the negative cases, which are expected compile
+failures, and programs that need a manifest or flags: `nobuild` lines of the allowlist). 338 of those link static for AArch64 Linux and for
+RISC-V 64 Linux; the link check above builds each of them. The same two CI jobs now also run every one of the 338 under QEMU, next to its
+x86-64 `--fast` build, and compare standard output and exit status ([tools/test-linux-parity.sh](../tools/test-linux-parity.sh), surveyed
+by [tools/survey-linux-parity.sh](../tools/survey-linux-parity.sh); each native program is run twice, so a program whose own output
+varies is named instead of failing the comparison). Result on the first full run, both targets alike: 335 programs print and exit exactly
+what x86-64 does, 1 differs by design, 2 are not run here. The step builds 336 x86-64 references and runs 3 executions of each: 4 minutes on 4 CPUs
+per target (user time 5.5 minutes).
+
+The groups that keep a module program from matching, each one named in a list that may only shrink:
+
+- Does not link static (11 programs, `nobuild-a64` and `nobuild-rv64` in the
+  [allowlist](../tools/libc-free-programs-allowlist.txt)): `bootstrap-llvm`, `conformance-ir-cache`, `lowered-ir-cache`,
+  `native-function-address`, `stable-native-symbols` and `xtensa-interrupt-handler` import `src/` and so link libLLVM, which has no
+  AArch64 or RISC-V 64 build in the pinned shell (the compiler itself is built on static archives instead, #806 step C); `tls` and
+  `network-advanced` use OpenSSL; `import-alias-externs` and `unsafe-boundary` name C functions (`sin`, `dlsym`);
+  `compile-time-recursion-deep` runs out of the x86-64 compiler's own stack when building.
+- Differs by design ([blockers](../tools/linux-parity-blockers.tsv)): `proc-self-exe` prints the size of its own file, which differs
+  by architecture.
+- Not run here (`skip` in the blockers): `runtime-out-of-memory` needs the `ulimit -v` of `tools/test-runtime-memory.sh` (unlimited it
+  takes memory until it is killed) and `run-built` needs the arguments, environment and standard input that `tools/test-run-built.sh` gives it.
+- What the survey found: `tool-support` failed its `/proc/self/smaps` check on RISC-V 64 only. Under qemu-user the file is the
+  emulator's own (7382 bytes there, 8802 natively, 10160 on AArch64) and the check wanted more than 8192; the program now creates its own
+  64 mappings first, so the check no longer depends on the emulator. No program differed because of a missing system call, a kernel structure
+  or a numeric difference.
+
+The 22 programs outside `tests/cases/modules` that `tests/cases/linux/programs.txt` runs are as before. The other directories of
+`tests/cases` are not programs to compare: they test the compiler (diagnostics, caches, compile-time evaluation, the editor service,
+Android, Windows) through recipes in `tests/abla-tests.json` that name their own flags, inputs and expected output.
+
 ## macOS arm64 and Intel
 
 [CI](../.github/workflows/ci.yml) job `macos`, named **${{ matrix.name }}**,
