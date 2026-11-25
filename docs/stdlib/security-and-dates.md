@@ -147,7 +147,7 @@ for ML-KEM-768 (25 key generations, 25 encapsulations, 10 decapsulations with al
 
 Big-number arithmetic for code that signs or verifies on its own curve or field. A `BigModulus` is an odd modulus of 4 to 512 bytes; a `BigNumber` is a value modulo
 one, of that width. Both own their memory, wipe it when dropped, and borrow in every parameter, so `a.add(b)` leaves both alive and returns a number the caller owns. The
-arithmetic is in Montgomery form inside and constant time in the values: the same code runs for any values of one width, and none of it branches or indexes on one.
+arithmetic is in Montgomery form inside and constant time in the values: the same code runs for any values of one width, and none of it branches or indexes on one. The raw engine under it (the `bn*` functions that take the address of a work area) is internal to the standard library since v0.2.73 (`bignum/core.ab`, `// public: none`): a program uses `BigModulus` and `BigNumber`.
 
 | Call | Answers |
 |---|---|

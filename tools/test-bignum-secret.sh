@@ -24,15 +24,16 @@ done
 echo "ok   private bignum helpers are inaccessible"
 for mode in --fast ''; do
     label=${mode:---release}
-    "$compiler" build "$out/run.ab" -o "$out/oracle" --no-cache $mode
+    "$compiler" build "$out/run.ab" -o "$out/oracle" --no-cache --stdlib-internals $mode
     node tests/cases/crypto-bignum-secret/oracle.mjs "$PWD/$out/oracle" "$PWD/$out"
-    "$compiler" build "$out/alias.ab" -o "$out/alias" --no-cache $mode
+    "$compiler" build "$out/alias.ab" -o "$out/alias" --no-cache --stdlib-internals $mode
     "$out/alias" || { echo "overlap guard failed" >&2; exit 1; }
     echo "ok   overlap guards reject aliased buffers"
     echo "ok   bignum secret $label"
 done
 # Cross-target numeric oracle: BigInt supplies the expected integers, and the
 # static no-libc executable runs under qemu-aarch64 without a network or files.
+cp stdlib/abla/crypto/bignum/core.ab "$out/bignum-core.ab"
 node tests/cases/crypto-bignum-secret/aarch64-kat.mjs "$out/aarch64-kat.ab"
 sed -n '/^\/\/ BEGIN RSA SECRET BIGNUM PRIMITIVES$/,/^\/\/ END RSA SECRET BIGNUM PRIMITIVES$/p' stdlib/abla/crypto/rsa/entry.ab >> "$out/aarch64-kat.ab"
 "$compiler" build tests/cases/crypto-bignum-secret/aarch64-build.ab -o "$out/aarch64-driver" --no-cache

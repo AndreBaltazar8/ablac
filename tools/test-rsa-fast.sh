@@ -14,7 +14,7 @@ mkdir -p "$out"
 chmod 700 "$out"
 cd "$root"
 for mode in release fast; do
-    flags=(--no-cache)
+    flags=(--no-cache --stdlib-internals)
     [[ $mode == fast ]] && flags+=(--fast)
     "$compiler" build tests/cases/rsa-fast/reference.ab -o "$out/reference.$mode" "${flags[@]}"
     # The release run does all the sizes (1 to 96 limbs); the --fast one (about thirty times slower) those to 33: the same code, another code generator.

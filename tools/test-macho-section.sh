@@ -13,7 +13,7 @@ mkdir -p "$out"
 source=tests/cases/macho-section/main.ab
 if [[ $(uname -s) == Darwin ]]; then
     for mode in release fast; do
-        flags=(--no-cache)
+        flags=(--no-cache --stdlib-internals)
         [[ $mode == fast ]] && flags+=(--fast)
         "$compiler" build "$source" -o "$out/$mode" "${flags[@]}"
         [[ $("$out/$mode") == 'macho section: ok' ]] || { echo "macho section ($mode): wrong output" >&2; exit 1; }
@@ -28,7 +28,7 @@ fi
 # Off a Mac the link needs an SDK (ABLA_MACOS_SDK); the module is written before it, and LLVM's assembler is
 # the judge of the section name.
 for target in arm64-macos x86_64-macos; do
-    "$compiler" build "$source" -o "$out/$target" --no-cache --target "$target" > "$out/$target.log" 2>&1 || true
+    "$compiler" build "$source" -o "$out/$target" --no-cache --stdlib-internals --target "$target" > "$out/$target.log" 2>&1 || true
     [[ -s $out/$target.ll ]] || { cat "$out/$target.log" >&2; echo "macho section ($target): no module written" >&2; exit 1; }
     llc -O0 -filetype=obj "$out/$target.ll" -o "$out/$target.o" 2> "$out/$target.err" || {
         echo "macho section ($target): llc refused the module" >&2; head -n 5 "$out/$target.err" >&2; exit 1

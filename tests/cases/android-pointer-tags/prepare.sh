@@ -12,6 +12,8 @@ mkdir -p "$3"
 out=$(cd "$3" && pwd)
 here=$root/tests/cases/android-pointer-tags
 printf 'compileCapabilities = ["filesystem.write"]\n' > "$out/abla.toml"
+# The raw bignum engine of the sysroot's library (a file of its own that no program can import by name) as a module beside the fixture.
+cp "$sysroot/stdlib/abla/crypto/bignum/core.ab" "$out/bignum-core.ab"
 
 # The RSA secret bignum primitives of the sysroot's library, between their markers.
 source=$sysroot/stdlib/abla/crypto/rsa/entry.ab

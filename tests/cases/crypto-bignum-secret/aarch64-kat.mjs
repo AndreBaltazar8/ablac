@@ -8,7 +8,7 @@ const inverse = (value, modulus) => {
     while (r1) { const q = r0 / r1; [r0, r1] = [r1, r0 - q * r1]; [t0, t1] = [t1, t0 - q * t1]; }
     return ((t0 % modulus) + modulus) % modulus;
 };
-const lines = ['import "abla/crypto/bignum"', 'import "abla/ct"', ''];
+const lines = ['import "bignum-core.ab"', 'import "abla/ct"', ''];
 const checks = [];
 [1, 3, 17, 64, 128].forEach((words, testCase) => {
     const bits = BigInt(words * 32);
