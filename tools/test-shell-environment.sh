@@ -24,6 +24,12 @@ AB
 status=0
 "$output_directory/tls" || status=$?
 [[ $status -eq 42 ]] || { echo "shell environment: a TLS program exited with $status" >&2; exit 1; }
+# The shell's own lib directory (a store path whose hash follows the shell's arguments) stays out of every link's rpath: a build
+# in another shell would otherwise differ in the rpath and the build id (the "nested nix-shell RUNPATH" difference of release-check).
+if [[ ${NIX_LDFLAGS:-} == *"${out:-/nonexistent}/lib"* ]] || LC_ALL=C grep -a -q -- '-nix-shell/lib' "$output_directory/tls"; then
+    echo "shell environment: the shell's own lib directory is in the rpath of a link" >&2
+    exit 1
+fi
 # And the compiler itself, which links it too.
 env -u LD_LIBRARY_PATH "$(readlink -f "$compiler.bin" 2>/dev/null || echo "$compiler")" --version >/dev/null
 echo 'shell environment: OpenSSL by runpath, no LD_LIBRARY_PATH'

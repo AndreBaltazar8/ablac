@@ -88,5 +88,9 @@ pkgs.mkShell {
     # What links here finds this OpenSSL when it runs. LD_LIBRARY_PATH would do it
     # too, but it also reaches the host's own tools, whose glibc is another.
     export NIX_LDFLAGS="-rpath ${pkgs.openssl.out}/lib ''${NIX_LDFLAGS:-}"
+    # nixpkgs' linker wrapper also adds this shell's own lib directory (a store path that does not exist and whose hash
+    # follows the shell's arguments) to every link's rpath: it made two builds of one source differ in the rpath and the
+    # build id. Keep it out so a third party's shell links the same bytes (tools/test-shell-environment.sh).
+    export NIX_LDFLAGS="$(printf '%s' "$NIX_LDFLAGS" | sed "s| -rpath $out/lib||g")"
   '';
 }
