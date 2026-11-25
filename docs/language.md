@@ -2993,10 +2993,14 @@ Exports:
 A `@kernel` function is a GPU kernel written in ordinary Abla (#1233,
 [design/gpu-kernels.md](design/gpu-kernels.md)). It runs once per thread of a
 launch, finds its thread with abla/kernel's ids, and reads and writes memory
-only through `KernelF32Buffer` and `KernelU32Buffer`. A buffer is an address and
+only through its buffers: `KernelF32Buffer`, `KernelU32Buffer`,
+`KernelU16Buffer` and `KernelU8Buffer` (bytes, with `loadU16` and `loadU32` at
+any alignment for packed data such as GGML blocks). A buffer is an address and
 an element count: an index outside it loads 0 and stores nothing, on every
-backend. Ordinary code does not make one from an address: abla/kernel/cuda's
-`CudaKernelMemory.floats()` and `words()` give the device memory's, and a
+backend. `KernelF32Buffer.load4(i)` reads four elements as an `f32x4`, one
+16-byte load on a GPU when they are inside the buffer and aligned. Ordinary
+code does not make a buffer from an address: abla/kernel/cuda's
+`CudaKernelMemory.floats()`, `words()`, `halves()` and `raw()` give the device memory's, and a
 trusted function that owns host memory and keeps it alive builds one for the CPU
 (the raw constructors are trusted-only, [#1226](#trusted-native-implementations)).
 The same function runs:
@@ -3013,10 +3017,13 @@ The same function runs:
 A kernel, and every function it calls, may use: `bool`, the integer types,
 `f32` and `f64` scalars; arithmetic, comparison and bit operators;
 `if`/`when`, loops and `return`; calls to other such functions (not
-recursive); the buffers; `kernelGlobalId`, `kernelLocalId`, `kernelGroupId`, `kernelGroupIdY`,
-`kernelGroupSize`; `kernelSubgroupLane`, `kernelSubgroupSize` and
-`kernelSubgroupSum` (32 lanes on CUDA, 1 on the CPU, so a kernel written for
-any size runs on both); `kernelFma`; and abla/float's bit and conversion
+recursive); the buffers, also in `val` locals; `kernelGlobalId`, `kernelLocalId`, `kernelGroupId`, `kernelGroupIdY`,
+`kernelGroupSize`; `kernelSubgroupLane`, `kernelSubgroupSize`,
+`kernelSubgroupSum` and `kernelSubgroupMax` (32 lanes on CUDA, 1 on the CPU,
+so a kernel written for any size runs on both); the group's shared memory,
+`kernelSharedF32(count)` and `kernelSharedU32(count)` with a constant `count`,
+and `kernelBarrier()` (CUDA's `__shared__` and `__syncthreads`); `kernelFma`,
+`kernelSqrt`, `kernelRsqrt` and `kernelF16ToF32`; and abla/float's bit and conversion
 functions. Anything else (a string, an array, a class value, a closure, an
 allocation, I/O, a native call) is refused when the program is built, naming
 what and where:
@@ -3026,13 +3033,17 @@ what and where:
 | `kernel.operation:<what>` | an operation outside the subset (a string, an allocation, ...) |
 | `kernel.call:<name>` | a call to something a kernel cannot run (an extern, a native intrinsic) |
 | `kernel.recursion:<name>` | a call back into a function the kernel is already in |
-| `kernel.type:<type>` | a value of a type a kernel cannot hold (a buffer in a local, a class) |
+| `kernel.type:<type>` | a value of a type a kernel cannot hold (a buffer in a `var`, a class) |
 | `kernel.signature:<detail>` | a kernel that returns a value, or that the program does not lower |
 | `kernel.toolchain:cuda` | `opt` or `llc` failed to build the PTX |
 
-Two differences from the CPU remain: on a GPU an integer division by zero
-gives 0 (the CPU stops the program), and `kernelFma` rounds once there (twice on
-the CPU). A kernel must not depend on either.
+Differences from the CPU remain: on a GPU an integer division by zero gives 0
+(the CPU stops the program); `kernelFma` rounds once there (twice on the CPU);
+`kernelRsqrt` is the GPU's approximation (within 2 ulp, as CUDA C's `rsqrtf`;
+correctly rounded on the CPU); and the CPU runs a group's threads one after
+another, so `kernelBarrier` works there only in groups of one thread (a larger
+group stops the program). A kernel must not depend on the first three; one
+that strides by `kernelGroupSize()` runs on both.
 
 ```abla fragment
 import "abla/kernel"

@@ -3,11 +3,15 @@
 // (`kernel.<rule>`) and also compiles it for each GPU backend (CUDA: kernelPtx()). The same function runs on the CPU through
 // kernelRunCpu, where this module answers the ids.
 //
-// A kernel reads and writes device memory only through KernelF32Buffer and KernelU32Buffer, each an address and an element
+// A kernel reads and writes device memory only through KernelF32Buffer, KernelU32Buffer, KernelU16Buffer and KernelU8Buffer, each an address and an element
 // count: an index outside the buffer loads 0 and stores nothing, on every backend. On CUDA a buffer is two kernel parameters,
 // its device address and its count (u64 each).
 import "abla/float"
 import "abla/unsafe/memory/raw"
+import "abla/unsafe/memory"
+import "abla/simd"
+import "abla/math"
+import "abla/process/exit"
 
 /** A buffer of `count` f32 values at `address` (host memory on the CPU, device memory on a GPU), as a kernel sees it. */
 @__abla_trusted_only("error: take one from CudaKernelMemory.floats(), or build it in a trusted function that owns the memory and keeps it alive")
@@ -43,11 +47,65 @@ trusted fun KernelU32Buffer.store(index: int, value: int): void {
     return
 }
 
+/** A buffer of `count` u16 values at `address`, as a kernel sees it (GGML Q8_0 blocks are 17 of them: an f16 scale and 32
+ *  bytes); its elements read as ints from 0 to 65535. */
+@__abla_trusted_only("error: take one from CudaKernelMemory.halves(), or build it in a trusted function that owns the memory and keeps it alive")
+class KernelU16Buffer(val address: int, val count: int)
+
+/** The number of elements of the buffer. */
+fun KernelU16Buffer.size(): int = this.count
+
+/** Element `index` of the buffer (0 to 65535), or 0 when `index` is outside it. */
+trusted fun KernelU16Buffer.load(index: int): int =
+    if (index >= 0 && index < this.count) ablaUnsafeLoadU16(nativePointerFromAddress(this.address + index * 2)) else 0
+
+/** Stores the low 16 bits of `value` as element `index`; does nothing when `index` is outside the buffer. */
+trusted fun KernelU16Buffer.store(index: int, value: int): void {
+    if (index >= 0 && index < this.count) ablaUnsafeStoreU16(nativePointerFromAddress(this.address + index * 2), value)
+    return
+}
+
+/** A buffer of `count` bytes at `address`, as a kernel sees it: packed data at any alignment (GGML blocks of 34 or 36
+ *  bytes), read a byte, two or four at a time. */
+@__abla_trusted_only("error: take one from CudaKernelMemory.raw(), or build it in a trusted function that owns the memory and keeps it alive")
+class KernelU8Buffer(val address: int, val count: int)
+
+/** The number of bytes of the buffer. */
+fun KernelU8Buffer.size(): int = this.count
+
+/** Byte `index` (0 to 255), or 0 when `index` is outside the buffer. */
+trusted fun KernelU8Buffer.load(index: int): int =
+    if (index >= 0 && index < this.count) ablaUnsafeLoadU8(nativePointerFromAddress(this.address + index)) else 0
+
+/** Stores the low 8 bits of `value` as byte `index`; does nothing when `index` is outside the buffer. */
+trusted fun KernelU8Buffer.store(index: int, value: int): void {
+    if (index >= 0 && index < this.count) ablaUnsafeStoreU8(nativePointerFromAddress(this.address + index), value)
+    return
+}
+
+/** The little-endian u16 at bytes `index` and `index + 1`, at any alignment (bytes outside the buffer count 0). On a GPU
+ *  an even address is one 16-bit load. */
+fun KernelU8Buffer.loadU16(index: int): int = this.load(index) | (this.load(index + 1) << 8)
+
+/** The little-endian u32 at bytes `index` to `index + 3`, at any alignment (bytes outside the buffer count 0). On a GPU a
+ *  4-byte-aligned address is one 32-bit load and an even one two 16-bit loads. */
+fun KernelU8Buffer.loadU32(index: int): int =
+    this.load(index) | (this.load(index + 1) << 8) | (this.load(index + 2) << 16) | (this.load(index + 3) << 24)
+
+/** Elements `index` to `index + 3` as one vector, each 0 when outside the buffer. On a GPU, four elements inside the buffer
+ *  at a 16-byte-aligned address are one 16-byte load (CUDA's float4); anywhere else, four loads. */
+fun KernelF32Buffer.load4(index: int): f32x4 =
+    f32x4(this.load(index), this.load(index + 1), this.load(index + 2), this.load(index + 3))
+
 /** Where the CPU backend is in a launch: the thread kernelRunCpu is running. One launch at a time. */
-class KernelCpuState(var group: int, var groupY: int, var local: int, var groupSize: int)
+class KernelCpuState(
+    var group: int, var groupY: int, var local: int, var groupSize: int,
+    // The group's shared memory: slot n is the n-th kernelShared call of the thread being run (sharedNext counts them).
+    var sharedNext: int, val sharedAddresses: array<int>, val sharedBytes: array<int>
+)
 
 /** The CPU backend's launch position. */
-val kernelCpuState = KernelCpuState(0, 0, 0, 1)
+val kernelCpuState = KernelCpuState(0, 0, 0, 1, 0, [], [])
 
 /** The thread's index in the whole launch: group * group size + local index. */
 fun kernelGlobalId(): int = kernelCpuState.group * kernelCpuState.groupSize + kernelCpuState.local
@@ -74,6 +132,66 @@ fun kernelSubgroupSize(): int = 1
  *  CPU, `value` itself. */
 fun kernelSubgroupSum(value: f32): f32 = value
 
+/** The workgroup's shared memory for `count` f32 values: every thread of a group gets the same memory, which a GPU keeps on
+ *  the chip (CUDA __shared__). Each call in a kernel is its own array, and `count` must be a compile-time constant (a
+ *  literal, or a value the compiler folds to one). Its contents start undefined; share them across threads with
+ *  kernelBarrier. */
+trusted fun kernelSharedF32(count: int): KernelF32Buffer = KernelF32Buffer(kernelCpuShared(count * 4), count)
+
+/** The workgroup's shared memory for `count` u32 values (see kernelSharedF32). */
+trusted fun kernelSharedU32(count: int): KernelU32Buffer = KernelU32Buffer(kernelCpuShared(count * 4), count)
+
+/** The CPU backend's shared memory: the slot of the current thread's next kernelShared call, kept across launches. */
+private trusted fun kernelCpuShared(bytes: int): int {
+    val slot = kernelCpuState.sharedNext
+    kernelCpuState.sharedNext = slot + 1
+    if (slot < kernelCpuState.sharedAddresses.size && kernelCpuState.sharedBytes[slot] >= bytes) {
+        return kernelCpuState.sharedAddresses[slot]
+    }
+    val address = nativePointerAddress(ablaUnsafeAllocate(if (bytes > 0) bytes else 4))
+    if (slot < kernelCpuState.sharedAddresses.size) {
+        kernelCpuState.sharedAddresses[slot] = address
+        kernelCpuState.sharedBytes[slot] = bytes
+    } else {
+        kernelCpuState.sharedAddresses.append(address)
+        kernelCpuState.sharedBytes.append(bytes)
+    }
+    address
+}
+
+/** Waits until every thread of the group has reached it, and makes their writes to shared and device memory visible to
+ *  each other (CUDA __syncthreads). Every thread of the group must reach the same barriers. The CPU backend runs a group's
+ *  threads one after another, so there a barrier holds only for groups of one thread: it does nothing then, and stops the
+ *  program in a larger group. A kernel that strides by kernelGroupSize() runs on both. */
+fun kernelBarrier(): void {
+    if (kernelCpuState.groupSize > 1) panic("kernelBarrier: the CPU backend runs a group's threads one after another, so it needs groups of one thread")
+    return
+}
+
+/** The largest `value` over the thread's subgroup, in every lane (every lane must call it together). On the CPU, `value`. */
+fun kernelSubgroupMax(value: f32): f32 = value
+
+/** The square root of `value` (correctly rounded on every backend: through f64 on the CPU). */
+fun kernelSqrt(value: f32): f32 = ablaConvertF64ToF32(sqrt(ablaConvertF32ToF64(value)))
+
+/**
+ * An approximation of 1 / sqrt(`value`): on CUDA the GPU's rsqrt.approx.f32 (CUDA C's `rsqrtf`, within 2 ulp), on the CPU
+ * the correctly rounded 1 / sqrt through f64. Use kernelSqrt where every backend must give the same bits.
+ */
+fun kernelRsqrt(value: f32): f32 = ablaConvertF64ToF32(1.0 / sqrt(ablaConvertF32ToF64(value)))
+
+/** The f32 value of the IEEE binary16 bits in the low 16 bits of `bits` (exact: every f16 is an f32). */
+fun kernelF16ToF32(bits: int): f32 {
+    val sign = (bits >> 15) & 1
+    val exponent = (bits >> 10) & 31
+    val mantissa = bits & 1023
+    var magnitude = f32(0.0)
+    if (exponent == 0) magnitude = f32FromInt(mantissa) * f32FromBits(u32(864026624))
+    else if (exponent == 31) magnitude = f32FromBits(u32(if (mantissa == 0) 2139095040 else 2143289344))
+    else magnitude = f32FromBits(u32(((exponent + 112) << 23) | (mantissa << 13)))
+    if (sign == 1) -magnitude else magnitude
+}
+
 /** x * y + z: one rounding on a GPU; on the CPU the product is exact in f64 and the sum is rounded twice (to f64, then f32). */
 fun kernelFma(x: f32, y: f32, z: f32): f32 =
     ablaConvertF64ToF32(ablaConvertF32ToF64(x) * ablaConvertF32ToF64(y) + ablaConvertF32ToF64(z))
@@ -91,6 +209,7 @@ fun kernelRunCpuGrid(groups: int, groupsY: int, groupSize: int, body: () -> void
             kernelCpuState.group = group
             for (local in 0 until groupSize) {
                 kernelCpuState.local = local
+                kernelCpuState.sharedNext = 0
                 body()
             }
         }

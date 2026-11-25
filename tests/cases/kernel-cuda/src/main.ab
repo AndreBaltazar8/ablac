@@ -5,6 +5,8 @@
 import "vadd.ab"
 import "nvfp4.ab"
 import "edges.ab"
+import "rmsnorm.ab"
+import "q8.ab"
 import "abla/kernel"
 import "abla/kernel/cuda"
 import "abla/float"
@@ -144,6 +146,81 @@ trusted fun main: int {
         if (floatAt(cpuEdge, i) != want || floatAt(gpuEdge, i) != want) edgesRight = false
     }
     println("edges: loads past a buffer give 0 and stores past it do nothing, on the GPU and the CPU $edgesRight")
+
+    // rmsnorm (shared memory and barriers): 3 rows of 259, weighted, groups of 128 threads on the GPU and of 1 on the CPU.
+    val normRows = 3
+    val normN = 259
+    val normX = floats(normRows * normN) { i -> f32FromInt((i * 13) % 41 - 20) / f32(16.0) }
+    val normW = floats(normN) { i -> f32FromInt(i % 19 - 9) / f32(16.0) }
+    val cpuNorm = floats(normRows * normN) { i -> f32(0.0) }
+    val normXBuffer = KernelF32Buffer(nativePointerAddress(normX.address), normRows * normN)
+    val normWBuffer = KernelF32Buffer(nativePointerAddress(normW.address), normN)
+    val cpuNormBuffer = KernelF32Buffer(nativePointerAddress(cpuNorm.address), normRows * normN)
+    val eps = f32(0.00001)
+    kernelRunCpu(normRows, 1) { rmsnorm(normXBuffer, normWBuffer, cpuNormBuffer, normN, eps) }
+    val dnx = device.allocate(normX.capacity)
+    val dnw = device.allocate(normW.capacity)
+    val dny = device.allocate(normX.capacity)
+    if (dnx == null || dnw == null || dny == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val gpuNorm = floats(normRows * normN) { i -> f32(0.0) }
+    if (!device.upload(dnx, normX) || !device.upload(dnw, normW) ||
+        !device.launch("rmsnorm", normRows, 128, cudaKernelArguments().buffer(dnx.floats()).buffer(dnw.floats())
+            .buffer(dny.floats()).integer(normN).float(eps)) || !device.download(dny, gpuNorm)) {
+        println("kernel-cuda: rmsnorm: ${device.error}")
+        return 1
+    }
+    var normWorst = 0.0
+    for (i in 0 until normRows * normN) {
+        val got = f32ToF64(floatAt(gpuNorm, i))
+        val want = f32ToF64(floatAt(cpuNorm, i))
+        val difference = if (got > want) got - want else want - got
+        if (difference > normWorst) normWorst = difference
+    }
+    val normAgree = normWorst <= 0.00001
+    println("rmsnorm: $normRows x $normN, groups of 128 on the GPU within 1e-5 of the CPU $normAgree")
+
+    // Q8_0 matvec (byte buffer with u16/u32 loads at any alignment, f16 scales, f32x4 loads): 300 rows of 512.
+    val q8Rows = 300
+    val q8Cols = 512
+    val q8Halves = q8Rows * q8Cols / 32 * 17
+    val q8Weights = nativeByteBuffer(q8Halves * 2)
+    var q8Seed = 777
+    for (half in 0 until q8Halves) {
+        q8Seed = (q8Seed * 1103515245 + 12345) & 2147483647
+        // A scale: an f16 between 2^-8 and 2^-5 (sign either way); else two random signed bytes.
+        val value = if (half % 17 == 0) ((q8Seed >> 3) & 32768) | ((7 + q8Seed % 4) << 10) | (q8Seed >> 9 & 1023) else q8Seed & 65535
+        q8Weights.store(half * 2, value & 255)
+        q8Weights.store(half * 2 + 1, value >> 8)
+    }
+    val q8X = floats(q8Cols) { i -> f32FromInt(i % 23 - 11) / f32(8.0) }
+    val cpuQ8 = floats(q8Rows) { i -> f32(0.0) }
+    val q8W = KernelU8Buffer(nativePointerAddress(q8Weights.address), q8Halves * 2)
+    val q8XBuffer = KernelF32Buffer(nativePointerAddress(q8X.address), q8Cols)
+    val cpuQ8Buffer = KernelF32Buffer(nativePointerAddress(cpuQ8.address), q8Rows)
+    kernelRunCpu(q8Rows, 1) { matvecQ8(q8W, q8XBuffer, cpuQ8Buffer, q8Rows, q8Cols) }
+    val dqw = device.allocate(q8Weights.capacity)
+    val dqx = device.allocate(q8X.capacity)
+    val dqy = device.allocate(q8Rows * 4)
+    if (dqw == null || dqx == null || dqy == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val gpuQ8 = floats(q8Rows) { i -> f32(0.0) }
+    if (!device.upload(dqw, q8Weights) || !device.upload(dqx, q8X) ||
+        !device.launch("matvecQ8", (q8Rows + 7) / 8, 256, cudaKernelArguments().buffer(dqw.raw()).buffer(dqx.floats())
+            .buffer(dqy.floats()).integer(q8Rows).integer(q8Cols)) || !device.download(dqy, gpuQ8)) {
+        println("kernel-cuda: matvecQ8: ${device.error}")
+        return 1
+    }
+    var q8Worst = 0.0
+    var q8Largest = 0.0
+    for (row in 0 until q8Rows) {
+        val got = f32ToF64(floatAt(gpuQ8, row))
+        val want = f32ToF64(floatAt(cpuQ8, row))
+        val difference = if (got > want) got - want else want - got
+        if (difference > q8Worst) q8Worst = difference
+        val magnitude = if (want < 0.0) -want else want
+        if (magnitude > q8Largest) q8Largest = magnitude
+    }
+    val q8Agree = q8Worst <= q8Largest * 0.00001 && q8Largest > 0.01
+    println("matvecQ8: $q8Rows x $q8Cols, GPU within 1e-5 of CPU $q8Agree")
     device.close()
-    if (vaddEqual && agree && untouched && edgesRight) 0 else 1
+    if (vaddEqual && agree && untouched && edgesRight && normAgree && q8Agree) 0 else 1
 }

@@ -1,0 +1,37 @@
+import "abla/kernel"
+import "abla/float"
+
+/** abla-grad's rmsnorm: one group per row of `n` values; y = x / sqrt(mean(x^2) + eps), times w when w is not empty. The
+ *  group's threads stride over the row and add their squares in shared memory (a tree over a power-of-two group size up
+ *  to 1024, with barriers): any group size from 1 runs it, so the CPU backend's groups of one thread do too. */
+@kernel
+fun rmsnorm(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, n: int, eps: f32) {
+    val sums = kernelSharedF32(1024)
+    val lane = kernelLocalId()
+    val size = kernelGroupSize()
+    val base = kernelGroupId() * n
+    var sum = f32(0.0)
+    var i = lane
+    while (i < n) {
+        val value = x.load(base + i)
+        sum = kernelFma(value, value, sum)
+        i = i + size
+    }
+    sums.store(lane, sum)
+    kernelBarrier()
+    var width = size / 2
+    while (width > 0) {
+        if (lane < width) sums.store(lane, sums.load(lane) + sums.load(lane + width))
+        kernelBarrier()
+        width = width / 2
+    }
+    // Both roots, so the test covers kernelSqrt and kernelRsqrt (rsqrt.approx on CUDA: within the 1e-5 the CPU check allows).
+    val mean = sums.load(0) / f32FromInt(n) + eps
+    val factor = (kernelRsqrt(mean) + f32(1.0) / kernelSqrt(mean)) * f32(0.5)
+    i = lane
+    while (i < n) {
+        val value = x.load(base + i) * factor
+        y.store(base + i, if (w.size() > 0) value * w.load(i) else value)
+        i = i + size
+    }
+}

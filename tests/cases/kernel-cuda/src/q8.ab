@@ -1,0 +1,35 @@
+import "abla/kernel"
+import "abla/float"
+import "abla/simd"
+
+/** The f32 value of the signed byte in the low 8 bits of `bits`. */
+fun q8KernelSigned(bits: int): f32 = f32FromInt(((bits & 255) ^ 128) - 128)
+
+/** abla-grad's Q8_0 matvec (GGML blocks of 34 bytes: an f16 scale and 32 signed bytes, at any alignment), one subgroup per
+ *  row: lane l takes parts l, l + size, ... (eight parts of four weights per block), reads its four weights as one u32 and
+ *  its four activations as one f32x4. */
+@kernel
+fun matvecQ8(w: KernelU8Buffer, x: KernelF32Buffer, y: KernelF32Buffer, rows: int, cols: int) {
+    val size = kernelSubgroupSize()
+    val row = kernelGlobalId() / size
+    if (row >= rows) return
+    val start = row * (cols / 32 * 34)
+    val parts = cols / 32 * 8
+    var sum = f32(0.0)
+    var part = kernelSubgroupLane()
+    while (part < parts) {
+        val block = part / 8
+        val piece = part % 8
+        val base = start + block * 34
+        val scale = kernelF16ToF32(w.loadU16(base))
+        val quants = w.loadU32(base + 2 + piece * 4)
+        val values = x.load4(block * 32 + piece * 4)
+        sum = kernelFma(scale * q8KernelSigned(quants), values.get(0), sum)
+        sum = kernelFma(scale * q8KernelSigned(quants >> 8), values.get(1), sum)
+        sum = kernelFma(scale * q8KernelSigned(quants >> 16), values.get(2), sum)
+        sum = kernelFma(scale * q8KernelSigned(quants >> 24), values.get(3), sum)
+        part = part + size
+    }
+    val total = kernelSubgroupSum(sum)
+    if (kernelSubgroupLane() == 0) y.store(row, total)
+}
