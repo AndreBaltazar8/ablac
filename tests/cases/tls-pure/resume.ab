@@ -372,6 +372,55 @@ fun main: int {
     val second = unlimited.seal(TLS_SUITE_AES_128_GCM_SHA256, 2, "r".repeat(32), "", "localhost")
     if (first.slice(0, 16) != second.slice(0, 16)) fail("the default limit rotated the key after two tickets")
 
+    // Our client against a hostile server (#1139 area 3 round 6). The ServerHello is built by hand (the client checks its pre_shared_key before any key agreement or
+    // decryption), so what is looked at is only what the client does with a PSK answer it should not take: illegal_parameter (47), nothing else, and no resumption.
+    val hostileTicket = "t".repeat(40)
+    val hostileSuite = TLS_SUITE_AES_128_GCM_SHA256
+    for (variant in 0 until 4) {
+        val hostileCache = tlsSessionCacheNew(now)
+        // variants 0 to 2 offer a ticket; variant 3 (the control) accepts it as it should
+        if (variant != 99) hostileCache.put("localhost", "", hostileSuite, hostileTicket, "p".repeat(32), 1, 7200, tlsX509Scope(store))
+        var hostile = clientWith(store, "localhost", hostileCache)
+        val hostileHelloRecord = hostile.takeOutput()
+        val offered = tlsParseClientHello(hostileHelloRecord.slice(9, hostileHelloRecord.size))
+        if (!offered.ok || offered.pskIdentities.size != 1) {
+            fail("hostile server variant $variant: the client did not offer its ticket")
+            continue
+        }
+        // 0: the server selects identity 1, which was not offered; 1: a suite whose hash is not the ticket's (SHA-384 for a SHA-256 PSK); 2: the control, identity 0 and the
+        // ticket's suite: taken (the client goes on to wait for the server's encrypted flight, resumed); 3: a client that offered no ticket is told a PSK was selected.
+        var chosenIndex = 0
+        var chosenSuite = hostileSuite
+        if (variant == 0) chosenIndex = 1
+        if (variant == 1) chosenSuite = TLS_SUITE_AES_256_GCM_SHA384
+        if (variant == 3) {
+            var bare = clientWith(store, "localhost", tlsSessionCacheNew(now))
+            val bareRecord = bare.takeOutput()
+            val bareOffer = tlsParseClientHello(bareRecord.slice(9, bareRecord.size))
+            if (bareOffer.pskIdentities.size != 0) fail("a client with an empty cache offered a PSK")
+            val bareHello = tlsBuildServerHello(random(32), bareOffer.sessionId, hostileSuite, TlsKeyShare(TLS_GROUP_X25519, random(32)), 0)
+            bare.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, bareHello))
+            val bareOut = bare.takeOutput()
+            if (!bare.failed() || bare.resumed() || bareOut.size < 7 || bareOut[0] != 21 || bareOut[6] != 47) fail("a PSK selected for a client that offered none: failed ${bare.failed()}")
+            continue
+        }
+        val hostileHello = tlsBuildServerHello(random(32), offered.sessionId, chosenSuite, TlsKeyShare(TLS_GROUP_X25519, random(32)), chosenIndex)
+        hostile.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, hostileHello))
+        val hostileOut = hostile.takeOutput()
+        if (variant == 2) {
+            if (hostile.failed() || !hostile.resumed()) fail("the control: a ServerHello selecting the offered PSK was refused: [${hostile.error}]")
+        } else if (!hostile.failed() || hostile.resumed() || hostileOut.size < 7 || hostileOut[0] != 21 || hostileOut[6] != 47) {
+            fail("hostile server variant $variant: failed ${hostile.failed()} resumed ${hostile.resumed()} alert ${if (hostileOut.size >= 7) hostileOut[6] else -1}")
+        }
+    }
+    // A forged NewSessionTicket cannot make a ticket live longer than a week, whatever lifetime it claims; and a ticket that arrives with a zero lifetime or no ticket is kept by no one.
+    val forgedCache = tlsSessionCacheNew(now)
+    forgedCache.put("localhost", "", hostileSuite, hostileTicket, "p".repeat(32), 4294967295, 4294967295, tlsX509Scope(store))
+    clock = clock + 604799
+    if (forgedCache.count("localhost") != 1) fail("a ticket of the longest lifetime a server may give expired within the week")
+    clock = clock + 2
+    if (forgedCache.take("localhost", [], tlsX509Scope(store)) != null) fail("a ticket whose server claimed 2^32-1 seconds outlived the week")
+
     if (failures > 0) return 1
     println("tls-pure resume ok")
     0
