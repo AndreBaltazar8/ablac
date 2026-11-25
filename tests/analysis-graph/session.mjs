@@ -1088,6 +1088,7 @@ async function validateOccurrences() {
 async function typedRegexDefinitions() {
     const text = String.raw`// λ 😀
 import "abla/regex"
+import "abla/array"
 import "abla/process/exit"
 import "other.ab"
 
