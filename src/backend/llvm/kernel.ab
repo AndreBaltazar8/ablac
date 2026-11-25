@@ -689,6 +689,57 @@ fun bootstrapKernelBuiltin(
         result = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$result = call float @llvm.nvvm.rsqrt.approx.f(float $operand)")
         type = "f32"
+    } else if (name == "kernelExp") {
+        if (instruction.operands.size < 1) return false
+        val a = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[0]), "f32")
+        if (a == "") return true
+        // libdevice's __nv_expf without ftz (CUDA C's expf without fast-math) step for step, so a ported kernel keeps its
+        // bits: j = saturate(a * log2(e) / 252 + 0.5) * 252 rounded down onto 1.5 * 2^23 + 1 (the integer part of
+        // a * log2(e) + 127 in j's low bits), f = a * log2(e) - (j - 1.5 * 2^23 - 127) in two fma steps (log2(e) split in
+        // two), and the result 2^f (ex2.approx) times 2^(j's low bits - 127), made by shifting j's bits into the exponent.
+        bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.fma.rn.f(float, float, float)")
+        bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.fma.rm.f(float, float, float)")
+        bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.saturate.f(float)")
+        bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.ex2.approx.ftz.f32(float)")
+        val log2e = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$log2e = bitcast i32 1069066811 to float")
+        val log2eLow = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$log2eLow = bitcast i32 849703008 to float")
+        val magic = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$magic = bitcast i32 1262485504 to float")
+        val step = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$step = fdiv float $log2e, 252.0")
+        val scaled = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$scaled = call float @llvm.nvvm.fma.rn.f(float $a, float $step, float 0.5)")
+        val clamped = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$clamped = call float @llvm.nvvm.saturate.f(float $scaled)")
+        val lowBias = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$lowBias = fadd float -126.0, $magic")
+        val bias = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$bias = fadd float $lowBias, 127.0")
+        val j = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$j = call float @llvm.nvvm.fma.rm.f(float $clamped, float 252.0, float $bias)")
+        val shift = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$shift = fadd float $magic, 127.0")
+        val whole = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$whole = fsub float $j, $shift")
+        val negated = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$negated = fsub float -0.0, $whole")
+        val high = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$high = call float @llvm.nvvm.fma.rn.f(float $a, float $log2e, float $negated)")
+        val fraction = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$fraction = call float @llvm.nvvm.fma.rn.f(float $a, float $log2eLow, float $high)")
+        val bits = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$bits = bitcast float $j to i32")
+        val exponent = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$exponent = shl i32 $bits, 23")
+        val scale = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$scale = bitcast i32 $exponent to float")
+        val power = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$power = call float @llvm.nvvm.ex2.approx.ftz.f32(float $fraction)")
+        result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = fmul float $power, $scale")
+        type = "f32"
     } else if (name == "kernelF16ToF32") {
         if (instruction.operands.size < 1) return false
         val bits = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[0]), "u16")

@@ -3023,7 +3023,7 @@ recursive); the buffers, also in `val` locals; `kernelGlobalId`, `kernelLocalId`
 so a kernel written for any size runs on both); the group's shared memory,
 `kernelSharedF32(count)` and `kernelSharedU32(count)` with a constant `count`,
 and `kernelBarrier()` (CUDA's `__shared__` and `__syncthreads`); `kernelFma`,
-`kernelSqrt`, `kernelRsqrt` and `kernelF16ToF32`; and abla/float's bit and conversion
+`kernelSqrt`, `kernelRsqrt`, `kernelExp` and `kernelF16ToF32`; and abla/float's bit and conversion
 functions. Anything else (a string, an array, a class value, a closure, an
 allocation, I/O, a native call) is refused when the program is built, naming
 what and where:
@@ -3039,8 +3039,8 @@ what and where:
 
 Differences from the CPU remain: on a GPU an integer division by zero gives 0
 (the CPU stops the program); `kernelFma` rounds once there (twice on the CPU);
-`kernelRsqrt` is the GPU's approximation (within 2 ulp, as CUDA C's `rsqrtf`;
-correctly rounded on the CPU); and the CPU runs a group's threads one after
+`kernelRsqrt` and `kernelExp` compute what CUDA C's `rsqrtf` and `expf` do
+there (within 2 ulp; on the CPU through f64); and the CPU runs a group's threads one after
 another, so `kernelBarrier` works there only in groups of one thread (a larger
 group stops the program). A kernel must not depend on the first three; one
 that strides by `kernelGroupSize()` runs on both.

@@ -51,9 +51,10 @@ if [[ -n $library ]]; then
     else
         grep -q "GPU equal to CPU true" "$out/kernel-cuda.out" && grep -q "within 1e-5 of CPU true" "$out/kernel-cuda.out" &&
             grep -q "on the GPU and the CPU true" "$out/kernel-cuda.out" &&
-            grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" ||
+            grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" &&
+            grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" ||
             fail "kernel-cuda: $(cat "$out/kernel-cuda.out")"
-        cuda="vadd, the NVFP4 and Q8_0 matvecs, rmsnorm (shared memory, barriers) and the buffer edges agree on the GPU and the CPU"
+        cuda="vadd, the NVFP4 and Q8_0 matvecs, rmsnorm (shared memory, barriers), kernelExp and the buffer edges agree on the GPU and the CPU"
     fi
 fi
 echo "kernels: the NVFP4 matvec kernel matches its reference on the CPU; a string, recursion, a result and native code are refused; CUDA: $cuda"
