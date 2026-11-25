@@ -276,8 +276,9 @@ ARM64. Job `windows-arm64-cross` cross-builds hosted programs and
 `windows-arm64-run`, **Windows ARM64 program runtime**, runs the checked
 images on `windows-11-arm`. The same standard-library programs as on x64 (`tests/cases/windows/programs.txt`,
 `tools/test-windows-programs.sh <compiler> aarch64-windows`) are cross-built for ARM64 there: all 81 build, with the import allowlist and no C
-runtime checked, and the runner runs them with `tools/windows/test-hosted.ps1` (the step reports and does not fail the job until the
-list has passed once on the runner; Wine has no ARM64, so nothing runs it before CI).
+runtime checked, and the runner runs them with `tools/windows/test-hosted.ps1`: all pass there (CI run 45560269126) and a program that
+differs fails the job (Wine has no ARM64, so nothing runs the list before CI). `https-loopback` had failed on ARM64 because the CPU probe
+read `ID_AA64ISAR0_EL1`, which Windows refuses; Windows targets now take the fixed answer Apple's do (AES and PMULL present).
 
 The release workflow includes `ablac-windows-arm64.zip` from v0.2.69
 alongside the x86-64 zip introduced in v0.2.68. `windows_arm64: with`
