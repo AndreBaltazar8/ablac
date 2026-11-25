@@ -12,11 +12,13 @@ import "abla/crypto/mlkem"
 import "abla/crypto/p384/core.ab"
 import "abla/crypto/rsa"
 import "abla/crypto/rsa/raw.ab"
+import "abla/crypto/bignum"
 import "abla/crypto/bignum/core.ab"
 import "abla/unsafe/memory/raw"
 import "abla/fs"
 import "abla/integer"
 import "abla/process/arguments"
+import "abla/text"
 
 noescape extern:"c" fun ctt_init(count: int, size: int, seed: int): int
 noescape extern:"c" fun ctt_input(state: int, index: int): int
@@ -112,6 +114,12 @@ trusted fun main: int {
     val kemEncapsulation = mlkem768EncapsulateWithMessage(mlkem768EncapsulationKey(kemKey.bytes), signSeed(3))
     if (!kemKey.ok || !kemEncapsulation.ok || mlkem768Decapsulate(kemKey.bytes, kemEncapsulation.ciphertext).bytes != kemEncapsulation.sharedSecret) return 15
     if (p384Peer.size != 97) return 16
+    // BigModulus and BigNumber (the big-<operation>-<256|384> targets): a fixed odd modulus of 32 or 48 bytes, a fixed public
+    // operand and exponent; the secret is the other operand (zero vs random), made outside the timed interval.
+    val bigWidth = if (mode.endsWith("-384")) 48 else 32
+    val bigMod = bigModulus(bigModulusBytes(bigWidth)) ?? return 30
+    val bigFixed = bigMod.number(bigFixedBytes(bigWidth, 1)) ?? return 31
+    val bigExponent = bigFixedBytes(bigWidth, 2)
     // RSA decryption: a valid PKCS#1 v1.5 and a valid OAEP ciphertext of a fixed message under the test key, for the padding-oracle targets.
     val rsaPublic = rsaPublicFromNumbers(key.modulus, "\x01\x00\x01", "public key")
     val pkcsValid = rsaPublic.encryptPkcs1Legacy("timing target message")
@@ -266,6 +274,25 @@ trusted fun main: int {
             ctt_begin(state, data, output, work)
             val signature = ed25519Sign(signKey, message)
             ctt_end(state, i, data, output, work, signature.bytes.size)
+        } else if (mode.startsWith("big-")) {
+            // big-null-*: the control for the others: the operand does not depend on the class (a fixed sequence of values over the
+            // samples, the same in both classes), so the statistic should stay small if the measurement itself is sound.
+            val operand = if (mode.startsWith("big-null-")) bigFixedBytes(bigWidth, 3 + i % 251) else bytesAt(data, bigWidth)
+            val x = bigMod.reduce(operand) ?? return 32
+            // isEqual: the operand is the fixed one exactly where the data is zero (the zero class), else far from it.
+            val same = bigMod.reduce(xorRepeated(bigFixedBytes(bigWidth, 1), bytesAt(data, bigWidth))) ?? return 33
+            val bit = secretU32(u32(int(ablaUnsafeLoadU8(bnPointer(data))) & 1))
+            ctt_begin(state, data, output, work)
+            val outcome = if (mode.startsWith("big-mul-")) x.mul(bigFixed).words
+                else if (mode.startsWith("big-null-add-")) x.add(bigFixed).words
+                else if (mode.startsWith("big-null-sub-")) x.sub(bigFixed).words
+                else if (mode.startsWith("big-add-")) x.add(bigFixed).words
+                else if (mode.startsWith("big-sub-")) x.sub(bigFixed).words
+                else if (mode.startsWith("big-select-")) x.select(bigFixed, ctFromLowBit(bit)).words
+                else if (mode.startsWith("big-equal-")) int(same.isEqual(bigFixed).declassify())
+                else if (mode.startsWith("big-pow-")) x.pow(bigExponent).words
+                else x.toBytes().size
+            ctt_end(state, i, data, output, work, outcome)
         } else if (mode == "compare") {
             ctt_begin(state, data, output, zero)
             val result = int(ctDifferenceAddress(zero, data, 256).declassify())
@@ -350,5 +377,19 @@ fun signSeed(n: int): string {
 fun xorRepeated(base: string, noise: string): string {
     val bytes: array<int> = []
     for (i in 0 until base.size) bytes.append(int(base[i]) ^ int(noise[i % noise.size]))
+    cryptoByteString(bytes)
+}
+
+/** A fixed odd modulus of `width` bytes with its top bit set (all ones but the last byte 0xfd). */
+fun bigModulusBytes(width: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until width) bytes.append(if (i == width - 1) 253 else 255)
+    cryptoByteString(bytes)
+}
+
+/** A fixed value of `width` bytes below that modulus (top byte 0x7f), different for each `n`. */
+fun bigFixedBytes(width: int, n: int): string {
+    val bytes: array<int> = []
+    for (i in 0 until width) bytes.append(if (i == 0) 127 else (i * 7 + n * 31) & 255)
     cryptoByteString(bytes)
 }

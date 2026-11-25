@@ -83,14 +83,16 @@ fi
 # Key residue in the heap (tests/cases/crypto-pure/heap-residue.ab): after an operation with a key, the caller's own copy wiped and two collections, no window of the key (or of the
 # key xor an HMAC pad constant) is left in the process's writable memory. The control (nothing wiped) must be found, or the scan proves nothing.
 residue_failed=0
-for mode in aes256gcm aes256gcm-open chacha x25519 x25519-dh ed25519 ed25519-pub p256 p256-pub p256-ecdh p384 hmac hmac384 hmac512 hkdf sha256-stream sha384-secret sha512-secret; do
+for mode in aes256gcm aes256gcm-open chacha x25519 x25519-dh ed25519 ed25519-pub p256 p256-pub p256-ecdh p384 hmac hmac384 hmac512 hkdf sha256-stream sha384-secret sha512-secret bignum; do
     line=$("$out/heap-residue" "$mode" 2>&1) || true
     if [[ $line != *"ok=true"*"after=0" ]]; then echo "residue: $line"; residue_failed=1; fi
 done
 control=$("$out/heap-residue" aes256gcm control 2>&1) || true
 if [[ ! $control =~ after=[1-9] ]]; then echo "residue control not found: $control"; residue_failed=1; fi
+control=$("$out/heap-residue" bignum control 2>&1) || true
+if [[ ! $control =~ after=[1-9] ]]; then echo "bignum residue control not found: $control"; residue_failed=1; fi
 if (( residue_failed == 0 )); then
-    echo "ok   key residue: 18 operations leave no window of their key in the heap (the control is found)"
+    echo "ok   key residue: 19 operations (BigNumber's dropped storage among them) leave no window of their key in the heap (the controls are found)"
 else
     fail key-residue
 fi

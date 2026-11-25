@@ -162,7 +162,9 @@ arithmetic is in Montgomery form inside and constant time in the values: the sam
 | `a.toBytes(bigEndian = true)` | the value as `width` bytes: **the place where a secret leaves the type** |
 
 The raw `bn*` functions of the same module take the address of a work area as an integer and trust it: they are the engine of the library's RSA and curves, not a safe API.
-Tests: `tools/test-bignum-checked.sh` (JavaScript's BigInt as the oracle at 4, 8, 32, 64 and 512 bytes), and `tools/test-ct.sh` reads the code of the steps that touch a value.
+Tests: `tools/test-bignum-checked.sh` (JavaScript's BigInt as the oracle at 4, 8, 32, 64 and 512 bytes), and `tools/test-ct.sh` reads the code of the steps that touch a value. The timing of `mul`, `add`, `sub`, `select`, `isEqual`, `pow` and `toBytes` at 256 and 384 bits is measured by `tools/ct-timing` (the `big-*` targets: a zero against a random secret operand, with a control that must be caught), and that a dropped number's memory is wiped by `tests/cases/crypto-pure/heap-residue.ab` (`bignum`).
+
+There is no inverse: a number's inverse modulo a prime is `a.pow(p - 2)`, whose exponent is public. Nothing on a secret path takes a variable-time inverse (`bnPublicInverse` of the raw engine works on public values only).
 
 ## `abla/crypto/ed25519`
 

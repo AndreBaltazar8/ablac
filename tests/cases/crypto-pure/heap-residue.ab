@@ -8,6 +8,7 @@ import "abla/io"
 import "abla/memory"
 import "abla/crypto"
 import "abla/crypto/aes"
+import "abla/crypto/bignum"
 import "abla/crypto/chacha20poly1305"
 import "abla/crypto/ed25519"
 import "abla/crypto/hkdf"
@@ -152,6 +153,7 @@ val peer = "\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00\x09\x08\x07\x06\x05\x04\x03
 
 fun main: int {
     val mode = processArgument(0)
+    if (mode == "bignum") return bignumResidue(!(processArgumentCount() > 1 && processArgument(1) == "control"))
     val wipe = !(processArgumentCount() > 1 && processArgument(1) == "control")
     var key = makeKey(if (mode == "p384") 48 else 32)
     // P-256 wants a scalar below the order.
@@ -176,4 +178,42 @@ fun main: int {
 trusted fun setFirstByte(key: string, value: int): void {
     ablaUnsafeStoreU8(nativePointerFromAddress(ablaUnsafeStringAddress(key)), value)
     return
+}
+
+// BigNumber (abla/crypto/bignum): a secret number's own storage, which holds its value in Montgomery form, must be wiped when the
+// number is dropped. The windows searched for are 16-byte windows of that stored form, read from the storage before any use; the
+// number is multiplied, raised to a power, copied and read out, then dropped, and every copy it made along the way is wiped by its own drop.
+// The control (not wiped) leaves a plain copy of the windows in a buffer that is freed as it is, which the scan has to find.
+@noinline trusted fun bignumWork(wipe: bool): bool {
+    val modulus = bigModulus("\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd") ?? return false
+    val key = makeKey(32)
+    setFirstByte(key, 127)
+    val secret = modulus.number(key) ?? return false
+    cryptoWipeString(key)
+    val storage = secret.storage
+    needles.storeI64(0, storage.loadI64(0) ^ MASK)
+    needles.storeI64(8, storage.loadI64(8) ^ MASK)
+    needles.storeI64(16, storage.loadI64(16) ^ MASK)
+    needles.storeI64(24, storage.loadI64(24) ^ MASK)
+    needles.storeI64(32, storage.loadI64(8) ^ MASK)
+    needles.storeI64(40, storage.loadI64(16) ^ MASK)
+    val squared = secret.mul(secret.copy())
+    val powered = secret.pow("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03")
+    val ok = squared.toBytes().size == 32 && powered.toBytes().size == 32 && secret.toBytes().size == 32
+    if (!wipe) {
+        val plain = nativeByteBuffer(32)
+        for (i in 0 until 4) plain.storeI64(i * 8, storage.loadI64(i * 8))
+        plain.close()
+    }
+    ok
+}
+
+trusted fun bignumResidue(wipe: bool): int {
+    val before = scan()
+    val ok = bignumWork(wipe)
+    memoryCollect()
+    memoryCollect()
+    val after = scan()
+    println("bignum ${if (wipe) "wiped" else "control"}: ok=$ok windows before=$before after=$after")
+    0
 }

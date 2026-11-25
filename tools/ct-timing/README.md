@@ -85,6 +85,8 @@ before measurement. Each observation has separate storage.
 | `p384-sign-nonce` | `p384EcdsaSign` with a fixed key of a zero vs random 64-byte message |
 | `rsa-pkcs1-decrypt` | `decryptPkcs1Legacy` (implicit rejection) of a fixed 2048-bit key: a valid ciphertext of a fixed message in the zero class, a random ciphertext below the modulus (a padding failure) in the random class: the padding-oracle target |
 | `rsa-oaep-decrypt` | `decryptOaepSha256`, as `rsa-pkcs1-decrypt`: a valid ciphertext against a random one (refused) |
+| `big-mul-256`, `big-mul-384`, `big-add-*`, `big-sub-*`, `big-select-*`, `big-equal-*`, `big-pow-*`, `big-bytes-*` | `BigNumber` `mul`, `add`, `sub`, `select` (mask from the data's low bit), `isEqual` (the operand is the fixed one in the zero class), `pow` (a fixed public exponent of the modulus's width; the secret is the base) and `toBytes`, at 32 and 48 bytes, the other operand fixed and public, the secret operand zero vs random below the modulus; the number is made outside the interval, its allocation inside |
+| `big-null-add-384`, `big-null-sub-384` | The control of the `big-*` targets: the operand is a fixed sequence of values over the samples, the same in both classes, so the statistic must stay small |
 | `leaky-compare` | Deliberately early-exiting 256-byte Abla comparison; mandatory detection control |
 
 AES key expansion is outside these encryption tests. RSA CRT includes the
