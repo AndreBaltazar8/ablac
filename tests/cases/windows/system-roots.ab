@@ -1,0 +1,65 @@
+// The system trust store on a hosted Windows program (the runtime's system call 4006, crypt32's ROOT store; tools/test-windows-system-roots.sh runs it
+// under Wine with a certificate put into the registry's stores). Modes, by the first argument:
+//   writecert       writes system-roots-cert.pem (the certificate below, for 127.0.0.1) and system-roots-key.pem, and exits 0
+//   serve <port>    a TLS server with that certificate (answers every connection that completes its handshake)
+//   (none)          starts the server on a free port, connects to it with the system trust store and prints `trusted true|false`
+// The program exits 0 whatever the answer: the script reads the line.
+import "abla/io"
+import "abla/fs"
+import "abla/net"
+import "abla/integer"
+import "abla/process/arguments"
+import "abla/process/command"
+import "abla/process/time"
+import "abla/sys/linux/process"
+import "abla/tls/pure"
+
+val certificatePem = "-----BEGIN CERTIFICATE-----\nMIIBqzCCAVGgAwIBAgIUBcI7/waq4uNvLQxdsdeZFBnnZ48wCgYIKoZIzj0EAwIw\nFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEyMzIyMjAzMloYDzIxMjYxMDMw\nMjIyMDMyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\nPQMBBwNCAASm/UOCQcdKlssN/oXY4GkkDwCbMgeuK2mpR2KKBX9Nkg9kzCoS9OWx\n9zKhdEK7wprWyt2nWbgJgsuRPbD0l8mno38wfTAdBgNVHQ4EFgQU7vGkPBeTrvVc\nDdHh+IpSxo3dam8wHwYDVR0jBBgwFoAU7vGkPBeTrvVcDdHh+IpSxo3dam8wGgYD\nVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P\nAQH/BAQDAgKEMAoGCCqGSM49BAMCA0gAMEUCIQCMoR3ahbryAQgxr+lmFQrWCdr2\n08yr3/WmP0H6qFoFtAIgRbeAPw94T/kmdhosCD5faknqDsW4LyvX1oHyRv4WNWc=\n-----END CERTIFICATE-----\n"
+val keyPem = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgN2N55cgZDgLxJbL3\nqDUmLebv8NOgWkr0HOZyPD9PYnShRANCAASm/UOCQcdKlssN/oXY4GkkDwCbMgeu\nK2mpR2KKBX9Nkg9kzCoS9OWx9zKhdEK7wprWyt2nWbgJgsuRPbD0l8mn\n-----END PRIVATE KEY-----\n"
+
+fun writeCertificate(): int {
+    path("system-roots-cert.pem").writeText(certificatePem)
+    path("system-roots-key.pem").writeText(keyPem)
+    0
+}
+
+fun serve(port: int): int {
+    val listener = tlsListen("system-roots-cert.pem", "system-roots-key.pem", "127.0.0.1", port, 16, false)
+    if (listener.handle == -1) return 1
+    val deadline = linuxMonotonicMilliseconds() + 30000
+    while (linuxMonotonicMilliseconds() < deadline) {
+        val connection = listener.accept(1000, 5000)
+        if (connection.handle != -1) {
+            val request = connection.read(4096)
+            if (request.size > 0) connection.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            connection.close()
+        }
+    }
+    listener.close()
+    0
+}
+
+fun main: int {
+    if (processArgumentCount() > 0 && processArgument(0) == "writecert") return writeCertificate()
+    if (processArgumentCount() > 1 && processArgument(0) == "serve") return serve((processArgument(1).parseInt() ?? 0))
+    var probe = tcpListenAddress(ipv4Loopback(0))
+    val port = probe.localPort()
+    probe.close()
+    val child = command("/proc/self/exe").argument("serve").argument("$port").start()
+    var listening = false
+    var attempt = 0
+    while (!listening && attempt < 1500) {
+        var tcp = tcpConnectIpv4("127.0.0.1", port, 200)
+        if (tcp.descriptor >= 0) {
+            tcp.close()
+            listening = true
+        } else sleepNanoseconds(20000000)
+        attempt = attempt + 1
+    }
+    val connection = tlsConnect("127.0.0.1", port, 5000, 5000)
+    println("trusted ${connection.handle != -1}")
+    if (connection.handle != -1) connection.close()
+    println("roots ${tlsSystemTrustStore().certificates.size}")
+    child.stop(2000)
+    0
+}
