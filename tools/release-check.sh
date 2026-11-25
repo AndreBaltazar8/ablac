@@ -15,6 +15,8 @@
 #   static      (when the run built ablac-static-x86_64-linux, #806 step C; `static-aarch64` for ablac-static-aarch64-linux, run natively or under
 #               qemu-aarch64, SKIP on a host with neither, never with the fixpoint) it has no PT_INTERP or DT_NEEDED, prints the version, builds and
 #               runs a smoke program and, with ABLA_STATIC_LLVM_LIB set, reaches the fixpoint (tools/test-static-artifact.sh)
+#   static-input (with the dynamic asset beside the static default) the run's Linux job logged the sha256 of the compiler its static step built from, and it is
+#               the published ablac-dynamic-x86_64-linux (FAIL if not; SKIP with a warning when the run logged no such line or its log cannot be read)
 #   toolchain   (when the run ships abla-toolchain-dynamic-x86_64-linux.tar.gz beside the default) abla-toolchain-x86_64-linux.tar.gz is the static package: no
 #               PT_INTERP or DT_NEEDED, no shared library or external LLVM tool, at most 60 MB (150 MB unpacked), its launcher runs with an empty PATH
 #   playground  (when the run ships abla-playground-<version>.tar.gz, the browser compiler of tools/build-playground.sh) its manifest names this
@@ -364,6 +366,32 @@ for static_arch in x86_64 aarch64; do
         fi
     fi
 done
+
+# 7b. static-input: the static compiler is built from the compiler that is published as ablac-dynamic-x86_64-linux. The run's Linux job logs the sha256 of
+# the compiler the static step builds from (`static input compiler sha256: <hash>`); it must be the dynamic asset's. A run without that line (a release before
+# the step logged it) is a SKIP that says so; a different hash is a FAIL (the static asset was built from another stage than the one published).
+if ((switched)) && [[ -f $out/ablac-dynamic-x86_64-linux ]]; then
+    static_input_job=
+    static_input_log=
+    if command -v gh > /dev/null 2>&1; then
+        static_input_job=$(gh run view "$run_id" -R "$repo" --json workflowName,jobs --jq \
+            'select(.workflowName == "Release") | .jobs[] | select(.name | test("^compiler \\(ubuntu-[^,]*, ablac-x86_64-linux,")) | .databaseId' 2>/dev/null | awk 'NR == 1') || static_input_job=
+        [[ -z $static_input_job ]] || static_input_log=$(gh run view "$run_id" -R "$repo" --job "$static_input_job" --log 2>/dev/null) || static_input_log=
+    fi
+    static_input_log=${static_input_log//$'\r'/}
+    if [[ -z $static_input_log ]]; then
+        report SKIP static-input "cannot read the Linux job log of run $run_id"
+    else
+        logged=$(awk '/static input compiler sha256: / { print $NF; exit }' <<< "$static_input_log")
+        if [[ ! $logged =~ ^[[:xdigit:]]{64}$ ]]; then
+            report SKIP static-input "WARNING: run $run_id logged no 'static input compiler sha256' line (a release from before the step printed it): the static asset's input is unchecked"
+        elif [[ ${logged,,} == "$(sha256 "$out/ablac-dynamic-x86_64-linux")" ]]; then
+            report PASS static-input "the static compiler was built from the published dynamic asset (${logged:0:12})"
+        else
+            report FAIL static-input "the static compiler was built from ${logged:0:12}, not the published dynamic asset ($(sha256 "$out/ablac-dynamic-x86_64-linux" | cut -c1-12))"
+        fi
+    fi
+fi
 
 # 8. toolchain: when the release ships the dynamic toolchain archive beside the default (abla-toolchain-dynamic-x86_64-linux.tar.gz, one release, like
 # decision #90 A), `abla-toolchain-x86_64-linux.tar.gz` is the static package (tools/package-linux-static-toolchain.sh): no PT_INTERP and no
