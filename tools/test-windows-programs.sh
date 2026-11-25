@@ -84,6 +84,11 @@ while read -r source status where; do
     done <<< "$imports"
     # A program marked `runner` (one Wine cannot check) is built and left for the Windows runner only; so is every program for ARM64.
     if [[ $target == aarch64-windows ]]; then
+        # Windows ends a program that reads ID_AA64ISAR0_EL1 (mrs, system register S3_0_C0_C6_0) with STATUS_ILLEGAL_INSTRUCTION: the CPU
+        # probe of abla/simd/target must not emit it for this target (the ARM64 https-loopback died of it in aesGcmKeyOwner).
+        llvm-objdump -d "$exe" > "$exe.asm" 2>/dev/null || fail "$name: llvm-objdump could not disassemble $exe"
+        ! grep -qE 'mrs[[:space:]].*(S3_0_C0_C6_0|ID_AA64ISAR0_EL1)' "$exe.asm" || fail "$name: reads ID_AA64ISAR0_EL1, which Windows refuses to user code"
+        rm -f "$exe.asm"
         if grep -qxF "$source" tests/cases/windows/arm64-debug.txt; then
             mkdir -p build/windows-arm64-debug
             "$compiler" build "$source" --target "$target" -o "build/windows-arm64-debug/$name.exe" --fast --backtrace --no-cache \
