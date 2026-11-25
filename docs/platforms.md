@@ -36,6 +36,7 @@ Checksums accompany the published compiler and toolchain assets.
 | WebAssembly hosted | T2 | No Wasm-hosted compiler gate | Release/development modules execute with the `abla_host` ABI under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | WebAssembly hostless | T2 | No Wasm-hosted compiler gate | Import-free runtime fixtures and differential programs execute under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | Xtensa / ESP32 | T3 | No compiler hosted on the microcontroller | Object/assembly checks and optional companion integration; no required board run | No ablac ESP32 binary; separately versioned LLVM companion |
+| Linux RISC-V 64 | T2 | Static compiler (pinned patched LLVM/lld) executed under qemu in CI: release and fast hello, in-process object emission; self-build fixed point under qemu on manual dispatch | Static LP64D programs; every module program that links static runs under qemu and matches x86-64 (335 of 336) | None; the RV64 compiler is not a release asset |
 | Windows x86-64 | T2 | Packaged compiler smoke on `windows-latest` nightly and on dispatch; native fixed point required when the zip ships | Cross-built on Linux; the freestanding exit-status program, the hosted crash program with its symbolized backtrace, and selected hosted programs run natively on `windows-latest` in CI | None in v0.2.64; `abla-toolchain-x86_64-windows.zip` shipped in v0.2.68 |
 | Windows ARM64 | T2 | Packaged compiler smoke and native fixed point on `windows-11-arm` required when the zip ships | Hosted programs cross-built on Linux and run natively on `windows-11-arm` in CI | None in v0.2.64. `ablac-windows-arm64.zip` starts with v0.2.69. |
 <!-- readiness-platforms:end -->
@@ -163,6 +164,33 @@ The groups that keep a module program from matching, each one named in a list th
 The 22 programs outside `tests/cases/modules` that `tests/cases/linux/programs.txt` runs are as before. The other directories of
 `tests/cases` are not programs to compare: they test the compiler (diagnostics, caches, compile-time evaluation, the editor service,
 Android, Windows) through recipes in `tests/abla-tests.json` that name their own flags, inputs and expected output.
+
+## Linux RISC-V 64
+
+Everything on this target has run under QEMU user mode (`qemu-riscv64`, the version `shell.nix` pins); no RV64 hardware or hosted runner is
+part of the CI. What is proven, and by what:
+
+- **Programs.** `--target riscv64-linux` builds hosted, libc-free LP64D PIE executables (own startup, TLS, system-call translation, threads;
+  [the runtime](../src/backend/llvm/riscv64.ab)). The `libc-free-riscv64` job
+  ([CI](../.github/workflows/ci.yml)) links all 338 module programs that link static on any target, runs 124 selected programs
+  and then every module program under QEMU and compares standard output and exit status with the x86-64 build: 335 of 336 match
+  and 1 differs by design ([results and blockers](#every-module-program-under-qemu-1208)).
+- **The compiler.** The same job builds the compiler itself as a static LP64D PIE
+  ([tools/test-static-compiler-riscv64.sh](../tools/test-static-compiler-riscv64.sh)) from the pinned patched LLVM 23.1.3 and lld
+  archives (`llvm-23.1.3-fdiv-1-riscv64-linux.tar.xz`, SHA-256 `5962b6786305393b5ad28900cc4dd0ad8644bc908751f5d53d88f2906e7ff999`,
+  cross-built by [llvm-riscv64-static.yml](../.github/workflows/llvm-riscv64-static.yml), consumed by
+  [nix/riscv64-static-native-deps.nix](../nix/riscv64-static-native-deps.nix)) and runs it under QEMU with an empty `PATH`: release and
+  `--fast` hello, and in-process object emission.
+- **The fixed point.** The dispatch-only [RV64 static compiler convergence](../.github/workflows/rv64-static-convergence.yml) builds stage 2 with that
+  seed and stage 3 with stage 2, both under QEMU, and compares the bytes. Run 45588819403 (source `130b50ec2`, the compiler reporting 0.2.72): stage 2 took 5178 s
+  and stage 3 5288 s on one hosted x86-64 runner each, and the two images are byte-identical (SHA-256
+  `9b2f7bdafb5e86b24bc8cc0d5894403aa5584f060031f39d067063fcd69d9b84`). The earlier run 45302710345 (source `9d6d3b81c`) agreed the same
+  way (`0afdf044237d644a84f3e11cf0205ef65a174ba4ff02f4a34ed71b9416caaf21`, 5176 s and 5126 s, 4.4 GB resident each). The job limit is
+  240 minutes per stage, so the fixed point is not part of the per-commit CI.
+
+What is not covered: a run on RISC-V hardware or a native runner (QEMU user mode emulates the Linux system-call interface, so kernel
+differences, `riscv_hwprobe` on older kernels and real timing are unchecked), performance of the compiler or its programs, an installable
+release (there is no `ablac-riscv64-linux` asset and no `setup-abla` support), and a fixed-point run for every commit.
 
 ## macOS arm64 and Intel
 
