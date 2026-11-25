@@ -20,15 +20,9 @@ if ! /usr/bin/env time --version >/dev/null 2>&1; then
 fi
 # The budget is CPU time (about 9 s of it), which load does not change; the wall-clock limit only ends a hang.
 #
-# The compile is measured with the absolute path to src/orc_main.ab (the record's method) and with the path relative to the
-# project root: the semantic identities once carried the source path of every name and local, and an absolute path peaked
-# ~100 MB (6-7%) over a relative one (#814). The two are measured alternately, five rounds, so load that comes and goes
-# is on both; each takes the lowest of its runs. The absolute path may not peak more than 5% over the relative one: the
-# old compiler's gap is 6-7%, the fixed one's is -2%..+2%, and the lowest of five interleaved runs moves by about 1%
-# under suite load (the first version, the lower of two runs measured one kind after the other, saw +4.9% at load).
-# A source with the same text measured 1,689,700-1,730,964 kB on one machine across five runs of a commit (a 1.5-2% spread), and
-# 1,640,000-1,657,000 on another: the limits are 10% over and 20% under the last record line, so the lowest of five rounds (not three)
-# keeps a commit that did not move the peak from failing by luck of the load or of the checkout (see the record).
+# Keep the default-GC RSS ceiling for both entry spellings. A path change can cross a
+# collection threshold and change the high-water mark without retaining more data.
+# Use the forced-collection checkpoints below to check the actual path retention (#814).
 measure() { # KIND ROUND: the peak resident kB of one compile, in the file named by the arguments
     local kind=$1 round=$2 input directory=$project_root
     input="$project_root/src/orc_main.ab"
@@ -47,11 +41,8 @@ measure() { # KIND ROUND: the peak resident kB of one compile, in the file named
 peak=""
 relative_peak=""
 recorded=$(grep -v '^#' "$record" | tail -n 1 | cut -d' ' -f1)
-# Five rounds keep a commit that did not move the peak from failing by luck, which matters near a limit. Clear of every
-# limit by a margin after two rounds (the gap within 3%, the peak within 7% over and 17% under the record), the rest
-# would only lower the minima (2026-11-19: 100 of the suite's CPU-seconds for the ten runs): the suite stops there.
-# More rounds can only bring a peak down, so a peak over a limit still fails, after all five. RUN_TESTS_FULL=1 or
-# MEMORY_PEAK_ROUNDS=5 always runs five.
+# Two pairs suffice if both minima are comfortably within the RSS ceiling.
+# RUN_TESTS_FULL=1 or MEMORY_PEAK_ROUNDS=5 still takes five interleaved pairs.
 all_rounds=${MEMORY_PEAK_ROUNDS:-${RUN_TESTS_FULL:+5}}
 rounds=0
 for round in 1 2 3 4 5; do
@@ -65,7 +56,7 @@ for round in 1 2 3 4 5; do
         fi
     done
     rounds=$round
-    if [[ $all_rounds != 5 ]] && (( round >= 2 && peak * 100 <= relative_peak * 103 && peak * 100 <= recorded * 115 )); then
+    if [[ $all_rounds != 5 ]] && (( round >= 2 && peak * 100 <= recorded * 115 && relative_peak * 100 <= recorded * 115 )); then
         break
     fi
 done
@@ -75,22 +66,55 @@ done
 # (49.41–49.44 B/B) to frontend.lowering.end (43.22–43.25 B/B) across three inputs.
 # A limit of 47 leaves about 9% margin. The RSS runs keep default GC.
 retained_per_source_byte_hundredths=4700
-traced="$output_directory/traced.err"
-(
-    cd "$project_root"
-    ABLA_COMPILER_MEMORY_TRACE=retained \
-        ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=120 \
-        "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm src/orc_main.ab >"$output_directory/self.ll" 2>"$traced"
-) || {
-    echo "compiler-memory-peak: the traced --emit-llvm failed" >&2
-    tr -d '\0' <"$traced" | sed -n '1,20p' >&2
+for kind in absolute relative; do
+    input=src/orc_main.ab
+    if [[ $kind == absolute ]]; then input="$project_root/$input"; fi
+    traced="$output_directory/traced-$kind.err"
+    (
+        cd "$project_root"
+        ABLA_COMPILER_MEMORY_TRACE=retained \
+            ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=1800 ABLA_MAX_CPU_SECONDS=120 \
+            "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm "$input" >"$output_directory/self.ll" 2>"$traced"
+    ) || {
+        echo "compiler-memory-peak: the traced --emit-llvm ($kind path) failed" >&2
+        tr -d '\0' <"$traced" | sed -n '1,20p' >&2
+        exit 1
+    }
+    tr -d '\0' < "$traced" | awk '
+        /^abla-retained-memory / {
+            phase = $2
+            sub(/:.*/, "", phase)
+            if ($NF + 0 > high[phase]) high[phase] = $NF + 0
+        }
+        END { for (phase in high) printf "%s %d\n", phase, high[phase] }
+    ' > "$output_directory/retained-$kind.txt"
+done
+# Compare corresponding phases. An earlier regression could retain long names during
+# semantic analysis and free them before the overall lowering peak.
+path_sample=$(awk '
+    NR == FNR { absolute[$1] = $2; phases++; next }
+    $1 in absolute && $2 > 0 {
+        matched++
+        growth = absolute[$1] / $2
+        if (growth > worst) { worst = growth; phase = $1; a = absolute[$1]; r = $2 }
+    }
+    END {
+        if (matched == 0 || matched != phases || matched != FNR) exit 1
+        printf "%s %d %d\n", phase, a, r
+    }
+' "$output_directory/retained-absolute.txt" "$output_directory/retained-relative.txt") || {
+    echo "compiler-memory-peak: no matching retained-heap samples for both entry paths" >&2
     exit 1
 }
-peak_sample=$(tr -d '\0' <"$traced" | awk '
-    /^abla-retained-memory / && $NF + 0 > m { m = $NF + 0; phase = $2 }
-    END { printf "%s %d\n", (phase != "" ? phase : "unknown"), m }
-')
+read -r path_phase path_absolute path_relative <<< "$path_sample"
+if (( path_absolute * 100 > path_relative * 101 )); then
+    echo "compiler-memory-peak: $path_absolute retained bytes for the absolute path at $path_phase vs $path_relative for the relative path, over the 1% path-retention limit (#814)." >&2
+    exit 1
+fi
+peak_sample=$(awk '$2 + 0 > m { m = $2; phase = $1 } END { printf "%s %d\n", phase, m }' \
+    "$output_directory/retained-absolute.txt" "$output_directory/retained-relative.txt")
 read -r peak_phase retained <<< "$peak_sample"
+traced="$output_directory/traced-relative.err"
 source_bytes=$(tr -d '\0' <"$traced" | sed -n 's/^abla-frontend-memory graph\.acquire:\(.*\) [0-9]*$/\1/p' | sort -u |
     (cd "$project_root" && xargs -d '\n' cat) | wc -c)
 if (( retained <= 0 || source_bytes <= 0 )); then
@@ -101,12 +125,9 @@ if (( retained * 100 > source_bytes * retained_per_source_byte_hundredths )); th
     echo "compiler-memory-peak: $retained retained bytes at $peak_phase for $source_bytes bytes of source: $((retained / source_bytes)) per byte, over the limit of $((retained_per_source_byte_hundredths / 100)). Inspect the retained trace with ABLA_COMPILER_MEMORY_TRACE=retained." >&2
     exit 1
 fi
-if (( peak * 100 > relative_peak * 105 )); then
-    echo "compiler-memory-peak: $peak kB with the absolute path to src/orc_main.ab, $relative_peak kB with the relative one: a build's peak must not follow the length of the path (what keeps the path per name or local?)." >&2
+if (( peak * 100 > recorded * 120 || relative_peak * 100 > recorded * 120 )); then
+    echo "compiler-memory-peak: $peak kB absolute and $relative_peak kB relative, over the recorded $recorded kB by more than 20% (a loose ceiling: the live-bytes check is the tight one, and it passed). Add a line to $record saying why, or find what grew." >&2
     exit 1
 fi
-if (( peak * 100 > recorded * 120 )); then
-    echo "compiler-memory-peak: $peak kB, over the recorded $recorded kB by more than 20% (a loose ceiling: the live-bytes check is the tight one, and it passed). Add a line to $record saying why, or find what grew." >&2
-    exit 1
-fi
+echo "compiler-memory-peak: absolute/relative retained comparison passes (largest ratio at $path_phase, $path_absolute versus $path_relative bytes)"
 echo "compiler-memory-peak: --emit-llvm of the compiler peaks at $peak kB resident (recorded $recorded kB; $relative_peak kB given a relative path; $rounds rounds), $retained retained bytes at $peak_phase for $source_bytes source bytes ($((retained * 100 / source_bytes)) hundredths per byte)"
