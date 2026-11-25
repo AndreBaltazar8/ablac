@@ -9,6 +9,7 @@ import "rmsnorm.ab"
 import "q8.ab"
 import "exp.ab"
 import "pick4.ab"
+import "q8fast.ab"
 import "abla/kernel"
 import "abla/kernel/cuda"
 import "abla/float"
@@ -241,6 +242,36 @@ trusted fun main: int {
     val q8Agree = q8Worst <= q8Largest * 0.00001 && q8Largest > 0.01
     println("matvecQ8: $q8Rows x $q8Cols, GPU within 1e-5 of CPU $q8Agree")
 
+    // The unchecked fast path: matvecQ8Fast gives matvecQ8's bits on each backend.
+    val cpuQ8Fast = floats(q8Rows) { i -> f32(0.0) }
+    val cpuQ8FastBuffer = KernelF32Buffer(nativePointerAddress(cpuQ8Fast.address), q8Rows)
+    kernelRunCpu(q8Rows, 1) { matvecQ8Fast(q8W, q8XBuffer, cpuQ8FastBuffer, q8Rows, q8Cols) }
+    val gpuQ8Fast = floats(q8Rows) { i -> f32(0.0) }
+    if (!device.launch("matvecQ8Fast", (q8Rows + 7) / 8, 256, cudaKernelArguments().buffer(dqw.raw()).buffer(dqx.floats())
+        .buffer(dqy.floats()).integer(q8Rows).integer(q8Cols)) || !device.download(dqy, gpuQ8Fast)) {
+        println("kernel-cuda: matvecQ8Fast: ${device.error}")
+        return 1
+    }
+    var fastSame = true
+    for (row in 0 until q8Rows) {
+        if (f32ToBits(floatAt(cpuQ8Fast, row)) != f32ToBits(floatAt(cpuQ8, row))) fastSame = false
+        if (f32ToBits(floatAt(gpuQ8Fast, row)) != f32ToBits(floatAt(gpuQ8, row))) fastSame = false
+    }
+    // The same weights seen one byte later: rows at odd addresses, so matvecQ8Fast takes its checked loop (an unchecked
+    // 2-byte load there would fault the launch); it still gives matvecQ8's bits on that view.
+    val oddWeights = KernelU8Buffer(dqw.raw().address + 1, dqw.raw().count - 1)
+    val gpuOdd = floats(q8Rows) { i -> f32(0.0) }
+    val gpuOddFast = floats(q8Rows) { i -> f32(0.0) }
+    if (!device.launch("matvecQ8", (q8Rows + 7) / 8, 256, cudaKernelArguments().buffer(oddWeights).buffer(dqx.floats())
+            .buffer(dqy.floats()).integer(q8Rows).integer(q8Cols)) || !device.download(dqy, gpuOdd) ||
+        !device.launch("matvecQ8Fast", (q8Rows + 7) / 8, 256, cudaKernelArguments().buffer(oddWeights).buffer(dqx.floats())
+            .buffer(dqy.floats()).integer(q8Rows).integer(q8Cols)) || !device.download(dqy, gpuOddFast)) {
+        println("kernel-cuda: matvecQ8Fast at an odd address: ${device.error}")
+        return 1
+    }
+    for (row in 0 until q8Rows) if (f32ToBits(floatAt(gpuOddFast, row)) != f32ToBits(floatAt(gpuOdd, row))) fastSame = false
+    println("matvecQ8Fast: unchecked loads give the checked kernel's bits on the GPU and the CPU, and at an odd address $fastSame")
+
     // kernelExp from -110 to 95 in steps of 1/1024 (past both ends: 0 below about -104, infinity above about 88.7), and
     // -0, the infinities and NaN. exp is never negative, so the distance between the bit patterns counts ulps.
     val sweep = 205 * 1024 + 1
@@ -278,5 +309,5 @@ trusted fun main: int {
     val expAgree = expWorst <= 2 && expNaN && expEnds
     println("kernelExp: $expCount values, GPU within $expWorst ulp of the CPU (at most 2), NaN, 0 and infinity at the ends: $expAgree")
     device.close()
-    if (vaddEqual && pickEqual && agree && untouched && edgesRight && normAgree && q8Agree && expAgree) 0 else 1
+    if (vaddEqual && pickEqual && agree && untouched && edgesRight && normAgree && q8Agree && fastSame && expAgree) 0 else 1
 }

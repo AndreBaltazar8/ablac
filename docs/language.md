@@ -3045,6 +3045,21 @@ another, so `kernelBarrier` works there only in groups of one thread (a larger
 group stops the program). A kernel must not depend on the first three; one
 that strides by `kernelGroupSize()` runs on both.
 
+Every buffer access above is checked, which costs a compare and a branch per
+load. A kernel that shows its indexes are inside can skip them on the unchecked
+fast path: `loadUnchecked(index)` on every buffer, `KernelF32Buffer.load4Aligned`
+(one 16-byte load at a 16-byte-aligned address) and `KernelU8Buffer.loadU16Aligned`
+and `loadU32Aligned`. They are trusted-only
+([#1226](#trusted-native-implementations)), so the kernel, and any function
+of it that calls one, is a `trusted fun` whose comment gives the argument. On
+a GPU nothing checks them: an index outside reads whatever memory is there, and
+a misaligned wide load faults the launch. The CPU backend checks them anyway and
+stops the program, so a CPU run of the kernel finds a wrong index. The usual
+shape checks once, before its loop, that the loop's loads are inside
+(`size()`) and aligned (`isAligned(index, bytes)` on every buffer, which reads
+no memory, since a buffer may start at any offset into device memory), then runs
+the loop with unchecked loads, and otherwise the same loop with checked ones.
+
 ```abla fragment
 import "abla/kernel"
 

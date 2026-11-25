@@ -1,0 +1,39 @@
+import "abla/kernel"
+import "abla/float"
+import "abla/simd"
+import "q8.ab"
+
+/** matvecQ8 on the unchecked fast path (#143), the pattern a trusted kernel follows: it checks once per row that every
+ *  load of the row is inside its buffer and aligned (the row's bytes start..start + cols / 32 * 34 of `w` at an even
+ *  address, so each 34-byte block's scale and the quants' halves are 2-byte-aligned loads; elements 0..cols of `x` at a
+ *  16-byte-aligned address, cols a multiple of 32, so each f32x4 at a multiple of 4 is aligned), then runs the loop with
+ *  unchecked loads; else it runs matvecQ8's checked loop. Both give the same bits. */
+@kernel
+trusted fun matvecQ8Fast(w: KernelU8Buffer, x: KernelF32Buffer, y: KernelF32Buffer, rows: int, cols: int) {
+    val size = kernelSubgroupSize()
+    val row = kernelGlobalId() / size
+    if (row >= rows) return
+    val rowBytes = cols / 32 * 34
+    val start = row * rowBytes
+    val parts = cols / 32 * 8
+    val fast = cols % 32 == 0 && start >= 0 && start + rowBytes <= w.size() && cols <= x.size() &&
+        w.isAligned(start, 2) && x.isAligned(0, 16)
+    var sum = f32(0.0)
+    var part = kernelSubgroupLane()
+    while (part < parts) {
+        val block = part / 8
+        val piece = part % 8
+        val base = start + block * 34
+        val quantsAt = base + 2 + piece * 4
+        val scale = kernelF16ToF32(if (fast) w.loadU16Aligned(base) else w.loadU16(base))
+        val quants = if (fast) w.loadU16Aligned(quantsAt) | (w.loadU16Aligned(quantsAt + 2) << 16) else w.loadU32(quantsAt)
+        val values = if (fast) x.load4Aligned(block * 32 + piece * 4) else x.load4(block * 32 + piece * 4)
+        sum = kernelFma(scale * q8KernelSigned(quants), values.get(0), sum)
+        sum = kernelFma(scale * q8KernelSigned(quants >> 8), values.get(1), sum)
+        sum = kernelFma(scale * q8KernelSigned(quants >> 16), values.get(2), sum)
+        sum = kernelFma(scale * q8KernelSigned(quants >> 24), values.get(3), sum)
+        part = part + size
+    }
+    val total = kernelSubgroupSum(sum)
+    if (kernelSubgroupLane() == 0) y.store(row, total)
+}

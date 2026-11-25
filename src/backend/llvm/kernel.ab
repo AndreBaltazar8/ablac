@@ -501,6 +501,38 @@ fun bootstrapKernelBufferAccess(
     }
 }
 
+/** The unchecked fast path (#143): loadUnchecked (`wide` ""; the buffer's element), load4Aligned (`wide` "<4 x float>")
+ *  and loadU16Aligned/loadU32Aligned ("i16"/"i32" from a byte buffer) as one plain load at the element's (or the wide
+ *  value's) alignment, with no bounds check: the trusted caller has shown the index is inside and aligned. */
+fun bootstrapKernelUncheckedLoad(
+    var emitter: BootstrapKernelEmitter,
+    var state: BootstrapKernelFunctionState,
+    instruction: BootstrapInstruction,
+    wide: string
+): void {
+    if (instruction.operands.size < 2) { bootstrapKernelFail(emitter, state.name, "operation", instruction.text); return }
+    val buffer = bootstrapKernelGet(state, instruction.operands[0])
+    if (!buffer.type.startsWith("buffer.")) { bootstrapKernelFail(emitter, state.name, "type", buffer.type); return }
+    val element = bootstrapKernelElement(buffer.type)
+    val index = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
+    if (index == "") return
+    val address = bootstrapKernelFresh(state)
+    bootstrapKernelLine(state, "$address = getelementptr inbounds $element, ptr ${buffer.operand}, i64 $index")
+    val loadType = if (wide == "") element else wide
+    val align = if (loadType == "<4 x float>") 16 else if (loadType == "i8") 1 else if (loadType == "i16") 2 else 4
+    val loaded = bootstrapKernelFresh(state)
+    bootstrapKernelLine(state, "$loaded = load $loadType, ptr $address, align $align")
+    if (loadType == "<4 x float>") {
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(loaded, "f32x4", ""))
+    } else if (loadType == "float") {
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(loaded, "f32", ""))
+    } else {
+        val extended = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$extended = zext $loadType $loaded to i64")
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(extended, "i64", ""))
+    }
+}
+
 /** KernelF32Buffer.load4: elements index..index + 3 as an f32x4, each 0 outside the buffer. When all four are inside and
  *  the address is 16-byte aligned it is one vector load (ld.v4.f32), else four bounds-checked loads. */
 fun bootstrapKernelLoad4(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState, instruction: BootstrapInstruction): void {
@@ -619,6 +651,36 @@ fun bootstrapKernelBuiltin(
         type = "f32"
     } else if (name == "extension_KernelU8Buffer_loadU16" || name == "extension_KernelU8Buffer_loadU32") {
         bootstrapKernelLoadWide(emitter, state, instruction, if (name == "extension_KernelU8Buffer_loadU16") 2 else 4)
+        return true
+    } else if (name == "extension_KernelF32Buffer_loadUnchecked" || name == "extension_KernelU32Buffer_loadUnchecked" ||
+        name == "extension_KernelU16Buffer_loadUnchecked" || name == "extension_KernelU8Buffer_loadUnchecked") {
+        bootstrapKernelUncheckedLoad(emitter, state, instruction, "")
+        return true
+    } else if (name == "extension_KernelF32Buffer_isAligned" || name == "extension_KernelU32Buffer_isAligned" ||
+        name == "extension_KernelU16Buffer_isAligned" || name == "extension_KernelU8Buffer_isAligned") {
+        // Whether element `index`'s address is a multiple of `bytes` (a power of two): no memory is read.
+        if (instruction.operands.size < 3) return false
+        val buffer = bootstrapKernelGet(state, instruction.operands[0])
+        if (!buffer.type.startsWith("buffer.")) { bootstrapKernelFail(emitter, state.name, "type", buffer.type); return true }
+        val index = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
+        val bytes = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[2]), "i64")
+        if (index == "" || bytes == "") return true
+        val address = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$address = getelementptr ${bootstrapKernelElement(buffer.type)}, ptr ${buffer.operand}, i64 $index")
+        val integer = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$integer = ptrtoint ptr $address to i64")
+        val mask = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$mask = sub i64 $bytes, 1")
+        val low = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$low = and i64 $integer, $mask")
+        result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = icmp eq i64 $low, 0")
+        type = "bool"
+    } else if (name == "extension_KernelF32Buffer_load4Aligned") {
+        bootstrapKernelUncheckedLoad(emitter, state, instruction, "<4 x float>")
+        return true
+    } else if (name == "extension_KernelU8Buffer_loadU16Aligned" || name == "extension_KernelU8Buffer_loadU32Aligned") {
+        bootstrapKernelUncheckedLoad(emitter, state, instruction, if (name == "extension_KernelU8Buffer_loadU16Aligned") "i16" else "i32")
         return true
     } else if (name == "extension_KernelF32Buffer_load4") {
         bootstrapKernelLoad4(emitter, state, instruction)
