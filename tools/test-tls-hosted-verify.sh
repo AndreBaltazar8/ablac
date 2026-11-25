@@ -96,11 +96,24 @@ listen
 (printf 'ping\n'; sleep 1; printf 'R\n'; sleep 2) | timeout 15 openssl s_client -connect "127.0.0.1:$port" -tls1_2 -CAfile "$out/ca.pem" > "$out/renegotiate.log" 2>&1 || true
 grep -q 'no renegotiation' "$out/renegotiate.log" || { cat "$out/renegotiate.log" >&2; fail 'the hosted server took a renegotiation'; }
 # A server that asks the hosted client to renegotiate (s_server's R command): the client refuses (no_renegotiation), so a server cannot change the
-# session's parameters under a program that is not looking.
+# session's parameters under a program that is not looking. The R is typed once the server has finished the client's handshake (its log says
+# `CIPHER is`: the readiness probe below never gets that far), not after a fixed time: a loaded machine can be seconds late to connect, and an R
+# typed before the connection asks nothing of anyone.
 port=$((port + 1))
-(sleep 3; printf 'R\n'; sleep 4) | openssl s_server -accept "$port" -cert "$out/good.pem" -key "$out/good.key" -tls1_2 > "$out/s.reneg.log" 2>&1 &
+rm -f "$out/reneg.in"
+mkfifo "$out/reneg.in"
+exec 7<> "$out/reneg.in" # open for reading and writing here, so that s_server's standard input neither blocks nor ends
+openssl s_server -accept "$port" -cert "$out/good.pem" -key "$out/good.key" -tls1_2 < "$out/reneg.in" > "$out/s.reneg.log" 2>&1 &
 pids+=("$!")
 for _ in $(seq 1 600); do (echo > "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break; sleep 0.1; done
-timeout 20 "$out/client" localhost "$port" "$out/ca.pem" linger > "$out/reneg-client.out" 2>&1 || true
-grep -q 'no renegotiation' "$out/s.reneg.log" || { cat "$out/s.reneg.log" >&2; fail 'the hosted client renegotiated when its server asked'; }
+timeout 60 "$out/client" localhost "$port" "$out/ca.pem" linger > "$out/reneg-client.out" 2>&1 &
+client=$!
+for _ in $(seq 1 600); do grep -q '^CIPHER is' "$out/s.reneg.log" 2> /dev/null && break; sleep 0.1; done
+grep -q '^CIPHER is' "$out/s.reneg.log" || { cat "$out/s.reneg.log" "$out/reneg-client.out" >&2; fail 'the hosted client never completed a handshake with the renegotiating server'; }
+printf 'R\n' >&7
+# The client lingers a few seconds reading; the server's refusal shows in its log as soon as the client answers.
+for _ in $(seq 1 600); do grep -q 'no renegotiation' "$out/s.reneg.log" && break; kill -0 "$client" 2> /dev/null || break; sleep 0.1; done
+wait "$client" || true
+exec 7>&-
+grep -q 'no renegotiation' "$out/s.reneg.log" || { cat "$out/s.reneg.log" "$out/reneg-client.out" >&2; fail 'the hosted client renegotiated when its server asked'; }
 echo "tls hosted verify: names and IP addresses are checked as such, TLS 1.0 and 1.1 are refused whatever the configuration says, and neither side takes a renegotiation"
