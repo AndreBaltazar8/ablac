@@ -14,6 +14,7 @@ import "abla/tls/pure/client"
 import "abla/tls/pure/handshake"
 import "abla/tls/pure/identity"
 import "abla/tls/pure/record"
+import "abla/tls/pure/resume"
 import "abla/tls/pure/server"
 import "abla/tls/pure/tls12"
 import "abla/text"
@@ -624,6 +625,31 @@ fun main: int {
             flooded = flooded + 1
         }
         if (!floodServer.failed() || flooded > TLS_MAX_EMPTY_RUN + 1 || !floodServer.error.contains("KeyUpdates")) fail("KeyUpdate flood: $flooded of them: [${floodServer.error}]")
+        // The same two floods from a hostile server to our client (#1144): KeyUpdates in a row end the connection, and a flood of tickets neither ends it nor grows the
+        // client's cache past its capacity (tickets are rare in a row but legal: a server may send many; each is kept under the capacity and the oldest goes).
+        var kuFloodServer = tlsServerNew(plainConfig)
+        val flooderCache = tlsSessionCacheNew(now, 4)
+        var kuFloodClient = tlsClientNew(tlsClientConfigWithSessions(tlsClientConfig("localhost", tlsX509Verifier(edStore, now), random), flooderCache, tlsX509Scope(edStore)))
+        pump(kuFloodClient, kuFloodServer)
+        var serverFlooded = 0
+        while (serverFlooded < 40 && !kuFloodClient.failed()) {
+            kuFloodClient.feed(tlsProtectRecord(kuFloodServer.write, TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0))).bytes)
+            kuFloodServer.serverApplicationSecret = tlsNextTrafficSecret(kuFloodServer.hash, kuFloodServer.serverApplicationSecret)
+            kuFloodServer.write = tlsRecordProtection(kuFloodServer.aead,
+                tlsTrafficKey(kuFloodServer.hash, kuFloodServer.serverApplicationSecret, kuFloodServer.keyLength),
+                tlsTrafficIv(kuFloodServer.hash, kuFloodServer.serverApplicationSecret))
+            serverFlooded = serverFlooded + 1
+        }
+        if (!kuFloodClient.failed() || serverFlooded > TLS_MAX_EMPTY_RUN + 1 || !kuFloodClient.error.contains("KeyUpdates")) fail("KeyUpdate flood to the client: $serverFlooded of them: [${kuFloodClient.error}]")
+        var ticketServer = tlsServerNew(plainConfig)
+        var ticketClient = tlsClientNew(tlsClientConfigWithSessions(tlsClientConfig("localhost", tlsX509Verifier(edStore, now), random), flooderCache, tlsX509Scope(edStore)))
+        pump(ticketClient, ticketServer)
+        for (sent in 0 until 300) {
+            val ticketMessage = tlsHandshakeMessage(TLS_NEW_SESSION_TICKET, tlsU32(7200) + tlsU32(sent) + tlsVec8("\x00") + tlsVec16("ticket-$sent") + tlsVec16(""))
+            ticketClient.feed(tlsProtectRecord(ticketServer.write, TLS_HANDSHAKE, ticketMessage).bytes)
+        }
+        if (ticketClient.failed()) fail("300 NewSessionTickets in a row ended the connection: [${ticketClient.error}]")
+        if (flooderCache.count("localhost") > 4) fail("a ticket flood grew the cache to ${flooderCache.count("localhost")} tickets (capacity 4)")
         // A TLS 1.2 sequence number past 2^62 seals and opens nothing either.
         var spent = tls12Protection(tls12Suite(TLS12_ECDHE_ECDSA_AES_128_GCM_SHA256) ?? return 1, random(16), random(4))
         spent.sequence = 4611686018427387904
