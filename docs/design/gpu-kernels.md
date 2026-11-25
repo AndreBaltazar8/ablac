@@ -59,13 +59,13 @@ All three describe the same kernel. Here is vector add in each.
 
 ### A. A kernel annotation on an ordinary function (recommended)
 
-```abla
+```abla fragment
 import "abla/kernel"
 
 @kernel
-fun vadd(a: KernelBuffer<f32>, b: KernelBuffer<f32>, out: KernelMutableBuffer<f32>, n: u32) {
+fun vadd(a: KernelF32Buffer, b: KernelF32Buffer, out: KernelF32Buffer, n: int) {
     val i = kernelGlobalId()
-    if (i < n) out[i] = a[i] + b[i]
+    if (i < n) out.store(i, a.load(i) + b.load(i))
 }
 ```
 
@@ -160,7 +160,7 @@ algorithm allows it, and add fission after.
 
 ### Host side (Abla, `abla/kernel`)
 
-```abla
+```abla fragment
 interface KernelBackend {
     fun name(): string
     fun buffer(bytes: int, usage: KernelBufferUsage): KernelDeviceBuffer

@@ -9,10 +9,6 @@ import "abla/text"
 import "abla/array"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
-import "abla/llvm/orc"
-import "abla/unsafe/memory"
-import "bindings.ab"
-import "../../codegen_units.ab"
 
 /** The names of the program's `@kernel` functions, in declaration order. */
 fun bootstrapKernelNames(parsed: BootstrapParseResult): array<string> {
@@ -148,8 +144,7 @@ class BootstrapKernelEmitter(
     var diagnostics: string,
     var errors: int,
     val done: array<string>,
-    val active: array<string>,
-    val context: i64*
+    val active: array<string>
 )
 
 /** The LLVM type of the Abla scalar `type`, or "" when a kernel cannot hold it. */
@@ -285,15 +280,71 @@ fun bootstrapKernelConvert(
     result
 }
 
-/** The LLVM text of the float constant `text` (as lowered IR writes it, C99 hexadecimal) of Abla type `type`. */
-trusted fun bootstrapKernelFloatConstant(emitter: BootstrapKernelEmitter, type: string, text: string): string {
-    val llvmType = if (type == "f32") LLVMFloatTypeInContext(emitter.context) else LLVMDoubleTypeInContext(emitter.context)
-    val constant = LLVMConstRealOfStringAndSize(llvmType, text, i32(text.size))
-    val printed = LLVMPrintValueToString(constant)
-    val rendered = nativeCString(printed)
-    LLVMDisposeMessage(printed)
-    val space = rendered.indexOf(" ")
-    if (space < 0) rendered else rendered.slice(space + 1, rendered.size)
+/** The LLVM text of the float constant `text` as lowered IR writes it (C99 hexadecimal: "-0x1.8p+3", "0x0p+0", or "inf"
+ *  and "nan"): LLVM's exact 64-bit form ("0x4028000000000000"), which it takes for float and double constants alike.
+ *  Converted here rather than through LLVM's C API, which the browser's compiler does not link. */
+fun bootstrapKernelFloatConstant(text: string): string {
+    var index = 0
+    var negative = false
+    if (index < text.size && text[index] == 45) { negative = true; index = index + 1 }
+    if (index < text.size && text[index] == 43) index = index + 1
+    val rest = text.slice(index, text.size)
+    var bits = 0
+    if (rest == "inf" || rest == "infinity") bits = 9218868437227405312
+    else if (rest == "nan") bits = 9221120237041090560
+    else if (rest.size >= 3 && rest[0] == 48 && (rest[1] == 120 || rest[1] == 88)) {
+        index = 2
+        val leading = if (index < rest.size) bootstrapKernelHexDigit(rest[index]) else 0
+        index = index + 1
+        // Up to 13 hexadecimal digits of fraction: the 52 bits of the mantissa.
+        var fraction = 0
+        var digits = 0
+        if (index < rest.size && rest[index] == 46) {
+            index = index + 1
+            while (index < rest.size && bootstrapKernelHexDigit(rest[index]) >= 0) {
+                if (digits < 13) {
+                    fraction = (fraction << 4) | bootstrapKernelHexDigit(rest[index])
+                    digits = digits + 1
+                }
+                index = index + 1
+            }
+        }
+        while (digits < 13) {
+            fraction = fraction << 4
+            digits = digits + 1
+        }
+        var exponent = 0
+        if (index < rest.size && (rest[index] == 112 || rest[index] == 80)) {
+            index = index + 1
+            var exponentNegative = false
+            if (index < rest.size && rest[index] == 45) { exponentNegative = true; index = index + 1 }
+            if (index < rest.size && rest[index] == 43) index = index + 1
+            while (index < rest.size && rest[index] >= 48 && rest[index] <= 57) {
+                exponent = exponent * 10 + (rest[index] - 48)
+                index = index + 1
+            }
+            if (exponentNegative) exponent = -exponent
+        }
+        // 1.fraction x 2^exponent is a normal double; 0.fraction a subnormal (its exponent field 0) or zero.
+        bits = if (leading == 1) ((exponent + 1023) << 52) | fraction else fraction
+    }
+    if (negative) bits = bits | (1 << 63)
+    var result = "0x"
+    var shift = 60
+    while (shift >= 0) {
+        val nibble = (bits >>> shift) & 15
+        result = result + "0123456789ABCDEF".slice(nibble, nibble + 1)
+        shift = shift - 4
+    }
+    result
+}
+
+/** The value of the hexadecimal digit `byte`, or -1. */
+fun bootstrapKernelHexDigit(byte: int): int {
+    if (byte >= 48 && byte <= 57) return byte - 48
+    if (byte >= 97 && byte <= 102) return byte - 87
+    if (byte >= 65 && byte <= 70) return byte - 55
+    -1
 }
 
 /** Reads a PTX special register (tid.x, ctaid.x, ntid.x, laneid) as an i64. */
@@ -707,7 +758,7 @@ fun bootstrapKernelInstruction(var emitter: BootstrapKernelEmitter, var state: B
         val type = op.slice(6, op.size)
         if (type == "void") bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "void", ""))
         else if (bootstrapKernelFloat(type))
-            bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(bootstrapKernelFloatConstant(emitter, type, instruction.text), type, ""))
+            bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(bootstrapKernelFloatConstant(instruction.text), type, ""))
         else if (bootstrapKernelLlvmType(type) != "")
             bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(instruction.text, type, ""))
         else bootstrapKernelFail(emitter, state.name, "operation", type)
@@ -869,10 +920,10 @@ trusted fun bootstrapKernelBuild(parsed: BootstrapParseResult, var program: Boot
         bootstrapKernelReplacePtx(program, "")
         return BootstrapKernelResult("", 0)
     }
-    val context = LLVMContextCreate()
-    val emitter = BootstrapKernelEmitter(program, "", [], "", 0, [], [], context)
+
+    val emitter = BootstrapKernelEmitter(program, "", [], "", 0, [], [])
     val module = bootstrapKernelCudaModule(emitter, names)
-    LLVMContextDispose(context)
+
     if (emitter.errors > 0) return BootstrapKernelResult(emitter.diagnostics, emitter.errors)
     if (processEnvironmentOr("ABLA_KERNEL_DUMP_LLVM", "") != "") linuxWriteStandardError(module)
     var ptx = ""

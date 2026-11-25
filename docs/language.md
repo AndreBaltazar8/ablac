@@ -2995,7 +2995,11 @@ A `@kernel` function is a GPU kernel written in ordinary Abla (#1233,
 launch, finds its thread with abla/kernel's ids, and reads and writes memory
 only through `KernelF32Buffer` and `KernelU32Buffer`. A buffer is an address and
 an element count: an index outside it loads 0 and stores nothing, on every
-backend. The same function runs:
+backend. Ordinary code does not make one from an address: abla/kernel/cuda's
+`CudaKernelMemory.floats()` and `words()` give the device memory's, and a
+trusted function that owns host memory and keeps it alive builds one for the CPU
+(the raw constructors are trusted-only, [#1226](#trusted-native-implementations)).
+The same function runs:
 
 - on the CPU through `kernelRunCpu(groups, groupSize) { kernel(...) }`, which
   runs each thread in turn on the calling thread (a subgroup there is one
