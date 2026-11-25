@@ -391,6 +391,11 @@ project's `abla.toml` authorizes them. Preparation fails before compilation
 with `E_PACKAGE_CAPABILITY_DENIED` naming the dependency, locked revision,
 source identity, requested capability, and root manifest.
 
+While the lock is made, `package update` also evaluates the import providers that a dependency's own source uses (to find its
+dependencies). That code is the dependency's: it has the capabilities its own `abla.toml` lists within the root's
+`compileCapabilities`, and never `process.io`, `network` or `trusted.native`, which the root names for a package the lock pins and which cannot
+be pinned yet (the root's own providers keep the root's list).
+
 ### Trusted and extern code in a dependency
 
 The one line `fast-json = ["trusted.native"]` in the root's `[dependencyCompileCapabilities]` has two separate effects:

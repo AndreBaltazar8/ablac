@@ -690,6 +690,7 @@ test-serial: ablac
 	tools/test-emit-reachable.sh $(COMPILER)
 	tools/test-new-project.sh $(COMPILER)
 	tools/test-package-subpaths.sh $(COMPILER)
+	tools/test-package-provider-effects.sh $(COMPILER)
 	tools/test-package-vendor-digest.sh $(COMPILER)
 	tools/test-package-vendor-strict.sh $(COMPILER)
 	tools/test-package-symlink.sh $(COMPILER)
