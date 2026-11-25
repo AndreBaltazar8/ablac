@@ -60,6 +60,14 @@ for required in nix_installer_sha nix_version windows_url windows_sha windows_ta
     [[ -n ${!required} ]] || { echo "release-sbom: could not read $required from the checkout" >&2; exit 1; }
 done
 
+# The OpenSSL the dynamic Linux compiler links: the version of the store path its rpath names (the loader finds libssl there; the static
+# asset links none). NOASSERTION when no asset names one.
+openssl_version=NOASSERTION
+for candidate in "$assets/ablac-dynamic-x86_64-linux" "$assets/ablac-x86_64-linux"; do
+    [[ -f $candidate ]] || continue
+    found=$(LC_ALL=C grep -a -o -m 1 '[0-9a-z]\{32\}-openssl-[0-9][0-9.]*[a-z]*/lib' "$candidate" | head -n 1 | sed 's/^[0-9a-z]*-openssl-//; s|/lib$||' || true)
+    if [[ -n $found ]]; then openssl_version=$found; break; fi
+done
 created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 {
     printf '{\n  "spdxVersion": "SPDX-2.3",\n  "dataLicense": "CC0-1.0",\n  "SPDXID": "SPDXRef-DOCUMENT",\n'
@@ -80,7 +88,9 @@ created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     printf '    {"SPDXID": "SPDXRef-xtensa-companion", "name": "abla Xtensa LLVM companion (optional, installed explicitly)", "versionInfo": "%s", "downloadLocation": "git+https://github.com/AndreBaltazar8/llvm-project@%s", "filesAnalyzed": false, "licenseConcluded": "Apache-2.0 WITH LLVM-exception", "licenseDeclared": "Apache-2.0 WITH LLVM-exception", "copyrightText": "NOASSERTION", "comment": "LLVM %s; its archives and checksums are pinned in tools/xtensa-companions.json"},\n' "$companion" "$companion_commit" "$companion_llvm"
     printf '    {"SPDXID": "SPDXRef-nix", "name": "Nix (the Linux build tool; the installer script is pinned by sha256 and holds the hash of the archive it installs)", "versionInfo": "%s", "downloadLocation": "https://releases.nixos.org/nix/nix-%s/install", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s"}], "licenseConcluded": "LGPL-2.1-or-later", "licenseDeclared": "LGPL-2.1-or-later", "copyrightText": "NOASSERTION", "comment": ".github/actions/install-nix; a build tool, not shipped"},\n' "$nix_version" "$nix_version" "$nix_installer_sha"
     printf '    {"SPDXID": "SPDXRef-nixpkgs", "name": "nixpkgs (the Linux build environment)", "versionInfo": "%s", "downloadLocation": "%s", "filesAnalyzed": false, "licenseConcluded": "MIT", "licenseDeclared": "MIT", "copyrightText": "NOASSERTION", "comment": "nix/nixpkgs.nix; supplies the C toolchain, lld, compiler-rt, OpenSSL and the other Linux inputs, not shipped in the static assets except compiler-rt builtins and the statically linked LLVM and lld"},\n' "$nixpkgs_commit" "$nixpkgs_url"
-    printf '    {"SPDXID": "SPDXRef-seed", "name": "ablac bootstrap seed", "versionInfo": "%s", "downloadLocation": "https://github.com/AndreBaltazar8/ablac/releases/tag/v%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s", "comment": "ablac-x86_64-linux"}], "licenseConcluded": "MPL-2.0", "licenseDeclared": "MPL-2.0", "copyrightText": "NOASSERTION", "comment": "tools/bootstrap-compiler.sh; the compiler that builds this release (stage 1)"}\n' "$seed_version" "${seed_version#v}" "$seed_linux"
+    printf '    {"SPDXID": "SPDXRef-seed", "name": "ablac bootstrap seed", "versionInfo": "%s", "downloadLocation": "https://github.com/AndreBaltazar8/ablac/releases/tag/v%s", "filesAnalyzed": false, "checksums": [{"algorithm": "SHA256", "checksumValue": "%s", "comment": "ablac-x86_64-linux"}], "licenseConcluded": "MPL-2.0", "licenseDeclared": "MPL-2.0", "copyrightText": "NOASSERTION", "comment": "tools/bootstrap-compiler.sh; the compiler that builds this release (stage 1)"},\n' "$seed_version" "${seed_version#v}" "$seed_linux"
+    printf '    {"SPDXID": "SPDXRef-openssl", "name": "OpenSSL (libssl and libcrypto of nixpkgs, linked by the dynamic Linux compiler and its toolchain archive; the static compiler links none)", "versionInfo": "%s", "downloadLocation": "NOASSERTION", "filesAnalyzed": false, "licenseConcluded": "Apache-2.0", "licenseDeclared": "Apache-2.0", "copyrightText": "NOASSERTION", "comment": "the version is read from the store path in the rpath of the dynamic asset; the build is nixpkgs commit %s (nix/nixpkgs.nix)"},\n' "$openssl_version" "$nixpkgs_commit"
+    printf '    {"SPDXID": "SPDXRef-trust-roots", "name": "TLS trust roots (not shipped)", "versionInfo": "NOASSERTION", "downloadLocation": "NOASSERTION", "filesAnalyzed": false, "licenseConcluded": "NOASSERTION", "licenseDeclared": "NOASSERTION", "copyrightText": "NOASSERTION", "comment": "No asset carries a root certificate bundle: abla/crypto/x509 reads the host system store at run time (the first of /etc/ssl/certs/ca-certificates.crt, /etc/pki/tls/certs/ca-bundle.crt, /etc/ssl/ca-bundle.pem, /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem, /etc/ssl/cert.pem, /usr/local/share/certs/ca-root-nss.crt, /etc/ssl/certs/ca-bundle.crt that exists), so the roots and their date are the host\u0027s, not this release\u0027s"}\n'
     printf '  ],\n  "files": [\n'
     first=1
     while IFS= read -r path; do
@@ -95,9 +105,10 @@ created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     if [[ -n $windows_arm64_url ]]; then
         printf '    {"spdxElementId": "SPDXRef-ablac", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-llvm-windows-arm64"},\n'
     fi
-    for dependency in llvm-fork llvm-portable-linux llvm-macos-arm64 llvm-macos-x86-64 llvm-windows-x86-64 xtensa-companion nix nixpkgs seed; do
+    for dependency in llvm-fork llvm-portable-linux llvm-macos-arm64 llvm-macos-x86-64 llvm-windows-x86-64 xtensa-companion nix nixpkgs seed openssl; do
         printf '    {"spdxElementId": "SPDXRef-ablac", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-%s"},\n' "$dependency"
     done
+    printf '    {"spdxElementId": "SPDXRef-trust-roots", "relationshipType": "RUNTIME_DEPENDENCY_OF", "relatedSpdxElement": "SPDXRef-ablac"},\n'
     first=1
     while IFS= read -r path; do
         name=${path#"$assets"/}
