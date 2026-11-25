@@ -1,5 +1,5 @@
 // The host C library's side of tools/test-libc-parse.sh (#1139 area 4): `parse.c gen SEED COUNT` writes cases, `parse.c` reads them from stdin and prints what the host's
-// strtod, strtol, strtoll, strtoul and strtoull make of each: a case is "kind base hextext" (kind d, l, L, u or U; the text is hex so any byte can be in it), a result line
+// strtod, strtof, strtol, strtoll, strtoul and strtoull make of each: a case is "kind base hextext" (kind d, f, l, L, u or U; the text is hex so any byte can be in it), a result line
 // "value end errno" (value: the double's bits for d, the integer otherwise; end: the byte offset of endptr; errno 0 or 34 (ERANGE) or 22).
 #define _GNU_SOURCE
 #include <errno.h>
@@ -62,10 +62,10 @@ int main(int argc, char **argv) {
                 if (below(6) != 0) length += (size_t)sprintf(text + length, "p%d", exponents[below(17)]);
                 text[length] = 0;
             }
-            static const char kinds[] = "dlLuU";
-            char kind = kinds[below(5)];
+            static const char kinds[] = "dfdlLuU";
+            char kind = kinds[below(7)];
             static const int bases[] = {0, 0, 0, 10, 10, 16, 2, 8, 36, 3, 35, 1, 37, 11, 24, -1};
-            int base = kind == 'd' ? 0 : bases[below(16)];
+            int base = kind == 'd' || kind == 'f' ? 0 : bases[below(16)];
             emit(kind, base, text, length);
         }
         return 0;
@@ -86,7 +86,13 @@ int main(int argc, char **argv) {
         text[length] = 0;
         char *end = text;
         errno = 0;
-        if (kind == 'd') {
+        if (kind == 'f') {
+            float value = strtof(text, &end);
+            uint32_t bits;
+            memcpy(&bits, &value, 4);
+            if (value != value) bits = 0x7fc00000u;  // the sign and payload of a NaN are not compared
+            printf("%u %ld %d\n", bits, (long)(end - text), errno == ERANGE ? 34 : 0);
+        } else if (kind == 'd') {
             double value = strtod(text, &end);
             uint64_t bits;
             memcpy(&bits, &value, 8);

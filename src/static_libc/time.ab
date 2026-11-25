@@ -131,10 +131,16 @@ fun libcHexDigit(c: int): int {
     99
 }
 
-// A hexadecimal floating constant (C99 6.4.4.2: 0x, hex digits with an optional point, an optional p exponent in decimal) at `at` (the 0 of 0x), rounded once to the
-// nearest double (ties to even; subnormals; overflow to infinity): the exact value is a 64-bit window of the digits (the rest of them a sticky bit) times a power
-// of two. Stores the end offset (the text up to and not past the last part that parsed) and sets ERANGE (34) on overflow, and on a subnormal or a zero from nonzero digits.
-trusted fun libcStrtodHex(text: int, at: int, negative: bool, end: int): f64 {
+// A hexadecimal floating constant (C99 6.4.4.2: 0x, hex digits with an optional point, an optional p exponent in decimal) at `at` (the 0 of 0x), rounded once to the nearest
+// binary float of `precision` significant bits (53: a double, 24: a float; ties to even; subnormals; overflow to infinity): the exact value is a 64-bit window of the digits (the rest
+// of them a sticky bit) times a power of two. `minimum` is the exponent of the smallest normal number (-1022, -126) and `maximum` of the largest (1023, 127). Returns the IEEE
+// bit pattern (64 or 32 bits wide: `precision` says), stores the end offset (the text up to and not past the last part that parsed) and sets ERANGE (34) on overflow, on an inexact
+// subnormal and on a zero from nonzero digits.
+trusted fun libcParseHexFloat(text: int, at: int, negative: bool, end: int, precision: int, minimum: int, maximum: int): int {
+    val width = if (precision == 53) 64 else 32
+    val signBit = if (!negative) 0 else if (width == 64) -9223372036854775808 else 2147483648
+    val exponentLimit = if (width == 64) 2047 else 255
+    val infinityBits = signBit | ((exponentLimit) << (precision - 1))
     var position = at + 2
     var window = u64(0)
     var significant = 0
@@ -167,7 +173,7 @@ trusted fun libcStrtodHex(text: int, at: int, negative: bool, end: int): f64 {
     if (!seenDigit) {
         // "0x" with no digit: the 0 alone
         if (end != 0) ablaRuntimeStoreI64(end, text + at + 1)
-        return if (negative) f64FromBits(-9223372036854775808) else 0.0
+        return signBit
     }
     var stop = position
     if ((ablaRuntimeLoadU8(text + position) | 32) == 112) {
@@ -188,18 +194,18 @@ trusted fun libcStrtodHex(text: int, at: int, negative: bool, end: int): f64 {
         }
     }
     if (end != 0) ablaRuntimeStoreI64(end, text + stop)
-    val signBit = if (negative) -9223372036854775808 else 0
-    if (window == u64(0)) return f64FromBits(signBit)
+    if (window == u64(0)) return signBit
     if (sticky) window = window | u64(1)
     // The digits were gathered as `window` (16 significant hex digits at most) times 2^exponent.
     var top = 63
     while ((window >> u64(top)) == u64(0)) top = top - 1
     val leading = exponent + top
-    if (leading > 1023) {
+    if (leading > maximum) {
         libcSetErrno(34)
-        return f64FromBits(signBit | 9218868437227405312)
+        return infinityBits
     }
-    val quantum = if (leading >= -1022) leading - 52 else -1074
+    val subnormalQuantum = minimum - (precision - 1)
+    val quantum = if (leading >= minimum) leading - (precision - 1) else subnormalQuantum
     var result = u64(0)
     var inexact = sticky
     if (exponent >= quantum) {
@@ -220,26 +226,32 @@ trusted fun libcStrtodHex(text: int, at: int, negative: bool, end: int): f64 {
             if (remainder > half || (remainder == half && (kept & u64(1)) == u64(1))) result = kept + u64(1)
         }
     }
-    var bits = u64(0)
-    if (leading >= -1022) {
+    val hidden = u64(1) << u64(precision - 1)
+    if (leading >= minimum) {
         var mantissa = result
-        var biased = leading + 1023
-        if (mantissa == u64(9007199254740992)) {
-            mantissa = u64(4503599627370496)
+        var biased = leading - minimum + 1
+        if (mantissa == (hidden << u64(1))) {
+            mantissa = hidden
             biased = biased + 1
         }
-        if (biased >= 2047) {
+        if (biased >= exponentLimit) {
             libcSetErrno(34)
-            return f64FromBits(signBit | 9218868437227405312)
+            return infinityBits
         }
-        bits = (u64(biased) << u64(52)) | (mantissa - u64(4503599627370496))
-    } else {
-        bits = result
-        // ERANGE for a subnormal result that is inexact, and for zero from nonzero digits (glibc's underflow).
-        if (inexact || result == u64(0)) libcSetErrno(34)
+        return signBit | ((biased << (precision - 1)) | int(mantissa - hidden))
     }
-    f64FromBits(signBit | int(bits))
+    // ERANGE for a subnormal result that is inexact, and for zero from nonzero digits (glibc's underflow).
+    if (inexact || result == u64(0)) libcSetErrno(34)
+    signBit | int(result)
 }
+
+// strtod's hexadecimal float, as a double.
+trusted fun libcStrtodHex(text: int, at: int, negative: bool, end: int): f64 = f64FromBits(libcParseHexFloat(text, at, negative, end, 53, -1022, 1023))
+
+// Whether a hexadecimal float starts at `at` (after any sign): 0x, then a hex digit or a point and a hex digit.
+trusted fun libcStartsHexFloat(text: int, at: int): bool =
+    ablaRuntimeLoadU8(text + at) == 48 && (ablaRuntimeLoadU8(text + at + 1) | 32) == 120 &&
+    (libcHexDigit(ablaRuntimeLoadU8(text + at + 2)) < 16 || (ablaRuntimeLoadU8(text + at + 2) == 46 && libcHexDigit(ablaRuntimeLoadU8(text + at + 3)) < 16))
 
 // strtod: the longest prefix of [space] [sign] (digits [. digits] | . digits) [e [sign] digits], or inf / infinity / nan.
 trusted fun libcStrtodAt(text: int, end: int): f64 {
@@ -251,10 +263,7 @@ trusted fun libcStrtodAt(text: int, end: int): f64 {
         negative = ablaRuntimeLoadU8(text + at) == 45
         at = at + 1
     }
-    if (ablaRuntimeLoadU8(text + at) == 48 && (ablaRuntimeLoadU8(text + at + 1) | 32) == 120 &&
-        (libcHexDigit(ablaRuntimeLoadU8(text + at + 2)) < 16 || (ablaRuntimeLoadU8(text + at + 2) == 46 && libcHexDigit(ablaRuntimeLoadU8(text + at + 3)) < 16))) {
-        return libcStrtodHex(text, at, negative, end)
-    }
+    if (libcStartsHexFloat(text, at)) return libcStrtodHex(text, at, negative, end)
     val first = ablaRuntimeLoadU8(text + at) | 32
     if (first == 105 || first == 110) {
         // inf, infinity, nan: letters compared without case.

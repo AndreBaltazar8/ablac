@@ -37,3 +37,7 @@ if [[ -s $out/new-differences.txt ]]; then
     exit 1
 fi
 echo "libc parse: $total cases (seed $seed), $(wc -l < "$out/differences.txt") known differences, none else"
+# The cost of a megabyte of digits (and of zeros, a long fraction, a long exponent, a long hex float) stays linear: each shape, read by strtod and by strtof, under a second.
+cost=$(printf 'T 0 00\n' | timeout 300 "$out/abla")
+[[ $cost == 'cost ok' ]] || { echo "libc parse: a megabyte-long number is slow: $cost" >&2; exit 1; }
+echo "libc parse: a megabyte of digits, zeros, fraction, exponent and hex digits reads in under a second each"
