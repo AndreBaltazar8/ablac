@@ -9,6 +9,7 @@ import "rmsnorm.ab"
 import "q8.ab"
 import "exp.ab"
 import "pick4.ab"
+import "groups.ab"
 import "q8fast.ab"
 import "abla/kernel"
 import "abla/kernel/cuda"
@@ -102,6 +103,47 @@ trusted fun main: int {
     var pickEqual = floatAt(cpuPick, 1) != floatAt(cpuPick, 0)
     for (i in 0 until quads) if (floatAt(gpuPick, i) != floatAt(cpuPick, i)) pickEqual = false
     println("pick4: $quads quads chosen by an if, GPU equal to CPU $pickEqual")
+
+    // Atomics: countThreads over vadd's 100000 threads, and sumGroups (the last group adds the partials), twice each.
+    val words = nativeByteBuffer(4 * 400)
+    val counterCpu = KernelU32Buffer(nativePointerAddress(words.address), 1)
+    val partialCpu = KernelU32Buffer(nativePointerAddress(words.address) + 4, 391)
+    val totalCpu = KernelU32Buffer(nativePointerAddress(words.address) + 4 * 392, 1)
+    counterCpu.store(0, 0)
+    kernelRunCpu((n + 255) / 256, 256) { countThreads(counterCpu, n) }
+    var countRight = counterCpu.load(0) == n
+    counterCpu.store(0, 0)
+    val sumGroupsCount = 391
+    var expected = 0
+    for (g in 0 until sumGroupsCount) expected = expected + 7 * g + 1
+    for (round in 0 until 2) {
+        kernelRunCpu(sumGroupsCount, 1) { sumGroups(partialCpu, counterCpu, totalCpu, sumGroupsCount) }
+        if (totalCpu.load(0) != expected || counterCpu.load(0) != 0) countRight = false
+    }
+    val dcounter = device.allocate(4)
+    val dpartial = device.allocate(4 * sumGroupsCount)
+    val dtotal = device.allocate(4)
+    if (dcounter == null || dpartial == null || dtotal == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val zero = nativeByteBuffer(4)
+    KernelU32Buffer(nativePointerAddress(zero.address), 1).store(0, 0)
+    val readBack = nativeByteBuffer(4)
+    if (!device.upload(dcounter, zero) || !device.launch("countThreads", (n + 255) / 256, 256,
+        cudaKernelArguments().buffer(dcounter.words()).integer(n)) || !device.download(dcounter, readBack)) {
+        println("kernel-cuda: countThreads: ${device.error}")
+        return 1
+    }
+    if (KernelU32Buffer(nativePointerAddress(readBack.address), 1).load(0) != n) countRight = false
+    if (!device.upload(dcounter, zero)) { println("kernel-cuda: ${device.error}"); return 1 }
+    for (round in 0 until 2) {
+        if (!device.launch("sumGroups", sumGroupsCount, 64, cudaKernelArguments().buffer(dpartial.words()).buffer(dcounter.words())
+            .buffer(dtotal.words()).integer(sumGroupsCount)) || !device.download(dtotal, readBack)) {
+            println("kernel-cuda: sumGroups: ${device.error}")
+            return 1
+        }
+        if (KernelU32Buffer(nativePointerAddress(readBack.address), 1).load(0) != expected) countRight = false
+        if (!device.download(dcounter, readBack) || KernelU32Buffer(nativePointerAddress(readBack.address), 1).load(0) != 0) countRight = false
+    }
+    println("atomics: $n adds to one word and $sumGroupsCount groups handing partials to the last, twice, on the GPU and the CPU $countRight")
 
     // NVFP4 matvec: one subgroup per row on the GPU (8 warps per group), one thread per row on the CPU.
     val rows = 1000
@@ -309,5 +351,5 @@ trusted fun main: int {
     val expAgree = expWorst <= 2 && expNaN && expEnds
     println("kernelExp: $expCount values, GPU within $expWorst ulp of the CPU (at most 2), NaN, 0 and infinity at the ends: $expAgree")
     device.close()
-    if (vaddEqual && pickEqual && agree && untouched && edgesRight && normAgree && q8Agree && fastSame && expAgree) 0 else 1
+    if (vaddEqual && pickEqual && countRight && agree && untouched && edgesRight && normAgree && q8Agree && fastSame && expAgree) 0 else 1
 }

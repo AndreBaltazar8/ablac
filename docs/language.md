@@ -3023,7 +3023,7 @@ recursive); the buffers, also in `val` locals; `kernelGlobalId`, `kernelLocalId`
 so a kernel written for any size runs on both); the group's shared memory,
 `kernelSharedF32(count)` and `kernelSharedU32(count)` with a constant `count`,
 and `kernelBarrier()` (CUDA's `__shared__` and `__syncthreads`); `kernelFma`,
-`kernelSqrt`, `kernelRsqrt`, `kernelExp` and `kernelF16ToF32`; and abla/float's bit and conversion
+`kernelSqrt`, `kernelRsqrt`, `kernelExp` and `kernelF16ToF32`; `KernelU32Buffer.atomicAdd` (one indivisible add, giving the old value) and `kernelFence()` (CUDA's `__threadfence`), with which the last group to finish can combine every group's results; and abla/float's bit and conversion
 functions. Anything else (a string, an array, a class value, a closure, an
 allocation, I/O, a native call) is refused when the program is built, naming
 what and where:

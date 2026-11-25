@@ -719,6 +719,39 @@ fun bootstrapKernelBuiltin(
         bootstrapKernelLine(state, "call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0)")
         bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "void", ""))
         return true
+    } else if (name == "kernelFence") {
+        // CUDA's __threadfence: this thread's earlier device-memory writes are seen by every group before its later ones.
+        bootstrapKernelDeclare(emitter, "declare void @llvm.nvvm.membar.gl()")
+        bootstrapKernelLine(state, "call void @llvm.nvvm.membar.gl()")
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "void", ""))
+        return true
+    } else if (name == "extension_KernelU32Buffer_atomicAdd") {
+        // One indivisible add (CUDA's atomicAdd, relaxed; kernelFence orders it), checked as a load is: outside the buffer it
+        // adds nothing and gives 0.
+        if (instruction.operands.size < 3) return false
+        val buffer = bootstrapKernelGet(state, instruction.operands[0])
+        if (buffer.type != "buffer.u32") { bootstrapKernelFail(emitter, state.name, "type", buffer.type); return true }
+        val index = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
+        val addend = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[2]), "u32")
+        if (index == "" || addend == "") return true
+        state.counter = state.counter + 1
+        val label = "ka${state.counter}"
+        val inside = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$inside = icmp ult i64 $index, ${buffer.count}")
+        val before = state.block
+        bootstrapKernelLine(state, "br i1 $inside, label %$label.in, label %$label.end")
+        state.terminated = true
+        bootstrapKernelBlock(state, "$label.in")
+        val address = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$address = getelementptr inbounds i32, ptr ${buffer.operand}, i64 $index")
+        val previous = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$previous = atomicrmw add ptr $address, i32 $addend monotonic, align 4")
+        bootstrapKernelBlock(state, "$label.end")
+        val joined = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$joined = phi i32 [ $previous, %$label.in ], [ 0, %$before ]")
+        result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = zext i32 $joined to i64")
+        type = "i64"
     } else if (name == "kernelSubgroupMax") {
         if (instruction.operands.size < 1) return false
         var largest = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[0]), "f32")
