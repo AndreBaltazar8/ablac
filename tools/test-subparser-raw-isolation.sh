@@ -67,14 +67,15 @@ const uri = pathToFileURL(path.join(root, 'valid.ab')).href;
 const standard = fs.readFileSync(path.join(root, 'valid.ab'), 'utf8')
     .replace('import "provider.ab"', 'import "abla/raw-isolation-test"');
 const opaque = 'import "provider.ab"\nfun main(): int { val value = $rawTest {plain}; 0 }\n';
+const projection = { fields: ['diagnostics', 'symbols'] };
 const requests = [
     ['initialize', { workspaceRoots: [root], analysisMode: 'graph-v2' }],
     ['document/open', { uri, version: 1, text: standard }],
-    ['analyze', {}],
+    ['analyze', projection],
     ['document/change', { uri, version: 2, text: standard.replace('tailAnswer() ==', 'tailAnswer() + 0 ==') }],
-    ['analyze', {}],
+    ['analyze', projection],
     ['document/change', { uri, version: 3, text: opaque }],
-    ['analyze', {}],
+    ['analyze', projection],
     ['shutdown', {}],
 ];
 const input = requests.map(([method, params], index) =>
@@ -82,7 +83,8 @@ const input = requests.map(([method, params], index) =>
 const analysis = spawnSync(compiler, ['analyze', '--stdio'], {
     input, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
 });
-assert.equal(analysis.status, 0, analysis.stderr);
+assert.ifError(analysis.error);
+assert.equal(analysis.status, 0, analysis.stderr || analysis.signal);
 const responses = analysis.stdout.trim().split('\n').map(JSON.parse);
 const document = id => {
     const response = responses.find(row => row.id === id);
