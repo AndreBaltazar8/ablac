@@ -162,6 +162,13 @@ export const LINEAGES = {
             b: ['v0.2.72', 'a4f9c843f6cf4d00c914ff321d4abca1d82cff90d21f20839e9d50ad54c3f929'],
         },
     },
+    'v0.2.74': {
+        historical: 'e69fba5065dcf67b2c2758cc5ae8137c807898cb',
+        seeds: {
+            a: ['v0.2.74', '03337bf89f919b8506497894ecf20723a8e04e9f3a4f86a42a9e3d9ac7bc7471'],
+            b: ['v0.2.73', '8a67ba0cf4e28af968e1b36899c87db2b77c48249674b017cfa7cda620dd23e2'],
+        },
+    },
 };
 
 /** Select the pair of routes (the module-level HISTORICAL and SEEDS the rest of the gate reads), and where the candidate
