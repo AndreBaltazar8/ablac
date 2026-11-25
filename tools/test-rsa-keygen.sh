@@ -8,7 +8,9 @@ chmod 700 "$out"
 # Expose the private search helpers only in a generated test-local copy.
 sed -e 's/^private trusted fun rsaProbablePrime/trusted fun rsaProbablePrime/' \
     -e 's/^private fun rsaPrimeDistance/fun rsaPrimeDistance/' \
-    "$root/stdlib/abla/crypto/rsa/entry.ab" > "$out/rsa-copy.ab"
+    "$root/stdlib/abla/crypto/rsa/entry.ab" | sed 's|^import "raw.ab"$|import "rsa-raw-copy.ab"|' > "$out/rsa-copy.ab"
+# The library's raw.ab names the real entry.ab's types: the copy of it names the copy of entry.ab.
+sed 's|^import "entry.ab"$|import "rsa-copy.ab"|' "$root/stdlib/abla/crypto/rsa/raw.ab" > "$out/rsa-raw-copy.ab"
 cp "$root/tests/cases/rsa-keygen/primality.ab" "$out/primality.ab"
 "$compiler" build "$out/primality.ab" -o "$out/primality" --fast --no-cache
 "$out/primality"

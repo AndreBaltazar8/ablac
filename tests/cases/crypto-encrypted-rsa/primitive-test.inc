@@ -34,7 +34,7 @@ trusted fun pbeTestXor256(memory: int): void = pbeAccumulate(memory, false)
 trusted fun pbeTestWipe(address: int, size: int): void = pbeWipe(address, size)
 // A negative control: genuine password-dependent address selection.
 @inline @export("ct_pbe_leak")
-trusted fun pbeTestLeak(memory: int): int = ablaUnsafeLoadU8(aesPointer(memory + int(pbeByte(memory).declassify())))
+trusted fun pbeTestLeak(memory: int): int = ablaUnsafeLoadU8(pbePointer(memory + int(pbeByte(memory).declassify())))
 
 @inline @export("ct_pbe_password_pad")
 trusted fun pbeTestPasswordPad(out: int, password: int, size: int): void = pbePadBody(out, password, size, 54)
