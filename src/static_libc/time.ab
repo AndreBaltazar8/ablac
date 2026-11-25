@@ -124,6 +124,123 @@ trusted fun libcStrftime(buffer: int, size: int, format: int, tm: int): int = li
 @export("__strftime_l")
 trusted fun libcStrftimeL(buffer: int, size: int, format: int, tm: int, locale: int): int = libcStrftimeInto(buffer, size, format, tm)
 
+// The value of a hexadecimal digit, or 99.
+fun libcHexDigit(c: int): int {
+    if (c >= 48 && c <= 57) return c - 48
+    if ((c | 32) >= 97 && (c | 32) <= 102) return (c | 32) - 87
+    99
+}
+
+// A hexadecimal floating constant (C99 6.4.4.2: 0x, hex digits with an optional point, an optional p exponent in decimal) at `at` (the 0 of 0x), rounded once to the
+// nearest double (ties to even; subnormals; overflow to infinity): the exact value is a 64-bit window of the digits (the rest of them a sticky bit) times a power
+// of two. Stores the end offset (the text up to and not past the last part that parsed) and sets ERANGE (34) on overflow, and on a subnormal or a zero from nonzero digits.
+trusted fun libcStrtodHex(text: int, at: int, negative: bool, end: int): f64 {
+    var position = at + 2
+    var window = u64(0)
+    var significant = 0
+    var exponent = 0
+    var sticky = false
+    var seenDigit = false
+    var seenPoint = false
+    var scanning = true
+    while (scanning) {
+        val c = ablaRuntimeLoadU8(text + position)
+        val digit = libcHexDigit(c)
+        if (digit < 16) {
+            seenDigit = true
+            if (significant < 16) {
+                if (significant > 0 || digit != 0) {
+                    window = window * u64(16) + u64(digit)
+                    significant = significant + 1
+                }
+                if (seenPoint) exponent = exponent - 4
+            } else {
+                if (digit != 0) sticky = true
+                if (!seenPoint) exponent = exponent + 4
+            }
+            position = position + 1
+        } else if (c == 46 && !seenPoint) {
+            seenPoint = true
+            position = position + 1
+        } else scanning = false
+    }
+    if (!seenDigit) {
+        // "0x" with no digit: the 0 alone
+        if (end != 0) ablaRuntimeStoreI64(end, text + at + 1)
+        return if (negative) f64FromBits(-9223372036854775808) else 0.0
+    }
+    var stop = position
+    if ((ablaRuntimeLoadU8(text + position) | 32) == 112) {
+        var probe = position + 1
+        var negativeExponent = false
+        if (ablaRuntimeLoadU8(text + probe) == 45 || ablaRuntimeLoadU8(text + probe) == 43) {
+            negativeExponent = ablaRuntimeLoadU8(text + probe) == 45
+            probe = probe + 1
+        }
+        if (ablaRuntimeLoadU8(text + probe) >= 48 && ablaRuntimeLoadU8(text + probe) <= 57) {
+            var value = 0
+            while (ablaRuntimeLoadU8(text + probe) >= 48 && ablaRuntimeLoadU8(text + probe) <= 57) {
+                if (value < 100000) value = value * 10 + (ablaRuntimeLoadU8(text + probe) - 48)
+                probe = probe + 1
+            }
+            exponent = exponent + (if (negativeExponent) 0 - value else value)
+            stop = probe
+        }
+    }
+    if (end != 0) ablaRuntimeStoreI64(end, text + stop)
+    val signBit = if (negative) -9223372036854775808 else 0
+    if (window == u64(0)) return f64FromBits(signBit)
+    if (sticky) window = window | u64(1)
+    // The digits were gathered as `window` (16 significant hex digits at most) times 2^exponent.
+    var top = 63
+    while ((window >> u64(top)) == u64(0)) top = top - 1
+    val leading = exponent + top
+    if (leading > 1023) {
+        libcSetErrno(34)
+        return f64FromBits(signBit | 9218868437227405312)
+    }
+    val quantum = if (leading >= -1022) leading - 52 else -1074
+    var result = u64(0)
+    var inexact = sticky
+    if (exponent >= quantum) {
+        result = window << u64(exponent - quantum)
+    } else {
+        val shift = quantum - exponent
+        inexact = true
+        if (shift >= 65) {
+            result = u64(0)
+        } else if (shift == 64) {
+            result = if (window > u64(9223372036854775808)) u64(1) else u64(0)
+        } else {
+            val kept = window >> u64(shift)
+            val remainder = window - (kept << u64(shift))
+            val half = u64(1) << u64(shift - 1)
+            result = kept
+            inexact = remainder != u64(0) || sticky
+            if (remainder > half || (remainder == half && (kept & u64(1)) == u64(1))) result = kept + u64(1)
+        }
+    }
+    var bits = u64(0)
+    if (leading >= -1022) {
+        var mantissa = result
+        var biased = leading + 1023
+        if (mantissa == u64(9007199254740992)) {
+            mantissa = u64(4503599627370496)
+            biased = biased + 1
+        }
+        if (biased >= 2047) {
+            libcSetErrno(34)
+            return f64FromBits(signBit | 9218868437227405312)
+        }
+        bits = (u64(biased) << u64(52)) | (mantissa - u64(4503599627370496))
+    } else {
+        bits = result
+        // ERANGE for a subnormal result that is inexact, and for zero from nonzero digits (glibc's underflow).
+        if (inexact || result == u64(0)) libcSetErrno(34)
+    }
+    f64FromBits(signBit | int(bits))
+}
+
 // strtod: the longest prefix of [space] [sign] (digits [. digits] | . digits) [e [sign] digits], or inf / infinity / nan.
 trusted fun libcStrtodAt(text: int, end: int): f64 {
     var at = 0
@@ -133,6 +250,10 @@ trusted fun libcStrtodAt(text: int, end: int): f64 {
     if (ablaRuntimeLoadU8(text + at) == 45 || ablaRuntimeLoadU8(text + at) == 43) {
         negative = ablaRuntimeLoadU8(text + at) == 45
         at = at + 1
+    }
+    if (ablaRuntimeLoadU8(text + at) == 48 && (ablaRuntimeLoadU8(text + at + 1) | 32) == 120 &&
+        (libcHexDigit(ablaRuntimeLoadU8(text + at + 2)) < 16 || (ablaRuntimeLoadU8(text + at + 2) == 46 && libcHexDigit(ablaRuntimeLoadU8(text + at + 3)) < 16))) {
+        return libcStrtodHex(text, at, negative, end)
     }
     val first = ablaRuntimeLoadU8(text + at) | 32
     if (first == 105 || first == 110) {
@@ -145,8 +266,15 @@ trusted fun libcStrtodAt(text: int, end: int): f64 {
             return if (negative) -1.0 / 0.0 else 1.0 / 0.0
         }
         if (first == 110 && (ablaRuntimeLoadU8(text + at + 1) | 32) == 97 && (ablaRuntimeLoadU8(text + at + 2) | 32) == 110) {
-            if (end != 0) ablaRuntimeStoreI64(end, text + at + 3)
-            return f64FromBits(9221120237041090560)
+            // nan(n-char-sequence): the parenthesis is part of the number when it closes after letters, digits and underscores.
+            var stopNan = at + 3
+            if (ablaRuntimeLoadU8(text + stopNan) == 40) {
+                var probeNan = stopNan + 1
+                while ((ablaRuntimeLoadU8(text + probeNan) >= 48 && ablaRuntimeLoadU8(text + probeNan) <= 57) || ((ablaRuntimeLoadU8(text + probeNan) | 32) >= 97 && (ablaRuntimeLoadU8(text + probeNan) | 32) <= 122) || ablaRuntimeLoadU8(text + probeNan) == 95) probeNan = probeNan + 1
+                if (ablaRuntimeLoadU8(text + probeNan) == 41) stopNan = probeNan + 1
+            }
+            if (end != 0) ablaRuntimeStoreI64(end, text + stopNan)
+            return f64FromBits(if (negative) -2251799813685248 else 9221120237041090560)
         }
     }
     var digits = 0
@@ -180,7 +308,23 @@ trusted fun libcStrtodAt(text: int, end: int): f64 {
         index = index + 1
     }
     if (end != 0) ablaRuntimeStoreI64(end, text + at)
-    f64Parse(literal)
+    val parsed = f64Parse(literal)
+    // ERANGE (as glibc): an infinity from finite digits, and a zero or subnormal from digits that are not all zero (a decimal subnormal is never exact in fewer than
+    // hundreds of digits, so every one counts as inexact).
+    val parsedBits = f64ToBits(parsed)
+    val parsedExponent = (parsedBits >>> 52) & 2047
+    if (parsedExponent == 2047) libcSetErrno(34)
+    else if (parsedExponent == 0) {
+        var nonzero = false
+        var scan = start
+        while (scan < at && (ablaRuntimeLoadU8(text + scan) | 32) != 101) {
+            val c = ablaRuntimeLoadU8(text + scan)
+            if (c >= 49 && c <= 57) nonzero = true
+            scan = scan + 1
+        }
+        if (nonzero) libcSetErrno(34)
+    }
+    parsed
 }
 
 @export("strtod")
