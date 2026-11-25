@@ -145,6 +145,49 @@ trusted fun main: int {
     }
     println("atomics: $n adds to one word and $sumGroupsCount groups handing partials to the last, twice, on the GPU and the CPU $countRight")
 
+    // Xor shuffles (GPU only: a CPU subgroup is one thread): per subgroup the largest value, ties to the lowest lane, and
+    // each lane's partner's 64-bit int.
+    val shuffleThreads = 256 * 4
+    val shuffleX = floats(shuffleThreads) { i -> f32FromInt((i * 7) % 5) }
+    val dsx = device.allocate(shuffleThreads * 4)
+    val dbest = device.allocate(shuffleThreads / 32 * 4)
+    val dbestLane = device.allocate(shuffleThreads / 32 * 4)
+    val dhigh = device.allocate(shuffleThreads * 4)
+    val dlow = device.allocate(shuffleThreads * 4)
+    if (dsx == null || dbest == null || dbestLane == null || dhigh == null || dlow == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val gotBest = nativeByteBuffer(shuffleThreads / 32 * 4)
+    val gotLane = nativeByteBuffer(shuffleThreads / 32 * 4)
+    val gotHigh = nativeByteBuffer(shuffleThreads * 4)
+    val gotLow = nativeByteBuffer(shuffleThreads * 4)
+    if (!device.upload(dsx, shuffleX) || !device.launch("shuffleMax", 4, 256, cudaKernelArguments().buffer(dsx.floats())
+            .buffer(dbest.floats()).buffer(dbestLane.words()).buffer(dhigh.words()).buffer(dlow.words())) ||
+        !device.download(dbest, gotBest) || !device.download(dbestLane, gotLane) || !device.download(dhigh, gotHigh) ||
+        !device.download(dlow, gotLow)) {
+        println("kernel-cuda: shuffleMax: ${device.error}")
+        return 1
+    }
+    var shuffleRight = true
+    val laneWords = KernelU32Buffer(nativePointerAddress(gotLane.address), shuffleThreads / 32)
+    val highWords = KernelU32Buffer(nativePointerAddress(gotHigh.address), shuffleThreads)
+    val lowWords = KernelU32Buffer(nativePointerAddress(gotLow.address), shuffleThreads)
+    for (warp in 0 until shuffleThreads / 32) {
+        var wantScore = f32(-1.0)
+        var wantLane = 0
+        for (lane in 0 until 32) {
+            val value = f32FromInt(((warp * 32 + lane) * 7) % 5)
+            if (value > wantScore) {
+                wantScore = value
+                wantLane = lane
+            }
+        }
+        if (floatAt(gotBest, warp) != wantScore || laneWords.load(warp) != wantLane) shuffleRight = false
+    }
+    for (i in 0 until shuffleThreads) {
+        val partnerLane = (i % 32) ^ 1
+        if (highWords.load(i) != (partnerLane + 1) * 2 || lowWords.load(i) != partnerLane) shuffleRight = false
+    }
+    println("shuffle: $shuffleThreads lanes, the subgroup maximum with ties to the lowest lane and 64-bit partners on the GPU $shuffleRight")
+
     // NVFP4 matvec: one subgroup per row on the GPU (8 warps per group), one thread per row on the CPU.
     val rows = 1000
     val cols = 512
@@ -351,5 +394,5 @@ trusted fun main: int {
     val expAgree = expWorst <= 2 && expNaN && expEnds
     println("kernelExp: $expCount values, GPU within $expWorst ulp of the CPU (at most 2), NaN, 0 and infinity at the ends: $expAgree")
     device.close()
-    if (vaddEqual && pickEqual && countRight && agree && untouched && edgesRight && normAgree && q8Agree && fastSame && expAgree) 0 else 1
+    if (vaddEqual && pickEqual && countRight && shuffleRight && agree && untouched && edgesRight && normAgree && q8Agree && fastSame && expAgree) 0 else 1
 }

@@ -69,7 +69,7 @@ if [[ -n $library ]]; then
             grep -q "on the GPU and the CPU true" "$out/kernel-cuda.out" &&
             grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" &&
             grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" &&
-            grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" ||
+            grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" ||
             fail "kernel-cuda: $(cat "$out/kernel-cuda.out")"
         cuda="vadd, the NVFP4 and Q8_0 matvecs (and Q8_0 on the unchecked fast path), rmsnorm (shared memory, barriers), kernelExp and the buffer edges agree on the GPU and the CPU"
     fi
