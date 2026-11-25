@@ -31,18 +31,22 @@ done
 # (it would be signed and uploaded as an asset).
 [[ ! -e $dir/static-suite-source.sha ]] || { echo "sign-release: remove $dir/static-suite-source.sha first (it is not an asset)" >&2; exit 2; }
 rm -f "$dir/SHA256SUMS" "$dir/SHA256SUMS.sig"
+# Scratch files live outside DIR: inside it the list of DIR's files would list the scratch file itself (the empty
+# SHA256SUMS.tmp of v0.2.73's list, the .sbom.tmp of its SBOM).
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/sign-release.XXXXXX") || exit 1
+trap 'rm -rf -- "$scratch"' EXIT
 if [[ -n $tag ]]; then
     rm -f "$dir/ablac-${tag#v}.spdx.json"
-    "$here/release-sbom.sh" "$tag" "$dir" "$dir/.sbom.tmp"
-    mv "$dir/.sbom.tmp" "$dir/ablac-${tag#v}.spdx.json"
+    "$here/release-sbom.sh" "$tag" "$dir" "$scratch/sbom.json"
+    cp "$scratch/sbom.json" "$dir/ablac-${tag#v}.spdx.json"
 fi
 (
     cd "$dir"
     find . -type f | LC_ALL=C sort | sed 's|^\./||' | while IFS= read -r name; do
         case $name in */*) echo "sign-release: nested file $name" >&2; exit 1 ;; esac
         if command -v sha256sum >/dev/null 2>&1; then sha256sum "$name"; else shasum -a 256 "$name"; fi
-    done > SHA256SUMS.tmp
-    mv SHA256SUMS.tmp SHA256SUMS
+    done > "$scratch/SHA256SUMS"
 )
+cp "$scratch/SHA256SUMS" "$dir/SHA256SUMS"
 ssh-keygen -Y sign -f "$key" -n abla-release "$dir/SHA256SUMS" >/dev/null
 "$here/verify-release.sh" "$dir"

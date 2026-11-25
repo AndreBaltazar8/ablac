@@ -56,6 +56,22 @@ refuses 'a name that is not listed' "$work/rel" extra-asset
 fresh; rm "$work/rel/abla-toolchain-x86_64-linux.tar.gz"
 refuses 'a listed asset that is missing (by name)' "$work/rel" abla-toolchain-x86_64-linux.tar.gz
 echo 'extra and missing assets refused'
+# The whole directory is checked too: a listed file that is missing is a refusal (v0.2.73 listed its own empty temporary
+# list; exactly that line is tolerated, nothing else).
+fresh; rm "$work/rel/abla-toolchain-x86_64-linux.tar.gz"
+refuses 'a listed asset that is missing (whole directory)' "$work/rel"
+ghost() { # the v0.2.73 line, signed again with the good key
+    rm -f "$work/rel/SHA256SUMS.sig"
+    printf '%s  %s\n' "$1" "$2" >> "$work/rel/SHA256SUMS"
+    ssh-keygen -Y sign -f "$work/good" -n abla-release "$work/rel/SHA256SUMS" >/dev/null 2>&1
+}
+fresh; ghost e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 SHA256SUMS.tmp
+accepts "$work/rel"
+fresh; ghost 0000000000000000000000000000000000000000000000000000000000000000 SHA256SUMS.tmp
+refuses 'a missing SHA256SUMS.tmp with another hash' "$work/rel"
+fresh; ghost e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 other.tmp
+refuses 'a missing file with the hash of nothing' "$work/rel"
+echo 'a listed file missing from the directory refused (the v0.2.73 line tolerated)'
 
 # The real signer: sign-release.sh signs a directory and verifies it against the repository's public key, so with
 # a key that is not the project's it must refuse (the guard against shipping with the wrong secret).
@@ -82,6 +98,9 @@ if command -v git >/dev/null 2>&1; then
     (cd "$local_root" && ABLA_RELEASE_SIGNING_KEY_FILE="$work/good" tools/sign-release.sh "$work/rel" --tag v9.9.9) > "$work/out" 2>&1 || { cat "$work/out" >&2; fail 'sign-release.sh failed on a local directory'; }
     [[ -f $work/rel/ablac-9.9.9.spdx.json && -f $work/rel/SHA256SUMS.sig ]] || fail 'sign-release.sh wrote no SBOM or signature'
     grep -q 'ablac-9.9.9.spdx.json' "$work/rel/SHA256SUMS" || fail 'the SBOM is not in SHA256SUMS'
+    # Neither list names a scratch file: nothing of the signer's own temporary files is signed.
+    ! grep -q '\.tmp' "$work/rel/SHA256SUMS" || fail 'SHA256SUMS lists a temporary file'
+    ! grep -q '\.tmp' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM lists a temporary file'
     accepts "$work/rel"
     # The Windows toolchain zip is an ordinary asset: signed in SHA256SUMS, listed in the SBOM, whose Windows LLVM entry comes from the pin.
     fresh; rm -f "$work/rel/SHA256SUMS" "$work/rel/SHA256SUMS.sig"

@@ -57,5 +57,12 @@ else
         case $name in SHA256SUMS | SHA256SUMS.sig) continue ;; esac
         check "$name"; count=$((count + 1))
     done < <(find "$dir" -type f | LC_ALL=C sort)
+    # A listed file that is not in DIR is a refusal too, except the one line v0.2.73 signed by mistake: its own empty
+    # temporary list (sha256 of nothing, SHA256SUMS.tmp), which no release since carries.
+    while read -r want name; do
+        [[ -f $dir/$name ]] && continue
+        [[ $name == SHA256SUMS.tmp && $want == e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]] && continue
+        fail "$name is listed in the signed SHA256SUMS but missing from $dir"
+    done < "$listed"
 fi
 printf 'verify-release: signature good; %d file(s) match the signed checksums\n' "$count"
