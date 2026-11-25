@@ -41,7 +41,10 @@ The claim, stated so that it can be checked and so that its limits are visible. 
   fixpoint (pass 2 equals pass 3, `tools/test-static-artifact.sh`, which a third party can run on the published file
   with the pinned archives from `tools/static-llvm-env.sh`). `tools/build-static-compiler.sh` on the published dynamic
   asset gave the same file in three runs here, but not the published one (v0.2.73: 3,816 bytes smaller, .text and .rodata
-  differ); the cause is not found. Compare the dynamic asset, not the static one.
+  differ); the cause is not found. Ruled out: the job count (`ABLA_NATIVE_JOBS` unset on 28 cores and set to 4, as CI
+  does, gave the same file; the code generation units are fixed, not taken from the machine), `ABLA_DEBUG` and
+  `ABLA_SYSROOT` (unset, as in CI), a build path in the file (none), the C++ compiler and linker of the lld shim (GCC 16.2.0 and
+  LLD 23.1.3 in both). Compare the dynamic asset, not the static one.
 - **The Xtensa and Wasm outputs of a user's program** are deterministic for one toolchain (the same compiler, the same
   LLVM) and are not compared across LLVM versions.
 - **Source provenance of dependencies of the nixpkgs closure** beyond what nixpkgs itself provides.
