@@ -50,6 +50,8 @@ free_port() {   # a port below the ephemeral range that nobody listens on
 start_h2o() {
     tls_port=$(free_port)
     plain_port=$(free_port)
+    # Nothing listens on either port yet, so free_port can pick the same one twice.
+    while [[ $plain_port == "$tls_port" ]]; do plain_port=$(free_port); done
     cat > "$out/h2o.conf" << EOF
 listen:
   port: $tls_port
