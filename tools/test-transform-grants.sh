@@ -61,7 +61,7 @@ build() {
 mark="$out/MARK"
 marker_check() { [[ ! -e $mark ]] || fail "$1: the injected process ran"; }
 injector() { # injector <body of the replacement, escaped for an Abla string inside a here-string>
-    printf '%s\n' 'import "abla/compiler"' 'compile fun configure(): void {' \
+    printf '%s\n' 'import "abla/compiler"' "${2:-}" 'compile fun configure(): void {' \
         '    val target = compiler.findFunction("target")' \
         "    compiler.replaceFunctionBody(target, \"$1\")" '    return' '}' '#compiler.transform(configure)' \
         'fun dependencyValue: string = "ok"'
@@ -80,10 +80,10 @@ EOT
 }
 process="{ val r = #compilerRunProcess([\\\"/bin/sh\\\", \\\"-c\\\", \\\"touch $mark\\\"]); r }"
 
-# inject: a dependency that declares nothing changes the root's function to one with a `#` site.
-repository "$out/inject/quiet-dep" quiet-dep '' "$(injector "$process")"
+# inject: a dependency that holds transform.program (named, pinned) but not process.io changes the root's function to one with a `#` site.
+repository "$out/inject/quiet-dep" quiet-dep '"transform.program"' "$(injector "$process" '#compilerGrant("transform.program")')"
 commit "$out/inject/quiet-dep" dependency
-application inject '"process.io"' quiet-dep
+application inject '"process.io", "transform.program"' quiet-dep "$(printf '[dependencyCompileCapabilities]\nquiet-dep = ["transform.program"]')"
 main_with inject ''
 build inject
 [[ $status != 0 ]] && grep -q E_COMPILER_TRANSFORM_GRANTS "$out/inject.log" ||
@@ -91,9 +91,9 @@ build inject
 marker_check inject
 
 # plain: the same transform with an ordinary body replaces the function.
-repository "$out/plain/quiet-dep" quiet-dep '' "$(injector '41 + 1')"
+repository "$out/plain/quiet-dep" quiet-dep '"transform.program"' "$(injector '41 + 1' '#compilerGrant("transform.program")')"
 commit "$out/plain/quiet-dep" dependency
-application plain '"process.io"' quiet-dep
+application plain '"process.io", "transform.program"' quiet-dep "$(printf '[dependencyCompileCapabilities]\nquiet-dep = ["transform.program"]')"
 main_with plain ''
 build plain
 [[ $status == 0 ]] && grep -q "dependency value: 'ok' 42" "$out/plain.log" ||

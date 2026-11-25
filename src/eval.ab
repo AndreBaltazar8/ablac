@@ -539,6 +539,9 @@ fun bootstrapFunctionBodyReplacementRoot(): string =
 // The declarations a running transform may change (its own module's, by
 // handle); empty outside the staged parse, which then checks nothing here.
 var bootstrapCompilerTransformEditable: array<bool> = []
+// The module whose `#compiler.transform` actions are running: the code that asks for the changes is the action's, whichever module declares the
+// handler it names (a root that registers a library's handler vouches for it). "" when no transform runs.
+var bootstrapCompilerTransformActionFile: string = ""
 
 /** Why a transform may not change the declaration at `handle` ("" when it
  *  may): the runtime's functions never (its guarantees rest on them). Another
@@ -556,6 +559,46 @@ fun bootstrapCompilerTransformTarget(
         return "error[E_COMPILER_TRANSFORM_RUNTIME]: $operation can't change `${declaration.name}`: it is the runtime's (abla/runtime), whose guarantees rest on its code as written\n"
     }
     ""
+}
+
+/** Why compile-time code of a dependency may not change the declaration at `handle` ("" when it may; decision #145 A): a transform, or a `#`
+ *  site, of a dependency package rewrites only functions of its own package, unless the root names `transform.program` for that package
+ *  (a pinned, named-only grant, like trusted.native). The root's own code is not held to it (it owns the program), the standard library is
+ *  governed by `transform.library`, and what a transform generated is its own. The package is that of the module whose `#compiler.transform`
+ *  action runs (a root that registers a library's handler vouches for it; bootstrapCompilerTransformActionFile), or of the `#` site's file. */
+fun bootstrapCompilerProgramChange(
+    evaluator: BootstrapEvaluator,
+    handle: int,
+    operation: string
+): string {
+    if (!ctNativeModuleGrantsActive || handle < 0 || handle >= evaluator.declarations.size) return ""
+    val actor = if (bootstrapCompilerTransformActive && bootstrapCompilerTransformActionFile != "") bootstrapCompilerTransformActionFile
+        else bootstrapBuildCallFile(evaluator)
+    if (actor == "") return ""
+    val actingPackage = ctNativePackageAt(actor)
+    if (actingPackage == "") return ""
+    val declaration = evaluator.declarations[handle]
+    val source = declaration.sourceIdentity
+    if (bootstrapStandardLibraryModuleSource(source) || source.startsWith("<generated:")) return ""
+    val targetPackage = ctNativePackageAt(source)
+    if (targetPackage == actingPackage) return ""
+    if ((ctNativeGrantsAt(actor, evaluator.allowedCompileEffects) & BOOTSTRAP_COMPILE_TRANSFORM_PROGRAM) != 0) return ""
+    val owner = if (actingPackage == "?") "the module $actor" else "dependency '$actingPackage'"
+    val of = if (targetPackage == "") "the root project" else if (targetPackage == "?") "no package of this build" else "package '$targetPackage'"
+    "error[E_COMPILER_TRANSFORM_PROGRAM]: $operation can't change `${declaration.name}`: it belongs to $of, and a transform of $owner rewrites only its own package's functions; " +
+        "the root project may grant it `transform.program` (add it to the root's `compileCapabilities`, name it for the package in `[dependencyCompileCapabilities]` " +
+        "and request it with `#compilerGrant(\"transform.program\")` in the transform's module)\n"
+}
+
+/** bootstrapCompilerTransformTarget and bootstrapCompilerProgramChange for one change a transform or a `#` site asks for. */
+fun bootstrapCompilerChangeRefusal(
+    evaluator: BootstrapEvaluator,
+    handle: int,
+    operation: string,
+    ownModule: bool
+): string {
+    val target = bootstrapCompilerTransformTarget(evaluator.declarations, handle, operation, ownModule)
+    if (target != "") target else bootstrapCompilerProgramChange(evaluator, handle, operation)
 }
 
 /** The refusal ("" when none) of a replacement body that carries compile-time code, a `#` expression or a `$` subparser form, for the
@@ -11921,7 +11964,8 @@ fun bootstrapEvaluateCallCompiler(
         if (bootstrapEvalLeaves(initial)) return initial
         val mutable = bootstrapEvalJournalArg(evaluator, expression, 4)
         if (bootstrapEvalLeaves(mutable)) return mutable
-        val valid = handle >= 0 && handle < evaluator.declarations.size &&
+        val programRefused = bootstrapCompilerProgramChange(evaluator, handle, "compiler.addExtensionField")
+        val valid = programRefused == "" && handle >= 0 && handle < evaluator.declarations.size &&
             evaluator.declarations[handle].kind == "class" &&
             name.kind == "string" && type.kind == "string" &&
             initial.kind == "string" && mutable.kind == "boolean" &&
@@ -11929,7 +11973,10 @@ fun bootstrapEvaluateCallCompiler(
                 "extension-field:${evaluator.declarations[handle].name}.${name.text}",
                 "${if (mutable.boolean) "var" else "val"} ${evaluator.declarations[handle].name}.${name.text}: ${type.text} = ${initial.text}\n"
             ))
-        if (!valid) {
+        if (programRefused != "") {
+            evaluator.diagnostics = "${evaluator.diagnostics}$programRefused"
+            evaluator.errors = evaluator.errors + 1
+        } else if (!valid) {
             evaluator.recordEvaluatorDiagnostic(
                 "E_COMPILER_TRANSFORM_EXTENSION_FIELD",
                 "compiler.addExtensionField requires a class handle, a field name, a type and a default's source, inside compiler.transform"
@@ -12067,8 +12114,8 @@ fun bootstrapEvaluateCallCompiler(
             evaluator.declarations[handle].kind == "class" &&
             name.kind == "string" && name.text.size > 0 &&
             members.kind == "string"
-        val refused = if (valid) bootstrapCompilerTransformTarget(
-            evaluator.declarations, handle, "compiler.addConformance", false
+        val refused = if (valid) bootstrapCompilerChangeRefusal(
+            evaluator, handle, "compiler.addConformance", false
         ) else ""
         if (refused != "") valid = false
         if (valid) {
@@ -12121,8 +12168,8 @@ fun bootstrapEvaluateCallCompiler(
                 if (evaluator.declarations[candidate].name == name.text) field = candidate
             }
         }
-        val refused = if (field >= 0) bootstrapCompilerTransformTarget(
-            evaluator.declarations, field, "compiler.removeExtensionField", true
+        val refused = if (field >= 0) bootstrapCompilerChangeRefusal(
+            evaluator, field, "compiler.removeExtensionField", true
         ) else ""
         val library = field < 0 || refused != "" || !bootstrapCompilerTransformActive ||
             bootstrapCompilerLibraryChange(
@@ -12218,8 +12265,8 @@ fun bootstrapEvaluateCallCompiler(
             evaluator.functionHandleValid(reflected.integer) &&
             reflected.integer < evaluator.declarations.size &&
             evaluator.declarations[reflected.integer].kind == "fun"
-        val refused = if (valid) bootstrapCompilerTransformTarget(
-            evaluator.declarations, reflected.integer, "compiler.replaceFunctionBody", true
+        val refused = if (valid) bootstrapCompilerChangeRefusal(
+            evaluator, reflected.integer, "compiler.replaceFunctionBody", true
         ) else ""
         if (refused != "") {
             valid = false
@@ -12282,8 +12329,8 @@ fun bootstrapEvaluateCallCompiler(
             evaluator.functionHandleValid(reflected.integer) &&
             reflected.integer < evaluator.declarations.size &&
             evaluator.declarations[reflected.integer].kind == "fun"
-        val refused = if (valid) bootstrapCompilerTransformTarget(
-            evaluator.declarations, reflected.integer, "compiler.addFunctionAnnotation", false
+        val refused = if (valid) bootstrapCompilerChangeRefusal(
+            evaluator, reflected.integer, "compiler.addFunctionAnnotation", false
         ) else ""
         if (refused != "") {
             valid = false

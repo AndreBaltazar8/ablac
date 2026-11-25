@@ -108,6 +108,10 @@ complete program before analysis:
   `transform.library`. Annotations, and a program's own modules, need no
   grant. With `ABLA_COMPILE_EVAL_TRACE=1` each granted change prints a
   `note[transform]:` line naming the transform's site and the function.
+- A function, class or extension field of another package is changed only by the root's own transforms, or by a dependency's that holds the
+  [`transform.program`](compile-time.md#capabilities-files-environment-processes-network) grant (named for it by the root, pinned by `abla.lock`,
+  requested with `#compilerGrant("transform.program")`); without it the call is refused with `E_COMPILER_TRANSFORM_PROGRAM`, naming the grant.
+  A dependency's transform changes its own package's functions freely.
 
 ## The `compiler` service at a glance
 

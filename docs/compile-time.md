@@ -517,7 +517,7 @@ Capabilities are granted per package, not per program. A `#` site gets what its 
 - ∩ what the package declares: for a dependency, the `compileCapabilities` of its own `abla.toml`; for the root,
   its authorization,
 - ∩ what the root allows that package. For the root's own code that is its `compileCapabilities`. A dependency
-  gets the same list without `process.io`, `network` and `trusted.native`, which it gets only by name:
+  gets the same list without `process.io`, `network`, `trusted.native` and `transform.program`, which it gets only by name:
 
 ```toml
 compileCapabilities = ["filesystem.read", "network", "trusted.native"]   # the root's own `#` code, and the ceiling for all
@@ -562,6 +562,14 @@ Code that runs for one package does not borrow another's grants:
 - A subparser handler (`#compilerRegisterSubparser`) runs with the grants of the file that declares it, within what the file that uses the syntax
   has: a dependency's handler gets the dependency's grants, not those of the root file that writes `$name ...`. A standard-library handler is
   the root's.
+- A transform (or `#` site) of a dependency changes only functions of its own package: `compiler.replaceFunctionBody`,
+  `addFunctionAnnotation`, `addConformance`, `addExtensionField` and `removeExtensionField` on a function or class of another package are
+  `E_COMPILER_TRANSFORM_PROGRAM`, naming `transform.program`, unless the root gives it: the root lists `transform.program` in its own
+  `compileCapabilities`, names it for that package in `[dependencyCompileCapabilities]` (it holds only while `abla.lock` pins the package, as
+  for `trusted.native`), and the transform's module requests it with `#compilerGrant("transform.program")`. The root's own transforms are not
+  held to it (a root that registers a dependency's handler with its own `#compiler.transform(handler)` vouches for it), the standard library is
+  governed by `transform.library`, and what a transform generated is its own. A package that rewrites the
+  functions its users annotate therefore needs that line from each root that uses it.
 - A body a transform installs (`compiler.replaceFunctionBody`) may carry compile-time code (`#`, `$`) only when the transform's own grants
   include those of the file the function is in; otherwise `E_COMPILER_TRANSFORM_GRANTS`. A body without such code is runtime code: a `#` site
   of the function's own file that calls it runs what the transform wrote, with that site's grants (a transform that changes your functions is trusted with the grants of the sites that call them).
@@ -583,6 +591,7 @@ The check happens before evaluation starts, so a denied path never runs.
 | `trusted.native` | run trusted and `extern` code (raw memory, C functions, system calls) | see [below](#what-works-at-compile-time-today) | disabled |
 | `time.unlimited` | the module's `#` sites run without `ABLA_COMPILE_EVAL_TIME_LIMIT` (a game played under `#`, a long generation); only the module that requests it, every other module keeps the limit | no provider: the request itself | kept: it changes no result |
 | `transform.library` | a transform changes a standard-library function's body or removes a standard-library extension field (annotations need no grant; a program's own modules never do) | `compilerReplaceFunctionBody`, `compilerRemoveExtensionField` on a standard-library target (see [compiler-api.md](compiler-api.md)) | kept: the edits are part of each module's fingerprint |
+| `transform.program` | a transform (or a `#` site) of a dependency changes a function, or adds a conformance or an extension field, of another package: the root's, or another dependency's; named only (decision #145 A) | `compilerReplaceFunctionBody`, `compilerAddFunctionAnnotation`, `compilerAddConformance`, `compilerAddExtensionField`, `compilerRemoveExtensionField` on a target of another package | kept: the edits are part of each module's fingerprint |
 
 `trusted.native` is all or nothing: it lets compile-time code load and call
 any C library, so it can open windows, use the GPU and audio, and open

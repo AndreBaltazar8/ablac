@@ -409,6 +409,8 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_EXT_TYPED_QUERY_BEFORE_RESOLUTION`, `E_REACTIVE_*` | typed reflection asked too early, or an invalid lifted function |
 | `E_COMPILER_TRANSFORM_*` | a `compiler.transform` handler or its body/annotation changes were rejected |
 | `E_COMPILER_TRANSFORM_RUNTIME` | a transform asked to change a runtime function (`abla/runtime`), which it never may ([transforms](compiler-api.md#transforms-changing-the-program)) |
+| `E_COMPILER_TRANSFORM_PROGRAM` | a transform or `#` site of a dependency asked to change a function or class of another package without the `transform.program` grant ([grants per package](compile-time.md#grants-per-package)) |
+| `E_COMPILER_TRANSFORM_GRANTS` | a transform asked to install a body with compile-time code (`#`, `$`) into a function whose file has grants the transform does not ([grants per package](compile-time.md#grants-per-package)) |
 | `E_COMPILER_EDIT_CONFLICT` | two transforms gave one function different bodies; the message names both ([transforms](compiler-api.md#transforms-changing-the-program)) |
 | `E_COMPILER_EDIT_TARGET` | a transform's change to another module names no declaration, or more than one |
 | `E_COMPILE_EDIT_FIXPOINT` (`compile.edit-fixpoint`) | compile-time code changed the program in each of 8 rounds of lowering; the message lists the last round's edits ([committing changes](compile-time.md#committing-program-changes)) |
