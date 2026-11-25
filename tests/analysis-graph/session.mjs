@@ -1278,20 +1278,34 @@ async function incrementalUnusedImportReplay() {
     };
     try {
         await check(original, 0, 1);
+        let version = 0;
+        const edit = async text => {
+            const params = { uri: uri(file), version: ++version, text };
+            for (const session of sessions) {
+                assert.ok(!('error' in await session.rpc(version === 1 ? 'document/open' : 'document/change', params)));
+            }
+        };
         const results = [765432, 9, 812, 4];
         for (const [index, value] of results.entries()) {
             const text = original.replace('    42\n', '    ' + value + '\n');
-            const params = { uri: uri(file), version: index + 1, text };
-            for (const session of sessions) {
-                assert.ok(!('error' in await session.rpc(index === 0 ? 'document/open' : 'document/change', params)));
-            }
+            await edit(text);
             await check(text, index + 1, 1);
         }
-        const text = original.replace('makeProbe().valueNow()', '0');
-        for (const session of sessions) {
-            assert.ok(!('error' in await session.rpc('document/change', { uri: uri(file), version: results.length + 1, text })));
+        let hits = results.length;
+        const beforeComment = original.replace('    42\n', '    4\n');
+        for (const comment of ['    // Explain the calculation.\n', '    // Shorter.\n', '']) {
+            const text = beforeComment.replace('    val positive', comment + '    val positive');
+            await edit(text);
+            await check(text, ++hits, 1);
         }
-        await check(text, results.length, 3);
+        const outside = beforeComment.replace('fun answer: int', '// Document the public answer.\nfun answer: int');
+        await edit(outside);
+        await check(outside, hits, 1);
+        await edit(beforeComment);
+        await check(beforeComment, hits, 1);
+        const text = original.replace('makeProbe().valueNow()', '0');
+        await edit(text);
+        await check(text, hits, 3);
     } finally {
         await Promise.all(sessions.map(session => session.close()));
     }
