@@ -4,7 +4,7 @@
 // evaluator (output, exit status, a runtime error, standard input).
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
-import { compile, createBase, run } from "./host.mjs";
+import { boundedCompiler, compile, createBase, run } from "./host.mjs";
 
 const [wasmPath, root] = process.argv.slice(2);
 const module = await WebAssembly.compile(readFileSync(wasmPath));
@@ -70,4 +70,20 @@ check("run: standard input", input.ok && input.stdout === "got ping\n", JSON.str
 const churn = 'import "abla/io"\n\nclass Node(val value: int, val next: Node?)\n\nfun sumList(node: Node?): int = if (node == null) 0 else node.value + sumList(node.next)\n\nfun churn(round: int): int {\n    var list: Node? = null\n    for (index in 0 until 40) list = Node(index + round, list)\n    sumList(list)\n}\n\nfun main: int {\n    var total = 0\n    for (round in 0 until 20000) total = total + churn(round)\n    println("total $total")\n    0\n}\n';
 const churned = await run(module, base, new Map([["main.ab", churn]]));
 check("run: garbage is collected", churned.ok && churned.stdout === "total 8015200000\n" && churned.memoryBytes < 1024 * 1024 * 1024, JSON.stringify({ status: churned.status, megabytes: Math.round(churned.memoryBytes / 1048576), diagnostics: churned.diagnostics.slice(0, 120) }));
+
+// Limits of a run (the page runs a visitor's program in this module): output stops at its limit, a program that allocates without end stops
+// at the memory limit of a bounded module, and both come back as ordinary failed runs, not as exceptions.
+const bounded = await boundedCompiler(readFileSync(wasmPath));
+const flood = 'import "abla/io"\n\nfun main: int {\n    var i = 0\n    while (i < 1000000) {\n        println("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")\n        i = i + 1\n    }\n    0\n}\n';
+const flooded = await run(bounded, base, new Map([["main.ab", flood]]));
+check("run: output stops at the limit", !flooded.ok && flooded.stdout.length <= 1048576 && flooded.stdout.length > 1000000 && /output passed 1048576 bytes/.test(flooded.diagnostics),
+    JSON.stringify({ ok: flooded.ok, stdout: flooded.stdout.length, diagnostics: flooded.diagnostics.slice(-120) }));
+const hungry = 'import "abla/io"\n\nfun main: int {\n    var all: array<string> = []\n    var i = 0\n    while (i < 100000000) {\n        all.append("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$i")\n        i = i + 1\n    }\n    println("${all.size}")\n    0\n}\n';
+let grown;
+try { grown = await run(bounded, base, new Map([["main.ab", hungry]])); } catch (error) { grown = { ok: true, diagnostics: `threw ${error.message}`, memoryBytes: 0 }; }
+check("run: allocation stops at the memory limit", !grown.ok && grown.memoryBytes <= 1073741824 && /memory|E_EVAL_STEP_LIMIT|limit/.test(grown.diagnostics),
+    JSON.stringify({ ok: grown.ok, megabytes: Math.round(grown.memoryBytes / 1048576), diagnostics: grown.diagnostics.slice(-160) }));
+const small = await run(bounded, base, new Map([["main.ab", fib]]));
+check("run: a bounded module still runs a program", small.ok && small.stdout === "fib = 6765\n" && small.status === 3, JSON.stringify({ ok: small.ok, status: small.status }));
+
 process.exit(failed ? 1 : 0);

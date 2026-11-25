@@ -2,6 +2,21 @@
 // in-memory file system. One compilation per instance: the compiler keeps its state in its own heap, so each compile starts from a
 // fresh instance of the module the page compiled once.
 import { Vfs, createSyscalls } from "./vfs.mjs";
+import { withBoundedMemory } from "./wasm-memory.mjs";
+
+// The most output (bytes of descriptor 1, and of descriptor 2) one run keeps: a program that prints without end would otherwise build
+// strings of hundreds of megabytes in the worker and hand them to the page. At the limit the run stops.
+export const outputLimitBytes = 1048576;
+// The most linear memory (64 KiB pages) a compiler instance may grow to: 1 GiB. A program that allocates without end stops at the limit
+// instead of taking the tab's whole memory (the evaluator's step limit comes much later for allocation loops).
+export const compilerMemoryPages = 16384;
+
+// The compiler module with its linear memory bounded: `bytes` are the module's Wasm bytes. Returns what `compile` takes in place of a
+// WebAssembly.Module; each compilation then gets its own memory capped at `pages`.
+export async function boundedCompiler(bytes, pages = compilerMemoryPages) {
+    const bounded = withBoundedMemory(bytes instanceof ArrayBuffer ? bytes : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), pages);
+    return { module: await WebAssembly.compile(bounded.binary), initial: bounded.initial, maximum: bounded.maximum };
+}
 
 // `stdlib`: Map<path under /stdlib, Uint8Array>; the compiler reads it at /stdlib/... (its toolchain root is "." and the working
 // directory "/"). `files`: Map<path under /work, Uint8Array|string> for the program.
@@ -25,6 +40,8 @@ export async function compile(module, base, files, options = {}) {
     class Exit extends Error {
         constructor(code) { super(`exit ${code}`); this.code = code; }
     }
+    const outputLimit = options.outputLimit ?? outputLimitBytes;
+    let outputTruncated = false;
     if (options.entry) vfs.put("/work/entry", encoder.encode(at(options.entry)));
     const fileCalls = createSyscalls(vfs, () => memory, { cwd: options.cwd ?? root, stdin: options.stdin, unknown: (n) => { unknown[n] = (unknown[n] ?? 0) + 1; } });
     const heap = () => new Uint8Array(memory.buffer);
@@ -37,7 +54,12 @@ export async function compile(module, base, files, options = {}) {
                 const fd = Number(a0);
                 if (!(fd in output)) break;
                 const length = Number(a2);
-                output[fd] += decoder.decode(heap().subarray(address(a1), address(a1) + length));
+                const kept = Math.max(0, Math.min(length, outputLimit - output[fd].length));
+                output[fd] += decoder.decode(heap().subarray(address(a1), address(a1) + kept));
+                if (kept < length) {
+                    outputTruncated = true;
+                    throw new Exit(1);
+                }
                 return BigInt(length);
             }
             case 60: case 231: throw new Exit(Number(a0));
@@ -58,11 +80,21 @@ export async function compile(module, base, files, options = {}) {
         fork: () => -1,
         strlen: (address) => { const heap = new Uint8Array(memory.buffer); let end = address >>> 0; while (heap[end]) end++; return end - (address >>> 0); },
     };
-    const instance = await WebAssembly.instantiate(module, { abla_host, env });
+    // A bounded module (boundedCompiler) takes its memory from the host, capped; a plain WebAssembly.Module brings its own, unbounded.
+    const bounded = module instanceof WebAssembly.Module ? null : module;
+    const imports = { abla_host, env };
+    if (bounded) imports.env = { ...env, memory: new WebAssembly.Memory({ initial: bounded.initial, maximum: bounded.maximum }) };
+    const instance = await WebAssembly.instantiate(bounded ? bounded.module : module, imports);
     memory = instance.exports.memory;
     let status;
-    try { status = instance.exports.main(); } catch (error) { if (error instanceof Exit) status = error.code; else throw error; }
-    return { status, stdout: output[1], stderr: output[2], vfs, unknown, memoryBytes: memory.buffer.byteLength };
+    let memoryLimit = false;
+    try { status = instance.exports.main(); } catch (error) {
+        if (error instanceof Exit) status = error.code;
+        // The compiler trapped with its memory more than half way to the limit: its allocator could not grow it further.
+        else if (bounded && error instanceof WebAssembly.RuntimeError && memory.buffer.byteLength >= bounded.maximum * 32768) { status = 1; memoryLimit = true; }
+        else throw error;
+    }
+    return { status, stdout: output[1], stderr: output[2], vfs, unknown, memoryBytes: memory.buffer.byteLength, outputTruncated, memoryLimit };
 }
 
 // Runs a program with the compiler's evaluator: a wrapper module calls the program's `main` at compile time (a `#` site), so the program's
@@ -80,7 +112,9 @@ export async function run(module, base, files, { stdin = "" } = {}) {
     const result = await compile(module, base, all, { entry: "eval.ab", stdin: typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin });
     const exit = /^exit=(-?\d+)$/m.exec(result.stderr);
     let diagnostics = result.stderr.split("\n").filter((line) => !/^(exit=|lowered:|errors=)/.test(line)).join("\n").trim();
-    const ok = exit !== null && /errors=0 /.test(result.stderr);
+    const ok = exit !== null && /errors=0 /.test(result.stderr) && !result.outputTruncated;
+    if (result.outputTruncated) diagnostics += `\n\nThe program's output passed ${outputLimitBytes} bytes and the run stopped.`;
+    if (result.memoryLimit) diagnostics += `\n\nThe program used more than ${compilerMemoryPages / 16} MiB of memory and the run stopped.`;
     if (!ok && /^error\[E_SEMANTIC\]: compile\.(?:effect-denied|capability-not-authorized):/m.test(diagnostics)) {
         diagnostics += "\n\nThe browser playground supports standard input, clocks and random bytes. Run this program locally with ablac run main.ab. If it requests a compile-time capability, authorize it in your local project.";
     }

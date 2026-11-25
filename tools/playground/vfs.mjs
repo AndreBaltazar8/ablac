@@ -5,6 +5,8 @@
 const ENOENT = 2, EIO = 5, EBADF = 9, EEXIST = 17, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENOTEMPTY = 39, ENOSYS = 38;
 const O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000, O_APPEND = 0o2000, O_DIRECTORY = 0o200000;
 const AT_FDCWD = -100;
+// The most one file of the overlay may hold: a write or truncate past it fails (EIO / EINVAL) instead of allocating what the guest names.
+const maximumFileBytes = 64 * 1048576;
 
 const normalize = (path) => {
     const parts = [];
@@ -148,6 +150,7 @@ export function createSyscalls(vfs, memory, options = {}) {
         const file = vfs.files.get(entry.path);
         const source = bytes().subarray(ptr(address), ptr(address) + Number(length));
         const end = position + source.length;
+        if (!(position >= 0) || end > maximumFileBytes) throw new RangeError("file too large");
         if (end > file.data.length) {
             const larger = new Uint8Array(end);
             larger.set(file.data);
@@ -291,6 +294,7 @@ export function createSyscalls(vfs, memory, options = {}) {
                     const entry = descriptors.get(Number(a0));
                     if (!entry || !entry.write) return -BigInt(EBADF);
                     const file = vfs.files.get(entry.path);
+                    if (!(Number(a1) >= 0) || Number(a1) > maximumFileBytes) return -BigInt(EINVAL);
                     const data = new Uint8Array(Number(a1));
                     data.set(file.data.subarray(0, Number(a1)));
                     file.data = data;

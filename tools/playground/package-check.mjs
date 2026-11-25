@@ -50,6 +50,10 @@ try {
     const run = (source, files = []) => host.run(module, base, new Map([["main.ab", source], ...files]));
     const result = await run(source);
     if (!result.ok || result.stdout !== "package ok\n" || result.status !== 7) fail(`the program ran as ${JSON.stringify({ ok: result.ok, status: result.status, stdout: result.stdout, diagnostics: result.diagnostics.slice(0, 200) })}`);
+    // The bounded module the page loads (its memory comes from the host, capped) runs the same program.
+    const boundedModule = await host.boundedCompiler(wasm);
+    const boundedRun = await host.run(boundedModule, base, new Map([["main.ab", source]]));
+    if (!boundedRun.ok || boundedRun.stdout !== "package ok\n" || boundedRun.status !== 7) fail(`the bounded module ran as ${JSON.stringify({ ok: boundedRun.ok, status: boundedRun.status, stdout: boundedRun.stdout })}`);
     for (const [signature, tail, status] of [["fun main(): i64", "7", 7], ["fun main", "return", 0]]) {
         const output = await run(`import "abla/io"\n${signature} { println("main ran"); ${tail} }\n`);
         if (!output.ok || output.status !== status || output.stdout !== "main ran\n") {
