@@ -1,0 +1,201 @@
+// Editor-only suggestions. Match the written AST using the resolved types
+// already exported by graph analysis. There is no second parse or type pass.
+import "analysis_service.ab"
+import "frontend_diagnostics.ab"
+import "module.ab"
+import "parser.ab"
+import "sema.ab"
+import "abla/text"
+
+private fun idiomTypeAt(occurrences: BootstrapAnalysisOccurrenceSet,
+    name: BootstrapExpression): string {
+    var low = 0
+    var high = occurrences.begins.size
+    while (low < high) {
+        val middle = low + (high - low) / 2
+        if (occurrences.begins[middle] < name.begin) low = middle + 1
+        else high = middle
+    }
+    if (low < occurrences.begins.size && occurrences.begins[low] == name.begin &&
+        occurrences.ends[low] == name.end && occurrences.ids[low] != "") occurrences.types[low]
+    else ""
+}
+
+private fun idiomOneStatement(expression: BootstrapExpression): BootstrapExpression =
+    if (expression.kind == "block" && expression.children.size == 1) expression.children[0]
+    else expression
+
+private fun idiomHasComment(source: string): bool = source.contains("//") || source.contains("/*")
+
+private fun idiomScalar(type: string): bool =
+    type == "i64" || type == "int" || type == "string" || type == "bool"
+
+private fun idiomNullableEdit(source: string, local: BootstrapExpression, guard: BootstrapExpression,
+    occurrences: BootstrapAnalysisOccurrenceSet): string {
+    val initializer = local.children[0]
+    if (local.children[1].text != "inferred" || guard.text != "" || guard.children.size != 3 ||
+        guard.children[2].kind != "missing") return ""
+    // These expression forms bind tighter than ??. The gap check refuses a
+    // trailing closer that the initializer's AST range does not include.
+    if (initializer.kind != "identifier" && initializer.kind != "call" &&
+        initializer.kind != "member" && initializer.kind != "member.call" &&
+        initializer.kind != "index") return ""
+    val condition = guard.children[0]
+    if (condition.kind != "==" || condition.children.size != 2) return ""
+    val left = condition.children[0]
+    val right = condition.children[1]
+    val name = if (left.kind == "null") right else left
+    if (name.kind != "identifier" || name.text != local.text ||
+        (left.kind != "null" && right.kind != "null")) return ""
+    val type = idiomTypeAt(occurrences, name)
+    if (!bootstrapIsNullableType(type) || !idiomScalar(bootstrapNullableElementType(type))) return ""
+    val exit = idiomOneStatement(guard.children[1])
+    if (exit.kind != "return" && exit.kind != "continue") return ""
+    val exitText = source.slice(exit.begin, exit.end)
+    if (exit.kind == "return") {
+        val value = exit.children[0]
+        if (value.kind != "missing" && value.kind != "integer" && value.kind != "string" &&
+            value.kind != "true" && value.kind != "false" && value.kind != "null") return ""
+        // Parentheses around a return value are outside its AST range.
+        if (value.kind != "missing" && source.slice(exit.begin + 6, value.begin).trim() != "") return ""
+    } else if (exitText != "continue") return ""
+    val gap = source.slice(local.end, guard.begin).trim()
+    if (gap != "" && gap != ";") return ""
+    if (idiomHasComment(source.slice(local.end, guard.end))) return ""
+    val head = source.slice(local.begin, local.end).trim()
+    "$head ?? $exitText"
+}
+
+// These transforms use only the loop item and built-in scalar operations.
+// No closure capture, user operator, mutation or call moves into the block.
+private fun idiomIntegerTransform(expression: BootstrapExpression, name: string): bool {
+    if (expression.kind == "identifier") return expression.text == name
+    if (expression.kind == "integer") return true
+    if (expression.kind != "+" && expression.kind != "-" && expression.kind != "*") return false
+    expression.children.size == 2 && idiomIntegerTransform(expression.children[0], name) &&
+        idiomIntegerTransform(expression.children[1], name)
+}
+
+private fun idiomMappedTransform(expression: BootstrapExpression, name: string,
+    input: string, output: string): bool {
+    if (output == "int" || output == "i64") {
+        return (input == "int" || input == "i64") && idiomIntegerTransform(expression, name)
+    }
+    if (output != "string") return false
+    if (expression.kind == "string") return true
+    if (expression.kind != "string.template") return false
+    for (part in expression.children) {
+        if (part.kind != "string" && (part.kind != "identifier" || part.text != name)) return false
+    }
+    true
+}
+
+private fun idiomMappedEdit(source: string, local: BootstrapExpression, loop: BootstrapExpression,
+    occurrences: BootstrapAnalysisOccurrenceSet): string {
+    val empty = local.children[0]
+    if (empty.kind != "array" || empty.children.size != 0 ||
+        loop.children.size != 2 || bootstrapLoopLabel(loop) != "") return ""
+    val input = loop.children[0]
+    val append = idiomOneStatement(loop.children[1])
+    if (input.kind != "identifier" || input.text == local.text ||
+        append.kind != "member.call" || append.text != "append" || append.children.size != 2) return ""
+    val output = append.children[0]
+    if (output.kind != "identifier" || output.text != local.text) return ""
+    val inputType = idiomTypeAt(occurrences, input)
+    val outputType = idiomTypeAt(occurrences, output)
+    if (!bootstrapIsArrayType(inputType) || !bootstrapIsArrayType(outputType)) return ""
+    val item = bootstrapArrayElementType(inputType)
+    if (!idiomScalar(item) ||
+        !idiomMappedTransform(append.children[1], loop.text, item, bootstrapArrayElementType(outputType))) return ""
+    if (idiomHasComment(source.slice(local.begin, loop.end))) return ""
+    // Keep the whole argument as written, including parentheses omitted by
+    // its AST. The call span ends just before the token following its closer.
+    val suffix = source.slice(output.end, append.end).trim()
+    if (!suffix.startsWith(".append(") || !suffix.endsWith(")")) return ""
+    val argument = suffix.slice(8, suffix.size - 1).trim()
+    if (argument.endsWith(",")) return ""
+    val head = source.slice(local.begin, empty.begin)
+    val gap = source.slice(empty.end, loop.begin).trim()
+    if (!head.trimEnd().endsWith("=") || (gap != "" && gap != ";")) return ""
+    "${head}${input.text}.mapped { ${loop.text} -> $argument }"
+}
+
+private fun idiomAppend(source: string, expression: BootstrapExpression,
+    occurrences: BootstrapAnalysisOccurrenceSet, nullable: bool, mapped: bool,
+    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string): void {
+    if (expression.kind == "block") {
+        // Leave the block's result expression in place.
+        for (index in 0 until expression.children.size - 2) {
+            val local = expression.children[index]
+            if (local.kind != "local.val" || local.children.size != 2) continue
+            val next = expression.children[index + 1]
+            val early = nullable && next.kind == "if"
+            if (!early && (!mapped || next.kind != "for")) continue
+            if (local.begin < 0 || local.begin >= local.end || local.end > next.begin ||
+                next.begin >= next.end || next.end > source.size || next.end - local.begin > 4096) continue
+            // A trailing closer omitted by the AST would stay after the edit.
+            var after = next.end
+            while (after < source.size && (source[after] == 32 || source[after] == 9)) after = after + 1
+            if (after < source.size && source[after] != 10 && source[after] != 13 &&
+                source[after] != 59 && source[after] != 125) continue
+            val replacement = if (early) idiomNullableEdit(source, local, next, occurrences)
+                else idiomMappedEdit(source, local, next, occurrences)
+            if (replacement != "") {
+                val code = if (early) "W_NULLABLE_EARLY_EXIT" else "W_ARRAY_MAPPED"
+                val title = if (early) "Combine the binding and null guard with ??" else "Replace the append loop with array.mapped"
+                diagnostics.append(BootstrapFrontendDiagnostic(code, title, path, local.begin, next.end,
+                    fixes = [BootstrapFrontendFix(title, "replace", local.begin, next.end, replacement)],
+                    severity = "warning"))
+            }
+        }
+    }
+    for (child in expression.children) idiomAppend(source, child, occurrences, nullable, mapped, diagnostics, path)
+}
+
+private fun idiomDeclaration(source: string, declaration: BootstrapDeclaration,
+    occurrences: BootstrapAnalysisOccurrenceSet, nullable: bool, mapped: bool,
+    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string): void {
+    // A resolved occurrence in an instantiated generic body does not prove
+    // that the edit is valid for every substitution.
+    if (declaration.typeParameters.size != 0 || declaration.sourceIdentity != path) return
+    idiomAppend(source, declaration.expression, occurrences, nullable, mapped, diagnostics, path)
+    for (method in declaration.methods) idiomDeclaration(source, method, occurrences, nullable, mapped, diagnostics, path)
+}
+
+/** The standard extension is the only possible target of the introduced
+ * member call. If another extension named mapped is loaded, skip the hint. */
+fun bootstrapAnalysisMappedProvider(declarations: array<BootstrapDeclaration>, provider: string): bool {
+    var found = false
+    for (declaration in declarations) {
+        if (declaration.extensionOwner == "") continue
+        if (bootstrapCanonicalDeclarationHasSourceName(declaration.name, "mapped")) {
+            if (declaration.sourceIdentity != provider) return false
+            found = true
+        }
+        // Even an extension on a type alias can overload a scalar operator.
+        // Without an operator-resolution proof at every site, leave it alone.
+        if (bootstrapCanonicalDeclarationHasSourceName(declaration.name, "plus") ||
+            bootstrapCanonicalDeclarationHasSourceName(declaration.name, "minus") ||
+            bootstrapCanonicalDeclarationHasSourceName(declaration.name, "times")) return false
+    }
+    found
+}
+
+/** Append edits for recognized idioms in a checked, written module. */
+fun bootstrapAnalysisIdiomHints(source: string, path: string, parsed: BootstrapParseResult,
+    occurrences: BootstrapAnalysisOccurrenceSet, mappedProvider: bool,
+    var diagnostics: array<BootstrapFrontendDiagnostic>): void {
+    if (parsed.errors != 0 || parsed.extensionErrors != 0) return
+    val nullable = source.contains("==") && source.contains("null")
+    var mapped = false
+    if (mappedProvider && source.contains(".append(") && source.contains("\"abla/array\"")) {
+        for (edge in bootstrapScanImports(source).edges) {
+            if (edge.source == "abla/array" && edge.alias == "" && !edge.provider && !edge.contractOnly) mapped = true
+        }
+    }
+    if (!nullable && !mapped) return
+    for (diagnostic in diagnostics) if (diagnostic.severity == "error") return
+    for (declaration in parsed.declarations) {
+        idiomDeclaration(source, declaration, occurrences, nullable, mapped, diagnostics, path)
+    }
+}

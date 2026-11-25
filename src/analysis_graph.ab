@@ -20,6 +20,7 @@ import "abla/runtime/memory"
 import "abla/sys/linux/process"
 import "abla/sys/linux"
 import "analysis_budget.ab"
+import "analysis_idiom_hints.ab"
 
 // Compiler frontend globals are serial already. One process-local graph state
 // avoids handing an immutable field view to the mutable module-state API.
@@ -507,10 +508,11 @@ fun bootstrapAnalysisGraphSemantic(
 fun bootstrapAnalysisGraphDiagnostics(
     document: BootstrapAnalysisGraphDocument, project: BootstrapFrontendHostProject,
     semanticDiagnostics: string,
-    unusedImports: string = ""
+    unusedImports: string = "", occurrences: BootstrapAnalysisOccurrenceSet? = null,
+    mappedProvider: bool = false, replay: bool = false
 ): Json {
     val values: array<BootstrapFrontendDiagnostic> = []
-    for (kind in ["parser", "subparser", "import", "local", "parameter", "declaration", "json-construction", "strict-import", "qualified-import", "semantic"]) {
+    if (!replay || unusedImports != "") for (kind in ["parser", "subparser", "import", "local", "parameter", "declaration", "json-construction", "strict-import", "qualified-import", "semantic"]) {
         val text = if (kind == "semantic") semanticDiagnostics
             else if (kind == "import" || kind == "local" || kind == "parameter" || kind == "declaration" || kind == "json-construction") "${project.written.diagnostics}$unusedImports"
             else project.written.diagnostics
@@ -518,9 +520,23 @@ fun bootstrapAnalysisGraphDiagnostics(
             "source[$kind]:${document.document.path}:", document.document.path,
             document.document.text, values)
     }
+    if (occurrences != null && document.hostSource == "") {
+        bootstrapAnalysisIdiomHints(document.document.text, document.document.path, document.parsed,
+            occurrences, mappedProvider, values)
+    }
     val exported: array<Json> = []
     for (value in values) exported.append(bootstrapFrontendDiagnosticJson(value))
     jsonArray(exported)
+}
+
+// Keep dependency and standard-library suggestions out of project diagnostics.
+private fun BootstrapAnalysisService.idiomSource(path: string, stdlib: string): bool {
+    if (path.startsWith(stdlib) || path.contains("/.abla/packages/")) return false
+    for (root in this.roots) {
+        if (path.startsWith(root) && path.size > root.size &&
+            (root.endsWith("/") || path[root.size] == 47)) return true
+    }
+    false
 }
 
 // Workspace revisions include disk and configuration inputs, not only overlay
@@ -955,7 +971,9 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
         val old = previous.snapshot.get("documents").values[index]
         if (old.getString("uri") != document.uri) return bootstrapAnalysisRejectReplay("old document")
         for (diagnostic in old.get("diagnostics").values) {
-            if (!this.graphUnusedImports || diagnostic.getString("code") != "W_UNUSED_IMPORT") {
+            val code = diagnostic.getString("code")
+            if (code == "W_NULLABLE_EARLY_EXIT" || code == "W_ARRAY_MAPPED") continue
+            if (!this.graphUnusedImports || code != "W_UNUSED_IMPORT") {
                 return bootstrapAnalysisRejectReplay("old diagnostics")
             }
         }
@@ -1012,6 +1030,8 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
     val uris: array<string> = []
     val offsetIdPrefix = "abla:$changedPath:"
     val contractIdPrefix = "abla:$changedPath#contract:"
+    val stdlib = bootstrapPathUnderPrefix(bootstrapStandardLibraryRoot())
+    val mappedProvider = bootstrapAnalysisMappedProvider(project.written.declarations, "${stdlib}abla/array/entry.ab")
     // The syntax-side use facts have been checked above. The proof preserves
     // resolved names, so the checked use facts still describe this revision.
     // Run the same warning pass against the new source and import locations.
@@ -1032,8 +1052,8 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
             if (id.startsWith(offsetIdPrefix) || id.startsWith(contractIdPrefix) || retired.has(id)) return bootstrapAnalysisRejectReplay("offset ID")
         }
         val old = previous.snapshot.get("documents").values[index]
-        val diagnostics = if (warnings == "") jsonArray([])
-            else bootstrapAnalysisGraphDiagnostics(document, project, "", warnings)
+        val diagnostics = bootstrapAnalysisGraphDiagnostics(document, project, "", warnings,
+            if (this.idiomSource(document.document.path, stdlib)) set else null, mappedProvider, replay = true)
         val diagnosticText = jsonStringify(diagnostics)
         if (index != changed && diagnosticText != jsonStringify(old.get("diagnostics"))) {
             return bootstrapAnalysisRejectReplay("untouched diagnostics changed")
@@ -1306,6 +1326,8 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
         val occurrenceIndex = bootstrapAnalysisOccurrenceIndex(analyzed.parsed.declarations,
             semantic, builtinIds)
         bootstrapAnalysisSampleMemory("occurrence index")
+        val stdlib = bootstrapPathUnderPrefix(bootstrapStandardLibraryRoot())
+        val mappedProvider = bootstrapAnalysisMappedProvider(project.written.declarations, "${stdlib}abla/array/entry.ab")
         for (document in documents) {
             if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
             // Kept compact for the queries, and in the answer as the text it encodes to: not a node per occurrence.
@@ -1313,7 +1335,8 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
                 document.parsed, analyzed.parsed.declarations, semantic, aliases, true,
                 occurrenceIndex, document.hostSource)
             sets.set(bootstrapAnalysisGraphPath(document.document.uri), set)
-            val diagnostics = bootstrapAnalysisGraphDiagnostics(document, project, semanticDiagnostics, unusedImports)
+            val diagnostics = bootstrapAnalysisGraphDiagnostics(document, project, semanticDiagnostics, unusedImports,
+                if (this.idiomSource(document.document.path, stdlib)) set else null, mappedProvider)
             if (this.graphStableIds) {
                 fingerprints.set(document.document.uri,
                     "${document.document.version}|${document.key}|${bootstrapAnalysisGraphSetHash(set)}|${bootstrapAnalysisGraphHash(jsonStringify(diagnostics))}")

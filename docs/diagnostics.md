@@ -557,6 +557,16 @@ For example, the compiler reports `W_UNUSED_IMPORT` for a helper imported by
 `main.ab` when nothing in the program uses its declarations. Remove the import,
 or use `export import` when a package entry is meant to pass that module on.
 
+## Editor idiom hints
+
+These hints appear in checked workspace files in graph analysis and carry a
+quick fix. They leave comments and code with uncertain types or effects alone.
+
+| Code | Meaning |
+|---|---|
+| `W_NULLABLE_EARLY_EXIT` | Combine an inferred nullable scalar binding and the immediately following null guard with `?? return` or `?? continue`. The null branch must only exit, with at most a literal return value. The initializer still runs once. |
+| `W_ARRAY_MAPPED` | Replace a fresh array and the immediately following single-append loop with [`array.mapped`](stdlib/arrays.md). The hint covers simple scalar transforms with no calls or captures when the standard extension is already imported and resolves unambiguously. |
+
 ## Builds
 
 | Code | Meaning |

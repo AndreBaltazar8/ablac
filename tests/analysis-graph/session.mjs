@@ -1,7 +1,7 @@
 // Protocol-only fixtures for `ablac analyze --stdio`. Run against a built compiler; never
 // executes a package's or the user's compile-time code (the standard library's subparsers are expanded). Usage: node session.mjs COMPILER
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -1311,7 +1311,170 @@ async function incrementalUnusedImportReplay() {
     }
 }
 
-const tests = { body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+async function idiomHints(mode) {
+    const source = `// café
+import "abla/array"
+resource class Ticket(val value: int)
+var calls = 0
+fun next(): int? { calls = calls + 1; 3 }
+fun effect(value: int): int { calls = calls + 1; value }
+fun early(input: int?): int {
+    val value = input
+    if (value == null) return 0
+    value + 1
+}
+fun bare(input: int?): void {
+    val value = input
+    if (value == null) return
+    calls = calls + value
+}
+fun skipped(inputs: array<int?>): int {
+    var count = 0
+    for (input in inputs) {
+        val value = input
+        if (null == value) { continue }
+        count = count + value
+    }
+    count
+}
+fun afterCall(): int {
+    val value = next()
+    if (value == null) return 0
+    value
+}
+fun guarded(input: int?): int {
+    val value = input
+    if (value == null) {
+        effect(0)
+        return 0
+    }
+    value
+}
+fun fallback(input: int?): int {
+    val value = input
+    if (value == null) return effect(0)
+    value
+}
+fun commented(input: int?): int {
+    val value = input
+    // Keep this explanation with the early exit.
+    if (value == null) return 0
+    value
+}
+fun annotated(input: int?): int {
+    val value: int? = input
+    if (value == null) return 0
+    value
+}
+fun mappedLoop(input: array<int>): array<int> {
+    val output: array<int> = []
+    for (value in input) { output.append((value + 2) * 3) }
+    output
+}
+fun mappedText(input: array<string>): array<string> {
+    val output: array<string> = []
+    for (word in input) output.append("hello $word")
+    output
+}
+fun extra(input: array<int>): array<int> {
+    val output: array<int> = []
+    for (value in input) {
+        effect(value)
+        output.append(value + 1)
+    }
+    output
+}
+fun effects(input: array<int>): array<int> {
+    val output: array<int> = []
+    for (value in input) output.append(effect(value))
+    output
+}
+fun grouped(input: array<int>): array<int> {
+    val output: array<int> = ([])
+    for (value in input) output.append(value + 1)
+    output
+}
+fun resources(input: array<Ticket>): array<string> {
+    val output: array<string> = []
+    for (value in input) output.append("ticket")
+    output
+}
+fun tickets(input: array<int>): array<Ticket> {
+    val output: array<Ticket> = []
+    for (value in input) output.append(Ticket(value))
+    output
+}
+fun main: int {
+    if (early(null) != 0 || early(2) != 3 || skipped([null, 2, null, 3]) != 5) return 1
+    if (afterCall() != 3 || calls != 1) return 2
+    bare(null)
+    bare(2)
+    if (calls != 3) return 4
+    if (mappedLoop([1, 2])[1] != 12 || mappedText(["world"])[0] != "hello world") return 3
+    0
+}
+`;
+    const p = fixture(`idiom-hints-${mode}`, { 'main.ab': source });
+    const entry = path.join(p, 'main.ab');
+    const session = await start(p, { mode });
+    try {
+        const snapshot = await session.analyze();
+        assert.equal(snapshot.complete, true);
+        const diagnostics = doc(snapshot, entry).diagnostics;
+        assert.ok(diagnostics.every((d) => d.severity === 'warning'), JSON.stringify(diagnostics));
+        const expected = [
+            ['W_NULLABLE_EARLY_EXIT', 'val value = input ?? return 0'],
+            ['W_NULLABLE_EARLY_EXIT', 'val value = input ?? return'],
+            ['W_NULLABLE_EARLY_EXIT', 'val value = input ?? continue'],
+            ['W_NULLABLE_EARLY_EXIT', 'val value = next() ?? return 0'],
+            ['W_ARRAY_MAPPED', 'val output: array<int> = input.mapped { value -> (value + 2) * 3 }'],
+            ['W_ARRAY_MAPPED', 'val output: array<string> = input.mapped { word -> "hello $word" }'],
+        ];
+        assert.deepEqual(diagnostics.map((d) => [d.code, d.fixes?.[0]?.edits?.[0]?.newText]), expected);
+        let edited = Buffer.from(source);
+        const edits = diagnostics.flatMap((d) => d.fixes.flatMap((fix) => fix.edits));
+        for (const { range, newText } of edits.reverse()) {
+            edited = Buffer.concat([edited.subarray(0, range.start), Buffer.from(newText), edited.subarray(range.end)]);
+        }
+        await session.rpc('document/open', { uri: uri(entry), version: 1, text: edited.toString() });
+        noErrors(await session.analyze());
+        const output = path.join(p, 'program');
+        for (const text of [source, edited]) {
+            fs.writeFileSync(entry, text);
+            const built = spawnSync(compiler, ['build', entry, '-o', output, '--no-cache'], { encoding: 'utf8' });
+            assert.equal(built.status, 0, built.stderr);
+            assert.equal(spawnSync(output, []).status, 0, 'example behavior changed');
+        }
+    } finally {
+        await session.close();
+    }
+}
+
+async function idiomMappedVisibility() {
+    const loop = `fun map(input: array<int>): array<int> {
+    val result: array<int> = []
+    for (item in input) result.append(item + 1)
+    result
+}
+fun main: int = map([1])[0] - 2
+`;
+    for (const [name, prefix] of [
+        ['missing', ''],
+        ['alias', 'import "abla/array" as collections\n'],
+        ['overload', 'import "abla/array"\nfun array<int>.mapped(transform: (int) -> int): array<int> = [99]\n'],
+        ['operator', 'import "abla/array"\nclass Counter(val value: int)\noperator fun Counter.plus(rhs: Counter): Counter = rhs\n'],
+    ]) {
+        const project = fixture(`idiom-mapped-${name}`, { 'main.ab': prefix + loop });
+        const session = await start(project, { mode: 'graph-v2' });
+        try {
+            noErrors(await session.analyze());
+        } finally {
+            await session.close();
+        }
+    }
+}
+
+const tests = { idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
