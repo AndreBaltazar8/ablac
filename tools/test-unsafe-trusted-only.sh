@@ -5,10 +5,10 @@
 # tools/sys-trusted-only.tsv list them. Checked here:
 #   - the marks and the lists agree: every restricted declaration that is not already a trusted extern carries the marker, and
 #     no other declaration of abla/unsafe or abla/sys does;
-#   - with the standard library as it is (phase "warn"), a call from code that is not trusted builds and warns
+#   - with a copy of the standard library whose markers are back at "warn 0.2.73" (the phase stays tested), a call from code that is not trusted builds and warns
 #     (warning[E_SEMANTIC]: native.trust:...), and stdlib-heavy programs build with no such warning (the library's own uses
 #     are trusted);
-#   - with every marker at "error" (a copy of the standard library), a call, a raw constructor call and a reference to the
+#   - with the standard library as it is (every marker at "error"), a call, a raw constructor call and a reference to the
 #     function as a value from code that is not trusted (run-time or compile-time code alike) are `native.trust:<name>` with the
 #     help, and the same call inside a trusted function, the factory, the checked methods and module values made with the
 #     open producers of a program-lifetime address (static storage, a function's address) are accepted;
@@ -47,8 +47,11 @@ build() {
     ABLA_STDLIB=$1 "$compiler" build "$cases/$2.ab" -o "$out/$2" --fast --no-cache > "$out/$2.log" 2>&1 || status=$?
 }
 
-# Phase "warn" (the standard library as it is).
-build "$root/stdlib" plain-call
+# Phase "warn" (a copy of the standard library with every marker back at "warn 0.2.73": the phase stays tested after the flip).
+mkdir -p "$out/warn-stdlib"
+cp -R stdlib/. "$out/warn-stdlib/"
+find "$out/warn-stdlib/abla/unsafe" "$out/warn-stdlib/abla/sys" -name '*.ab' -exec sed -i 's/^@__abla_trusted_only("error/@__abla_trusted_only("warn 0.2.73/' {} +
+build "$out/warn-stdlib" plain-call
 [[ $status == 0 ]] || fail "plain-call did not build in the warn phase: $(head -4 "$out/plain-call.log")"
 grep -q 'warning\[E_SEMANTIC\]: native.trust:nativePointerAddress' "$out/plain-call.log" || fail "plain-call: no warning: $(head -4 "$out/plain-call.log")"
 grep -q 'from 0.2.73' "$out/plain-call.log" || fail 'plain-call: the warning does not name the release'
@@ -59,14 +62,11 @@ for program in tests/cases/modules/bytes.ab tests/cases/modules/linux-net.ab tes
     ! grep -q 'native.trust' "$out/stdlib-$name.log" || fail "$program warns about the standard library's own uses: $(grep -m2 -A1 native.trust "$out/stdlib-$name.log")"
 done
 
-# Phase "error": every marker flipped, in a copy of the standard library.
-mkdir -p "$out/stdlib"
-cp -R stdlib/. "$out/stdlib/"
-find "$out/stdlib/abla/unsafe" "$out/stdlib/abla/sys" -name '*.ab' -exec sed -i 's/^@__abla_trusted_only("warn 0.2.73/@__abla_trusted_only("error/' {} +
+# Phase "error" (the standard library as it is: every marker is at "error").
 for refused in plain-call:nativePointerAddress constructor:NativeByteBuffer reference:nativePointerAddress \
     compile-time:nativePointerAddress plain-syscall:linuxSyscall1; do
     IFS=: read -r name what <<< "$refused"
-    build "$out/stdlib" "$name"
+    build "$root/stdlib" "$name"
     [[ $status != 0 ]] || fail "$name built with the marker at error"
     grep -q "native.trust:$what" "$out/$name.log" || fail "$name: no native.trust:$what: $(head -4 "$out/$name.log")"
 done
@@ -74,7 +74,7 @@ grep -q 'help: allocate one with nativeByteBuffer(capacity)' "$out/constructor.l
 grep -q 'help: wrap the call in a trusted function' "$out/plain-call.log" || fail "plain-call: no help: $(head -5 "$out/plain-call.log")"
 grep -q 'help: call the abla/sys wrapper' "$out/plain-syscall.log" || fail "plain-syscall: no help: $(head -5 "$out/plain-syscall.log")"
 for accepted in trusted-call open trusted-syscall; do
-    build "$out/stdlib" "$accepted"
+    build "$root/stdlib" "$accepted"
     [[ $status == 0 ]] || fail "$accepted was refused: $(head -4 "$out/$accepted.log")"
     ! grep -q 'native.trust' "$out/$accepted.log" || fail "$accepted warned: $(head -3 "$out/$accepted.log")"
     "$out/$accepted" > "$out/$accepted.out" || fail "$accepted did not run"
