@@ -1,12 +1,14 @@
 // Checks the front end built for wasm32 (src/browser_main.ab), under Node with the page's host:
-//   node frontend-check.mjs <browser-frontend.wasm> <repository root>
+//   node frontend-check.mjs <browser-frontend.wasm> <repository root> [CLI WASI fixtures directory]
 // It lowers a hello and a program with a compile-time site, reports a wrong program's error, and runs programs with the compiler's
 // evaluator (output, exit status, a runtime error, standard input).
-import { readFileSync, readdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
-import { boundedCompiler, compile, createBase, run } from "./host.mjs";
+import { boundedCompiler, compile, compileGuest, createBase, run } from "./host.mjs";
+import { runGuest } from "./guest.mjs";
 
-const [wasmPath, root] = process.argv.slice(2);
+const [wasmPath, root, wasiDirectory] = process.argv.slice(2);
 const module = await WebAssembly.compile(readFileSync(wasmPath));
 const stdlib = new Map();
 const walk = (directory) => {
@@ -85,5 +87,64 @@ check("run: allocation stops at the memory limit", !grown.ok && grown.memoryByte
     JSON.stringify({ ok: grown.ok, megabytes: Math.round(grown.memoryBytes / 1048576), diagnostics: grown.diagnostics.slice(-160) }));
 const small = await run(bounded, base, new Map([["main.ab", fib]]));
 check("run: a bounded module still runs a program", small.ok && small.stdout === "fib = 6765\n" && small.status === 3, JSON.stringify({ ok: small.ok, status: small.status }));
+
+const cases = join(root, "tests/cases/wasm-browser-frontend");
+for (const [name, status, stdout] of [
+    ["compiled-hello", 0, "hello from Wasm\n"],
+    ["compiled-loop", 7, ""],
+]) {
+    const source = readFileSync(join(cases, name + ".ab"));
+    const compiled = await compileGuest(bounded, base, new Map([["main.ab", source]]));
+    check(`emit ${name}`, compiled.ok && compiled.wasm instanceof ArrayBuffer && compiled.stdout === "", compiled.stderr.trim());
+    if (!compiled.ok) continue;
+    const guest = await runGuest(compiled.wasm, compiled.stdoutBudget);
+    check(`run ${name}`, guest.stdout === stdout && guest.status === status && guest.memoryBytes === 65536);
+    const cliOutput = wasiDirectory ? join(wasiDirectory, name + ".wasm") : "";
+    if (cliOutput && existsSync(cliOutput)) {
+        const cli = spawnSync("wasmtime", ["run", cliOutput], { encoding: "utf8", timeout: 30000 });
+        check(`CLI WASI parity ${name}`, !cli.error && cli.status === guest.status && cli.stdout === guest.stdout,
+            cli.error?.message ?? String(cli.stderr).trim());
+    } else console.log(`skip CLI WASI parity ${name} (wasmtime or its comparison module is missing)`);
+    if (name === "compiled-hello") {
+        const capped = await runGuest(compiled.wasm, 3);
+        check("guest output obeys the remaining byte budget", capped.status === 1 && capped.outputTruncated && capped.stdout === "hel");
+        const foreignImport = Buffer.from(compiled.wasm.slice(0));
+        const namespace = foreignImport.indexOf("abla_playground");
+        if (namespace >= 0) foreignImport[namespace] = 120;
+        let rejected = false;
+        try {
+            await runGuest(foreignImport);
+        } catch (error) {
+            rejected = /Unexpected playground guest imports/.test(error.message);
+        }
+        check("guest denies a module requesting another import", namespace >= 0 && rejected);
+        const oversized = Buffer.from(compiled.wasm.slice(0));
+        const memory = oversized.indexOf(Buffer.from([5, 4, 1, 1, 1, 16]));
+        let cappedMemory = false;
+        if (memory >= 0) {
+            oversized[memory + 4] = 17;
+            oversized[memory + 5] = 17;
+            try {
+                await runGuest(oversized);
+            } catch (error) {
+                cappedMemory = error.message === "memory-limit";
+            }
+        }
+        check("guest denies a valid module with more than 16 initial pages",
+            memory >= 0 && WebAssembly.validate(oversized) && cappedMemory);
+    }
+}
+const unsupported = await compileGuest(bounded, base, new Map([["main.ab",
+    'fun main: int { var value = 7; value / 2 }\n',
+]]));
+check("compiled mode rejects operations outside its subset",
+    !unsupported.ok && unsupported.wasm === null && /unsupported lowered operation/.test(unsupported.stderr),
+    unsupported.stderr.trim());
+const initialized = await compileGuest(bounded, base, new Map([["main.ab",
+    'val value = 7\nfun main: int = value\n',
+]]));
+check("compiled mode rejects project runtime initialization",
+    !initialized.ok && initialized.wasm === null && /without runtime global initializers/.test(initialized.stderr),
+    initialized.stderr.trim());
 
 process.exit(failed ? 1 : 0);

@@ -15,4 +15,11 @@ mkdir -p "$output_directory"
 (cd "$project_root" && "$compiler" build "$cases/build.ab" -o "$output_directory/build-driver" --no-cache)
 (cd "$project_root" && "$output_directory/build-driver")
 node "$cases/check.mjs" "$output_directory/browser-frontend.wasm" 20
-node "$project_root/tools/playground/frontend-check.mjs" "$output_directory/browser-frontend.wasm" "$project_root"
+if command -v wasmtime >/dev/null; then
+    for program in compiled-hello compiled-loop; do
+        (cd "$project_root" && "$compiler" build "$cases/$program.ab" --target wasm32-wasi \
+            --fast --no-cache -o "$output_directory/$program.wasm")
+    done
+fi
+node "$project_root/tools/playground/frontend-check.mjs" \
+    "$output_directory/browser-frontend.wasm" "$project_root" "$output_directory"

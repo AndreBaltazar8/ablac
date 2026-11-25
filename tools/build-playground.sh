@@ -46,7 +46,7 @@ cp "$stage/browser-compiler.wasm" "$output/$package/$wasm_name"
 
 # 2. The standard library as one brotli bundle, and the page's host files.
 stdlib_name=$(node "$root/tools/playground/pack-stdlib.mjs" "$root/stdlib" "$output/$package")
-for file in host.mjs vfs.mjs stdlib-bundle.mjs wasm-memory.mjs; do cp "$root/tools/playground/$file" "$output/$package/$file"; done
+for file in host.mjs vfs.mjs stdlib-bundle.mjs wasm-memory.mjs guest.mjs guest-worker.mjs; do cp "$root/tools/playground/$file" "$output/$package/$file"; done
 
 # 3. The manifest: what the page fetches, with sizes and hashes (no dates).
 node - "$output/$package" "$version" "$wasm_name" "$stdlib_name" <<'JS'
@@ -64,7 +64,7 @@ const manifest = {
     version,
     compiler: describe(wasm),
     stdlib: describe(stdlib),
-    host: ["host.mjs", "stdlib-bundle.mjs", "vfs.mjs", "wasm-memory.mjs"].map(describe),
+    host: ["host.mjs", "stdlib-bundle.mjs", "vfs.mjs", "wasm-memory.mjs", "guest.mjs", "guest-worker.mjs"].map(describe),
 };
 writeFileSync(join(directory, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
 JS

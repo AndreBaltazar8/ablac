@@ -36,6 +36,7 @@ export async function compile(module, base, files, options = {}) {
     let memory;
     const unknown = {};
     const output = { 1: "", 2: "" };
+    const outputBytes = { 1: 0, 2: 0 };
     const decoder = new TextDecoder();
     class Exit extends Error {
         constructor(code) { super(`exit ${code}`); this.code = code; }
@@ -43,6 +44,7 @@ export async function compile(module, base, files, options = {}) {
     const outputLimit = options.outputLimit ?? outputLimitBytes;
     let outputTruncated = false;
     if (options.entry) vfs.put("/work/entry", encoder.encode(at(options.entry)));
+    if (options.emitGuest) vfs.put("/.abla-browser-emit", encoder.encode("wasm"));
     const fileCalls = createSyscalls(vfs, () => memory, { cwd: options.cwd ?? root, stdin: options.stdin, unknown: (n) => { unknown[n] = (unknown[n] ?? 0) + 1; } });
     const heap = () => new Uint8Array(memory.buffer);
     const address = (value) => Number(BigInt.asUintN(32, BigInt(value)));
@@ -54,8 +56,9 @@ export async function compile(module, base, files, options = {}) {
                 const fd = Number(a0);
                 if (!(fd in output)) break;
                 const length = Number(a2);
-                const kept = Math.max(0, Math.min(length, outputLimit - output[fd].length));
+                const kept = Math.max(0, Math.min(length, outputLimit - outputBytes[fd]));
                 output[fd] += decoder.decode(heap().subarray(address(a1), address(a1) + kept));
+                outputBytes[fd] += kept;
                 if (kept < length) {
                     outputTruncated = true;
                     throw new Exit(1);
@@ -94,7 +97,7 @@ export async function compile(module, base, files, options = {}) {
         else if (bounded && error instanceof WebAssembly.RuntimeError && memory.buffer.byteLength >= bounded.maximum * 32768) { status = 1; memoryLimit = true; }
         else throw error;
     }
-    return { status, stdout: output[1], stderr: output[2], vfs, unknown, memoryBytes: memory.buffer.byteLength, outputTruncated, memoryLimit };
+    return { status, stdout: output[1], stderr: output[2], stdoutBytes: outputBytes[1], vfs, unknown, memoryBytes: memory.buffer.byteLength, outputTruncated, memoryLimit };
 }
 
 // Runs a program with the compiler's evaluator: a wrapper module calls the program's `main` at compile time (a `#` site), so the program's
@@ -122,4 +125,36 @@ export async function run(module, base, files, { stdin = "" } = {}) {
         diagnostics += "\n\nThis run received only the editor file. If the example has companion files, save them beside main.ab using the paths shown in the example, then run ablac run main.ab locally.";
     }
     return { status: ok ? Number(exit[1]) : 1, stdout: result.stdout, stderr: result.stderr, diagnostics, ok, memoryBytes: result.memoryBytes };
+}
+
+// Compile the opt-in subset. Only the resulting Wasm bytes and bounded
+// compiler-phase output cross the worker boundary; the VFS stays behind.
+export async function compileGuest(module, base, files) {
+    if (!(module?.module instanceof WebAssembly.Module) ||
+        !Number.isInteger(module.maximum) || module.maximum > compilerMemoryPages) {
+        throw new Error("The playground guest requires a bounded compiler");
+    }
+    const project = new Map(files);
+    for (const path of project.keys()) {
+        if (typeof path !== "string" || path.includes("\\") ||
+            path.split("/").some(part => part === "" || part === "." || part === "..")) {
+            throw new Error("Invalid playground project path");
+        }
+    }
+    project.set("abla.toml", 'compileCapabilities = ["clock", "random", "process.io"]\n');
+    const result = await compile(module, base, project, { entry: "main.ab", emitGuest: true });
+    const bytes = result.vfs.read("/.abla-browser-guest.wasm");
+    const ok = result.status === 0 && !result.outputTruncated && bytes instanceof Uint8Array;
+    let stderr = result.stderr.split("\n").filter(line => !/^errors=/.test(line)).join("\n");
+    if (result.memoryLimit) stderr += "\nThe compiler reached its linear memory limit.";
+    if (result.outputTruncated) stderr += "\nThe compiler reached its output limit.";
+    if (!ok && !stderr.trim()) stderr = "No playground Wasm module was produced.";
+    return {
+        ok,
+        status: ok ? 0 : result.status || 1,
+        stdout: result.stdout,
+        stderr,
+        stdoutBudget: outputLimitBytes - result.stdoutBytes,
+        wasm: ok ? bytes.slice().buffer : null,
+    };
 }

@@ -1,0 +1,331 @@
+// Direct emitter for the browser's opt-in integer and literal-output subset.
+import "../../ir.ab"
+import "../../eval.ab"
+import "../llvm/functions.ab"
+import "../llvm/analysis.ab"
+import "abla/bytes"
+import "abla/sys/linux"
+
+fun browserWasmBytes(var output: ByteBuffer, values: array<int>): void {
+    for (byte in values) output.appendByteValue(byte)
+}
+
+fun browserWasmUnsigned(var output: ByteBuffer, number: int): void {
+    var remaining = number
+    while (remaining >= 128) {
+        output.appendByteValue((remaining & 127) | 128)
+        remaining = remaining >> 7
+    }
+    output.appendByteValue(remaining)
+    return
+}
+
+fun browserWasmSigned(var output: ByteBuffer, number: int): void {
+    var remaining = number
+    var more = true
+    while (more) {
+        val digit = remaining & 127
+        remaining = remaining >> 7
+        more = !((remaining == 0 && (digit & 64) == 0) ||
+            (remaining == -1 && (digit & 64) != 0))
+        output.appendByteValue(digit | (if (more) 128 else 0))
+    }
+}
+
+fun browserWasmName(var output: ByteBuffer, text: string): void {
+    browserWasmUnsigned(output, text.size)
+    output.appendText(text)
+}
+
+fun browserWasmSection(var output: ByteBuffer, id: int, body: ByteBuffer): void {
+    output.appendByteValue(id)
+    browserWasmName(output, body.toText())
+}
+
+fun browserWasmModule(body: string, text: string): string {
+    val module = byteBuffer()
+    browserWasmBytes(module, [0, 97, 115, 109, 1, 0, 0, 0])
+
+    val types = byteBuffer()
+    // (i32, i32) -> void for write, then () -> i32 for main.
+    browserWasmBytes(types, [2, 96, 2, 127, 127, 0, 96, 0, 1, 127])
+    browserWasmSection(module, 1, types)
+
+    val imports = byteBuffer()
+    imports.appendByteValue(1)
+    browserWasmName(imports, "abla_playground")
+    browserWasmName(imports, "write")
+    browserWasmBytes(imports, [0, 0])
+    browserWasmSection(module, 2, imports)
+
+    val functions = byteBuffer()
+    browserWasmBytes(functions, [1, 1])
+    browserWasmSection(module, 3, functions)
+
+    val memory = byteBuffer()
+    // One unshared wasm32 memory: 64 KiB initially, at most 1 MiB.
+    browserWasmBytes(memory, [1, 1, 1, 16])
+    browserWasmSection(module, 5, memory)
+
+    val exports = byteBuffer()
+    exports.appendByteValue(1)
+    browserWasmName(exports, "main")
+    browserWasmBytes(exports, [0, 1])
+    browserWasmSection(module, 7, exports)
+
+    val code = byteBuffer()
+    code.appendByteValue(1)
+    browserWasmName(code, body)
+    browserWasmSection(module, 10, code)
+
+    if (text != "") {
+        val data = byteBuffer()
+        // One active segment starting at byte zero.
+        browserWasmBytes(data, [1, 0, 65, 0, 11])
+        browserWasmName(data, text)
+        browserWasmSection(module, 11, data)
+    }
+    module.toText()
+}
+
+fun browserWasmLocal(var output: ByteBuffer, opcode: int, index: int): void {
+    output.appendByteValue(opcode)
+    browserWasmUnsigned(output, index)
+}
+
+fun browserWasmConstant(var output: ByteBuffer, opcode: int, value: int): void {
+    output.appendByteValue(opcode)
+    browserWasmSigned(output, value)
+}
+
+fun browserWasmIntegerOp(opcode: string): int = when (opcode) {
+    "+" -> 124
+    "-" -> 125
+    "*" -> 126
+    "==" -> 81
+    "!=" -> 82
+    "<" -> 83
+    ">" -> 85
+    "<=" -> 87
+    ">=" -> 89
+    else -> 0
+}
+
+fun browserWasmScalar(values: array<string>, value: int): string =
+    if (value >= 0 && value < values.size) values[value] else ""
+
+fun browserWasmRead(var body: ByteBuffer, value: int): void =
+    browserWasmLocal(body, 32, value + 1)
+
+fun browserWasmSave(var body: ByteBuffer, value: int): void =
+    browserWasmLocal(body, 33, value + 1)
+
+fun browserWasmBlockIndex(function: BootstrapIrFunction, label: int): int {
+    var index = 0
+    while (index < function.blocks.size) {
+        if (function.blocks[index].label == label && function.blocks[index].reachable) return index
+        index = index + 1
+    }
+    -1
+}
+
+// The block is inside an if in the dispatch loop.
+fun browserWasmDispatch(var body: ByteBuffer): void = browserWasmBytes(body, [33, 0, 12, 1])
+
+fun browserWasmWriteLiteral(
+    var body: ByteBuffer, var data: ByteBuffer, function: BootstrapIrFunction, value: int
+): bool {
+    for (producer in function.instructions) {
+        if (producer.result == value && producer.opcode == "const.string") {
+            val text = "${producer.text}\n"
+            val offset = data.size()
+            if (text.size > 65536 - offset) return false
+            data.appendText(text)
+            browserWasmConstant(body, 65, offset)
+            browserWasmConstant(body, 65, text.size)
+            browserWasmBytes(body, [16, 0])
+            return true
+        }
+    }
+    false
+}
+
+fun browserWasmInstruction(
+    var body: ByteBuffer, var data: ByteBuffer, function: BootstrapIrFunction,
+    scalars: BootstrapLlvmScalarPlan, locals: BootstrapLlvmNameIndex, printName: string,
+    instruction: BootstrapInstruction
+): bool {
+    val op = instruction.opcode
+    val left = instruction.left
+    val result = instruction.result
+    if (op == "label" || op == "const.void" || op == "const.string") return true
+    if (op == "const.i64" || op == "const.bool") {
+        val value = if (op == "const.i64") bootstrapLlvmParseInteger(instruction.text)
+            else if (instruction.text == "true") 1 else 0
+        browserWasmConstant(body, 66, value)
+        browserWasmSave(body, result)
+        return true
+    }
+    if (op == "local.load" || op == "local.declare" || op == "local.assign" ||
+        op == "local.set") {
+        val local = locals.find(instruction.text)
+        if (local < 0 || (scalars.localTypes[local] != "i64" && scalars.localTypes[local] != "bool")) return false
+        val slot = scalars.valueTypes.size + 1 + local
+        if (op == "local.load") {
+            browserWasmLocal(body, 32, slot)
+        } else {
+            if (browserWasmScalar(scalars.valueTypes, left) != scalars.localTypes[local]) return false
+            browserWasmRead(body, left)
+            browserWasmLocal(body, if (result >= 0) 34 else 33, slot)
+        }
+        if (result >= 0) browserWasmSave(body, result)
+        return true
+    }
+    if (op == "local.zero.i64" || op == "local.zero.bool") {
+        val local = locals.find(instruction.text)
+        if (local < 0 || (scalars.localTypes[local] != "i64" && scalars.localTypes[local] != "bool")) return false
+        browserWasmConstant(body, 66, 0)
+        browserWasmLocal(body, 33, scalars.valueTypes.size + 1 + local)
+        return true
+    }
+    val integerOp = browserWasmIntegerOp(op)
+    if (integerOp != 0) {
+        val type = browserWasmScalar(scalars.valueTypes, left)
+        if (type != browserWasmScalar(scalars.valueTypes, instruction.right) ||
+            (type != "i64" && !(type == "bool" && (op == "==" || op == "!=")))) return false
+        browserWasmRead(body, left)
+        browserWasmRead(body, instruction.right)
+        body.appendByteValue(integerOp)
+        if (integerOp < 124) body.appendByteValue(173)
+        browserWasmSave(body, result)
+        return true
+    }
+    if (op == "return") {
+        if (browserWasmScalar(scalars.valueTypes, left) != "i64") return false
+        browserWasmRead(body, left)
+        browserWasmBytes(body, [167, 15])
+        return true
+    }
+    if (op == "jump" || op == "branch") {
+        val target = browserWasmBlockIndex(function, instruction.target)
+        if (target < 0) return false
+        if (op == "branch") {
+            val alternate = browserWasmBlockIndex(function, instruction.alternate)
+            if (alternate < 0 || browserWasmScalar(scalars.valueTypes, left) != "bool") return false
+            browserWasmRead(body, left)
+            // i64.eqz, then select the false or true block as an i32.
+            browserWasmBytes(body, [80, 4, 127])
+            browserWasmConstant(body, 65, alternate)
+            body.appendByteValue(5)
+            browserWasmConstant(body, 65, target)
+            body.appendByteValue(11)
+        } else browserWasmConstant(body, 65, target)
+        browserWasmDispatch(body)
+        return true
+    }
+    if (op == "call" && printName != "" && instruction.text == printName &&
+        instruction.operands.size == 1) return browserWasmWriteLiteral(body, data, function, instruction.operands[0])
+    false
+}
+
+fun browserWasmPrintName(program: BootstrapIrProgram): string {
+    for (function in program.functions) {
+        if (function.label == "println" && function.parameterTypes.size == 1 &&
+            function.parameterTypes[0] == "string") {
+            val file = bootstrapIrSourcePositionFile(function.position)
+            if (file >= 0 && file < bootstrapIrSourceFiles.size &&
+                bootstrapIrSourceFiles[file] == "/stdlib/abla/io/entry.ab") return function.name
+        }
+    }
+    ""
+}
+
+fun browserWasmFailure(program: BootstrapIrProgram, reason: string): BootstrapLlvmEmission {
+    bootstrapStageDriverDiagnostic("error[E_PLAYGROUND_WASM_UNSUPPORTED]: $reason\n")
+    bootstrapNoteDiagnosedLoweringErrors(1)
+    BootstrapLlvmEmission("", program.errors + 1, "")
+}
+
+fun browserWasmHasProgramGlobals(program: BootstrapIrProgram): bool {
+    for (instruction in program.instructions) {
+        if (instruction.opcode == "global.store") {
+            val file = bootstrapIrSourcePositionFile(instruction.position)
+            if (file < 0 || file >= bootstrapIrSourceFiles.size) return true
+            val source = bootstrapIrSourceFiles[file]
+            // The browser's lowering includes the bundled native runtime's
+            // initialization. This guest subset does not require that runtime.
+            if (source != "/stdlib/abla/runtime/platform/host.ab" &&
+                source != "/stdlib/abla/runtime/self/stm.ab") return true
+        }
+    }
+    false
+}
+
+trusted fun browserWasmEmit(program: BootstrapIrProgram): BootstrapLlvmEmission {
+    if (program.errors > 0) return BootstrapLlvmEmission("", program.errors, "")
+    val functionNames: array<string> = []
+    for (function in program.functions) functionNames.append(function.name)
+    val functionIndex = bootstrapLlvmNameIndex(functionNames)
+    val main = functionIndex.find("main")
+    if (main < 0) return browserWasmFailure(program, "a main function is required")
+    val function = program.functions[main]
+    if (browserWasmHasProgramGlobals(program) || function.parameters.size != 0 ||
+        bootstrapLlvmScalarType(function.resultType) != "i64" ||
+        function.naked || function.targetFeatures != "" ||
+        function.instructions.size > 4096 || function.blocks.size == 0 || function.blocks.size > 128 ||
+        bootstrapLlvmScalarValueCount(function) > 4096) {
+        return browserWasmFailure(program, "the prototype accepts a parameterless int main without runtime global initializers")
+    }
+
+    val nativeNames: array<string> = []
+    for (native in program.natives) nativeNames.append(native.name)
+    val locals = bootstrapLlvmLocalIndex(function)
+    val scalars = bootstrapLlvmBuildScalarPlan(
+        program, function, functionIndex, bootstrapLlvmNameIndex(nativeNames), locals
+    )
+    val body = byteBuffer()
+    val data = byteBuffer()
+    val printName = browserWasmPrintName(program)
+    // Local 0 is the i32 dispatch index. Each scalar SSA value and local gets
+    // an i64 register. The prototype limits both the IR and this register file.
+    browserWasmBytes(body, [2, 1, 127])
+    browserWasmUnsigned(body, scalars.valueTypes.size + function.instructions.size)
+    body.appendByteValue(126)
+    browserWasmBytes(body, [3, 64])
+    var index = 0
+    while (index < function.blocks.size) {
+        val block = function.blocks[index]
+        if (block.reachable) {
+            browserWasmBytes(body, [32, 0])
+            browserWasmConstant(body, 65, index)
+            browserWasmBytes(body, [70, 4, 64])
+            var position = block.begin
+            while (position < block.end) {
+                val instruction = function.instructions[position]
+                if (!browserWasmInstruction(body, data, function, scalars, locals, printName, instruction)) {
+                    return browserWasmFailure(program, "unsupported lowered operation `${instruction.opcode}`")
+                }
+                position = position + 1
+            }
+            val end = if (block.end > block.begin) function.instructions[block.end - 1].opcode else ""
+            if (end != "jump" && end != "branch" && end != "return") {
+                if (index + 1 >= function.blocks.size || !function.blocks[index + 1].reachable) {
+                    return browserWasmFailure(program, "the final block must return an integer")
+                }
+                browserWasmConstant(body, 65, index + 1)
+                browserWasmDispatch(body)
+            }
+            body.appendByteValue(11)
+        }
+        index = index + 1
+    }
+    // The loop can end only through the emitted return. Trap invalid dispatch.
+    browserWasmBytes(body, [0, 11, 0, 11])
+    val module = browserWasmModule(body.toText(), data.toText())
+    val output = linuxOpen("/.abla-browser-guest.wasm", 577, 0o600)
+    if (output.descriptor < 0) return browserWasmFailure(program, "cannot open the generated Wasm module")
+    val wrote = output.write(module)
+    val closed = output.close()
+    if (wrote != module.size || closed != 0) return browserWasmFailure(program, "cannot write the generated Wasm module")
+    BootstrapLlvmEmission("", program.errors, "")
+}

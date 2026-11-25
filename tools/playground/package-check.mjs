@@ -54,6 +54,15 @@ try {
     const boundedModule = await host.boundedCompiler(wasm);
     const boundedRun = await host.run(boundedModule, base, new Map([["main.ab", source]]));
     if (!boundedRun.ok || boundedRun.stdout !== "package ok\n" || boundedRun.status !== 7) fail(`the bounded module ran as ${JSON.stringify({ ok: boundedRun.ok, status: boundedRun.status, stdout: boundedRun.stdout })}`);
+    if (manifest.host.some(entry => entry.file === "guest-worker.mjs")) {
+        const { runGuest } = await import(pathToFileURL(join(directory, "guest.mjs")));
+        const compiled = await host.compileGuest(boundedModule, base, new Map([["main.ab", source]]));
+        if (!compiled.ok) fail(`the packed direct emitter failed: ${compiled.stderr}`);
+        const guest = await runGuest(compiled.wasm, compiled.stdoutBudget);
+        if (guest.status !== 7 || guest.stdout !== "package ok\n" || guest.memoryBytes !== 65536) {
+            fail(`the packed direct guest ran as ${JSON.stringify(guest)}`);
+        }
+    }
     for (const [signature, tail, status] of [["fun main(): i64", "7", 7], ["fun main", "return", 0]]) {
         const output = await run(`import "abla/io"\n${signature} { println("main ran"); ${tail} }\n`);
         if (!output.ok || output.status !== status || output.stdout !== "main ran\n") {

@@ -36,7 +36,7 @@ function join(chunks) {
 
 // wasm-ld emits one defined linear memory. Move it to env.memory with index
 // zero, preserving the code, data segments and memory export.
-export function withBoundedMemory(binary, cap) {
+export function withBoundedMemory(binary, cap, allowedSections) {
     const bytes = new Uint8Array(binary);
     if (!header.every((byte, index) => bytes[index] === byte)) throw new Error("Invalid Wasm header");
     const sections = [];
@@ -46,6 +46,7 @@ export function withBoundedMemory(binary, cap) {
     while (position.offset < bytes.length) {
         const start = position.offset;
         const id = bytes[position.offset++];
+        if (allowedSections && !allowedSections.has(id)) throw new Error("Unexpected Wasm section");
         const size = readU32(bytes, position);
         const end = position.offset + size;
         if (end > bytes.length) throw new Error("Truncated Wasm section");
