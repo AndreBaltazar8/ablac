@@ -22,6 +22,8 @@ const known_rules = [
     (refusal, tags) => refusal === "E:HPE_UNEXPECTED_CONTENT_LENGTH" && tags.includes("mode-twocl"),
     (refusal, tags, stream) => refusal === "E:HPE_INVALID_TRANSFER_ENCODING" && /chunked[ ]*\t|\t[ ]*chunked/.test(stream),
     (refusal, tags) => refusal === "E:HPE_STRICT" && tags.includes("ch-ext"),
+    // Go's net/http parses an absolute-form target's authority and refuses a port that is not a number; the target is passed on as received here (target-8bit), the framing is the same.
+    (refusal) => /^E:parse_.*invalid_port/.test(refusal),
     (refusal, tags) => (refusal === "E:HPE_INVALID_METHOD" || refusal === "E:HPE_INVALID_URL") && tags.includes("mut"),
 ];
 const parts = (v) => (v === "I" ? [] : v.split(" | "));
