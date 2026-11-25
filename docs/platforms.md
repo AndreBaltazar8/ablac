@@ -226,6 +226,16 @@ suite. [test-android-link.sh](../tools/test-android-link.sh) checks NDK imports;
 the Android system image's bionic linker under qemu-aarch64 and executes
 exports, heap, random and thread checks. This is runtime evidence, stronger
 than merely generating JNI/Gradle files, and weaker than an app/device run.
+[test-android-seccomp.sh](../tools/test-android-seccomp.sh) checks what qemu-user cannot: Android starts app processes under a seccomp
+filter and ends one that makes a call outside it with SIGSYS. The test builds five libraries (scalar, threaded, rich release and debug
+runtimes), finds every call of the library's AArch64 translator in its machine code with the constant x86-64 number passed, maps it through the
+translator's table and handlers to the AArch64 calls it makes, and requires each to be allowed to an app by the bionic policy of
+Android 8.0, 10, 12, 14 and 16 (API 26 to 36; the pinned files and how the policy is made are in
+[tests/data/android-seccomp](../tests/data/android-seccomp/README.md); API 24 and 25 have no app filter). The 16 distinct calls found
+(`clock_gettime close exit_group futex getpid gettid madvise mmap mremap munmap nanosleep openat process_vm_readv read sigaltstack write`)
+are all allowed. Two call sites in the debug stack printer take their number from a stack slot reloaded after a loop and are listed in
+[android-seccomp-unresolved.tsv](../tools/android-seccomp-unresolved.tsv). A control library that calls `setuid` must be rejected. This is
+the policy as published in AOSP, not a run on a device: vendor kernels and the Zygote's own filter setup are not covered.
 The manually dispatched `android-pointer-tags-control` job, **AArch64
 tagged-pointer positive and negative controls**, is additional optional evidence.
 

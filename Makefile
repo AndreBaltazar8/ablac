@@ -632,6 +632,7 @@ test-serial: ablac
 	tools/test-wasm-names.sh $(COMPILER)
 	tools/test-android-extension.sh $(COMPILER)
 	tools/test-android-link.sh $(COMPILER)
+	tools/test-android-seccomp.sh $(COMPILER)
 	tools/test-android-run.sh $(COMPILER)
 	tools/test-foreign-threads.sh $(COMPILER)
 	tools/test-valgrind.sh $(COMPILER)
