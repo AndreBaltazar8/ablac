@@ -20,7 +20,7 @@ const show = Number(process.argv[process.argv.indexOf("--show") + 1] || 10);
 // Findings are the unexplained ones and every "different".
 const known_rules = [
     (refusal, tags) => refusal === "E:HPE_UNEXPECTED_CONTENT_LENGTH" && tags.includes("mode-twocl"),
-    (refusal, tags, stream) => refusal === "E:HPE_INVALID_TRANSFER_ENCODING" && /chunked\t|\tchunked/.test(stream),
+    (refusal, tags, stream) => refusal === "E:HPE_INVALID_TRANSFER_ENCODING" && /chunked[ ]*\t|\t[ ]*chunked/.test(stream),
     (refusal, tags) => refusal === "E:HPE_STRICT" && tags.includes("ch-ext"),
     (refusal, tags) => (refusal === "E:HPE_INVALID_METHOD" || refusal === "E:HPE_INVALID_URL") && tags.includes("mut"),
 ];
