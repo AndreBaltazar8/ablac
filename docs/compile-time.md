@@ -557,6 +557,15 @@ The package a module belongs to is decided by where the module is, never by a ma
 Grants are per site. A dependency's `#` site that calls a function of a module the root owns is judged
 by the dependency's grants, because the effects the function reaches are counted at the site.
 
+Code that runs for one package does not borrow another's grants:
+
+- A subparser handler (`#compilerRegisterSubparser`) runs with the grants of the file that declares it, within what the file that uses the syntax
+  has: a dependency's handler gets the dependency's grants, not those of the root file that writes `$name ...`. A standard-library handler is
+  the root's.
+- A body a transform installs (`compiler.replaceFunctionBody`) may carry compile-time code (`#`, `$`) only when the transform's own grants
+  include those of the file the function is in; otherwise `E_COMPILER_TRANSFORM_GRANTS`. A body without such code is runtime code: a `#` site
+  of the function's own file that calls it runs what the transform wrote, with that site's grants (a transform that changes your functions is trusted with the grants of the sites that call them).
+
 The compiler works out which capabilities each function needs, transitively.
 The error names the whole call path, as in
 `compile.effect-denied:environment:readBuildEnvironment->compilerEnvironment`.
@@ -580,6 +589,32 @@ any C library, so it can open windows, use the GPU and audio, and open
 sockets, whatever the other grants say. A game client run under `#` reaches
 X11, Vulkan, ALSA and libcurl that way, by opening them with `dlopen`, and
 never asks for `network`.
+
+### What `trusted.native` grants
+
+`trusted.native` is permission to run code the compiler cannot contain: it is the one capability that is not a narrower slice of what a program may do,
+so it is held for as few packages as possible and never by default.
+
+- **At compile time**, the `#` sites, subparser handlers and transform handlers of a package that holds it run `trusted` functions and `extern`
+  declarations as a compiled program does: raw memory reads and writes, any C function of the compiler process (the C library, the libraries of
+  `nativeLibraries`, whatever `dlopen` loads), and raw system calls. That is arbitrary code in the compiler with the building user's authority:
+  it reads and writes any file that user can, starts any program, opens sockets and windows, and none of the other capabilities bound it
+  (`filesystem.*`, `environment`, `process.io`, `network`, the path containment of
+  [paths at compile time](#paths-at-compile-time) and the output limits of the providers do not apply to a native call).
+  A build with a native site is never taken from the native object cache.
+- **Who holds it**: the root's own code when `compileCapabilities` lists it; a dependency only by name, in the root's
+  `[dependencyCompileCapabilities]`, while `abla.lock` pins its content digest, and never beyond the root's own list; a dependency's own manifest and
+  its own `#compilerGrant` cannot give it. The standard library's own raw memory (a byte buffer it allocates and owns) is contained and asks for
+  nothing; the network scopes of `abla/tls/pure` and `abla/platform/host/tls` ask for `network` only.
+- **It is not lent.** Code that runs for a package runs with that package's grants, whichever file it stands in: a subparser handler runs with the
+  grants of the file that declares it, within those of the file that uses the syntax; a body a transform installs may carry compile-time code
+  (`#`, `$`) only if the transform's own grants cover the grants of the file the function is in. (A program a build call builds is its own
+  project, authorized by its own `abla.toml`: the code that builds it vouches for that tree.)
+- **At run time** it means nothing: a compiled program's `trusted` code runs as any program does, with no sandbox, and a program that is built needs
+  no compile capability to run. What `trusted.native` for a dependency also decides is whether the dependency may *define* `trusted` and `extern`
+  code at all ([packages.md](packages.md#trusted-and-extern-code-in-a-dependency)); that code then runs, unrestricted, in every program that links it.
+- **What it does not hide**: a native site's own raw system calls are not resolved or checked (the paths it opens are the ones it names), and the
+  statically linked compiler can call only the C functions its own C library exports.
 
 The `compiler*` providers come from `import "abla/compiler"`. Every relative
 path compile-time code names, for file operations and for build calls

@@ -558,6 +558,28 @@ fun bootstrapCompilerTransformTarget(
     ""
 }
 
+/** The refusal ("" when none) of a replacement body that carries compile-time code, a `#` expression or a `$` subparser form, for the
+ *  declaration at `handle`: such a site runs with the grants of the file the function lives in (the code stands in that file), so a
+ *  transform whose own grants are fewer (a dependency's handler changing the root's function) could lend itself the root's process.io,
+ *  network or trusted.native. A body without them is runtime code, which no grant lets run at compile time. */
+fun bootstrapReplacementBodyGrants(
+    evaluator: BootstrapEvaluator,
+    handle: int,
+    body: string
+): string {
+    if (handle < 0 || handle >= evaluator.declarations.size || !bootstrapTextContains(body, "#") && !bootstrapTextContains(body, "$")) return ""
+    var compileTime = false
+    for (token in bootstrapLexShared(body)) {
+        if (token.kind == BOOTSTRAP_TOKEN_HASH || token.kind == BOOTSTRAP_TOKEN_DOLLAR) compileTime = true
+    }
+    if (!compileTime) return ""
+    val declaration = evaluator.declarations[handle]
+    val target = ctNativeGrantsAt(declaration.sourceIdentity, evaluator.allowedCompileEffects)
+    val own = evaluator.allowedCompileEffects
+    if (target - (target & own) == 0) return ""
+    "error[E_COMPILER_TRANSFORM_GRANTS]: a body for `${declaration.name}` with compile-time code (`#` or `$`) would run with the grants of ${declaration.sourceIdentity}, which the transform that installs it does not have\n"
+}
+
 /** Whether compile-time code may change the declaration at `handle` (""), or
  *  why not: a standard library declaration not in the transform's own module
  *  needs the `transform.library` capability. Under ABLA_COMPILE_EVAL_TRACE=1
@@ -12212,6 +12234,14 @@ fun bootstrapEvaluateCallCompiler(
             )
             valid = library
         }
+        var grantsRefused = ""
+        if (valid) {
+            grantsRefused = bootstrapReplacementBodyGrants(evaluator, reflected.integer, body.text)
+            if (grantsRefused != "") {
+                valid = false
+                evaluator.diagnostics = "${evaluator.diagnostics}$grantsRefused"
+            }
+        }
         // From a `#` site while the program is lowered: an edit the next round
         // of lowering commits.
         if (valid && !bootstrapCompilerTransformActive && bootstrapCompileEditRound >= 0) {
@@ -12228,7 +12258,7 @@ fun bootstrapEvaluateCallCompiler(
         )
         if (valid) {
             result = bootstrapEvalBoolean(true)
-        } else if (refused != "") {
+        } else if (refused != "" || grantsRefused != "") {
             evaluator.errors = evaluator.errors + 1
             result = bootstrapEvalBoolean(false)
         } else if (!library) {
@@ -15204,8 +15234,16 @@ fun bootstrapInvokeSubparserHandlerIn(
     declarations: array<BootstrapDeclaration>,
     handler: string,
     cursor: BootstrapSubparserCursor,
-    allowedCompileEffects: int
+    siteCompileEffects: int
 ): BootstrapSubparserInvocation {
+    // The handler is its declaring package's code: it runs with what the file that declares it is granted, within what the using file has
+    // (a dependency's handler, used from the root's file, does not get the root's grants; a standard-library handler is the root's).
+    var allowedCompileEffects = siteCompileEffects
+    for (candidate in declarations) {
+        if (candidate.name == handler && candidate.extensionOwner == "" && candidate.kind == "compile.fun") {
+            allowedCompileEffects = allowedCompileEffects & ctNativeGrantsAt(candidate.sourceIdentity, siteCompileEffects)
+        }
+    }
     val stopsBefore = bootstrapEvalDepthStops
     val names: array<string> = ["cursor"]
     val values: array<BootstrapEvalValue> = [bootstrapEvalMake(
