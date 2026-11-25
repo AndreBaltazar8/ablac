@@ -8,6 +8,7 @@ import "edges.ab"
 import "rmsnorm.ab"
 import "q8.ab"
 import "exp.ab"
+import "pick4.ab"
 import "abla/kernel"
 import "abla/kernel/cuda"
 import "abla/float"
@@ -83,6 +84,23 @@ trusted fun main: int {
     var vaddEqual = true
     for (i in 0 until n) if (floatAt(gpu, i) != floatAt(cpu, i)) vaddEqual = false
     println("vadd: $n elements, GPU equal to CPU $vaddEqual")
+
+    // pick4 (an `if` choosing between two load4 results) over vadd's inputs: the same floats on both backends.
+    val quads = n / 4
+    val cpuPick = floats(quads) { i -> f32(0.0) }
+    val cpuPickBuffer = KernelF32Buffer(nativePointerAddress(cpuPick.address), quads)
+    kernelRunCpu((quads + 255) / 256, 256) { pick4(cpuA, cpuB, cpuPickBuffer, quads) }
+    val dp = device.allocate(quads * 4)
+    if (dp == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val gpuPick = floats(quads) { i -> f32(0.0) }
+    if (!device.launch("pick4", (quads + 255) / 256, 256, cudaKernelArguments().buffer(da.floats()).buffer(db.floats())
+        .buffer(dp.floats()).integer(quads)) || !device.download(dp, gpuPick)) {
+        println("kernel-cuda: pick4: ${device.error}")
+        return 1
+    }
+    var pickEqual = floatAt(cpuPick, 1) != floatAt(cpuPick, 0)
+    for (i in 0 until quads) if (floatAt(gpuPick, i) != floatAt(cpuPick, i)) pickEqual = false
+    println("pick4: $quads quads chosen by an if, GPU equal to CPU $pickEqual")
 
     // NVFP4 matvec: one subgroup per row on the GPU (8 warps per group), one thread per row on the CPU.
     val rows = 1000
@@ -260,5 +278,5 @@ trusted fun main: int {
     val expAgree = expWorst <= 2 && expNaN && expEnds
     println("kernelExp: $expCount values, GPU within $expWorst ulp of the CPU (at most 2), NaN, 0 and infinity at the ends: $expAgree")
     device.close()
-    if (vaddEqual && agree && untouched && edgesRight && normAgree && q8Agree && expAgree) 0 else 1
+    if (vaddEqual && pickEqual && agree && untouched && edgesRight && normAgree && q8Agree && expAgree) 0 else 1
 }
