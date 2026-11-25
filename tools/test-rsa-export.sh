@@ -10,9 +10,9 @@ chmod 700 "$out"
 sed -e 's/^private @noinline trusted fun rsaPrivateExportDer/trusted fun rsaPrivateExportDer/' \
     -e 's/^private @noinline trusted fun rsaPrivateExportPem/trusted fun rsaPrivateExportPem/' \
     -e 's/^private trusted fun rsaExportLimbs/trusted fun rsaExportLimbs/' \
-    "$root/stdlib/abla/crypto/rsa/entry.ab" | sed 's|^import "raw.ab"$|import "rsa-raw-copy.ab"|' > "$out/rsa-copy.ab"
+    "$root/stdlib/abla/crypto/rsa/entry.ab" | sed -e 's|^import "raw.ab"$|import "rsa-raw-copy.ab"|' -e 's|^import "../bignum/core.ab"$|import "abla/crypto/bignum/core.ab"|' > "$out/rsa-copy.ab"
 # The library's raw.ab names the real entry.ab's types: the copy of it names the copy of entry.ab.
-sed 's|^import "entry.ab"$|import "rsa-copy.ab"|' "$root/stdlib/abla/crypto/rsa/raw.ab" > "$out/rsa-raw-copy.ab"
+sed -e 's|^import "entry.ab"$|import "rsa-copy.ab"|' -e 's|^import "../bignum/core.ab"$|import "abla/crypto/bignum/core.ab"|' "$root/stdlib/abla/crypto/rsa/raw.ab" > "$out/rsa-raw-copy.ab"
 # The real module must not expose the export before key generation lands.
 cat > "$out/forbidden.ab" <<'ABLA'
 import "abla/crypto/rsa"
@@ -27,7 +27,7 @@ if "$compiler" build "$out/forbidden.ab" -o "$out/forbidden" --fast --no-cache >
 fi
 rg -q 'name.private:rsaPrivateExportDer|E_NAME_PRIVATE' "$out/forbidden.log"
 cp "$root/tests/cases/rsa-export/main.ab" "$out/main.ab"
-"$compiler" build "$out/main.ab" -o "$out/main" --fast --no-cache
+"$compiler" build "$out/main.ab" -o "$out/main" --fast --no-cache --stdlib-internals
 # This independent OpenSSL-format fixture already has a 2048-bit private key.
 cp "$root/tests/vectors/crypto/rsa-implicit-key.pem" "$out/input.pem"
 openssl rsa -in "$out/input.pem" -traditional -out "$out/traditional.pem" 2>/dev/null
