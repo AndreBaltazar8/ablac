@@ -1,0 +1,127 @@
+// Randomness and signing nonces (#1139 area 5 round 3):
+// 1. After fork, a parent and a child that draw random bytes get different ones, for every random source of the library (the system
+//    call, the crypto module's, an AEAD's nonce, a P-256 key, an ML-KEM key): no pool or generator is duplicated by the fork. The
+//    control is a provider that keeps a user-space generator (what a pool would be): the same test must see its bytes equal, or it
+//    proves nothing.
+// 2. ECDSA signing (P-256, P-384) never asks the random source: the nonce is RFC 6979's, so a failing, constant or zero source
+//    cannot make a fixed or zero k; and a source that gives zeros, a short answer or the group order never makes a private key.
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/aes"
+import "abla/crypto/p256"
+import "abla/crypto/p384"
+import "abla/crypto/mlkem"
+import "abla/crypto/rsa"
+import "abla/random"
+import "abla/text"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+var failures = 0
+var sourceCalls = 0
+var generatorState = 1
+fun check(ok: bool, what: string): void {
+    if (!ok) {
+        println("FAIL $what")
+        failures = failures + 1
+    }
+    return
+}
+
+// What `draw` gives in this process and in a child forked just before it, one after the other: the child writes its bytes to a pipe and
+// leaves with exit_group, the parent reads them after waiting for it.
+trusted fun forkDraw(draw: () -> string): array<string> {
+    val fds = nativeByteBuffer(16)
+    val piped = linuxSyscall2(293, nativePointerAddress(fds.address), 0)
+    val readEnd = ablaUnsafeLoadU32(fds.address)
+    val writeEnd = ablaUnsafeLoadU32(nativePointerFromAddress(nativePointerAddress(fds.address) + 4))
+    fds.close()
+    if (piped != 0) return []
+    val child = linuxSyscall0(57)
+    if (child == 0) {
+        val bytes = draw()
+        val out = nativeByteBuffer(bytes.size + 1)
+        for (index in 0 until bytes.size) ablaUnsafeStoreU8(nativePointerFromAddress(nativePointerAddress(out.address) + index), bytes[index])
+        linuxSyscall3(1, writeEnd, nativePointerAddress(out.address), bytes.size)
+        linuxSyscall1(231, 0)
+    }
+    val mine = draw()
+    val status = nativeByteBuffer(16)
+    linuxSyscall4(61, child, nativePointerAddress(status.address), 0, 0)
+    status.close()
+    linuxSyscall1(3, writeEnd)
+    val theirs = nativeByteBuffer(4097)
+    val count = linuxSyscall3(0, readEnd, nativePointerAddress(theirs.address), 4096)
+    linuxSyscall1(3, readEnd)
+    val childBytes = if (count > 0) theirs.adoptString(count) else ""
+    [mine, childBytes]
+}
+
+fun differs(name: string, draw: () -> string): void {
+    draw() // whatever the first use sets up (a lazily made buffer, a key schedule) exists before the fork
+    val pair = forkDraw(draw)
+    if (pair.size != 2 || pair[0].size == 0 || pair[1].size == 0) { check(false, "$name: no bytes from the parent or the child"); return }
+    check(pair[0] != pair[1], "$name: the parent and the child drew the same ${pair[0].size} bytes")
+}
+
+val aeadKey = "0123456789abcdef0123456789abcdef"
+
+fun main: int {
+    differs("secureRandomBytes") { secureRandomBytes(32).bytes }
+    differs("cryptoRandomBytes") { cryptoRandomBytes(32) }
+    differs("aesGcmSealRandom nonce") { aesGcmSealRandom(aeadKey, "m").bytes.slice(0, 12) }
+    differs("p256GeneratePrivateKey") { p256GeneratePrivateKey().bytes }
+    differs("mlkem768GenerateKey") { mlkem768GenerateKey().bytes.slice(0, 64) }
+
+    // 2. signing does not use the random source
+
+    cryptoSetRandom { count: int -> sourceCalls = sourceCalls + 1; "" }
+    val key256 = "\x00".repeat(31) + "\x07"
+    val key384 = "\x00".repeat(47) + "\x07"
+    val message = "message"
+    val sign256 = p256EcdsaSignRaw(key256, message)
+    val sign384 = p384EcdsaSignRaw(key384, message)
+    check(sign256.ok && sign256.bytes.size == 64, "P-256 signing with a failing random source: ok ${sign256.ok}")
+    check(sign384.ok && sign384.bytes.size == 96, "P-384 signing with a failing random source: ok ${sign384.ok}")
+    check(sourceCalls == 0, "ECDSA signing asked the random source $sourceCalls times")
+    check(p256EcdsaSignRaw(key256, message).bytes == sign256.bytes, "P-256 signing is not deterministic")
+    // the same signature as with the system source: the random source is not part of the nonce
+    cryptoSetRandom { count: int -> "\x11".repeat(count) }
+    check(p256EcdsaSignRaw(key256, message).bytes == sign256.bytes, "P-256: a constant random source changes the signature")
+    check(p384EcdsaSignRaw(key384, message).bytes == sign384.bytes, "P-384: a constant random source changes the signature")
+    // private keys outside 1..n-1 are refused, never signed with
+    check(!p256EcdsaSignRaw("\x00".repeat(32), message).ok, "P-256: a zero private key signed")
+    check(!p384EcdsaSignRaw("\x00".repeat(48), message).ok, "P-384: a zero private key signed")
+    check(!p256EcdsaSignRaw("\xff".repeat(32), message).ok, "P-256: a private key of 2^256-1 signed")
+
+    // 2. key generation with a source that gives zeros, the group order, a short answer or nothing: no key
+    cryptoSetRandom { count: int -> "\x00".repeat(count) }
+    check(!p256GeneratePrivateKey().ok, "P-256 key from an all-zero source")
+    cryptoSetRandom { count: int -> hexDecode("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551").slice(0, count) }
+    check(!p256GeneratePrivateKey().ok, "P-256 key from a source that always gives the group order")
+    cryptoSetRandom { count: int -> "\x01".repeat(count - 1) }
+    check(!p256GeneratePrivateKey().ok, "P-256 key from a source that answers short")
+    cryptoSetRandom { count: int -> "" }
+    check(!p256GeneratePrivateKey().ok && !mlkem768GenerateKey().ok, "a key from a failing random source")
+
+    // 1, control: a provider with a user-space generator, seeded once, is duplicated by a fork: the test must see the bytes equal
+    val digits = "0123456789abcdef"
+    val seed = secureRandomBytes(8).bytes
+    generatorState = 1
+    for (index in 0 until 8) generatorState = (generatorState << 8) | seed[index]
+    cryptoSetRandom { count: int ->
+        var hex = ""
+        for (index in 0 until count) {
+            generatorState = (generatorState * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+            val value = (generatorState >>> 33) & 255
+            hex = hex + digits.slice(value >>> 4, (value >>> 4) + 1) + digits.slice(value & 15, (value & 15) + 1)
+        }
+        hexDecode(hex)
+    }
+    val control = forkDraw { cryptoRandomBytes(32) }
+    check(control.size == 2 && control[0].size == 32 && control[1].size == 32, "the control did not run")
+    check(control.size == 2 && control[0] == control[1], "the control (a user-space generator) was not seen duplicated: the fork test would prove nothing")
+    if (failures == 0) println("rng safety ok")
+    if (failures == 0) 0 else 1
+}

@@ -687,6 +687,36 @@ fun hybridHello(share: string): string {
         [TLS_GROUP_X25519_MLKEM768], shares, [TLS_SIG_ED25519], [], "")
 }
 
+// The alert (-1: none) of a server offering only X25519 for a ClientHello whose X25519 share is `share`.
+fun alertForPlain(share: string, edIdentity: TlsIdentity): int {
+    val hello = tlsBuildClientHello(random(32), random(32), [TLS_SUITE_AES_128_GCM_SHA256], "localhost",
+        [TLS_GROUP_X25519], [TlsKeyShare(TLS_GROUP_X25519, share)], [TLS_SIG_ED25519], [], "")
+    var server = tlsServerNew(TlsServerConfig(edIdentity, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [],
+        random, false, false, acceptAny))
+    server.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, hello))
+    if (!server.failed()) return -1
+    alertOf(server.takeOutput())
+}
+
+// Points of small order on Curve25519 (RFC 7748 section 6.1 and the libsodium list): the shared secret with any scalar is all zero, which
+// the key exchange must refuse (RFC 8446 section 7.4.2: "implementations MUST check this"), whatever the encoding (the 2^255-19 and above
+// non-canonical ones, the top bit set).
+fun smallOrderPoints(): array<string> =
+    [hexDecode("0000000000000000000000000000000000000000000000000000000000000000"),
+     hexDecode("0100000000000000000000000000000000000000000000000000000000000000"),
+     hexDecode("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+     hexDecode("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+     hexDecode("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+     hexDecode("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+     hexDecode("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+     hexDecode("0000000000000000000000000000000000000000000000000000000000000080"),
+     hexDecode("0100000000000000000000000000000000000000000000000000000000000080"),
+     hexDecode("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b880"),
+     hexDecode("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7"),
+     hexDecode("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+     hexDecode("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+     hexDecode("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")]
+
 fun alertFor(share: string, edIdentity: TlsIdentity): int {
     var server = tlsServerNew(TlsServerConfig(edIdentity, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519_MLKEM768], [],
         random, false, false, acceptAny))
@@ -780,6 +810,16 @@ fun keyExchanges(directory: string): void {
     if (alertFor(share + "\x00", ed) != 47) fail("a 1217-byte hybrid share: alert ${alertFor(share + "\x00", ed)}")
     // An X25519 part that is a point of small order (all zero): the secret is all zero, so illegal_parameter.
     if (alertFor(share.slice(0, 1184) + "\x00".repeat(32), ed) != 47) fail("an all-zero X25519 part")
+    // The plain X25519 group (a server for it alone, and the library's own agree on the client's side): every point of small order is
+    // illegal_parameter, a good share is not.
+    val plainPair = tlsGenerateKeyPair(TLS_GROUP_X25519, random) ?? return
+    if (alertForPlain(plainPair.publicKey, ed) != -1) fail("a good X25519 share was refused: alert ${alertForPlain(plainPair.publicKey, ed)}")
+    var plainIndex = 0
+    for (point in smallOrderPoints()) {
+        if (alertForPlain(point, ed) != 47) fail("X25519 small-order point $plainIndex (server): alert ${alertForPlain(point, ed)}")
+        if (tlsAgree(plainPair, point).ok) fail("X25519 small-order point $plainIndex (client side): the agreement is ok")
+        plainIndex = plainIndex + 1
+    }
     // A group's share of the wrong size for its group.
     if (alertFor("\x01".repeat(65), ed) != 47) fail("a 65-byte share for the hybrid")
     // The client's side (section 4.2 again): a server share of the wrong length, and an X25519 part of small order, are

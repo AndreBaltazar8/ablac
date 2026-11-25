@@ -28,7 +28,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more wycheproof-hashes aead-random heap-residue signatures sha3 mlkem p384 wipe-views)
+programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more wycheproof-hashes aead-random rng-safety heap-residue signatures sha3 mlkem p384 wipe-views)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -78,6 +78,14 @@ if "$out/aead-random" > "$out/aead-random.log" 2>&1 && grep -q '^aead random ok$
     echo "ok   aead with random nonces"
 else
     fail aead-random; tail -20 "$out/aead-random.log"
+fi
+
+# Randomness after a fork and ECDSA nonces (tests/cases/crypto-pure/rng-safety.ab): a forked child and its parent draw different bytes from every source of the
+# library (the control, a user-space generator, must be seen duplicated); signing never asks the random source; no private key from a zero, order or failing source.
+if "$out/rng-safety" > "$out/rng-safety.log" 2>&1 && grep -q '^rng safety ok$' "$out/rng-safety.log"; then
+    echo "ok   randomness after fork, ECDSA signing without the random source"
+else
+    fail rng-safety; tail -20 "$out/rng-safety.log"
 fi
 
 # Key residue in the heap (tests/cases/crypto-pure/heap-residue.ab): after an operation with a key, the caller's own copy wiped and two collections, no window of the key (or of the
