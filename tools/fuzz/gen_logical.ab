@@ -1,0 +1,210 @@
+// logical_assign_check (#648, decision #147 A): `&&=` and `||=` on mutable Boolean locals and ordinary fields. Every
+// right-hand side logs what it evaluates, so a mode that evaluates it when it should not (or skips it when it should
+// not) prints a different log. The places are locals, fields of locals, a field reached through a receiver that logs
+// when it is evaluated (a call and an array index: the receiver must be evaluated exactly once, before the read), a
+// field two levels deep, and `this.flag`/`this.box.flag` in methods. Assignments are also used as values: in an `if`
+// condition, as a call argument, nested inside another assignment's right-hand side (the same place or another), and
+// repeated in a loop. The generator evaluates the same tree and the check compares its log and final state with that.
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+
+/** An expression tree. kind: "f" (laF(k, v): logs f<k>, gives v), "and", "or", "not", "read" (a place), "set" (`place
+ *  op= rhs`), "method" (a box method that does `this.flag op= laF(k, v)`, or the holder's on `this.box.flag`). */
+class LaNode(val kind: string, val k: int, val v: bool, val place: LaPlace, val op: string, val kids: array<LaNode>)
+
+/** A place: `slot` is the Boolean it names in the state (0-2 locals l0..l2, 3-4 b0/b1.flag, 5 h.box.flag, 6-8
+ *  bs[0..2].flag); `receiver` is "plain", "pick" (h.fresh(k).flag: a new box, flag k odd, stored as h.box) or "index" (bs[laIdx<i>(k, j)].flag). */
+class LaPlace(val slot: int, val receiver: string, val k: int)
+
+class LaState(val values: array<bool>, val log: array<string>)
+
+/** The place of a node that has none. */
+val LA_NO_PLACE = LaPlace(0, "plain", 0)
+val LA_PLAIN_TEXT: array<string> = ["l0", "l1", "l2", "b0.flag", "b1.flag", "h.box.flag"]
+
+fun laBool(value: bool): string = if (value) "true" else "false"
+
+/** A place; `fixed`: no `h.fresh` (under an assignment to h.box.flag, which already holds the box it writes: a fresh box there would make
+ *  h.box another object than the one written, which the slot model cannot say). */
+fun FuzzGen.laPlace(var counter: array<int>, fixed: bool): LaPlace {
+    val kind = this.r.below(10)
+    if (kind < 4) return LaPlace(this.r.below(3), "plain", 0)
+    if (kind < 6 || (kind < 8 && fixed)) return LaPlace(3 + this.r.below(3), "plain", 0)
+    counter[0] = counter[0] + 1
+    if (kind < 8) return LaPlace(5, "pick", counter[0])
+    LaPlace(6 + this.r.below(3), "index", counter[0])
+}
+
+fun FuzzGen.laNode(depth: int, var counter: array<int>, fixed: bool): LaNode {
+    val kind = if (depth <= 0) this.r.below(2) else this.r.below(9)
+    if (kind == 0 || kind == 2) {
+        counter[0] = counter[0] + 1
+        return LaNode("f", counter[0], this.r.chance(0.5), LA_NO_PLACE, "", [])
+    }
+    if (kind == 1) return LaNode("read", 0, false, this.laPlace(counter, fixed), "", [])
+    if (kind == 3) return LaNode("and", 0, false, LA_NO_PLACE, "", [this.laNode(depth - 1, counter, fixed), this.laNode(depth - 1, counter, fixed)])
+    if (kind == 4) return LaNode("or", 0, false, LA_NO_PLACE, "", [this.laNode(depth - 1, counter, fixed), this.laNode(depth - 1, counter, fixed)])
+    if (kind == 5) return LaNode("not", 0, false, LA_NO_PLACE, "", [this.laNode(depth - 1, counter, fixed)])
+    if (kind == 6) {
+        counter[0] = counter[0] + 1
+        // a box method (slot 3 or 4) or the holder's (slot 5)
+        return LaNode("method", counter[0], this.r.chance(0.5), LaPlace(3 + this.r.below(3), "plain", 0),
+            this.r.pick(["&&=", "||="]), [])
+    }
+    this.laSet(depth - 1, counter, fixed)
+}
+
+fun FuzzGen.laSet(depth: int, var counter: array<int>, fixed: bool): LaNode {
+    val place = this.laPlace(counter, fixed)
+    LaNode("set", 0, false, place, this.r.pick(["&&=", "||="]), [this.laNode(depth, counter, fixed || place.slot == 5)])
+}
+
+fun laPlaceText(place: LaPlace, index: int): string {
+    if (place.receiver == "pick") return "h.fresh(${place.k}).flag"
+    if (place.receiver == "index") return "bs[laIdx${index}(${place.k}, ${place.slot - 6})].flag"
+    LA_PLAIN_TEXT[place.slot]
+}
+
+fun laText(node: LaNode, index: int): string {
+    val kind = node.kind
+    if (kind == "f") return "laF${index}(${node.k}, ${laBool(node.v)})"
+    if (kind == "read") return laPlaceText(node.place, index)
+    if (kind == "and") return "(${laText(node.kids[0], index)} && ${laText(node.kids[1], index)})"
+    if (kind == "or") return "(${laText(node.kids[0], index)} || ${laText(node.kids[1], index)})"
+    if (kind == "not") return "!${laText(node.kids[0], index)}"
+    if (kind == "method") {
+        val name = if (node.op == "&&=") "andF" else "orF"
+        val receiver = if (node.place.slot == 5) "h" else "b${node.place.slot - 3}"
+        return "${receiver}.${name}(${node.k}, ${laBool(node.v)})"
+    }
+    "(${laPlaceText(node.place, index)} ${node.op} ${laText(node.kids[0], index)})"
+}
+
+/** Evaluates a place's receiver (its log) and gives the slot. */
+fun laReceiver(place: LaPlace, var state: LaState): int {
+    if (place.receiver == "pick") {
+        state.log.append("p${place.k}")
+        state.values[5] = place.k % 2 == 1
+    }
+    if (place.receiver == "index") state.log.append("i${place.k}")
+    place.slot
+}
+
+fun laEval(node: LaNode, var state: LaState): bool {
+    val kind = node.kind
+    if (kind == "f") {
+        state.log.append("f${node.k}")
+        return node.v
+    }
+    if (kind == "read") return state.values[laReceiver(node.place, state)]
+    if (kind == "and") return laEval(node.kids[0], state) && laEval(node.kids[1], state)
+    if (kind == "or") return laEval(node.kids[0], state) || laEval(node.kids[1], state)
+    if (kind == "not") return !laEval(node.kids[0], state)
+    val slot = if (kind == "method") node.place.slot else laReceiver(node.place, state)
+    val old = state.values[slot]
+    if ((node.op == "&&=") != old) return old
+    val value = if (kind == "method") {
+        state.log.append("f${node.k}")
+        node.v
+    } else laEval(node.kids[0], state)
+    state.values[slot] = value
+    value
+}
+
+fun FuzzGen.logicalAssignCheck(index: int): FuzzCheck {
+    val box = "LaBox$index"
+    val hold = "LaHold$index"
+    val lines: array<string> = [
+        "val laLog$index: array<string> = []",
+        "fun laF${index}(k: int, v: bool): bool {",
+        "    laLog$index.append(\"f\$k\")",
+        "    v",
+        "}",
+        "class $box(var flag: bool) {",
+        "    fun andF(k: int, v: bool): bool = (this.flag &&= laF${index}(k, v))",
+        "    fun orF(k: int, v: bool): bool = (this.flag ||= laF${index}(k, v))",
+        "}",
+        "class $hold(var box: $box) {",
+        "    fun andF(k: int, v: bool): bool = (this.box.flag &&= laF${index}(k, v))",
+        "    fun orF(k: int, v: bool): bool = (this.box.flag ||= laF${index}(k, v))",
+        "    fun fresh(k: int): $box {",
+        "        laLog$index.append(\"p\$k\")",
+        "        val created = $box(k % 2 == 1)",
+        "        this.box = created",
+        "        created",
+        "    }",
+        "}",
+        "fun laIdx${index}(k: int, j: int): int {",
+        "    laLog$index.append(\"i\$k\")",
+        "    j",
+        "}",
+        "fun laNote${index}(k: int, v: bool): void {",
+        "    laLog$index.append(if (v) \"t\$k\" else \"e\$k\")",
+        "}",
+        "fun laBits${index}(values: array<bool>): string {",
+        "    var out = \"\"",
+        "    for (v in values) out = out + (if (v) \"1\" else \"0\")",
+        "    out",
+        "}",
+        "fun c${index}(): string {"]
+    val values: array<bool> = []
+    for (slot in 0 until 9) values.append(this.r.chance(0.5))
+    val state = LaState(values, [])
+    lines.append("    var l0 = ${laBool(values[0])}")
+    lines.append("    var l1 = ${laBool(values[1])}")
+    lines.append("    var l2 = ${laBool(values[2])}")
+    lines.append("    val b0 = $box(${laBool(values[3])})")
+    lines.append("    val b1 = $box(${laBool(values[4])})")
+    lines.append("    val h = $hold($box(${laBool(values[5])}))")
+    lines.append("    val bs = [$box(${laBool(values[6])}), $box(${laBool(values[7])}), $box(${laBool(values[8])})]")
+    // laF/laPick/laIdx numbers and laNote numbers: one counter, so every log entry names its call site
+    val counter = [0]
+    val statements = this.r.range(3, 8)
+    for (statement in 0 until statements) {
+        val form = this.r.below(6)
+        val node = this.laSet(this.r.range(0, 2), counter, false)
+        val text = laText(node, index)
+        if (form <= 1) {
+            lines.append("    $text")
+            laEval(node, state)
+        } else if (form == 2) {
+            counter[0] = counter[0] + 1
+            lines.append("    if ($text) laNote${index}(${counter[0]}, true) else laNote${index}(${counter[0]}, false)")
+            val taken = laEval(node, state)
+            state.log.append(if (taken) "t${counter[0]}" else "e${counter[0]}")
+        } else if (form == 3) {
+            counter[0] = counter[0] + 1
+            lines.append("    laNote${index}(${counter[0]}, $text)")
+            val value = laEval(node, state)
+            state.log.append(if (value) "t${counter[0]}" else "e${counter[0]}")
+        } else if (form == 4) {
+            val times = this.r.range(2, 3)
+            lines.append("    for (rep in 0 until $times) $text")
+            for (rep in 0 until times) laEval(node, state)
+        } else {
+            // a while loop whose condition is the assignment; bounded by a counter that is checked first
+            val bound = this.r.range(1, 3)
+            counter[0] = counter[0] + 1
+            val n = counter[0]
+            lines.append("    var w$n = 0")
+            lines.append("    while (w$n < $bound && $text) {")
+            lines.append("        w$n += 1")
+            lines.append("        laNote${index}($n, true)")
+            lines.append("    }")
+            var w = 0
+            while (w < bound && laEval(node, state)) {
+                w = w + 1
+                state.log.append("t$n")
+            }
+        }
+    }
+    var bits = ""
+    for (v in state.values) bits = bits + (if (v) "1" else "0")
+    val expected = textJoin(state.log, ",") + ":" + bits
+    lines.append("    val actual = textJoin(laLog$index, \",\") + \":\" + laBits${index}([l0, l1, l2, b0.flag, b1.flag, h.box.flag, bs[0].flag, bs[1].flag, bs[2].flag])")
+    lines.append("    if (actual != \"$expected\") return \"FUZZ_ORACLE_FAILURE:\" + actual")
+    lines.append("    actual")
+    lines.append("}")
+    FuzzCheck(lines, "c${index}()", "str", index)
+}

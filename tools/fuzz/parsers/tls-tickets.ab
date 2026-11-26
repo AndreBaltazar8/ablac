@@ -1,0 +1,177 @@
+// TLS session ticket keys (abla/tls/pure/resume: tlsTicketKeysNew) against a model of their rotation and expiry (#648 on #1139 area 3 round 7). One store per
+// seed with a random lifetime (including the clamped 0 and over-seven-days values), rotateAfter (the 24-hour default, 0, small) and maximumSeals; then a
+// random run of clock steps (often to the edges: lifetime and rotateAfter minus one, exactly, plus one), seals, explicit rotations and opens. The model
+// says which key seals each ticket (the key name is the first 16 bytes of a ticket): a new key when the current one is rotateAfter old or has sealed
+// maximumSeals tickets, or after `rotate`; and which keys still open tickets: a retired key until a seal or rotation finds the clock past retired +
+// lifetime. Per input:
+//   1 a seal uses the key the model expects (a new name exactly when a new key is due);
+//   2 an earlier ticket opens exactly when the model keeps its key, with the suite, issue time, ticket_age_add, PSK, ALPN and server name it was sealed
+//     with; in particular a ticket younger than its lifetime always opens (docs/tls.md: the retired key opens its tickets until they expire);
+//   3 a damaged ticket (one to four mutations, a flipped bit, truncation, another ticket's name) never opens unless it is byte for byte a ticket.
+//
+//   tools/fuzz/parsers/run tls-tickets --seeds 1-200 [--inputs 200]
+import "abla/io"
+import "abla/text"
+import "abla/integer"
+import "abla/bytes"
+import "abla/tls/pure/resume"
+import "abla/process/arguments"
+import "../prng.ab"
+import "./mutate.ab"
+
+var ticketClock = 1900000000
+var ticketRandom = prngSeeded(1)
+
+fun ticketNow(): int = ticketClock
+
+fun ticketBytes(count: int): string = mutateBytes(ticketRandom, count)
+
+/** A key of the model: its name once a ticket showed it ("" before), when it was made and retired (0: current), and whether it is gone. */
+class TicketModelKey(var name: string, val created: int, var retired: int, var dropped: bool)
+
+class TicketSealed(val ticket: string, val suite: int, val issued: int, val ageAdd: int, val psk: string, val alpn: string, val serverName: string,
+    val key: int)
+
+/** Every key the store made, in order (the last is the current one); a key is an index into `keys`. */
+class TicketModel(var keys: array<TicketModelKey>, var sealed: int, val lifetime: int, val rotateAfter: int, val maximumSeals: int)
+
+fun TicketModel.expire(at: int): void {
+    for (i in 0 until this.keys.size) {
+        if (this.keys[i].retired != 0 && at > this.keys[i].retired + this.lifetime) this.keys[i].dropped = true
+    }
+}
+
+fun TicketModel.rotate(at: int): void {
+    this.keys[this.keys.size - 1].retired = at
+    this.keys.append(TicketModelKey("", at, 0, false))
+    this.sealed = 0
+    this.expire(at)
+}
+
+/** The key the model expects the next seal at `at` to use. */
+fun TicketModel.seal(at: int): int {
+    if (this.rotateAfter > 0 && at - this.keys[this.keys.size - 1].created >= this.rotateAfter) this.rotate(at)
+    if (this.sealed >= this.maximumSeals) this.rotate(at)
+    this.expire(at)
+    this.sealed = this.sealed + 1
+    this.keys.size - 1
+}
+
+fun ticketState(state: TlsTicketState, sealed: TicketSealed): string {
+    if (!state.ok) return "did not open"
+    if (state.suite != sealed.suite || state.issued != sealed.issued || state.ageAdd != sealed.ageAdd || state.psk != sealed.psk || state.alpn != sealed.alpn ||
+        state.serverName != sealed.serverName) return "opened with other contents (suite ${state.suite}, issued ${state.issued}, ageAdd ${state.ageAdd})"
+    ""
+}
+
+fun ticketRun(seed: int, inputs: int, verbose: bool): string {
+    var r = prngSeeded(seed)
+    ticketRandom = prngSeeded(seed + 1000000007)
+    ticketClock = 1900000000 + r.below(100000)
+    val lifetimes = [1, 2, 60, 7200, 604800, 0, -5, 999999]
+    val asked = lifetimes[r.below(lifetimes.size)]
+    val lifetime = if (asked < 1) 1 else if (asked > 604800) 604800 else asked
+    val rotateKind = r.below(4)
+    val rotateAfter = if (rotateKind == 0) 86400 else if (rotateKind == 1) 0 else if (rotateKind == 2) 1 + r.below(10) else 1 + r.below(100000)
+    val seals = [1, 2, 3, 1000, 16777216]
+    val maximumSeals = seals[r.below(seals.size)]
+    // The default arguments when the draw is the default, so the 24-hour default itself is what the store gets.
+    val keys = if (rotateKind == 0 && maximumSeals == 16777216) tlsTicketKeysNew(ticketBytes, ticketNow, asked)
+        else tlsTicketKeysNew(ticketBytes, ticketNow, asked, 1, rotateAfter, maximumSeals)
+    val model = TicketModel([TicketModelKey("", ticketClock, 0, false)], 0, lifetime, rotateAfter, maximumSeals)
+    if (keys.lifetime != lifetime) return "lifetime $asked became ${keys.lifetime}, not $lifetime"
+    val sealed: array<TicketSealed> = []
+    val setup = "lifetime $asked rotateAfter $rotateAfter maximumSeals $maximumSeals"
+    for (n in 0 until inputs) {
+        val kind = r.below(10)
+        if (verbose) println("input seed=$seed n=$n kind=$kind clock=$ticketClock $setup")
+        if (kind < 3) {
+            val steps = [0, 1, lifetime - 1, lifetime, lifetime + 1, rotateAfter - 1, rotateAfter, rotateAfter + 1, r.below(100000), r.below(10)]
+            val step = steps[r.below(steps.size)]
+            if (step > 0) ticketClock = ticketClock + step
+        } else if (kind < 6) {
+            val key = model.seal(ticketClock)
+            val psk = mutateBytes(r, 32 + r.below(2) * 16)
+            val alpn = r.pick(["", "h2", "http/1.1"])
+            val serverName = r.pick(["", "example.com", "a.example"])
+            val suite = r.pickInt([4865, 4866, 4867])
+            val ageAdd = r.below(4294967296)
+            val ticket = keys.seal(suite, ageAdd, psk, alpn, serverName)
+            if (ticket.size < 60) return "seal $n: no ticket ($setup)"
+            val name = ticket.slice(0, 16)
+            if (model.keys[key].name == "") {
+                for (other in sealed) {
+                    if (model.keys[other.key].name == name) return "seal $n at $ticketClock: a new key was due, the ticket is under an older key's name ($setup)"
+                }
+                model.keys[key].name = name
+            } else if (model.keys[key].name != name) return "seal $n at $ticketClock: the ticket is under a new key; the model's key (created ${model.keys[key].created}) was not due ($setup)"
+            sealed.append(TicketSealed(ticket, suite, ticketClock, ageAdd, psk, alpn, serverName, key))
+        } else if (kind == 6) {
+            if (!keys.rotate()) return "rotate $n failed"
+            model.rotate(ticketClock)
+        } else if (kind < 9 && sealed.size > 0) {
+            val one = sealed[r.below(sealed.size)]
+            val state = keys.open(one.ticket)
+            val problem = ticketState(state, one)
+            val young = ticketClock - one.issued <= lifetime
+            if (model.keys[one.key].dropped) {
+                if (state.ok) return "open $n at $ticketClock: a ticket issued at ${one.issued} opened though its key retired at ${model.keys[one.key].retired} is past the lifetime ($setup)"
+            } else if (problem != "") return "open $n at $ticketClock: a ticket issued at ${one.issued} (key retired at ${model.keys[one.key].retired}, young $young) $problem ($setup)"
+        } else if (sealed.size > 0) {
+            val one = sealed[r.below(sealed.size)]
+            val damageKind = r.below(4)
+            var damaged = one.ticket
+            if (damageKind == 0) damaged = mutate(r, damaged)
+            else if (damageKind == 1) {
+                val at = r.below(damaged.size)
+                val bit = 1 << r.below(8)
+                val buffer = byteBuffer()
+                for (i in 0 until damaged.size) buffer.appendByteValue(if (i == at) (damaged[i] ^ bit) & 255 else damaged[i])
+                damaged = buffer.toText()
+            } else if (damageKind == 2) damaged = damaged.slice(0, r.below(damaged.size))
+            else {
+                val other = sealed[r.below(sealed.size)]
+                damaged = other.ticket.slice(0, 16) + damaged.slice(16, damaged.size)
+            }
+            var known = false
+            for (each in sealed) {
+                if (each.ticket == damaged) known = true
+            }
+            if (!known && keys.open(damaged).ok) return "open $n: a damaged ticket opened: ${mutateEscape(damaged)} ($setup)"
+        }
+    }
+    ""
+}
+
+fun main: int {
+    var low = 1
+    var high = 50
+    var inputs = 200
+    var verbose = false
+    val count = processArgumentCount()
+    var index = 0
+    while (index < count) {
+        val argument = processArgument(index)
+        val value = if (index + 1 < count) processArgument(index + 1) else ""
+        if (argument == "--seeds") {
+            val dash = value.indexOf("-")
+            low = (if (dash < 0) value else value.slice(0, dash)).parseInt() ?? 1
+            high = (if (dash < 0) value else value.slice(dash + 1, value.size)).parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--inputs") {
+            inputs = value.parseInt() ?? 1
+            index = index + 1
+        } else if (argument == "--verbose") verbose = true
+        index = index + 1
+    }
+    var findings = 0
+    for (seed in low until high + 1) {
+        val problem = ticketRun(seed, inputs, verbose)
+        if (problem != "") {
+            println("FINDING seed=$seed: $problem")
+            findings = findings + 1
+        }
+    }
+    println("tls-tickets: seeds $low-$high, $inputs inputs each, $findings findings")
+    if (findings == 0) 0 else 1
+}
