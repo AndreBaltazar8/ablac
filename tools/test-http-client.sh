@@ -58,4 +58,12 @@ status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
 
-printf '%s\n' 'HTTP client: bounded raw IPv4 exchange + pluggable TLS transport passed'
+# Request splitting: a request part with a CR LF or another control byte is refused before anything is written (tests/cases/http-client-split).
+"$compiler" build "$project_root/tests/cases/http-client-split/main.ab" -o "$output_directory/split" --fast
+set +e
+"$project_root/tools/run-limited.sh" "$output_directory/split"
+status=$?
+set -e
+[[ $status -eq 42 ]] || exit 1
+
+printf '%s\n' 'HTTP client: bounded raw IPv4 exchange + pluggable TLS transport + request parts checked passed'

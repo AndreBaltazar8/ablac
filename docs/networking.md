@@ -409,6 +409,17 @@ http.step(0)
 val replies = http.takeCompletions()
 ```
 
+The clients write a request's parts as they are, so they refuse parts that would
+change its meaning on the wire before anything is connected or sent: a method that
+is not a token, a target (path and query) with a space or a control byte, a host
+with a space, comma or control byte, a header name that is not a token, and a
+header value with a control byte other than tab (a CR LF from a program's input
+would start another header or another request). `HttpClient.send` returns a
+failed result whose `error` names the part, `HttpAsyncClient` completes the
+request with that error, `H2Client.request` returns -1, and the WebSocket TLS
+client's connection is closed. Percent-encode user input that goes into a path or
+a query (`percentEncode`) rather than relying on this check.
+
 #### HTTP/2
 
 `HttpAsyncOptions` offers `h2` and `http/1.1` by ALPN on every `https://` connection (`http2` is **on by default**); when the server picks `h2` the connection speaks HTTP/2

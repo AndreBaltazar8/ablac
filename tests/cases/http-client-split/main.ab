@@ -1,0 +1,78 @@
+// Request splitting in the clients (#1139 area 4, round 7): a method that is not a token, a target with a space or a control byte, a host that is not a
+// host, a header name that is not a token or a header value with a control byte (a CR LF in a path or a header value from a program's input would start
+// another header or another request) is refused before anything is written, by HttpClient.send (its transport is never called; the result names the
+// part), by HttpAsyncClient.request (the completion's error names it; nothing is connected), and by H2Client.request (-1, nothing queued). Requests with
+// ordinary parts still go out. Exits 42.
+import "abla/io"
+import "abla/http"
+import "abla/http/async"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+
+var transportCalls = 0
+var failures = 0
+
+fun expect(cond: bool, what: string): void {
+    if (!cond) {
+        failures = failures + 1
+        println("FAIL $what")
+    }
+    return
+}
+
+fun counting(request: string, maximum: int, timeout: int): HttpTransportResult {
+    transportCalls = transportCalls + 1
+    HttpTransportResult("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", true)
+}
+
+fun main: int {
+    val client = httpClient("good.example", counting)
+    val ok = client.send(HttpRequest("GET", "/a", "x=1", [HttpHeader("X-User", "bob\tsmith")], "", [], []))
+    expect(ok.succeeded && ok.response.status == 204 && transportCalls == 1, "an ordinary request is sent: ${ok.response.status}, $transportCalls calls")
+    // Each bad part: refused, the transport not called, the part named (and its value not echoed).
+    val method = client.send(HttpRequest("GET /x HTTP/1.1\r\n", "/a", "", [], "", [], []))
+    val target = client.send(HttpRequest("GET", "/a HTTP/1.1\r\nHost: evil\r\n\r\nGET /admin", "", [], "", [], []))
+    val query = client.send(HttpRequest("GET", "/a", "q=1 HTTP/1.1\r\nX: y", [], "", [], []))
+    val name = client.send(HttpRequest("GET", "/a", "", [HttpHeader("X-User:\r\nX-Admin", "1")], "", [], []))
+    val value = client.send(HttpRequest("GET", "/a", "", [HttpHeader("X-User", "bob\r\nX-Admin: 1")], "", [], []))
+    val nul = client.send(HttpRequest("GET", "/a", "", [HttpHeader("X-User", "bob\u{0}")], "", [], []))
+    expect(transportCalls == 1, "a bad request reached the transport: $transportCalls calls")
+    expect(!method.succeeded && method.error == "the method is not a token", "method: '${method.error}'")
+    expect(!target.succeeded && target.error == "the target has a space or a control byte", "target: '${target.error}'")
+    expect(!query.succeeded && query.error == "the target has a space or a control byte", "query: '${query.error}'")
+    expect(!name.succeeded && name.error == "a header name is not a token", "header name: '${name.error}'")
+    expect(!value.succeeded && value.error == "a header value has a control byte", "header value: '${value.error}'")
+    expect(!nul.succeeded && nul.error == "a header value has a control byte", "NUL in a value: '${nul.error}'")
+    val splitting = httpClient("good.example\r\nX-Admin: 1", counting).send(HttpRequest("GET", "/", "", [], "", [], []))
+    expect(!splitting.succeeded && transportCalls == 1, "a host with CR LF was sent")
+    expect(HttpRequest("GET", "/a b", "", [], "", [], []).renderForClient("good.example") == "", "renderForClient renders a target with a space")
+
+    // The async client: refused at once, with the part named, nothing connected (port 9 on loopback would refuse a connection: another error).
+    var http = httpAsyncClient()
+    val first = http.request("GET", "http://127.0.0.1:9/a", [HttpHeader("X-User", "bob\r\nX-Admin: 1")])
+    val second = http.request("GET", "http://127.0.0.1:9/a b", [])
+    val third = http.request("GE T", "http://127.0.0.1:9/a", [])
+    var errors = ""
+    for (done in http.takeCompletions()) errors = "$errors${done.id}:${done.error};"
+    expect(errors == "$first:a header value has a control byte;$second:the target has a space or a control byte;$third:the method is not a token;",
+        "async refusals: $errors")
+
+    // The HTTP/2 client: -1 and nothing queued.
+    var h2 = h2ClientNew()
+    h2.takeOutput()
+    h2.feed(h2Frame(4, 0, 0, ""), 0)
+    h2.takeOutput()
+    val badValue = h2.request("GET", "https", "good.example", "/a", [HpackField("x-user", "bob\r\nx-admin: 1", false)], "")
+    val badPath = h2.request("GET", "https", "good.example", "/a b", [], "")
+    val badAuthority = h2.request("GET", "https", "good.example\r\n", "/a", [], "")
+    val badMethod = h2.request("G T", "https", "good.example", "/a", [], "")
+    expect(badValue == -1 && badPath == -1 && badAuthority == -1 && badMethod == -1 && h2.takeOutput() == "",
+        "h2 refusals: $badValue $badPath $badAuthority $badMethod")
+    val good = h2.request("GET", "https", "good.example", "/a", [HpackField("X-User", "bob", false)], "")
+    expect(good > 0 && h2.takeOutput() != "", "an ordinary h2 request: $good")
+    if (failures == 0) {
+        println("http client split ok")
+        return 42
+    }
+    1
+}

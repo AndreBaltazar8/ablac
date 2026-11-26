@@ -56,7 +56,9 @@ class HttpTransportResult(
 class HttpClientResult(
     val response: HttpResponse,
     val succeeded: bool,
-    val complete: bool
+    val complete: bool,
+    // Why the request was not sent (httpClientRequestError names the part), "" otherwise.
+    val error: string = ""
 )
 
 // Holds decoded body bytes and consumed input length, with separate flags for a complete and a valid chunk stream.
@@ -389,9 +391,11 @@ fun HttpResponse.render(): string = "${this.renderHeaders()}\r\n${this.body}"
 fun HttpResponse.renderHead(): string = "${this.renderHeaders()}\r\n"
 
 // Serializes an HTTP/1.1 request and body. Uses `authority` for Host when absent and fills missing Content-Length and Connection headers.
+// Returns "" for a request whose parts cannot be sent as they are (httpClientRequestError): nothing of it is written.
 fun HttpRequest.renderForClient(authority: string): string {
     var target = this.path
     if (this.query != "") target = "$target?${this.query}"
+    if (httpClientRequestError(this.method, target, authority, this.headers) != "") return ""
     var output = "${this.method} $target HTTP/1.1\r\n"
     var hasHost = false
     var hasLength = false
@@ -529,6 +533,32 @@ private fun httpHostValueValid(value: string): bool {
         index = index + 1
     }
     valid
+}
+
+/** Why the clients refuse to send a request with these parts, or "" when they may: a method that is not a token, a target with a space or a
+ *  control byte, a host that is not a host, a header name that is not a token, or a header value with a control byte other than tab. Each of
+ *  these would be written to the wire as it is (a CR LF in a path or a header value from a program's input would start another header or
+ *  another request: request splitting); they are what this library's servers refuse. */
+fun httpClientRequestError(method: string, target: string, host: string, headers: array<HttpHeader>): string {
+    if (method.size == 0) return "the method is empty"
+    for (i in 0 until method.size) {
+        if (!httpTokenByte(method[i])) return "the method is not a token"
+    }
+    for (i in 0 until target.size) {
+        if (target[i] <= 32 || target[i] == 127) return "the target has a space or a control byte"
+    }
+    if (!httpHostValueValid(host)) return "the host has a space, a comma or a control byte"
+    for (header in headers) {
+        if (header.name.size == 0) return "a header name is empty"
+        for (i in 0 until header.name.size) {
+            if (!httpTokenByte(header.name[i])) return "a header name is not a token"
+        }
+        for (i in 0 until header.value.size) {
+            val byte = header.value[i]
+            if ((byte < 32 && byte != 9) || byte == 127) return "a header value has a control byte"
+        }
+    }
+    ""
 }
 
 // Reads decimal digits in `value` under the supplied `maximum`. Returns -1 for empty or nondecimal input or when the accumulated length exceeds the bound.
@@ -1352,8 +1382,15 @@ fun httpUnixClient(
 // Renders `request`, runs the client's transport, and parses the response. Transport failure returns an empty response with status zero and both result flags false.
 fun HttpClient.send(request: HttpRequest): HttpClientResult {
     val transport = this.exchange
+    val rendered = request.renderForClient(this.authority)
+    // A request whose parts can't be sent as they are (httpClientRequestError) is not sent at all.
+    if (rendered == "") {
+        var target = request.path
+        if (request.query != "") target = "$target?${request.query}"
+        return HttpClientResult(HttpResponse(0, [], ""), false, false, httpClientRequestError(request.method, target, this.authority, request.headers))
+    }
     val exchanged = transport(
-        request.renderForClient(this.authority),
+        rendered,
         this.maximumResponseBytes,
         this.timeoutMilliseconds
     )

@@ -320,7 +320,8 @@ fun h2Forbidden(name: string): bool =
 
 /** Starts a request: HEADERS (and DATA as the windows allow). Returns the stream id, -1 when the connection cannot take it (draining, closed, no room): the
  *  caller uses another connection. `headers` are the caller's (any case); host, connection, keep-alive, proxy-connection, transfer-encoding and upgrade are dropped
- *  (`te` only as `trailers`), and content-length is added for a body unless given. */
+ *  (`te` only as `trailers`), and content-length is added for a body unless given. -1 too, with nothing sent, for parts that could not be sent as they are: a
+ *  method that is not a token, a path or authority with a space or control byte, a header name that is not a token or a value with NUL, CR or LF. */
 fun H2Client.request(method: string, scheme: string, authority: string, path: string, headers: array<HpackField>, body: string): int =
     this.open(method, scheme, authority, path, headers, body, false, -1)
 
@@ -330,8 +331,31 @@ fun H2Client.request(method: string, scheme: string, authority: string, path: st
 fun H2Client.requestStream(method: string, scheme: string, authority: string, path: string, headers: array<HpackField>, length: int = -1): int =
     this.open(method, scheme, authority, path, headers, "", true, length)
 
+/** Whether a request's parts may be sent (RFC 9113 8.2.1 and 8.3.1, and what an HTTP/1.1 hop after this one could carry): a token method, a path and an
+ *  authority with no space or control byte (and no comma in the authority), and header fields that h2ResponseFieldValid takes. */
+private fun h2RequestPartsValid(method: string, authority: string, path: string, headers: array<HpackField>): bool {
+    if (method.size == 0) return false
+    for (i in 0 until method.size) {
+        val c = method[i]
+        val token = (c >= 65 && c <= 90) || h2ResponseFieldValid(method.slice(i, i + 1).lowercase(), "")
+        if (!token) return false
+    }
+    for (i in 0 until path.size) {
+        if (path[i] <= 32 || path[i] == 127) return false
+    }
+    for (i in 0 until authority.size) {
+        if (authority[i] <= 32 || authority[i] == 44 || authority[i] == 127) return false
+    }
+    for (h in headers) {
+        if (!h2ResponseFieldValid(h.name.lowercase(), h.value)) return false
+    }
+    true
+}
+
 private fun H2Client.open(method: string, scheme: string, authority: string, path: string, headers: array<HpackField>, body: string, streaming: bool, length: int): int {
     if (!this.hasRoom()) return -1
+    // A request whose parts could not be sent as they are is not sent (-1, as for a connection that cannot take it).
+    if (!h2RequestPartsValid(method, authority, path, headers)) return -1
     val id = this.nextStreamId
     this.nextStreamId = this.nextStreamId + 2
     val fields: array<HpackField> = [HpackField(":method", method, false), HpackField(":scheme", scheme, false), HpackField(":authority", authority, false), HpackField(":path", path, false)]
