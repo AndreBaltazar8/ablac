@@ -1,0 +1,148 @@
+import "abla/io"
+import "abla/regex"
+import "abla/text"
+
+// findAllWithin and replaceWithin (#1139 area 4, decision #153 A): one step budget across every search of the call.
+// 1 differential: with a budget that does not run out, Done has exactly findAll's spans and replace's text;
+// 2 resume: under small budgets, the matches of continued calls (findAllWithin(text, steps, resumeAt)) joined are
+//   findAll's, including empty matches and a budget that runs out right after one;
+// 3 cost: `a+b|a` over 4,000 `a`s (quadratic for findAll) stops at the budget, for both functions;
+// 4 empty matches advance: `x*`, `` and `\b` finish in one call, and give findAll's matches.
+
+var failures = 0
+
+fun expect(ok: bool, label: string): void {
+    if (!ok) {
+        failures += 1
+        if (failures <= 20) println("FAIL ${label}")
+    }
+}
+
+fun spansText(matches: array<RegexMatch>): string {
+    var out = ""
+    for (m in matches) {
+        out = out + "["
+        for (k in 0 until m.spans.size) out = out + "${m.spans[k]},"
+        out = out + "]"
+    }
+    out
+}
+
+// The spans of a done result, or "exhausted".
+fun doneSpans(result: RegexFindAllResult): string = when (result) {
+    is RegexFindAllDone -> spansText(result.matches)
+    is RegexFindAllExhausted -> "exhausted"
+}
+
+fun doneCount(result: RegexFindAllResult): int = when (result) {
+    is RegexFindAllDone -> result.matches.size
+    is RegexFindAllExhausted -> -1
+}
+
+// -1 when done, else resumeAt; `count` gets the exhausted result's match count.
+fun exhaustedAt(result: RegexFindAllResult, var count: array<int>): int = when (result) {
+    is RegexFindAllDone -> -1
+    is RegexFindAllExhausted -> {
+        count[0] = result.matches.size
+        result.resumeAt
+    }
+}
+
+fun replaced(result: RegexReplaceResult): string? = when (result) {
+    is RegexReplaceDone -> result.text
+    is RegexReplaceExhausted -> null
+}
+
+// Continues findAllWithin from each resumeAt until done. A continuation that completes no search (no match, same
+// resumeAt) gets twice the budget for its next call; the number of exhausted calls is counted.
+fun continued(re: Regex, text: string, budget: int, var exhausted: array<int>): array<RegexMatch> {
+    val all: array<RegexMatch> = []
+    var start = 0
+    var steps = budget
+    var rounds = 0
+    while (rounds < 100000) {
+        rounds += 1
+        val result = re.findAllWithin(text, steps, start)
+        when (result) {
+            is RegexFindAllDone -> {
+                for (m in result.matches) all.append(m)
+                return all
+            }
+            is RegexFindAllExhausted -> {
+                exhausted[0] = exhausted[0] + 1
+                // Progress: a call that resumes where it started has completed nothing (else continuing loops for ever).
+                if (result.resumeAt == start && result.matches.size != 0) {
+                    expect(false, "exhausted at its own start with ${result.matches.size} matches: ${re.pattern}")
+                    return all
+                }
+                for (m in result.matches) all.append(m)
+                if (result.matches.size == 0 && result.resumeAt == start) steps = steps * 2 else steps = budget
+                expect(result.resumeAt >= start && result.resumeAt <= text.size, "resumeAt in range")
+                start = result.resumeAt
+            }
+        }
+    }
+    expect(false, "continuation did not finish: ${re.pattern} over ${text.size} bytes")
+    all
+}
+
+fun main: int {
+    val patterns = ["a", "a+", "a*", "x*", "", "\\b", "^", "$", "a|ab", "ab|a", "(a)(b)?", "[a-c]+", "\\w+", "\\d*",
+        "a+b|a", "(?:a|)b?", ".", "é|e", "[^a]", "(\\w)\\w*?", "b*a?", "(a*)*", "\\s*", "a{2,3}", "(?:ab)*c?"]
+    val texts = ["", "a", "aa", "abab", "baac", "aab ab", "xyz", "é a e é", "aaaab", "a1 b22 c333", "  a  ",
+        "abcabcabc", "ba", "\u0000a\u0000", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"]
+    var pairs = 0
+    var resumed = 0
+    for (pattern in patterns) {
+        val compiled = regexCompile(pattern)
+        expect(compiled.succeeded, "compile ${pattern}")
+        val re = compiled.regex
+        for (text in texts) {
+            pairs += 1
+            val all = re.findAll(text)
+            expect(doneSpans(re.findAllWithin(text, 100000000)) == spansText(all),"findAllWithin ${pattern} over \"${text}\"")
+            for (replacement in ["<$0>", "-", "$1$1"]) {
+                val bounded = replaced(re.replaceWithin(text, replacement, 100000000))
+                expect(bounded != null && bounded == re.replace(text, replacement),
+                    "replaceWithin ${pattern} over \"${text}\" with ${replacement}")
+            }
+            for (budget in [1, 2, 3, 5, 8, 13, 40, 150]) {
+                val exhausted = [0]
+                val joined = continued(re, text, budget, exhausted)
+                resumed += exhausted[0]
+                expect(spansText(joined) == spansText(all), "continued ${pattern} over \"${text}\" with ${budget} steps")
+            }
+        }
+    }
+
+    // The quadratic case stops at the budget, for findAll and replace alike.
+    val quadratic = regexCompile("a+b|a").regex
+    val long = "a".repeat(2000)
+    // findAll takes about 12 million steps here (3 million for 1,000 a's, 48 million for 4,000): 48 times the budget below.
+    expect(quadratic.findAllWork(long) > 10000000, "a+b|a over 2,000 a's is quadratic for findAll")
+    val count = [0]
+    val resumeAt = exhaustedAt(quadratic.findAllWithin(long, 250000), count)
+    expect(resumeAt > 0 && resumeAt < long.size && count[0] == resumeAt,
+        "findAllWithin stops a+b|a at the budget with the matches before it (resumeAt ${resumeAt}, ${count[0]} matches)")
+    expect(replaced(quadratic.replaceWithin(long, "x", 250000)) == null, "replaceWithin stops a+b|a at the budget")
+
+    // Empty matches advance: one call finishes with findAll's matches (one per position, and after each code point).
+    for (pattern in ["x*", "", "\\b", "(?:)"]) {
+        val re = regexCompile(pattern).regex
+        val text = "ab é c"
+        expect(doneSpans(re.findAllWithin(text, 100000)) == spansText(re.findAll(text)),"empty matches of ${pattern} advance")
+    }
+    val empty = regexCompile("x*").regex
+    expect(doneCount(empty.findAllWithin("abc", 1000000)) == 4, "x* over abc: four empty matches")
+
+    // Edges: an invalid start and a failed compile are done with nothing; a zero budget is exhausted at the start.
+    expect(doneCount(empty.findAllWithin("abc", 100, 4)) == 0, "start past the end")
+    expect(doneCount(regexCompile("(").regex.findAllWithin("abc", 100)) == 0, "failed compile")
+    val zeroCount = [-1]
+    expect(exhaustedAt(empty.findAllWithin("abc", 0, 2), zeroCount) == 2 && zeroCount[0] == 0, "zero budget")
+    expect(replaced(empty.replaceWithin("abc", "-", 0)) == null, "zero budget replace")
+
+    expect(resumed > 1000, "the budgets ran out often enough to exercise resuming (${resumed})")
+    println("within-all: ${pairs} pattern/text pairs, ${resumed} exhausted calls resumed, ${failures} failures")
+    if (failures == 0) 0 else 1
+}

@@ -78,6 +78,9 @@ compiler identity and individual timings.
 | `re.matchPrefixEnd(text)` | Exclusive end byte offset of a match starting at byte zero, or `-1` |
 | `re.findAll(text)` | `array<RegexMatch>`, non-overlapping, left to right |
 | `re.replace(text, replacement)` | `string` with every match replaced |
+| `re.findWithin(text, maximumSteps, start = 0)` | `RegexSearchResult`: `find` within a step budget (see Cost) |
+| `re.findAllWithin(text, maximumSteps, start = 0)` | `RegexFindAllResult`: `findAll` within one step budget for the whole call |
+| `re.replaceWithin(text, replacement, maximumSteps)` | `RegexReplaceResult`: `replace` within one step budget for the whole call |
 | `re.groupCount` | number of capturing groups |
 | `m.start()`, `m.end()`, `m.text0()` | span and text of the whole match |
 | `m.group(i)`, `m.groupStart(i)`, `m.groupEnd(i)`, `m.hasGroup(i)`, `m.groupCount()` | group `i` (0 is the whole match); `null`/`-1` when it did not take part |
@@ -141,9 +144,10 @@ of each match. When a longer alternative keeps running after a shorter one has m
 (`a+b|a`, `(?:a+b)?a`, `a*b|a` over `aaaa…`), each search runs to the end of the text
 before it can give the short match, and the whole takes quadratic time: 5,000
 characters 0.5 s, 10,000 2.1 s, 20,000 10 s, 40,000 38 s. `re.findAllWork(text)` counts
-the steps. RE2 and Rust's `regex` have the same limit. For untrusted text, bound the
-text's size, or avoid patterns whose alternatives can be prefixes of one another's
-continuations.
+the steps. RE2 and Rust's `regex` have the same limit. **For untrusted text or patterns,
+use the Within functions**: `findWithin`, `findAllWithin` and `replaceWithin` stop at a
+step budget you choose, whatever the pattern and the text (see "Bounding findAll and
+replace" below).
 
 A search costs at most 2 × (text size + 1) × instructions steps (about 12 ns each), so at the limit of
 100,000 instructions a megabyte of text could take many minutes. Nested counted repeats multiply: `(a{1,30}){1,30}` is
@@ -191,6 +195,45 @@ fun main {
 }
 // output:
 // green
+```
+
+### Bounding findAll and replace
+
+`re.findAllWithin(text, maximumSteps, start = 0)` and `re.replaceWithin(text, replacement,
+maximumSteps)` run every search of the call on one budget, with the same steps as
+`findWithin`, so `a+b|a` over a long run of `a`s stops at the budget instead of taking
+quadratic time.
+
+- `RegexFindAllDone(matches)` has the same matches as `findAll` from `start`.
+- `RegexFindAllExhausted(matches, resumeAt)` has the matches completed before the budget
+  ran out. `re.findAllWithin(text, maximumSteps, resumeAt)` continues, and the matches of
+  the calls joined are those of `findAll`. A continuation that returns no match and the
+  same `resumeAt` could not finish one search with its budget: stop there, or give it more.
+- `RegexReplaceDone(text)` is the same text as `replace`; `RegexReplaceExhausted()` has no
+  partially replaced text.
+
+```abla
+import "abla/io"
+import "abla/regex"
+import "abla/text"
+
+fun main {
+    val re = regexCompile("a+b|a").regex
+    val long = "a".repeat(2000)
+    val found = re.findAllWithin(long, 100000)
+    when (found) {
+        is RegexFindAllDone -> println("done: ${found.matches.size} matches")
+        is RegexFindAllExhausted -> println("stopped at byte ${found.resumeAt}")
+    }
+    val words = regexCompile("[a-z]+").regex.replaceWithin("one two", "<$0>", 1000)
+    when (words) {
+        is RegexReplaceDone -> println(words.text)
+        is RegexReplaceExhausted -> println("too complex")
+    }
+}
+// output:
+// stopped at byte 7
+// <one> <two>
 ```
 
 ## Syntax

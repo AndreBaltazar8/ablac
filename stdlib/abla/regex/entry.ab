@@ -84,9 +84,59 @@ class Regex(
         if (start < 0 || start > text.size || this.program.size == 0) return RegexSearchMiss()
         if (maximumSteps <= 0) return RegexSearchExhausted()
         var vm = regexVm(this, text)
-        val spans = regexRunBounded(vm, start, maximumSteps)
+        val spans = regexRunBounded(vm, start, maximumSteps, false)
         if (vm.work < 0) return RegexSearchExhausted()
         if (spans.size == 0) RegexSearchMiss() else RegexSearchMatch(RegexMatch(text, spans))
+    }
+    /// Every non-overlapping match from byte offset `start`, as `findAll`, using at most `maximumSteps` search steps in
+    /// all (one budget for every search of the call; a step is as in `findWithin`). When the budget runs out the result
+    /// has the matches completed before it and `resumeAt`: `findAllWithin(text, steps, resumeAt)` continues, and the
+    /// matches of the calls joined are those of `findAll`. An invalid start, or a failed compile, is done with no match.
+    fun findAllWithin(text: string, maximumSteps: int, start: int = 0): RegexFindAllResult {
+        val found: array<RegexMatch> = []
+        if (start < 0 || start > text.size || this.program.size == 0) return RegexFindAllDone(found)
+        if (maximumSteps <= 0) return RegexFindAllExhausted(found, start)
+        var vm = regexVm(this, text)
+        var position = start
+        var advance = false
+        while (position <= text.size) {
+            val spans = regexRunBounded(vm, position, maximumSteps, advance)
+            if (vm.work < 0) {
+                // The unfinished search followed an empty match at `position`: that match is left out and found again
+                // by the continuation, which starts afresh there (a continuation cannot know it must refuse it).
+                if (advance) found.removeLast()
+                return RegexFindAllExhausted(found, position)
+            }
+            if (spans.size == 0) break
+            found.append(RegexMatch(text, spans))
+            advance = spans[1] == spans[0]
+            position = spans[1]
+        }
+        RegexFindAllDone(found)
+    }
+    /// `replace` using at most `maximumSteps` search steps in all (a step is as in `findWithin`). When the budget runs
+    /// out the result is `RegexReplaceExhausted`, with no partially replaced text.
+    fun replaceWithin(text: string, replacement: string, maximumSteps: int): RegexReplaceResult {
+        if (this.program.size == 0) return RegexReplaceDone(text)
+        if (maximumSteps <= 0) return RegexReplaceExhausted()
+        val plain = !replacement.contains("$")
+        val out = byteBuffer()
+        var last = 0
+        var vm = regexVm(this, text)
+        var position = 0
+        var advance = false
+        while (position <= text.size) {
+            val spans = regexRunBounded(vm, position, maximumSteps, advance)
+            if (vm.work < 0) return RegexReplaceExhausted()
+            if (spans.size == 0) break
+            out.appendText(text.slice(last, spans[0]))
+            out.appendText(if (plain) replacement else regexExpand(RegexMatch(text, spans), replacement))
+            last = spans[1]
+            advance = spans[1] == spans[0]
+            position = spans[1]
+        }
+        out.appendText(text.slice(last, text.size))
+        RegexReplaceDone(out.toText())
     }
     /** Byte offset of the first match at or after start, or -1. */
     fun findStart(text: string, start: int = 0): int {
@@ -214,6 +264,24 @@ class RegexSearchMiss : RegexSearchResult
 
 /// A search that needed another step after spending its budget.
 class RegexSearchExhausted : RegexSearchResult
+
+/// The outcomes of `findAllWithin`.
+sealed interface RegexFindAllResult
+
+/// Every match, the same as `findAll` from the same start.
+class RegexFindAllDone(val matches: array<RegexMatch>) : RegexFindAllResult
+
+/// The budget ran out: the matches completed before it, and the byte offset a continuation starts at.
+class RegexFindAllExhausted(val matches: array<RegexMatch>, val resumeAt: int) : RegexFindAllResult
+
+/// The outcomes of `replaceWithin`.
+sealed interface RegexReplaceResult
+
+/// The text with every match replaced, the same as `replace`.
+class RegexReplaceDone(val text: string) : RegexReplaceResult
+
+/// The budget ran out; there is no partially replaced text.
+class RegexReplaceExhausted : RegexReplaceResult
 
 // Holds a named capture's group slot and source span in the pattern.
 class RegexCaptureName(val name: string, val slot: int, val begin: int, val end: int)
@@ -1284,12 +1352,16 @@ private @inline fun RegexVm.classMatchesBounded(index: int, c: int, maximumSteps
     hit
 }
 
-private fun regexRunBounded(var vm: RegexVm, from: int, maximumSteps: int): array<int> {
+// `advance` refuses an empty match at `from` (findAllWithin after an empty match). The VM's work count carries over
+// from earlier searches on the same VM, so one budget covers them all.
+private fun regexRunBounded(var vm: RegexVm, from: int, maximumSteps: int, advance: bool): array<int> {
     val size = vm.text.size
     var matched = false
     var current = 0
     var position = from
     vm.generation += 1
+    vm.counts[0] = 0
+    vm.counts[1] = 0
     while (!matched || vm.counts[current] != 0) {
         if (!vm.searchStep(maximumSteps)) return []
         if (!matched) {
@@ -1308,6 +1380,7 @@ private fun regexRunBounded(var vm: RegexVm, from: int, maximumSteps: int): arra
             val pc = vm.pcs[entry]
             val op = vm.program[pc * 3]
             if (op == 7) {
+                if (advance && position == from) continue
                 // Keep only paths ahead of this result in priority order.
                 vm.copyEntry(entry, vm.resultEntry())
                 matched = true

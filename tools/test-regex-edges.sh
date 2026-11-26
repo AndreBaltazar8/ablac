@@ -41,6 +41,17 @@ for mode in fast release; do
     "$out/within-$mode" | grep -Fx 'bounded regex: ok' >/dev/null
 done
 
+# findAllWithin and replaceWithin: Done equals findAll/replace, continued runs join to findAll, the quadratic case
+# stops at the budget, empty matches advance (#1139, decision #153 A).
+for mode in fast release; do
+    options=()
+    [[ $mode == release ]] || options+=(--fast)
+    "$compiler" build tests/cases/regex/within-all.ab -o "$out/within-all-$mode" --no-cache "${options[@]}"
+    "$out/within-all-$mode" | tee "$out/within-all-$mode.txt" | grep -E '^within-all: [0-9]+ pattern/text pairs, [0-9]+ exhausted calls resumed, 0 failures$' >/dev/null ||
+        { echo "regex edges: within-all ($mode) failed:" >&2; head -12 "$out/within-all-$mode.txt" >&2; exit 1; }
+done
+cat "$out/within-all-release.txt"
+
 # Sorted, merged class ranges and the binary search against a linear scan of the ranges as written (#1139, R5-1).
 "$compiler" build tests/cases/regex/class-diff.ab -o "$out/class-diff" --no-cache
 "$out/class-diff" | tee "$out/class-diff.txt" | grep -E '^class-diff: 2400 classes, [0-9]+ \(class, code point\) pairs, 0 differences$' >/dev/null ||
