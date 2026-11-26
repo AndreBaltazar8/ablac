@@ -291,6 +291,7 @@ Abla? Start with [the tour](docs/guide.md).
 - [Programmable builds](docs/programmable-builds.md)
 - [Package imports](docs/packages.md)
 - [Networking, UDP, WebSockets, and realtime RPC](docs/networking.md)
+- [Migrating from hosted TLS and crypto](docs/migrating-from-tls-hosted.md)
 - [Bootstrap and trust model](docs/bootstrap.md)
 - [Self-hosting status](docs/self-hosting.md)
 - [Standard library](docs/standard-library.md)

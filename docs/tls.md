@@ -3,11 +3,9 @@
 `abla/tls/pure` is TLS written in Abla: a client and a server for TLS 1.3 and for TLS 1.2 in a modern subset, with
 X.509 verification, over the sockets of `abla/sys/linux/net`. It needs no OpenSSL and no libc. `abla/http/tls`,
 `abla/websocket/tls` and the Xtensa installer's HTTPS stream use it, so a program that opens HTTPS connections links
-as a static, libc-free executable. `abla/websocket/server/tls` is pure too. `abla/tls/hosted` (OpenSSL) remains only for programs that import it
-themselves (OpenSSL's handles and internals); such a program links libc. The flat host API (`abla/platform/host/tls`, which the compiler's compile-time evaluator
-uses) is over `abla/tls/pure` too: the compiler imports no libssl or libcrypto.
+as a static, libc-free executable. `abla/websocket/server/tls` and the compiler’s compile-time TLS adapter use the same implementation. See the [migration guide](migrating-from-tls-hosted.md) for changes to former hosted APIs.
 
-The module has the calls of `abla/tls/hosted`: `tlsConnect`, `tlsConnectWithCa`, `tlsConnectWithIdentity`,
+The public API includes `tlsConnect`, `tlsConnectWithCa`, `tlsConnectWithIdentity`,
 `tlsUpgrade` and `tlsUpgradeWithIdentity` (TCP and Unix sockets), `tlsListen`, `TlsListener.accept`,
 `tlsServerUpgrade`, `TlsConnection` (`handle`, `read`, `write`, `setTimeouts`, `close`), `tlsLastError`,
 `tlsAvailable`, `tlsClientIdentityFromPem` and `tlsClientIdentityFromPkcs12`, with the same meanings (end of stream is
@@ -51,16 +49,6 @@ RSA keys under 2048 bits for PSS verification.
   build and about 300 ms in a `--fast` build; ECDSA and Ed25519 are far cheaper. Parsing a system bundle of 145
   certificates takes about 6 ms in a release build and 90 ms in a `--fast` build.
 - Server side: one certificate by default; several are chosen by server name and signature algorithms (below).
-
-## Together with `abla/tls/hosted`
-
-`abla/http/tls`, `abla/websocket/tls` and the Xtensa installer import `abla/tls/pure` under an alias, so a program
-that imports `abla/tls/hosted` itself (for OpenSSL's handles and internals: `tlsControlPointer`, `tlsAllocateConnection`,
-`TlsConnection(handle)` views of a handle, as NovaKind's abla-s3 and abla-postgres do) and also imports `abla/http` compiles
-and runs: the two modules' public names do not collide, because the pure ones are reached through the alias inside the
-stdlib. A program that imports `abla/tls/pure` directly and `abla/tls/hosted` in the same program gets a name clash and
-must alias one of them. (A type that the stdlib hands out, such as `TlsWebSocketConnection.stream`, is the pure module's
-`TlsConnection`.)
 
 ## Checks that refuse by default
 
@@ -135,8 +123,7 @@ A server that staples a stale or wrong response, which a client without the chec
 
 To opt out, or to require a staple, build the configuration: `TlsClientConfig.revocation` is the policy (1 staple, 2 require, 0 off: no `status_request`, a staple is not looked at, as in v0.2.69), and
 `tlsClientConfigWithRevocation(config, policy, tlsOcspVerifier(store, host, now, policy))` sets it with its verifier (`tlsOcspVerifierLazy` takes the store when the staples arrive). The setting takes effect only with a staple
-verifier: a configuration made by hand with its own `verifier` has none and checks nothing until it is given one. The hosted (OpenSSL) client, which a program built for a platform with its own TLS library uses, has no revocation
-setting: the default covers the pure client only. The ClientHello is 9 bytes longer (the extension). A handshake with a server that sends no staple costs nothing measurable; one that staples costs about 0.4 ms more (the response's signature check and parse: 1.7 to 2.1 ms in a release build, one core, local server).
+verifier: a configuration made by hand with its own `verifier` has none and checks nothing until it is given one. The ClientHello is 9 bytes longer (the extension). A handshake with a server that sends no staple costs nothing measurable; one that staples costs about 0.4 ms more (the response's signature check and parse: 1.7 to 2.1 ms in a release build, one core, local server).
 
 How it works. The ClientHello offers `status_request`; a server that staples an OCSP response (TLS 1.3: in the Certificate entry; TLS 1.2: a CertificateStatus message the
 ServerHello promised) has it judged by `abla/crypto/ocsp` after the chain and the signature have verified: the response must be for that certificate, signed by its issuer or by a

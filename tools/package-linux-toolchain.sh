@@ -166,7 +166,7 @@ for library in "$bundle"/lib/*.so*; do
 done
 
 for package in binaryen clang-23 libbsd0 libclang-rt-23-dev libedit2 libffi8 libgcc-s1 \
-    libicu70 libllvm23 liblzma5 libmd0 libssl3 libstdc++6 libtinfo6 \
+    libicu70 libllvm23 liblzma5 libmd0 libstdc++6 libtinfo6 \
     libxml2 libzstd1 zlib1g; do
     copyright="/usr/share/doc/$package/copyright"
     if [[ -r $copyright ]]; then

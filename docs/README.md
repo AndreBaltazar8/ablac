@@ -19,6 +19,7 @@ examples. The [compact guide](guide.md) is a single-page refresher.
 | [stdlib/text.md](stdlib/text.md), [stdlib/system.md](stdlib/system.md), [stdlib/numbers.md](stdlib/numbers.md), [stdlib/security-and-dates.md](stdlib/security-and-dates.md), [stdlib/testing.md](stdlib/testing.md) | Library API pages: text, files and processes, math, hashing and dates, testing |
 | [json.md](json.md) | `abla/json`, `$json` and `$jsons` |
 | [networking.md](networking.md) | Sockets, HTTP, WebSocket, TLS and JWT |
+| [migrating-from-tls-hosted.md](migrating-from-tls-hosted.md) | Replace the removed hosted TLS and crypto APIs |
 | [diagnostics.md](diagnostics.md) | How to read compiler errors, and what each code means |
 | [debugging.md](debugging.md) | Debug builds, stack traces, panics |
 

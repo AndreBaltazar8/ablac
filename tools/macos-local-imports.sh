@@ -6,8 +6,8 @@
 # It fails on a line missing from tools/libsystem-imports-allowlist.txt (a new import). Lines of
 # the list that no longer appear here are reported only, since the Mac's toolchain can differ
 # (when this was written every program line matched except tasks.fast _pthread_join, which only
-# the Mac links). Not checked: the compiler's lines (not linked here) and tls-http (it links
-# Homebrew's OpenSSL). A local pre-check before a Mac CI round, not part of CI (the Linux runner
+# the Mac links). Not checked: the compiler's lines (not linked here).
+# A local pre-check before a Mac CI round, not part of CI (the Linux runner
 # has no macOS SDK). Needs llvm-nm (nix-shell).
 # Usage: ABLA_MACOS_SDK=<MacOSX.sdk> tools/macos-local-imports.sh [compiler]
 set -euo pipefail
@@ -21,7 +21,7 @@ trap 'rm -rf "$out"' EXIT
 export ABLA_DEBUG=0
 unset ABLA_TEST_FAST_BUILDS
 grep -v '^#' "$root/tools/libsystem-imports-allowlist.txt" |
-    grep -v -e '^compiler ' -e '^tls-http\.' -e ' needed:<brew>/' | sed 's/ ?$//' | sort -u > "$out/allow.txt"
+    grep -v -e '^compiler ' -e ' needed:<brew>/' | sed 's/ ?$//' | sort -u > "$out/allow.txt"
 subjects=$(awk '{split($1, part, "."); print part[1]}' "$out/allow.txt" | sort -u)
 for name in $subjects; do
     # A "dylib-<name>" subject is tests/cases/libsystem-dylibs/<name>.ab, built as a dylib (#833).
@@ -69,6 +69,6 @@ if [[ -n $stale ]]; then
     printf 'macos local imports: in the allowlist, not imported here (check on the Mac):\n%s\n' "$stale" >&2
 fi
 if [[ $status -eq 0 ]]; then
-    echo "macos local imports: $(wc -l < "$out/imports.txt" | tr -d ' ') imports, all in the allowlist (tls-http and the compiler not checked)"
+    echo "macos local imports: $(wc -l < "$out/imports.txt" | tr -d ' ') imports, all in the allowlist (compiler not checked)"
 fi
 exit "$status"

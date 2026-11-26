@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# abla/crypto/aes and abla/crypto/rsa: the vectors of tools/test-crypto.sh (NIST CAVP, Wycheproof) on the
-# hardware and software paths, on this CPU and on one with no AES (qemu64); refusals; random inputs against
-# abla/crypto/hosted and the openssl CLI; known answers run on AArch64 under qemu and Wasm under Node, and
-# compiled for Xtensa; and that neither links OpenSSL. What's read of the code is in tools/test-ct.sh.
-# Wycheproof for X25519, P-256 ECDH, ECDSA, HKDF, HMAC and RSA SHA-384/512 (wycheproof-tls.ab).
+# AES/RSA vectors, refusals and OpenSSL CLI interop, plus software known answers on AArch64 and Wasm.
 # CRYPTO_ROUNDS sets random rounds (default 30). The 2048-bit key is freshly generated; weak/PSS keys are fixtures.
 set -uo pipefail
 
@@ -28,7 +24,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted both kat-native wycheproof-tls wycheproof-more wycheproof-hashes aead-random rng-safety heap-residue signatures sha3 mlkem p384 wipe-views)
+programs=(vectors edge tool kat-native wycheproof-tls wycheproof-more wycheproof-hashes aead-random rng-safety heap-residue signatures sha3 mlkem p384 wipe-views)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -217,18 +213,6 @@ if timeout 300 "$out/edge" "$keys" > "$out/edge.log" 2>&1 < /dev/null; then
 else
     fail "edge (exit $?)"; tail -20 "$out/edge.log"
 fi
-if timeout 300 "$out/against-hosted" "$keys" "$rounds" > "$out/against-hosted.log" 2>&1 < /dev/null; then
-    echo "ok   against abla/crypto/hosted: $rounds rounds"
-else
-    fail "against hosted (exit $?)"; tail -20 "$out/against-hosted.log"
-fi
-
-if timeout 60 "$out/both" "$keys/k2048.pem" > "$out/both.log" 2>&1 < /dev/null; then
-    echo "ok   one program with both RSAs, no aliases"
-else
-    fail "both (exit $?)"; tail -20 "$out/both.log"
-fi
-
 # --- Random inputs against the openssl CLI, on both paths ------------------------------------
 work=$out/work
 compare() { [[ $2 == "$3" ]] || fail "$1: ours ${2:0:64} theirs ${3:0:64}"; }

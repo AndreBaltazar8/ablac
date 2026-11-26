@@ -24,15 +24,14 @@ checks the rules below on every workflow (`--controls` shows each rule refusing 
 - Native LLVM comes from `tools/llvm-*-pins.sh` (the fork's releases, sha256 pinned) and nixpkgs (a pinned commit).
 - The Nix installer is pinned by sha256 (`.github/actions/install-nix`, in the SBOM).
 - Not pinned by hash, and named in the SBOM comment:
-  - `apt-get install` inside the pinned `ubuntu:22.04@sha256` image (binaryen, libssl, libzstd and others) for the dynamic
+  - `apt-get install` inside the pinned `ubuntu:22.04@sha256` image (binaryen, libzstd and others) for the dynamic
     toolchain archive. apt checks the Ubuntu archive's signed indexes, so the trust is the archive's, and the image is
     fixed by digest; what drifts is the package versions between two releases. The dynamic archive is the extra asset of one
     release (decision #90 A) and the static archive, the default, takes none of it. If the dynamic archive stays, pin it
     through a dated snapshot of the Ubuntu archive (a snapshot URL in the container's apt sources) rather than package hashes
     by hand, and add the snapshot date to the SBOM.
   - Homebrew's `binaryen` and `openssl@3` on the macOS runners. Homebrew checks each bottle's sha256 against its own index, so
-    the trust is Homebrew's; the macOS compiler links OpenSSL dynamically through an rpath into the Homebrew prefix and does not bundle it, so the runner's copy is
-    not what ships. Pinning a bottle by hand would make the build depend on a bottle Homebrew may withdraw.
+    the trust is Homebrew's. The OpenSSL CLI is a test peer. Pinning a bottle by hand would make the build depend on a bottle Homebrew may withdraw.
 - `nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/<commit>.tar.gz` in the workflows is fetched without a hash
   for `<nixpkgs>` lookups; the build itself uses `nix/nixpkgs.nix`, which carries the hash.
 

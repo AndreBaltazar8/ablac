@@ -14,8 +14,8 @@ openssl req -x509 -new -key "$out/key.pem" -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
     -out "$out/cert.pem" 2>/dev/null
 # The peer is an Abla program over raw sockets (tests/cases/http-close-delimited-peer):
-# every HTTP byte is a literal in its source. Its TLS side is the hosted OpenSSL server
-# (abla/tls/hosted); the client under test is the hosted OpenSSL HTTPS client of
+# every HTTP byte is a literal in its source. Its TLS side is the pure TLS server
+# (abla/tls/pure); the client under test is the pure HTTPS client of
 # abla/http/tls, so both ends of the TLS cases are OpenSSL (what the cases check is
 # the HTTP framing above it, not TLS). The plain and async cases use no TLS at all.
 "$compiler" build "$root/tests/cases/http-close-delimited-peer/peer.ab" -o "$out/peer" --fast

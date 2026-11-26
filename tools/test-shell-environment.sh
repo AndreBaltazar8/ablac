@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The repository's shell leaves a host's own tools alone: no LD_LIBRARY_PATH of its
-# glibc's, and a program linking OpenSSL still finds it, by its runpath.
+# glibc's, and no OpenSSL runpath in the compiler.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -17,7 +17,7 @@ if [[ ${LD_LIBRARY_PATH:-} == *"$ABLA_LINUX_OPENSSL_LIB"* ]]; then
     exit 1
 fi
 cat > "$output_directory/tls.ab" <<'AB'
-import "abla/tls/hosted"
+import "abla/tls/pure"
 fun main: int = if (tlsLastError() == "") 42 else 1
 AB
 "$compiler" build "$output_directory/tls.ab" -o "$output_directory/tls"
@@ -30,6 +30,13 @@ if [[ ${NIX_LDFLAGS:-} == *"${out:-/nonexistent}/lib"* ]] || LC_ALL=C grep -a -q
     echo "shell environment: the shell's own lib directory is in the rpath of a link" >&2
     exit 1
 fi
-# And the compiler itself, which links it too.
-env -u LD_LIBRARY_PATH "$(readlink -f "$compiler.bin" 2>/dev/null || echo "$compiler")" --version >/dev/null
-echo 'shell environment: OpenSSL by runpath, no LD_LIBRARY_PATH'
+# The compiler runs without a library-path override and has neither runpath.
+payload=$compiler
+[[ ! -f $compiler.bin ]] || payload=$compiler.bin
+env -u LD_LIBRARY_PATH "$payload" --version >/dev/null
+dynamic=$(readelf -d "$payload")
+if grep -E 'NEEDED.*(libssl|libcrypto)|RUNPATH.*(openssl|nix-shell/lib)' <<< "$dynamic" >/dev/null; then
+    echo 'shell environment: the compiler carries OpenSSL linkage or an OpenSSL or shell-local runpath' >&2
+    exit 1
+fi
+echo 'shell environment: no OpenSSL in the compiler link and no OpenSSL LD_LIBRARY_PATH'

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The HTTP clients and abla/tls/hosted against forked peers that reset or go
+# The HTTP clients and abla/tls/pure against forked peers that reset or go
 # quiet (tests/cases/tls-faults). Each stage has a time limit: without socket
 # timeouts and the SIGPIPE guard a stage hangs or the process dies of SIGPIPE.
 # TLS_FAULTS_FAULTS_ONLY=1 builds only the stages that use the older API, so

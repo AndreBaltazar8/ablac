@@ -153,10 +153,8 @@ Inventory 2026-11-15 (master `ede03cd6`, stage 2 of it; `tools/test-libc-imports
   libcrypto), and no stdlib module outside them imports either (the importers are tests, `tests/cases/tls-mix` among
   them, NovaKind's signer and the compiler's `abla/platform/host/tls`).
 - Shared libraries leave only the loader's `__tls_get_addr` undefined (emulated TLS, `test-libc-imports.sh`).
-Next, in order: (1) NovaKind's signer onto `abla/tls/pure` (branch `tls-pure-822`, parked by André), then delete
-`abla/tls/hosted`, `abla/crypto/hosted` and `abla/jwt/libcrypto`'s leftovers, keeping OpenSSL only as the test oracle
-(`tests/cases/crypto-pure/against-hosted.ab`, move it to the `openssl` command line); `tls-http` leaves
-`tools/libc-imports-static-pending.txt` with them; (2, done 2026-11-20) `tools/test-aarch64-linux.sh` covers all 11
+(1) `abla/tls/hosted` and `abla/crypto/hosted` were removed (#1282, decision #149 B). `tls-http` tests the pure stack without libc, and the OpenSSL CLI remains a peer and test oracle. NovaKind’s migration is tracked in #1017 while that project is parked.
+(2, done 2026-11-20) `tools/test-aarch64-linux.sh` covers all 11
 `libc-imports` programs (it ran 6 when this was written) and, new,
 `tools/test-libc-free-programs.sh` builds every `tests/cases/modules/*.ab` `--fast` for x86-64 and AArch64 Linux and fails
 on a program that links libc, or stops building, outside `tools/libc-free-programs-allowlist.txt` (a list that only

@@ -36,7 +36,8 @@ The claim, stated so that it can be checked and so that its limits are visible. 
   store path (`<hash>-nix-shell/lib`, a directory that does not exist; its hash follows the shell's arguments), so a rebuild
   in another shell differed in 52 bytes: that path and the GNU build id. `shell.nix` no longer lets it into a link; two
   shells (the default and `ABLA_NIX_ANDROID_TESTS=1`) link the same bytes. `ABLA_NIX_XTENSA=0` still changes the
-  store paths of LLVM in the RUNPATH.
+  store paths of LLVM in the RUNPATH. The OpenSSL RUNPATH entry shipped before the hosted TLS and crypto removal
+  was a link flag from the shell. It did not record a runtime dependency of the dynamic compiler.
 - **`ablac-x86_64-linux` (the static compiler) is not rebuilt bit for bit by a third party.** The release checks it by its
   fixpoint (pass 2 equals pass 3, `tools/test-static-artifact.sh`, which a third party can run on the published file
   with the pinned archives from `tools/static-llvm-env.sh`). `tools/build-static-compiler.sh` on the published dynamic

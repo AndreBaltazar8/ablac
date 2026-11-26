@@ -56,10 +56,10 @@ adjacent comments, not `@param` tags in a function's comment.
 | [128-bit integers](stdlib/uint128.md) | `abla/uint128`, `abla/int128` ([int128](stdlib/int128.md)) |
 | [UUIDs](stdlib/uuid.md) | `abla/uuid` |
 | [Regular expressions](stdlib/regex.md) | `abla/regex` |
-| [Hashing, encryption, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/crypto/hosted`, `abla/date` |
+| [Hashing, encryption, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/date` |
 | [Testing](stdlib/testing.md) | `abla/test` and `ablac test` |
 | [JSON](json.md) | `abla/json`, `abla/http/json`, `$json` |
-| [Networking](networking.md) | `abla/net`, `abla/http/*`, `abla/websocket/*`, `abla/tls/pure`, `abla/tls/hosted`, `abla/dns`, `abla/dns/async`, `abla/jwt` |
+| [Networking](networking.md) | `abla/net`, `abla/http/*`, `abla/websocket/*`, `abla/tls/pure`, `abla/dns`, `abla/dns/async`, `abla/jwt` |
 | [Compiler API](compiler-api.md), [subparsers](subparsers.md), [programmable builds](programmable-builds.md) | `abla/compiler`, `abla/compiler/parser`, `abla/build`, `abla/wasm/build`, `abla/android/build` |
 
 Built into the language rather than imported: `string`, arrays, `Map`,
@@ -89,7 +89,6 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/crypto/ed25519` | Ed25519 (RFC 8032): keys, signatures, verification; constant-time on the secret paths |
 | `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES and RSA in Abla, no OpenSSL, on every target; what timing protection each has is documented |
 | `abla/crypto/legacy` | 3DES-CBC and RC2-CBC, decrypt only, to read old PKCS#12 files (not constant time; no OpenSSL) |
-| `abla/crypto/hosted` | AES-GCM, AES-CBC, AES-ECB, RSA signatures and encryption, PEM, DER, X.509 and PKCS#12 keys, through OpenSSL |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
 | `abla/test` | checks for test programs run by `ablac test` |
 | `abla/io` | console output, end-of-input-aware line input, buffered text writers |
@@ -127,7 +126,6 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/fs/secure` | Descriptor-relative operations with component validation, bounded handle reads and directory listings, no-follow opens and no-replace rename. `replaceSymlink` requires a trusted parent; its non-symlink destination check is not atomic against a hostile writer. |
 | `abla/fs/watch` | `fileEvents(paths)`: waits (with a timeout) for a change to files, by inotify on Linux and kqueue on macOS through system calls, no libc. A wait can also report a write that changed nothing, or on macOS another file of the same directory: compare the contents (`watchFiles`) to know. `ablac run --watch` uses it. |
 | `abla/tls/pure` | TLS client and server over raw sockets, with hostname and certificate verification |
-| `abla/tls/hosted` | OpenSSL-linked TLS client and listener, with hostname and certificate verification |
 | `abla/websocket` | bounded RFC 6455 handshake, framing, connection lifecycle, and routed server helpers |
 | `abla/websocket/client` | client masking keys |
 | `abla/websocket/json`, `/rpc` | bounded JSON messages and transport-neutral RPC method routing |

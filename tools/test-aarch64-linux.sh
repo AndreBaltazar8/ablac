@@ -82,11 +82,11 @@ program_check() { # SOURCE: both modes, built for AArch64, checked, and run on A
 }
 # shellcheck disable=SC2086
 parallel_each program_check $programs $checks
-# Static and libc-free, built only (no run): the other libc-imports programs that have an AArch64 build (tls-http needs
-# OpenSSL, which has none) in both modes, and one program for each stdlib area a libc-free build can still reach libc
+# Static and libc-free, built only (no run): libc-imports programs in both modes and one program for each
+# stdlib area a libc-free build can still reach libc
 # from (sockets, processes, signals, stm, tls/pure, http/async, websocket), --fast. A regression there would otherwise
 # show only on a machine that runs AArch64.
-static_both='tests/cases/libc-imports/http-async-tls.ab tests/cases/libc-imports/jwt-verify.ab
+static_both='tests/cases/libc-imports/http-async-tls.ab tests/cases/libc-imports/jwt-verify.ab tests/cases/libc-imports/tls-http.ab
 tests/cases/libc-imports/tls-pure-https.ab tests/cases/libc-imports/tls-pure-thread.ab
 tests/cases/libc-imports/websocket-server-tls.ab'
 static_fast='tests/cases/modules/hosted-network.ab tests/cases/modules/udp-ephemeral.ab tests/cases/modules/linux-process.ab

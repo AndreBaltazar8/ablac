@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Two modules that declare the same names and neither imports the other (abla/tls/hosted and abla/tls/pure) coexist in one
+# Two modules that declare the same names and neither imports the other coexist in one
 # program: each module's names mean the declarations its own imports reach, however far (#830). Before, the program-wide
 # names met as `symbol.duplicate:Conn` and a transitive constructor call matched the wrong class (`constructor.arity:Conn`).
 # The compile-time evaluator resolves them the same way, and an aliased module's intrinsic runs under `#` (it was refused as

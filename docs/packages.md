@@ -13,7 +13,7 @@ the same type from their own compile functions, including providers that do not
 use Git.
 
 A longer path imports one module of the package, not its entry, the way
-`abla/crypto/hosted` is one module of `abla/crypto`:
+`abla/crypto/aes` is one module of `abla/crypto`:
 
 ```abla fragment
 import github("owner/abla-blockchain/evm")

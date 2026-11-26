@@ -11,14 +11,12 @@
 | `abla/crypto/x509` | X.509 certificates: parsing, chain building and validation (RFC 5280), host names (RFC 6125), a trust store, in Abla |
 | `abla/crypto/chacha20poly1305` | ChaCha20, Poly1305 and the RFC 8439 AEAD: in Abla, on every target |
 | `abla/crypto/rsapss` | RSASSA-PSS (SHA-256, -384, -512; MGF1 over the same hash) on `abla/crypto/rsa` keys: in Abla, on every target |
-| `abla/crypto/hosted` | the same and more, through OpenSSL |
 | `abla/random` | a cryptographically secure source (`getrandom(2)`) |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
 | `abla/jwt`, `abla/jwt/remote` | JSON Web Token verification ([networking.md](../networking.md)) |
 
 `abla/crypto` and `abla/date` are pure Abla: they work on every target and at compile
-time. `abla/crypto/aes` and `abla/crypto/rsa` are too, but not at compile time. `abla/crypto/hosted`
-is OpenSSL, and links it into the programs that import it. [Which to use](#which-to-use).
+time. `abla/crypto/aes` and `abla/crypto/rsa` are pure Abla and are available at run time.
 
 ## `abla/crypto`
 
@@ -192,96 +190,6 @@ both products, so it is not faster than signing. Speed: about 8 ms to sign and 8
 Tested against RFC 8032 section 7.1's vectors, Wycheproof's 210 verification cases (`tests/vectors/crypto/wycheproof-ed25519.json`),
 and random seeds and messages against the `openssl` CLI both ways (`tools/test-ed25519.sh`).
 
-## `abla/crypto/hosted`
-
-AES and RSA through OpenSSL's libcrypto, the provider `abla/tls/hosted` already uses, 1.1.1
-or 3.x. Programs that don't import it don't link it, and stay free of libc.
-Where OpenSSL is missing (embedded targets, wasm), use [`abla/crypto/aes` and `abla/crypto/rsa`](#ablacryptoaes-and-ablacryptorsa).
-
-```abla
-import "abla/io"
-import "abla/crypto"
-import "abla/crypto/hosted"
-import "abla/random"
-
-fun main {
-    val key = secureRandomBytes(32)
-    val nonce = secureRandomBytes(12)
-    val sealed = hostedAesGcmEncrypt(key.bytes, nonce.bytes, "a message", "its context")
-    val opened = hostedAesGcmDecrypt(key.bytes, nonce.bytes, sealed.bytes, "its context")
-    println("${sealed.bytes.size} ${opened.bytes}")
-    println(hostedAesGcmDecrypt(key.bytes, nonce.bytes, sealed.bytes, "another").error)
-    val ecb = hostedAesEcbEncryptPkcs5("0123456789abcdef", "hello")
-    println(hexEncode(ecb.bytes))
-    val none = hostedRsaPrivateKeyFromPem("not a key")
-    println("${none.ok()}")
-}
-// output:
-// 25 a message
-// authentication failed: the data, key, nonce or associated data is wrong
-// 674c7ef38e78cabd9cec9c125823a639
-// false
-```
-
-Each operation returns a `CryptoResult(bytes, ok, error)`. An `error` names what failed
-and never holds key material or plaintext.
-
-### AES
-
-| Function | Notes |
-|---|---|
-| `hostedAesGcmEncrypt(key, nonce, plaintext, associatedData = "")`, `hostedAesGcmDecrypt(key, nonce, ciphertext, associatedData = "")` | use this one. The result is the ciphertext and then a 16-byte tag; decryption returns nothing unless the tag verifies. The nonce has 12 bytes and must never repeat under a key |
-| `hostedAesCbcEncryptPkcs7(key, iv, plaintext)`, `hostedAesCbcDecryptPkcs7(key, iv, ciphertext)` | unauthenticated. The IV has 16 unpredictable bytes. Bad padding is a distinct failure, so never show a remote party which failure happened (a padding oracle): pair it with a MAC checked first |
-| `hostedAesEcbEncryptPkcs5(key, plaintext)`, `hostedAesEcbDecryptPkcs5(key, ciphertext)` | **for protocols that require it only**, such as Portugal's AT WS-Security header. Equal blocks encrypt equally |
-
-Keys have 16, 24 or 32 bytes. For a 16-byte block, PKCS#5 and PKCS#7 padding are the same.
-
-### RSA
-
-Load a key, check `ok()` or `error`, and call its methods. A key is a resource: OpenSSL's
-copy is freed and cleansed when it's dropped.
-
-| Function | Reads |
-|---|---|
-| `hostedRsaPrivateKeyFromPem(pem, passphrase = "")` | PKCS#8, encrypted PKCS#8, PKCS#1. An encrypted key without its passphrase fails; it never asks on the terminal |
-| `hostedRsaPrivateKeyFromDer(der)` | unencrypted PKCS#8 or PKCS#1 |
-| `hostedRsaPrivateKeyFromPkcs12(der, password)` | a `.pfx`. OpenSSL 3 refuses RC2 (what OpenSSL 1.x's `pkcs12 -export` writes) unless re-encrypted: `openssl pkcs12 -in old.pfx -legacy -nodes \| openssl pkcs12 -export -out new.pfx` |
-| `hostedRsaPublicKeyFromPem(pem)` | `PUBLIC KEY` (SubjectPublicKeyInfo), `RSA PUBLIC KEY`, or the key of a `CERTIFICATE`. The certificate's chain and dates aren't checked |
-| `hostedRsaPublicKeyFromDer(der)`, `hostedRsaPublicKeyFromCertificateDer(der)` | SubjectPublicKeyInfo; an X.509 certificate's key |
-| `hostedRsaGeneratePrivateKey(bits = 2048)` | a new key of 2048, 3072 or 4096 bits with e = 65537, the sizes and exponent of `rsaGeneratePrivateKey` in `abla/crypto/rsa`; any other size fails. OpenSSL draws the primes, and the key stays in its memory, wiped on drop |
-
-A key, generated or read, exports with `private.toPkcs8Der()` and `private.toPkcs8Pem()` (unencrypted PKCS#8, which `hostedRsaPrivateKeyFromDer` and `FromPem` read back and `abla/crypto/rsa` reads too), and with `toSpkiDer()` and `toSpkiPem()` on a private or a public key (SubjectPublicKeyInfo, read by `hostedRsaPublicKeyFromDer` and `FromPem`). An export is a `CryptoResult` of Abla bytes: it can't be wiped, so write it where it must go and drop it. Nothing in an error names key material.
-
-| Method | Keys | Notes |
-|---|---|---|
-| `private.signPkcs1Sha256(message)`, `public.verifyPkcs1Sha256(message, signature)` | 2048 bits or more | RSASSA-PKCS1-v1_5, deterministic |
-| `private.signPkcs1Sha1Legacy(message)`, `public.verifyPkcs1Sha1Legacy(message, signature)` | 1024 bits or more | **required by Despacho 8632/2014 for Portuguese invoices; nothing new should use it.** SHA-1 collisions are practical, and 1024 bits is within reach of a well-funded attacker |
-| `public.encryptOaepSha256(plaintext)`, `private.decryptOaepSha256(ciphertext)` | 2048 bits or more | use this one. SHA-256 for both the hash and MGF1 |
-| `public.encryptOaepSha1Legacy(plaintext)`, `private.decryptOaepSha1Legacy(ciphertext)` | 1024 bits or more | SHA-1 for both, the default of Java's OAEP and .NET's `fOAEP` |
-| `public.encryptPkcs1Legacy(plaintext)`, `private.decryptPkcs1Legacy(ciphertext)` | 1024 bits or more | RSAES-PKCS1-v1_5, for protocols that require it. See below |
-
-From OpenSSL 3.2, `decryptPkcs1Legacy` on bad padding succeeds with random-looking bytes
-(implicit rejection); before it, the call fails, and showing a remote party that failure is
-the Bleichenbacher attack. Check the plaintext's expected form either way.
-
-`opensslConstantTimeEquals(a, b)` compares with `CRYPTO_memcmp`, which is built so
-that a compiler can't make it stop early. Different lengths are unequal at once.
-
-### Timing and memory
-
-| | Protection | Limit |
-|---|---|---|
-| RSA private operations | OpenSSL's blinding and constant-time exponentiation, for keys with their CRT values (every format above) | PKCS#1 v1.5 decryption has a history of leaks (Marvin, 2023): implicit rejection from 3.2 is the fix. Use a current OpenSSL |
-| AES | AES-NI, ARMv8 instructions, or vector code (VPAES) | a CPU with none of them falls back to OpenSSL's table code, which isn't constant-time. Any x86-64 or ARMv8 server of the last decade has them |
-| GCM's tag | carry-less multiply instructions | without them, table-based |
-| Verification and public-key encryption | no secret is involved in the key | |
-| Key generation | OpenSSL's generator, with its working numbers freed and cleansed | the exported PKCS#8 or PEM is an Abla string, like the key bytes below |
-| Key bytes in Abla strings | none: strings can't be wiped | PEM text, passphrases and `secureRandomBytes` results stay in memory until it is reused. Read them late and don't keep them. Failed decryptions cleanse their buffer, and successful ones are the caller's |
-
-Left out so far: RSA-PSS, ECDSA signing, Ed25519, ChaCha20-Poly1305, HKDF,
-SHA-3, SHA-224, CBC without padding, GCM with other nonce or tag sizes, and OAEP labels. Nothing here needs them
-yet, and each is a short wrapper around OpenSSL when something does.
-
 ## `abla/crypto/chacha20poly1305`
 
 RFC 8439 in Abla, with no OpenSSL and no table: `chaCha20Poly1305Seal(key, nonce, plaintext, associatedData = "")` returns the
@@ -304,11 +212,7 @@ lengths 32 and 0), and signing and verifying against Node, including a given sal
 
 ## `abla/crypto/aes` and `abla/crypto/rsa`
 
-AES and RSA with no OpenSSL, for wherever it isn't, and for programs that shouldn't link it. They answer to the names
-`abla/crypto/hosted` gives with `hosted` in front (`rsaPrivateKeyFromPem` there is `hostedRsaPrivateKeyFromPem`), so one
-program, or the packages it uses, can have both. `abla/crypto/pure` is both of these two. Same vectors, same results: see [the
-tests](#how-this-is-tested). The difference is in what they don't offer, and in how far their timing has been
-looked at.
+`abla/crypto/aes` and `abla/crypto/rsa` implement AES and RSA in Abla. Import `abla/crypto/pure` to use both. See the [migration guide](../migrating-from-tls-hosted.md) for former hosted names and format changes.
 
 ```abla
 import "abla/io"
@@ -333,11 +237,11 @@ fun main {
 | | |
 |---|---|
 | `aesGcmSealRandom(key, plaintext, associatedData = "")`, `aesGcmOpenRandom(key, box, associatedData = "")` | AES-GCM with a fresh random 12-byte nonce, returned first in the box (nonce, ciphertext, tag); fails without a random source. At most 2^32 messages per key this way (NIST SP 800-38D 8.3). **Never reuse a nonce under a key** with `aesGcmEncrypt`: one repeat gives away the authentication key and the XOR of two plaintexts |
-| `aesGcmEncrypt`, `aesGcmDecrypt`, `aesCbcEncryptPkcs7`, `aesCbcDecryptPkcs7`, `aesEcbEncryptPkcs5`, `aesEcbDecryptPkcs5` | as in [`abla/crypto/hosted`](#aes) |
-| `rsaPublicKeyFromPem`, `rsaPublicKeyFromDer`, `rsaPublicKeyFromCertificateDer` | as [there](#rsa). A certificate's chain, dates and signature aren't checked |
+| `aesGcmEncrypt`, `aesGcmDecrypt`, `aesCbcEncryptPkcs7`, `aesCbcDecryptPkcs7`, `aesEcbEncryptPkcs5`, `aesEcbDecryptPkcs5` | AES-GCM with a 12-byte nonce and optional associated data, or ECB/CBC with PKCS#7 padding. Use ECB/CBC only for legacy interoperability. |
+| `rsaPublicKeyFromPem`, `rsaPublicKeyFromDer`, `rsaPublicKeyFromCertificateDer` | Read a public key from PEM, DER, or a DER certificate. Reading a key from a certificate does not verify the certificate. |
 | `rsaPrivateKeyFromPem(pem)`, `rsaPrivateKeyFromDer(der)` | PKCS#8 and PKCS#1, unencrypted. Password-resource overloads read PBES2/PBKDF2/AES-CBC [encrypted PKCS#8](encrypted-keys.md); `rsaPrivateKeyFromPkcs12(der, password, limits)` reads modern MAC-verified DER key bags (see the same limits and restrictions) |
-| `private.signPkcs1Sha256`, `public.verifyPkcs1Sha256`, `private.signPkcs1Sha1Legacy`, `public.verifyPkcs1Sha1Legacy` | as there, with the same minimum sizes |
-| RSA encryption and decryption | as above, with empty-label OAEP. PKCS#1 v1.5 uses deterministic implicit rejection: invalid padding returns synthetic plaintext. Prefer OAEP, and make subsequent protocol checks indistinguishable to remote peers |
+| `private.signPkcs1Sha256`, `public.verifyPkcs1Sha256`, `private.signPkcs1Sha1Legacy`, `public.verifyPkcs1Sha1Legacy` | PKCS#1 v1.5 signing and verification. Prefer SHA-256. |
+| RSA encryption and decryption | Uses empty-label OAEP. PKCS#1 v1.5 uses deterministic implicit rejection: invalid padding returns synthetic plaintext. Prefer OAEP, and make subsequent protocol checks indistinguishable to remote peers |
 | `rsaGeneratePrivateKey(bits = 2048)` | Generate a key with 2048, 3072 or 4096 bits and exponent 65537. Check `ok()` or `error`; generation fails without randomness. |
 | `private.toPkcs8Der()`, `private.toPkcs8Pem()` | Export unencrypted PKCS#8. A number-only key without its private exponent returns an error. |
 | `cryptoSetRandom(source)` | where the randomness for encryption, blinding and key generation comes from. Needed on WebAssembly (bare and WASI: the module does not ask the host for random bytes on its own) and on an ESP32, whose hardware RNG it takes; Linux (x86-64, AArch64) uses `getrandom`, macOS `getentropy` and Windows `ProcessPrng`. A Wasm host's `crypto.getRandomValues` is the usual source. Its quality is yours to answer for. Without one, what needs it fails, and signing never goes on unblinded |
@@ -415,24 +319,12 @@ Nothing here has been through what OpenSSL's has: years of attack, and timing me
 statistical test (`dudect`) has been run: the assembly check shows no branch or index on a secret, and no more
 than that.
 
-### Which to use
-
-- On a hosted server with OpenSSL, for keys that matter: `abla/crypto/hosted`. It has broader format support and more scrutiny, and is about 14 times faster at signing. TLS stays on it.
-- For embedded and Wasm, or where linking OpenSSL isn't wanted: these. Compared on an i9-13900K with 2048-bit
-  keys, 2026-11-01: signing 5.1 ms (OpenSSL 0.36 ms); GCM 476 MiB/s with instructions and 34 MiB/s without (OpenSSL
-  2700 MiB/s); ECB 2700 MiB/s and 130 MiB/s.
-
 ### How this is tested
 
-`tools/test-crypto-pure.sh`: the NIST CAVP and Wycheproof vectors of `tools/test-crypto.sh` on both AES paths,
+`tools/test-crypto-pure.sh`: NIST CAVP and Wycheproof vectors on both AES paths,
 on this CPU and on `qemu-x86_64 -cpu qemu64` with neither instruction; refusals; random inputs against
-`abla/crypto/hosted` and the `openssl` CLI, both ways. Known answers on AArch64 under qemu (with AES and PMULL) and
+the `openssl` CLI, both ways. Known answers on AArch64 under qemu (with AES and PMULL) and
 on Wasm under Node. On Xtensa it's compiled, and read by `tools/test-ct.sh`, not run. RSA decryption vectors run on the hosted native paths.
-
-`tools/test-crypto-hosted-keygen.sh`: `hostedRsaGeneratePrivateKey` at 2048, 3072 and 4096 bits signs, verifies, encrypts and
-decrypts through hosted; its exports read back to the same key; it works both ways with `abla/crypto/rsa` in one program; other sizes
-are refused; and the `openssl` CLI checks the 2048-bit key (consistency, e = 65537, its signature) and that its exports are byte-equal to
-openssl's.
 
 ## Dates: `abla/date`
 
@@ -473,7 +365,7 @@ fun main {
 The current time comes from `utcNow()` in `abla/process/time`
 ([system.md](system.md#time-ablaprocesstime)).
 
-## `abla/tls/hosted`: upgrading streams
+## `abla/tls/pure`: upgrading streams
 
 `tlsUpgrade(connection, host, caPath = "", timeoutMilliseconds = 5000,
 readWriteTimeoutMilliseconds = 30000)` consumes an established `TcpConnection`
@@ -488,10 +380,8 @@ deadline = 0)` on either TCP or Unix. The identity comes from
 `tlsClientIdentityFromPem` or `tlsClientIdentityFromPkcs12`, as with
 `tlsConnectWithIdentity`; the caller may drop it once upgrade returns. The
 nonzero `deadline` is an absolute monotonic millisecond time bounding the
-handshake. The low-level `tlsUpgradeHandle` also accepts either stream type,
-this deadline and explicit identity handles; the ordinary upgrade API keeps
-its existing timeout arguments. Already-configured socket timeouts survive
-client and server upgrades; otherwise the arguments supply handshake and
+handshake. On the client, already-configured socket timeouts survive
+upgrade; otherwise the arguments supply handshake and
 subsequent read/write limits.
 
 `tlsServerUpgrade(connection, certificatePath, privateKeyPath,
@@ -552,8 +442,7 @@ the trust anchor's own fields, the public suffix list), and the test fails when 
 
 ## `abla/tls/pure`: a listener that asks for client certificates
 
-`abla/tls/pure` (TLS 1.3 and the modern subset of 1.2 in Abla, no OpenSSL, no libc) has `tlsListen` as `abla/tls/hosted`
-does, and one call more for mutual TLS:
+`abla/tls/pure` offers a listener that verifies client certificates:
 
 | Function | Result |
 |---|---|

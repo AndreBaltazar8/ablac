@@ -221,12 +221,18 @@ rejected "$cases/type-parameters/bad-main.ab" --flat-imports \
 # entry module that reaches it, and a strict program is told it's internal.
 "$compiler" build "$cases/internal.ab" -o "$output_directory/internal" --flat-imports \
     --visibility-report "$output_directory/internal.tsv" > "$output_directory/internal.out" 2>&1 || true
-grep -F "	OpenSSL_version_num	" "$output_directory/internal.tsv" | grep -F 'import "abla/tls/hosted"' >/dev/null ||
+grep -F "	ablaXmlLiteralScalar	" "$output_directory/internal.tsv" | grep -F 'import "abla/xml/write"' >/dev/null ||
     { echo "strict-imports: the internal name's report line:"; cat "$output_directory/internal.tsv"; exit 1; }
 rejected "$cases/internal.ab" --strict-imports \
-    '`OpenSSL_version_num` is internal to the standard library' \
-    'help: the public module(s) for this: abla/tls/hosted, abla/tls/pure' \
+    '`ablaXmlLiteralScalar` is internal to the standard library' \
+    'help: the public module(s) for this: abla/xml' \
     'help: a library module that offers it would be a change to the standard library to request'
+for module in abla/tls/hosted abla/crypto/hosted; do
+    removed="$output_directory/removed-hosted.ab"
+    printf 'import "%s" as hosted\nfun main: int = 0\n' "$module" > "$removed"
+    rejected "$removed" --strict-imports 'error[E_IMPORT_NOT_FOUND]' \
+        "$module was removed" 'abla/tls/pure' 'migrating-from-tls-hosted.md'
+done
 # The pointer is data in each internal file's header (`// public: <modules>`): every non-entry library file has it, and
 # every module it names is a library module (an entry.ab); `none` says nothing public offers the file.
 internal_count=0

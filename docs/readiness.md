@@ -148,7 +148,6 @@ Security mechanisms and limits: `docs/reliability-roadmap.md`, `docs/constant-ti
     tools/test-tls-faults.sh
     tools/test-tls-fuzz.sh
     tools/test-tls-handles.sh
-    tools/test-tls-hosted-mix.sh
     tools/test-tls-ocsp.sh
     tools/test-tls-pure-interop.sh
     tools/test-tls-pure.sh

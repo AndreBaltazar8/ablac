@@ -28,9 +28,6 @@ run_case() {
 for profile in release fast; do
     flag=()
     [[ $profile == fast ]] && flag=(--fast)
-    "$compiler" build tests/cases/android-pointer-tags/tls.ab -o "$out/tls-$profile" \
-        --no-cache ${flag[@]+"${flag[@]}"}
-    run_case "tls-$profile" 0 "$out/tls-$profile"
     "$compiler" build "$out/$profile-build.ab" -o "$out/$profile-driver" --fast --no-cache
     for entry in values pages descriptor rsa bad_free bad_realloc; do
         llvm-mc -triple aarch64-linux-gnu -filetype=obj "$out/$entry-start.s" -o "$out/$entry-start.o"
@@ -41,4 +38,4 @@ for profile in release fast; do
     done
 done
 [[ $failures == 0 ]] || { echo "tagged pointers: $failures cases failed" >&2; exit 1; }
-echo 'tagged pointers: release/fast, negative TLS handle, TBI loads/GC/page keys/sort/descriptors/RSA and original-tag free passed'
+echo 'tagged pointers: release/fast, TBI loads/GC/page keys/sort/descriptors/RSA and original-tag free passed'

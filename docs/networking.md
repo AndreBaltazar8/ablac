@@ -657,27 +657,17 @@ that way, from its one poller.
 
 `abla/http/tls`, `abla/websocket/tls` and the Xtensa installer's HTTPS stream use `abla/tls/pure`, TLS written in
 Abla with no OpenSSL and no libc: what it supports and refuses is in [TLS in Abla](tls.md). The rest of this section
-describes the calls, which `abla/tls/pure` and `abla/tls/hosted` share.
+describes the public calls.
 
-Client connections of both modules enable peer verification, system trust, SNI, and hostname checks. An explicit
+Client connections enable peer verification, system trust, SNI, and hostname checks. An explicit
 CA-file connector and certificate/private-key listener support local and private PKI deployments. `abla/http/tls` and
 `abla/websocket/tls` provide the HTTPS and WSS client transports, over `abla/tls/pure`.
-
-The hosted module sets, on every context of its own whatever the system's OpenSSL configuration says: TLS 1.2 as the oldest version (a client and a server both),
-no renegotiation in either direction, a host name matched against the certificate's DNS SANs only (never the subject's common name, as `abla/tls/pure`), an IP address
-matched against its IP SANs (and not sent as the server name). A verification failure is a failed connect (handle -1, `tlsLastError()`), never an unverified session;
-[test-tls-hosted-verify.sh](../tools/test-tls-hosted-verify.sh) checks each against `openssl s_server` and `s_client`.
-
-`ablac build` links OpenSSL for a program that uses `abla/tls/hosted`.
-When linking an object emitted with `--emit object` by hand, add
-`-lssl -lcrypto` to the link line. `abla/random/hosted` supplies
-hosted secure random on Linux and macOS.
 
 | Function | Result |
 |---|---|
 | `tlsConnect(host, port = 443, timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` | a verified `TlsConnection`, with `read`, `write` and `close` |
 | `tlsConnectWithCa(host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds)` | the same, trusting the given CA file |
-| `tlsClientIdentityFromPem(certificatePem, keyPem, passphrase = "")`, `tlsClientIdentityFromPkcs12(der, password)` | load a certificate, intermediates and matching private key for mutual TLS. `abla/tls/pure` returns `TlsIdentity` and `abla/tls/hosted` returns `TlsClientIdentity`. Both expose `identity.ok()` and `identity.error`. |
+| `tlsClientIdentityFromPem(certificatePem, keyPem, passphrase = "")`, `tlsClientIdentityFromPkcs12(der, password)` | load a certificate, intermediates and matching private key for mutual TLS. Returns `TlsIdentity`, with `identity.ok()` and `identity.error`. |
 | `tlsConnectWithIdentity(host, identity, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds)` | as `tlsConnect`, presenting the identity, and trusting the CA file if given. Under TLS 1.3 a server's refusal of the certificate shows on the first read, since the handshake has already finished for the client |
 | `tlsUpgrade(var connection, host, caPath = "", timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` | start verified client TLS on an existing TCP or Unix connection; existing socket timeouts survive |
 | `tlsUpgradeWithIdentity(connection, host, identity, ...)` | upgrade while presenting a client identity |
@@ -685,9 +675,9 @@ hosted secure random on Linux and macOS.
 | `connection.setTimeouts(readMilliseconds, writeMilliseconds)` | replace the limits on an open connection (also on a `TcpConnection`); 0 waits as long as it takes |
 | `tlsListen(certificatePath, privateKeyPath, host = "::", port = 443, ...)` | a `TlsListener`, with `accept(handshakeTimeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` |
 | `webSocketServerTls(certificatePath, privateKeyPath, handshakeTimeoutMilliseconds = 5000)` | from `abla/websocket/server/tls`: a `WebSocketServerTls` for `WebSocketServerOptions(tls = ...)` ([TLS](#tls-wss-and-https)); `webSocketServerTlsPem` takes PEM text |
-| `tlsAvailable()`, `tlsLastError()` | whether the backend is available and the calling thread's last TLS error. Availability is always true for pure TLS and checks the linked OpenSSL version for hosted TLS. |
+| `tlsAvailable()`, `tlsLastError()` | whether the backend is available and the calling thread's last TLS error. `tlsAvailable()` returns true. |
 
-Unix upgrades and ownership/deadline details are described in the [stdlib TLS guide](stdlib/security-and-dates.md#ablatlshosted-upgrading-streams).
+Unix upgrades and ownership/deadline details are described in the [stdlib TLS guide](stdlib/security-and-dates.md#ablatlspure-upgrading-streams).
 
 `timeoutMilliseconds` bounds connecting and the handshake. The other limit bounds
 each `read` and each `write` of the open connection, so a peer that goes quiet
@@ -701,14 +691,7 @@ times out leaves the connection unusable.
 of these, and `webSocketTlsClient` for everything except waiting for a frame, which
 a quiet conversation can make as long as it likes.
 
-`TlsConnection.handle` and `TlsListener.handle` contain native control pointers.
-Only `-1` means failed or closed: use `handle == -1`, never a sign check.
-A live Android heap pointer can be negative because its top byte is tagged.
-
-A peer that resets the socket fails the operation that notices it. OpenSSL's
-writes would raise `SIGPIPE`, so `TlsConnection` and `abla/http/async` hold the
-signal around each OpenSSL call, and the thread's mask and the program's handler
-are as they were afterwards: `app | head` still ends the way it did.
+`TlsConnection.handle` and `TlsListener.handle` are `-1` on failure or after close. Use `descriptor()` to get the underlying socket for a poller. A peer that resets the socket fails the operation that notices it. TLS writes use the runtime’s socket send path without raising `SIGPIPE`.
 
 ## Persistent HTTP and streaming
 
@@ -847,8 +830,7 @@ The raw `abla/net` facade remains Linux-specific so a libc-free binary never
 silently acquires hosted dependencies; cross-platform programs select
 `abla/net/hosted`. The bounded DNS client currently implements UDP A/AAAA with
 compression pointers, but not DNSSEC, TCP fallback, IDNA, or a shared cache.
-`abla/tls/pure` runs over the raw socket layer. Select `abla/tls/hosted`
-when you want the OpenSSL backend.
+`abla/tls/pure` runs over the raw socket layer.
 HTTP/2 is a default-on (https) client feature of `abla/http/async` and a server feature of `abla/http/event/tls` (both above); HTTP/3/QUIC, proxy negotiation, and automatic reconnection remain
 separate protocols rather than implicit behavior in the HTTP/1.1 APIs.
 

@@ -80,17 +80,15 @@ pkgs.mkShell {
       export ABLA_XTENSA_LLVM_ROOT="''${ABLA_XTENSA_LLVM_ROOT:-${xtensaCohort}}"
     ''}
     export ABLA_MACOS_CLANG="${llvm.clang-unwrapped}/bin/clang"
+    # Historical seeds and macOS cross-link stubs may still need these libraries.
     export ABLA_LINUX_OPENSSL_LIB="${pkgs.openssl.out}/lib"
     # The libLLVM of the LLVM above. A released compiler is linked to the one its own build had, a store path
     # that this shell may not hold (a new pinned LLVM is another path): the bootstrap's located copy
     # gets this one too (tools/build-self-hosted-current.sh).
     export ABLA_LINUX_LLVM_LIB="${pkgs.lib.getLib llvmTools}/lib"
-    # What links here finds this OpenSSL when it runs. LD_LIBRARY_PATH would do it
-    # too, but it also reaches the host's own tools, whose glibc is another.
-    export NIX_LDFLAGS="-rpath ${pkgs.openssl.out}/lib ''${NIX_LDFLAGS:-}"
     # nixpkgs' linker wrapper also adds this shell's own lib directory (a store path that does not exist and whose hash
     # follows the shell's arguments) to every link's rpath: it made two builds of one source differ in the rpath and the
     # build id. Keep it out so a third party's shell links the same bytes (tools/test-shell-environment.sh).
-    export NIX_LDFLAGS="$(printf '%s' "$NIX_LDFLAGS" | sed "s| -rpath $out/lib||g")"
+    export NIX_LDFLAGS="$(printf ' %s' "''${NIX_LDFLAGS:-}" | sed "s| -rpath $out/lib||g; s|^ ||")"
   '';
 }

@@ -4,25 +4,37 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=${1:-"$project_root/build/ablac"}
 output_directory="$project_root/build/native-library-test"
+fixture="$project_root/tests/cases/native-library-project"
+host=$(uname -s)
 
 mkdir -p "$output_directory"
-"$compiler" build --project \
-    "$project_root/tests/cases/native-library-project" \
-    -o "$output_directory/valid"
-set +e
-"$output_directory/valid"
-status=$?
-set -e
+if [[ $host == Darwin ]]; then
+    library="$output_directory/libabla_native_probe.dylib"
+    clang -dynamiclib -install_name "$library" "$fixture/probe.c" -o "$library"
+else
+    library="$output_directory/libabla_native_probe.so"
+    clang -shared -fPIC "$fixture/probe.c" -o "$library"
+fi
+LIBRARY_PATH="$output_directory${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+    "$compiler" build --project "$fixture" -o "$output_directory/valid" --no-cache
+
+status=0
+if [[ $host == Darwin ]]; then
+    "$output_directory/valid" || status=$?
+else
+    LD_LIBRARY_PATH="$output_directory${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$output_directory/valid" || status=$?
+fi
 if [[ $status -ne 42 ]]; then
     printf 'manifest native-library probe returned %s, expected 42\n' \
         "$status" >&2
     exit 1
 fi
-if [[ $(uname -s) == Darwin ]]; then
-    otool -L "$output_directory/valid" | rg -q '/libssl[.0-9]*\.dylib' || exit 1
+if [[ $host == Darwin ]]; then
+    otool -L "$output_directory/valid" | rg -F "$library" >/dev/null
 else
     llvm-readelf -d "$output_directory/valid" |
-        rg -q 'Shared library: \[libssl' || exit 1
+        rg -F 'Shared library: [libabla_native_probe.so]' >/dev/null
 fi
 
 if "$compiler" build --project \

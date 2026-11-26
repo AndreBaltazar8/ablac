@@ -112,11 +112,8 @@ if command -v git >/dev/null 2>&1; then
     grep -q 'SPDXRef-llvm-windows-x86-64' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM has no Windows LLVM package'
     grep -q 'SPDXRef-nix' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM has no Nix installer package'
     # OpenSSL and the trust roots: the version is the one in the dynamic asset's rpath (NOASSERTION without one), and the roots are declared as not shipped.
-    grep -q '"SPDXID": "SPDXRef-openssl".*"versionInfo": "NOASSERTION"' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM has no OpenSSL package (no version without an rpath)'
     grep -q '"SPDXID": "SPDXRef-trust-roots".*not shipped' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM does not say the trust roots are not shipped'
-    printf 'ELF\0/nix/store/0123456789abcdfghijklmnpqrsvwxyz-openssl-3.5.8/lib:/nix/store/x\n' > "$work/rel/ablac-dynamic-x86_64-linux"
-    (cd "$local_root" && ABLA_RELEASE_SIGNING_KEY_FILE="$work/good" tools/sign-release.sh "$work/rel" --tag v9.9.9) > "$work/out" 2>&1 || { cat "$work/out" >&2; fail 'sign-release.sh failed on a directory with a dynamic asset'; }
-    grep -q '"SPDXID": "SPDXRef-openssl".*"versionInfo": "3.5.8"' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM does not name the OpenSSL of the dynamic asset'
+    ! grep -q SPDXRef-openssl "$work/rel/ablac-9.9.9.spdx.json" || fail "the SBOM still claims an OpenSSL runtime dependency"
     rm -f "$work/rel/ablac-dynamic-x86_64-linux" "$work/rel/SHA256SUMS" "$work/rel/SHA256SUMS.sig"
     (cd "$local_root" && ABLA_RELEASE_SIGNING_KEY_FILE="$work/good" tools/sign-release.sh "$work/rel" --tag v9.9.9) > "$work/out" 2>&1 || { cat "$work/out" >&2; fail 'sign-release.sh failed again'; }
     accepts "$work/rel"

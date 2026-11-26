@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 1xx responses above the blocking clients (plain and TLS) and the async one, against a peer written in Abla (tests/cases/http-interim-peer): every HTTP byte is a literal
-# in its source. Its TLS side is the hosted OpenSSL server (abla/tls/hosted); the client under test is the hosted OpenSSL HTTPS client of abla/http/tls, so both ends of the TLS
+# in its source. Its TLS side is the pure TLS server; the client under test is the pure HTTPS client of abla/http/tls, so both ends of the TLS
 # case are OpenSSL (what the case checks is the handling of 1xx responses above TLS). The plain and async cases use no TLS at all.
 # Every step's output goes to a log under build/http-interim and is printed when the step fails: a failure of this test says what failed. The peer picks its own ports (port 0) and
 # publishes them in a file written atomically, which this script waits for (and for the peer to still be alive); the client program is built once, before the peer starts, and

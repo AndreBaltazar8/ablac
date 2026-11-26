@@ -4,7 +4,7 @@
 #              mid.ab imports): one run adds the three imports, exits 0, and the program then builds and runs; a
 #              second run adds nothing;
 #   --dry-run  lists the first round's additions and changes no file;
-#   ambiguous  tlsAvailable (abla/tls/hosted and abla/tls/pure): no import, the name listed, exit 1;
+#   ambiguous  sqrt (the math modules): no import, the name listed, exit 1;
 #   outside    the program imports ../shared/util.ab, which uses println: a file outside the program's directory is
 #              not changed, the name is listed, exit 1.
 set -euo pipefail
@@ -52,8 +52,8 @@ diff -r "$project_root/tests/cases/fix-imports/app" "$work/app" > /dev/null || f
 fresh ambiguous
 run ambiguous "$work/ambiguous/main.ab"
 [[ $status -eq 1 ]] || fail "ambiguous: exit $status, expected 1" "$work/ambiguous.log"
-grep -q '`tlsAvailable` declared in several standard modules (abla/tls/hosted,abla/tls/pure)' "$work/ambiguous.log" ||
-    fail "ambiguous: tlsAvailable is not listed" "$work/ambiguous.log"
+grep -q '`sqrt` declared in several standard modules' "$work/ambiguous.log" ||
+    fail "ambiguous: sqrt is not listed" "$work/ambiguous.log"
 grep -q '^import' "$work/ambiguous/main.ab" && fail "ambiguous: an import was added" "$work/ambiguous.log"
 
 fresh outside

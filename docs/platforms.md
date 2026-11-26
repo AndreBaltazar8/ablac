@@ -119,8 +119,8 @@ need a different setup.
 
 - `host-runtime.ab` reads `tests/cases/bootstrap/value.ab` relative to
   the repository root. All three images return 42 from that directory.
-- `network-advanced.ab` uses OpenSSL. The native image links shared
-  libraries and the cross links lack target `libssl` and `libcrypto`.
+- `network-advanced.ab` used OpenSSL in this survey. The native image linked shared
+  libraries and the cross links lacked target `libssl` and `libcrypto`.
 - `unsafe-boundary.ab` calls `dlsym`. The native image links a C library
   and the libc-free cross links have no definition for that symbol.
 - `https-loopback.ab` starts its TLS server by executing
@@ -369,8 +369,6 @@ standard library's test programs (`tests/abla-tests.json`), those in
 `programs.txt` run on Windows; the rest of the survey is blocked by:
 signals (`signal-watch.ab` needs `signalfd`: the runtime answers `rt_sigprocmask`
 with an empty mask, and Windows has no POSIX signals to watch);
-the OpenSSL-backed `abla/tls/hosted` (`network-advanced.ab` fails to link
-`OpenSSL_version_num`; the pure TLS of `abla/tls/pure`, which the HTTPS client uses, runs on Windows: see below);
 tests that fork, as they are (`dns-async.ab`, `http-async.ab`, `websocket-server.ab` and `websocket-server-protocol.ab` have thread-based
 copies in `tests/cases/windows`); tests that run POSIX tools
 (`printf`, `sh` in `process-capture.ab`, `host-process-configured.ab`,

@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # #806: the module test programs (tests/cases/modules/*.ab) built --fast for x86-64, AArch64 and RISC-V Linux link no C
 # library. tools/libc-free-programs-allowlist.txt holds the exceptions, one per line, and may only shrink:
-#   <program> x86       an x86-64 build that links libc (it brings a C library: OpenSSL, extern "host", an extern:"c" call, or
-#                       the compiler's own modules, which link libLLVM). These are the by-design cases: tls and network-advanced
-#                       (abla/tls/hosted: OpenSSL), import-alias-externs and unsafe-boundary (the program
-#                       names C functions), and the 13 programs that import src/ (libLLVM in process: the pinned shell's libLLVM is
+#   <program> x86       an x86-64 build that links libc (it brings a C library: extern "host", an extern:"c" call, or
+#                       the compiler's own modules, which link libLLVM). These are the by-design cases: import-alias-externs and unsafe-boundary
+#                       (the program names C functions), and the 13 programs that import src/ (libLLVM in process: the pinned shell's libLLVM is
 #                       dynamic and needs libc; only the compiler itself is built on the static archives, #806 step C, because the
 #                       C library it carries is Abla modules of src/static_libc that a program must contain itself).
 #   nobuild <program>   an x86-64 build that fails (the negative cases, and programs that need a manifest or flags)
-#   nobuild-a64 <program>  builds for x86-64 but not for AArch64 Linux (libLLVM and OpenSSL have no AArch64 build here)
+#   nobuild-a64 <program>  builds for x86-64 but not for AArch64 Linux (libLLVM has no AArch64 build here)
 #   nobuild-rv64 <program>  builds for x86-64 but not for RISC-V Linux
 # A line whose program is now static and building fails the test, so the line gets removed; a new libc link or a new build
 # failure fails it too.

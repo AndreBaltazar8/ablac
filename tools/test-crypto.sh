@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# abla/crypto and abla/crypto/hosted: NIST CAVP and Wycheproof vectors
-# (tests/vectors/crypto), refusals on keys generated here, random inputs compared
-# with the openssl CLI both ways, mutual TLS against `openssl s_server`, and that only
-# the hosted module links OpenSSL. CRYPTO_ROUNDS sets the random rounds (default 40).
-# The ordinary 2048-bit key is generated for this run; weak and PSS keys are public test fixtures.
+# Compare hashing, AES and RSA with the OpenSSL CLI, and exercise mutual TLS with
+# openssl s_server. CRYPTO_ROUNDS sets the random rounds (default 40).
+# The 2048-bit key is generated for this run; the 1024-bit legacy key is a public fixture.
 set -uo pipefail
 
 compiler=${1:-build/ablac}
@@ -27,52 +25,22 @@ server_pid=
 cleanup() { [[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null; }
 trap cleanup EXIT
 
-for program in vectors edge tool; do
-    "$compiler" build "tests/cases/crypto/$program.ab" -o "$out/$program" --fast --no-cache \
-        > "$out/$program.build.log" 2>&1 || { cat "$out/$program.build.log"; exit 2; }
-done
 tool=$out/tool
+"$compiler" build tests/cases/crypto/tool.ab -o "$tool" --fast --no-cache \
+    > "$out/tool.build.log" 2>&1 || { cat "$out/tool.build.log"; exit 2; }
 # This helper generates interop keys; the dedicated keygen test still covers --fast.
 ABLA_TEST_FAST_BUILDS=0 "$compiler" build tests/cases/rsa-keygen/generate.ab -o "$out/generate-rsa" --o1 --no-cache \
     > "$out/generate-rsa.build.log" 2>&1 || { cat "$out/generate-rsa.build.log"; exit 2; }
 
-# --- Vectors ---------------------------------------------------------------------
-if "$out/vectors" tests/vectors/crypto > "$out/vectors.log" 2>&1; then
-    echo "ok   vectors: $(grep -v failures "$out/vectors.log" | tr '\n' ' ')"
-else
-    fail vectors; cat "$out/vectors.log"
-fi
-
-# --- Keys, in every form ---------------------------------------------------------
+# --- Interoperability keys ------------------------------------------------------
 keys=$out/keys
 make_keys() {
     cp tests/vectors/crypto/test-keys/legacy-rsa-1024.pem "$keys/k1024.pem"
-    openssl rsa -in "$keys/k1024.pem" -traditional -out "$keys/k1024-traditional.pem"
-    openssl pkcs8 -topk8 -nocrypt -in "$keys/k1024.pem" -outform DER -out "$keys/k1024.der"
-    openssl rsa -in "$keys/k1024.pem" -traditional -outform DER -out "$keys/k1024-traditional.der"
-    openssl pkcs8 -topk8 -in "$keys/k1024.pem" -passout 'pass:secret words' -out "$keys/k1024-encrypted.pem"
     openssl pkey -in "$keys/k1024.pem" -pubout -out "$keys/spki.pem"
-    openssl pkey -in "$keys/k1024.pem" -pubout -outform DER -out "$keys/spki.der"
-    openssl rsa -in "$keys/k1024.pem" -RSAPublicKey_out -out "$keys/rsapublic.pem"
-    openssl req -x509 -new -key "$keys/k1024.pem" -days 2 -subj /CN=test -sha256 -out "$keys/certificate.pem"
-    openssl x509 -in "$keys/certificate.pem" -outform DER -out "$keys/certificate.der"
-    openssl pkcs12 -export -in "$keys/certificate.pem" -inkey "$keys/k1024.pem" -passout pass:pw -out "$keys/k1024.p12"
-    openssl pkcs12 -export -legacy -in "$keys/certificate.pem" -inkey "$keys/k1024.pem" -passout pass:pw -out "$keys/k1024-legacy.p12"
     "$out/generate-rsa" "$keys/k2048.pem" || return 1
     openssl pkey -in "$keys/k2048.pem" -pubout -out "$keys/k2048-spki.pem"
-    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$keys/ec.pem"
-    openssl pkey -in "$keys/ec.pem" -pubout -out "$keys/ec-spki.pem"
-    cp tests/vectors/crypto/test-keys/rsa-pss-2048.pem "$keys/pss.pem"
-    cp tests/vectors/crypto/test-keys/legacy-rsa-768.pem "$keys/k768.pem"
 }
 make_keys > "$out/keys.log" 2>&1 || { fail "generating keys"; sed 's/^/     /' "$out/keys.log"; exit 1; }
-
-# --- Refusals --------------------------------------------------------------------
-if timeout 120 "$out/edge" "$keys" > "$out/edge.log" 2>&1 < /dev/null; then
-    echo "ok   edge: $(grep -c '^note' "$out/edge.log") note(s): $(grep '^note' "$out/edge.log")"
-else
-    fail "edge (exit $?)"; cat "$out/edge.log"
-fi
 
 # --- Random inputs against the openssl CLI -----------------------------------------
 work=$out/work
@@ -200,7 +168,7 @@ fun main: int = if (sha512("abc").size == 64) 0 else 1
 PROGRAM
 "$compiler" build "$out/portable.ab" -o "$out/portable" --fast --no-cache > "$out/portable.log" 2>&1 || fail "portable build"
 if readelf -d "$out/portable" 2>/dev/null | grep -E 'libcrypto|libssl' >/dev/null; then fail "abla/crypto alone links OpenSSL"; else echo "ok   abla/crypto alone doesn't link OpenSSL"; fi
-readelf -d "$tool" | grep libcrypto >/dev/null && echo "ok   abla/crypto/hosted links OpenSSL" || fail "abla/crypto/hosted doesn't link OpenSSL"
+if readelf -d "$tool" | grep -E 'libssl|libcrypto' >/dev/null; then fail "the crypto and TLS tool links OpenSSL"; fi
 
 key_text=$(sed -n 2p "$keys/k1024.pem")
 if grep -l -F "$key_text" "$out"/*.log > /dev/null 2>&1; then fail "a log holds key material"; else echo "ok   no key material in the logs"; fi
