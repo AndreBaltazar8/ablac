@@ -8146,20 +8146,26 @@ fun bootstrapLlvmEmitFunction(
         bootstrapLlvmDirectResultIsScalar(function) &&
         LLVMGetNamedMetadataNumOperands(backend.module, BOOTSTRAP_LLVM_RECURSIVE_CLASS_ARGUMENT) == 0)
         2 else 0
-    var directlyAllocates = false
-    var allocationInstruction = 0
-    while (allocationInstruction < function.instructions.size) {
-        if (bootstrapLlvmInstructionMayAllocate(
-            function.instructions[allocationInstruction]
-        )) directlyAllocates = true
-        allocationInstruction = allocationInstruction + 1
-    }
-    val pressure = backend.pressureSafePoints && collecting &&
-        (directlyAllocates || bootstrapLlvmHasSpinLoop(function)) &&
-        !runtimeImplementation &&
+    val mayPoll = backend.pressureSafePoints && collecting && !runtimeImplementation &&
         !bootstrapLlvmModuleInitializer(function.name)
+    var directlyAllocates = false
+    var allocationPressure = false
+    if (mayPoll) {
+        for (instruction in function.instructions) {
+            if (bootstrapLlvmInstructionMayAllocate(instruction)) {
+                directlyAllocates = true
+                if (!bootstrapLlvmNativeOmitsPressure(instruction, program, nativeIndex)) {
+                    allocationPressure = true
+                    break
+                }
+            }
+        }
+    }
+    val spin = mayPoll && !allocationPressure && bootstrapLlvmHasSpinLoop(function)
+    val pressure = mayPoll && (allocationPressure || spin)
+    val pressureRootSites = mayPoll && (directlyAllocates || spin)
     // A loop that allocates also runs the safe point on its back edge (see there).
-    val loopSafePoints = bootstrapLlvmLoopSafePoints(function, pressure)
+    val loopSafePoints = bootstrapLlvmLoopSafePoints(function, pressure, program, nativeIndex)
     var rootValues: array<bool> = []
     if (collecting) rootValues = bootstrapLlvmGcRootPlan(
         function, functionIndex, mayCollect, loopSafePoints
@@ -8233,7 +8239,7 @@ fun bootstrapLlvmEmitFunction(
     if (lazy) {
         rootSites = if (lazySites.size > 0) lazySites
             else bootstrapLlvmLazyRootSites(
-                function, functionIndex, mayCollect, pressure, loopSafePoints
+                function, functionIndex, mayCollect, pressureRootSites, loopSafePoints
             )
         lazy = rootSites.size > 0 && !rootSites[0]
     }

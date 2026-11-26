@@ -618,6 +618,21 @@ fun bootstrapLlvmInstructionMayAllocate(
     result
 }
 
+// A noescape native scalar result is already an unboxed value. Keep the
+// conservative collecting-function and root analysis for native re-entry.
+fun bootstrapLlvmNativeOmitsPressure(instruction: BootstrapInstruction,
+    program: BootstrapIrProgram, nativeIndex: BootstrapLlvmNameIndex): bool {
+    if (instruction.opcode != "extern.c" || bootstrapLlvmBlockingNative(instruction) ||
+        bootstrapLlvmEntersGeneratedCode(instruction.text)) return false
+    val native = nativeIndex.find(instruction.text)
+    if (native < 0) return false
+    val declaration = program.natives[native]
+    if (!declaration.isNoEscape || bootstrapLlvmScalarBitWidth(declaration.resultType) == 0) return false
+    // Converting an argument to cstring can allocate a temporary in the Abla heap.
+    for (type in declaration.parameterTypes) if (type == "cstring") return false
+    true
+}
+
 // The C entry points into generated code that runtime implementations call
 // (__ablaRuntimeDispatchClosure, GeneratorStep, ReleaseClosure, DropClosure, and a
 // transaction's attempt).
@@ -869,7 +884,8 @@ fun bootstrapLlvmLoops(function: BootstrapIrFunction): BootstrapLlvmLoops {
 // calls nothing else would reach none however much garbage it made. Only with `pressure`
 // (the function's safe points); every analysis that asks whether an instruction may
 // collect counts these.
-fun bootstrapLlvmLoopSafePoints(function: BootstrapIrFunction, pressure: bool): array<bool> {
+fun bootstrapLlvmLoopSafePoints(function: BootstrapIrFunction, pressure: bool,
+    program: BootstrapIrProgram, nativeIndex: BootstrapLlvmNameIndex): array<bool> {
     val points: array<bool> = []
     val allocations: array<int> = []
     // Instructions that read memory other threads write (an atomic or volatile access), counted the same way.
@@ -880,7 +896,8 @@ fun bootstrapLlvmLoopSafePoints(function: BootstrapIrFunction, pressure: bool): 
     for (instruction in function.instructions) {
         points.append(false)
         allocations.append(allocations[allocations.size - 1] +
-            if (pressure && bootstrapLlvmInstructionMayAllocate(instruction)) 1 else 0)
+            if (pressure && bootstrapLlvmInstructionMayAllocate(instruction) &&
+                !bootstrapLlvmNativeOmitsPressure(instruction, program, nativeIndex)) 1 else 0)
         waits.append(waits[waits.size - 1] +
             if (pressure && pollable && bootstrapLlvmSharedMemoryAccess(instruction)) 1 else 0)
     }
