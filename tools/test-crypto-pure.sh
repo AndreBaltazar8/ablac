@@ -76,6 +76,20 @@ else
     fail aead-random; tail -20 "$out/aead-random.log"
 fi
 
+# AES-GCM's length limit (tests/cases/crypto-pure/gcm-limit.ab): aesGcmLengthValid at its boundary (2^36 - 32 bytes), and every AES-GCM entry point
+# calls it before it encrypts or decrypts (read from the source: a 64 GiB text can't be made here).
+gcm_limit_ok=1
+"$compiler" build "$cases/gcm-limit.ab" -o "$out/gcm-limit" --no-cache --stdlib-internals > "$out/gcm-limit.build.log" 2>&1 || gcm_limit_ok=0
+if [[ $gcm_limit_ok == 1 ]] && "$out/gcm-limit" > "$out/gcm-limit.log" 2>&1 && grep -q '^gcm limit ok$' "$out/gcm-limit.log"; then :; else gcm_limit_ok=0; cat "$out/gcm-limit.build.log" "$out/gcm-limit.log" 2>/dev/null | tail -20; fi
+for entry in aesGcmEncryptWork aesGcmDecryptWork aesGcmSealHw aesGcmOpenWithKey; do
+    body=$(awk -v name="fun $entry(" 'index($0, name) { on = 1 } on { print } on && /^}/ { exit }' stdlib/abla/crypto/aes/entry.ab)
+    if [[ -z $body || $body != *'aesGcmLengthValid('* ]]; then
+        echo "gcm limit: $entry does not call aesGcmLengthValid"
+        gcm_limit_ok=0
+    fi
+done
+if [[ $gcm_limit_ok == 1 ]]; then echo "ok   aes-gcm length limit"; else fail gcm-limit; fi
+
 # Randomness after a fork and ECDSA nonces (tests/cases/crypto-pure/rng-safety.ab): a forked child and its parent draw different bytes from every source of the
 # library (the control, a user-space generator, must be seen duplicated); signing never asks the random source; no private key from a zero, order or failing source.
 if "$out/rng-safety" > "$out/rng-safety.log" 2>&1 && grep -q '^rng safety ok$' "$out/rng-safety.log"; then

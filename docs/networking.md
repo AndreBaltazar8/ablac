@@ -546,6 +546,12 @@ if (result.valid) admit(result.subject) else refuse(result.error)
 | `jwtDecodeUnverified(token)` | the claims as `Json`, **without** checking the signature: for logging only |
 | `jwksCache(url, ...)`, `cache.verify(token, options)` | from `abla/jwt/remote`: a cached, refreshed remote key set |
 
+An ES256 token has two valid signatures: ECDSA takes `(r, s)` and `(r, n - s)`
+alike, as every standard verifier does, so anyone holding a token can make its
+twin without the key. Key replay protection and token revocation on the
+`jti` claim (or the claims), never on the signature bytes or a hash of the
+whole token.
+
 ## DNS and TLS
 
 `abla/dns` encodes bounded A/AAAA queries and parses compressed response names
