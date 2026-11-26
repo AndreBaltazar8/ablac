@@ -9,6 +9,8 @@ import "abla/text"
 import "abla/array"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
+import "abla/sys/linux/random"
+import "abla/fs/secure"
 
 /** The names of the program's `@kernel` functions, in declaration order. */
 fun bootstrapKernelNames(parsed: BootstrapParseResult): array<string> {
@@ -1253,8 +1255,17 @@ fun bootstrapKernelTool(name: string): string {
  *  newer GPUs such as Ada's sm_89), or "" with `failure` set to what went wrong. */
 fun bootstrapKernelCompilePtx(module: string, var failure: array<string>): string {
     val base = processEnvironmentOr("TMPDIR", "/tmp")
-    val directory = Path("$base/abla-kernel-${linuxProcessId()}")
-    if (!directory.createDirectories()) { failure.append("cannot create ${directory.text}"); return "" }
+    // A directory of the compiler's own, made new with a name nobody can guess and mode 0700: a name from the process id in a
+    // shared /tmp could be made beforehand by another user, with kernels.ll or kernels.ptx links to a file of this user's (opt and
+    // llc write through them) or a kernels.ptx of its own that this program would then run on the GPU.
+    val random = secureRandomBytes(16)
+    if (!random.succeeded) { failure.append("no random bytes for a scratch directory"); return "" }
+    var suffix = ""
+    for (byte in random.bytes) suffix = "$suffix${"0123456789abcdef".slice(byte >> 4, (byte >> 4) + 1)}${"0123456789abcdef".slice(byte & 15, (byte & 15) + 1)}"
+    val name = "abla-kernel-$suffix"
+    val parent = secureDirectory(base)
+    if (parent.descriptor < 0 || !parent.createDirectory(name, 0o700)) { failure.append("cannot create $base/$name"); return "" }
+    val directory = Path("$base/$name")
     val source = directory.child("kernels.ll")
     val optimized = directory.child("kernels.bc")
     val output = directory.child("kernels.ptx")
@@ -1304,8 +1315,29 @@ trusted fun bootstrapKernelBuild(parsed: BootstrapParseResult, var program: Boot
             )
         }
     }
+    if (ptx != "") {
+        // Each kernel's parameters, for abla/kernel/cuda's launch to check its arguments against ("// abla-kernel <name> <kinds>").
+        for (name in names) ptx = "$ptx// abla-kernel ${bootstrapKernelSymbol(name)} ${bootstrapKernelSignature(program, name)}\n"
+    }
     bootstrapKernelReplacePtx(program, ptx)
     BootstrapKernelResult("", 0)
+}
+
+/** The parameter kinds of kernel `name`, a letter each: f, w, h and r for an f32, u32, u16 and byte buffer, i for an int, x for an f32,
+ *  ? for any other type. */
+fun bootstrapKernelSignature(program: BootstrapIrProgram, name: string): string {
+    val index = bootstrapKernelFunctionIndex(program, name)
+    var kinds = ""
+    if (index < 0) return "?"
+    val function = program.functions[index]
+    for (position in 0 until function.parameters.size) {
+        val type = if (position < function.parameterTypes.size) function.parameterTypes[position] else "unknown"
+        val buffer = bootstrapKernelBufferType(type)
+        val llvm = bootstrapKernelLlvmType(type)
+        kinds = kinds + (if (buffer == "buffer.f32") "f" else if (buffer == "buffer.u32") "w" else if (buffer == "buffer.u16") "h"
+            else if (buffer == "buffer.u8") "r" else if (llvm == "i64") "i" else if (llvm == "float") "x" else "?")
+    }
+    kinds
 }
 
 /** Whether the program calls kernelPtx() anywhere (only then is the PTX built). */

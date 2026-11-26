@@ -33,6 +33,25 @@ for refused in string:operation:string recursion:recursion:depth result:signatur
         fail "refused-$name: kernel.$rule does not name $detail: $(head -3 "$out/refused-$name.log")"
 done
 
+# The CUDA host types (#1139 area 13): a device and device memory made by hand are refused outside trusted code.
+status=0
+"$compiler" build "$cases/refused-cuda-forge.ab" -o "$out/refused-cuda-forge" --fast --no-cache > "$out/refused-cuda-forge.log" 2>&1 || status=$?
+[[ $status != 0 ]] || fail "refused-cuda-forge built"
+for name in CudaKernelDevice CudaKernelMemory; do
+    grep -q "error\[E_SEMANTIC\]: native\.trust:.*$name" "$out/refused-cuda-forge.log" ||
+        fail "refused-cuda-forge: no native.trust error naming $name: $(head -3 "$out/refused-cuda-forge.log")"
+done
+
+# A shared-memory count that wraps when multiplied by the element size stops the CPU backend (it gave a 4-byte buffer claiming 2^62 + 1 elements).
+"$compiler" build "$cases/shared-count.ab" -o "$out/shared-count" --fast --no-cache > "$out/shared-count.log" 2>&1 ||
+    fail "shared-count did not build: $(head -4 "$out/shared-count.log")"
+status=0
+"$out/shared-count" > "$out/shared-count.out" 2>&1 || status=$?
+[[ $status != 0 ]] && grep -q "shared-count: in range ok" "$out/shared-count.out" &&
+    grep -q "kernelShared: a group's shared memory has 0 to 1048576 elements" "$out/shared-count.out" &&
+    ! grep -q "was accepted" "$out/shared-count.out" ||
+    fail "shared-count: the huge count was not stopped (exit $status): $(head -4 "$out/shared-count.out")"
+
 # The unchecked fast path (#143): refused outside trusted code, and stopped on the CPU backend past the end.
 status=0
 "$compiler" build "$cases/refused-unchecked.ab" -o "$out/refused-unchecked" --fast --no-cache > "$out/refused-unchecked.log" 2>&1 ||
@@ -69,7 +88,8 @@ if [[ -n $library ]]; then
             grep -q "on the GPU and the CPU true" "$out/kernel-cuda.out" &&
             grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" &&
             grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" &&
-            grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" ||
+            grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" &&
+            grep -q "launch guards: .* true" "$out/kernel-cuda.out" && grep -q "edge indices: .* true" "$out/kernel-cuda.out" ||
             fail "kernel-cuda: $(cat "$out/kernel-cuda.out")"
         cuda="vadd, the NVFP4 and Q8_0 matvecs (and Q8_0 on the unchecked fast path), rmsnorm (shared memory, barriers), kernelExp and the buffer edges agree on the GPU and the CPU"
     fi

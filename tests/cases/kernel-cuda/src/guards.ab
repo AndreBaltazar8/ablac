@@ -1,0 +1,92 @@
+// CudaKernelDevice.launch refuses what would let a program read or write device memory it does not own, or make the driver read host
+// memory past the argument list (#1139 area 13): arguments that are not the kernel's parameters in number and kind, a buffer whose
+// memory was dropped, a launch on a closed device. Each case runs on its own device (a refused launch leaves the device with its error).
+import "abla/kernel"
+import "abla/kernel/cuda"
+import "abla/io"
+import "abla/text"
+
+/** A buffer of `memory` after the memory is dropped (the buffer value outlives it; a launch must not). */
+trusted fun staleBuffer(var device: CudaKernelDevice): KernelF32Buffer {
+    val memory = device.allocate(4096)
+    if (memory == null) return KernelF32Buffer(0, 0)
+    memory.floats()
+}
+
+/** Whether `device` refused the last launch for a reason containing `reason`. */
+fun refusedFor(device: CudaKernelDevice, launched: bool, reason: string): bool = !launched && device.error.contains(reason)
+
+/** The number of guard cases that gave the wrong answer; prints each. */
+trusted fun guardCases(): int {
+    var wrong = 0
+    // Too few arguments: the driver would read the missing pointers from beyond the argument list.
+    var few = cudaKernelDevice()
+    val fewMemory = few.allocate(4096)
+    if (fewMemory == null || !refusedFor(few, few.launch("vadd", 1, 32, cudaKernelArguments().buffer(fewMemory.floats())), "takes parameters")) {
+        println("guards: a launch with too few arguments was not refused: ${few.error}")
+        wrong += 1
+    }
+    // Integers where buffers go: a made-up address and count in place of memory this program owns.
+    var forged = cudaKernelDevice()
+    val forgedMemory = forged.allocate(4096)
+    if (forgedMemory == null) { println("guards: ${forged.error}"); return wrong + 1 }
+    val live = forgedMemory.floats()
+    val forgedArguments = cudaKernelArguments().buffer(live).buffer(live).integer(live.address).integer(1000000).integer(8)
+    if (!refusedFor(forged, forged.launch("vadd", 1, 32, forgedArguments), "takes parameters")) {
+        println("guards: integers in place of a buffer were not refused: ${forged.error}")
+        wrong += 1
+    }
+    // A byte buffer where the kernel takes f32 elements: its count would be read as four times as many elements.
+    var typed = cudaKernelDevice()
+    val typedMemory = typed.allocate(4096)
+    if (typedMemory == null) { println("guards: ${typed.error}"); return wrong + 1 }
+    val typedArguments = cudaKernelArguments().buffer(typedMemory.raw()).buffer(typedMemory.floats()).buffer(typedMemory.floats()).integer(8)
+    if (!refusedFor(typed, typed.launch("vadd", 1, 32, typedArguments), "takes parameters")) {
+        println("guards: a byte buffer for an f32 buffer was not refused: ${typed.error}")
+        wrong += 1
+    }
+    // A buffer whose memory is gone.
+    var stale = cudaKernelDevice()
+    // (memory made first stays live; the driver gives a freed address to the next allocation, so a stale buffer made before it could land inside it)
+    val keep = stale.allocate(4096)
+    if (keep == null) { println("guards: ${stale.error}"); return wrong + 1 }
+    val gone = staleBuffer(stale)
+    if (!refusedFor(stale, stale.launch("vadd", 1, 32, cudaKernelArguments().buffer(gone).buffer(keep.floats()).buffer(keep.floats()).integer(8)),
+        "not inside live memory")) {
+        println("guards: a buffer of dropped memory was not refused: ${stale.error}")
+        wrong += 1
+    }
+    // A buffer longer than its memory (a view the program made up past the end of a live allocation).
+    var long = cudaKernelDevice()
+    val longMemory = long.allocate(4096)
+    if (longMemory == null) { println("guards: ${long.error}"); return wrong + 1 }
+    val whole = longMemory.floats()
+    val past = KernelF32Buffer(whole.address, whole.count + 1)
+    if (!refusedFor(long, long.launch("vadd", 1, 32, cudaKernelArguments().buffer(past).buffer(whole).buffer(whole).integer(8)),
+        "not inside live memory")) {
+        println("guards: a buffer longer than its memory was not refused: ${long.error}")
+        wrong += 1
+    }
+    // The right arguments launch, and a closed device refuses everything (and closes twice without harm).
+    var good = cudaKernelDevice()
+    val goodMemory = good.allocate(4096)
+    if (goodMemory == null) { println("guards: ${good.error}"); return wrong + 1 }
+    val buffer = goodMemory.floats()
+    if (!good.launch("vadd", 1, 32, cudaKernelArguments().buffer(buffer).buffer(buffer).buffer(buffer).integer(8))) {
+        println("guards: a valid launch failed: ${good.error}")
+        wrong += 1
+    }
+    good.close()
+    good.close()
+    if (good.ready() || good.launch("vadd", 1, 32, cudaKernelArguments().buffer(buffer).buffer(buffer).buffer(buffer).integer(8)) ||
+        good.allocate(16) != null) {
+        println("guards: a closed device was still used")
+        wrong += 1
+    }
+    few.close()
+    forged.close()
+    typed.close()
+    stale.close()
+    long.close()
+    wrong
+}

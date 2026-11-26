@@ -3,6 +3,8 @@
 // nativeLibraries = ["cuda"]. No CUDA toolkit is needed: the driver compiles the PTX for the GPU it finds.
 import "abla/kernel"
 import "abla/float"
+import "abla/text"
+import "abla/array"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
@@ -24,29 +26,77 @@ private trusted noescape extern:"c" fun cuLaunchKernel(
     stream: i64*, params: i64*, extra: i64*
 ): i32
 
-/** A CUDA device with the program's kernels loaded: `error` says what the last failed call was. */
+// What this module has made and not yet released, which no other code can write: the contexts (one entry each) and the device
+// allocations (a context, an address and a size each). A device or memory value is only a record of these, and a record
+// that code could build or change by hand is not believed: every driver call and every launch checks it against these lists
+// (an address a program made up, a context closed already, a buffer whose memory was dropped).
+private val cudaOpenContexts: array<int> = []
+private val cudaLiveMemory: array<int> = []
+
+/** A CUDA device with the program's kernels loaded: `error` says what the last failed call was. Only cudaKernelDevice makes one. */
+@__abla_trusted_only("error: get a device from cudaKernelDevice(); a hand-made one would send the driver calls to a context of your choosing")
 class CudaKernelDevice(val context: int, val module: int, var error: string)
 
-/** Device memory of `bytes` bytes at `address` on `device`; freed when dropped. */
+/** Device memory of `bytes` bytes at `address` on `device`; freed when dropped. Only CudaKernelDevice.allocate makes one. */
+@__abla_trusted_only("error: get memory from CudaKernelDevice.allocate(); a hand-made one would free or hand a kernel an address of your choosing")
 resource class CudaKernelMemory(val device: CudaKernelDevice, val address: int, val bytes: int) {
-    /** Frees the device memory (cuMemFree). */
+    /** Frees the device memory (cuMemFree) and forgets it: a buffer made from it no longer launches. */
     trusted fun drop(): void {
-        cuMemFree_v2(u64(this.address))
+        if (cudaForgetMemory(this.device.context, this.address, this.bytes)) cuMemFree_v2(u64(this.address))
         return
     }
 }
 
+/** Removes the allocation (`context`, `address`, `bytes`) from the live list; false when it is not there (made by hand, freed already, or its context closed). */
+private fun cudaForgetMemory(context: int, address: int, bytes: int): bool {
+    var index = 0
+    while (index + 2 < cudaLiveMemory.size) {
+        if (cudaLiveMemory[index] == context && cudaLiveMemory[index + 1] == address && cudaLiveMemory[index + 2] == bytes) {
+            cudaLiveMemory[index] = cudaLiveMemory[cudaLiveMemory.size - 3]
+            cudaLiveMemory[index + 1] = cudaLiveMemory[cudaLiveMemory.size - 2]
+            cudaLiveMemory[index + 2] = cudaLiveMemory[cudaLiveMemory.size - 1]
+            cudaLiveMemory.removeLast()
+            cudaLiveMemory.removeLast()
+            cudaLiveMemory.removeLast()
+            return true
+        }
+        index += 3
+    }
+    false
+}
+
+/** Whether bytes `address` to `address + bytes - 1` are inside one live allocation of `context`. */
+private fun cudaMemoryHolds(context: int, address: int, bytes: int): bool {
+    if (bytes < 0 || address < 0) return false
+    var index = 0
+    while (index + 2 < cudaLiveMemory.size) {
+        val start = cudaLiveMemory[index + 1]
+        val size = cudaLiveMemory[index + 2]
+        if (cudaLiveMemory[index] == context && address >= start && address - start <= size && bytes <= size - (address - start)) return true
+        index += 3
+    }
+    false
+}
+
+// The memory as a kernel's buffer, of the whole allocation (an empty one, address 0, when the memory is not a live allocation of an open
+// device). A buffer outlives its memory as a value, but not as a launch argument: CudaKernelDevice.launch refuses one whose bytes are
+// no longer inside a live allocation (a device allocation is freed when its memory is dropped).
+
 /** The memory as a kernel's f32 buffer (bytes / 4 elements). */
-trusted fun CudaKernelMemory.floats(): KernelF32Buffer = KernelF32Buffer(this.address, this.bytes / 4)
+trusted fun CudaKernelMemory.floats(): KernelF32Buffer =
+    if (cudaMemoryHolds(this.device.context, this.address, this.bytes)) KernelF32Buffer(this.address, this.bytes / 4) else KernelF32Buffer(0, 0)
 
 /** The memory as a kernel's u32 buffer (bytes / 4 elements). */
-trusted fun CudaKernelMemory.words(): KernelU32Buffer = KernelU32Buffer(this.address, this.bytes / 4)
+trusted fun CudaKernelMemory.words(): KernelU32Buffer =
+    if (cudaMemoryHolds(this.device.context, this.address, this.bytes)) KernelU32Buffer(this.address, this.bytes / 4) else KernelU32Buffer(0, 0)
 
 /** The memory as a kernel's u16 buffer (bytes / 2 elements). */
-trusted fun CudaKernelMemory.halves(): KernelU16Buffer = KernelU16Buffer(this.address, this.bytes / 2)
+trusted fun CudaKernelMemory.halves(): KernelU16Buffer =
+    if (cudaMemoryHolds(this.device.context, this.address, this.bytes)) KernelU16Buffer(this.address, this.bytes / 2) else KernelU16Buffer(0, 0)
 
 /** The memory as a kernel's byte buffer. */
-trusted fun CudaKernelMemory.raw(): KernelU8Buffer = KernelU8Buffer(this.address, this.bytes)
+trusted fun CudaKernelMemory.raw(): KernelU8Buffer =
+    if (cudaMemoryHolds(this.device.context, this.address, this.bytes)) KernelU8Buffer(this.address, this.bytes) else KernelU8Buffer(0, 0)
 
 /** Whether the driver call answered `status` 0; else records `call` and the status in `device`. */
 private fun cudaKernelOk(var device: CudaKernelDevice, status: i32, call: string): bool {
@@ -67,6 +117,7 @@ trusted fun cudaKernelDevice(ordinal: int = 0): CudaKernelDevice {
     val ptx = kernelPtx()
     if (ptx == "") {
         failed.error = "the program has no @kernel function"
+        cuCtxDestroy_v2(context.load())
         return failed
     }
     val module = nativePointerCell(nativeNullPointer())
@@ -74,42 +125,57 @@ trusted fun cudaKernelDevice(ordinal: int = 0): CudaKernelDevice {
         cuCtxDestroy_v2(context.load())
         return failed
     }
-    CudaKernelDevice(nativePointerAddress(context.load()), nativePointerAddress(module.load()), "")
+    val made = CudaKernelDevice(nativePointerAddress(context.load()), nativePointerAddress(module.load()), "")
+    cudaOpenContexts.append(made.context)
+    made
 }
 
-/** Whether the device is usable (its `error` is ""). */
-fun CudaKernelDevice.ready(): bool = this.error == "" && this.context != 0
+/** Whether the device is usable: no error, and its context was made by cudaKernelDevice and is not closed. */
+fun CudaKernelDevice.ready(): bool {
+    if (this.error != "" || this.context == 0) return false
+    for (open in cudaOpenContexts) if (open == this.context) return true
+    false
+}
 
 /** `bytes` bytes of device memory, or null (the reason in `error`). */
 trusted fun CudaKernelDevice.allocate(bytes: int): CudaKernelMemory? {
+    if (!this.ready()) return null
     val address = nativeI64Cell(0)
     if (bytes <= 0 || !cudaKernelOk(this, cuMemAlloc_v2(address.address, u64(bytes)), "cuMemAlloc")) return null
+    cudaLiveMemory.append(this.context)
+    cudaLiveMemory.append(address.load())
+    cudaLiveMemory.append(bytes)
     CudaKernelMemory(this, address.load(), bytes)
 }
 
 /** Copies all of `data` (at most the memory's size) to the start of `memory`. */
 trusted fun CudaKernelDevice.upload(memory: CudaKernelMemory, data: NativeByteBuffer): bool {
+    if (!this.ready() || !cudaMemoryHolds(this.context, memory.address, memory.bytes)) return false
     val bytes = if (data.capacity < memory.bytes) data.capacity else memory.bytes
     cudaKernelOk(this, cuMemcpyHtoD_v2(u64(memory.address), data.address, u64(bytes)), "cuMemcpyHtoD")
 }
 
 /** Copies the start of `memory` into all of `data` (at most the memory's size); waits for the launches before it. */
 trusted fun CudaKernelDevice.download(memory: CudaKernelMemory, var data: NativeByteBuffer): bool {
+    if (!this.ready() || !cudaMemoryHolds(this.context, memory.address, memory.bytes)) return false
     val bytes = if (data.capacity < memory.bytes) data.capacity else memory.bytes
     cudaKernelOk(this, cuMemcpyDtoH_v2(data.address, u64(memory.address), u64(bytes)), "cuMemcpyDtoH")
 }
 
 /** The parameters of one launch, in the kernel's order: a buffer is its address and its element count, an int is 64 bits,
- *  an f32 32 bits (each in an 8-byte slot, as cuLaunchKernel reads them). */
-class CudaKernelArguments(val words: array<int>)
+ *  an f32 32 bits (each in an 8-byte slot, as cuLaunchKernel reads them). `kinds` has one letter per parameter (f f32 buffer, w u32
+ *  buffer, h u16 buffer, r byte buffer, i int, x f32); launch checks it against the kernel's own parameters, which the compiler
+ *  writes into the PTX, so an argument of the wrong kind or number is refused before the driver reads it. */
+class CudaKernelArguments(val words: array<int>, var kinds: string)
 
 /** An empty parameter list. */
-fun cudaKernelArguments(): CudaKernelArguments = CudaKernelArguments([])
+fun cudaKernelArguments(): CudaKernelArguments = CudaKernelArguments([], "")
 
 /** Adds an f32 buffer parameter. */
 fun CudaKernelArguments.buffer(buffer: KernelF32Buffer): CudaKernelArguments {
     this.words.append(buffer.address)
     this.words.append(buffer.count)
+    this.kinds = "${this.kinds}f"
     this
 }
 
@@ -117,6 +183,7 @@ fun CudaKernelArguments.buffer(buffer: KernelF32Buffer): CudaKernelArguments {
 fun CudaKernelArguments.buffer(buffer: KernelU32Buffer): CudaKernelArguments {
     this.words.append(buffer.address)
     this.words.append(buffer.count)
+    this.kinds = "${this.kinds}w"
     this
 }
 
@@ -124,6 +191,7 @@ fun CudaKernelArguments.buffer(buffer: KernelU32Buffer): CudaKernelArguments {
 fun CudaKernelArguments.buffer(buffer: KernelU16Buffer): CudaKernelArguments {
     this.words.append(buffer.address)
     this.words.append(buffer.count)
+    this.kinds = "${this.kinds}h"
     this
 }
 
@@ -131,26 +199,70 @@ fun CudaKernelArguments.buffer(buffer: KernelU16Buffer): CudaKernelArguments {
 fun CudaKernelArguments.buffer(buffer: KernelU8Buffer): CudaKernelArguments {
     this.words.append(buffer.address)
     this.words.append(buffer.count)
+    this.kinds = "${this.kinds}r"
     this
 }
 
 /** Adds an int parameter. */
 fun CudaKernelArguments.integer(value: int): CudaKernelArguments {
     this.words.append(value)
+    this.kinds = "${this.kinds}i"
     this
 }
 
 /** Adds an f32 parameter. */
 fun CudaKernelArguments.float(value: f32): CudaKernelArguments {
     this.words.append(int(f32ToBits(value)))
+    this.kinds = "${this.kinds}x"
     this
 }
 
-/** Runs kernel `name` over `groups` (x) by `groupsY` (y) groups of `groupSize` threads with `arguments`, and waits for it. */
+/** The parameter kinds the compiler wrote for kernel `name` into the PTX ("// abla-kernel <name> <kinds>"), or "?" when there is none. */
+private fun cudaKernelSignature(name: string): string {
+    val prefix = "// abla-kernel $name "
+    for (line in kernelPtx().split("\n")) {
+        if (line.startsWith(prefix)) return line.slice(prefix.size, line.size).trim()
+    }
+    "?"
+}
+
+/** Why `arguments` do not fit kernel `name` on `device` (not the kernel's parameters in number or kind, or a buffer not inside live device
+ *  memory of this device), or "" when they do. */
+private fun cudaKernelArgumentProblem(device: CudaKernelDevice, name: string, arguments: CudaKernelArguments): string {
+    val signature = cudaKernelSignature(name)
+    if (signature == "?") return "no kernel named $name in the program's PTX"
+    if (signature != arguments.kinds) return "kernel $name takes parameters '$signature' (f/w/h/r buffers, i int, x f32), not '${arguments.kinds}'"
+    var word = 0
+    for (kind in signature) {
+        if (kind == 105 || kind == 120) {
+            word += 1
+        } else {
+            val size = if (kind == 114) 1 else if (kind == 104) 2 else 4
+            if (word + 1 >= arguments.words.size) return "kernel $name: a buffer argument is missing its count"
+            val address = arguments.words[word]
+            val count = arguments.words[word + 1]
+            // An empty buffer (count 0) is never read or written, whatever its address.
+            if (count < 0 || count > 2305843009213693951 || (count > 0 && !cudaMemoryHolds(device.context, address, count * size))) {
+                return "kernel $name: a buffer argument is not inside live memory of this device (freed, from another device, or made up)"
+            }
+            word += 2
+        }
+    }
+    if (word != arguments.words.size) return "kernel $name: the argument words do not match their kinds"
+    ""
+}
+
+/** Runs kernel `name` over `groups` (x) by `groupsY` (y) groups of `groupSize` threads with `arguments`, and waits for it. The arguments
+ *  must be the kernel's parameters in kind and number, each buffer inside live memory of this device (else false, the reason in `error`). */
 trusted fun CudaKernelDevice.launch(name: string, groups: int, groupSize: int, arguments: CudaKernelArguments, groupsY: int = 1): bool {
     if (!this.ready()) return false
     if (groups < 1 || groups > 2147483647 || groupsY < 1 || groupsY > 65535 || groupSize < 1 || groupSize > 1024) {
         this.error = "a launch has 1 to 2^31 - 1 by 1 to 65535 groups of 1 to 1024 threads"
+        return false
+    }
+    val problem = cudaKernelArgumentProblem(this, name, arguments)
+    if (problem != "") {
+        this.error = problem
         return false
     }
     val function = nativePointerCell(nativeNullPointer())
@@ -175,7 +287,27 @@ trusted fun CudaKernelDevice.launch(name: string, groups: int, groupSize: int, a
 
 /** Unloads the kernels and destroys the context. */
 trusted fun CudaKernelDevice.close(): void {
+    if (!this.ready()) return
+    // The context goes first from the open list, so a second close, or a launch or allocation on this device, finds it closed; its
+    // allocations go with it (the driver frees them with the context).
+    var kept: array<int> = []
+    var index = 0
+    while (index + 2 < cudaLiveMemory.size) {
+        if (cudaLiveMemory[index] != this.context) {
+            kept.append(cudaLiveMemory[index])
+            kept.append(cudaLiveMemory[index + 1])
+            kept.append(cudaLiveMemory[index + 2])
+        }
+        index += 3
+    }
+    while (cudaLiveMemory.size > 0) cudaLiveMemory.removeLast()
+    for (word in kept) cudaLiveMemory.append(word)
+    var open: array<int> = []
+    for (context in cudaOpenContexts) if (context != this.context) open.append(context)
+    while (cudaOpenContexts.size > 0) cudaOpenContexts.removeLast()
+    for (context in open) cudaOpenContexts.append(context)
     if (this.module != 0) cuModuleUnload(nativePointerFromAddress(this.module))
-    if (this.context != 0) cuCtxDestroy_v2(nativePointerFromAddress(this.context))
+    cuCtxDestroy_v2(nativePointerFromAddress(this.context))
+    this.error = "the device is closed"
     return
 }
