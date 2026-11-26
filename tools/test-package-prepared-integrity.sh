@@ -52,6 +52,22 @@ tamper_marker() {
     git --git-dir="$scratch" write-tree > "$app/.abla/packages/dep/digest"
 }
 
+# A copy that hashed to the digest is recorded by its files' status-change times, so later builds need not hash it (a copy younger
+# than two seconds is not recorded). An edit of the same size with the modification time set back is still a change.
+check fresh main.ab
+sleep 3
+check settled main.ab
+ls "$ABLA_PACKAGE_CACHE"/verified/* > /dev/null 2>&1 || fail 'a settled prepared copy left no fingerprint record'
+file=$app/.abla/packages/dep/source/src/dep.ab
+old=$(stat -c %y "$file")
+sleep 1
+echo 'fun depValue(): int = 2' > "$file"
+touch -d "$old" "$file"
+[ "$(stat -c %y "$file")" = "$old" ] || fail 'touch -d did not restore the modification time'
+# Older than the two seconds a fingerprint ignores: only the status-change time tells this copy from the recorded one.
+sleep 3
+check same-size-touched main.ab
+
 tamper; check single main.ab
 tamper; check project --project .
 tamper_marker; check single-marker main.ab

@@ -10,6 +10,8 @@ import "abla/integer"
 import "abla/process/signal"
 import "sema.ab"
 import "abla/text"
+import "ct_tier.ab"
+import "abla/array"
 
 // Import providers are evaluated above the module parser. Ordinary builds use
 // only stable source identity plus abla.lock; `package update` alone invokes a
@@ -1553,11 +1555,54 @@ fun bootstrapPackageCheckoutValid(
 // locked revision and digest, and its files hash to that digest. An import reads the copy, so the markers alone prove
 // nothing: a restored CI cache, a commit of .abla or a compile-time write can change the files and leave them. A copy made
 // from a vendored tree holds its two marker files, which `fromVendor` leaves out of the digest.
-fun bootstrapPackagePreparedValid(packageRoot: string, package: BootstrapLockedPackage, fromVendor: bool): bool =
-    Path("$packageRoot/revision").readText() == package.revision &&
-        Path("$packageRoot/digest").readText() == package.digest &&
-        Path("$packageRoot/source").info().isDirectory() &&
-        bootstrapPackageDirectoryDigest("$packageRoot/source", fromVendor) == package.digest
+// Hashing every copy on every build costs about 60 ms per package of a few hundred files, so a copy that hashed to the digest is
+// recorded by its fingerprint (bootstrapPackageTreeFingerprint) in the package cache, and a later build whose copy has the same
+// fingerprint skips the hash.
+fun bootstrapPackagePreparedValid(packageRoot: string, package: BootstrapLockedPackage, fromVendor: bool): bool {
+    val source = "$packageRoot/source"
+    if (Path("$packageRoot/revision").readText() != package.revision || Path("$packageRoot/digest").readText() != package.digest ||
+        !Path(source).info().isDirectory()) return false
+    val absolute = if (Path(source).isAbsolute()) source else currentDirectory().child(source).text
+    val record = Path(bootstrapPackageCacheRoot()).child("verified").child(ctContentKey("$absolute\n${package.digest}\n$fromVendor"))
+    // Taken before the hash: a file changed while it is hashed fails the hash, or changes the fingerprint after it.
+    val fingerprint = bootstrapPackageTreeFingerprint(source)
+    if (fingerprint != "" && record.readText() == fingerprint) return true
+    if (bootstrapPackageDirectoryDigest(source, fromVendor) != package.digest) return false
+    if (fingerprint != "" && record.parent().createDirectories()) record.writeTextAtomic(fingerprint)
+    true
+}
+
+// What a prepared copy's files are on this file system: each entry below `source` but the top .git (which the digest leaves out),
+// as its path, kind, size, inode and modification and status-change times. Any write, chmod, rename or replacement of an entry
+// moves its status-change time, which no ordinary user can set back (a modification time can be, with touch -d), and a new inode
+// comes with a new file. "" when the copy cannot be fingerprinted: a time or inode is unavailable (Windows), there are more than
+// 50,000 entries, or an entry changed in the last two seconds (a file system's coarse clock could give a second change in the same
+// tick the same time).
+fun bootstrapPackageTreeFingerprint(source: string): string {
+    val lines: array<string> = []
+    val pending: array<string> = [""]
+    val recent = linuxRealtimeNanoseconds() - 2000000000
+    var valid = true
+    while (valid && pending.size > 0) {
+        val relative = pending[pending.size - 1]
+        pending.removeLast()
+        val directory = if (relative == "") Path(source) else Path(source).child(relative)
+        for (entry in directory.entries()) {
+            val name = entry.name()
+            val path = if (relative == "") name else "$relative/$name"
+            if (path == ".git") continue
+            val info = entry.linkInfo()
+            if (!info.exists() || info.inode == 0 || info.changed == 0 || info.changed > recent || lines.size >= BOOTSTRAP_PACKAGE_TREE_MAX_FILES) {
+                valid = false
+                break
+            }
+            lines.append("${info.kind} ${info.size} ${info.inode} ${info.revision} ${info.changed} $path")
+            if (info.isDirectory()) pending.append(path)
+        }
+    }
+    if (!valid) return ""
+    "abla-prepared-fingerprint-v1\n${lines.join("\n")}\n"
+}
 
 fun bootstrapPackageValidateCapabilityPolicy(
     projectRoot: string,
