@@ -167,6 +167,22 @@ fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameter
         return false
     }
     if (kind == "integer" || kind == "float" || kind == "true" || kind == "false") return true
+    // A block of immutable scalar locals and a scalar result: each `val` is a new name (no shadowing) of inferred type (a written type is
+    // an occurrence of its own, left to full typing), initialized from the parameters and the locals before it.
+    if (kind == "block" && expression.children.size > 1) {
+        val scope: array<string> = []
+        for (name in parameters) scope.append(name)
+        for (index in 0 until expression.children.size - 1) {
+            val statement = expression.children[index]
+            if (statement.kind != "local.val" || statement.children.size != 2 || statement.children[1].kind != "type") return false
+            val declared = statement.children[1].text
+            if (declared != "inferred") return false
+            for (name in scope) if (name == statement.text) return false
+            if (!bootstrapAnalysisScalarExpression(statement.children[0], scope, depth + 1, calls)) return false
+            scope.append(statement.text)
+        }
+        return bootstrapAnalysisScalarExpression(expression.children[expression.children.size - 1], scope, depth + 1, calls)
+    }
     val arity = if (kind == "if") 3
         else if (kind == "block" || kind == "unary-" || kind == "unary!") 1
         else if (kind == "+" || kind == "-" || kind == "*" || kind == "<" || kind == ">" ||
@@ -273,6 +289,14 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
         bootstrapAnalysisScalarCallNames(old.declarations[0].expression, candidates)
         bootstrapAnalysisScalarCallNames(body, candidates)
         if (candidates.has(declaration.name)) return null
+        // A local named like a function the body calls, or like the function itself, leaves the call's target to the full checker.
+        // The locals are the document's symbols too: an edit that adds, removes or renames one rebuilds them through full typing.
+        val oldLocals: Map<string, int> = Map()
+        val locals: Map<string, int> = Map()
+        bootstrapAnalysisScalarLocalNames(old.declarations[0].expression, oldLocals)
+        bootstrapAnalysisScalarLocalNames(body, locals)
+        if (!bootstrapAnalysisReplayStrings(oldLocals.keys(), locals.keys())) return null
+        for (name in locals.keys()) if (candidates.has(name) || name == declaration.name) return null
         candidates.set(declaration.name, 0)
         // Require exactly one global candidate for each spelling and no
         // operator selection. A generic or alias owner could name a scalar.
@@ -409,7 +433,9 @@ fun bootstrapAnalysisReplayScalarOccurrence(old: BootstrapAnalysisOccurrenceSet,
         if (!inserted && (atEnd || old.begins[index] >= change.at)) {
             for (item in 0 until fresh.begins.size) {
                 if (fresh.begins[item] < change.at || fresh.begins[item] >= newEnd) continue
-                if (fresh.ends[item] > newEnd || fresh.ids[item] == "" || (requireTypes && fresh.types[item] == "")) return null
+                // A local's own name carries no type in any analysis (the full one neither): it is the binding, not a typed expression.
+                if (fresh.ends[item] > newEnd || fresh.ids[item] == "" ||
+                    (requireTypes && fresh.types[item] == "" && !fresh.ids[item].contains("/local:"))) return null
                 begins.append(fresh.begins[item])
                 ends.append(fresh.ends[item])
                 ids.append(fresh.ids[item])
@@ -442,4 +468,11 @@ fun bootstrapAnalysisBodyStart(text: string, begin: int): int {
     if (cursor == 0 || text[cursor - 1] != 61 || cursor == begin) return begin
     while (cursor < begin && (text[cursor] == 32 || text[cursor] == 9)) cursor = cursor + 1
     cursor
+}
+
+/** The names of the `val` locals in `expression`. */
+fun bootstrapAnalysisScalarLocalNames(expression: BootstrapExpression, var names: Map<string, int>): void {
+    if (expression.kind == "local.val") names.set(expression.text, 0)
+    for (child in expression.children) bootstrapAnalysisScalarLocalNames(child, names)
+    return
 }
