@@ -1,8 +1,20 @@
-# Produce a real Windows compiler for local Wine validation.
+# Produce a real Windows compiler for local Wine validation, or, with crt_inventory, measure the C runtime it links
+# (docs/design/windows-crt-free-compiler.md: a link map, the CRT archive members and leave-one-out links; ablac.exe itself
+# is linked as without it).
 name: Windows compiler link
 
 on:
   workflow_dispatch:
+    inputs:
+      architecture:
+        description: 'x64 (windows-latest) or arm64 (windows-11-arm)'
+        type: choice
+        options: [x64, arm64]
+        default: x64
+      crt_inventory:
+        description: 'Also run the C runtime inventory links and upload their map, logs and summary'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,6 +28,7 @@ jobs:
       ABLA_NATIVE_JOBS: '4'
       ABLA_CODEGEN_JOBS: '4'
       ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1200'
+      TARGET: ${{ inputs.architecture == 'arm64' && 'aarch64-windows' || 'x86_64-windows-hosted' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -26,7 +39,7 @@ jobs:
       - name: Build the bootstrap compiler and emit the Windows COFF object
         run: |
           nix-shell shell.nix --run 'make ablac'
-          nix-shell shell.nix --run 'tools/windows/cross-compiler-object.sh build/ablac src/orc_windows_main.ab build/windows-compiler-coff'
+          nix-shell shell.nix --run 'tools/windows/cross-compiler-object.sh build/ablac src/orc_windows_main.ab build/windows-compiler-coff "$TARGET"'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-compiler-coff
@@ -39,8 +52,11 @@ jobs:
   link:
     name: Link the Windows compiler with its static LLVM SDK
     needs: cross-compile
-    runs-on: windows-latest
-    timeout-minutes: 20
+    runs-on: ${{ inputs.architecture == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
+    timeout-minutes: 40
+    env:
+      ARCHITECTURE: ${{ inputs.architecture }}
+      CRT_INVENTORY: ${{ inputs.crt_inventory }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -51,17 +67,26 @@ jobs:
           path: build/windows-compiler-coff
       - name: Install the verified Windows LLVM SDK
         shell: pwsh
-        run: ./tools/windows/install-static-llvm.ps1 -Destination build/llvm
+        run: ./tools/windows/install-static-llvm.ps1 -Destination build/llvm -Architecture $env:ARCHITECTURE
       - name: Link ablac.exe
         shell: pwsh
         run: |
+          $inventory = $env:CRT_INVENTORY -eq 'true'
           ./tools/windows/build-static-compiler.ps1 `
             -CompilerObject build/windows-compiler-coff/ablac.exe.o `
             -ImportDirectory build/windows-compiler-coff/ablac.exe.imports `
-            -LlvmRoot build/llvm -BuildDirectory build/windows-compiler
+            -LlvmRoot build/llvm -BuildDirectory build/windows-compiler -Architecture $env:ARCHITECTURE `
+            -CrtInventory:$inventory
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: windows-compiler
+          name: windows-compiler-${{ inputs.architecture }}
           path: build/windows-compiler/ablac.exe
           if-no-files-found: error
           retention-days: 3
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ inputs.crt_inventory }}
+        with:
+          name: windows-compiler-crt-inventory-${{ inputs.architecture }}
+          path: build/windows-compiler/crt-inventory/
+          if-no-files-found: error
+          retention-days: 30

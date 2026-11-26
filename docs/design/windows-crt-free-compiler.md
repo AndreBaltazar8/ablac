@@ -90,6 +90,9 @@ recommended**; listed because it came up in the inventory.
    symbol by library (UCRT, VCRuntime, STL, Win32) and by role (start-up, heap, stdio/fd, locale, math, threads, C++
    support), with bytes as well as symbol counts. Then try the step-1 link of option B
    (`/NODEFAULTLIB:libucrt.lib`) and list what is unresolved. That turns B's main risk into a number.
+   It runs as the `Windows compiler link` workflow with `crt_inventory: true`, once per `architecture` (x64, arm64):
+   tools/windows/crt-inventory.ps1 uploads the map, the member log, bytes per archive and each leave-one-out link's
+   undefined symbols. The shipped `ablac` link is not changed by it.
 2. **Then choose between A and B with that list.** If the UCRT surface LLVM reaches is ordinary (memory, stdio/fd, a few
    strings and math functions, locale stubs), B is a bounded port and gives Windows the same meaning of "libc-free" as
    Linux. If `libcpmt`/`libvcruntime` reach deep into UCRT internals, A is the honest answer until there is a reason to

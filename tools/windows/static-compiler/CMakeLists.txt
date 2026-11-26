@@ -31,3 +31,28 @@ target_link_libraries(ablac PRIVATE lldCOFF lldELF lldWasm LLVMOptDriver LLVMOrc
 target_link_options(ablac PRIVATE
   /entry:wmainCRTStartup /subsystem:console "/machine:${ABLA_WINDOWS_MACHINE}" /brepro /stack:134217728
   "/def:${ABLA_IMPORT_DIR}/exports.def")
+
+# The C runtime inventory (docs/design/windows-crt-free-compiler.md, measurement only; ablac above is unchanged). With
+# -DABLA_CRT_INVENTORY=ON, more executables link the same inputs with the same options: ablac-crt-map with a link map
+# and lld's /verbose member log, and four links that each leave one CRT archive out, which fail and list what that
+# archive provided. None of them is shipped.
+option(ABLA_CRT_INVENTORY "Define the C runtime inventory links" OFF)
+if(ABLA_CRT_INVENTORY)
+  function(abla_crt_probe name)
+    add_executable(${name} "${ABLA_COMPILER_OBJECT}" "../../../runtime/abla_lld_shim.cpp" crt-start.cpp)
+    set_property(TARGET ${name} PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded)
+    target_compile_features(${name} PRIVATE cxx_std_17)
+    target_compile_definitions(${name} PRIVATE _HAS_EXCEPTIONS=0)
+    target_compile_options(${name} PRIVATE /GR- /EHs-c-)
+    target_include_directories(${name} PRIVATE ${LLVM_INCLUDE_DIRS} ${LLD_INCLUDE_DIRS})
+    target_link_libraries(${name} PRIVATE lldCOFF lldELF lldWasm LLVMOptDriver LLVMOrcJIT ${windows_imports})
+    target_link_options(${name} PRIVATE
+      /entry:wmainCRTStartup /subsystem:console "/machine:${ABLA_WINDOWS_MACHINE}" /brepro /stack:134217728
+      "/def:${ABLA_IMPORT_DIR}/exports.def" ${ARGN})
+  endfunction()
+  abla_crt_probe(ablac-crt-map "/lldmap:${CMAKE_BINARY_DIR}/crt-inventory/ablac.map" /verbose)
+  abla_crt_probe(ablac-crt-no-ucrt /nodefaultlib:libucrt.lib /errorlimit:0)
+  abla_crt_probe(ablac-crt-no-ucrt-cmt /nodefaultlib:libucrt.lib /nodefaultlib:libcmt.lib /errorlimit:0)
+  abla_crt_probe(ablac-crt-no-vcruntime /nodefaultlib:libvcruntime.lib /errorlimit:0)
+  abla_crt_probe(ablac-crt-no-cpmt /nodefaultlib:libcpmt.lib /errorlimit:0)
+endif()
