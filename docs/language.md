@@ -3077,6 +3077,11 @@ measured on an RTX 4090 against CUDA C:
 - An `int` is 64 bits, so index arithmetic costs two registers a value and
   several instructions a multiply. Where registers limit how many groups fit
   (1024 threads a group leave 64 a thread), `i32` loop counters help.
+- Convert small integers to `f32` from an `i32` (`f32FromI32`), not from an
+  `int`: a 64-bit conversion is a slow instruction of its own. Decoding a
+  signed byte as `f32FromI32((i32(bits) << i32(24)) >> i32(24))` is one
+  conversion; `f32FromInt` of a compare and select made a Q8_0 matrix-vector
+  kernel a third slower on bandwidth-bound shapes.
 
 ```abla fragment
 import "abla/kernel"
