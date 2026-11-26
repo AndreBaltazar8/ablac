@@ -71,6 +71,26 @@ try {
     Check ($message -eq 'gone') "other: the error was changed: '$message'"
     Check ($script:calls -eq 1) "other: retried a non-sharing error ($($script:calls) attempts)"
 
+    # denied: what Windows throws for a directory with an open file below it
+    $source = New-Tree 'denied'; $target = Join-Path $temp 'relocated\denied target'
+    $script:calls = 0
+    Move-Toolchain $source $target {
+        param($from, $to)
+        $script:calls++
+        if ($script:calls -lt 3) { throw [UnauthorizedAccessException]::new('Access to the path is denied.') }
+        [IO.Directory]::Move($from, $to)
+    } $fast
+    Check ($script:calls -eq 3) "denied: expected 3 attempts, got $($script:calls)"
+    Check (Test-Path -LiteralPath (Join-Path $target 'bin\ablac.exe')) 'denied: bin\ablac.exe is not at the target'
+
+    # denied for good: bounded, and the failure names both paths
+    $source = New-Tree 'denied-stays'; $target = Join-Path $temp 'relocated\denied-stays target'
+    $script:calls = 0
+    $message = ''
+    try { Move-Toolchain $source $target { param($from, $to) $script:calls++; throw [UnauthorizedAccessException]::new('Access to the path is denied.') } @(1, 1) } catch { $message = $_.Exception.Message }
+    Check ($message -like '*could not move*denied*') "denied-stays: the failure does not name the move: '$message'"
+    Check ($script:calls -eq 3) "denied-stays: expected 3 attempts, got $($script:calls)"
+
     # exists
     $source = New-Tree 'exists'; $target = New-Tree 'exists-target'
     $message = ''
@@ -89,7 +109,7 @@ try {
                 $script:calls++
                 if ($script:calls -eq 3 -and $null -ne $held) { $held.Dispose(); $script:held = $null }
                 try { [IO.Directory]::Move($from, $to) }
-                catch { if (Test-SharingViolation $_.Exception) { $script:sawViolation++ }; throw }
+                catch { if (Test-RetryableMoveFailure $_.Exception) { $script:sawViolation++; Write-Host "real: attempt $($script:calls) failed with $($_.Exception.GetType().Name): $($_.Exception.Message)" }; throw }
             } @(100, 100, 100, 100)
         } finally { if ($null -ne $held) { $held.Dispose() } }
         Check ($script:sawViolation -ge 2) "real: Windows did not report a sharing violation for the held file ($($script:sawViolation))"

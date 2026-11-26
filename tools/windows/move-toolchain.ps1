@@ -15,6 +15,16 @@ function Test-SharingViolation([Exception]$errorCause) {
     return $false
 }
 
+# What Windows reports for a directory rename while a file below it is open: the release run 45735219041 showed that
+# [IO.Directory]::Move then throws UnauthorizedAccessException ("Access to the path ... is denied", ERROR_ACCESS_DENIED), not a sharing
+# violation. A real permission problem looks the same, so the retry is bounded and the final error names both paths and the cause.
+function Test-RetryableMoveFailure([Exception]$errorCause) {
+    for ($cause = $errorCause; $null -ne $cause; $cause = $cause.InnerException) {
+        if ($cause -is [UnauthorizedAccessException]) { return $true }
+    }
+    return Test-SharingViolation $errorCause
+}
+
 function Write-LockingProcesses([string]$directory) {
     $locked = @(foreach ($file in Get-ChildItem -LiteralPath $directory -File -Force -Recurse) {
         try {
@@ -115,7 +125,7 @@ function Move-Toolchain(
             break
         } catch {
             $failure = $_
-            if (!(Test-SharingViolation $failure.Exception)) { throw }
+            if (!(Test-RetryableMoveFailure $failure.Exception)) { throw }
             # What a failed attempt left at the target is its own (the target did not exist): never let a retry move the source into it.
             if (Test-Path -LiteralPath $destination) {
                 try { Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction Stop }
@@ -126,7 +136,7 @@ function Move-Toolchain(
                 catch { Write-Warning "Could not identify locking processes: $_" }
                 throw "windows toolchain: could not move $source to $destination after $($attempt + 1) attempts: $($failure.Exception.Message)"
             }
-            Write-Host "Toolchain move hit a sharing violation. Retrying in $($delays[$attempt]) ms."
+            Write-Host "Toolchain move failed ($($failure.Exception.GetType().Name): a sharing violation or access denied, as Windows reports a held file). Retrying in $($delays[$attempt]) ms."
             Start-Sleep -Milliseconds $delays[$attempt]
         }
     }
