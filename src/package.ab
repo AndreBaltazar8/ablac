@@ -398,11 +398,14 @@ fun bootstrapPackageRelativePathValid(path: string): bool {
     var index = 0
     while (valid && index <= path.size) {
         if (index < path.size && path[index] == 0) valid = false
-        // A path is the same file on every host: no control character, backslash or colon (a Windows separator, a drive, a stream).
-        if (index < path.size && (path[index] < 32 || path[index] == 127 || path[index] == 92 || path[index] == 58)) valid = false
+        // A path is the same file on every host: no control character, backslash or colon (a Windows separator, a drive, a stream),
+        // and none of the other characters Windows refuses in a name (< > " | ? *).
+        if (index < path.size && (path[index] < 32 || path[index] == 127 || path[index] == 92 || path[index] == 58 ||
+            path[index] == 60 || path[index] == 62 || path[index] == 34 || path[index] == 124 || path[index] == 63 || path[index] == 42)) valid = false
         if (index == path.size || path[index] == 47) {
             val component = path.slice(begin, index)
-            if (component == "" || component == "." || component == ".." || component.size > 255 || bootstrapPackageGitName(component)) {
+            if (component == "" || component == "." || component == ".." || component.size > 255 || bootstrapPackageGitName(component) ||
+                bootstrapPackageWindowsOnlyName(component)) {
                 valid = false
             }
             begin = index + 1
@@ -410,6 +413,18 @@ fun bootstrapPackageRelativePathValid(path: string): bool {
         index = index + 1
     }
     valid
+}
+
+// Whether Windows reads `component` as another name or as no file: it ends in a dot or a space (which Windows drops), or it is
+// a device (CON, PRN, AUX, NUL, COM1-9, LPT1-9, in any case and with any extension). Such a file of a package, checked out or
+// vendored on another host, cannot be checked out on Windows.
+fun bootstrapPackageWindowsOnlyName(component: string): bool {
+    if (component.size > 0 && (component[component.size - 1] == 46 || component[component.size - 1] == 32)) return true
+    val dot = component.indexOf(".")
+    var stem = (if (dot >= 0) component.slice(0, dot) else component).lowercase()
+    while (stem.size > 0 && stem[stem.size - 1] == 32) stem = stem.slice(0, stem.size - 1)
+    if (stem == "con" || stem == "prn" || stem == "aux" || stem == "nul") return true
+    stem.size == 4 && (stem.startsWith("com") || stem.startsWith("lpt")) && stem[3] >= 49 && stem[3] <= 57
 }
 
 // Whether `component` is what git, a case-folding file system or Windows reads as the repository directory: `.git` in any case, with trailing dots or spaces, or its 8.3 name.
@@ -1171,6 +1186,14 @@ fun bootstrapPackageTreeVerdict(repository: string, revision: string, listingPat
         }
         if (path.size > BOOTSTRAP_PACKAGE_TREE_MAX_PATH || depth > BOOTSTRAP_PACKAGE_TREE_MAX_DEPTH) {
             return BootstrapPackageTreeVerdict("E_PACKAGE_SIZE", "has a path of more than ${BOOTSTRAP_PACKAGE_TREE_MAX_PATH} bytes or ${BOOTSTRAP_PACKAGE_TREE_MAX_DEPTH} levels")
+        }
+        // The rule a content provider's files follow: a package's files are the same files on every host it is built or vendored on.
+        if (!bootstrapPackageRelativePathValid(path)) {
+            return BootstrapPackageTreeVerdict("E_PACKAGE_TREE", "has a path that is not the same file on every host ('$path': a backslash, a colon, a character or name Windows refuses, or a name ending in a dot or a space)")
+        }
+        // The manifest is read as the package's own: never through a link to another file.
+        if (path == "abla.toml" && mode == "120000") {
+            return BootstrapPackageTreeVerdict("E_PACKAGE_TREE", "has an abla.toml that is a symbolic link; a package's manifest is a file of its own")
         }
         files = files + 1
         if (files > BOOTSTRAP_PACKAGE_TREE_MAX_FILES) {

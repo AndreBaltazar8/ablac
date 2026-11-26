@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A git dependency is attacker-controlled bytes (#1139 area 2, round 2, item 2). Each case is a repository made with git plumbing and fetched by `package update`:
 #   what the build reads must be the blobs the lock's digest covers (.gitattributes eol, ident, filter, user autocrlf must not change them);
-#   a tree that is too big, too many files, too deep, has a submodule, a name with a control character or is malformed (duplicate or unsorted entries, a
+#   a tree that is too big, too many files, too deep, has a submodule, a name with a control character or one Windows reads as another file, a linked abla.toml, or is malformed (duplicate or unsorted entries, a
 #   .gitmodules link) is refused before anything is checked out, naming the dependency, and leaves no cache entry and no lock.
 # Sizes are small: the limits are lowered with ABLA_PACKAGE_CHECKOUT_LIMIT_BYTES and ABLA_PACKAGE_GIT_MAX_BYTES, and ulimit -f makes a checkout that still happens fail.
 set -euo pipefail
@@ -131,6 +131,27 @@ noise=$(head -c 3145728 /dev/urandom | g hash-object -w --stdin)
 commit "$(blobs_tree "100644 blob $manifest\tabla.toml" "100644 blob $lib\tlib.ab" "100644 blob $noise\tnoise.bin")"
 ( export ABLA_PACKAGE_GIT_MAX_BYTES=1048576; refused "a 3 MiB pack over a 1 MiB limit" E_PACKAGE_SIZE )
 
+# 8c. Names that are not the same file on Windows (a vendored copy of the package could not be checked out there): a backslash, a colon,
+#     a device name with or without an extension, a name ending in a dot or a space, a character Windows refuses; in a subdirectory too.
+for name in 'a\\b.ab' 'a:b.ab' 'CON' 'aux.ab' 'Com1.txt' 'lpt9' 'x.ab.' 'x.ab ' 'a?b' 'a*b' 'a|b' 'a<b' 'a>b' 'a"b'; do
+    newrepo
+    sub=$(blobs_tree "100644 blob $lib\t$name")
+    commit "$(blobs_tree "100644 blob $manifest\tabla.toml" "100644 blob $lib\tlib.ab" "040000 tree $sub\tsrc")"
+    refused "the name '$name'" E_PACKAGE_TREE
+done
+# ...while names that only look like them are files like any other.
+newrepo
+commit "$(blobs_tree "100644 blob $manifest\tabla.toml" "100644 blob $lib\tlib.ab" "100644 blob $lib\tconsole.ab" "100644 blob $lib\tcom10" "100644 blob $lib\tnull.ab" "100644 blob $lib\t.hidden")"
+update "$t/log$n"
+[ "$status" = 0 ] && [ -f "$(cached)/console.ab" ] || fail "names near Windows device names: the fetch failed" "$t/log$n"
+
+# 8d. The manifest is the package's own file, never a symbolic link (to another package's manifest, or out of the tree).
+newrepo
+link=$(printf 'meta/real.toml' | g hash-object -w --stdin)
+meta=$(blobs_tree "100644 blob $manifest\treal.toml")
+commit "$(blobs_tree "120000 blob $link\tabla.toml" "100644 blob $lib\tlib.ab" "040000 tree $meta\tmeta")"
+refused "a symbolic link as abla.toml" E_PACKAGE_TREE
+
 # 9. The lock's digest is the repository's own tree.
 newrepo
 tree=$(blobs_tree "100644 blob $manifest\tabla.toml" "100644 blob $lib\tlib.ab")
@@ -141,4 +162,4 @@ if [ "$status" != 0 ]; then fail "the plain repository did not fetch" "$t/log$n"
 fi
 
 [ "$failures" = 0 ] || { printf 'package hostile git: %d failure(s)\n' "$failures" >&2; exit 1; }
-echo "package hostile git: attributes and autocrlf leave the blobs as locked; a submodule, control-character names, too many files, too deep, malformed trees, a blob over the limit and a pack over the limit are refused before checkout"
+echo "package hostile git: attributes and autocrlf leave the blobs as locked; a submodule, control-character names, Windows-only names, a linked manifest, too many files, too deep, malformed trees, a blob over the limit and a pack over the limit are refused before checkout"
