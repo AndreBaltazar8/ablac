@@ -8,7 +8,9 @@
 #   - plain: the same transform with an ordinary body: the root's function is replaced (the control);
 #   - own: the root's own transform with the same body: allowed, the process runs (the grants are the same).
 # A `$name` subparser handler of a dependency is likewise judged by the dependency's grants, not by the file that uses its syntax (handler-undeclared, handler-declared),
-# and so is a `#` site the handler builds (syntaxCompile) into the using file (site-undeclared, site-nested, site-declared).
+# and so is a `#` site the handler builds (syntaxCompile) into the using file (site-undeclared, site-nested, site-declared), and the finalizer of an
+# extension request it records, within the grants of the recording handler and of the file that declares the finalizer (finalizer-undeclared,
+# finalizer-declared).
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -195,5 +197,48 @@ use_site site-declared '$word 1;'
 build site-declared
 [[ $status == 0 ]] && grep -q "$ABLA_GRANT_PROBE" "$out/site-declared.log" ||
     fail "site-declared: the declared handler's site did not read it (status $status): $(grep -m3 'error\|value' "$out/site-declared.log")"
-echo "transform grants: a dependency's subparser handler and the sites it builds run with the dependency's grants"
+# An extension request's finalizer (compilerRecordExtensionRequest) is the code of the package whose handler recorded it: it runs later, while the
+# using file is parsed, but within the grants of the handler that recorded it and of the file that declares it.
+finalizer_handler='import "abla/compiler"
+import "abla/compiler/parser"
+compile fun finalize(payload: string, expression: SyntaxExpression): string {
+    val seen = compilerEnvironment("ABLA_GRANT_PROBE")
+    "fun finalizerProbe(): string = \"[$seen]\"\n"
+}
+compile fun wordParse(cursor: ParserCursor): SyntaxExpression {
+    parserRawSkipWhitespace(cursor)
+    val origin = parserParseAblaExpression(cursor)
+    parserRawExpect(cursor, ";")
+    compilerRecordExtensionRequest("quietdep.word", "", origin, finalize)
+    syntaxString("w")
+}
+#compilerRegisterSubparser("word", wordParse)
+fun dependencyValue: string = "ok"'
+use_finalizer() { # use_finalizer <case> <the expression that uses the word>
+    cat > "$out/$1/application/src/main.ab" <<EOT
+import "abla/io"
+import "abla/compiler"
+import "provider.ab"
+import dependencySource()
+#compilerGrant("environment")
+fun main { println("dependency value: '\${dependencyValue()}' \${$2} \${finalizerProbe()}") }
+EOT
+}
+# finalizer-undeclared: the dependency declares nothing; the root authorizes environment for its own file: the finalizer is refused.
+repository "$out/finalizer-undeclared/quiet-dep" quiet-dep '' "$finalizer_handler"
+commit "$out/finalizer-undeclared/quiet-dep" dependency
+application finalizer-undeclared '"environment"' quiet-dep
+use_finalizer finalizer-undeclared '$word 1;'
+build finalizer-undeclared
+[[ $status != 0 ]] && ! grep -q "$ABLA_GRANT_PROBE" "$out/finalizer-undeclared.log" ||
+    fail "finalizer-undeclared: the dependency's extension finalizer read the root's environment (status $status): $(grep -m3 'error\|value' "$out/finalizer-undeclared.log")"
+# finalizer-declared: the dependency declares environment and the root authorizes it: the finalizer reads it (the control).
+repository "$out/finalizer-declared/quiet-dep" quiet-dep '"environment"' "$finalizer_handler"$'\n#compilerGrant("environment")'
+commit "$out/finalizer-declared/quiet-dep" dependency
+application finalizer-declared '"environment"' quiet-dep
+use_finalizer finalizer-declared '$word 1;'
+build finalizer-declared
+[[ $status == 0 ]] && grep -q "\[$ABLA_GRANT_PROBE\]" "$out/finalizer-declared.log" ||
+    fail "finalizer-declared: the declared finalizer did not read it (status $status): $(grep -m3 'error\|value' "$out/finalizer-declared.log")"
+echo "transform grants: a dependency's subparser handler, the sites it builds and its extension finalizers run with the dependency's grants"
 
