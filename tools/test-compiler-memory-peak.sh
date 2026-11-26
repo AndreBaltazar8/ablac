@@ -8,7 +8,7 @@ record="$project_root/tests/cases/memory-peak/emit-llvm-self"
 mkdir -p "$output_directory"
 
 # The compiler's peak resident memory on its own source's IR (`--emit-llvm src/orc_main.ab`, about
-# 9 s), the lower of two runs, under the launcher's limits (the collector paces itself by the
+# 9 s), the lowest measured peak for each path, under the launcher's limits (the collector paces itself by the
 # address-space limit), against the last line of the record. The allocator's free lists once held
 # each size's high-water mark for good: that took this build from 1.26-1.40 GB to 1.67 GB, and an
 # Xtensa build of abla-embedded's package-import past the 4 GB limit. Runs land near either end of
@@ -41,7 +41,8 @@ measure() { # KIND ROUND: the peak resident kB of one compile, in the file named
 peak=""
 relative_peak=""
 recorded=$(grep -v '^#' "$record" | tail -n 1 | cut -d' ' -f1)
-# Two pairs suffice if both minima are comfortably within the RSS ceiling.
+# Once both minima are comfortably within the RSS ceiling, a retry can only
+# lower them. Take another pair only when one spelling still needs it.
 # RUN_TESTS_FULL=1 or MEMORY_PEAK_ROUNDS=5 still takes five interleaved pairs.
 all_rounds=${MEMORY_PEAK_ROUNDS:-${RUN_TESTS_FULL:+5}}
 rounds=0
@@ -56,7 +57,7 @@ for round in 1 2 3 4 5; do
         fi
     done
     rounds=$round
-    if [[ $all_rounds != 5 ]] && (( round >= 2 && peak * 100 <= recorded * 115 && relative_peak * 100 <= recorded * 115 )); then
+    if [[ $all_rounds != 5 ]] && (( peak * 100 <= recorded * 115 && relative_peak * 100 <= recorded * 115 )); then
         break
     fi
 done
