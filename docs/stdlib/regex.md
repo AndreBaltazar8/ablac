@@ -82,7 +82,9 @@ compiler identity and individual timings.
 | `m.start()`, `m.end()`, `m.text0()` | span and text of the whole match |
 | `m.group(i)`, `m.groupStart(i)`, `m.groupEnd(i)`, `m.hasGroup(i)`, `m.groupCount()` | group `i` (0 is the whole match); `null`/`-1` when it did not take part |
 
-`regexCompile` returns an error, never a panic, for any invalid pattern.
+`regexCompile` returns an error, never a panic, for any invalid pattern. The
+`regex` of a failed compile is empty and matches nothing: every method returns
+no match (`false`, `null`, `-1`, `[]`, the text unchanged, `RegexSearchMiss`).
 
 ## Named captures
 
@@ -150,6 +152,8 @@ refuses a larger program with the same error (it never allows more than 100,000)
 search: the cost is the pattern's instructions times the text's length, so `(?:a*){1000}b` (about 3,000 instructions) over 3,000
 characters is up to 18 million steps (about 0.2 s in a release build, 10 times that in a `--fast` build), and the same pattern over
 a megabyte of text would be a few minutes. Bound the text's size as well when the pattern is not yours.
+A character class is one instruction whatever its size: its ranges are sorted and merged when the pattern is compiled,
+and testing a character is a binary search, so a class of 4,000 code points costs about 12 range checks per test.
 
 Use `re.findWithin(text, maximumSteps, start = 0)` to limit a single search.
 Its sealed result has three cases.
@@ -159,7 +163,10 @@ Its sealed result has three cases.
 - `RegexSearchExhausted` means another step was needed. It carries no tentative match.
 
 Each step is a VM position visit, an instruction reached in a closure, a thread
-advance, or a character-class range check. The bounded search runs the general VM
+advance, or a character-class range check (one probe of the class's binary search: about log2 of its ranges, at least
+one). Before v0.2.78 a class test was charged one step per range scanned in order, so a class of thousands of ranges
+now needs far fewer steps; a small class can need a step or two more than before (`[a-cx-z]` tests its middle range
+first), so a `maximumSteps` set exactly at an old step count can run out. The bounded search runs the general VM
 so those charges also apply to patterns with an ordinary literal or fixed-width
 fast path. Nonpositive limits exhaust a valid search before running it.
 The budget counts search steps. VM initialization, the cost of copying capture

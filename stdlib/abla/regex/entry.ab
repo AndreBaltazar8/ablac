@@ -4,11 +4,15 @@
 // no backtracking, so no pattern can take exponential time. findAll and replace
 // search again from the end of each match, so they cost up to (matches + 1) times
 // that when a longer alternative keeps running after a shorter one has matched. Backreferences and
-// lookaround are rejected when the pattern is compiled.
+// lookaround are rejected when the pattern is compiled. A class's ranges are
+// sorted and merged when it is compiled, and a class test is a binary search,
+// so a class with many members costs O(log ranges) per test, not O(ranges).
+// A failed compile's empty Regex matches nothing.
 //
 // Text is UTF-8: `.`, classes and literals match whole code points, and every
 // span is a byte offset into the text. A byte that is not part of valid UTF-8
 // reads as U+FFFD, one byte wide. `\d`, `\w`, `\s` and `\b` are ASCII only.
+import "abla/array"
 import "abla/bytes"
 import "abla/text"
 import "abla/compiler/parser"
@@ -327,6 +331,30 @@ private fun regexShorthand(letter: int): array<int> {
     [9, 13, 32, 32]
 }
 
+// The [low, high, ...] ranges sorted by low, with overlapping and adjacent ranges merged, so a lookup can binary search.
+private fun regexNormalizeRanges(ranges: array<int>): array<int> {
+    // A code point fits in 21 bits, so (low, high) packs into one sortable integer.
+    val keys: array<int> = []
+    var i = 0
+    while (i + 1 < ranges.size) {
+        keys.append(ranges[i] * 2097152 + ranges[i + 1])
+        i += 2
+    }
+    val out: array<int> = []
+    for (key in keys.sorted()) {
+        val low = key / 2097152
+        val high = key % 2097152
+        val last = out.size - 1
+        if (last > 0 && low <= out[last] + 1) {
+            if (high > out[last]) out[last] = high
+        } else {
+            out.append(low)
+            out.append(high)
+        }
+    }
+    out
+}
+
 private fun regexComplement(ranges: array<int>): array<int> {
     val out: array<int> = []
     var next = 0
@@ -375,9 +403,7 @@ class RegexParser(
 
     // Copies the class's ranges into the parser table and returns its index.
     fun addClass(ranges: array<int>): int {
-        val copy: array<int> = []
-        for (value in ranges) copy.append(value)
-        this.classes.append(copy)
+        this.classes.append(regexNormalizeRanges(ranges))
         this.classes.size - 1
     }
 
@@ -1047,15 +1073,18 @@ class RegexVm(
     }
 
     // Returns true if the code point matches the indexed character class and its negation rule.
+    // Binary search over the class's sorted, disjoint ranges.
     fun classMatches(index: int, c: int): bool {
         val ranges = this.classes[index]
-        var i = 0
-        var hit = false
-        while (!hit && i < ranges.size) {
-            hit = c >= ranges[i] && c <= ranges[i + 1]
-            i += 2
+        var low = 0
+        var high = ranges.size / 2
+        while (low < high) {
+            val middle = (low + high) / 2
+            if (c < ranges[middle * 2]) high = middle
+            else if (c > ranges[middle * 2 + 1]) low = middle + 1
+            else return true
         }
-        hit
+        false
     }
 }
 
@@ -1084,6 +1113,8 @@ private fun regexScalar(text: string, i: int, width: int): int =
  */
 private fun regexRun(re: Regex, var vm: RegexVm, from: int, anchored: bool, needEnd: bool,
     advance: bool): array<int> {
+    // A failed compile's empty Regex has no program: it matches nothing.
+    if (re.program.size == 0) return []
     val size = vm.text.size
     var matched = false
     var current = 0
@@ -1234,17 +1265,20 @@ private @inline fun RegexVm.addBounded(list: int, pc0: int, source: int, positio
 
 private @inline fun RegexVm.classMatchesBounded(index: int, c: int, maximumSteps: int): bool {
     val ranges = this.classes[index]
-    var i = 0
+    var low = 0
+    var high = ranges.size / 2
     var hit = false
     var work = this.work
-    while (!hit && i < ranges.size) {
+    while (!hit && low < high) {
         if (work == maximumSteps) {
             work = -1
             break
         }
         work += 1
-        hit = c >= ranges[i] && c <= ranges[i + 1]
-        i += 2
+        val middle = (low + high) / 2
+        if (c < ranges[middle * 2]) high = middle
+        else if (c > ranges[middle * 2 + 1]) low = middle + 1
+        else hit = true
     }
     this.work = work
     hit

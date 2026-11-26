@@ -1,0 +1,158 @@
+import "abla/io"
+import "abla/regex"
+import "abla/text"
+
+// Character classes against a linear reference (#1139 area 4, R5-1): the compiler sorts and merges a class's ranges and
+// the VM binary-searches them, so every (class, code point) pair must give what a scan of the ranges as written gives.
+// Classes are random: single points, ranges, ranges adjacent to or overlapping the previous one, \d \w \s \D \W \S,
+// negation, members out of order, and the edges 0, U+D7FF, U+E000, U+FFFF, U+10000 and U+10FFFF. Each class is tested
+// at every member's edges and their neighbours plus random points, by matches and by findWithin (always the general VM).
+// 2,400 classes, over 50,000 pairs; run by tools/test-regex-edges.sh.
+
+var seed = 88172645463325252
+
+fun next(bound: int): int {
+    seed = seed ^ (seed << 13)
+    seed = seed ^ (seed >>> 7)
+    seed = seed ^ (seed << 17)
+    val value = seed % bound
+    if (value < 0) value + bound else value
+}
+
+fun hex4(value: int): string {
+    val digits = "0123456789abcdef"
+    var out = ""
+    for (shift in [12, 8, 4, 0]) {
+        val digit = (value >> shift) & 15
+        out = out + digits.slice(digit, digit + 1)
+    }
+    out
+}
+
+// A member as pattern text: \uXXXX in the BMP (so ] \ ^ - need no care), the character itself above it.
+fun spell(c: int): string = if (c <= 0xFFFF) "\\u" + hex4(c) else utf8Encode(c)
+
+val edges = [0, 1, 0x7F, 0x80, 0xD7FF, 0xE000, 0xFFFF, 0x10000, 0x10FFFE, 0x10FFFF]
+
+fun point(): int {
+    val choice = next(10)
+    if (choice < 4) return 32 + next(96)
+    if (choice < 6) return edges[next(edges.size)]
+    if (choice < 8) {
+        val c = next(0xFFFF)
+        return if (c >= 0xD800 && c <= 0xDFFF) c - 0x800 else c
+    }
+    0x10000 + next(0x100000)
+}
+
+fun shorthand(letter: int): array<int> {
+    if (letter == 100) return [48, 57]
+    if (letter == 119) return [48, 57, 65, 90, 95, 95, 97, 122]
+    [9, 13, 32, 32]
+}
+
+fun complement(ranges: array<int>): array<int> {
+    val out: array<int> = []
+    var from = 0
+    var i = 0
+    while (i < ranges.size) {
+        if (ranges[i] > from) { out.append(from); out.append(ranges[i] - 1) }
+        from = ranges[i + 1] + 1
+        i += 2
+    }
+    if (from <= 0x10FFFF) { out.append(from); out.append(0x10FFFF) }
+    out
+}
+
+fun holds(ranges: array<int>, c: int): bool {
+    var i = 0
+    while (i < ranges.size) {
+        if (c >= ranges[i] && c <= ranges[i + 1]) return true
+        i += 2
+    }
+    false
+}
+
+fun isSurrogate(c: int): bool = c >= 0xD800 && c <= 0xDFFF
+
+fun main: int {
+    val classes = 2400
+    var pairs = 0
+    var failures = 0
+    for (round in 0 until classes) {
+        val members = if (next(20) == 0) 150 + next(150) else 1 + next(12)
+        val ranges: array<int> = []
+        var pattern = "["
+        val negated = next(3) == 0
+        if (negated) pattern = pattern + "^"
+        for (m in 0 until members) {
+            val kind = next(12)
+            if (kind == 0) {
+                val letters = "dwsDWS"
+                val which = next(6)
+                val letter = letters[which]
+                val lower = if (letter >= 97) letter else letter + 32
+                val set = if (letter >= 97) shorthand(lower) else complement(shorthand(lower))
+                for (value in set) ranges.append(value)
+                pattern = pattern + "\\" + letters.slice(which, which + 1)
+                continue
+            }
+            var low = point()
+            var high = low
+            if (kind <= 4) {
+                high = low + next(if (next(4) == 0) 5000 else 40)
+            } else if (kind <= 7 && ranges.size >= 2) {
+                // Adjacent to, or overlapping, the previous member.
+                val previousHigh = ranges[ranges.size - 1]
+                low = previousHigh + 1 - next(3)
+                if (low < 0) low = 0
+                high = low + next(20)
+            }
+            if (high > 0x10FFFF) high = 0x10FFFF
+            if (low > high) low = high
+            // A range must not start or end inside the surrogates when spelled as text above U+FFFF.
+            if (isSurrogate(low)) low = 0xE000
+            if (isSurrogate(high)) high = 0xD7FF
+            if (low > high) { low = 0xE000; high = 0xE000 }
+            ranges.append(low)
+            ranges.append(high)
+            pattern = pattern + spell(low)
+            if (high != low) pattern = pattern + "-" + spell(high)
+        }
+        pattern = pattern + "]"
+        val compiled = regexCompile(pattern)
+        if (!compiled.succeeded) {
+            failures += 1
+            println("FAIL compile ${pattern}: ${compiled.error.message} at ${compiled.error.offset}")
+            continue
+        }
+        val re = compiled.regex
+        val probes: array<int> = []
+        var i = 0
+        while (i < ranges.size && probes.size < 40) {
+            for (c in [ranges[i] - 1, ranges[i], ranges[i + 1], ranges[i + 1] + 1]) probes.append(c)
+            i += 2
+        }
+        for (k in 0 until 8) probes.append(point())
+        probes.append(0)
+        probes.append(0x10FFFF)
+        for (c in probes) {
+            if (c < 0 || c > 0x10FFFF || isSurrogate(c)) continue
+            val text = utf8Encode(c)
+            val expected = holds(ranges, c) != negated
+            pairs += 1
+            val bounded = re.findWithin(text, 100000)
+            val found = when (bounded) {
+                is RegexSearchMatch -> true
+                is RegexSearchMiss -> false
+                is RegexSearchExhausted -> !expected
+            }
+            if (re.matches(text) != expected || found != expected) {
+                failures += 1
+                if (failures <= 10) println("FAIL ${pattern} on U+${c}: expected ${expected}")
+            }
+        }
+    }
+    println("class-diff: ${classes} classes, ${pairs} (class, code point) pairs, ${failures} differences")
+    if (failures == 0) 0 else 1
+}

@@ -40,3 +40,9 @@ for mode in fast release; do
     "$compiler" build tests/cases/regex/within.ab -o "$out/within-$mode" --no-cache "${options[@]}"
     "$out/within-$mode" | grep -Fx 'bounded regex: ok' >/dev/null
 done
+
+# Sorted, merged class ranges and the binary search against a linear scan of the ranges as written (#1139, R5-1).
+"$compiler" build tests/cases/regex/class-diff.ab -o "$out/class-diff" --no-cache
+"$out/class-diff" | tee "$out/class-diff.txt" | grep -E '^class-diff: 2400 classes, [0-9]+ \(class, code point\) pairs, 0 differences$' >/dev/null ||
+    { echo "regex edges: class differential failed:" >&2; head -12 "$out/class-diff.txt" >&2; exit 1; }
+cat "$out/class-diff.txt"
