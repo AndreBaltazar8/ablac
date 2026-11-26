@@ -95,8 +95,11 @@ if command -v git >/dev/null 2>&1; then
     git -C "$local_root" -c user.name=t -c user.email=t@t add -A
     git -C "$local_root" -c user.name=t -c user.email=t@t commit -q -m start
     fresh; rm -f "$work/rel/SHA256SUMS" "$work/rel/SHA256SUMS.sig"
+    : > "$work/rel/.release-check"
     (cd "$local_root" && ABLA_RELEASE_SIGNING_KEY_FILE="$work/good" tools/sign-release.sh "$work/rel" --tag v9.9.9) > "$work/out" 2>&1 || { cat "$work/out" >&2; fail 'sign-release.sh failed on a local directory'; }
     [[ -f $work/rel/ablac-9.9.9.spdx.json && -f $work/rel/SHA256SUMS.sig ]] || fail 'sign-release.sh wrote no SBOM or signature'
+    [[ ! -e $work/rel/.release-check ]] || fail 'sign-release.sh kept the release-check marker'
+    ! grep -Fq '.release-check' "$work/rel/SHA256SUMS" "$work/rel/ablac-9.9.9.spdx.json" || fail 'the release-check marker was listed as an asset'
     grep -q 'ablac-9.9.9.spdx.json' "$work/rel/SHA256SUMS" || fail 'the SBOM is not in SHA256SUMS'
     # Neither list names a scratch file: nothing of the signer's own temporary files is signed.
     ! grep -q '\.tmp' "$work/rel/SHA256SUMS" || fail 'SHA256SUMS lists a temporary file'
@@ -117,6 +120,10 @@ if command -v git >/dev/null 2>&1; then
     rm -f "$work/rel/ablac-dynamic-x86_64-linux" "$work/rel/SHA256SUMS" "$work/rel/SHA256SUMS.sig"
     (cd "$local_root" && ABLA_RELEASE_SIGNING_KEY_FILE="$work/good" tools/sign-release.sh "$work/rel" --tag v9.9.9) > "$work/out" 2>&1 || { cat "$work/out" >&2; fail 'sign-release.sh failed again'; }
     accepts "$work/rel"
+    printf 'keep this file\n' > "$work/rel/.release-check"
+    if "$local_root/tools/sign-release.sh" "$work/rel" "$work/good" > "$work/out" 2>&1; then fail 'sign-release.sh accepted a nonempty release-check marker'; fi
+    grep -Fxq 'keep this file' "$work/rel/.release-check" || fail 'sign-release.sh changed the nonempty release-check marker'
+    rm "$work/rel/.release-check"
     printf 'x' > "$work/rel/static-suite-source.sha"
     if "$root/tools/sign-release.sh" "$work/rel" "$work/good" > "$work/out" 2>&1; then fail 'sign-release.sh signed a directory with static-suite-source.sha'; fi
     echo 'local signing: SBOM and signature written into the directory and verified; the marker file is refused'

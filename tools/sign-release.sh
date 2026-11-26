@@ -8,8 +8,9 @@
 #
 # KEYFILE is the private key (default: the file named by ABLA_RELEASE_SIGNING_KEY_FILE). With --tag the SBOM
 # ablac-X.Y.Z.spdx.json is made in DIR first (tools/release-sbom.sh reads the checkout this script is run from, so run
-# it from the release commit's checkout). Run it on the directory release-check.sh checked, then run release-check.sh
-# again (its `signature` check must PASS) and upload every file of DIR. Needs bash, ssh-keygen and sha256sum or shasum.
+# it from the release commit's checkout). Signing consumes the empty .release-check marker if present. Run
+# release-check.sh again with DIR as --artifacts and a separate --out (its `signature` check must PASS), then upload
+# every file of DIR. Needs bash, ssh-keygen and sha256sum or shasum.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' >&2; exit 2; }
@@ -30,6 +31,14 @@ done
 # The publish job removes this marker of the static suite before signing; a local directory must not keep it either
 # (it would be signed and uploaded as an asset).
 [[ ! -e $dir/static-suite-source.sha ]] || { echo "sign-release: remove $dir/static-suite-source.sha first (it is not an asset)" >&2; exit 2; }
+marker=$dir/.release-check
+if [[ -e $marker || -L $marker ]]; then
+    [[ -f $marker && ! -L $marker && ! -s $marker ]] || {
+        echo "sign-release: $marker is not an empty release-check marker" >&2
+        exit 2
+    }
+    rm -- "$marker"
+fi
 rm -f "$dir/SHA256SUMS" "$dir/SHA256SUMS.sig"
 # Scratch files live outside DIR: inside it the list of DIR's files would list the scratch file itself (the empty
 # SHA256SUMS.tmp of v0.2.73's list, the .sbom.tmp of its SBOM).

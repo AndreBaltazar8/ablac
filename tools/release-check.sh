@@ -584,7 +584,8 @@ fi
 echo "RESULT: PASS (nothing is published by this script)"
 if [[ ! -f $out/SHA256SUMS.sig ]]; then
     printf 'next: sign the assets (the key from a separate clone, never the shared repo), from the release commit checkout:\n'
-    printf '  tools/sign-release.sh %s <keyfile> --tag %s   # SBOM + SHA256SUMS + SHA256SUMS.sig in the same directory\n' "$out" "$tag"
-    printf '  tools/release-check.sh %s %s <stage2> --artifacts %s ...   # its signature check must now PASS\n' "$tag" "$run_id" "$out"
+    printf '  tools/sign-release.sh %q <keyfile> --tag %q   # SBOM + SHA256SUMS + SHA256SUMS.sig in the same directory\n' "$out" "$tag"
+    printf '  tools/release-check.sh %q %q %q --artifacts %q --out %q ...   # its signature check must now PASS\n' \
+        "$tag" "$run_id" "$stage2" "$out" "${out%/}.verified"
     printf 'then upload every file of %s with gh release create\n' "$out"
 fi

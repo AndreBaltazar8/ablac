@@ -608,4 +608,16 @@ check="$signed_root/tools/release-check.sh" expect_fail "a signed release contai
     run_check "$work/signed-release" v9.9.9 "$stage2" --out "$work/signed-check-out"
 grep -q '^FAIL  signature.*\.unlisted is not listed' "$work/out.txt" || fail "signature check did not reject the unlisted file"
 
+# A manual release signs the checker's output and verifies it through a separate output directory.
+cp "$project_root/tools/sign-release.sh" "$signed_root/tools/"
+manual_out="$work/manual release"
+output=$(check="$signed_root/tools/release-check.sh" run_check "$release" v9.9.9 "$stage2" \
+    --out "$manual_out") || { echo "$output" >&2; fail "release-check refused unsigned manual artifacts"; }
+expected_paths=$(printf -- '--artifacts %q --out %q' "$manual_out" "$manual_out.verified")
+grep -Fq -- "$expected_paths" <<<"$output" || fail "manual release instructions did not give a separate verification output"
+"$signed_root/tools/sign-release.sh" "$manual_out" "$work/sign-key" >/dev/null 2>&1 || fail "could not sign the checked manual artifacts"
+output=$(check="$signed_root/tools/release-check.sh" run_check "$manual_out" v9.9.9 "$stage2" \
+    --out "$manual_out.verified") || { echo "$output" >&2; fail "release-check refused the signed manual artifacts"; }
+grep -q '^PASS  signature' <<<"$output" || { echo "$output" >&2; fail "no PASS line for the manual release signature"; }
+
 echo "release scripts: a good release is accepted; a doctored sha256, a changed asset, a missing or extra asset, a wrong version and another stage 2 are refused; a pin moves the version and three sha256s and refuses a bad .sha256"
