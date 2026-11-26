@@ -305,7 +305,106 @@ fun hpackPins(): void {
     return
 }
 
+fun rq(method: string, path: string, authority: string): array<HpackField> =
+    [hf(":method", method), hf(":scheme", "https"), hf(":path", path), hf(":authority", authority)]
+
+fun with(fields: array<HpackField>, name: string, value: string): array<HpackField> {
+    val more: array<HpackField> = []
+    for (f in fields) more.append(f)
+    more.append(hf(name, value))
+    more
+}
+
+/** A request block on stream 1 (END_STREAM): refused with RST_STREAM(PROTOCOL_ERROR) and never handed over, or, with `accepted`, handed over. */
+fun ruled(label: string, fields: array<HpackField>, accepted: bool = false): void {
+    var s = ready()
+    s.feed(frame(1, 5, 1, block(fields)), 0)
+    val handed = s.takeRequests().size
+    val code = resetCode(frames(s.takeOutput()), 1)
+    if (accepted && (handed != 1 || code >= 0)) fail("8.2-8.3: $label: $handed requests, reset code $code (wanted it accepted)")
+    if (!accepted && (handed != 0 || code != 1)) fail("8.2-8.3: $label: $handed requests, reset code $code (wanted PROTOCOL_ERROR)")
+    return
+}
+
+/** A streaming request on stream 1, "abc" of body, then a trailer block holding `name: value`: refused, or with `accepted` the END event carries it. */
+fun trailered(label: string, name: string, value: string, accepted: bool = false): void {
+    var s = h2ServerNew()
+    s.streamRoute("POST", "/up", 0)
+    s.feed(H2_PREFACE + frame(4, 0, 0, ""), 0)
+    s.takeOutput()
+    s.feed(frame(1, 4, 1, block(rq("POST", "/up", "example.com"))), 0)
+    s.feed(frame(0, 0, 1, "abc"), 0)
+    s.feed(frame(1, 5, 1, block([hf(name, value)])), 0)
+    var ended = false
+    for (e in s.takeEvents()) {
+        if (e.kind == 3 && e.trailers.size == 1 && e.trailers[0].name == name && e.trailers[0].value == value) ended = true
+    }
+    val code = resetCode(frames(s.takeOutput()), 1)
+    if (accepted && (!ended || code >= 0)) fail("8.1 trailers: $label: delivered $ended, reset code $code (wanted it delivered)")
+    if (!accepted && (ended || code != 1)) fail("8.1 trailers: $label: delivered $ended, reset code $code (wanted PROTOCOL_ERROR)")
+    return
+}
+
+// RFC 9113 8.2-8.3 request rules, and the host, path and trailer checks the HTTP/1 readers make (R2-3, F1, httpTrailerLineValid): a handler must
+// not get from an HTTP/2 request what an HTTP/1 request could never carry. The H2-1..H2-3 cases (host values, a second host, the path's bytes,
+// the trailer fields) failed before the round 6 fix; the others are regressions.
+fun requestRules(): void {
+    ruled("a plain request", rq("GET", "/a", "example.com:8443"), true)
+    ruled("OPTIONS *", rq("OPTIONS", "*", "example.com"), true)
+    ruled("DEL in the path (as in HTTP/1)", rq("GET", "/a\u{7f}b", "example.com"), true)
+    ruled("a host equal to :authority", with(rq("GET", "/", "example.com"), "host", "example.com"), true)
+    ruled("a host and no :authority", [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf("host", "example.com")], true)
+    ruled("te: trailers", with(rq("GET", "/", "example.com"), "te", "trailers"), true)
+    // H2-1: hosts.
+    ruled("H2-1 :authority with a space", rq("GET", "/", "a b"))
+    ruled("H2-1 :authority with a comma", rq("GET", "/", "a,b"))
+    ruled("H2-1 :authority with a control byte", rq("GET", "/", "a\u{1}b"))
+    ruled("H2-1 a host with a space", [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf("host", "a b")])
+    ruled("H2-1 two hosts", [hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf("host", "good.example"), hf("host", "evil.example")])
+    // H2-2: the path's bytes.
+    ruled("H2-2 a space in :path", rq("GET", "/a b", "example.com"))
+    ruled("H2-2 a control byte in :path", rq("GET", "/a\u{1}b", "example.com"))
+    ruled("H2-2 a tab in :path", rq("GET", "/a\tb", "example.com"))
+    // Pseudo-headers (8.3).
+    ruled("a pseudo-header after a regular field", [hf(":method", "GET"), hf(":scheme", "https"), hf("x-a", "1"), hf(":path", "/"), hf(":authority", "a")])
+    ruled("two :path", with(rq("GET", "/", "a"), ":path", "/b"))
+    ruled("two :method", [hf(":method", "GET"), hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "a")])
+    ruled("an unknown pseudo-header", with(rq("GET", "/", "a"), ":protocol", "x"))
+    ruled("a response pseudo-header", [hf(":status", "200"), hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "a")])
+    ruled("no :method", [hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "a")])
+    ruled("no :scheme", [hf(":method", "GET"), hf(":path", "/"), hf(":authority", "a")])
+    ruled("no :path", [hf(":method", "GET"), hf(":scheme", "https"), hf(":authority", "a")])
+    ruled("a :method that is not a token", rq("G T", "/", "a"))
+    ruled("a :method with a control byte", rq("GE\u{1}T", "/", "a"))
+    // Fields (8.2).
+    ruled("an upper case name", with(rq("GET", "/", "a"), "X-A", "1"))
+    for (name in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]) ruled("connection-specific $name", with(rq("GET", "/", "a"), name, "x"))
+    ruled("te: gzip", with(rq("GET", "/", "a"), "te", "gzip"))
+    ruled("a NUL in a value", with(rq("GET", "/", "a"), "x-a", "1\u{0}2"))
+    // content-length against the DATA (8.1.1).
+    var s = ready()
+    s.feed(frame(1, 4, 1, block(with(rq("POST", "/", "a"), "content-length", "5"))), 0)
+    s.feed(frame(0, 1, 1, "abc"), 0)
+    val handed = s.takeRequests().size
+    val code = resetCode(frames(s.takeOutput()), 1)
+    if (handed != 0 || code != 1) fail("8.1.1: content-length 5 with 3 bytes of DATA: $handed requests, reset code $code (wanted PROTOCOL_ERROR)")
+    // H2-3: trailers.
+    trailered("a plain trailer", "x-sum", "1", true)
+    trailered("a host trailer (as in HTTP/1)", "host", "example.com", true)
+    trailered("H2-3 CRLF in a trailer value", "x-a", "1\r\nset-cookie: a=1")
+    trailered("H2-3 NUL in a trailer value", "x-a", "1\u{0}2")
+    trailered("H2-3 an upper case trailer name", "X-A", "1")
+    trailered("H2-3 a trailer name with a space", "x a", "1")
+    trailered("H2-3 content-length in trailers", "content-length", "5")
+    trailered("H2-3 transfer-encoding in trailers", "transfer-encoding", "chunked")
+    trailered("H2-3 connection in trailers", "connection", "close")
+    trailered("H2-3 te: gzip in trailers", "te", "gzip")
+    trailered("a pseudo-header in trailers", ":path", "/x")
+    return
+}
+
 fun main: int {
+    requestRules()
     hpackPins()
     heldHeaders()
     unreadOutput()

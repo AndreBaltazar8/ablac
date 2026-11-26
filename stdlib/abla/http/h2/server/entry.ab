@@ -821,8 +821,14 @@ private fun H2Server.finishBlock(): void {
     if (this.streams[at].sawHeaders) {
         // Trailers: a header block after the request's own, which must end the stream, with no pseudo-headers; decoded and dropped (a streaming route's handler gets them with END).
         if (!endStream) { this.streamError(stream, H2_PROTOCOL_ERROR); return }
+        // A trailer field is checked as a request field is (RFC 9113 8.2.1 and 8.2.2), and, as the HTTP/1 readers do, may not frame the message
+        // (content-length, transfer-encoding: RFC 9110 6.5.1): a streaming route's handler gets these fields.
         for (f in decoded.fields) {
-            if (f.name.size > 0 && f.name[0] == 58) { this.streamError(stream, H2_PROTOCOL_ERROR); return }
+            if (!h2ValidFieldName(f.name) || !h2ValidFieldValue(f.value) || f.name[0] == 58 || (h2Forbidden(f.name) && f.name != "host") ||
+                f.name == "content-length" || (f.name == "te" && f.value != "trailers")) {
+                this.streamError(stream, H2_PROTOCOL_ERROR)
+                return
+            }
         }
         if (this.streams[at].streaming) {
             val kept: array<HttpHeader> = []
@@ -859,7 +865,11 @@ private fun H2Server.finishBlock(): void {
         if (h2HasUpper(f.name) || f.name.size == 0) { this.streamError(stream, H2_PROTOCOL_ERROR); return }
         if (h2Forbidden(f.name) && f.name != "host") { this.streamError(stream, H2_PROTOCOL_ERROR); return }
         if (f.name == "te" && f.value != "trailers") { this.streamError(stream, H2_PROTOCOL_ERROR); return }
-        if (f.name == "host") host = f.value
+        if (f.name == "host") {
+            // One host, and a host value (as the HTTP/1 readers require): a front end and the handler must not read different hosts.
+            if (host != "" || !h2HostValueValid(f.value)) { this.streamError(stream, H2_PROTOCOL_ERROR); return }
+            host = f.value
+        }
         if (f.name == "content-length") {
             val parsed = f.value.parseInt()
             if (parsed == null || parsed < 0 || (contentLength >= 0 && contentLength != parsed)) { this.streamError(stream, H2_PROTOCOL_ERROR); return }
@@ -870,6 +880,8 @@ private fun H2Server.finishBlock(): void {
     if (method == "" || scheme == "" || path == "" || !h2ParseMethodOk(method) || method == "CONNECT") { this.streamError(stream, H2_PROTOCOL_ERROR); return }
     // RFC 9113 section 8.3.1: an http(s) request's :path is an absolute path (or "*" for OPTIONS).
     if (path[0] != 47 && !(method == "OPTIONS" && path == "*")) { this.streamError(stream, H2_PROTOCOL_ERROR); return }
+    // The path and :authority as an HTTP/1 request line and Host would have to be: no space or control byte in the path, a host in :authority.
+    if (!h2PathValueValid(path) || !h2HostValueValid(authority)) { this.streamError(stream, H2_PROTOCOL_ERROR); return }
     if (authority == "" && host != "") authority = host
     if (authority != "" && host == "") headers.append(HttpHeader("host", authority))
     // RFC 9113 8.3.1: with both, :authority is the one that counts. A handler reading `host` must not see another origin than the one the
@@ -1083,6 +1095,23 @@ fun h2ValidFieldValue(value: string): bool {
     for (i in 0 until value.size) {
         val c = value[i]
         if (c == 0 || c == 10 || c == 13) return false
+    }
+    true
+}
+
+/** A host value as the HTTP/1 readers take one (RFC 9112 3.2): no space, comma or control byte; empty is allowed (an empty authority). */
+private fun h2HostValueValid(value: string): bool {
+    for (i in 0 until value.size) {
+        val c = value[i]
+        if (c <= 32 || c == 44 || c == 127) return false
+    }
+    true
+}
+
+/** A :path an HTTP/1 request line could carry: no space and no control byte below 32 (DEL passes, as in the HTTP/1 request line). */
+private fun h2PathValueValid(value: string): bool {
+    for (i in 0 until value.size) {
+        if (value[i] <= 32) return false
     }
     true
 }
