@@ -1652,7 +1652,7 @@ async function checkedScalarBody(calls = false, operators = false) {
             const expression = calls
                 ? (i % 2 ? 'step(right + ' + n + ')' : 'shift(left) + ' + n)
                 : operators
-                ? (i % 2 ? 'left / (right + ' + n + ') % 7' : 'left << 2 | right ^ ' + n + ' & 255 >> 1 >>> 0')
+                ? (i % 2 ? '(left / (right + ' + n + ')) % 7' : 'left << 2 | right ^ ' + n + ' & 255 >> 1 >>> 0')
                 : (i % 2 ? 'right + ' + n : 'left * ' + n + ' + right');
             await edit(expression, ++hits);
         }
