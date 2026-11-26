@@ -1582,14 +1582,14 @@ async function unchangedInputs() {
 }
 
 const tests = { unchanged_inputs: unchangedInputs, logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
-async function checkedScalarBody(calls = false, operators = false, locals = false) {
-    const head = locals ? 'fun answer(left: int, right: int): int ' : 'fun answer(left: int, right: int): int = ';
+async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false) {
+    const head = locals || returns ? 'fun answer(left: int, right: int): int ' : 'fun answer(left: int, right: int): int = ';
     const block = (...lines) => '{\n' + lines.map(line => '    ' + line + '\n').join('') + '}';
-    const initial = calls ? 'step(left) + right' : locals ? block('val t = left + right', 't') : 'left + right';
+    const initial = calls ? 'step(left) + right' : locals ? block('val t = left + right', 't') : returns ? block('if (left < 0) return right', 'left + right') : 'left + right';
     const rest = '\nfun later(): int = 7\n' + (calls
         ? 'fun step(n: int): int = n + 1\nfun shift(n: int): int = n * 2\n' : '');
     const main = 'import "./dep.ab"\nfun main: int = answer(2, 3) + later()\n';
-    const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : locals ? 'checked-locals' : 'checked-scalar', {
+    const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : locals ? 'checked-locals' : returns ? 'checked-returns' : 'checked-scalar', {
         'abla.toml': 'name = "checked-scalar"\nentry = "main.ab"\nvisibility = "imports"\n',
         'main.ab': main,
         'dep.ab': head + initial + rest,
@@ -1656,6 +1656,8 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
                 ? (i % 2 ? '(left / (right + ' + n + ')) % 7' : 'left << 2 | right ^ ' + n + ' & 255 >> 1 >>> 0')
                 : locals
                 ? (i % 2 ? block('val t: int = left * ' + n, 't % 7 + right') : block('val t = (right + ' + n + ') / 2', 't - left'))
+                : returns
+                ? (i % 2 ? block('if (left < ' + n + ') return right', 'left - right') : block('if (right > ' + n + ') { return left * 2 }', 'return left + right'))
                 : (i % 2 ? 'right + ' + n : 'left * ' + n + ' + right');
             await edit(expression, ++hits);
         }
@@ -1663,11 +1665,11 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         if (locals) await edit(block('val t = left', 'val u = t + 1', 'u'), hits);
         // Back to one local: the symbols change again, so full typing.
         if (locals) await edit(block('val t: int = left', 't'), hits);
-        await edit(calls ? 'step(true)' : operators ? 'left / true' : locals ? block('val t: bool = left', '1') : 'true', hits);
+        await edit(calls ? 'step(true)' : operators ? 'left / true' : locals ? block('val t: bool = left', '1') : returns ? block('if (left) return 1', '0') : 'true', hits);
         await edit(initial, hits);
-        await edit(calls ? 'missing(left)' : locals ? block('val left = 1', 'left') : 'left + missing', hits);
-        await edit(calls ? 'step(right)' : locals ? block('right') : 'right', hits);
-        await edit(calls ? 'shift(left)' : locals ? block('left') : 'left', ++hits);
+        await edit(calls ? 'missing(left)' : locals ? block('val left = 1', 'left') : returns ? block('if (left < 1) return missing', 'left') : 'left + missing', hits);
+        await edit(calls ? 'step(right)' : locals || returns ? block('right') : 'right', hits);
+        await edit(calls ? 'shift(left)' : locals || returns ? block('return left') : 'left', ++hits);
     } finally {
         await Promise.all(sessions.map(s => s.close()));
     }
@@ -1677,6 +1679,7 @@ tests.checked_scalar = checkedScalarBody;
 tests.checked_calls = () => checkedScalarBody(true);
 tests.checked_operators = () => checkedScalarBody(false, true);
 tests.checked_locals = () => checkedScalarBody(false, false, true);
+tests.checked_returns = () => checkedScalarBody(false, false, false, true);
 
 tests.checked_interface = async () => {
     const base = 'fun interfaceSample(): int = 2+2\n';
