@@ -1,0 +1,47 @@
+// realpath of the statically linked compiler's C library (src/static_libc/fs.ab, #1139 area 14): LLVM's real_path gives it a buffer of PATH_MAX
+// (4096) bytes. A working directory about 3,000 bytes deep and a relative path about 2,000 bytes long make a result past that: it must be NULL with
+// ENAMETOOLONG (36), the bytes after the buffer untouched (it used to write the whole result there). A short path still resolves. The program works in
+// the directory named by its argument (tools/test-libc-functions.sh makes and removes it). Exits 42.
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/process/arguments"
+import "../../../src/static_libc/fs.ab"
+import "../../../src/static_libc/errno.ab"
+
+// Raw memory, never freed: a NativeByteBuffer would be freed when the function returns, under the caller.
+trusted fun cString(text: string): int {
+    val address = ablaUnsafePointerAddress(ablaUnsafeAllocate(text.size + 1))
+    for (i in 0 until text.size) ablaUnsafeStoreU8(nativePointerFromAddress(address + i), text[i])
+    ablaUnsafeStoreU8(nativePointerFromAddress(address + text.size), 0)
+    address
+}
+
+trusted fun byteAt(address: int): int = ablaUnsafeLoadU8(nativePointerFromAddress(address))
+
+trusted fun main: int {
+    if (processArgumentCount() < 1 || libcChdir(cString(processArgument(0))) != 0) return 1
+    var name = ""
+    for (i in 0 until 200) name = name + "d"
+    // The working directory: 15 levels of 200 bytes below the argument.
+    for (level in 0 until 15) {
+        libcMkdir(cString(name), 448)
+        if (libcChdir(cString(name)) != 0) return 2
+    }
+    // A relative path of 10 more levels, which exists.
+    var relative = ""
+    for (level in 0 until 10) {
+        relative = if (relative == "") name else "$relative/$name"
+        libcMkdir(cString(relative), 448)
+    }
+    val buffer = ablaUnsafePointerAddress(ablaUnsafeAllocate(4096 + 4096))
+    for (i in 4096 until 8192) ablaUnsafeStoreU8(nativePointerFromAddress(buffer + i), 90)
+    val result = libcRealpath(cString(relative), buffer)
+    if (result != 0) return 3
+    if (ablaUnsafeLoadU32(nativePointerFromAddress(libcErrnoAddress())) != 36) return 4
+    for (i in 4096 until 8192) {
+        if (byteAt(buffer + i) != 90) return 5
+    }
+    // A short path still resolves: "." is the working directory, which is more than 3,000 bytes but fits.
+    if (libcRealpath(cString("."), buffer) != buffer || byteAt(buffer) != 47) return 6
+    42
+}
