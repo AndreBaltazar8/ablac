@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Runs selected libc-free programs natively on x86-64 and under QEMU for a Linux cross target.
-# Usage: tools/test-linux-programs.sh <aarch64-linux|riscv64-linux> [compiler] [module-build-dir]
+# Usage: tools/test-linux-programs.sh <aarch64-linux|riscv64-linux> [compiler] [module-build-dir] [part]
 # Pass the existing test-libc-free-programs output directory to reuse that job's module images.
+# A part (1/3, 2/3 or 3/3) reuses that part's images. Part 1 also runs the non-module cases.
 set -euo pipefail
 export LC_ALL=C TZ=UTC
 target=${1:-}
 compiler=${2:-build/ablac}
 module_builds=${3:-}
+part=${4:-}
 case $target in
     aarch64-linux) emulator=qemu-aarch64; suffix=a64; machine=AArch64 ;;
     riscv64-linux) emulator=qemu-riscv64; suffix=rv64; machine=RISC-V ;;
@@ -24,6 +26,12 @@ cd "$root"
 unset ABLA_DEBUG ABLA_GC_STRESS ABLA_TEST_FAST_BUILDS
 list=tests/cases/linux/programs.txt
 out="$root/build/linux-programs/$target"
+if [[ -n $part ]]; then
+    case $part in
+        1/3|2/3|3/3) out=$out-part-${part%/*} ;;
+        *) echo 'linux programs: part must be 1/3, 2/3 or 3/3' >&2; exit 2 ;;
+    esac
+fi
 rm -rf -- "$out"
 mkdir -p "$out"
 awk '
@@ -37,6 +45,17 @@ awk '
     END { exit bad }
 ' "$list" > "$out/selected.txt"
 [[ -s $out/selected.txt ]] || { echo "linux programs: no programs in $list" >&2; exit 1; }
+if [[ -n $part ]]; then
+    while read -r source _; do
+        [[ -f $source ]] || { echo "linux programs: missing $source" >&2; exit 1; }
+    done < "$out/selected.txt"
+    LIBC_FREE_TARGETS=$suffix tools/test-libc-free-programs.sh "$compiler" --part "$part" --list > "$out/modules.txt"
+    awk -v part="$part" '
+        FNR == NR { selected[$1] = 1; next }
+        $1 in selected || (part == "1/3" && $1 !~ /^tests\/cases\/modules\/[^/]+\.ab$/)
+    ' "$out/modules.txt" "$out/selected.txt" > "$out/selected.part"
+    mv "$out/selected.part" "$out/selected.txt"
+fi
 
 check_elf() {
     local source=$1 image=$2 machine=$3 log=$4
@@ -93,5 +112,5 @@ export -f check_program check_elf
 export compiler target emulator out module_builds suffix machine
 workers=${ABLA_TEST_JOBS:-4}
 [[ $workers =~ ^[1-9][0-9]*$ ]] || { echo 'linux programs: ABLA_TEST_JOBS must be positive' >&2; exit 2; }
-xargs -P "$workers" -n 2 bash -euo pipefail -c 'check_program "$@"' _ < "$out/selected.txt"
+xargs -r -P "$workers" -n 2 bash -euo pipefail -c 'check_program "$@"' _ < "$out/selected.txt"
 printf 'linux programs (%s): %s libc-free programs match x86-64 stdout and exit status\n' "$target" "$(wc -l < "$out/selected.txt")"

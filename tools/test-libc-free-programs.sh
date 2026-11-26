@@ -18,7 +18,7 @@
 # LIBC_FREE_TARGETS=a64 the AArch64 half then has an AArch64 builder end to end, no x86-64 compiler involved (it needs ABLA_SYSROOT for the
 # stdlib, and ABLA_STATIC_LLVM_LIB unset, so the programs that import LLVM stay the exceptions the list names).
 # Usage: tools/test-libc-free-programs.sh [compiler] [--part 1/3|2/3|3/3] [--list]
-# The x86 suite runs three disjoint parts. Standalone and cross-target runs still check the whole directory.
+# Each target can run three disjoint parts. Standalone runs default to the whole directory.
 set -euo pipefail
 export LC_ALL=C
 compiler=${1:-build/ablac}
@@ -48,8 +48,8 @@ runner=${LIBC_FREE_RUNNER:-}
 [[ -z $runner || $targets == a64 ]] || { echo "libc free programs: LIBC_FREE_RUNNER needs LIBC_FREE_TARGETS=a64" >&2; exit 2; }
 [[ $targets == x86 || $targets == a64 || $targets == rv64 || $targets == 'x86 a64' ]] ||
     { echo "libc free programs: LIBC_FREE_TARGETS must be x86, a64, rv64 or 'x86 a64'" >&2; exit 2; }
-[[ $part == 0 || $targets == x86 ]] ||
-    { echo 'libc free programs: --part requires LIBC_FREE_TARGETS=x86' >&2; exit 2; }
+[[ $part == 0 || ( $targets != 'x86 a64' && -z $runner ) ]] ||
+    { echo 'libc free programs: --part requires one target and no compiler runner' >&2; exit 2; }
 programs=(tests/cases/modules/*.ab)
 select_programs() {
     printf '%s\n' "${programs[@]}" |
@@ -156,7 +156,7 @@ if ((part)); then
             owner[name] = (NR - 1) % 3 + 1
             next
         }
-        { name = ($1 == "nobuild" ? $2 : $1) }
+        { name = ($1 ~ /^nobuild(-a64|-rv64)?$/ ? $2 : $1) }
         (name in owner ? owner[name] : 1) == part
     ' <(printf '%s\n' "${programs[@]}") "$expected" > "$out/expected.part"
     mv "$out/expected.part" "$expected"

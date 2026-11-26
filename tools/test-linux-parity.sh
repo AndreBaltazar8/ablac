@@ -2,7 +2,7 @@
 # #1208: every module program (tests/cases/modules/*.ab) that builds libc-free for a Linux cross target runs under QEMU and prints and exits
 # what the x86-64 build prints and exits (tools/survey-linux-parity.sh). tools/linux-parity-blockers.tsv names the programs that do not, and why;
 # it may only shrink: a program that differs and is not listed fails the test, and so does a listed program that matches now.
-# Usage: tools/test-linux-parity.sh <aarch64-linux|riscv64-linux> [compiler] [image-dir]
+# Usage: tools/test-linux-parity.sh <aarch64-linux|riscv64-linux> [compiler] [image-dir] [part]
 #   image-dir: build/libc-free-programs of tools/test-libc-free-programs.sh for the target (NAME.a64 or NAME.rv64); the x86-64 builds of the
 #   same programs (--fast) are made here, into build/linux-parity/<target>/x86.
 set -euo pipefail
@@ -10,6 +10,7 @@ export LC_ALL=C TZ=UTC
 target=${1:-}
 compiler=${2:-build/ablac}
 images=${3:-build/libc-free-programs}
+part=${4:-}
 case $target in
     aarch64-linux) suffix=a64 ;;
     riscv64-linux) suffix=rv64 ;;
@@ -29,6 +30,12 @@ blockers=${LINUX_PARITY_BLOCKERS:-tools/linux-parity-blockers.tsv}
 sort -c "$blockers" || { echo "linux parity: $blockers must be sorted" >&2; exit 1; }
 unset ABLA_DEBUG ABLA_GC_STRESS ABLA_TEST_FAST_BUILDS
 work=$root/build/linux-parity/$target
+if [[ -n $part ]]; then
+    case $part in
+        1/3|2/3|3/3) work=$work-part-${part%/*} ;;
+        *) echo 'linux parity: part must be 1/3, 2/3 or 3/3' >&2; exit 2 ;;
+    esac
+fi
 rm -rf -- "$work"
 mkdir -p "$work/x86"
 for image in "$images"/*."$suffix"; do
@@ -59,6 +66,17 @@ tools/survey-linux-parity.sh "$suffix" "$work/x86" "$work/survey" | tail -1
 # What differs, against the list (the lines of the list for this target: "<program> <target> <verdict> <reason>", tab-separated).
 awk -F'\t' '$2 != "match" { print $1 "\t" $2 }' "$work/survey/results.tsv" | sort > "$work/actual.txt"
 awk -F'\t' -v t="$suffix" '($2 == t || $2 == "both") && $3 != "skip" { print $1 "\t" $3 }' "$blockers" | sort > "$work/listed.txt"
+if [[ -n $part ]]; then
+    LIBC_FREE_TARGETS=$suffix tools/test-libc-free-programs.sh "$compiler" --part "$part" --list > "$work/programs.txt"
+    while IFS=$'\t' read -r name verdict; do
+        source=tests/cases/modules/$name.ab
+        # Part 1 must still reject blockers whose source was removed.
+        if grep -Fx "$source" "$work/programs.txt" > /dev/null || [[ $part == 1/3 && ! -f $source ]]; then
+            printf '%s\t%s\n' "$name" "$verdict"
+        fi
+    done < "$work/listed.txt" > "$work/listed.part"
+    mv "$work/listed.part" "$work/listed.txt"
+fi
 failed=0
 while IFS=$'\t' read -r name verdict; do
     printf 'linux parity: %s is %s on %s and not in %s (%s)\n' "$name" "$verdict" "$target" "$blockers" "$work/survey/runs/$name" >&2
