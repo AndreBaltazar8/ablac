@@ -56,6 +56,17 @@ These checks are not all exercised by an ordinary push. The separate
 is another manual check; its route convergence is not an independent compiler
 implementation or proof against a compromised shared seed.
 
+## Tests outside the suite
+
+Every test script runs from the suite's recipe (`make test-serial`), a workflow,
+`tests/abla-tests.json` or another script, except the few listed with their
+reasons in [tests-outside-suite.txt](../tools/tests-outside-suite.txt): tests
+that need an AArch64 board, a live network or about a quarter of an hour. Run
+those by hand when their area changes. `tools/test-test-reachability.sh`, a
+suite guard, fails on a test script that has neither a caller nor an entry
+there. Lists that only select from the suite, such as `tools/test-quick.txt`,
+do not count as callers.
+
 ## Releases and logs
 
 Release's `compiler` job builds and packages Linux x86-64, macOS arm64 and

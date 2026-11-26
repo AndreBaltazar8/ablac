@@ -98,6 +98,7 @@ test-serial: ablac
 	tools/test-readiness.sh
 	tools/test-repo-language-guard.sh
 	tools/test-repo-language-guard-selftest.sh
+	tools/test-test-reachability.sh
 	tools/test-project-c-platform-symbols.sh
 	tools/test-repo-shebang-guard.sh
 	tools/test-repo-shebang-guard-selftest.sh
@@ -223,6 +224,8 @@ test-serial: ablac
 	tools/test-wasm-wasi.sh $(COMPILER)
 	tools/test-browser-frontend.sh $(COMPILER)
 	tools/test-playground-build.sh $(COMPILER)
+	node tools/playground/test-stdlib-bundle.mjs stdlib
+	tools/test-release-check-playground.sh
 	tools/test-wasm-panic-message.sh $(COMPILER)
 	tools/test-release-scripts.sh $(COMPILER)
 	tools/test-siblings-tool.sh
@@ -518,6 +521,13 @@ test-serial: ablac
 	tools/test-http-nodelay.sh $(COMPILER)
 	tools/test-http-event-drip.sh $(COMPILER)
 	tools/test-websocket-server-drip.sh $(COMPILER)
+	tools/test-http-request-line.sh $(COMPILER)
+	tools/test-http2-review.sh $(COMPILER)
+	tools/test-websocket-pipelined.sh $(COMPILER)
+	tools/test-dns-hardening.sh $(COMPILER)
+	tools/test-tls-resume-review.sh $(COMPILER)
+	tools/test-jwt-keys.sh $(COMPILER)
+	tools/test-tar-entry-count.sh $(COMPILER)
 	tools/test-http-differential.sh $(COMPILER)
 	tools/test-http-host.sh $(COMPILER)
 	tools/test-http-native-scan.sh $(COMPILER)
@@ -743,6 +753,13 @@ test-serial: ablac
 	tools/test-gc-background-free.sh $(COMPILER)
 	tools/test-json-differential.sh $(COMPILER)
 	tools/test-fuzz-abla.sh $(COMPILER)
+	tools/test-fuzz-parsers.sh $(COMPILER)
+	tools/test-runtime-hooks.sh $(COMPILER)
+	tools/test-runtime-prune.sh $(COMPILER)
+	tools/test-builtin-link.sh $(COMPILER)
+	tools/test-elf-relocations.sh $(COMPILER)
+	tools/test-static-libm.sh $(COMPILER)
+	tools/test-package-linux-cleanup.sh $(COMPILER_PAYLOAD)
 	tools/test-subparser-site-key.sh $(COMPILER)
 	tools/test-subparser-named-arguments.sh $(COMPILER)
 	tools/test-subparser-raw-isolation.sh $(COMPILER)
