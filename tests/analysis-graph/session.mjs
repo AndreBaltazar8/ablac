@@ -1530,6 +1530,82 @@ fun main: int {
 }
 
 const tests = { logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+async function checkedScalarBody() {
+    const head = 'fun answer(left: int, right: int): int = ';
+    const rest = '\nfun later(): int = 7\n';
+    const main = 'import "./dep.ab"\nfun main: int = answer(2, 3) + later()\n';
+    const p = fixture('checked-scalar', {
+        'abla.toml': 'name = "checked-scalar"\nentry = "main.ab"\nvisibility = "imports"\n',
+        'main.ab': main,
+        'dep.ab': head + 'left + right' + rest,
+    });
+    const file = path.join(p, 'dep.ab');
+    const options = { mode: 'graph-v2', unusedImports: true };
+    const trace = { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TRACE: '1' };
+    const replay = await start(p, { ...options,
+        env: { ...trace, ABLA_ANALYSIS_INCREMENTAL_TYPING: '2', ABLA_ANALYSIS_CHECK: '1' }, log: 'scalar.stderr' });
+    const full = await start(p, { ...options,
+        env: { ...trace, ABLA_ANALYSIS_INCREMENTAL_TYPING: '0', ABLA_ANALYSIS_CHECK: '0' }, log: 'full.stderr' });
+    const sessions = [replay, full];
+    let revision;
+    let version = 0;
+    const check = async (text, expectedHits) => {
+        const [actual, expected] = await Promise.all(sessions.map(s => s.analyze()));
+        assert.deepEqual(actual, expected);
+        if (revision !== undefined) {
+            const [delta, ref] = await Promise.all(sessions.map(s => s.rpc('analyze', { since: revision })));
+            assert.deepEqual(delta, ref);
+        }
+        revision = actual.revision;
+        const use = text.indexOf('left', head.length);
+        const editor = use < 0
+            ? { uri: uri(path.join(p, 'main.ab')), offset: bytes(main.slice(0, main.indexOf('later()'))), revision }
+            : { uri: uri(file), offset: bytes(text.slice(0, use)), revision };
+        for (const method of ['query/definition', 'query/hover', 'query/references']) {
+            const [found, ref] = await Promise.all(sessions.map(s => s.rpc(method, editor)));
+            assert.deepEqual(found, ref);
+        }
+        const log = fs.readFileSync(replay.log, 'utf8');
+        assert.equal(log.match(/rechecked one scalar body/g)?.length ?? 0, expectedHits, log);
+        assert.ok(!/abla-analysis-check.*(?:DIFFERENT|FAILED)/.test(log), log);
+        if (version === 1 || version === 8) {
+            const at = bytes(text.slice(0, text.lastIndexOf('7')));
+            const params = { baseRevision: revision, edits: [{ uri: uri(file), start: at, end: at + 1, newText: '8' }] };
+            const [found, ref] = await Promise.all(sessions.map(s => s.rpc('refactor/validate', params)));
+            assert.deepEqual(found, ref);
+            assert.equal(found.result.valid, true, found.result.reason);
+        }
+    };
+    const edit = async (expression, count) => {
+        const text = head + expression + rest;
+        version++;
+        for (const session of sessions) {
+            assert.ok(!('error' in await session.rpc(version === 1 ? 'document/open' : 'document/change', { uri: uri(file), version, text })));
+        }
+        await check(text, count);
+    };
+    try {
+        await check(head + 'left + right' + rest, 0);
+        let seed = 7907;
+        let hits = 0;
+        for (let i = 0; i < 8; i++) {
+            seed ^= seed << 13;
+            seed ^= seed >>> 17;
+            seed ^= seed << 5;
+            const n = (seed >>> 0) % 1000;
+            await edit(i % 2 ? 'right + ' + n : 'left * ' + n + ' + right', ++hits);
+        }
+        await edit('true', hits);
+        await edit('left + right', hits);
+        await edit('left + missing', hits);
+        await edit('right', hits);
+        await edit('left', ++hits);
+    } finally {
+        await Promise.all(sessions.map(s => s.close()));
+    }
+}
+
+tests.checked_scalar = checkedScalarBody;
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;

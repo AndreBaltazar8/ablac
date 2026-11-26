@@ -6,6 +6,7 @@ import "module.ab"
 import "parser.ab"
 import "lexer.ab"
 import "abla/text"
+import "overload.ab"
 
 class BootstrapAnalysisBodyInsert(
     val at: int,
@@ -151,6 +152,95 @@ fun bootstrapAnalysisPlainBodyChange(parsed: BootstrapParseResult, change: Boots
     false
 }
 
+class BootstrapAnalysisScalarEdit(val splice: BootstrapAnalysisBodyInsert, val declaration: int)
+
+fun bootstrapAnalysisScalarType(type: string): bool =
+    type == "int" || type == "i64" || type == "f64" || type == "bool"
+
+// No global reads or calls. The body checker resolves these names in the
+// unchanged parameter environment, and types primitives as the full pass does.
+fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameters: array<string>, depth: int): bool {
+    if (depth > 24) return false
+    val kind = expression.kind
+    if (kind == "identifier") {
+        for (name in parameters) if (name == expression.text) return true
+        return false
+    }
+    if (kind == "integer" || kind == "float" || kind == "true" || kind == "false") return true
+    val arity = if (kind == "if") 3
+        else if (kind == "block" || kind == "unary-" || kind == "unary!") 1
+        else if (kind == "+" || kind == "-" || kind == "*" || kind == "<" || kind == ">" ||
+            kind == "<=" || kind == ">=" || kind == "==" || kind == "!=" || kind == "&&" || kind == "||") 2
+        else 0
+    if (arity == 0 || expression.children.size != arity) return false
+    for (child in expression.children) {
+        if (!bootstrapAnalysisScalarExpression(child, parameters, depth + 1)) return false
+    }
+    true
+}
+
+fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration): bool {
+    if (declaration.kind != "fun" || !bootstrapAnalysisScalarType(declaration.resultType) ||
+        declaration.isTrusted || declaration.isResource || declaration.isNoEscape ||
+        declaration.annotations.size != 0 || declaration.typeParameters.size != 0 ||
+        declaration.extensionOwner != "" || declaration.externalLibrary != "" ||
+        declaration.generatedNamespace != "" || declaration.name == "main" ||
+        declaration.name.startsWith("__abla_")) return false
+    for (type in declaration.parameterTypes) if (!bootstrapAnalysisScalarType(type)) return false
+    for (kind in declaration.parameterKinds) if (kind != "parameter") return false
+    for (defaultValue in declaration.parameterDefaults) if (defaultValue.kind != "missing") return false
+    bootstrapAnalysisScalarExpression(declaration.expression, declaration.parameters, 0)
+}
+
+fun bootstrapAnalysisCommonPrefix(before: string, after: string): int {
+    var same = 0
+    while (same < before.size && same < after.size && before[same] == after[same]) same = same + 1
+    same
+}
+
+fun bootstrapAnalysisScalarChange(before: string, after: string,
+    parsed: BootstrapParseResult, project: BootstrapParseResult): BootstrapAnalysisScalarEdit? {
+    if (parsed.errors != 0 || parsed.extensionErrors != 0) return null
+    val changed = bootstrapAnalysisCommonPrefix(before, after)
+    val shift = after.size - before.size
+    for (index in 0 until parsed.declarations.size) {
+        val declaration = parsed.declarations[index]
+        val body = declaration.expression
+        val oldEnd = body.end - shift
+        if (changed < body.begin || changed >= body.end || body.end - body.begin > 1024 ||
+            oldEnd <= body.begin || oldEnd > before.size || oldEnd - body.begin > 1024 ||
+            before.slice(oldEnd, before.size) != after.slice(body.end, after.size) ||
+            !bootstrapAnalysisScalarFunction(declaration)) continue
+        val old = bootstrapParseWithIdentity(before.slice(declaration.begin, oldEnd), declaration.sourceIdentity)
+        if (old.errors != 0 || old.extensionErrors != 0 || old.declarations.size != 1 ||
+            !bootstrapAnalysisScalarFunction(old.declarations[0]) ||
+            old.declarations[0].expression.begin != body.begin - declaration.begin) return null
+        // Keep the initial slice independent of operator selection. In
+        // particular an alias or generic owner could name a scalar receiver.
+        var signatures = 0
+        for (candidate in project.declarations) {
+            if (bootstrapIsOperatorDeclaration(candidate)) return null
+            for (method in candidate.methods) if (bootstrapIsOperatorDeclaration(method)) return null
+            if (candidate.kind == "fun" && candidate.extensionOwner == "" && candidate.name == declaration.name) signatures = signatures + 1
+        }
+        if (signatures != 1) return null
+        val splice = BootstrapAnalysisBodyInsert(body.begin, body.end - body.begin, body.begin, "", 0, 0,
+            after.slice(body.begin, body.end), oldEnd - body.begin, before.slice(body.begin, oldEnd))
+        return BootstrapAnalysisScalarEdit(splice, index)
+    }
+    null
+}
+
+// The same entire expression must be present in both prepared snapshots;
+// transformations or a shift of anything outside it void the proof.
+fun bootstrapAnalysisPreparedScalarChange(before: string, after: string, change: BootstrapAnalysisBodyInsert): bool {
+    val at = bootstrapAnalysisCommonPrefix(before, after) - bootstrapAnalysisCommonPrefix(change.previousLine, change.line)
+    at >= 0 && at + change.removed <= before.size && at + change.size <= after.size &&
+        before.slice(at, at + change.removed) == change.previousLine &&
+        after.slice(at, at + change.size) == change.line &&
+        before.slice(at + change.removed, before.size) == after.slice(at + change.size, after.size)
+}
+
 class BootstrapAnalysisReplayInputs(
     val syntax: BootstrapModuleSyntaxInputs,
     val metadata: array<string>,
@@ -167,7 +257,7 @@ fun bootstrapAnalysisReplayStrings(left: array<string>, right: array<string>): b
 }
 
 fun bootstrapAnalysisReplayInputsAgree(before: BootstrapAnalysisReplayInputs,
-    after: BootstrapAnalysisReplayInputs, path: string, change: BootstrapAnalysisBodyInsert): bool {
+    after: BootstrapAnalysisReplayInputs, path: string, change: BootstrapAnalysisBodyInsert, scalar: bool = false): bool {
     val left = before.syntax
     val right = after.syntax
     if (!left.replayable || !right.replayable ||
@@ -181,9 +271,13 @@ fun bootstrapAnalysisReplayInputsAgree(before: BootstrapAnalysisReplayInputs,
     for (index in 0 until left.paths.size) {
         if (left.sources[index] == right.sources[index]) continue
         if (changed || left.paths[index] != path || left.hosts[index] != "") return false
-        val prepared = bootstrapAnalysisBodyChange(left.sources[index], right.sources[index])
-        if (prepared == null || prepared.comment != change.comment ||
-            prepared.line != change.line || prepared.previousLine != change.previousLine) return false
+        if (scalar) {
+            if (!bootstrapAnalysisPreparedScalarChange(left.sources[index], right.sources[index], change)) return false
+        } else {
+            val prepared = bootstrapAnalysisBodyChange(left.sources[index], right.sources[index])
+            if (prepared == null || prepared.comment != change.comment ||
+                prepared.line != change.line || prepared.previousLine != change.previousLine) return false
+        }
         changed = true
     }
     changed
@@ -220,5 +314,45 @@ fun bootstrapAnalysisReplayOccurrence(set: BootstrapAnalysisOccurrenceSet,
         types.append(set.types[i])
     }
     if (!inserted || (id != "" && change.removed != 0 && !replaced)) return null
+    BootstrapAnalysisOccurrenceSet(begins, ends, ids, types)
+}
+
+fun bootstrapAnalysisReplayScalarOccurrence(old: BootstrapAnalysisOccurrenceSet, fresh: BootstrapAnalysisOccurrenceSet,
+    change: BootstrapAnalysisBodyInsert): BootstrapAnalysisOccurrenceSet? {
+    val begins: array<int> = []
+    val ends: array<int> = []
+    val ids: array<string> = []
+    val types: array<string> = []
+    val oldEnd = change.at + change.removed
+    val newEnd = change.at + change.size
+    val shift = newEnd - oldEnd
+    var inserted = false
+    for (index in 0 until (old.begins.size + 1)) {
+        val atEnd = index == old.begins.size
+        if (!inserted && (atEnd || old.begins[index] >= change.at)) {
+            for (item in 0 until fresh.begins.size) {
+                if (fresh.begins[item] < change.at || fresh.begins[item] >= newEnd) continue
+                if (fresh.ends[item] > newEnd || fresh.ids[item] == "" || fresh.types[item] == "") return null
+                begins.append(fresh.begins[item])
+                ends.append(fresh.ends[item])
+                ids.append(fresh.ids[item])
+                types.append(fresh.types[item])
+            }
+            inserted = true
+        }
+        if (atEnd) break
+        val begin = old.begins[index]
+        val end = old.ends[index]
+        if (begin < change.at && end > change.at) return null
+        if (begin >= change.at && begin < oldEnd) {
+            if (end > oldEnd) return null
+            continue
+        }
+        val delta = if (begin >= oldEnd) shift else 0
+        begins.append(begin + delta)
+        ends.append(end + delta)
+        ids.append(old.ids[index])
+        types.append(old.types[index])
+    }
     BootstrapAnalysisOccurrenceSet(begins, ends, ids, types)
 }
