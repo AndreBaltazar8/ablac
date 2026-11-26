@@ -13,6 +13,7 @@ target=${1:-}
 images=${2:-}
 result=${3:-}
 list=${4:-}
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 case $target in
     a64) emulator=qemu-aarch64 ;;
     rv64) emulator=qemu-riscv64 ;;
@@ -33,6 +34,16 @@ fi
 # json-ascii-spans takes 21 s natively and 39 s under qemu-aarch64 on an idle CPU: the limit leaves room for a loaded runner.
 limit=${SURVEY_TIMEOUT:-180}
 
+run_program() {
+    local name=$1
+    shift
+    if [[ $name == http-server ]]; then
+        "$root/tools/test-http-server.sh" --run timeout -k 2 "$limit" "$@"
+    else
+        timeout -k 2 "$limit" "$@"
+    fi
+}
+
 run_one() {
     local name=$1 dir native guest status_a status_b status_g
     dir="$result/runs/$name"
@@ -44,16 +55,28 @@ run_one() {
         return 0
     fi
     status_a=0
-    (cd "$dir/a/w" && timeout -k 2 "$limit" "$native" < /dev/null) > "$dir/a.out" 2> "$dir/a.err" || status_a=$?
+    (cd "$dir/a/w" && run_program "$name" "$native" < /dev/null) > "$dir/a.out" 2> "$dir/a.err" || status_a=$?
+    if ((status_a == 124)); then
+        printf '%s\ttimeout\t%s\t-\tnative first run\n' "$name" "$status_a" > "$dir/line"
+        return 0
+    fi
+    if [[ $name == http-server && $status_a != 42 ]]; then
+        printf '%s\tstatus\t%s\t-\tHTTP fixture failed (expected 42)\n' "$name" "$status_a" > "$dir/line"
+        return 0
+    fi
     status_b=0
-    (cd "$dir/b/w" && timeout -k 2 "$limit" "$native" < /dev/null) > "$dir/b.out" 2> "$dir/b.err" || status_b=$?
+    (cd "$dir/b/w" && run_program "$name" "$native" < /dev/null) > "$dir/b.out" 2> "$dir/b.err" || status_b=$?
+    if ((status_b == 124)); then
+        printf '%s\ttimeout\t%s/%s\t-\tnative repeat\n' "$name" "$status_a" "$status_b" > "$dir/line"
+        return 0
+    fi
     if [[ $status_a != "$status_b" ]] || ! cmp -s "$dir/a.out" "$dir/b.out"; then
         printf '%s\tflaky\t%s/%s\t-\t\n' "$name" "$status_a" "$status_b" > "$dir/line"
         return 0
     fi
     status_g=0
-    (cd "$dir/g/w" && timeout -k 2 "$limit" "$emulator" "$guest" < /dev/null) > "$dir/g.out" 2> "$dir/g.err" || status_g=$?
-    if [[ $status_g == 124 && $status_a != 124 ]]; then
+    (cd "$dir/g/w" && run_program "$name" "$emulator" "$guest" < /dev/null) > "$dir/g.out" 2> "$dir/g.err" || status_g=$?
+    if [[ $status_g == 124 ]]; then
         printf '%s\ttimeout\t%s\t%s\t\n' "$name" "$status_a" "$status_g" > "$dir/line"
     elif [[ $status_g != "$status_a" ]]; then
         printf '%s\tstatus\t%s\t%s\t%s\n' "$name" "$status_a" "$status_g" "$(head -c 160 "$dir/g.err" | tr '\n\t' '  ')" > "$dir/line"
@@ -63,8 +86,8 @@ run_one() {
         printf '%s\tmatch\t%s\t%s\t\n' "$name" "$status_a" "$status_g" > "$dir/line"
     fi
 }
-export -f run_one
-export images result target emulator limit
+export -f run_program run_one
+export images result target emulator limit root
 workers=${ABLA_TEST_JOBS:-4}
 xargs -P "$workers" -I{} bash -c 'run_one {}' < "$result/names.txt"
 { for name in $(cat "$result/names.txt"); do cat "$result/runs/$name/line"; done; } > "$result/results.tsv"
