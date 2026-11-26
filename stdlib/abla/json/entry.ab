@@ -460,6 +460,47 @@ fun ablaJsonArray(values: array<Json>): Json = jsonArray(values)
 fun ablaJsonObject(keys: array<string>, values: array<Json>): Json =
     jsonObject(keys, values)
 
+/** The members a `$json` object with a computed key keeps (decision #154): one per key, at the position where the key first appears, each the
+ *  index of the last member with that key (the later member wins, as JavaScript's JSON.parse and jsonParse's mergeDuplicateKeys read a
+ *  repeated key). Linear: a map once there are more than eight members. */
+fun ablaJsonMergeOrder(keys: array<string>): array<int> {
+    val order: array<int> = []
+    if (keys.size <= 8) {
+        for (index in 0 until keys.size) {
+            var slot = -1
+            for (kept in 0 until order.size) {
+                if (slot < 0 && keys[order[kept]] == keys[index]) slot = kept
+            }
+            if (slot < 0) order.append(index) else order[slot] = index
+        }
+    } else {
+        val slots: Map<string, int> = Map()
+        for (index in 0 until keys.size) {
+            if (slots.has(keys[index])) {
+                val slot = slots.get(keys[index]) ?? 0
+                order[slot] = index
+            } else {
+                slots.set(keys[index], order.size)
+                order.append(index)
+            }
+        }
+    }
+    order
+}
+
+/** `$json`'s object when a key is computed: as jsonObject, with a repeated key merged (ablaJsonMergeOrder), so the output has one member per
+ *  name and jsonParse accepts it; JSON null if a key is invalid UTF-8. */
+fun ablaJsonObjectMerged(keys: array<string>, values: array<Json>): Json {
+    if (keys.size != values.size) return jsonNull()
+    val kept: array<string> = []
+    val keptValues: array<Json> = []
+    for (index in ablaJsonMergeOrder(keys)) {
+        kept.append(keys[index])
+        keptValues.append(values[index])
+    }
+    jsonObject(kept, keptValues)
+}
+
 // A `$json` value written as an Abla expression becomes JSON through these:
 // the call picks the overload for the expression's type, so a value of any
 // other type is a compile error at the value.
@@ -4646,6 +4687,7 @@ compile fun ablaJsonParseObject(cursor: ParserCursor, streamed: bool = false): S
     // Literal keys seen so far: a repeated one is an error, as jsonParse's default
     // rejects a duplicate key.
     val literalKeys: array<string> = []
+    var computed = false
     var more = !parserAt(cursor, "}")
     while (more) {
         if (parserAt(cursor, ",")) {
@@ -4680,7 +4722,10 @@ compile fun ablaJsonParseObject(cursor: ParserCursor, streamed: bool = false): S
                 }
                 literalKeys.append(text)
                 keys.append(key)
-            } else keys.append(ablaJsonSyntaxCall("ablaJsonKey", key))
+            } else {
+                computed = true
+                keys.append(ablaJsonSyntaxCall("ablaJsonKey", key))
+            }
             ablaJsonExpect(cursor, ":", "expected `:` after a \$json object key")
             values.append(ablaJsonParseForm(cursor, streamed))
             // A comma may follow the last member.
@@ -4694,7 +4739,8 @@ compile fun ablaJsonParseObject(cursor: ParserCursor, streamed: bool = false): S
     arguments.append(syntaxArray(keys))
     arguments.append(syntaxArray(values))
     if (guarded) arguments.append(syntaxArray(guards))
-    val object = syntaxCall("ablaJsonObject", arguments)
+    // A computed key may repeat another (decision #154): the tree form merges such an object at run time, the later member winning.
+    val object = syntaxCall(if (computed && !streamed) "ablaJsonObjectMerged" else "ablaJsonObject", arguments)
     if (guarded && !streamed) ablaJsonGuardedTree(object, prefix) else object
 }
 
@@ -4760,6 +4806,8 @@ fun ablaJsonLiteralMember(var object: JsonLiteralObject, key: string, value: Jso
 }
 /// Returns the completed JSON object or JSON null if a key is invalid UTF-8 or the key and value counts differ.
 fun ablaJsonLiteralFinish(object: JsonLiteralObject): Json = jsonObject(object.keys, object.values)
+/// Returns the completed JSON object of a guarded object with a computed key, a repeated key merged as ablaJsonObjectMerged does, or JSON null if a key is invalid UTF-8.
+fun ablaJsonLiteralFinishMerged(object: JsonLiteralObject): Json = ablaJsonObjectMerged(object.keys, object.values)
 
 /// Holds the generated guard and key expressions and the condition that all selected keys are valid.
 compile class JsonObjectSyntaxKeys(
@@ -4826,7 +4874,10 @@ compile fun ablaJsonGuardedTree(expression: SyntaxExpression, prefix: string): S
         if (prepared.guards[index] == "") body.append(member)
         else body.append(syntaxIf(syntaxIdentifier(prepared.guards[index]), member, syntaxBlock([])))
     }
-    body.append(syntaxCall("ablaJsonLiteralFinish", [syntaxIdentifier(name)]))
+    // With a computed key the members are merged, the later one winning (decision #154).
+    var computed = false
+    for (local in prepared.keys) { if (local != "") computed = true }
+    body.append(syntaxCall(if (computed) "ablaJsonLiteralFinishMerged" else "ablaJsonLiteralFinish", [syntaxIdentifier(name)]))
     prepared.statements.append(syntaxIf(prepared.valid, syntaxBlock(body), syntaxCall("ablaJsonNull", [])))
     syntaxBlock(prepared.statements)
 }
@@ -4949,6 +5000,15 @@ compile fun ablaJsonWriteObject(
                 valid = syntaxBinary("&&", valid, syntaxCall("ablaJsonWriteKeyValid", [syntaxIdentifier(local)]))
             }
         }
+        // A computed key may repeat another: the members are merged as the tree form merges them (decision #154).
+        val keyExpressions: array<SyntaxExpression> = []
+        val noGuards: array<string> = []
+        for (index in 0 until count) {
+            keyExpressions.append(if (keyNames[index] == "") syntaxChild(keys, index) else syntaxIdentifier(keyNames[index]))
+            noGuards.append("")
+        }
+        ablaJsonWriteMergedObject(plan, keyExpressions, values, noGuards, valid)
+        return
     }
     val body = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], plan.pending, plan.nextKey, plan.textTarget)
     plan.pending = ""
@@ -4981,11 +5041,78 @@ compile fun ablaJsonWriteObject(
 // Returns true if the supplied object key contains valid UTF-8.
 fun ablaJsonWriteKeyValid(key: string): bool = key.isValidUtf8()
 
+// `$jsonw` objects with a computed key (decision #154): each member's value is written to a buffer of its own, in source order, and the members are
+// merged as the tree form merges them (ablaJsonMergeOrder) before the object is written. Objects without a computed key are written directly.
+class JsonWrittenMembers(val keys: array<string>, val texts: array<string>)
+/// Returns an empty member list for a `$jsonw` object with a computed key.
+fun ablaJsonWrittenMembers(): JsonWrittenMembers = JsonWrittenMembers([], [])
+/// Returns a buffer for one member's value of a `$jsonw` object with a computed key.
+fun ablaJsonWrittenValue(): ByteBuffer = byteBuffer()
+/// Records one member: its key and the JSON text written for its value.
+fun ablaJsonWrittenMember(var members: JsonWrittenMembers, key: string, var value: ByteBuffer): void {
+    members.keys.append(key)
+    members.texts.append(value.toText())
+    return
+}
+/// Writes the recorded members as one object, a repeated key merged (the later member wins, at the first one's position).
+fun ablaJsonWriteMerged(var out: ByteBuffer, members: JsonWrittenMembers): void {
+    out.appendText("{")
+    var first = true
+    for (index in ablaJsonMergeOrder(members.keys)) {
+        if (!first) out.appendText(",")
+        first = false
+        ablaJsonWriteValue(out, members.keys[index])
+        out.appendText(":")
+        out.appendText(members.texts[index])
+    }
+    out.appendText("}")
+    return
+}
+
+/// Adds syntax that writes an object with a computed key through JsonWrittenMembers: `keys` are the key expressions (literals or the bound
+/// locals), `guards` the guard locals ("" for none); null is written instead when `valid` is false.
+compile fun ablaJsonWriteMergedObject(var plan: JsonWriteSyntaxPlan, keys: array<SyntaxExpression>, values: SyntaxExpression,
+    guards: array<string>, valid: SyntaxExpression): void {
+    ablaJsonWriteFlush(plan)
+    val members = "${plan.prefix}_members${plan.nextKey}"
+    plan.nextKey = plan.nextKey + 1
+    val body: array<SyntaxExpression> = [syntaxLocal(members, compilerFindType("JsonWrittenMembers"), syntaxCall("ablaJsonWrittenMembers", []))]
+    for (index in 0 until keys.size) {
+        val buffer = "${plan.prefix}_member${plan.nextKey}"
+        plan.nextKey = plan.nextKey + 1
+        val member = JsonWriteSyntaxPlan(syntaxIdentifier(buffer), plan.prefix, [], "", plan.nextKey, plan.textTarget)
+        member.statements.append(syntaxLocal(buffer, compilerFindType("ByteBuffer"), syntaxCall("ablaJsonWrittenValue", [])))
+        ablaJsonWriteLower(member, syntaxChild(values, index))
+        ablaJsonWriteFlush(member)
+        plan.nextKey = member.nextKey
+        member.statements.append(syntaxCall("ablaJsonWrittenMember", [syntaxIdentifier(members), keys[index], syntaxIdentifier(buffer)]))
+        if (guards[index] == "") {
+            for (statement in member.statements) body.append(statement)
+        } else body.append(syntaxIf(syntaxIdentifier(guards[index]), syntaxBlock(member.statements), syntaxBlock([])))
+    }
+    body.append(syntaxCall("ablaJsonWriteMerged", [ablaJsonWriteSink(plan.sink), syntaxIdentifier(members)]))
+    plan.statements.append(syntaxIf(valid, syntaxBlock(body), ablaJsonWriteTextCall(plan, "null")))
+    return
+}
+
 /// Adds syntax to stream the selected object members or write null if a selected key is invalid.
 compile fun ablaJsonWriteGuardedObject(var plan: JsonWriteSyntaxPlan, expression: SyntaxExpression): void {
     ablaJsonWriteFlush(plan)
     val prepared = ablaJsonGuardedKeys(expression, plan.prefix, plan.nextKey)
     for (statement in prepared.statements) plan.statements.append(statement)
+    // A computed key may repeat another: the members are merged as the tree form merges them (decision #154).
+    var computed = false
+    for (local in prepared.keys) { if (local != "") computed = true }
+    if (computed) {
+        plan.nextKey = prepared.nextKey
+        val guardedKeys = syntaxChild(expression, 0)
+        val keyExpressions: array<SyntaxExpression> = []
+        for (index in 0 until syntaxChildCount(guardedKeys)) {
+            keyExpressions.append(if (prepared.keys[index] == "") syntaxChild(guardedKeys, index) else syntaxIdentifier(prepared.keys[index]))
+        }
+        ablaJsonWriteMergedObject(plan, keyExpressions, syntaxChild(expression, 1), prepared.guards, prepared.valid)
+        return
+    }
     val body = JsonWriteSyntaxPlan(plan.sink, plan.prefix, [], "{", prepared.nextKey, plan.textTarget)
     val keys = syntaxChild(expression, 0)
     val values = syntaxChild(expression, 1)

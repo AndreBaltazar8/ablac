@@ -635,6 +635,15 @@ selected UTF-8 key makes the entire object `null` and skips its values.
 Literal duplicate keys remain errors even when guarded. A conditional computed
 key, `if (condition) "a" else "b": value`, keeps its existing meaning.
 
+A computed key can turn out equal to another key only when the program runs.
+Then the object has that key once, at the position where it first appears,
+with the value of the later member, in `$json`, `$jsons` and `$jsonw` alike
+(as JavaScript's `JSON.parse` reads a repeated key, and `jsonParse` with
+`mergeDuplicateKeys`), so the output never repeats a key. The later member
+wins, so write a fixed member after the computed ones when a key that comes
+from input must not replace it: `$json { k: v, "role": "user" }` keeps `"role"`
+as `"user"` whatever `k` is.
+
 A value of another type is rejected with a help line listing the accepted
 types.
 

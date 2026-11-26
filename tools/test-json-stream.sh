@@ -60,4 +60,13 @@ rejected guard-type 'bool' '{if (1) "key": 1}'
 rejected guard-null 'bool' '{if (null) "key": 1}'
 rejected guard-comma 'expected a \$json object member' '{if (false) "key": 1,,}'
 rejected guarded-duplicate 'duplicate key' '{if (true) "key": 1, if (false) "key": 2}'
-echo 'ok   json-stream shared grammar, typed diagnostics, runtime/staged byte parity'
+# A computed key that repeats another key (decision #154): one member per key, at the first position, with the later value, in the tree and
+# streaming forms alike, and jsonParse accepts the output (tests/cases/modules/json-merge.ab).
+for mode in release fast; do
+    flags=(--no-cache)
+    [[ $mode == fast ]] && flags+=(--fast)
+    "$compiler" build tests/cases/modules/json-merge.ab -o "$out/merge.$mode" "${flags[@]}"
+    result=$("$out/merge.$mode") || { echo "json-merge ($mode): $result" >&2; exit 1; }
+    [[ $result == 'json merge ok' ]] || { echo "json-merge ($mode): $result" >&2; exit 1; }
+done
+echo 'ok   json-stream shared grammar, typed diagnostics, runtime/staged byte parity, repeated computed keys merged'
