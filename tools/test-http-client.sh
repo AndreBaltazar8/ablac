@@ -66,4 +66,12 @@ status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
 
-printf '%s\n' 'HTTP client: bounded raw IPv4 exchange + pluggable TLS transport + request parts checked passed'
+# The async client's URLs: userinfo and other authority forms refused before any lookup, fragments not sent (tests/cases/http-client-split/url.ab).
+"$compiler" build "$project_root/tests/cases/http-client-split/url.ab" -o "$output_directory/url" --fast
+set +e
+ABLA_MAX_SECONDS=30 "$project_root/tools/run-limited.sh" "$output_directory/url"
+status=$?
+set -e
+[[ $status -eq 42 ]] || exit 1
+
+printf '%s\n' 'HTTP client: bounded raw IPv4 exchange + pluggable TLS transport + request parts and URLs checked passed'

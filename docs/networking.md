@@ -420,6 +420,13 @@ request with that error, `H2Client.request` returns -1, and the WebSocket TLS
 client's connection is closed. Percent-encode user input that goes into a path or
 a query (`percentEncode`) rather than relying on this check.
 
+`HttpAsyncClient` takes `http://` and `https://` URLs (the scheme in any case)
+whose authority ends at the first `/`, `?` or `#`, as the WHATWG URL parser reads
+it; a fragment is never sent. An authority with userinfo (`user@`, which is not
+looked up or sent anywhere), a backslash, a percent-encoded byte or an IPv6
+literal (`[::1]`: the clients do not take IPv6 literals yet; they never did) is
+refused before any lookup: the completion's error is `"invalid URL"`.
+
 #### HTTP/2
 
 `HttpAsyncOptions` offers `h2` and `http/1.1` by ALPN on every `https://` connection (`http2` is **on by default**); when the server picks `h2` the connection speaks HTTP/2

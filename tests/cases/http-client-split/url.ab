@@ -1,0 +1,70 @@
+// The async client's URLs (#1139 area 4, round 7), against the WHATWG URL parser's reading (a URL differential in Node: tools/test-http-client.sh
+// keeps only the cases here): a URL with userinfo, a backslash, a percent-encoded byte or an IPv6 literal in its authority is refused before
+// any lookup (the name would otherwise be looked up with the userinfo in it); the authority ends at `?` and `#` as well as `/`; the scheme is
+// matched in any case; a fragment is never sent. A loopback listener reads the request line the client writes. Exits 42.
+import "abla/io"
+import "abla/http/async"
+import "abla/net"
+import "abla/text"
+
+var failures = 0
+
+fun expect(cond: bool, what: string): void {
+    if (!cond) {
+        failures = failures + 1
+        println("FAIL $what")
+    }
+    return
+}
+
+// The request line `url` makes the client write, read by the listener.
+fun requestLine(var http: HttpAsyncClient, var listener: TcpListener, url: string): string {
+    http.request("GET", url, [])
+    // The listener does not block: a client that never connects ends the wait (a failure, not a hang).
+    var accepted = listener.accept()
+    var tries = 0
+    while (accepted.descriptor < 0 && tries < 100) {
+        http.step(10)
+        accepted = listener.accept()
+        tries = tries + 1
+    }
+    if (accepted.descriptor < 0) return "(no connection)"
+    var head = ""
+    for (i in 0 until 50) {
+        if (head.indexOf("\r\n") < 0) {
+            http.step(10)
+            val read = accepted.readWithTimeoutResult(4096, 20)
+            if (read.hasData()) head = "$head${read.bytes}"
+        }
+    }
+    accepted.close()
+    val end = head.indexOf("\r\n")
+    if (end < 0) "(nothing)" else head.slice(0, end)
+}
+
+fun main: int {
+    var http = httpAsyncClient()
+    // Refused at once, nothing looked up or connected.
+    val refused = ["http://token@127.0.0.1:9/", "http://user:pass@127.0.0.1:9/", "http://good.example:80@127.0.0.1:9/", "http://127.0.0.1:9\\@good.example/",
+        "http://%31%32%37.0.0.1:9/", "http://[::1]:9/"]
+    for (url in refused) http.request("GET", url, [])
+    var errors = 0
+    for (done in http.takeCompletions()) {
+        if (done.error == "invalid URL") errors = errors + 1
+        else println("FAIL ${done.id}: '${done.error}'")
+    }
+    expect(errors == refused.size, "$errors of ${refused.size} URLs refused as invalid")
+
+    var listener = tcpListen(0)
+    listener.setNonblocking()
+    val port = listener.localPort()
+    expect(requestLine(http, listener, "http://127.0.0.1:$port/p?x=1#frag") == "GET /p?x=1 HTTP/1.1", "a fragment is not sent")
+    expect(requestLine(http, listener, "http://127.0.0.1:$port?y=2") == "GET /?y=2 HTTP/1.1", "a query right after the authority")
+    expect(requestLine(http, listener, "HTTP://127.0.0.1:$port/upper") == "GET /upper HTTP/1.1", "a scheme in upper case")
+    listener.close()
+    if (failures == 0) {
+        println("http client url ok")
+        return 42
+    }
+    1
+}
