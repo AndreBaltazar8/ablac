@@ -68,6 +68,7 @@ only its parse errors.
 | `E_PARSE_INVALID_OCTAL` | an octal literal with an `8` or `9`, or with no digit (`0o`) |
 | `E_PARSE_ASSIGNMENT_TARGET` | the left side of `=` can't be assigned (a `?.` chain is not a place) |
 | `E_PARSE_COMPOUND_ASSIGNMENT_TARGET` | the left side of `+=` etc. contains a call ([language.md](language.md#expressions-and-operators)) |
+| `E_PARSE_LOGICAL_ASSIGNMENT_TARGET` | the left side of `&&=` or `\|\|=` is neither a name nor a field |
 | `E_PARSE_TRAILING_LAMBDA_TARGET` | a trailing lambda after something that can't be called |
 | `E_PARSE_DISCARDED_LAMBDA` | a bare lambda is used as a statement and its value is discarded. Call it, assign it, or use a control-flow block for statements intended to run immediately. |
 | `E_PARSE_CAST_TYPE` | `as?` isn't followed by a class name |
@@ -223,6 +224,7 @@ fun main {}
 | `local.initializer:<name>` | an initializer doesn't match the declared type |
 | `integer.narrowing:<where>@<offset>:<expected>:<actual>` | an `int` where a narrower integer is stored or passed (an argument, a declared local's initializer, an assignment, an array element or a result) that is not a literal that fits: convert it, e.g. `u8(value)` |
 | `assignment.type:<name>@<offset>` | an assigned value doesn't match the variable's type |
+| `logical.assignment.bool`, `logical.assignment.target` | `&&=` and `\|\|=` require a mutable Boolean local or ordinary Boolean field and a `bool` right-hand side |
 | `assignment.immutable`, `global.immutable`, `field.immutable`, `member.immutable` | assigning a `val` |
 | `library.program-global:<name>@<offset>` | standard-library code names a program's global `val` or `var` ([modules](language.md#modules-and-imports)) |
 | `global.initialization-cycle:<a>-><b>->...<a>` | top-level initializers that depend on each other, directly or through functions ([language.md](language.md#values-and-variables)) |
@@ -566,6 +568,7 @@ quick fix. They leave comments and code with uncertain types or effects alone.
 |---|---|
 | `W_NULLABLE_EARLY_EXIT` | Combine an inferred nullable scalar binding and the immediately following null guard with `?? return` or `?? continue`. The null branch must only exit, with at most a literal return value. The initializer still runs once. |
 | `W_ARRAY_MAPPED` | Replace a fresh array and the immediately following single-append loop with [`array.mapped`](stdlib/arrays.md). The hint covers simple scalar transforms with no calls or captures when the standard extension is already imported and resolves unambiguously. |
+| `W_LOGICAL_ASSIGNMENT` | Replace `x = x && expr` or `x = x \|\| expr` with the corresponding Boolean assignment for an ordinary mutable local. |
 
 ## Builds
 

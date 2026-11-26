@@ -333,6 +333,7 @@ test-serial: ablac
 	tools/test-date-edges.sh $(COMPILER)
 	tools/test-regex-edges.sh $(COMPILER)
 	tools/test-lexer-oddities.sh $(COMPILER)
+	tools/test-logical-assignment.sh $(COMPILER)
 	tools/test-numeric-edges.sh $(COMPILER)
 	tools/test-collection-edges.sh $(COMPILER)
 	tools/test-text-blocks.sh $(COMPILER)

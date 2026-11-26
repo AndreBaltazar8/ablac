@@ -140,6 +140,14 @@ class BootstrapExpression(
     val children: array<BootstrapExpression>
 )
 
+// Local compounds share ordinary short-circuit expressions. A field compound
+// carries just its RHS here so that the assignment can reuse the receiver.
+fun bootstrapLogicalLocalRhs(value: BootstrapExpression): bool =
+    value.text == "&&=" && value.kind == "&&" || value.text == "||=" && value.kind == "||"
+
+fun bootstrapLogicalFieldRhs(spelling: string, value: BootstrapExpression): BootstrapExpression =
+    BootstrapExpression("logical.assign.rhs", spelling, value.begin, value.end, [value])
+
 // Where a labeled `for` keeps its label: its text is "variable@label".
 fun bootstrapForLabelAt(text: string): int {
     var index = 0
@@ -2925,14 +2933,14 @@ class BootstrapParser(
         // `place op= value` is `place = place op value`; the place is read
         // again, so it may not call anything.
         val kind = this.tokens[this.position].kind
-        if (kind == BOOTSTRAP_TOKEN_PLUS_EQUAL || kind == BOOTSTRAP_TOKEN_MINUS_EQUAL || kind ==
-            BOOTSTRAP_TOKEN_STAR_EQUAL || kind == BOOTSTRAP_TOKEN_SLASH_EQUAL || kind ==
-            BOOTSTRAP_TOKEN_PERCENT_EQUAL) {
+        val logical = kind == BOOTSTRAP_TOKEN_AND_AND_EQUAL || kind == BOOTSTRAP_TOKEN_OR_OR_EQUAL
+        if (logical || (kind >= BOOTSTRAP_TOKEN_PLUS_EQUAL && kind <= BOOTSTRAP_TOKEN_PERCENT_EQUAL)) {
             this.position = this.position + 1
             if (this.layoutTrace != "") this.layoutTrace =
                 "${this.layoutTrace}${this.tokens[this.position - 1].end}:2;"
             this.skipSeparators()
             val value = this.parseExpression()
+            if (logical) return this.logicalAssignment(expression, value, kind)
             // (A `?.` chain is reported once, as not assignable.)
             if (!bootstrapRereadablePlace(expression) &&
                 !bootstrapIsSafeChain(expression)) this.failAt(
@@ -2947,6 +2955,24 @@ class BootstrapParser(
             ))
         }
         expression
+    }
+
+    fun logicalAssignment(target: BootstrapExpression, value: BootstrapExpression,
+        kind: int): BootstrapExpression {
+        val spelling = bootstrapTokenKindName(kind)
+        if (target.kind == "identifier") {
+            val operation = if (kind == BOOTSTRAP_TOKEN_AND_AND_EQUAL) "&&" else "||"
+            return this.assignment(target, BootstrapExpression(
+                operation, spelling, target.begin, value.end, [target, value]
+            ))
+        }
+        if (target.kind == "member" && !bootstrapIsSafeChain(target)) {
+            return this.assignment(target, bootstrapLogicalFieldRhs(spelling, value))
+        }
+        this.failAt("LOGICAL_ASSIGNMENT_TARGET",
+            "${spelling} needs a mutable Boolean local or field",
+            target.begin, target.end)
+        BootstrapExpression("invalid", "logical-assignment-target", target.begin, value.end, [value])
     }
 
     fun assignment(expression: BootstrapExpression,

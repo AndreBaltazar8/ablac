@@ -2189,7 +2189,7 @@ and blocks. From the tightest binding to the loosest:
 | equality | `==` `!=` | |
 | bitwise | `&`, then `^`, then `\|` | looser than `==`, as in C |
 | logical | `&&`, then `\|\|` | short-circuit |
-| assignment | `=` `+=` `-=` `*=` `/=` `%=` | right-associative |
+| assignment | `=` `+=` `-=` `*=` `/=` `%=` `&&=` `\|\|=` | right-associative |
 
 `yield` takes the whole expression after it.
 
@@ -2204,12 +2204,20 @@ Two traps follow from the table:
   ([delegated bindings](#delegated-bindings)). Between two integers, `^` is
   XOR.
 
-An assignment is an expression whose value is the assigned value. Compound
-assignment `place op= value` means `place = place op value`, so operator
+An assignment is an expression whose value is the assigned value. Arithmetic
+compound assignment `place op= value` means `place = place op value`, so operator
 functions apply to it. The place is evaluated twice, so it may contain only
 names, literals, fields and indexes, never a call
 (`E_PARSE_COMPOUND_ASSIGNMENT_TARGET`). Only names, fields, indexes and
 `^name` can be assigned (`E_PARSE_ASSIGNMENT_TARGET`).
+
+Boolean compound assignments update a mutable local or ordinary field of
+type `bool`. `ready &&= check()` reads `ready`, calls `check()` only when it
+was true, and assigns the resulting Boolean. `ready ||= check()` calls it
+only when `ready` was false. The receiver of a field is evaluated once,
+before the field is read. The assignment expression returns the assigned
+value. For a subscript, global, or delegated binding, write the read and
+assignment explicitly.
 
 `==` and `!=` compare integers, floats, booleans and strings by value
 (strings by their text; `NaN != NaN`). On class objects, arrays, maps and

@@ -7,18 +7,22 @@ import "parser.ab"
 import "sema.ab"
 import "abla/text"
 
-private fun idiomTypeAt(occurrences: BootstrapAnalysisOccurrenceSet,
-    name: BootstrapExpression): string {
+private fun idiomOccurrenceAt(occurrences: BootstrapAnalysisOccurrenceSet, begin: int, end: int): int {
     var low = 0
     var high = occurrences.begins.size
     while (low < high) {
         val middle = low + (high - low) / 2
-        if (occurrences.begins[middle] < name.begin) low = middle + 1
+        if (occurrences.begins[middle] < begin) low = middle + 1
         else high = middle
     }
-    if (low < occurrences.begins.size && occurrences.begins[low] == name.begin &&
-        occurrences.ends[low] == name.end && occurrences.ids[low] != "") occurrences.types[low]
-    else ""
+    if (low < occurrences.begins.size && occurrences.begins[low] == begin &&
+        occurrences.ends[low] == end && occurrences.ids[low] != "") low else -1
+}
+
+private fun idiomTypeAt(occurrences: BootstrapAnalysisOccurrenceSet,
+    name: BootstrapExpression): string {
+    val index = idiomOccurrenceAt(occurrences, name.begin, name.end)
+    if (index >= 0) occurrences.types[index] else ""
 }
 
 private fun idiomOneStatement(expression: BootstrapExpression): BootstrapExpression =
@@ -120,10 +124,49 @@ private fun idiomMappedEdit(source: string, local: BootstrapExpression, loop: Bo
     "${head}${input.text}.mapped { ${loop.text} -> $argument }"
 }
 
+// The resolved local identity distinguishes ordinary locals from globals,
+// delegated bindings and similarly named shadowing declarations.
+private fun idiomLogicalAssignment(source: string, path: string,
+    expression: BootstrapExpression, occurrences: BootstrapAnalysisOccurrenceSet,
+    locals: Map<string, bool>, var diagnostics: array<BootstrapFrontendDiagnostic>): void {
+    val rhs = expression.children[0]
+    if ((rhs.kind != "&&" && rhs.kind != "||") || rhs.text != rhs.kind || rhs.children.size != 2) return
+    val read = rhs.children[0]
+    if (read.kind != "identifier" || read.text != expression.text) return
+    val begin = expression.begin
+    val nameEnd = begin + expression.text.size
+    if (begin < 0 || read.end > source.size || read.begin < nameEnd || read.end - begin > 4096) return
+    if (source.slice(begin, nameEnd) != expression.text ||
+        source.slice(nameEnd, read.begin).trim() != "=") return
+    val written = idiomOccurrenceAt(occurrences, begin, nameEnd)
+    val repeated = idiomOccurrenceAt(occurrences, read.begin, read.end)
+    if (written < 0 || repeated < 0 || occurrences.types[written] != "bool" ||
+        occurrences.ids[written] != occurrences.ids[repeated] ||
+        locals.get(occurrences.ids[written]) == null) return
+    var operator = read.end
+    while (operator < source.size &&
+        (source[operator] == 32 || source[operator] == 9)) operator = operator + 1
+    val end = operator + 2
+    if (end > source.size || source.slice(operator, end) != rhs.kind) return
+    val title = "Use the ${rhs.kind}= Boolean assignment"
+    val text = "${expression.text} ${rhs.kind}="
+    diagnostics.append(BootstrapFrontendDiagnostic("W_LOGICAL_ASSIGNMENT", title, path, begin, end,
+        fixes = [BootstrapFrontendFix(title, "replace", begin, end, text)], severity = "warning"))
+}
+
 private fun idiomAppend(source: string, expression: BootstrapExpression,
     occurrences: BootstrapAnalysisOccurrenceSet, nullable: bool, mapped: bool,
-    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string): void {
-    if (expression.kind == "block") {
+    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string, logical: bool, var locals: Map<string, bool>): void {
+    if (logical) {
+        if (expression.kind == "local.var" && expression.children[0].kind != "delegate.initializer") {
+            val begin = expression.children[1].begin
+            val declaration = idiomOccurrenceAt(occurrences, begin, begin + expression.text.size)
+            if (declaration >= 0) locals.set(occurrences.ids[declaration], true)
+        } else if (expression.kind == "assign") {
+            idiomLogicalAssignment(source, path, expression, occurrences, locals, diagnostics)
+        }
+    }
+    if ((nullable || mapped) && expression.kind == "block") {
         // Leave the block's result expression in place.
         for (index in 0 until expression.children.size - 2) {
             val local = expression.children[index]
@@ -149,17 +192,17 @@ private fun idiomAppend(source: string, expression: BootstrapExpression,
             }
         }
     }
-    for (child in expression.children) idiomAppend(source, child, occurrences, nullable, mapped, diagnostics, path)
+    for (child in expression.children) idiomAppend(source, child, occurrences, nullable, mapped, diagnostics, path, logical, locals)
 }
 
 private fun idiomDeclaration(source: string, declaration: BootstrapDeclaration,
     occurrences: BootstrapAnalysisOccurrenceSet, nullable: bool, mapped: bool,
-    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string): void {
+    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string, logical: bool, var locals: Map<string, bool>): void {
     // A resolved occurrence in an instantiated generic body does not prove
     // that the edit is valid for every substitution.
     if (declaration.typeParameters.size != 0 || declaration.sourceIdentity != path) return
-    idiomAppend(source, declaration.expression, occurrences, nullable, mapped, diagnostics, path)
-    for (method in declaration.methods) idiomDeclaration(source, method, occurrences, nullable, mapped, diagnostics, path)
+    idiomAppend(source, declaration.expression, occurrences, nullable, mapped, diagnostics, path, logical, locals)
+    for (method in declaration.methods) idiomDeclaration(source, method, occurrences, nullable, mapped, diagnostics, path, logical, locals)
 }
 
 /** The standard extension is the only possible target of the introduced
@@ -193,9 +236,11 @@ fun bootstrapAnalysisIdiomHints(source: string, path: string, parsed: BootstrapP
             if (edge.source == "abla/array" && edge.alias == "" && !edge.provider && !edge.contractOnly) mapped = true
         }
     }
-    if (!nullable && !mapped) return
+    val logical = source.contains("=") && (source.contains("&&") || source.contains("||"))
+    if (!nullable && !mapped && !logical) return
     for (diagnostic in diagnostics) if (diagnostic.severity == "error") return
+    val locals: Map<string, bool> = Map()
     for (declaration in parsed.declarations) {
-        idiomDeclaration(source, declaration, occurrences, nullable, mapped, diagnostics, path)
+        idiomDeclaration(source, declaration, occurrences, nullable, mapped, diagnostics, path, logical, locals)
     }
 }

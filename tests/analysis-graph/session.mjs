@@ -1474,7 +1474,62 @@ fun main: int = map([1])[0] - 2
     }
 }
 
-const tests = { idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+
+async function logicalAssignmentFix(mode) {
+    const source = `var flag = true
+class Switch(var enabled: bool)
+fun tick(var counter: array<int>): bool {
+    counter[0] += 1
+    false
+}
+fun Switch.update(): void {
+    this.enabled = this.enabled && true
+    return
+}
+fun main: int {
+    val counter = [0]
+    var enabled = true
+    enabled = enabled && tick(counter)
+    enabled = enabled || (true && true)
+    enabled = enabled /* keep this */ && true
+    flag = flag && tick(counter)
+    val box = Switch(true)
+    box.update()
+    if (enabled && box.enabled && !flag && counter[0] == 2) 0 else 1
+}
+`;
+    const project = fixture(`logical-assignment-${mode}`, { 'main.ab': source });
+    const entry = path.join(project, 'main.ab');
+    const session = await start(project, { mode });
+    try {
+        const snapshot = await session.analyze();
+        assert.equal(snapshot.complete, true);
+        const diagnostics = doc(snapshot, entry).diagnostics;
+        assert.ok(diagnostics.every((d) => d.severity === 'warning'), JSON.stringify(diagnostics));
+        assert.deepEqual(diagnostics.map((d) => d.code), ['W_LOGICAL_ASSIGNMENT', 'W_LOGICAL_ASSIGNMENT']);
+        const edits = diagnostics.map((d) => d.fixes[0].edits[0]);
+        assert.deepEqual(edits.map((edit) => edit.newText), ['enabled &&=', 'enabled ||=']);
+        let edited = Buffer.from(source);
+        for (const { range, newText } of edits.reverse()) {
+            edited = Buffer.concat([edited.subarray(0, range.start), Buffer.from(newText), edited.subarray(range.end)]);
+        }
+        await session.rpc('document/open', { uri: uri(entry), version: 1, text: edited.toString() });
+        const after = await session.analyze();
+        noErrors(after);
+        assert.ok(!doc(after, entry).diagnostics.some((d) => d.code === 'W_LOGICAL_ASSIGNMENT'));
+        const output = path.join(project, 'program');
+        for (const text of [source, edited]) {
+            fs.writeFileSync(entry, text);
+            const built = spawnSync(compiler, ['build', entry, '-o', output, '--no-cache'], { encoding: 'utf8' });
+            assert.equal(built.status, 0, built.stderr);
+            assert.equal(spawnSync(output, []).status, 0, 'Boolean assignment edit changed behavior');
+        }
+    } finally {
+        await session.close();
+    }
+}
+
+const tests = { logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
