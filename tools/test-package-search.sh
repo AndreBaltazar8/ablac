@@ -135,3 +135,17 @@ printf 'abla-run-object-v5\n' > "$record"
 [[ $(search_with_helper) == "$helper_result" ]]
 grep -F '[jit-cache] miss ' "$work/helper-error"
 grep -F '[jit-cache] stored ' "$work/helper-error"
+
+# Catalog text reaches the terminal: a C1 control (some terminals act on U+009B as CSI) or a bidirectional control (which can make
+# one repository read as another) refuses the catalog as a C0 control does, written as a JSON escape or as raw UTF-8.
+for text in '\u009b31m' '\u0085' '\u202e' '\u2066x' '\u200f' $'\u202a' $'\u0090'; do
+    printf '[[package]]\nrepository = "owner/abla-plain"\ndescription = "Plain %s"\nkeywords = []\n' "$text" > "$work/hostile"
+    if ABLA_PACKAGE_INDEX_URL="file://$work/hostile" ABLA_PACKAGE_CACHE="$work/hostile-cache" "$compiler" package search plain > "$work/output" 2> "$work/error"; then
+        echo "a description with $text was shown: $(cat "$work/output")" >&2; exit 1
+    fi
+    grep -F 'invalid' "$work/error" > /dev/null
+    [[ ! -s "$work/output" ]]
+done
+# ...while other non-ASCII text is shown as it is.
+printf '[[package]]\nrepository = "owner/abla-plain"\ndescription = "Café — naïve ✓ \\u00e9"\nkeywords = ["日本"]\n' > "$work/hostile"
+[[ $(ABLA_PACKAGE_INDEX_URL="file://$work/hostile" ABLA_PACKAGE_CACHE="$work/plain-cache" "$compiler" package search plain) == $'owner/abla-plain\tCafé — naïve ✓ é' ]]
