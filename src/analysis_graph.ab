@@ -871,6 +871,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     val keptEntry = bootstrapAnalysisGraphActiveEntry
     val keptIndex = this.graphQueryIndex
     val keptIndexRevision = this.graphIndexRevision
+    val keptLoadKey = this.graphLoadKey
     val keptGenerations: array<BootstrapAnalysisGraphGeneration> = []
     for (generation in this.graphGenerations) keptGenerations.append(generation)
     // Nothing of the incremental run is reached from the cold one.
@@ -885,6 +886,7 @@ fun BootstrapAnalysisService.graphSnapshot(): Json {
     bootstrapAnalysisGraphActiveEntry = keptEntry
     this.graphQueryIndex = keptIndex
     this.graphIndexRevision = keptIndexRevision
+    this.graphLoadKey = keptLoadKey
     this.graphGenerations.truncate(0)
     for (generation in keptGenerations) this.graphGenerations.append(generation)
     val differing: array<string> = []
@@ -1335,6 +1337,15 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
     if (!bootstrapAnalysisGraphModules
         .sourceExists(entry)) return bootstrapAnalysisGraphIncomplete(this.revision,
             "project entry does not exist and has no open overlay", this.graphModeName())
+    // The revision's answer is held and a reload would read what the load behind it read: the answer, before anything of the last run is
+    // reset (a repeated request reloaded and re-parsed the project for an answer it then took from the cache, 120-150 ms on abla-one).
+    if (reuseTyping && this.graphIndexRevision == this.revision) {
+        val held = this.graphQueryIndex
+        if (held != null && held.revision == this.revision && this.graphUnchangedSinceLoad(entry)) {
+            if (linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TRACE").value == "1") linuxPrintStandardError("abla-analysis-typing unchanged inputs: held answer\n")
+            return held.snapshot
+        }
+    }
     bootstrapSourceRewrites = []
     if (this.graphJsonConstruction) {
         bootstrapJsonConstructionReset()
@@ -1370,11 +1381,16 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
     if (replay) bootstrapAnalysisGraphModules.syntaxInputs = BootstrapModuleSyntaxInputs()
     bootstrapAnalysisSampleMemory("project loaded")
     this.graphObserveInputs(project, entry)
+    val loadKey = BootstrapAnalysisLoadKey(entry, project.loadedPaths, bootstrapModuleCopyStrings(project.written.compileInputPaths),
+        bootstrapModuleCopyStrings(project.written.compileInputContents))
     if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
     // The slot of `cached` is only set when this returns: on the way to a new generation nothing here holds the old one.
     if (this.graphIndexRevision == this.revision) {
         val cached = this.graphQueryIndex
-        if (cached != null && cached.revision == this.revision) return cached.snapshot
+        if (cached != null && cached.revision == this.revision) {
+            this.graphLoadKey = loadKey
+            return cached.snapshot
+        }
     }
     // The previous generation (its answer tree and indexes, ~2 GB on the compiler's own source) is released before the new one
     // is built, not when it is replaced: both were resident for the length of an analysis.
@@ -1480,6 +1496,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
                     replayInputs.syntaxImportUses, bootstrapModuleCopyStrings(before.checkedImportUses))
                 this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(reused.snapshot, this.revision, reused.sets, reused.generated)
                 this.graphIndexRevision = this.revision
+                this.graphLoadKey = loadKey
                 this.graphRememberGeneration(BootstrapAnalysisGraphGeneration(reused.snapshot.getString("revision"), reused.fingerprints, reused.uris))
                 if (linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TRACE").value == "1") {
                     linuxPrintStandardError(if (reused.checkedInterface) "abla-analysis-typing rechecked scalar interface and dependents\n"
@@ -1608,6 +1625,7 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
     if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
     this.graphQueryIndex = bootstrapAnalysisGraphQueryIndex(result, this.revision, sets, generatedFields)
     this.graphIndexRevision = this.revision
+    this.graphLoadKey = loadKey
     if (this.graphStableIds) this.graphRememberGeneration(BootstrapAnalysisGraphGeneration(
         "${this.revision}", fingerprints, fingerprintUris))
     return result
@@ -1842,4 +1860,20 @@ fun bootstrapAnalysisGraphProjection(snapshot: Json, fields: Json): Json {
     keys.append("fields")
     values.append(fields)
     jsonObject(keys, values)
+}
+
+/** Whether a reload of `entry` would read what the load behind the held answer read (graphLoadKey): the same entry, the manifests and
+ *  compile-time inputs as they were, and a module graph that, resolved again, lists the same modules and reads none anew
+ *  (bootstrapFrontendHostGraphUnchanged). Overlays are covered by the revision: a document change is a new one. */
+fun BootstrapAnalysisService.graphUnchangedSinceLoad(entry: string): bool {
+    val key = this.graphLoadKey ?? return false
+    if (key.entry != entry || key.compilePaths.size != key.compileContents.size) return false
+    for (index in 0 until this.graphInputPaths.size) {
+        val observed = this.graphInputPaths[index]
+        if (observed.startsWith("metadata:") && Path(observed.slice(9, observed.size)).readText() != this.graphInputValues[index]) return false
+    }
+    for (index in 0 until key.compilePaths.size) {
+        if (bootstrapCompileInputContents(key.compilePaths[index]) != key.compileContents[index]) return false
+    }
+    bootstrapFrontendHostGraphUnchanged(entry, bootstrapAnalysisGraphModules, key.paths)
 }

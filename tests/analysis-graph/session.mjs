@@ -1529,7 +1529,59 @@ fun main: int {
     }
 }
 
-const tests = { logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+// A repeated analyze of an unchanged revision is answered from the held answer without reloading the project (#1132), and every change
+// a reload would see without an overlay still gives a new revision: a file edited on disk (same size), a file that appears and changes
+// where an import resolves (a prepared package beside the vendored one), and the manifest.
+async function unchangedInputs() {
+    const rev = '1'.repeat(40);
+    const digest = '2'.repeat(40);
+    fs.rmSync(path.join(root, 'unchanged-inputs'), { recursive: true, force: true });
+    const p = fixture('unchanged-inputs', {
+        'main.ab': 'import "dep.ab"\nimport "package/pkg"\nfun main: int = answer() + pkgValue()\n',
+        'dep.ab': 'fun answer: int = 42\n',
+        'abla.lock': `version = 2\n\n[[package]]\nname = "pkg"\nprovider = "git"\nidentity = "git:/nowhere"\nsource = "/nowhere"\nselector-kind = "branch"\nselector = "main"\nrevision = "${rev}"\ndigest = "${digest}"\nentry = "pkg.ab"\n`,
+        'vendor/pkg/.abla-revision': rev,
+        'vendor/pkg/.abla-digest': digest,
+        'vendor/pkg/pkg.ab': 'fun pkgValue: int = 1\n',
+    });
+    const log = 'unchanged.stderr';
+    const s = await start(p, { mode: 'graph-v2', log, env: { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TRACE: '1' } });
+    const held = () => (fs.readFileSync(path.join(p, log), 'utf8').match(/unchanged inputs: held answer/g) ?? []).length;
+    const text = (result, file) => result.documents.find(d => d.uri.endsWith(file))?.text;
+    const a = await s.analyze();
+    assert.ok(a.complete, JSON.stringify(a.issues));
+    const b = await s.analyze();
+    assert.equal(b.revision, a.revision);
+    assert.deepEqual(b.documents.map(d => [d.uri, d.text]), a.documents.map(d => [d.uri, d.text]));
+    assert.equal(held(), 1, 'an unchanged revision was reloaded');
+    // On disk, the same size: a new revision with the new text.
+    fs.writeFileSync(path.join(p, 'dep.ab'), 'fun answer: int = 43\n');
+    const c = await s.analyze();
+    assert.notEqual(c.revision, b.revision);
+    assert.equal(text(c, '/dep.ab'), 'fun answer: int = 43\n');
+    assert.equal(held(), 1);
+    // A prepared copy appears: `package/pkg` now resolves to it, not to vendor/.
+    fs.mkdirSync(path.join(p, '.abla/packages/pkg/source'), { recursive: true });
+    fs.writeFileSync(path.join(p, '.abla/packages/pkg/revision'), rev);
+    fs.writeFileSync(path.join(p, '.abla/packages/pkg/entry.ab'), 'import "source/pkg.ab"\n');
+    fs.writeFileSync(path.join(p, '.abla/packages/pkg/source/pkg.ab'), 'fun pkgValue: int = 2\n');
+    const d = await s.analyze();
+    assert.notEqual(d.revision, c.revision);
+    assert.ok(d.documents.some(doc => doc.uri.includes('/.abla/packages/pkg/')), JSON.stringify(d.documents.map(doc => doc.uri)));
+    assert.equal(held(), 1);
+    // The manifest.
+    fs.appendFileSync(path.join(p, 'abla.toml'), '# changed\n');
+    const e = await s.analyze();
+    assert.notEqual(e.revision, d.revision);
+    assert.equal(held(), 1);
+    // And unchanged again: held.
+    const f = await s.analyze();
+    assert.equal(f.revision, e.revision);
+    assert.equal(held(), 2);
+    await s.close();
+}
+
+const tests = { unchanged_inputs: unchangedInputs, logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 async function checkedScalarBody(calls = false) {
     const head = 'fun answer(left: int, right: int): int = ';
     const initial = calls ? 'step(left) + right' : 'left + right';

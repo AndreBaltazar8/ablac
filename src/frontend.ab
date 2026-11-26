@@ -3,6 +3,7 @@ import "abla/sys/linux/fs"
 // Compiler frontend operations shared by builds and editor analysis.
 // This module owns no protocol, filesystem writes, LLVM emission or type inference.
 import "module.ab"
+import "lexer.ab"
 import "parser.ab"
 import "sema.ab"
 import "receiver_names.ab"
@@ -197,7 +198,9 @@ fun bootstrapFrontendLoadHostGraph(
 class BootstrapFrontendHostProject(
     val written: BootstrapParseResult,
     val modules: array<BootstrapModule>,
-    val fullModules: Map<string, int>
+    val fullModules: Map<string, int>,
+    // The modules the load read, in its order (bootstrapFrontendHostGraphUnchanged compares a later graph with them).
+    val loadedPaths: array<string> = []
 )
 
 fun bootstrapFrontendLoadHostProject(
@@ -214,7 +217,32 @@ fun bootstrapFrontendLoadHostProject(
     }
     val parsed = graph.parse()
     state.syntaxOnly = previous
-    BootstrapFrontendHostProject(parsed, graph.modules, graph.index.fullModules)
+    val loaded: array<string> = []
+    for (snapshot in graph.orderedSnapshots) loaded.append(snapshot.path)
+    BootstrapFrontendHostProject(parsed, graph.modules, graph.index.fullModules, loaded)
+}
+
+/** Whether loading `entry` again would read what the load that listed `loadedPaths` read: the module graph is resolved again (every import,
+ *  every probe of a path that may now exist, every module's stamp), as a load does, and no module of it is read anew (state.refreshed: a
+ *  source whose stamp or overlay changed, a module that is new or gone) and it lists the same modules in the same order. The parse that
+ *  would follow is not run: the editor answers an unchanged revision with what it holds (#1132). The caller compares the manifests and
+ *  compile-time inputs, which the parse would read itself. */
+fun bootstrapFrontendHostGraphUnchanged(entry: string, var state: BootstrapModuleState, loadedPaths: array<string>): bool {
+    val previous = state.syntaxOnly
+    state.syntaxOnly = true
+    state.beginCounting()
+    val graph = bootstrapFrontendLoadHostGraph(entry, state)
+    // What parse() loads itself, from the sources the graph holds.
+    graph.loadImplicitTransactions()
+    // The loads began the lexer's memo, which parse() would end.
+    bootstrapLexMemoEnd()
+    state.syntaxOnly = previous
+    if (bootstrapAnalysisBudgetExpired() || state.refreshed != 0 || graph.errors != 0 ||
+        graph.orderedSnapshots.size != loadedPaths.size) return false
+    for (index in 0 until loadedPaths.size) {
+        if (graph.orderedSnapshots[index].path != loadedPaths[index]) return false
+    }
+    true
 }
 
 // Symbolic pre-CT typing only: sema.inferCompile types its operand and checks
