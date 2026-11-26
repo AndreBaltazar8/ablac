@@ -152,14 +152,14 @@ fun bootstrapAnalysisPlainBodyChange(parsed: BootstrapParseResult, change: Boots
     false
 }
 
-class BootstrapAnalysisScalarEdit(val splice: BootstrapAnalysisBodyInsert, val declaration: int)
+class BootstrapAnalysisScalarEdit(val splice: BootstrapAnalysisBodyInsert, val declaration: int, val callees: array<int>)
 
 fun bootstrapAnalysisScalarType(type: string): bool =
     type == "int" || type == "i64" || type == "f64" || type == "bool"
 
-// No global reads or calls. The body checker resolves these names in the
-// unchanged parameter environment, and types primitives as the full pass does.
-fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameters: array<string>, depth: int): bool {
+// No global reads. Direct calls, when admitted, still need a separate proof
+// for their complete lookup bucket and the callee's checking interface.
+fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameters: array<string>, depth: int, calls: bool): bool {
     if (depth > 24) return false
     val kind = expression.kind
     if (kind == "identifier") {
@@ -171,15 +171,16 @@ fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameter
         else if (kind == "block" || kind == "unary-" || kind == "unary!") 1
         else if (kind == "+" || kind == "-" || kind == "*" || kind == "<" || kind == ">" ||
             kind == "<=" || kind == ">=" || kind == "==" || kind == "!=" || kind == "&&" || kind == "||") 2
-        else 0
-    if (arity == 0 || expression.children.size != arity) return false
+        else if (calls && kind == "call") expression.children.size
+        else -1
+    if (arity < 0 || expression.children.size != arity) return false
     for (child in expression.children) {
-        if (!bootstrapAnalysisScalarExpression(child, parameters, depth + 1)) return false
+        if (!bootstrapAnalysisScalarExpression(child, parameters, depth + 1, calls)) return false
     }
     true
 }
 
-fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration): bool {
+fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration, calls: bool = false): bool {
     if (declaration.kind != "fun" || !bootstrapAnalysisScalarType(declaration.resultType) ||
         declaration.isTrusted || declaration.isResource || declaration.isNoEscape ||
         declaration.annotations.size != 0 || declaration.typeParameters.size != 0 ||
@@ -189,8 +190,21 @@ fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration): bool {
     for (type in declaration.parameterTypes) if (!bootstrapAnalysisScalarType(type)) return false
     for (kind in declaration.parameterKinds) if (kind != "parameter") return false
     for (defaultValue in declaration.parameterDefaults) if (defaultValue.kind != "missing") return false
-    bootstrapAnalysisScalarExpression(declaration.expression, declaration.parameters, 0)
+    bootstrapAnalysisScalarExpression(declaration.expression, declaration.parameters, 0, calls)
 }
+
+fun bootstrapAnalysisScalarCallNames(expression: BootstrapExpression, var names: Map<string, int>): void {
+    if (expression.kind == "call") names.set(expression.text, 0)
+    for (child in expression.children) bootstrapAnalysisScalarCallNames(child, names)
+    return
+}
+
+fun bootstrapAnalysisScalarInterfaceMatches(surface: BootstrapDeclaration, prepared: BootstrapDeclaration, calls: bool): bool =
+    bootstrapAnalysisScalarFunction(prepared, calls) && surface.sourceIdentity == prepared.sourceIdentity &&
+    surface.resultType == prepared.resultType &&
+    bootstrapAnalysisReplayStrings(surface.parameters, prepared.parameters) &&
+    bootstrapAnalysisReplayStrings(surface.parameterTypes, prepared.parameterTypes) &&
+    bootstrapAnalysisReplayStrings(surface.parameterKinds, prepared.parameterKinds)
 
 fun bootstrapAnalysisCommonPrefix(before: string, after: string): int {
     var same = 0
@@ -210,23 +224,46 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
         if (changed < body.begin || changed >= body.end || body.end - body.begin > 1024 ||
             oldEnd <= body.begin || oldEnd > before.size || oldEnd - body.begin > 1024 ||
             before.slice(oldEnd, before.size) != after.slice(body.end, after.size) ||
-            !bootstrapAnalysisScalarFunction(declaration)) continue
+            !bootstrapAnalysisScalarFunction(declaration, true)) continue
         val old = bootstrapParseWithIdentity(before.slice(declaration.begin, oldEnd), declaration.sourceIdentity)
         if (old.errors != 0 || old.extensionErrors != 0 || old.declarations.size != 1 ||
-            !bootstrapAnalysisScalarFunction(old.declarations[0]) ||
+            !bootstrapAnalysisScalarFunction(old.declarations[0], true) ||
             old.declarations[0].expression.begin != body.begin - declaration.begin) return null
-        // Keep the initial slice independent of operator selection. In
-        // particular an alias or generic owner could name a scalar receiver.
-        var signatures = 0
-        for (candidate in project.declarations) {
+        val candidates: Map<string, int> = Map()
+        bootstrapAnalysisScalarCallNames(old.declarations[0].expression, candidates)
+        bootstrapAnalysisScalarCallNames(body, candidates)
+        if (candidates.has(declaration.name)) return null
+        candidates.set(declaration.name, 0)
+        // Require exactly one global candidate for each spelling and no
+        // operator selection. A generic or alias owner could name a scalar.
+        for (item in 0 until project.declarations.size) {
+            val candidate = project.declarations[item]
             if (bootstrapIsOperatorDeclaration(candidate)) return null
             for (method in candidate.methods) if (bootstrapIsOperatorDeclaration(method)) return null
-            if (candidate.kind == "fun" && candidate.extensionOwner == "" && candidate.name == declaration.name) signatures = signatures + 1
+            val known = candidates.get(candidate.name)
+            if (candidate.extensionOwner == "" && known != null) {
+                if (known != 0) return null
+                candidates.set(candidate.name, item + 1)
+            }
         }
-        if (signatures != 1) return null
+        val own = candidates.get(declaration.name) ?? 0
+        if (own == 0 || !bootstrapAnalysisScalarInterfaceMatches(declaration, project.declarations[own - 1], true)) return null
+        // Only a same-module, call-free scalar function can be reused as a
+        // signature. It has no outgoing lookup, imported use or global effect.
+        val callees: array<int> = []
+        for (item in 0 until parsed.declarations.size) {
+            val callee = parsed.declarations[item]
+            if (item == index || !candidates.has(callee.name)) continue
+            val target = candidates.get(callee.name) ?? 0
+            if (target == 0 || callee.sourceIdentity != declaration.sourceIdentity ||
+                !bootstrapAnalysisScalarFunction(callee) ||
+                !bootstrapAnalysisScalarInterfaceMatches(callee, project.declarations[target - 1], false)) return null
+            callees.append(item)
+        }
+        if (callees.size + 1 != candidates.keys().size) return null
         val splice = BootstrapAnalysisBodyInsert(body.begin, body.end - body.begin, body.begin, "", 0, 0,
             after.slice(body.begin, body.end), oldEnd - body.begin, before.slice(body.begin, oldEnd))
-        return BootstrapAnalysisScalarEdit(splice, index)
+        return BootstrapAnalysisScalarEdit(splice, index, callees)
     }
     null
 }

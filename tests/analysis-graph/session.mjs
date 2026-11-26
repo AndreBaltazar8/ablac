@@ -1530,14 +1530,16 @@ fun main: int {
 }
 
 const tests = { logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
-async function checkedScalarBody() {
+async function checkedScalarBody(calls = false) {
     const head = 'fun answer(left: int, right: int): int = ';
-    const rest = '\nfun later(): int = 7\n';
+    const initial = calls ? 'step(left) + right' : 'left + right';
+    const rest = '\nfun later(): int = 7\n' + (calls
+        ? 'fun step(n: int): int = n + 1\nfun shift(n: int): int = n * 2\n' : '');
     const main = 'import "./dep.ab"\nfun main: int = answer(2, 3) + later()\n';
-    const p = fixture('checked-scalar', {
+    const p = fixture(calls ? 'checked-calls' : 'checked-scalar', {
         'abla.toml': 'name = "checked-scalar"\nentry = "main.ab"\nvisibility = "imports"\n',
         'main.ab': main,
-        'dep.ab': head + 'left + right' + rest,
+        'dep.ab': head + initial + rest,
     });
     const file = path.join(p, 'dep.ab');
     const options = { mode: 'graph-v2', unusedImports: true };
@@ -1557,7 +1559,9 @@ async function checkedScalarBody() {
             assert.deepEqual(delta, ref);
         }
         revision = actual.revision;
-        const use = text.indexOf('left', head.length);
+        const expression = text.slice(head.length, -rest.length);
+        const foundUse = calls ? /(?:step|shift)\(/u.exec(expression)?.index : expression.indexOf('left');
+        const use = foundUse === undefined || foundUse < 0 ? -1 : head.length + foundUse;
         const editor = use < 0
             ? { uri: uri(path.join(p, 'main.ab')), offset: bytes(main.slice(0, main.indexOf('later()'))), revision }
             : { uri: uri(file), offset: bytes(text.slice(0, use)), revision };
@@ -1585,7 +1589,7 @@ async function checkedScalarBody() {
         await check(text, count);
     };
     try {
-        await check(head + 'left + right' + rest, 0);
+        await check(head + initial + rest, 0);
         let seed = 7907;
         let hits = 0;
         for (let i = 0; i < 8; i++) {
@@ -1593,19 +1597,23 @@ async function checkedScalarBody() {
             seed ^= seed >>> 17;
             seed ^= seed << 5;
             const n = (seed >>> 0) % 1000;
-            await edit(i % 2 ? 'right + ' + n : 'left * ' + n + ' + right', ++hits);
+            const expression = calls
+                ? (i % 2 ? 'step(right + ' + n + ')' : 'shift(left) + ' + n)
+                : (i % 2 ? 'right + ' + n : 'left * ' + n + ' + right');
+            await edit(expression, ++hits);
         }
-        await edit('true', hits);
-        await edit('left + right', hits);
-        await edit('left + missing', hits);
-        await edit('right', hits);
-        await edit('left', ++hits);
+        await edit(calls ? 'step(true)' : 'true', hits);
+        await edit(initial, hits);
+        await edit(calls ? 'missing(left)' : 'left + missing', hits);
+        await edit(calls ? 'step(right)' : 'right', hits);
+        await edit(calls ? 'shift(left)' : 'left', ++hits);
     } finally {
         await Promise.all(sessions.map(s => s.close()));
     }
 }
 
 tests.checked_scalar = checkedScalarBody;
+tests.checked_calls = () => checkedScalarBody(true);
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;
