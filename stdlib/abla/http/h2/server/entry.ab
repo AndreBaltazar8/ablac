@@ -115,7 +115,17 @@ class H2Server(
     var streamRoutes: array<string> = [],
     var streamLimits: array<int> = [],
     // The decoded header bytes the open streams may hold together (H2_MAX_HELD_HEADER_BYTES by default; never below one stream's header list).
-    var maximumHeldHeaderBytes: int = H2_MAX_HELD_HEADER_BYTES)
+    var maximumHeldHeaderBytes: int = H2_MAX_HELD_HEADER_BYTES,
+    // Set by the event server while the server-wide budget of request bytes (HttpEventServerOptions.maximumBufferedRequestBytes) is used up: a new stream is refused (REFUSED_STREAM) and no
+    // receive credit is returned until it is lifted (`budgetRelease`), so a client cannot send more body to a server that has no room.
+    var budgetFull: bool = false)
+
+/** The request bytes this connection holds for streams whose handler has not run: the decoded header bytes of the open streams and the body bytes buffered for them. */
+fun H2Server.heldBytes(): int {
+    var total = this.bufferedBytes
+    for (open in this.streams) total = total + open.headerBytes
+    total
+}
 
 /** A connection with our SETTINGS queued; the peer's preface is expected first. `maximumBodyBytes` caps a request body, `maximumStreams` the concurrent streams. */
 fun h2ServerNew(maximumStreams: int = 100, maximumBodyBytes: int = 1048576, maximumHeaderListBytes: int = 65536, peer: SocketPeerAddress? = null,
@@ -886,7 +896,7 @@ private fun H2Server.finishBlock(): void {
     for (h in headers) heldHeaderBytes = heldHeaderBytes + h.name.size + h.value.size
     var otherStreams = 0
     for (open in this.streams) otherStreams = otherStreams + open.headerBytes
-    if (otherStreams + heldHeaderBytes > this.maximumHeldHeaderBytes) { this.streamError(stream, H2_REFUSED_STREAM); return }
+    if (otherStreams + heldHeaderBytes > this.maximumHeldHeaderBytes || this.budgetFull) { this.streamError(stream, H2_REFUSED_STREAM); return }
     this.streams[at].headerBytes = heldHeaderBytes
     this.streams[at].sawHeaders = true
     this.streams[at].method = method
@@ -1004,7 +1014,7 @@ private fun H2Server.onData(flags: int, stream: int, payload: string, now: int):
 /** Receive credit, once per read, after every frame of it was counted (see H2Client.credit). */
 private fun H2Server.credit(): void {
     // Request bodies no handler has taken are bounded per connection: past the budget the receive windows are not replenished, so the client cannot send more until handlers take bodies.
-    if (this.bufferedBytes >= H2_MAX_BUFFERED_BODY_BYTES) return
+    if (this.bufferedBytes >= H2_MAX_BUFFERED_BODY_BYTES || this.budgetFull) return
     if (this.connectionOwed >= H2_CONNECTION_WINDOW / 4) {
         this.queue(h2Frame(8, 0, 0, h2Be32(this.connectionOwed)))
         this.connectionReceive = this.connectionReceive + this.connectionOwed
@@ -1017,6 +1027,13 @@ private fun H2Server.credit(): void {
             this.streams[i].owed = 0
         }
     }
+    return
+}
+
+/** The server-wide budget has room again: lifts `budgetFull` and returns the receive credit it held back (the caller sends `takeOutput`). */
+fun H2Server.budgetRelease(): void {
+    this.budgetFull = false
+    this.credit()
     return
 }
 

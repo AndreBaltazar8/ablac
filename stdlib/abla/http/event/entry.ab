@@ -28,8 +28,34 @@ class HttpEventServerOptions(
     val drainTimeoutMilliseconds: int,
     val requestHeadTimeoutMilliseconds: int = 30000,
     val requestTimeoutMilliseconds: int = 0,
-    val responseTimeoutMilliseconds: int = 0
+    val responseTimeoutMilliseconds: int = 0,
+    // The request bytes the whole server may hold for requests whose handler has not run yet (their heads and buffered bodies, over all connections, plain, HTTPS and
+    // HTTP/2): default 256 MiB, 0 = no limit. The per-connection limits above bound one connection, and a server takes `maximumConnections` of them. At the limit a new HTTP/2 stream
+    // is refused (REFUSED_STREAM, a client retries), an HTTP/1 connection holding request bytes is not read until room opens (the request waits; nothing fails), and a connection holding
+    // none can still send a request head (up to 16 KiB over the limit each, so a small request is answered while the budget is full of waiting bodies). A server still at the limit after
+    // `idleTimeoutMilliseconds` (30 s when that is 0) closes the connection that has been idle longest among those holding request bytes, one per timeout. A request's bytes are released
+    // when its handler starts, and when its connection or stream ends for any reason.
+    val maximumBufferedRequestBytes: int = 268435456
 )
+
+// The most request-head bytes that a connection holding nothing may read when the server's buffered-request budget is used up.
+val HTTP_EVENT_HEAD_ALLOWANCE = 16384
+
+// The server-wide budget of `maximumBufferedRequestBytes`: `held` is the request bytes of the open connections (kept as reads and handlers go, and counted afresh at the end of every
+// pass, so it cannot drift), `overSince` when the budget was first found used up (0: it is not), `paused` the connections whose read waits for room.
+class HttpEventBudget(var held: int, var overSince: int, val paused: array<bool>)
+
+// Creates a budget with nothing held and no connection slots.
+fun httpEventBudget(): HttpEventBudget = HttpEventBudget(0, 0, [])
+
+// The most bytes a connection that holds `slotHeld` request bytes may read now under `limit` (0: none): the room left, and at least one request head for a connection holding nothing.
+// Zero or less: the read waits.
+fun HttpEventBudget.room(limit: int, slotHeld: int): int {
+    if (limit <= 0) return 2147483647
+    var room = limit - this.held
+    if (slotHeld == 0 && room < HTTP_EVENT_HEAD_ALLOWANCE) room = HTTP_EVENT_HEAD_ALLOWANCE
+    room
+}
 
 // The clocks of a server's connections for a request being received and a response being sent: when the request that is being received began
 // (0: none), which request that was and whether its head has been seen, and when the queued response began. One per server, indexed by slot;
@@ -143,7 +169,9 @@ resource class HttpEventServer(
     // A chunked request whose body is not complete, per connection (see `HttpEventChunkState`).
     val chunkStates: array<HttpEventChunkState> = [],
     // The clocks of the request being received and the response being sent, per connection (see HttpEventServerOptions).
-    val deadlines: HttpEventDeadlines = httpEventDeadlines()
+    val deadlines: HttpEventDeadlines = httpEventDeadlines(),
+    // The server-wide budget of buffered request bytes (see HttpEventServerOptions.maximumBufferedRequestBytes).
+    val budget: HttpEventBudget = httpEventBudget()
 ) {
     // Closes the open client descriptors when the server is released.
     fun drop(): void {
@@ -285,6 +313,7 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.tails.append(byteBuffer())
         this.chunkStates.append(httpEventChunkState())
         this.deadlines.deadlineGrow()
+        this.budget.paused.append(false)
     } else {
         this.descriptors[slot] = descriptor
         this.peerAddresses[slot] = peer
@@ -299,6 +328,7 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.tails[slot] = byteBuffer()
         this.chunkStates[slot].reset()
         this.deadlines.deadlineReset(slot)
+        this.budget.paused[slot] = false
     }
     while (this.descriptorSlots.size <= descriptor) {
         this.descriptorSlots.append(-1)
@@ -328,6 +358,62 @@ fun HttpEventServer.closeSlot(slot: int): void {
         // state of the closed connection stay until allocateSlot gives the slot fresh ones.
         this.needs[slot] = 0
         this.deadlines.deadlineReset(slot)
+        this.budget.paused[slot] = false
+    }
+    return
+}
+
+// The request bytes a connection holds that no handler has taken yet: the input waiting to be framed, the reads held back (see `needs`) and the chunked body assembled so far.
+// A closed slot holds none (its buffers stay until the slot is reused, and are not counted).
+fun HttpEventServer.slotHeldBytes(slot: int): int =
+    if (slot >= 0 && slot < this.descriptors.size && this.descriptors[slot] >= 0)
+        this.inputs[slot].size + this.tails[slot].size() + this.chunkStates[slot].body.size()
+    else 0
+
+// The request bytes held by all open connections, counted afresh: what `maximumBufferedRequestBytes` limits. Zero when nothing is buffered, whatever came and went.
+fun HttpEventServer.heldRequestBytes(): int {
+    var total = 0
+    var slot = 0
+    while (slot < this.descriptors.size) {
+        total = total + this.slotHeldBytes(slot)
+        slot = slot + 1
+    }
+    total
+}
+
+// Counts the held bytes afresh, lets the connections that waited for room read again once there is some, and closes the connection idle longest among those holding request bytes
+// when the budget has stayed used up for a whole idle timeout (one per timeout). Called at the end of every pass.
+fun HttpEventServer.budgetEnforce(): void {
+    val limit = this.options.maximumBufferedRequestBytes
+    if (limit <= 0) return
+    this.budget.held = this.heldRequestBytes()
+    if (this.budget.held < limit) {
+        this.budget.overSince = 0
+    } else {
+        val now = this.passMilliseconds
+        var timeout = this.options.idleTimeoutMilliseconds
+        if (timeout <= 0) timeout = 30000
+        if (this.budget.overSince == 0) this.budget.overSince = now
+        else if (now - this.budget.overSince >= timeout) {
+            var victim = -1
+            var slot = 0
+            while (slot < this.descriptors.size) {
+                if (this.slotHeldBytes(slot) > 0 &&
+                    (victim < 0 || this.lastActivityMilliseconds[slot] < this.lastActivityMilliseconds[victim])) victim = slot
+                slot = slot + 1
+            }
+            if (victim >= 0) this.closeSlot(victim)
+            this.budget.overSince = now
+            this.budget.held = this.heldRequestBytes()
+        }
+    }
+    var slot = 0
+    while (slot < this.budget.paused.size) {
+        if (this.budget.paused[slot] && this.descriptors[slot] >= 0 && this.budget.held < limit) {
+            this.budget.paused[slot] = false
+            this.readReady(slot)
+        }
+        slot = slot + 1
     }
     return
 }
@@ -874,6 +960,15 @@ fun HttpEventServer.readReady(slot: int): void {
     var reading = slot >= 0 && this.descriptors[slot] >= 0 &&
         this.outputs[slot].size == 0
     while (reading) {
+        // The server-wide budget of request bytes (see HttpEventServerOptions.maximumBufferedRequestBytes): with no room this connection is not read; the kernel keeps what the peer
+        // sent (the peer's window fills) and budgetEnforce reads it again once there is room.
+        val budgetRoom = this.budget.room(this.options.maximumBufferedRequestBytes, this.slotHeldBytes(slot))
+        if (budgetRoom <= 0) {
+            this.budget.paused[slot] = true
+            reading = false
+            continue
+        }
+        val heldBefore = this.slotHeldBytes(slot)
         if (this.useNoEscapeHandler) {
             var clearInput = false
             // A read held back (see `needs`) and whether the held ones were joined: both are stored after the
@@ -888,6 +983,7 @@ fun HttpEventServer.readReady(slot: int): void {
                 var accumulating = true
                 var continueReading = false
                 var reads = 0
+                var roomLeft = budgetRoom
                 // Keep adjacent pieces of an incomplete request in this
                 // region. Promote only when yielding back to the event loop,
                 // rather than copying every full receive into the GC heap.
@@ -897,9 +993,11 @@ fun HttpEventServer.readReady(slot: int): void {
                     var receiveMaximum = this.options.maximumHeaderBytes +
                         this.options.maximumBodyBytes - pending.size + 1
                     if (receiveMaximum > 131072) receiveMaximum = 131072
+                    if (receiveMaximum > roomLeft) receiveMaximum = roomLeft
                     val incoming = connection.readCompact(receiveMaximum)
                     connection.descriptor = -1
                     reads = reads + 1
+                    roomLeft = roomLeft - incoming.size
                     continueReading = false
                     accumulating = false
                     if (incoming.size > 0) {
@@ -944,7 +1042,7 @@ fun HttpEventServer.readReady(slot: int): void {
                                 input.slice(offset, input.size)
                             } else ""
                             accumulating = offset == 0 && consumed == 0 &&
-                                reads < 4 &&
+                                reads < 4 && roomLeft > 0 &&
                                 this.descriptors[slot] >= 0 &&
                                 this.outputs[slot].size == 0
                         }
@@ -970,7 +1068,8 @@ fun HttpEventServer.readReady(slot: int): void {
             val connection = TcpConnection(this.descriptors[slot])
             // Read a typical API body and its headers in one receive
             // operation, continuing after a full edge-triggered chunk.
-            val incoming = connection.readCompact(32768)
+            val plainRead = if (budgetRoom < 32768) budgetRoom else 32768
+            val incoming = connection.readCompact(plainRead)
             connection.descriptor = -1
             if (incoming.size > 0) {
                 this.lastActivityMilliseconds[slot] =
@@ -981,7 +1080,7 @@ fun HttpEventServer.readReady(slot: int): void {
                     // The request cannot be complete yet: keep the piece, parse nothing (a body sent a byte at a time
                     // used to be joined and re-framed whole on every read).
                     this.tails[slot].appendText(memoryPromoteString(incoming))
-                    reading = incoming.size == 32768 &&
+                    reading = incoming.size == plainRead &&
                         this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
                 } else {
                 var joined = this.inputs[slot]
@@ -1000,11 +1099,13 @@ fun HttpEventServer.readReady(slot: int): void {
                         this.options.maximumBodyBytes) <= 0) {
                     this.closeSlot(slot)
                 } else this.processSlot(slot)
-                reading = incoming.size == 32768 &&
+                reading = incoming.size == plainRead &&
                     this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
                 }
             } else reading = false
         }
+        // What this round took in or released (a handler started, the connection closed), so the next round and the other connections see the room.
+        this.budget.held = this.budget.held + this.slotHeldBytes(slot) - heldBefore
     }
     return
 }
@@ -1110,6 +1211,7 @@ fun HttpEventServer.step(timeoutMilliseconds: int = 1000): int {
             )) this.closeSlot(slot)
         slot = slot + 1
     }
+    this.budgetEnforce()
     handled
 }
 

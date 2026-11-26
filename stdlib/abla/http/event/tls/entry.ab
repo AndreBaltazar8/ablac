@@ -183,7 +183,9 @@ resource class HttpsEventServer(
     val tails: array<ByteBuffer> = [],
     val chunkStates: array<HttpEventChunkState> = [],
     // The clocks of the HTTP/1 request being received and the response being sent, per connection (see HttpEventServerOptions).
-    val deadlines: HttpEventDeadlines = httpEventDeadlines()
+    val deadlines: HttpEventDeadlines = httpEventDeadlines(),
+    // The server-wide budget of buffered request bytes, HTTP/1 and HTTP/2 together (see HttpEventServerOptions.maximumBufferedRequestBytes).
+    val budget: HttpEventBudget = httpEventBudget()
 ) {
     /// Closes the active sockets, poller and listener when the server is dropped.
     fun drop(): void {
@@ -890,6 +892,7 @@ private fun HttpsEventServer.allocate(descriptor: int): int {
         this.tails.append(byteBuffer())
         this.chunkStates.append(httpEventChunkState())
         this.deadlines.deadlineGrow()
+        this.budget.paused.append(false)
     } else {
         this.descriptors[slot] = descriptor
         this.peers[slot] = peer
@@ -905,6 +908,7 @@ private fun HttpsEventServer.allocate(descriptor: int): int {
         this.tails[slot] = byteBuffer()
         this.chunkStates[slot].reset()
         this.deadlines.deadlineReset(slot)
+        this.budget.paused[slot] = false
     }
     while (this.descriptorSlots.size <= descriptor) this.descriptorSlots.append(-1)
     this.descriptorSlots[descriptor] = slot
@@ -943,9 +947,64 @@ fun HttpsEventServer.closeSlot(slot: int): void {
         this.closing[slot] = false
         this.lastActivity[slot] = 0
         this.needs[slot] = 0
+        this.budget.paused[slot] = false
         this.abortExchanges(slot, "the connection closed")
         if (wasHttp2) {
             this.h2[slot] = h2ServerNew()
+        }
+    }
+    return
+}
+
+// The request bytes a connection holds that no handler has taken yet: HTTP/1 input waiting to be framed, reads held back and the chunked body assembled so far, or, for HTTP/2, the
+// decoded header bytes of its open streams and the body bytes buffered for them. A closed slot holds none.
+fun HttpsEventServer.slotHeldBytes(slot: int): int {
+    if (slot < 0 || slot >= this.descriptors.size || this.descriptors[slot] < 0) return 0
+    if (this.states[slot] == httpsHttp2) return this.h2[slot].heldBytes()
+    this.inputs[slot].size + this.tails[slot].size() + this.chunkStates[slot].body.size()
+}
+
+// The request bytes held by all open connections, counted afresh: what `maximumBufferedRequestBytes` limits. Zero when nothing is buffered, whatever came and went.
+fun HttpsEventServer.heldRequestBytes(): int {
+    var total = 0
+    for (slot in 0 until this.descriptors.size) total = total + this.slotHeldBytes(slot)
+    total
+}
+
+// Counts the held bytes afresh, tells the HTTP/2 connections whether the budget is used up, lets the HTTP/1 connections that waited for room read again, and closes the connection
+// idle longest among those holding request bytes when the budget has stayed used up for a whole idle timeout (one per timeout). Called at the end of every pass.
+private fun HttpsEventServer.budgetEnforce(): void {
+    val limit = this.options.base.maximumBufferedRequestBytes
+    if (limit <= 0) return
+    this.budget.held = this.heldRequestBytes()
+    if (this.budget.held < limit) {
+        this.budget.overSince = 0
+    } else {
+        val now = this.pass
+        var timeout = this.options.base.idleTimeoutMilliseconds
+        if (timeout <= 0) timeout = 30000
+        if (this.budget.overSince == 0) this.budget.overSince = now
+        else if (now - this.budget.overSince >= timeout) {
+            var victim = -1
+            for (slot in 0 until this.descriptors.size) {
+                if (this.slotHeldBytes(slot) > 0 && (victim < 0 || this.lastActivity[slot] < this.lastActivity[victim])) victim = slot
+            }
+            if (victim >= 0) this.closeSlot(victim)
+            this.budget.overSince = now
+            this.budget.held = this.heldRequestBytes()
+        }
+    }
+    val full = this.budget.held >= limit
+    for (slot in 0 until this.descriptors.size) {
+        if (this.descriptors[slot] < 0) continue
+        if (this.states[slot] == httpsHttp2) {
+            if (this.h2[slot].budgetFull && !full) {
+                this.h2[slot].budgetRelease()
+                this.flush(slot)
+            } else this.h2[slot].budgetFull = full
+        } else if (this.budget.paused[slot] && !full) {
+            this.budget.paused[slot] = false
+            this.readSlot(slot)
         }
     }
     return
@@ -962,11 +1021,11 @@ private fun HttpsEventServer.watchWrite(slot: int, want: bool): void {
 // Returns the bytes read ("" with `status` 0 for would-block, 1 closed, -1 failed in `lastStatus`); for TLS: want-write is reported as would-block with the write interest set.
 class HttpsRead(var bytes: string, var status: int)
 
-private fun HttpsEventServer.receive(slot: int, var into: HttpsRead): void {
+private fun HttpsEventServer.receive(slot: int, var into: HttpsRead, room: int): void {
     into.bytes = ""
     into.status = 0
     if (this.tls != null && this.states[slot] != httpsSniffing) {
-        val read = this.sessions[slot].readReady(16384)
+        val read = this.sessions[slot].readReady(if (room < 16384) room else 16384)
         if (read.status == 1 && read.bytes.size > 0) {
             into.bytes = read.bytes
         } else if (read.status == 3) {
@@ -979,7 +1038,7 @@ private fun HttpsEventServer.receive(slot: int, var into: HttpsRead): void {
         return
     }
     val connection = TcpConnection(this.descriptors[slot])
-    val result = connection.readResult(65536)
+    val result = connection.readResult(if (room < 65536) room else 65536)
     connection.descriptor = -1
     if (result.hasData()) into.bytes = result.bytes
     else if (result.reachedEof()) into.status = 1
@@ -1143,7 +1202,12 @@ private fun HttpsEventServer.serveHttp1(slot: int): void {
 }
 
 private fun HttpsEventServer.serveHttp2(slot: int, data: string): void {
+    val limit = this.options.base.maximumBufferedRequestBytes
+    val heldBefore = this.h2[slot].heldBytes()
+    if (limit > 0) this.h2[slot].budgetFull = this.budget.held >= limit
     this.h2[slot].feed(data, this.pass)
+    // The request bytes this connection holds now, so the other connections of the pass see the room (counted afresh at the end of the pass).
+    this.budget.held = this.budget.held + this.h2[slot].heldBytes() - heldBefore
     for (r in this.h2[slot].takeRequests()) {
         val eventHandler = this.handler
         val response = eventHandler(r.request)
@@ -1233,7 +1297,18 @@ fun HttpsEventServer.readSlot(slot: int): void {
             this.handshake(slot)
             return
         }
-        this.receive(slot, result)
+        // The server-wide budget of request bytes (see HttpEventServerOptions.maximumBufferedRequestBytes): an HTTP/1 connection that finds no room is not read (the kernel and the TLS
+        // session keep what the peer sent) until budgetEnforce finds room; an HTTP/2 connection is held back by refusing streams and by withheld receive credit instead.
+        val limit = this.options.base.maximumBufferedRequestBytes
+        var room = 2147483647
+        if (limit > 0 && this.states[slot] != httpsHttp2) room = this.budget.room(limit, this.slotHeldBytes(slot))
+        if (room <= 0) {
+            this.budget.paused[slot] = true
+            reading = false
+            continue
+        }
+        val heldBefore = if (this.states[slot] == httpsHttp2) 0 else this.slotHeldBytes(slot)
+        this.receive(slot, result, room)
         if (result.status != 0) {
             this.closeSlot(slot)
             reading = false
@@ -1243,6 +1318,7 @@ fun HttpsEventServer.readSlot(slot: int): void {
             // A connection with an unwritten answer reads no further until it is written (backpressure).
             if (this.descriptors[slot] >= 0 && this.outputs[slot].size > 0) reading = false
         } else reading = false
+        if (this.states[slot] != httpsHttp2) this.budget.held = this.budget.held + this.slotHeldBytes(slot) - heldBefore
     }
     return
 }
@@ -1295,7 +1371,7 @@ fun HttpsEventServer.acceptReady(): void {
 /** Whether the slot's TLS session holds decrypted bytes nobody has taken and the slot can take them (nothing of its own waits to be written). The socket has nothing to
  *  say about them: readSlot reads at most 64 times per event, and what the session had already read from the socket stays in it. */
 private fun HttpsEventServer.buffered(slot: int): bool =
-    this.tls != null && this.descriptors[slot] >= 0 && this.outputs[slot].size == 0 && !this.h1Paused(slot) &&
+    this.tls != null && this.descriptors[slot] >= 0 && this.outputs[slot].size == 0 && !this.h1Paused(slot) && !this.budget.paused[slot] &&
     (this.states[slot] == httpsHttp1 || this.states[slot] == httpsHttp2) && this.sessions[slot].hasPending()
 
 /// Polls once for up to the supplied timeout and returns the number of readiness events handled.
@@ -1338,7 +1414,8 @@ fun HttpsEventServer.step(timeoutMilliseconds: int = 1000): int {
                     // A half-closed peer may still have sent a request: read before giving up on it.
                     if (readable || closed) this.readSlot(slot)
                     if (writable && slot < this.descriptors.size && this.descriptors[slot] >= 0) this.writeSlot(slot)
-                    if (closed && slot < this.descriptors.size && this.descriptors[slot] >= 0 && !readable) this.closeSlot(slot)
+                    // (a connection waiting for room in the request-byte budget was not read: its hangup is all the server learns, and its request bytes go with it)
+                    if (closed && slot < this.descriptors.size && this.descriptors[slot] >= 0 && (!readable || this.budget.paused[slot])) this.closeSlot(slot)
                 }
                 handled = handled + 1
             }
@@ -1366,6 +1443,7 @@ fun HttpsEventServer.step(timeoutMilliseconds: int = 1000): int {
         }
     }
     this.timers()
+    this.budgetEnforce()
     handled
 }
 

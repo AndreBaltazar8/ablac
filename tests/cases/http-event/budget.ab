@@ -1,0 +1,313 @@
+// The event servers hold at most HttpEventServerOptions.maximumBufferedRequestBytes of request bytes (heads and buffered bodies of requests whose handler has not run), over
+// all connections together (#1139 area 4, decision #146 A). One program, servers and clients in one thread, a pass after every round of writes. The budget is 1 MiB here and
+// each connection is far under its own limits (body limit 1 MiB per connection); twelve of them together are over the budget:
+//   - HTTP/1, plain server and HTTPS server (no TLS): twelve connections each send the head of a 500 KB body and then pieces of it; the bytes held stay within the budget plus one
+//     request head (16 KiB) per connection, a fresh small request on a new connection is answered meanwhile, and once the clients are gone nothing is held;
+//   - HTTP/2 (h2c on the HTTPS server): twelve connections each open a new stream with 16 KiB of body every round, never finishing them; the bytes held stay within the budget plus one
+//     round, the streams past it are refused (REFUSED_STREAM), a new stream on a new connection is refused while the budget is used up, and answered once the clients are gone;
+//   - accounting: after requests that completed, were reset (HTTP/2 RST_STREAM), had their connection closed, were a parse error, and one that timed out, the bytes held are 0.
+// Each case is also run with the budget off (0): the held bytes then pass the bound, so the checks fail without the feature. Prints "http-event budget ok".
+import "abla/io"
+import "abla/text"
+import "abla/crypto"
+import "abla/http"
+import "abla/http/event"
+import "abla/http/event/tls"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+import "abla/net"
+
+val BUDGET = 1048576
+val CONNECTIONS = 12
+
+var failures = 0
+
+fun fail(what: string): void {
+    failures = failures + 1
+    println("FAIL $what")
+    return
+}
+
+fun answer(request: HttpRequest): HttpResponse = httpText("got ${request.body.size}")
+
+fun eventOptions(budget: int, idle: int): HttpEventServerOptions =
+    HttpEventServerOptions(64, 65536, 1048576, 2097152, 1000, idle, 256, 1000, 30000, 0, 0, budget)
+
+fun postHead(length: int): string = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: ${length}\r\n\r\n"
+
+val GET = "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+
+fun frame(kind: int, flags: int, stream: int, payload: string): string {
+    val n = payload.size
+    cryptoByteString([(n >> 16) & 255, (n >> 8) & 255, n & 255, kind, flags, (stream >> 24) & 127, (stream >> 16) & 255, (stream >> 8) & 255, stream & 255]) + payload
+}
+
+fun requestBlock(method: string): string {
+    var e = hpackEncoderNew(0)
+    e.encode([HpackField(":method", method, false), HpackField(":scheme", "http", false), HpackField(":path", "/", false), HpackField(":authority", "localhost", false)])
+}
+
+// Streams the server refused (RST_STREAM with REFUSED_STREAM) and whether it sent response headers, in `all`.
+fun refusedCount(all: string): int {
+    var at = 0
+    var refused = 0
+    while (at + 9 <= all.size) {
+        val n = (all[at] << 16) | (all[at + 1] << 8) | all[at + 2]
+        if (all[at + 3] == 3 && n == 4 && at + 13 <= all.size && all[at + 12] == 7) refused = refused + 1
+        at = at + 9 + n
+    }
+    refused
+}
+
+fun hasHeaders(all: string): bool {
+    var at = 0
+    while (at + 9 <= all.size) {
+        val n = (all[at] << 16) | (all[at + 1] << 8) | all[at + 2]
+        if (all[at + 3] == 1) return true
+        at = at + 9 + n
+    }
+    false
+}
+
+fun connect(port: int): TcpConnection {
+    var c = tcpConnectIpv4("127.0.0.1", port, 2000)
+    c.setNonblocking()
+    c
+}
+
+// ---- HTTP/1 ----
+
+class Flood(val held: int, val answered: bool, val after: int)
+
+fun plainFlood(budget: int): Flood {
+    val router = httpRouter()
+    router.get("/", answer)
+    router.post("/", answer)
+    val server = httpEventServer(router, ipv4Loopback(0), eventOptions(budget, 30000))
+    val port = server.listener.localPort()
+    val clients: array<TcpConnection> = []
+    for (i in 0 until CONNECTIONS) {
+        val c = connect(port)
+        c.write(postHead(500000))
+        clients.append(move(c))
+    }
+    server.step(50)
+    val piece = "x".repeat(16384)
+    for (round in 0 until 13) {
+        for (i in 0 until clients.size) clients[i].write(piece)
+        server.step(0)
+        server.step(0)
+    }
+    for (k in 0 until 20) server.step(10)
+    val held = server.heldRequestBytes()
+    val fresh = connect(port)
+    fresh.write(GET)
+    var answered = false
+    for (k in 0 until 40) {
+        server.step(10)
+        if (!answered) answered = fresh.readCompact(4096).indexOf("200") >= 0
+    }
+    for (i in 0 until clients.size) clients[i].close()
+    fresh.close()
+    for (k in 0 until 30) server.step(10)
+    Flood(held, answered, server.heldRequestBytes())
+}
+
+fun secureFlood(budget: int): Flood {
+    val router = httpRouter()
+    router.get("/", answer)
+    router.post("/", answer)
+    val server = httpsEventServer(router, ipv4Loopback(0), null, HttpsEventServerOptions(eventOptions(budget, 30000)))
+    val port = server.listener.localPort()
+    val clients: array<TcpConnection> = []
+    for (i in 0 until CONNECTIONS) {
+        val c = connect(port)
+        c.write(postHead(500000))
+        clients.append(move(c))
+    }
+    server.step(50)
+    val piece = "x".repeat(16384)
+    for (round in 0 until 13) {
+        for (i in 0 until clients.size) clients[i].write(piece)
+        server.step(0)
+        server.step(0)
+    }
+    for (k in 0 until 20) server.step(10)
+    val held = server.heldRequestBytes()
+    val fresh = connect(port)
+    fresh.write(GET)
+    var answered = false
+    for (k in 0 until 40) {
+        server.step(10)
+        if (!answered) answered = fresh.readCompact(4096).indexOf("200") >= 0
+    }
+    for (i in 0 until clients.size) clients[i].close()
+    fresh.close()
+    for (k in 0 until 30) server.step(10)
+    Flood(held, answered, server.heldRequestBytes())
+}
+
+// ---- HTTP/2 ----
+
+class H2Flood(val held: int, val admitted: int, val refused: int, val freshRefused: bool, val freshAnswered: bool, val after: int)
+
+fun h2Flood(budget: int): H2Flood {
+    val router = httpRouter()
+    router.get("/", answer)
+    router.post("/", answer)
+    val server = httpsEventServer(router, ipv4Loopback(0), null, HttpsEventServerOptions(eventOptions(budget, 30000)))
+    val port = server.listener.localPort()
+    val post = requestBlock("POST")
+    val clients: array<TcpConnection> = []
+    for (i in 0 until CONNECTIONS) {
+        val c = connect(port)
+        c.write(H2_PREFACE + frame(4, 0, 0, ""))
+        clients.append(move(c))
+    }
+    server.step(50)
+    val body = "y".repeat(16384)
+    var refused = 0
+    for (round in 0 until 10) {
+        for (i in 0 until clients.size) {
+            val stream = 1 + 2 * round
+            clients[i].write(frame(1, 4, stream, post) + frame(0, 0, stream, body))
+        }
+        server.step(0)
+        server.step(0)
+        for (i in 0 until clients.size) refused = refused + refusedCount(clients[i].readCompact(65536))
+    }
+    for (k in 0 until 20) {
+        server.step(10)
+        for (i in 0 until clients.size) refused = refused + refusedCount(clients[i].readCompact(65536))
+    }
+    val held = server.heldRequestBytes()
+    val get = requestBlock("GET")
+    val fresh = connect(port)
+    fresh.write(H2_PREFACE + frame(4, 0, 0, "") + frame(1, 5, 1, get))
+    var freshRefused = false
+    for (k in 0 until 20) {
+        server.step(10)
+        if (refusedCount(fresh.readCompact(65536)) > 0) freshRefused = true
+    }
+    fresh.close()
+    for (i in 0 until clients.size) clients[i].close()
+    for (k in 0 until 30) server.step(10)
+    val after = server.heldRequestBytes()
+    val again = connect(port)
+    again.write(H2_PREFACE + frame(4, 0, 0, "") + frame(1, 5, 1, get))
+    var answered = false
+    for (k in 0 until 40) {
+        server.step(10)
+        if (!answered) answered = hasHeaders(again.readCompact(65536))
+    }
+    H2Flood(held, 10 * CONNECTIONS - refused, refused, freshRefused, answered, after)
+}
+
+// ---- accounting ----
+
+// Requests that complete, are reset, lose their connection, are a parse error or time out leave nothing held.
+fun accountingH1(): int {
+    val router = httpRouter()
+    router.get("/", answer)
+    router.post("/", answer)
+    val server = httpEventServer(router, ipv4Loopback(0), eventOptions(BUDGET, 400))
+    val port = server.listener.localPort()
+    val kept: array<TcpConnection> = []
+    for (i in 0 until 4) {
+        val c = connect(port)
+        c.write(postHead(1000) + "z".repeat(1000))
+        kept.append(move(c))
+    }
+    for (i in 0 until 4) {
+        val c = connect(port)
+        c.write(postHead(50000) + "z".repeat(20000))
+        server.step(10)
+        c.close()
+    }
+    val bad = connect(port)
+    bad.write("NOT A REQUEST\r\n\r\n")
+    val slow = connect(port)
+    slow.write(postHead(50000) + "z".repeat(20000))
+    for (k in 0 until 10) server.step(10)
+    var midway = server.heldRequestBytes()
+    for (k in 0 until 60) server.step(20)
+    if (midway < 20000) fail("accounting h1: nothing was held midway ($midway)")
+    server.heldRequestBytes()
+}
+
+fun accountingH2(): int {
+    val router = httpRouter()
+    router.get("/", answer)
+    router.post("/", answer)
+    val server = httpsEventServer(router, ipv4Loopback(0), null, HttpsEventServerOptions(eventOptions(BUDGET, 30000)))
+    val port = server.listener.localPort()
+    val post = requestBlock("POST")
+    val hello = H2_PREFACE + frame(4, 0, 0, "")
+    val kept: array<TcpConnection> = []
+    // completed, then reset: a stream whose whole request arrived (the handler ran), a stream with a body that is then reset
+    val a = connect(port)
+    a.write(hello + frame(1, 4, 1, post) + frame(0, 1, 1, "q".repeat(1000)) + frame(1, 4, 3, post) + frame(0, 0, 3, "q".repeat(5000)))
+    for (k in 0 until 5) server.step(10)
+    val withOpenStream = server.heldRequestBytes()
+    if (withOpenStream < 5000) fail("accounting h2: an open stream held $withOpenStream bytes")
+    a.write(frame(3, 0, 3, h2Be32(8)))
+    for (k in 0 until 5) server.step(10)
+    val afterReset = server.heldRequestBytes()
+    if (afterReset != 0) fail("accounting h2: $afterReset bytes held after the stream was completed and the other reset")
+    kept.append(move(a))
+    // the connection closes with a stream open
+    val b = connect(port)
+    b.write(hello + frame(1, 4, 1, post) + frame(0, 0, 1, "q".repeat(9000)))
+    for (k in 0 until 5) server.step(10)
+    val midway = server.heldRequestBytes()
+    if (midway < 9000) fail("accounting h2: a stream with 9000 bytes of body held $midway")
+    b.close()
+    for (k in 0 until 10) server.step(10)
+    val afterClose = server.heldRequestBytes()
+    if (afterClose != 0) fail("accounting h2: $afterClose bytes held after the connection closed")
+    // a connection error: a frame that is not valid after the preface, with a stream open
+    val bad = connect(port)
+    bad.write(hello + frame(1, 4, 1, post) + frame(0, 0, 1, "q".repeat(4000)) + frame(0, 0, 0, "oops"))
+    for (k in 0 until 10) server.step(10)
+    kept[0].close()
+    for (k in 0 until 20) server.step(10)
+    server.heldRequestBytes()
+}
+
+fun main: int {
+    val slack = CONNECTIONS * HTTP_EVENT_HEAD_ALLOWANCE
+    val plain = plainFlood(BUDGET)
+    if (plain.held > BUDGET + slack) fail("h1 plain: ${plain.held} bytes held, the budget is $BUDGET (+$slack)")
+    if (plain.held < BUDGET / 2) fail("h1 plain: only ${plain.held} bytes held (the flood did not reach the budget)")
+    if (!plain.answered) fail("h1 plain: a fresh small request was not answered")
+    if (plain.after != 0) fail("h1 plain: ${plain.after} bytes held after the clients left")
+    val unlimited = plainFlood(0)
+    if (unlimited.held <= BUDGET + slack) fail("h1 plain, budget off: ${unlimited.held} bytes held, the flood does not exceed the bound (the check proves nothing)")
+
+    val secure = secureFlood(BUDGET)
+    if (secure.held > BUDGET + slack) fail("h1 https: ${secure.held} bytes held, the budget is $BUDGET (+$slack)")
+    if (secure.held < BUDGET / 2) fail("h1 https: only ${secure.held} bytes held")
+    if (!secure.answered) fail("h1 https: a fresh small request was not answered")
+    if (secure.after != 0) fail("h1 https: ${secure.after} bytes held after the clients left")
+    val secureOff = secureFlood(0)
+    if (secureOff.held <= BUDGET + slack) fail("h1 https, budget off: ${secureOff.held} bytes held, the flood does not exceed the bound")
+
+    val h2 = h2Flood(BUDGET)
+    val h2Slack = CONNECTIONS * 17000
+    if (h2.held > BUDGET + h2Slack) fail("h2: ${h2.held} bytes held, the budget is $BUDGET (+$h2Slack)")
+    if (h2.held < BUDGET / 2) fail("h2: only ${h2.held} bytes held")
+    if (h2.refused < 10) fail("h2: ${h2.refused} streams refused past the budget")
+    if (!h2.freshRefused) fail("h2: a new stream while the budget is used up was not refused")
+    if (h2.after != 0) fail("h2: ${h2.after} bytes held after the clients left")
+    if (!h2.freshAnswered) fail("h2: a new stream after the clients left was not answered")
+    val h2Off = h2Flood(0)
+    if (h2Off.held <= BUDGET + h2Slack) fail("h2, budget off: ${h2Off.held} bytes held, the flood does not exceed the bound")
+
+    val a1 = accountingH1()
+    if (a1 != 0) fail("accounting h1: $a1 bytes held at the end")
+    val a2 = accountingH2()
+    if (a2 != 0) fail("accounting h2: $a2 bytes held at the end")
+    if (failures > 0) return 1
+    println("http-event budget ok")
+    0
+}

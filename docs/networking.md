@@ -767,6 +767,14 @@ The last two are off because a large upload or download on a slow link is legiti
 per client address: on an open network run it behind a proxy that does, and that enforces a minimum data rate. `HttpsEventServer` takes the same options
 in its `base` options. For its HTTP/2 connections only `responseTimeoutMilliseconds` applies: a connection whose response the client's flow-control windows hold back for that long (no response byte going out) is closed with GOAWAY (`ENHANCE_YOUR_CALM`); HTTP/2 connections otherwise have their own idle and ping rules.
 
+The per-connection limits bound one connection, and a server takes `maximumConnections` of them. `HttpEventServerOptions.maximumBufferedRequestBytes` (default 256 MiB,
+0 = no limit) bounds them together: the request bytes the server holds for requests whose handler has not run (heads and buffered bodies, over all connections, plain,
+HTTPS and HTTP/2). At the limit a new HTTP/2 stream is refused (`REFUSED_STREAM`, which a client retries) and HTTP/2 receive credit is withheld, and an HTTP/1 connection
+that holds request bytes is not read until room opens (its request waits; nothing fails). A connection that holds none can still send a request head (up to 16 KiB over the
+limit each), so a small request is answered while the budget is full of waiting bodies. If the server stays at the limit for `idleTimeoutMilliseconds` (30 s when that
+is 0), it closes the connection idle longest among those holding request bytes, one per timeout. A request's bytes are released when its handler starts and when its
+stream or connection ends for any reason. `heldRequestBytes()` reports the current total. `tests/cases/http-event/budget.ab` runs these cases.
+
 The steady-state HTTP path keeps only readable interest registered. A response
 that fills the kernel send buffer enables writable interest exactly once, then
 removes it after the pending output drains. Ordinary complete writes therefore
