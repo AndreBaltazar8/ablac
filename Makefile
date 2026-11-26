@@ -706,6 +706,7 @@ test-serial: ablac
 	tools/test-package-symlink.sh $(COMPILER)
 	tools/test-package-dependency-data.sh $(COMPILER)
 	tools/test-package-install.sh $(COMPILER)
+	tools/test-package-prepared-integrity.sh $(COMPILER)
 	tools/test-package-add.sh $(COMPILER)
 	tools/test-package-git-source.sh $(COMPILER)
 	tools/test-package-git-timeout.sh $(COMPILER)

@@ -1521,6 +1521,16 @@ fun bootstrapPackageCheckoutValid(
     package: BootstrapLockedPackage
 ): bool = Path(source).info().isDirectory() && bootstrapPackageDirectoryDigest(source, false) == package.digest
 
+// Whether the prepared copy at `packageRoot` (.abla/packages/<name>) is the locked tree of `package`: its markers name the
+// locked revision and digest, and its files hash to that digest. An import reads the copy, so the markers alone prove
+// nothing: a restored CI cache, a commit of .abla or a compile-time write can change the files and leave them. A copy made
+// from a vendored tree holds its two marker files, which `fromVendor` leaves out of the digest.
+fun bootstrapPackagePreparedValid(packageRoot: string, package: BootstrapLockedPackage, fromVendor: bool): bool =
+    Path("$packageRoot/revision").readText() == package.revision &&
+        Path("$packageRoot/digest").readText() == package.digest &&
+        Path("$packageRoot/source").info().isDirectory() &&
+        bootstrapPackageDirectoryDigest("$packageRoot/source", fromVendor) == package.digest
+
 fun bootstrapPackageValidateCapabilityPolicy(
     projectRoot: string,
     packages: array<BootstrapLockedPackage>,
@@ -2396,10 +2406,8 @@ fun bootstrapPackageMaterialize(
     }
     val packageRoot = "$projectRoot/.abla/packages/${package.name}"
     val sourceRoot = "$packageRoot/source"
-    val existing = Path("$packageRoot/revision").readText() == package.revision &&
-        Path("$packageRoot/digest").readText() == package.digest &&
-        Path(sourceRoot).info().isDirectory() &&
-        (vendorValid || bootstrapPackageCheckoutValid(sourceRoot, package))
+    // A valid vendored copy does not vouch for the prepared one: imports read the prepared copy first.
+    val existing = bootstrapPackagePreparedValid(packageRoot, package, vendorValid)
     if (status == 0 && !existing) {
         val temporary = "$packageRoot.tmp.${linuxProcessId()}"
         bootstrapPackageRemoveTree(temporary)
@@ -2499,8 +2507,8 @@ fun bootstrapPackagePrepareWithLock(
 /**
  * Every package the abla.lock at `projectRoot` names, under its .abla/packages at the locked revision: fetched into
  * the cache when absent (never re-resolved: the lock's revision, not the selector's head), then materialized. One
- * already there at that revision and digest is left as it is, so a build that needs nothing reads two small files
- * per package. No lock: nothing to do (decision #85: builds use the committed lock; `package update` moves it).
+ * already there whose files hash to the locked digest is left as it is (a build that needs nothing hashes each copy, as
+ * `build --project` does). No lock: nothing to do (decision #85: builds use the committed lock; `package update` moves it).
  */
 fun bootstrapPackageInstallLocked(projectRoot: string, offline: bool): BootstrapPackageResult {
     val lockPath = Path(projectRoot).child("abla.lock")
@@ -2515,12 +2523,14 @@ fun bootstrapPackageInstallLocked(projectRoot: string, offline: bool): Bootstrap
             if (bootstrapPackageVendorDigest(projectRoot, vendor) != package.digest) {
                 return BootstrapPackageResult(1, bootstrapPackageVendorMismatch(package))
             }
+            // An import takes a prepared copy at the locked revision before the vendored tree: one whose files are not the
+            // locked tree goes, so the import reads vendor/.
+            val prepared = "$projectRoot/.abla/packages/${package.name}"
+            if (Path(prepared).exists() && !bootstrapPackagePreparedValid(prepared, package, true)) bootstrapPackageRemoveTree(prepared)
             continue
         }
         val root = "$projectRoot/.abla/packages/${package.name}"
-        if (Path("$root/revision").readText() == package.revision &&
-            Path("$root/digest").readText() == package.digest &&
-            Path("$root/source").info().isDirectory()) continue
+        if (bootstrapPackagePreparedValid(root, package, false)) continue
         val materialized = bootstrapPackageMaterialize(projectRoot, package, offline)
         if (materialized.status != 0) return materialized
         installed = true
