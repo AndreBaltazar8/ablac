@@ -598,6 +598,7 @@ test-serial: ablac
 	tools/test-frozen.sh $(COMPILER)
 	tools/test-gc-spin.sh $(COMPILER)
 	tools/test-gc-native-pressure.sh $(COMPILER)
+	tools/test-gc-root-plan.sh $(COMPILER)
 	tools/test-emutls.sh $(COMPILER)
 	@if test "$$(uname -s)" = Darwin; then tools/test-macos-host.sh $(COMPILER); else echo "macOS host: skipped on $$(uname -s)"; fi
 	tools/test-portable-io.sh $(COMPILER)

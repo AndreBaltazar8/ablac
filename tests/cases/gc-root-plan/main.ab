@@ -1,0 +1,184 @@
+// One minimal program for every kind of instruction that can lead to a collection (#1139 area 7, round 4): the values the caller holds
+// (strings, an array, an object) are live across only that instruction, once as expression TEMPORARIES (`verifyTemp(buildStrings(),
+// buildObject(), <the instruction>)`) and once as LOCALS (`val s = ...; val t = <the instruction>; check(s, o)`). Run with
+// ABLA_GC_STRESS=1 (a collection at every safe point) and ABLA_GC_POISON=1 (what a collection frees is overwritten); each case prints
+// "name=<wrong>", the number of held values that are not what was built (tools/test-gc-root-plan.sh reads them).
+import "abla/io"
+import "abla/memory"
+import "abla/text"
+
+class Held(val name: string, val values: array<int>)
+
+resource class Res(val id: int) {
+    fun drop(): void {
+        churnOp()
+        return
+    }
+}
+
+fun expected(index: int): string = "held-$index-${"abc".repeat(20)}"
+
+fun buildStrings(): array<string> {
+    val strings: array<string> = []
+    for (index in 0 until 16) strings.append(expected(index))
+    strings
+}
+
+fun buildObject(): Held = Held("object-${"x".repeat(60)}", [1, 2, 3, 4, 5, 6, 7, 8])
+
+/** The number of held values that are not what was built. */
+fun check(strings: array<string>, object: Held): int {
+    var wrong = 0
+    for (index in 0 until 16) if (strings[index] != expected(index)) wrong = wrong + 1
+    if (object.name != "object-${"x".repeat(60)}" || object.values[7] != 8) wrong = wrong + 1
+    wrong
+}
+
+fun verifyTemp(strings: array<string>, object: Held, token: int): int = check(strings, object) + (if (token == 1) 0 else 1)
+
+/** Allocates through a call (String.repeat) and has a safe point at its entry: returns 1. */
+fun churn(): int {
+    val garbage = "y".repeat(2000)
+    if (garbage.size > 0) 1 else 0
+}
+
+/** Allocates by an instruction of its own only (string interpolation): returns 1. */
+fun churnOp(): int {
+    val index = 5
+    val garbage = "y$index"
+    if (garbage.size > 0) 1 else 0
+}
+
+// ---- ordinary calls of functions that collect (a call, and the callee's own safe point at its entry)
+fun callTemp(): int = verifyTemp(buildStrings(), buildObject(), churn())
+fun callLocal(): int {
+    val strings = buildStrings()
+    val object = buildObject()
+    val token = churn()
+    check(strings, object) + (if (token == 1) 0 else 1)
+}
+fun callOpTemp(): int = verifyTemp(buildStrings(), buildObject(), churnOp())
+fun callOpLocal(): int {
+    val strings = buildStrings()
+    val object = buildObject()
+    val token = churnOp()
+    check(strings, object) + (if (token == 1) 0 else 1)
+}
+
+// ---- a call through a closure value
+fun indirectTemp(): int {
+    val body: () -> int = { churn() }
+    verifyTemp(buildStrings(), buildObject(), body())
+}
+fun indirectLocal(): int {
+    val body: () -> int = { churn() }
+    val strings = buildStrings()
+    val object = buildObject()
+    val token = body()
+    check(strings, object) + (if (token == 1) 0 else 1)
+}
+
+// ---- generator resumes (the body runs when the loop asks for the next value)
+fun generatorTemp(): int = verifyTemp(buildStrings(), buildObject(), if (true) {
+    var sum = 0
+    for (x in generator { yield churnOp()
+        yield churnOp() }) { sum = sum + x }
+    sum - 1
+} else 0)
+fun generatorLocal(): int {
+    val strings = buildStrings()
+    val object = buildObject()
+    var sum = 0
+    for (x in generator { yield churnOp()
+        yield churnOp() }) { sum = sum + x }
+    check(strings, object) + (if (sum == 2) 0 else 1)
+}
+
+// ---- a task awaited, a thread awaited
+fun taskTemp(): int = verifyTemp(buildStrings(), buildObject(), await task { churnOp() })
+fun taskLocal(): int {
+    val strings = buildStrings()
+    val object = buildObject()
+    val token = await task { churnOp() }
+    check(strings, object) + (if (token == 1) 0 else 1)
+}
+fun threadTemp(): int = verifyTemp(buildStrings(), buildObject(), await thread { churnOp() })
+fun threadLocal(): int {
+    val strings = buildStrings()
+    val object = buildObject()
+    val token = await thread { churnOp() }
+    check(strings, object) + (if (token == 1) 0 else 1)
+}
+
+// ---- a resource dropped (its drop() allocates)
+fun dropTemp(): int = verifyTemp(buildStrings(), buildObject(), if (true) {
+    val res = Res(1)
+    res.id
+} else 0)
+fun dropLocal(): int {
+    val strings = buildStrings()
+    val object = buildObject()
+    var token = 0
+    if (true) {
+        val res = Res(1)
+        token = res.id
+    }
+    check(strings, object) + (if (token == 1) 0 else 1)
+}
+
+// ---- a loop whose only collecting instructions are allocations by instruction (its back-edge safe point)
+fun loopTemp(): int = verifyTemp(buildStrings(), buildObject(), if (true) {
+    var index = 0
+    var total = 0
+    while (index < 3) {
+        val garbage = "z$index"
+        total = total + garbage.size - 1
+        index = index + 1
+    }
+    total - 2
+} else 0)
+fun loopLocal(): int {
+    val strings = buildStrings()
+    val object = buildObject()
+    var index = 0
+    var total = 0
+    while (index < 3) {
+        val garbage = "z$index"
+        total = total + garbage.size - 1
+        index = index + 1
+    }
+    check(strings, object) + (if (total == 3) 0 else 1)
+}
+
+// ---- the program's own request for a collection
+fun explicitTemp(): int = verifyTemp(buildStrings(), buildObject(), if (true) {
+    memoryCollect()
+    1
+} else 0)
+fun explicitLocal(): int {
+    val strings = buildStrings()
+    val object = buildObject()
+    memoryCollect()
+    check(strings, object)
+}
+
+fun run(name: string, wrong: int): int {
+    println("$name=$wrong")
+    wrong
+}
+
+fun main: int {
+    var total = 0
+    for (round in 0 until 3) {
+        total = total + run("call-temp", callTemp()) + run("call-local", callLocal())
+        total = total + run("callop-temp", callOpTemp()) + run("callop-local", callOpLocal())
+        total = total + run("indirect-temp", indirectTemp()) + run("indirect-local", indirectLocal())
+        total = total + run("generator-temp", generatorTemp()) + run("generator-local", generatorLocal())
+        total = total + run("task-temp", taskTemp()) + run("task-local", taskLocal())
+        total = total + run("thread-temp", threadTemp()) + run("thread-local", threadLocal())
+        total = total + run("drop-temp", dropTemp()) + run("drop-local", dropLocal())
+        total = total + run("loop-temp", loopTemp()) + run("loop-local", loopLocal())
+        total = total + run("explicit-temp", explicitTemp()) + run("explicit-local", explicitLocal())
+    }
+    if (total == 0) 0 else 1
+}
