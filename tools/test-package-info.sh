@@ -63,3 +63,20 @@ git -C "$repo" commit -qm 'missing metadata'
 if "$compiler" package info fixture/metadata > "$work/info" 2> "$work/error"; then exit 1; fi
 grep -F 'has no readable abla.toml' "$work/error"
 [[ ! -s $work/info && -z $(ls -A "$TMPDIR") ]]
+
+# A manifest blob is sized before it is read: 8 MiB of one byte is a few KiB in a pack but would be 8 MiB on disk. Under a 512 KiB
+# file limit the lookup must refuse it by its size, never by writing it (which the limit would stop as an unreadable manifest).
+{ printf 'name = "fixture"\n# '; head -c 8388608 /dev/zero | tr '\0' 'a'; printf '\n'; } > "$repo/abla.toml"
+git -C "$repo" add abla.toml
+git -C "$repo" commit -qm 'huge metadata'
+if (ulimit -f 1024; "$compiler" package info fixture/metadata) > "$work/info" 2> "$work/error"; then exit 1; fi
+grep -F 'abla.toml exceeds 64 KiB' "$work/error"
+[[ -z $(ls -A "$TMPDIR") ]]
+
+# A remote that never answers stops at the git timeout (here 2 s) instead of hanging the command.
+git config --global "url.ssh://hang.invalid/x.insteadOf" https://github.com/fixture/hang.git
+started=$SECONDS
+if GIT_SSH_COMMAND='sleep 600;:' ABLA_PACKAGE_GIT_TIMEOUT_SECONDS=2 timeout 60 "$compiler" package info fixture/hang > "$work/info" 2> "$work/error"; then exit 1; fi
+(( SECONDS - started < 30 ))
+grep -F 'cannot read fixture/hang from GitHub' "$work/error"
+[[ -z $(ls -A "$TMPDIR") ]]

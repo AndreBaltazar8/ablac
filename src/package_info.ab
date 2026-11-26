@@ -1,4 +1,5 @@
 import "package.ab"
+import "abla/integer"
 import "abla/json"
 import "package_catalog.ab"
 import "package_index.ab"
@@ -40,14 +41,7 @@ fun bootstrapPackageInfoField(manifest: string, key: string): string {
 
 // Preserve Unicode and keep control characters from remote metadata out of the CLI.
 fun bootstrapPackageInfoDisplay(value: string, missing: string): string {
-    if (value == "") return missing
-    var index = 0
-    while (index < value.size) {
-        val byte = value[index]
-        if (byte < 32 || byte == 127) return missing
-        index = index + 1
-    }
-    value
+    if (value == "" || !packageCatalogDisplaySafe(value)) missing else value
 }
 
 fun bootstrapPackageLookupGit(directory: string): LinuxCommand {
@@ -55,6 +49,9 @@ fun bootstrapPackageLookupGit(directory: string): LinuxCommand {
     command.workingDirectory = directory
     command.argument("-c")
     command.argument("credential.interactive=false")
+    // What a lookup receives is checked as the fetch path checks it.
+    command.argument("-c")
+    command.argument("transfer.fsckObjects=true")
     command
 }
 
@@ -81,21 +78,32 @@ fun bootstrapPackageLookupClone(
     clone.argument("--")
     clone.argument(source)
     clone.argument(repoDir)
-    clone.run() == 0
+    bootstrapPackageRunLimitedGit(clone).status == 0
 }
 
 fun bootstrapPackageLookupOutput(
     var command: LinuxCommand, file: Path, maximum: int
 ): LinuxProcessResult {
     command.outputPath = file.text
-    val status = command.run()
-    if (status != 0) return LinuxProcessResult(status, "")
+    val status = bootstrapPackageRunLimitedGit(command).status
+    if (status != 0) return LinuxProcessResult(if (status == -1) 1 else status, "")
     if (file.info().size > maximum) return LinuxProcessResult(-1, "")
     val read = file.readTextResult()
     LinuxProcessResult(if (read.succeeded) 0 else 1, read.text)
 }
 
 fun bootstrapPackageLookupManifest(repoDir: string, revision: string): LinuxProcessResult {
+    // The size first: a manifest over 64 KiB is refused before a byte of it is written (a partial clone fetches the blob for either).
+    val sized = bootstrapPackageLookupGit(repoDir)
+    sized.argument("cat-file")
+    sized.argument("-s")
+    sized.argument("$revision:abla.toml")
+    sized.errorPath = "/dev/null"
+    val size = bootstrapPackageRunLimitedGit(sized)
+    if (size.status != 0) return LinuxProcessResult(1, "")
+    val bytes = bootstrapPackageTrim(size.output).parseInt() ?? -1
+    if (bytes < 0) return LinuxProcessResult(1, "")
+    if (bytes > 65536) return LinuxProcessResult(-1, "")
     val command = bootstrapPackageLookupGit(repoDir)
     command.argument("cat-file")
     command.argument("blob")
