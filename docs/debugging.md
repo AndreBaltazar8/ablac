@@ -393,7 +393,9 @@ inside the code that filled it.
 ABLA_GC_POISON=1 ABLA_GC_GROWTH=1048576 build/app
 ```
 
-## valgrind, rr and perf (Linux)
+## valgrind, rr, perf and heaptrack (Linux)
+
+### Valgrind
 
 A program's heap is invisible to valgrind's memcheck by default: the runtime
 takes its memory from the system, not from a malloc valgrind replaces, so
@@ -425,12 +427,71 @@ plain build next to a valgrind one shares no prebuilt runtime object.
 `tools/valgrind.supp` is where a runtime report that cannot be avoided would
 go, with its reason. There is none.
 
-A development build records and replays under rr as it is: `rr record ./app`,
-then `rr replay` gives gdb with breakpoints, source lines, backtraces and
-reverse execution (`reverse-next`, `reverse-continue`). Every function of a
-build with debug information keeps a frame pointer, so
-`perf record --call-graph fp ./app` gives whole stacks, named from
-`abla_start` down to the runtime function sampled.
+### rr record and replay on x86-64
+
+Build a native executable and run rr from the source directory so GDB can
+resolve the relative DWARF paths. The same executable that runs directly
+also runs under rr, including Abla's libc-free startup and raw Linux syscalls.
+
+```sh
+ablac build app.ab -o app --fast
+rr record -o app.trace ./app
+rr replay app.trace
+```
+
+In the replay debugger, set a breakpoint such as `break app.main`, then use
+`continue` and `bt` to inspect the recorded stack. Use `reverse-next` to step
+back a source line, or `reverse-continue` to find an earlier breakpoint hit.
+`rr replay -a app.trace` replays the trace without a debugger.
+rr needs supported CPU counters and permission to use them. If recording
+fails before the program starts, check whether rr can record a system
+utility on the same machine. On a hybrid Intel system that reports zero
+branch events on an efficiency core, pass `rr record --bind-to-cpu=N` with
+the number of a performance core. Linux lists those CPUs in
+`/sys/bus/event_source/devices/cpu_core/cpus`.
+[rr system requirements](https://github.com/rr-debugger/rr/wiki/Will-rr-work-on-my-system)
+
+### CPU profiling with perf
+
+Use a debug build (`--fast` or `-g`) and keep the executable with its
+symbols. A user-space event records application and runtime call stacks
+through their frame pointers. Give the program enough work for samples
+to reach the functions you want to measure.
+
+```sh
+ablac build app.ab -o app --fast
+perf record -e cpu-clock:u --call-graph fp -- ./app
+perf report --stdio
+perf script
+```
+
+The report groups samples by symbol. `perf script` shows individual
+stacks with module-qualified names such as `app.update`. Keep the matching
+executable available when reading the capture later. If a native library
+omits frame pointers but provides unwind tables, record with
+`--call-graph dwarf`. Use `perf script -F +srcline` to include source lines.
+[perf record reference](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-record.txt)
+
+### Allocation profiling with heaptrack
+
+For a dynamically linked Linux program that calls a C allocator, build
+with debug information and run heaptrack on the executable. Pass the
+capture path printed by heaptrack to `heaptrack_print` to see the allocation
+stacks with Abla function names and source lines.
+
+```sh
+ablac build app.ab -o app --fast
+heaptrack --record-only ./app
+heaptrack_print -f CAPTURE
+```
+
+On x86-64 Linux, the Abla runtime manages its heap through raw syscalls.
+Heaptrack's allocator hooks record C allocations, such as an explicit
+`malloc` call in foreign code. A libc-free executable has no dynamic loader
+to install those hooks. Use the valgrind build above for Abla-managed
+object allocations, or [collector tracing](#collector-trace-abla_gc_trace1)
+for live bytes and collection costs.
+[Heaptrack allocator API](https://github.com/KDE/heaptrack/blob/master/src/track/heaptrack_api.h)
 
 ## Cost
 
