@@ -11,10 +11,14 @@ import "abla/sys/linux/process"
 resource class TlsWebSocketConnection(
     val stream: TlsConnection,
     var buffered: string,
+    // The key the first version masked every frame with; each frame now takes a fresh one (frameMask). Kept for the constructor's shape.
     val maskingKey: string,
     var closed: bool,
     var readTimeoutMilliseconds: int = 0,
-    val writeTimeoutMilliseconds: int = 0
+    val writeTimeoutMilliseconds: int = 0,
+    // Random bytes for the masking keys of the frames to come (RFC 6455 5.3: a fresh key per frame), drawn 256 at a time, and how many are used.
+    var maskPool: string = "",
+    var maskUsed: int = 0
 )
 
 private fun webSocketTlsClientConfigured(
@@ -99,16 +103,34 @@ fun webSocketTlsClientWithCa(
     host, path, port, timeoutMilliseconds, caPath
 )
 
+/** A fresh, unpredictable masking key for one frame (RFC 6455 5.3: the key of each frame must not be predictable from the ones before), or "" when the
+ *  system gives no random bytes: then nothing is sent. */
+private fun TlsWebSocketConnection.frameMask(): string {
+    if (this.maskUsed + 4 > this.maskPool.size) {
+        val entropy = hostedSecureRandomBytes(256)
+        if (!entropy.succeeded || entropy.bytes.size != 256) return ""
+        this.maskPool = entropy.bytes
+        this.maskUsed = 0
+    }
+    val mask = this.maskPool.slice(this.maskUsed, this.maskUsed + 4)
+    this.maskUsed = this.maskUsed + 4
+    mask
+}
+
 /// Sends one masked text frame and returns false for invalid UTF-8, a closed connection or a failed write.
 fun TlsWebSocketConnection.sendText(payload: string): bool {
-    val frame = webSocketEncodeFrame(payload, 1, true, this.maskingKey)
+    val mask = this.frameMask()
+    if (mask == "") return false
+    val frame = webSocketEncodeFrame(payload, 1, true, mask)
     !this.closed && webSocketUtf8Valid(payload) &&
         this.stream.write(frame) == frame.size
 }
 
 /// Sends one masked binary frame and returns false if the connection is closed or the write fails.
 fun TlsWebSocketConnection.sendBinary(payload: string): bool {
-    val frame = webSocketEncodeFrame(payload, 2, true, this.maskingKey)
+    val mask = this.frameMask()
+    if (mask == "") return false
+    val frame = webSocketEncodeFrame(payload, 2, true, mask)
     !this.closed && this.stream.write(frame) == frame.size
 }
 
@@ -160,6 +182,12 @@ fun TlsWebSocketConnection.readFrame(
     }
     if (limited) this.stream.setTimeouts(0, this.writeTimeoutMilliseconds)
     if (eof) this.closed = true
+    // RFC 6455 5.1: a client fails the connection on a masked frame from the server.
+    if (decoded.succeeded() && decoded.frame.masked) {
+        this.stream.close()
+        this.closed = true
+        return WebSocketReadResult(decoded.frame, false, true, false, "a server frame must not be masked")
+    }
     WebSocketReadResult(
         decoded.frame, decoded.succeeded(), eof, timedOut, decoded.error
     )
@@ -169,10 +197,10 @@ fun TlsWebSocketConnection.readFrame(
 fun TlsWebSocketConnection.close(): bool {
     var result = this.closed
     if (!this.closed) {
-        val frame = webSocketEncodeFrame(
-            webSocketClosePayload(1000, ""), 8, true, this.maskingKey
-        )
-        result = this.stream.write(frame) == frame.size
+        // No close frame without a fresh masking key (a client never sends an unmasked frame); the connection is closed either way.
+        val mask = this.frameMask()
+        val frame = if (mask == "") "" else webSocketEncodeFrame(webSocketClosePayload(1000, ""), 8, true, mask)
+        result = frame != "" && this.stream.write(frame) == frame.size
         this.stream.close()
         this.closed = true
     }

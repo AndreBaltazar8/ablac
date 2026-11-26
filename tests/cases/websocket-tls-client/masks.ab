@@ -1,0 +1,91 @@
+import "abla/websocket"
+import "abla/websocket/tls"
+import "abla/tls/pure"
+import "abla/http"
+import "abla/io"
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+
+// The TLS WebSocket client's frames (#1139 area 4, round 7; tools/test-websocket-tls-client.sh), against a raw server in a forked child that
+// reads what the client writes byte for byte:
+//   - every frame the client sends has a masking key of its own (RFC 6455 5.3): the server reads three text frames and reports whether their
+//     keys differ (the client used one key for the whole connection before);
+//   - a masked frame from the server fails the connection (RFC 6455 5.1: the client took it before).
+
+val maskCertificate = "build/websocket-tls-client/certificate.pem"
+val maskPrivateKey = "build/websocket-tls-client/private-key.pem"
+
+// Reads from `tls` until `wanted` bytes are buffered after `buffered`, or the peer is gone.
+fun readAtLeast(var tls: TlsConnection, buffered: string, wanted: int): string {
+    var have = buffered
+    while (have.size < wanted) {
+        val chunk = tls.read(65536)
+        if (chunk == "") return have
+        have = "$have$chunk"
+    }
+    have
+}
+
+// The child: the handshake by hand, three client frames read raw (a small frame's key is its bytes 2 to 5), then a verdict and a masked frame.
+fun maskServe(var listener: TcpListener): void {
+    var accepted = listener.accept()
+    var tls = tlsServerUpgrade(accepted, maskCertificate, maskPrivateKey, 5000, 5000)
+    var head = ""
+    while (httpHeaderEnd(head) < 0) {
+        val chunk = tls.read(65536)
+        if (chunk == "") return
+        head = "$head$chunk"
+    }
+    val end = httpHeaderEnd(head)
+    val request = httpParseRequest(head.slice(0, end))
+    val accept = webSocketAccept(request.header("Sec-WebSocket-Key"))
+    tls.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: $accept\r\n\r\n")
+    // Three frames of one byte of payload, masked: 2 + 4 + 1 bytes each.
+    val frames = readAtLeast(tls, head.slice(end, head.size), 21)
+    var verdict = "short"
+    if (frames.size >= 21) {
+        val first = frames.slice(2, 6)
+        val second = frames.slice(9, 13)
+        val third = frames.slice(16, 20)
+        verdict = if (first != second && second != third && first != third) "distinct" else "repeated"
+    }
+    tls.write(webSocketEncodeFrame(verdict, 1, true))
+    tls.write(webSocketEncodeFrame("masked", 1, true, "wxyz"))
+    linuxSleep(2000)
+}
+
+fun fail(what: string): int {
+    println("websocket-tls-client masks: $what")
+    1
+}
+
+trusted fun main: int {
+    var listener = tcpListenIpv6(ipv6Loopback(0), 16, false)
+    val port = listener.localPort()
+    if (port <= 0) return fail("no listener")
+    val child = linuxSyscall0(57)
+    if (child == 0) {
+        maskServe(listener)
+        linuxSyscall1(60, 0)
+    }
+    var result = 0
+    var client = webSocketTlsClientWithCa("localhost", "/masks", maskCertificate, port, 30000)
+    if (client.closed) result = fail("no connection")
+    if (result == 0 && !(client.sendText("a") && client.sendText("b") && client.sendText("c"))) result = fail("sending")
+    if (result == 0) {
+        val verdict = client.readFrame(1024, 10000)
+        if (!verdict.available || verdict.frame.payload != "distinct") result = fail("the masking keys of three frames: '${verdict.frame.payload}' (${verdict.error})")
+    }
+    if (result == 0) {
+        val masked = client.readFrame(1024, 10000)
+        if (masked.available || !client.closed) result = fail("a masked frame from the server was taken: available=${masked.available} '${masked.frame.payload}'")
+    }
+    linuxSyscall2(62, child, 9)
+    linuxWaitProcess(child, false)
+    if (result == 0) {
+        println("websocket-tls-client masks: ok")
+        return 42
+    }
+    result
+}
