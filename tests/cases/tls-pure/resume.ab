@@ -1,7 +1,7 @@
 // TLS 1.3 session resumption (abla/tls/pure/resume): PSK with tickets, psk_dhe_ke, no 0-RTT, in one process with no sockets. A full handshake with a server that has
 // ticket keys leaves a ticket in the client's cache; the next connection resumes with it (no Certificate, `resumed()` on both sides, application data both ways,
 // a new ticket); a ticket is used once; tickets expire; a rotated key still opens what it sealed until they expire; a ticket of another server, another host
-// or one that was altered, gives a full handshake; a binder that does not verify is decrypt_error; a HelloRetryRequest keeps the PSK
+// or one that was altered, gives a full handshake; a flood of PSK identities (a hundred and fifty, the real one last) resumes at the real one; a binder that does not verify is decrypt_error; a HelloRetryRequest keeps the PSK
 // (the binder is recomputed); a server that asks for client certificates sends none; tickets and PSKs are wiped (the wipe rule of abla/crypto). Argument 0 is
 // the directory of tools/test-tls-pure-interop.sh. Prints "tls-pure resume ok".
 import "abla/io"
@@ -413,6 +413,61 @@ fun main: int {
             fail("hostile server variant $variant: failed ${hostile.failed()} resumed ${hostile.resumed()} alert ${if (hostileOut.size >= 7) hostileOut[6] else -1}")
         }
     }
+    // Hostile PSK identities (#1139 area 3 round 7): the server opens each identity (a key name it knows, then a ticket that is not authentic: skipped, no error), uses the first that opens, is young enough and
+    // fits, and checks the binder of that one only. A hundred and fifty identities with the real ticket last resume at its index; garbage only (even with the right key name) is a full handshake and no error;
+    // the real ticket twice resumes at the first; the real ticket then a forged one with the right key name resumes at the first.
+    val floodCache = tlsSessionCacheNew(now)
+    if (!fullHandshake(identity, store, keys, floodCache, "identity flood")) return 1
+    val real = floodCache.take("localhost", [], tlsX509Scope(store))
+    if (real == null) {
+        fail("no ticket for the identity flood")
+    } else {
+        val realHash = tlsSuiteHash(real.suite)
+        val realAge = ((clock - real.received) * 1000 + real.ageAdd) & 4294967295
+        val floodBase = tlsClientConfig("localhost", tlsX509Verifier(store, now), random)
+        val floodOffer = tlsClientShares(tlsDefaultGroups(), true, random)
+        for (variant in 0 until 4) {
+            val identities: array<TlsPskIdentity> = []
+            val binders: array<string> = []
+            val garbageCount = if (variant == 0) 149 else if (variant == 1) 150 else 0
+            for (g in 0 until garbageCount) {
+                // the real key name (the first 16 bytes of every ticket it seals), then bytes that do not open
+                identities.append(TlsPskIdentity(real.ticket.slice(0, 16) + random(80 + g % 7), random(4)[0] * 16777216))
+                binders.append("b".repeat(tlsHashLength(realHash)))
+            }
+            if (variant != 1) {
+                identities.append(TlsPskIdentity(real.ticket, realAge))
+                binders.append("")
+            }
+            if (variant == 2) {
+                identities.append(TlsPskIdentity(real.ticket, realAge))
+                binders.append("")
+            }
+            if (variant == 3) {
+                identities.append(TlsPskIdentity(real.ticket.slice(0, 16) + random(90), realAge))
+                binders.append("")
+            }
+            var message = tlsBuildClientHello(random(32), random(32), floodBase.suites, "localhost", floodOffer.groups, floodOffer.shares, floodBase.signatureAlgorithms, [], "",
+                [], false, identities, tlsHashLength(realHash))
+            val partial = message.slice(0, tlsBindersStart(message))
+            val good = tlsBinderValue(realHash, real.psk, partial)
+            val finalBinders: array<string> = []
+            for (b in 0 until binders.size) finalBinders.append(if (binders[b] == "") good else binders[b])
+            message = tlsReplaceBinders(message, finalBinders)
+            var floodServer = serverWith(identity, keys)
+            floodServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, message))
+            val floodOut = floodServer.takeOutput()
+            val floodHello = tlsParseServerHello(if (floodOut.size > 9) floodOut.slice(9, 5 + floodOut[3] * 256 + floodOut[4]) else "")
+            // 0: 149 garbage, then the real one (index 149); 1: garbage only (a full handshake); 2: the real one twice (the first); 3: the real one, then a forged one with the right key name (the first)
+            val want = if (variant == 0) 149 else if (variant == 1) -1 else 0
+            if (floodServer.failed() || !floodHello.ok || floodHello.pskSelected != want) {
+                fail("PSK identity variant $variant: selected ${floodHello.pskSelected} (want $want) failed ${floodServer.failed()} [${floodServer.error}]")
+            }
+        }
+        tlsWipe(real.ticket)
+        tlsWipe(real.psk)
+    }
+
     // A forged NewSessionTicket cannot make a ticket live longer than a week, whatever lifetime it claims; and a ticket that arrives with a zero lifetime or no ticket is kept by no one.
     val forgedCache = tlsSessionCacheNew(now)
     forgedCache.put("localhost", "", hostileSuite, hostileTicket, "p".repeat(32), 4294967295, 4294967295, tlsX509Scope(store))
