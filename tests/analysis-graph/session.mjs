@@ -1582,13 +1582,13 @@ async function unchangedInputs() {
 }
 
 const tests = { unchanged_inputs: unchangedInputs, logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
-async function checkedScalarBody(calls = false) {
+async function checkedScalarBody(calls = false, operators = false) {
     const head = 'fun answer(left: int, right: int): int = ';
     const initial = calls ? 'step(left) + right' : 'left + right';
     const rest = '\nfun later(): int = 7\n' + (calls
         ? 'fun step(n: int): int = n + 1\nfun shift(n: int): int = n * 2\n' : '');
     const main = 'import "./dep.ab"\nfun main: int = answer(2, 3) + later()\n';
-    const p = fixture(calls ? 'checked-calls' : 'checked-scalar', {
+    const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : 'checked-scalar', {
         'abla.toml': 'name = "checked-scalar"\nentry = "main.ab"\nvisibility = "imports"\n',
         'main.ab': main,
         'dep.ab': head + initial + rest,
@@ -1651,10 +1651,12 @@ async function checkedScalarBody(calls = false) {
             const n = (seed >>> 0) % 1000;
             const expression = calls
                 ? (i % 2 ? 'step(right + ' + n + ')' : 'shift(left) + ' + n)
+                : operators
+                ? (i % 2 ? 'left / (right + ' + n + ') % 7' : 'left << 2 | right ^ ' + n + ' & 255 >> 1 >>> 0')
                 : (i % 2 ? 'right + ' + n : 'left * ' + n + ' + right');
             await edit(expression, ++hits);
         }
-        await edit(calls ? 'step(true)' : 'true', hits);
+        await edit(calls ? 'step(true)' : operators ? 'left / true' : 'true', hits);
         await edit(initial, hits);
         await edit(calls ? 'missing(left)' : 'left + missing', hits);
         await edit(calls ? 'step(right)' : 'right', hits);
@@ -1666,6 +1668,7 @@ async function checkedScalarBody(calls = false) {
 
 tests.checked_scalar = checkedScalarBody;
 tests.checked_calls = () => checkedScalarBody(true);
+tests.checked_operators = () => checkedScalarBody(false, true);
 
 tests.checked_interface = async () => {
     const base = 'fun interfaceSample(): int = 2+2\n';
