@@ -22,9 +22,8 @@ compiler=$1
 if [[ $compiler != /* ]]; then compiler=$project_root/$compiler; fi
 output=$2
 entry=${3:-src/orc_main.ab}
-# A compiler linked outside this shell (the pinned one) doesn't say where its
-# OpenSSL is. A copy says so: LD_LIBRARY_PATH would also reach the tools it starts,
-# which a host's own may not survive.
+# Older compilers may need a different OpenSSL or LLVM path. Patch a copy so the
+# library paths apply to that compiler alone and are kept out of its child tools.
 if [[ -n ${ABLA_LINUX_OPENSSL_LIB:-} ]] && ! "$compiler" --version >/dev/null 2>&1; then
     mkdir -p "$project_root/build"
     located_compiler=$(mktemp "$project_root/build/.bootstrap-located.XXXXXX")

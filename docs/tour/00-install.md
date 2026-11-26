@@ -9,8 +9,8 @@ and tools. A standalone compiler binary and a complete toolchain archive
 serve different purposes; the standalone file is not an installer.
 
 On Linux, the archive is statically linked: it needs no C library or LLVM on the
-host ([installation notes](../../README.md)). On macOS, follow those notes for
-the matching Homebrew LLVM, LLD and OpenSSL dependencies. In GitHub Actions,
+host ([installation notes](../../README.md)). Current macOS archives bundle
+the patched LLVM and LLD. In GitHub Actions,
 the README also shows the checksum-verifying `setup-abla` action. Keep the
 compiler and its bundled stdlib together.
 

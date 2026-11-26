@@ -8,7 +8,6 @@
 # abla/unsafe, abla/runtime and abla/sys) with an int or a pointer parameter, and compares the list with tools/trusted-address-review.tsv, which classes each:
 #   a  not an address: a count, a flag, an offset the callee bounds, a descriptor, an index the host validates (the reason is in the table);
 #   c  an address with no safe alternative, a named exception (none now: the bignum engine moved to bignum/core.ab behind BigModulus and BigNumber).
-#      (The hosted TLS handle calls are class a: the layer keeps a table of its live handles and refuses any other.)
 #   b  (the table keeps them for the record) an address with a safe alternative: must NOT be public.
 # A new public function that takes an int or a pointer fails until it is added to the table with its class; an (a) or (c) row whose function is gone fails
 # (drop the row); a (b) row that is public again fails.

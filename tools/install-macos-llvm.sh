@@ -48,8 +48,8 @@ done
 # by the native test drivers, then give later CI steps that SDK by default.
 sdk=$(xcrun --sdk macosx --show-sdk-path)
 printf '#include <dlfcn.h>\n' | SDKROOT="$sdk" "$prefix/bin/clang" -x c -fsyntax-only -
-# OpenSSL and Binaryen keep their existing Homebrew installation path. LLVM
-# itself always comes from the immutable archive above, on both Mac hosts.
+# Install the OpenSSL test CLI and Binaryen through Homebrew. Both Mac hosts
+# use the pinned LLVM archive above.
 export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
 export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
 for formula in openssl@3 binaryen; do

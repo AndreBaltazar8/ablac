@@ -119,8 +119,8 @@ need a different setup.
 
 - `host-runtime.ab` reads `tests/cases/bootstrap/value.ab` relative to
   the repository root. All three images return 42 from that directory.
-- `network-advanced.ab` used OpenSSL in this survey. The native image linked shared
-  libraries and the cross links lacked target `libssl` and `libcrypto`.
+- `network-advanced.ab` used OpenSSL in the original survey and lacked cross-target libraries.
+  It now uses pure TLS and cross-builds without shared libraries.
 - `unsafe-boundary.ab` calls `dlsym`. The native image links a C library
   and the libc-free cross links have no definition for that symbol.
 - `https-loopback.ab` starts its TLS server by executing
@@ -135,9 +135,9 @@ failures. Its cross-link exceptions are recorded separately.
 
 #### Every module program under QEMU (#1208)
 
-Of the 553 programs in `tests/cases/modules`, 349 build for x86-64 (the others are the negative cases, which are expected compile
-failures, and programs that need a manifest or flags: `nobuild` lines of the allowlist). 338 of those link static for AArch64 Linux and for
-RISC-V 64 Linux; the link check above builds each of them. The same two CI jobs now also run every one of the 338 under QEMU, next to its
+In the original survey, 349 of the 553 programs in `tests/cases/modules` built for x86-64 (the others were negative cases, which are expected compile
+failures, and programs that need a manifest or flags: `nobuild` lines of the allowlist). Of those, 338 linked statically for AArch64 Linux
+and RISC-V 64 Linux. The same two CI jobs run every statically linked module program under QEMU, next to its
 x86-64 `--fast` build, and compare standard output and exit status ([tools/test-linux-parity.sh](../tools/test-linux-parity.sh), surveyed
 by [tools/survey-linux-parity.sh](../tools/survey-linux-parity.sh); each native program is run twice, so a program whose own output
 varies is named instead of failing the comparison). Result on the first full run, both targets alike: 335 programs print and exit exactly
@@ -146,11 +146,11 @@ per target (user time 5.5 minutes).
 
 The groups that keep a module program from matching, each one named in a list that may only shrink:
 
-- Does not link static (11 programs, `nobuild-a64` and `nobuild-rv64` in the
+- Does not link static (`nobuild-a64` and `nobuild-rv64` in the
   [allowlist](../tools/libc-free-programs-allowlist.txt)): `bootstrap-llvm`, `conformance-ir-cache`, `lowered-ir-cache`,
   `native-function-address`, `stable-native-symbols` and `xtensa-interrupt-handler` import `src/` and so link libLLVM, which has no
-  AArch64 or RISC-V 64 build in the pinned shell (the compiler itself is built on static archives instead, #806 step C); `tls` and
-  `network-advanced` use OpenSSL; `import-alias-externs` and `unsafe-boundary` name C functions (`sin`, `dlsym`);
+  AArch64 or RISC-V 64 build in the pinned shell (the compiler itself is built on static archives instead, #806 step C);
+  `import-alias-externs` and `unsafe-boundary` name C functions (`sin`, `dlsym`);
   `compile-time-recursion-deep` runs out of the x86-64 compiler's own stack when building.
 - Differs by design ([blockers](../tools/linux-parity-blockers.tsv)): `proc-self-exe` prints the size of its own file, which differs
   by architecture.

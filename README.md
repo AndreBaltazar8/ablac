@@ -89,7 +89,7 @@ static compiler, the standard library and runtime, compiler-rt's builtins and th
 standalone `ablac-x86_64-linux` release binary is the same statically linked compiler (a static-pie
 executable whose self-build is a fixpoint, which the release checks) and the bootstrap compiler. It has no
 `dlopen`: compile-time `nativeLibraries` need the dynamic compiler, shipped as an opt-in asset (the only Linux compiler that can run them, and the release's stage 2 reproducibility proof):
-`ablac-dynamic-x86_64-linux` (it names a Nix-store dynamic loader and finds libLLVM, libssl and libcrypto
+`ablac-dynamic-x86_64-linux` (it names a Nix-store dynamic loader and finds libLLVM
 through Nix-store RUNPATH entries, so it runs only where those store paths exist, and is the byte-reproducible
 one) and as the `abla-toolchain-dynamic-x86_64-linux` archive. That archive bundles Abla's patched LLVM tools
 and needs glibc 2.35 or later (Ubuntu 22.04, Debian 12; RHEL 9 and its rebuilds work although their glibc is
@@ -102,12 +102,10 @@ See [Xtensa installation](docs/llvm-xtensa.md#explicit-installation). With the c
 objects (`--target-triple xtensa-esp-unknown-elf --emit object`); linking them, boot/vector assembly and flashing still
 need the ESP SDK ([what a release gives you](docs/llvm-xtensa.md#what-a-release-gives-you-and-what-it-does-not)).
 
-A macOS archive runs with
-Homebrew's, which must be the LLVM its compiler links, since the compiler reads
-`opt`'s bitcode back with its own libLLVM. From v0.2.16, install
-`brew install llvm@23 lld@23 openssl@3` (plus `binaryen` for Wasm), and
-`bin/ablac` puts `llvm@23` and `lld@23` first on PATH itself, whatever else PATH
-holds; `ABLA_LLVM` and `ABLA_LLD` name other prefixes of the same LLVM.
+Current macOS release archives bundle the patched LLVM and LLD used by the
+compiler. Use the included `bin/ablac` launcher so `opt` writes bitcode that the
+compiler's libLLVM can read. Older archives using Homebrew LLVM need
+`brew install llvm@23 lld@23`. For Wasm, install `binaryen`.
 
 ## Development
 
@@ -123,9 +121,11 @@ On a Mac, install Homebrew LLVM without enabling a blanket package
 upgrade, then build directly from the normal shell:
 
 ```sh
-HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@23 lld@23 openssl@3
+HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@23 lld@23
 make
 ```
+
+Install `openssl@3` as well when running the TLS interop tests.
 
 The macOS host supports Intel and Apple Silicon. `make` downloads the pinned
 bootstrap compiler, rebuilds the current Abla sources as a native Mach-O
@@ -147,9 +147,8 @@ ABLA_MACOS_SDK=/path/to/MacOSX.sdk \
   build/ablac src/orc_main.ab build/release/ablac
 ```
 
-The produced compiler binaries load Homebrew `llvm@23`; programs that import
-TLS additionally load Homebrew `openssl@3`. The helper creates only ignored
-files under `build/` and never modifies the SDK.
+The produced compiler binaries load Homebrew `llvm@23`. The helper creates
+ignored files under `build/` and leaves the SDK untouched.
 
 Run the ordinary test suite with:
 

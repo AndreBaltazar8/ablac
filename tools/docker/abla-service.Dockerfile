@@ -20,8 +20,8 @@
 # by the one before it, and the last builds the current sources. Every step
 # links LLVM_VERSION's libLLVM and runs with its tools. Stage 2 compiles the
 # service. The runtime stage carries only the binary plus the system libraries
-# it links: glibc, and OpenSSL when the program imports TLS, JWT, or the async
-# HTTPS client.
+# needed by the binary. OpenSSL is bundled for services built from older
+# source trees or with explicit native OpenSSL bindings.
 
 FROM ubuntu:24.04 AS toolchain
 ARG LLVM_VERSION=23

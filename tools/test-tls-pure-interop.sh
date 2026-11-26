@@ -150,7 +150,7 @@ result=$("$root/tools/run-limited.sh" "$out/interop" "$port" "$out/rsa.pem" 4919
 stop_server
 runs12=$((runs12 + 1))
 echo "TLS 1.2: $runs12 handshakes (4 certificate types x 3 suites x 2 groups, P-384 ECDHE for Ed25519 and P-384 certificates, and RSA with PKCS#1 v1.5)"
-# The hosted-API-compatible surface (abla/tls/pure: tlsConnectWithCa, TlsConnection, tlsLastError ...).
+# The public TLS API (abla/tls/pure: tlsConnectWithCa, TlsConnection, tlsLastError ...).
 start_server ed25519 -www -groups X25519
 result=$("$root/tools/run-limited.sh" "$out/api" "$port" "$out/ed25519.pem" "$out/rsa.pem") || { echo "tls-pure api: $result" >&2; head -5 "$out/server.log" >&2; exit 1; }
 [[ $result == 'tls-pure api ok' ]] || { echo "tls-pure api: $result" >&2; exit 1; }

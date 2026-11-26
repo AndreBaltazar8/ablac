@@ -12,7 +12,7 @@ openssl pkcs12 -export -inkey "$out/key.pem" -in "$out/cert.pem" \
     -passout pass:test -out "$out/identity.p12" 2>/dev/null
 # The peer is an Abla program over a raw TCP socket (no TLS library, no shared code with
 # the client): it never completes a handshake, stalling or trickling bytes. The client
-# under test is the hosted (OpenSSL) HTTPS client of abla/http/tls with a 250 ms deadline.
+# under test is abla/http/tls with an explicit handshake deadline.
 "$compiler" build "$root/tests/cases/http-tls-deadline-peer/peer.ab" -o "$out/peer" --fast --no-cache
 peer_pid=
 trap 'if [[ -n $peer_pid ]]; then kill "$peer_pid" 2>/dev/null || true; wait "$peer_pid" 2>/dev/null || true; fi' EXIT

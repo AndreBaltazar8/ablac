@@ -24,7 +24,7 @@ if ! grep -v "^#" "$allow" | sort -cu; then
     exit 1
 fi
 # Comment lines ("#") are documentation; the rest is compared. A line ending in " ?" is one whose import a
-# change is expected to remove but that could not be checked before a Mac run (the compiler, OpenSSL programs):
+# change is expected to remove but that could not be checked before a Mac run:
 # allowed while it is imported, reported (not a failure) once it is not, so that its next change removes it.
 mkdir -p build
 grep -v "^#" "$allow" | sed 's/ ?$//' | sort -u > build/libsystem-imports-allow.txt

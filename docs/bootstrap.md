@@ -65,10 +65,10 @@ tools/build-self-hosted-current.sh published build/rebuilt
 cmp published build/rebuilt
 ```
 
-(`chmod +x` it first.) Since v0.2.28 release CI uses the default shell, whose LLVM and OpenSSL store paths
-are in the binary's RUNPATH, so `ABLA_NIX_XTENSA=0` or an edit to `shell.nix` changes those
-bytes and nothing else (up to v0.2.77 the shell's own lib directory was in the RUNPATH too, so the
-rebuild differed in that path and the build id; `shell.nix` now keeps it out). Releases up to v0.2.27 were built without Xtensa and cut the module
+(`chmod +x` it first.) Since v0.2.28 release CI uses the default shell. Its LLVM
+store path is in the binary's RUNPATH, so `ABLA_NIX_XTENSA=0` or a change to the pinned LLVM
+can change that path and the build ID. Historical releases also recorded the shell's OpenSSL path and, up to
+v0.2.74, its own lib directory. Releases up to v0.2.27 were built without Xtensa and cut the module
 by the machine's processors, so they match only with `ABLA_NIX_XTENSA=0 ABLA_NATIVE_JOBS=4`.
 `tools/test-reproducible-elsewhere.sh` guards this; `--self` is the release's gate.
 

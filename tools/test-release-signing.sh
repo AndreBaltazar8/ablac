@@ -114,7 +114,7 @@ if command -v git >/dev/null 2>&1; then
     grep -q '"fileName": "abla-toolchain-x86_64-windows.zip"' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the Windows zip is not in the SBOM'
     grep -q 'SPDXRef-llvm-windows-x86-64' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM has no Windows LLVM package'
     grep -q 'SPDXRef-nix' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM has no Nix installer package'
-    # OpenSSL and the trust roots: the version is the one in the dynamic asset's rpath (NOASSERTION without one), and the roots are declared as not shipped.
+    # Trust roots are declared as external, and the SBOM omits the former hosted TLS dependency.
     grep -q '"SPDXID": "SPDXRef-trust-roots".*not shipped' "$work/rel/ablac-9.9.9.spdx.json" || fail 'the SBOM does not say the trust roots are not shipped'
     ! grep -q SPDXRef-openssl "$work/rel/ablac-9.9.9.spdx.json" || fail "the SBOM still claims an OpenSSL runtime dependency"
     rm -f "$work/rel/ablac-dynamic-x86_64-linux" "$work/rel/SHA256SUMS" "$work/rel/SHA256SUMS.sig"
