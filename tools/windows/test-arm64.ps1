@@ -46,7 +46,11 @@ function Invoke-Program {
         $stderr = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($Seconds * 1000)) {
             $process.Kill($true)
-            throw "$label timed out"
+            $null = $process.WaitForExit(10000)
+            # What it printed until it was stopped (a guard program's last "phase:" line on standard error names the phase that hung).
+            $partialOut = if ($stdout.Wait(5000)) { $stdout.Result } else { '' }
+            $partialErr = if ($stderr.Wait(5000)) { $stderr.Result } else { '' }
+            throw "$label timed out. stdout: $partialOut stderr: $partialErr"
         }
         $out = $stdout.GetAwaiter().GetResult().Replace("`r`n", "`n")
         $err = $stderr.GetAwaiter().GetResult().Replace("`r`n", "`n")
