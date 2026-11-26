@@ -14,6 +14,13 @@ unset RUN_TESTS_FILTER RUN_TESTS_EXCLUDE RUN_TESTS_COMMANDS
 mkdir -p build   # run-tests.sh stamps its compiler cache there
 work=$(mktemp -d "${TMPDIR:-/tmp}/test-shards.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
+# The libc-free check is a separate suite recipe for each x86 part.
+LIBC_FREE_TARGETS=x86 tools/test-libc-free-programs.sh "$compiler" --list > "$work/libc-free.whole"
+for part in 1 2 3; do
+    LIBC_FREE_TARGETS=x86 tools/test-libc-free-programs.sh "$compiler" --part "$part/3" --list
+done | sort > "$work/libc-free.parts"
+sort "$work/libc-free.whole" > "$work/libc-free.expected"
+diff -u "$work/libc-free.expected" "$work/libc-free.parts"
 list() { RUN_TESTS_LIST=1 RUN_TESTS_OUTPUT="$work/$1" "$root/tools/run-tests.sh" "$compiler" "${@:2}" | sort -n; }
 export RUN_TESTS_SHARD=
 whole=$(RUN_TESTS_SHARD='' list whole)

@@ -130,9 +130,9 @@ while IFS= read -r command; do
     fi
 done <"$output/commands.txt"
 
-# RUN_TESTS_SHARD=i/n runs shard i of n (1-based): every selected command is in exactly one shard. The commands are dealt out longest
-# first to the shard with the least cost so far (the cost is a command's CPU seconds in the history, else its wall seconds, else 20), so the shards
-# are about as long as each other; test-self-hosted.sh and the commands that wait for it are one unit (they share its build directories).
+# RUN_TESTS_SHARD=i/n runs shard i of n (1-based). The largest wall-time commands start on separate shards. The remaining units
+# are dealt out by CPU seconds, else wall seconds, else 20, largest first to the cheapest shard so far. test-self-hosted.sh and
+# the commands that wait for it are one unit (they share its build directories).
 # The same history file (tools/test-times.tsv, or the last run's) makes the same split on every machine of a CI matrix: a run's history must not
 # decide it, so a sharded run reads tools/test-times.tsv only. tools/test-shards.sh checks the split.
 shard_index=1
@@ -151,14 +151,19 @@ shard_filter() { # "n<TAB>command<TAB>group" lines in, the lines of this shard o
         BEGIN {
             while ((getline line < history) > 0) {
                 split(line, field, "\t")
-                if (field[3] ~ /^[0-9.]+$/) cost[key(field[4])] = (field[5] + 0 > 0 ? field[5] + 0 : field[3] + 0)
+                if (field[3] ~ /^[0-9.]+$/) {
+                    k = key(field[4]); wall[k] = field[3] + 0
+                    cost[k] = (field[5] + 0 > 0 ? field[5] + 0 : wall[k])
+                }
             }
         }
         {
             lines++; number[lines] = $1; text[lines] = $0
-            c = (key($2) in cost ? cost[key($2)] : 20)
-            if ($3 == 1) { unit[lines] = 0; unitcost[0] += c; if (!(0 in first)) first[0] = lines }
-            else { unit[lines] = lines; unitcost[lines] = c; first[lines] = lines }
+            k = key($2); u = ($3 == 1 ? 0 : lines)
+            unit[lines] = u; unitcost[u] += (k in cost ? cost[k] : 20)
+            w = (k in wall ? wall[k] : 20)
+            if (w > unitwall[u]) unitwall[u] = w
+            if (!(u in first)) first[u] = lines
         }
         END {
             # The units by cost, longest first (ties: the earlier command).
@@ -168,7 +173,19 @@ shard_filter() { # "n<TAB>command<TAB>group" lines in, the lines of this shard o
                 if (unitcost[b] > unitcost[a] || (unitcost[b] == unitcost[a] && first[b] < first[a])) { order[i] = b; order[j] = a }
             }
             for (s = 1; s <= count; s++) load[s] = 0
+            # Keep the longest indivisible commands apart before balancing CPU work.
+            for (s = 1; s <= count && s <= units; s++) {
+                leader = -1
+                for (i = 1; i <= units; i++) {
+                    u = order[i]
+                    if (u in shard) continue
+                    if (leader < 0 || unitwall[u] > unitwall[leader] ||
+                        (unitwall[u] == unitwall[leader] && first[u] < first[leader])) leader = u
+                }
+                shard[leader] = s; load[s] = unitcost[leader]
+            }
             for (i = 1; i <= units; i++) {
+                if (order[i] in shard) continue
                 best = 1
                 for (s = 2; s <= count; s++) if (load[s] < load[best]) best = s
                 shard[order[i]] = best; load[best] += unitcost[order[i]]

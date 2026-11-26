@@ -44,8 +44,9 @@ expect_status 2 "$work/tools/soak-tests.sh" 1 '['
 # A focused parent must not shrink the shard check's whole-recipe universe.
 # Only listing runs here: none of the recipe's commands (or its compiler) execute.
 cp "$root/Makefile" "$work/Makefile"
-cp "$root/tools/test-shards.sh" "$root/tools/test-times.tsv" "$work/tools/"
-mkdir -p "$work/src" "$work/stdlib"
+cp "$root/tools/test-shards.sh" "$root/tools/test-times.tsv" "$root/tools/test-libc-free-programs.sh" "$work/tools/"
+mkdir -p "$work/src" "$work/stdlib" "$work/tests/cases/modules"
+touch "$work/tests/cases/modules/"{first,second,third,fourth}.ab
 expect_status 0 env RUN_TESTS_FILTER='no-such-command' RUN_TESTS_EXCLUDE='.*' \
     RUN_TESTS_COMMANDS="$work/no-such-recipe" "$work/tools/test-shards.sh" build/ablac
 # A bare compiler has no .bin companion: keep its cache between identical runs,

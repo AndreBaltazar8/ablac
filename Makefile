@@ -107,7 +107,9 @@ test-serial: ablac
 	tools/test-shell-wait-guard.sh
 	tools/test-run-limited.sh
 	tools/test-libc-imports.sh $(COMPILER)
-	LIBC_FREE_TARGETS=x86 tools/test-libc-free-programs.sh $(COMPILER)
+	LIBC_FREE_TARGETS=x86 tools/test-libc-free-programs.sh $(COMPILER) --part 1/3
+	LIBC_FREE_TARGETS=x86 tools/test-libc-free-programs.sh $(COMPILER) --part 2/3
+	LIBC_FREE_TARGETS=x86 tools/test-libc-free-programs.sh $(COMPILER) --part 3/3
 	tools/test-compiler-libc-needs.sh $(COMPILER)
 	tools/test-libc-functions.sh $(COMPILER)
 	tools/test-alias-sweep.sh $(COMPILER)
