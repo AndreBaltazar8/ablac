@@ -21,6 +21,7 @@ import "abla/sys/linux/process"
 import "abla/sys/linux"
 import "analysis_budget.ab"
 import "analysis_idiom_hints.ab"
+import "import_edits.ab"
 
 // Compiler frontend globals are serial already. One process-local graph state
 // avoids handing an immutable field view to the mutable module-state API.
@@ -1422,6 +1423,71 @@ fun bootstrapAnalysisGraphBuildReferences(index: BootstrapAnalysisGraphQueryInde
         }
     }
     references
+}
+
+fun BootstrapAnalysisService.graphMissingImports(id: int, params: Json): string {
+    val uri = params.getString("uri")
+    if (!bootstrapAnalysisGraphUriValid(uri)) return bootstrapAnalysisError(id, "invalid_params",
+        "missing imports requires a local absolute file URI")
+    val index = this.graphQueryIndex
+    if (params.getString("revision") != "${this.revision}" || index == null || index.revision != this.revision) {
+        return bootstrapAnalysisError(id, "stale_revision", "analysis revision is stale")
+    }
+    val document = index.documents.get(bootstrapAnalysisGraphPath(uri))
+    if (document == null || index.snapshot.get("pending").size() != 0) {
+        return bootstrapAnalysisResponse(id, jsonNull())
+    }
+    var count = 0
+    val wanted: array<string> = []
+    val seen: Map<string, bool> = Map()
+    for (diagnostic in document.get("diagnostics").values) {
+        if (bootstrapAnalysisBudgetExpired()) return bootstrapAnalysisError(id, "analysis_incomplete", "request time budget exceeded")
+        val code = diagnostic.getString("code")
+        if (code != "E_NAME_NOT_IMPORTED" && code != "E_SEMANTIC") continue
+        val fixes = diagnostic.get("fixes").values
+        var line = ""
+        if (fixes.size == 1 && fixes[0].getString("kind") == "import") {
+            val edits = fixes[0].get("edits").values
+            if (edits.size == 1) line = edits[0].getString("newText").trim()
+        }
+        if (line == "" && code == "E_NAME_NOT_IMPORTED") {
+            for (help in diagnostic.get("help").values) {
+                val sample = help.asString()
+                if (sample.startsWith("add: import \"")) line = sample.slice(5, sample.size)
+            }
+            // The strict-import scan emits its help before the source
+            // location. Recover the same spelling from its declaring module.
+            val message = diagnostic.getString("message")
+            val from = "` is declared in "
+            val to = ", which this module doesn't import"
+            val start = message.indexOf(from)
+            if (line == "" && start >= 0 && message.endsWith(to)) {
+                val declaring = message.slice(start + from.size, message.size - to.size)
+                line = bootstrapStrictImportLine(bootstrapAnalysisGraphPath(uri), declaring)
+            }
+        }
+        // An unambiguous stdlib import can be attached to E_SEMANTIC.
+        // A name without an import choice must remain an explicit fix.
+        if (!line.startsWith("import \"") || !line.endsWith("\"") ||
+            line.contains("\n") || line.contains(".abla/packages/")) {
+            if (code == "E_NAME_NOT_IMPORTED") return bootstrapAnalysisResponse(id, jsonNull())
+            continue
+        }
+        count = count + 1
+        if (!seen.has(line)) {
+            seen.set(line, true)
+            wanted.append(line)
+        }
+    }
+    if (count < 2) return bootstrapAnalysisResponse(id, jsonNull())
+    val insertion = bootstrapFixImportsInsertion(document.getString("text"), wanted)
+    if (insertion.newText == "" || bootstrapAnalysisBudgetExpired()) return bootstrapAnalysisResponse(id, jsonNull())
+    val validation = this.validateEdit($json {
+        "baseRevision": "${this.revision}",
+        "edits": [{"uri": uri, "start": insertion.at, "end": insertion.at, "newText": insertion.newText}]
+    }, true)
+    if (!validation.get("valid").asBoolean()) return bootstrapAnalysisResponse(id, jsonNull())
+    bootstrapAnalysisResponse(id, $json {"offset": insertion.at, "newText": insertion.newText})
 }
 
 fun BootstrapAnalysisService.graphQuery(id: int, method: string, params: Json): string {
