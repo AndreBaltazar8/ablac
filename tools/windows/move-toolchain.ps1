@@ -15,12 +15,15 @@ function Test-SharingViolation([Exception]$errorCause) {
     return $false
 }
 
-# What Windows reports for a directory rename while a file below it is open: the release run 45735219041 showed that
-# [IO.Directory]::Move then throws UnauthorizedAccessException ("Access to the path ... is denied", ERROR_ACCESS_DENIED), not a sharing
-# violation. A real permission problem looks the same, so the retry is bounded and the final error names both paths and the cause.
+# What Windows reports for a directory rename while a file below it is open: not a sharing violation but ERROR_ACCESS_DENIED
+# ("Access to the path ... is denied"). .NET's directory move throws it as an IOException with HRESULT 0x80070005 (run 45739761059), other
+# calls as an UnauthorizedAccessException. A real permission problem looks the same, so the retry is bounded and the final error names both
+# paths and the cause.
 function Test-RetryableMoveFailure([Exception]$errorCause) {
     for ($cause = $errorCause; $null -ne $cause; $cause = $cause.InnerException) {
         if ($cause -is [UnauthorizedAccessException]) { return $true }
+        # HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED).
+        if ($cause -is [IO.IOException] -and $cause.HResult -eq 0x80070005) { return $true }
     }
     return Test-SharingViolation $errorCause
 }

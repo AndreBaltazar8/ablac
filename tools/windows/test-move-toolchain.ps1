@@ -83,6 +83,18 @@ try {
     Check ($script:calls -eq 3) "denied: expected 3 attempts, got $($script:calls)"
     Check (Test-Path -LiteralPath (Join-Path $target 'bin\ablac.exe')) 'denied: bin\ablac.exe is not at the target'
 
+    # denied as .NET's directory move reports it: an IOException with HRESULT ERROR_ACCESS_DENIED (the held-file case on a Windows runner)
+    $source = New-Tree 'denied-io'; $target = Join-Path $temp 'relocated\denied-io target'
+    $script:calls = 0
+    Move-Toolchain $source $target {
+        param($from, $to)
+        $script:calls++
+        if ($script:calls -lt 3) { throw [IO.IOException]::new('Access to the path is denied.', [int]0x80070005) }
+        [IO.Directory]::Move($from, $to)
+    } $fast
+    Check ($script:calls -eq 3) "denied-io: expected 3 attempts, got $($script:calls)"
+    Check (Test-Path -LiteralPath (Join-Path $target 'bin\ablac.exe')) 'denied-io: bin\ablac.exe is not at the target'
+
     # denied for good: bounded, and the failure names both paths
     $source = New-Tree 'denied-stays'; $target = Join-Path $temp 'relocated\denied-stays target'
     $script:calls = 0
@@ -100,18 +112,25 @@ try {
     # real: Windows' own sharing violation on a held file
     if ($IsWindows) {
         $source = New-Tree 'real'; $target = Join-Path $temp 'relocated\real target'
-        $held = [IO.File]::Open((Join-Path $source 'bin\ablac.exe'), 'Open', 'Read', 'Read')
+        $script:held = [IO.File]::Open((Join-Path $source 'bin\ablac.exe'), 'Open', 'Read', 'Read')
         $script:calls = 0
         $script:sawViolation = 0
         try {
             Move-Toolchain $source $target {
                 param($from, $to)
                 $script:calls++
-                if ($script:calls -eq 3 -and $null -ne $held) { $held.Dispose(); $script:held = $null }
+                if ($script:calls -eq 3 -and $null -ne $script:held) { $script:held.Dispose(); $script:held = $null }
                 try { [IO.Directory]::Move($from, $to) }
-                catch { if (Test-RetryableMoveFailure $_.Exception) { $script:sawViolation++; Write-Host "real: attempt $($script:calls) failed with $($_.Exception.GetType().Name): $($_.Exception.Message)" }; throw }
+                # `throw $_` keeps the exception chain; a bare `throw` wraps it in a ParentContainsErrorRecordException with no inner exception.
+                catch {
+                    $inner = $_.Exception
+                    while ($null -ne $inner.InnerException) { $inner = $inner.InnerException }
+                    Write-Host "real: attempt $($script:calls) failed with $($inner.GetType().FullName) HResult 0x$('{0:X8}' -f $inner.HResult): $($inner.Message)"
+                    if (Test-RetryableMoveFailure $_.Exception) { $script:sawViolation++ }
+                    throw $_
+                }
             } @(100, 100, 100, 100)
-        } finally { if ($null -ne $held) { $held.Dispose() } }
+        } finally { if ($null -ne $script:held) { $script:held.Dispose() } }
         Check ($script:sawViolation -ge 2) "real: Windows did not report a sharing violation for the held file ($($script:sawViolation))"
         Check (Test-Path -LiteralPath (Join-Path $target 'bin\ablac.exe')) 'real: bin\ablac.exe is not at the target'
         Check (!(Test-Path -LiteralPath $source)) 'real: the source is still there'
