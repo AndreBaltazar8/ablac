@@ -3060,6 +3060,24 @@ shape checks once, before its loop, that the loop's loads are inside
 no memory, since a buffer may start at any offset into device memory), then runs
 the loop with unchecked loads, and otherwise the same loop with checked ones.
 
+What makes a small kernel fast is the latency of its dependent memory rounds,
+measured on an RTX 4090 against CUDA C:
+
+- Issue independent loads before their first use, so they are in flight
+  together. A loop whose loads each wait on a check, or on the previous
+  iteration, waits a full memory latency per load. A loop with a constant trip
+  count (`while (k < 18)`) unrolls, so its loads go out together.
+- Keep helpers on the hot path branch-free: compute both candidates and choose
+  with an `if` value (a select) rather than returning early. An early return
+  becomes a real branch, and loads after it cannot be scheduled before it.
+- Decide a fast path from parameters and buffer sizes, not from a value the
+  kernel loaded. The GPU assembler must treat a branch on loaded data as
+  divergent, so subgroup operations under it (`kernelSubgroupSum`, for
+  one) become outlined calls.
+- An `int` is 64 bits, so index arithmetic costs two registers a value and
+  several instructions a multiply. Where registers limit how many groups fit
+  (1024 threads a group leave 64 a thread), `i32` loop counters help.
+
 ```abla fragment
 import "abla/kernel"
 
