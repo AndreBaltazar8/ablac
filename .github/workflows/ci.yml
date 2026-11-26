@@ -592,15 +592,16 @@ jobs:
   macos:
     if: ${{ !inputs.xtensa_compiler_memory_probe && !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
     name: ${{ matrix.name }}
-    # Both macOS architectures run on push: Apple Silicon the whole job, Intel the compiler stages and the host tests
-    # (the Darwin code paths differ by architecture: BSD system call asm, Mach-O routines). The self-rebuild, the iOS
-    # Simulator stay Apple Silicon only, and the import guard is informative on Intel (its list is the union of both).
+    # Apple Silicon runs the full job, including the self-rebuild and iOS Simulator.
+    # Intel's host and live tests run on separate runners, each using its own stage 2.
+    # In GA45 the live JIT test alone took 10 minutes of the 41-minute Intel job.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {runner: macos-15, name: macOS host and compiler fixed point, full: true}
-          - {runner: macos-15-intel, name: macOS host and compiler fixed point (Intel), full: false}
+          - {runner: macos-15, name: macOS host and compiler fixed point, full: true, tests: all, logs: arm64}
+          - {runner: macos-15-intel, name: macOS host and compiler fixed point (Intel), full: false, tests: host, logs: x86_64}
+          - {runner: macos-15-intel, name: macOS live compiler tests (Intel), full: false, tests: live, logs: x86_64-live}
     runs-on: ${{ matrix.runner }}
     # Intel took 28 min on 89e3a628 and passed 35 on 576a47ef (stage builds and host paths are slower there).
     # The last five green runs took 32 to 38 min (59f5309c 32, a1950bc6 38, 428aff92 35, 681f64fe 33, 5a01101e 36),
@@ -636,6 +637,7 @@ jobs:
             build/ci/bootstrap-ablac build/ci/ablac-stage1 \
             2>&1 | tee build/ci-logs/macos-stage1.log
       - name: Exercise the calls made by BSD system call, one by one (stage 1)
+        if: ${{ matrix.tests != 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-darwin-syscalls.sh build/ci/ablac-stage1 \
@@ -663,13 +665,14 @@ jobs:
           echo "stage 2 build exit status: $status"
           exit $status
       - name: Exercise the native macOS host paths
+        if: ${{ matrix.tests != 'live' }}
         run: |
           tools/test-macos-host.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-host.log
       # A crash's stack with file:line (atos): a -g program's from its debug map, a --backtrace one's (stripped of it)
       # from the <output>.dSYM its build wrote.
       - name: ablac symbolize (a -g program, and a --backtrace one's .dSYM)
-        if: always()
+        if: ${{ always() && matrix.tests != 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-symbolize.sh build/ci/ablac-stage2 \
@@ -677,38 +680,38 @@ jobs:
       # What only ever ran on Linux (#811), each a step of its own that runs whatever failed before it, so one failure
       # does not hide the other answers.
       - name: A dylib entered from threads it did not start (export enter/leave thunks, @hostImport)
-        if: always()
+        if: ${{ always() && matrix.tests != 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-foreign-threads.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-foreign-threads.log
       - name: "Threads stopped for a collection (stop-the-world: safe points, blocking system calls, a held thread)"
-        if: always()
+        if: ${{ always() && matrix.tests != 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-gc-threads.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-gc-threads.log
       - name: A thread's stack overflow on its own signal stack (Darwin sigaltstack, the stack guard)
-        if: always()
+        if: ${{ always() && matrix.tests != 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-runtime-checks.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-runtime-checks.log
       - name: A stop and a stack overflow on a thread a compile-time site starts
-        if: always()
+        if: ${{ always() && matrix.tests != 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-ct-stop-threads.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-ct-stop-threads.log
       - name: The compiler's emulated TLS for ablac run (100,000 JIT-compiled threads)
-        if: always()
+        if: ${{ always() && matrix.tests != 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-emutls.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-emutls.log
       # Live mode (`ablac run`, live by default on a Mac too, and `--watch`): both Macs passed it in run 44558971183.
       - name: A live run redefines its functions (ablac run, live by default; liveReload, the refusals)
-        if: always()
+        if: ${{ always() && matrix.tests != 'host' }}
         # The reload 20 times more: arm64 trapped in a new lambda's call until the registry forward passed its output
         # as sret (runs 44586994389 to 44654107874).
         env:
@@ -718,28 +721,28 @@ jobs:
           tools/test-live-jit.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-live-jit.log
       - name: A --watch run reloads on a save, keeps running after a broken one, restarts after a refused one
-        if: always()
+        if: ${{ always() && matrix.tests != 'host' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-live-watch.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-live-watch.log
       # `ablac test --watch` on a Mac: both Macs passed it in run 44856754457 (92d97ad8), so it blocks.
       - name: A test --watch run runs again when a file it reads changes, and not for another file
-        if: always()
+        if: ${{ always() && matrix.tests != 'host' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-test-watch.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-test-watch.log
       # `ablac repl` is a live run on a Mac too: both Macs passed it in run 44837861069, so it blocks.
       - name: A REPL session keeps its state from line to line, contains a panic and refuses a change it cannot take
-        if: always()
+        if: ${{ always() && matrix.tests != 'host' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-repl.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-repl.log
       # lldb reads a development build's variables (2026-11-21, new): informative until both Macs have passed it.
       - name: A debugger reads a development build's parameters, locals and their Abla types (lldb)
-        if: always()
+        if: ${{ always() && matrix.tests != 'host' }}
         continue-on-error: true
         run: |
           mkdir -p build/ci-logs
@@ -750,7 +753,7 @@ jobs:
       # refactor-session), repeated ten rounds (needs only bash, sed and the compiler; tools/test-analysis-service.sh runs it after its protocol
       # cases on Linux). Blocking on both Macs.
       - name: A long analyze --stdio session (abla-lsp's refactor requests) answers every request and exits 0
-        if: always()
+        if: ${{ always() && matrix.tests != 'host' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-analysis-refactor-session.sh build/ci/ablac-stage2 10 \
@@ -759,7 +762,7 @@ jobs:
       # and mutex imports it would catch returning were traced by tools/macos-import-origin.sh, now a manual tool: none
       # is imported since #826.
       - name: Check the libSystem import guard
-        if: always()
+        if: ${{ always() && matrix.tests != 'live' }}
         run: |
           tools/test-libsystem-imports.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-libsystem-imports.log
@@ -779,7 +782,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: macos-ci-logs-${{ matrix.full && 'arm64' || 'x86_64' }}
+          name: macos-ci-logs-${{ matrix.logs }}
           path: |
             build/ci-logs/
             build/probe/
