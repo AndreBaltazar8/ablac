@@ -1,0 +1,74 @@
+// HTTP/1.1 requests for a streaming route of the HTTPS event server (abla/http/event/tls, here without TLS) are started from their head, before the
+// framing reads the body; the head's request line is checked as for any other request (#1139 area 4, round 6), and an absolute-form target is
+// routed by its path with its authority as the host (RFC 9112 3.2.2):
+//   - `GET /up x HTTP/1.1` (a space in the target; a front end that splits at the last space reads another path) and a target with userinfo get a
+//     400 and never reach the handler (the streaming route took them before: the line was only read for its HTTP/1.x ending);
+//   - `GET http://good.example/up` with another Host field reaches the handler as /up with Host good.example;
+//   - a plain `GET /up` reaches it.
+// One program, server and client in one thread over loopback. Prints "http-event stream-line ok".
+import "abla/io"
+import "abla/text"
+import "abla/net"
+import "abla/http"
+import "abla/http/event/tls"
+
+var seenPath = "-"
+var seenHost = "-"
+
+class Recorder : HttpStreamHandler {
+    fun onRequest(exchange: HttpStreamExchange): HttpStreamStep {
+        seenPath = exchange.path
+        for (h in exchange.headers) { if (h.name.lowercase() == "host") seenHost = h.value }
+        HttpStreamStep(respond = true, status = 200, headers = [HttpHeader("content-type", "text/plain")], length = 3, write = "ok\n", finish = true)
+    }
+    fun onData(exchange: HttpStreamExchange, chunk: string): HttpStreamStep = HttpStreamStep()
+    fun onEnd(exchange: HttpStreamExchange, trailers: array<HttpHeader>): HttpStreamStep = HttpStreamStep()
+    fun onWritable(exchange: HttpStreamExchange): HttpStreamStep = HttpStreamStep()
+    fun onAbort(exchange: HttpStreamExchange, reason: string): void {
+        return
+    }
+}
+
+fun answer(request: HttpRequest): HttpResponse = HttpResponse(200, [HttpHeader("Content-Type", "text/plain")], "plain\n")
+
+class Outcome(val status: string, val path: string, val host: string)
+
+fun exchange(request: string): Outcome {
+    seenPath = "-"
+    seenHost = "-"
+    val router = httpRouter()
+    router.get("/", answer)
+    val server = httpsEventServer(router, ipv4Loopback(0), null)
+    server.streamRoute("GET", "/up", Recorder())
+    var client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
+    client.setNonblocking()
+    client.write(request)
+    var answer = ""
+    for (k in 0 until 30) {
+        server.step(10)
+        answer = answer + client.readCompact(4096)
+    }
+    client.close()
+    val lineEnd = answer.indexOf("\r\n")
+    Outcome(if (lineEnd > 0) answer.slice(0, lineEnd) else "(nothing)", seenPath, seenHost)
+}
+
+var failures = 0
+
+fun expect(label: string, request: string, status: string, path: string, host: string): void {
+    val o = exchange(request)
+    if (!o.status.startsWith(status) || o.path != path || o.host != host) {
+        failures = failures + 1
+        println("FAIL $label: ${o.status}, handler saw path ${o.path} host ${o.host} (wanted $status, $path, $host)")
+    }
+    return
+}
+
+fun main: int {
+    expect("a plain request", "GET /up HTTP/1.1\r\nHost: a\r\n\r\n", "HTTP/1.1 200", "/up", "a")
+    expect("a space in the target", "GET /up x HTTP/1.1\r\nHost: a\r\n\r\n", "HTTP/1.1 400", "-", "-")
+    expect("an absolute-form target", "GET http://good.example/up HTTP/1.1\r\nHost: other.example\r\n\r\n", "HTTP/1.1 200", "/up", "good.example")
+    expect("an absolute-form target with userinfo", "GET http://u@good.example/up HTTP/1.1\r\nHost: a\r\n\r\n", "HTTP/1.1 400", "-", "-")
+    if (failures == 0) println("http-event stream-line ok")
+    if (failures == 0) 0 else 1
+}

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A request sent a few bytes at a time costs the HTTP event servers time in proportion to its size, not its square (#1139 area 4):
 # the plain server (tests/cases/http-event/drip.ab) and the HTTPS server, here without TLS (drip-https.ab); and the request, head and response deadlines
-# (deadlines.ab, deadlines-https.ab); and the server-wide budget of buffered request bytes, HTTP/1 and HTTP/2 (budget.ab).
+# (deadlines.ab, deadlines-https.ab); and the server-wide budget of buffered request bytes, HTTP/1 and HTTP/2 (budget.ab); and the request line of a streaming
+# route's head (stream-line.ab).
 # Usage: tools/test-http-event-drip.sh [compiler]
 set -euo pipefail
 compiler=${1:-build/ablac}
@@ -11,7 +12,7 @@ cd "$root"
 out=build/http-event-drip
 rm -rf "$out"
 mkdir -p "$out"
-for case in "drip:http-event drip ok" "drip-https:http-event-tls drip ok" "deadlines:http-event deadlines ok" "deadlines-https:http-event-tls deadlines ok" "budget:http-event budget ok"; do
+for case in "drip:http-event drip ok" "drip-https:http-event-tls drip ok" "deadlines:http-event deadlines ok" "deadlines-https:http-event-tls deadlines ok" "budget:http-event budget ok" "stream-line:http-event stream-line ok"; do
     name=${case%%:*} expected=${case#*:}
     "$compiler" build "tests/cases/http-event/$name.ab" -o "$out/$name" --no-cache
     result=$("$root/tools/run-limited.sh" "$out/$name") || { echo "http-event-drip: $name: $result" >&2; exit 1; }

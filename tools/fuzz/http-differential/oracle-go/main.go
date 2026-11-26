@@ -48,6 +48,15 @@ func main() {
 			if i := strings.IndexByte(path, '?'); i >= 0 {
 				path = path[:i]
 			}
+			// An absolute-form target is served by its path (RFC 9112 3.2.2), as Abla's servers do: the path is compared in origin form.
+			if i := strings.Index(path, "://"); i > 0 && !strings.HasPrefix(path, "/") {
+				rest := path[i+3:]
+				if j := strings.IndexByte(rest, '/'); j >= 0 {
+					path = rest[j:]
+				} else {
+					path = "/"
+				}
+			}
 			b := hex.EncodeToString(body)
 			if b == "" {
 				b = "-"

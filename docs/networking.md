@@ -751,7 +751,14 @@ header name that is not a token character (`Content-Length\x0b:`,
 `Content_Length:`). So is a request with more than one `Host` line or a `Host`
 value that has a space, a comma or a control byte in it (RFC 9112 3.2: the
 application and a proxy in front could read different hosts). A missing `Host`
-is allowed on purpose, which RFC 9112 does not allow for HTTP/1.1. Other
+is allowed on purpose, which RFC 9112 does not allow for HTTP/1.1. A request
+whose target is an absolute form (`GET http://example.com/p`, as a proxy may
+send it) is served as `/p` with `example.com` as its `Host`, whatever `Host`
+line it sent (RFC 9112 3.2.2; `httpRequestOriginForm`), so routes and a host
+check read what the proxy routed by; one whose scheme is not `http` or `https`,
+or whose authority is empty, has userinfo (`user@`) or is not a host, is
+answered `400`. The WebSocket servers read the requests they take (upgrades,
+and the plain HTTP requests of `abla/websocket/server`) by the same rules. Other
 repeated headers are not refused: `request.header(name)` returns the last line
 of that name and `request.headers` has all of them, so an application that
 reads a single-valued header such as `Authorization`, `Cookie` or `Content-Type`

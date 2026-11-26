@@ -1836,7 +1836,7 @@ fun httpReadRequestWithin(connection: TcpConnection, options: HttpServeOptions):
 private fun httpServeConnection(router: HttpRouter, connection: TcpConnection, options: HttpServeOptions): int {
     val read = httpReadRequestWithin(connection, options)
     if (read.timedOut) return -1
-    val request = httpRequestWithPeer(httpParseRequest(read.request), connection.descriptor)
+    val request = httpRequestOriginForm(httpRequestWithPeer(httpParseRequest(read.request), connection.descriptor))
     val response = router.dispatch(request)
     var rendered = response.render()
     if (request.method == "HEAD") rendered = response.renderHead()
@@ -1887,13 +1887,57 @@ fun serveHttpOnListener(router: HttpRouter, var listener: TcpListener): int = se
 /** The request line must be `method SP target SP HTTP/1.x` and nothing else: returns 1 for HTTP/1.1, 0 for HTTP/1.0
  *  and -1 for anything else, which is refused (a line that is not a request is never routed). The target is an origin
  *  form (`/p`), `*`, or an absolute form (`http://host/p`, which a proxy sends). The parser has already split the
- *  line, so this reads only where the version has to be: after the method, the path and the query. */
+ *  line, so this reads only where the version has to be: after the method, the path and the query. An absolute form must
+ *  be `http://` or `https://` with a non-empty authority that is a host (no userinfo, space, comma or control byte):
+ *  the servers then use that authority as the host and route by its path (`httpRequestOriginForm`, RFC 9112 3.2.2). */
 trusted fun httpRequestLineVersion(
     input: string, request: HttpRequest, headerEnd: int
-): int =
-    if (ablaCompileTimeNativeHost()) httpLineVersionNative(input, request, headerEnd)
-    else if (ablaAtCompileTime()) httpLineVersionChecked(input, request, headerEnd)
-    else httpLineVersionNative(input, request, headerEnd)
+): int {
+    val version = if (ablaCompileTimeNativeHost()) httpLineVersionNative(input, request, headerEnd)
+        else if (ablaAtCompileTime()) httpLineVersionChecked(input, request, headerEnd)
+        else httpLineVersionNative(input, request, headerEnd)
+    if (version >= 0 && !httpAbsoluteTargetValid(request.path)) -1 else version
+}
+
+// The authority of an absolute-form target (`scheme://authority/...`, the request's path before any query), or "" for any other form.
+private fun httpAbsoluteAuthority(path: string): string {
+    val start = path.indexOf("://")
+    if (path.size == 0 || path[0] == 47 || path[0] == 42 || start < 0) return ""
+    val rest = path.slice(start + 3, path.size)
+    val slash = rest.indexOf("/")
+    if (slash < 0) rest else rest.slice(0, slash)
+}
+
+// Whether a target that is not an origin form or `*` is an http or https absolute form whose authority is a host.
+private fun httpAbsoluteTargetValid(path: string): bool {
+    if (path.size == 0 || path[0] == 47 || path[0] == 42) return true
+    val start = path.indexOf("://")
+    if (start < 0) return false
+    val scheme = path.slice(0, start)
+    val authority = httpAbsoluteAuthority(path)
+    (httpAsciiEqualInsensitive(scheme, "http") || httpAsciiEqualInsensitive(scheme, "https")) && authority.size > 0 && authority.indexOf("@") < 0 && httpHostValueValid(authority)
+}
+
+/** RFC 9112 3.2.2: a request whose target is an absolute form (`http://host/p`) is served as `/p` with the target's
+ *  authority as its Host (any Host field it sent is replaced), so routes and a Host check see what a proxy routed by.
+ *  Any other request is returned as it is. Call it after `httpRequestLineVersion` accepted the line. */
+fun httpRequestOriginForm(request: HttpRequest): HttpRequest {
+    val authority = httpAbsoluteAuthority(request.path)
+    if (authority.size == 0) return request
+    val rest = request.path.slice(request.path.indexOf("://") + 3, request.path.size)
+    val slash = rest.indexOf("/")
+    val path = if (slash < 0) "/" else rest.slice(slash, rest.size)
+    val headers: array<HttpHeader> = []
+    var placed = false
+    for (header in request.headers) {
+        if (httpAsciiEqualInsensitive(header.name, "Host")) {
+            if (!placed) headers.append(HttpHeader(header.name, authority))
+            placed = true
+        } else headers.append(header)
+    }
+    if (!placed) headers.append(HttpHeader("Host", authority))
+    HttpRequest(request.method, path, request.query, headers, request.body, request.parameterNames, request.parameterValues, request.peerAddress)
+}
 
 private @inline trusted fun httpLineByte(data: int, index: int): int =
     ablaUnsafeLoadU8(nativePointerFromAddress(data + index))

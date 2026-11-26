@@ -10,7 +10,10 @@ const server = http.createServer({ maxHeaderSize: 65536, keepAliveTimeout: 5000,
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
-        const path = req.url.split("?")[0];
+        // An absolute-form target is served by its path (RFC 9112 3.2.2), as Abla's servers do: compared in origin form.
+        const target = req.url.split("?")[0];
+        const absolute = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\/]*(.*)$/.exec(target);
+        const path = absolute ? (absolute[1] || "/") : target;
         results[results.length - 1].push(`R:${req.method} ${path} ${Buffer.concat(chunks).toString("hex") || "-"}`);
         res.end("ok");
     });

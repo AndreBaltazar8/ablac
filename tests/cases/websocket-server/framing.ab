@@ -1,0 +1,108 @@
+// The WebSocket server (abla/websocket/server) answers plain HTTP requests too; it reads them as the HTTP servers do (#1139 area 4, round 6):
+//   - a line that is not a request, and repeated or conflicting Content-Length or Host fields, get a 400 and no HTTP event (it took the
+//     last Content-Length before: a proxy that read the first one would have seen another request in the body);
+//   - an absolute-form target (`GET http://host/p`) is served as `/p` with that host (RFC 9112 3.2.2), whatever Host field it sent;
+//   - a plain request still gives its HTTP event.
+// One program: the server and a client in one thread over loopback. Prints "websocket-server framing ok".
+import "abla/io"
+import "abla/text"
+import "abla/net"
+import "abla/http"
+import "abla/websocket/server"
+import "abla/websocket/event"
+
+class Outcome(val status: string, val path: string, val host: string, val body: string)
+
+// Sends `request` on a new connection; the response's status line and the HTTP event's path, Host and body ("-" when there was no event).
+fun exchange(request: string): Outcome {
+    val server = webSocketServer(ipv4Loopback(0))
+    if (server.listener.descriptor < 0) return Outcome("no listener", "-", "-", "-")
+    val client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
+    client.write(request)
+    var path = "-"
+    var host = "-"
+    var body = "-"
+    for (i in 0 until 6) {
+        server.step(20)
+        for (e in server.takeEvents()) {
+            val r = e.request
+            if (e.kind == 5 && r != null) {
+                path = r.path
+                host = r.header("Host")
+                body = r.body
+                server.respond(e.id, httpText("ok", 200))
+            }
+        }
+    }
+    client.setNonblocking()
+    val answer = client.readCompact(4096)
+    client.close()
+    val lineEnd = answer.indexOf("\r\n")
+    Outcome(if (lineEnd > 0) answer.slice(0, lineEnd) else "(nothing)", path, host, body)
+}
+
+var failures = 0
+
+fun refused(label: string, request: string): void {
+    val o = exchange(request)
+    if (o.status != "HTTP/1.1 400 Bad Request" || o.path != "-") {
+        failures = failures + 1
+        println("FAIL $label: ${o.status}, event path ${o.path} (wanted a 400 and no event)")
+    }
+    return
+}
+
+fun served(label: string, request: string, path: string, host: string, body: string): void {
+    val o = exchange(request)
+    if (o.path != path || o.host != host || o.body != body) {
+        failures = failures + 1
+        println("FAIL $label: ${o.status}, event path ${o.path} host ${o.host} body ${o.body} (wanted $path, $host, $body)")
+    }
+    return
+}
+
+
+fun echo(path: string, kind: string, payload: string): WebSocketEventReply = webSocketEventReply(payload, "text", true)
+
+// The event WebSocket server (abla/websocket/event): the status line it answers an upgrade request with.
+fun upgrade(request: string): string {
+    val router = webSocketEventRouter()
+    router.route("/ws", echo)
+    var server = webSocketEventServer(router, ipv4Loopback(0))
+    var client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
+    client.setNonblocking()
+    client.write(request)
+    var answer = ""
+    for (k in 0 until 20) {
+        server.step(10)
+        answer = answer + client.readCompact(4096)
+    }
+    client.close()
+    val lineEnd = answer.indexOf("\r\n")
+    if (lineEnd > 0) answer.slice(0, lineEnd) else "(nothing)"
+}
+
+val UPGRADE_FIELDS = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+
+fun upgraded(label: string, line: string, wanted: string): void {
+    val status = upgrade("$line\r\nHost: a\r\n$UPGRADE_FIELDS")
+    if (!status.startsWith(wanted)) {
+        failures = failures + 1
+        println("FAIL event server, $label: $status (wanted $wanted)")
+    }
+    return
+}
+fun main: int {
+    served("a plain request", "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello", "/p", "a", "hello")
+    refused("two Content-Length values", "POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nContent-Length: 5\r\n\r\nhello")
+    refused("two Host fields", "GET /p HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n")
+    refused("a request line with a space in the target", "GET /a b HTTP/1.1\r\nHost: a\r\n\r\n")
+    refused("a request line without a version", "GET /p\r\nHost: a\r\n\r\n")
+    served("an absolute-form target", "GET http://good.example/p HTTP/1.1\r\nHost: other.example\r\n\r\n", "/p", "good.example", "")
+    refused("an absolute-form target with userinfo", "GET http://u@good.example/p HTTP/1.1\r\nHost: good.example\r\n\r\n")
+    upgraded("an upgrade", "GET /ws HTTP/1.1", "HTTP/1.1 101")
+    upgraded("an upgrade with a space in the target", "GET /ws x HTTP/1.1", "HTTP/1.1 404")
+    upgraded("an absolute-form upgrade", "GET http://a/ws HTTP/1.1", "HTTP/1.1 101")
+    if (failures == 0) println("websocket-server framing ok")
+    if (failures == 0) 0 else 1
+}
