@@ -544,7 +544,8 @@ The package a module belongs to is decided by where the module is, never by a ma
 - The root's tree is its project: the nearest directory at or above the entry whose `abla.toml` has a
   `name`, else the repository root, else the working directory. This is the same project that bounds
   compile-time paths. A symbolically linked directory in the tree counts by its path, so it is part of
-  the tree. The standard library counts as the root's.
+  the tree. The standard library counts as the root's. Which files of the tree are the root's code is
+  decided by who imports them (below).
 - A locked package is its copy under the root's `.abla/packages/<name>/`, or its vendored tree
   `vendor/<name>/` with its revision marker.
 - Any other package copy gets nothing. That covers the package cache, another project's
@@ -553,6 +554,11 @@ The package a module belongs to is decided by where the module is, never by a ma
   belongs to whoever imports it. If the root's own code reaches it, it is the root's. Otherwise the
   first dependency whose code reaches it owns it, so a file a dependency reaches with `../../..` out of
   its copy is that dependency's and never the root's. A module nobody owns gets nothing.
+- A file of the root's tree is the root's when the root's own code imports it, directly or through other
+  modules of the root, wherever that import is. A file of the tree that only a dependency imports (by its
+  absolute path) belongs to the first dependency whose code reaches it, as a file outside the tree does: a
+  dependency can't make the root's code run by importing a file the root doesn't. A file of the tree that
+  nothing imports (the entry aside) stays the root's.
 
 Grants are per site. A dependency's `#` site that calls a function of a module the root owns is judged
 by the dependency's grants, because the effects the function reaches are counted at the site.

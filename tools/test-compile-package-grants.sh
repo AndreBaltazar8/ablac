@@ -14,6 +14,8 @@
 #   - path-import: a module the project imports by path from outside its tree is the project's own code, granted;
 #   - path-callee: a dependency's site calling into such a module is judged by the dependency's grants: refused;
 #   - path-escape: a file only a dependency reaches (a path out of its copy) is the dependency's: refused as undeclared;
+#   - tree-dependency, tree-root: a file of the root's own tree that only a dependency imports is the dependency's (refused); one the
+#     root's code imports too, through another root module and after the dependency, is the root's (granted);
 #   - jit-reader, jit-native: with the root's environment and trusted.native in the native tier's generation, a
 #     dependency's site that reads the environment or calls C is refused in analysis, before anything runs.
 #   - process, network: process.io and network are named-only too (#112 A): declared and authorized, still refused
@@ -214,6 +216,35 @@ application path-escape '"environment"' quiet-dep
 refused path-escape E_COMPILE_CAPABILITY_UNDECLARED
 grep -q "tool.ab' of dependency 'quiet-dep'" "$out/path-escape.log" ||
     fail "path-escape: the escaped module wasn't counted as the dependency's: $(grep -m2 error "$out/path-escape.log")"
+# The same for a file of the root's own tree that the root doesn't import (#1139 area 1, round 5): a dependency that imports it by its absolute
+# path makes it the dependency's code, not the root's, so its `#` sites don't run with the root's grants.
+tree_config() { # tree_config <case>: the root's tools/config.ab, which reads the probe variable at compile time
+    mkdir -p "$out/$1/application/tools"
+    cat > "$out/$1/application/tools/config.ab" <<'EOF'
+import "abla/compiler"
+#compilerGrant("environment")
+val configValue = #compilerEnvironment("ABLA_GRANT_PROBE")
+fun configText: string = configValue
+EOF
+}
+# tree-dependency: only the dependency imports it: refused as the dependency's, naming the file and the dependency.
+repository "$out/tree-dependency/quiet-dep" quiet-dep '' "import \"$out/tree-dependency/application/tools/config.ab\""$'\n'"fun dependencyValue: string = configText()"
+commit "$out/tree-dependency/quiet-dep" dependency
+application tree-dependency '"environment"' quiet-dep
+tree_config tree-dependency
+refused tree-dependency E_COMPILE_CAPABILITY_UNDECLARED
+grep -q "config.ab' is in the project's tree, but only dependency 'quiet-dep' imports it" "$out/tree-dependency.log" ||
+    fail "tree-dependency: the module wasn't counted as the dependency's: $(grep -m2 error "$out/tree-dependency.log")"
+# tree-root: the root imports it too, after the dependency (the dependency's import is resolved first) and through another of its modules: it
+# is the root's, granted.
+repository "$out/tree-root/quiet-dep" quiet-dep '' "import \"$out/tree-root/application/tools/config.ab\""$'\n'"fun dependencyValue: string = configText()"
+commit "$out/tree-root/quiet-dep" dependency
+application tree-root '"environment"' quiet-dep
+tree_config tree-root
+printf '%s\n' 'import "../tools/config.ab"' 'fun configured: string = configText()' > "$out/tree-root/application/src/settings.ab"
+printf '%s\n' 'import "abla/io"' 'import "provider.ab"' 'import dependencySource()' 'import "settings.ab"' \
+    "fun main { println(\"dependency value: '\${configured()}'\") }" > "$out/tree-root/application/src/main.ab"
+granted tree-root "$ABLA_GRANT_PROBE"
 # The native tier: the root grants itself environment and trusted.native, so the JIT's generation gets the compiler's
 # environment and the root's libraries (ct_jit.ab, bootstrapCtSetEnvironment, bootstrapCtNativeLibraries). A dependency
 # that requests nothing can't use either: its sites are refused in analysis (compile.effect-denied), before any runs,

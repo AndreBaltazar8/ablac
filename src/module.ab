@@ -1540,6 +1540,9 @@ fun bootstrapCompileEffectsOfNames(names: array<string>): int {
 
 // A module outside the root's tree that is no package's copy: whose it is depends on who imports it.
 val BOOTSTRAP_COMPILE_PACKAGE_PATH: string = "~"
+// A module of the root's own tree (not the entry, not the standard library) while the owners are worked out: the root's when the root's code
+// reaches it, else the first dependency's that does; one nothing reaches stays the root's.
+val BOOTSTRAP_COMPILE_PACKAGE_TREE: string = "~tree"
 
 /** The name of the directory right after `marker` in `absolute` (from `at`), or "". */
 fun bootstrapCompilePackageNameAfter(absolute: string, at: int, marker: string): string {
@@ -1647,7 +1650,10 @@ fun bootstrapManifestNamedCompileGrants(manifest: string): array<string> {
  * outside the root's tree and every package copy (BOOTSTRAP_COMPILE_PACKAGE_PATH) is its importer's: the root's when
  * the root's own code (the entry always) reaches it through such modules, else the first dependency's that does, else
  * no one's. So a sibling checkout the project imports by path is the project's own code, and a file a dependency
- * reaches with `../../..` out of its copy is that dependency's, never the root's, wherever it lies.
+ * reaches with `../../..` out of its copy is that dependency's, never the root's, wherever it lies. A module of the
+ * root's own tree (BOOTSTRAP_COMPILE_PACKAGE_TREE) is decided the same way, except that one nothing reaches stays the
+ * root's: a dependency that imports a file of the tree by its absolute path does not make the root's code run. The
+ * root's reach is walked first over the whole resolved graph, so the order of the imports doesn't matter.
  */
 fun bootstrapCompilePackageOwners(
     snapshots: array<BootstrapModuleSnapshot>,
@@ -1661,9 +1667,12 @@ fun bootstrapCompilePackageOwners(
     var index = 0
     for (snapshot in snapshots) {
         val located = bootstrapCompilePackageOf(rootDirectory, snapshot.path, locked)
-        val isEntry = located == BOOTSTRAP_COMPILE_PACKAGE_PATH &&
-            bootstrapUnusedImportAbsolute(snapshot.path) == entry
-        owners.append(if (isEntry) "" else located)
+        val entered = bootstrapUnusedImportAbsolute(snapshot.path) == entry
+        val isEntry = located == BOOTSTRAP_COMPILE_PACKAGE_PATH && entered
+        // A file of the root's tree is the root's only when the root's code imports it: a dependency that imports one by its absolute path does
+        // not make the root's code run (#1139 area 1, round 5).
+        val inTree = located == "" && !entered && !bootstrapStandardLibraryModuleSource(snapshot.path)
+        owners.append(if (isEntry) "" else if (inTree) BOOTSTRAP_COMPILE_PACKAGE_TREE else located)
         positions.set(snapshot.path, index)
         index = index + 1
     }
@@ -1673,7 +1682,8 @@ fun bootstrapCompilePackageOwners(
         index = 0
         while (index < owners.size) {
             val owner = owners[index]
-            if (owner != BOOTSTRAP_COMPILE_PACKAGE_PATH && owner != "?" && (owner == "") == rootPass) queue.append(index)
+            if (owner != BOOTSTRAP_COMPILE_PACKAGE_PATH && owner != BOOTSTRAP_COMPILE_PACKAGE_TREE && owner != "?" &&
+                (owner == "") == rootPass) queue.append(index)
             index = index + 1
         }
         var head = 0
@@ -1683,7 +1693,8 @@ fun bootstrapCompilePackageOwners(
             if (current >= importTargets.size) continue
             for (target in importTargets[current]) {
                 val position = positions.get(target)
-                if (position != null && owners[position] == BOOTSTRAP_COMPILE_PACKAGE_PATH) {
+                if (position != null && (owners[position] == BOOTSTRAP_COMPILE_PACKAGE_PATH ||
+                    owners[position] == BOOTSTRAP_COMPILE_PACKAGE_TREE)) {
                     owners[position] = owners[current]
                     queue.append(position)
                 }
@@ -1694,19 +1705,22 @@ fun bootstrapCompilePackageOwners(
     // anything, so the walk above never reached it. It is its source module's code: it takes that module's owner.
     index = 0
     while (index < owners.size) {
-        if (owners[index] == BOOTSTRAP_COMPILE_PACKAGE_PATH) {
+        if (owners[index] == BOOTSTRAP_COMPILE_PACKAGE_PATH || owners[index] == BOOTSTRAP_COMPILE_PACKAGE_TREE) {
             val path = snapshots[index].path
             val hash = path.indexOf("#")
             if (hash > 0) {
                 val source = positions.get(path.slice(0, hash))
-                if (source != null && owners[source] != BOOTSTRAP_COMPILE_PACKAGE_PATH) owners[index] = owners[source]
+                if (source != null && owners[source] != BOOTSTRAP_COMPILE_PACKAGE_PATH &&
+                    owners[source] != BOOTSTRAP_COMPILE_PACKAGE_TREE) owners[index] = owners[source]
             }
         }
         index = index + 1
     }
+    // A file of the root's tree that nothing reached stays the root's (as it was by location); an outside one nobody reached is no one's.
     index = 0
     while (index < owners.size) {
         if (owners[index] == BOOTSTRAP_COMPILE_PACKAGE_PATH) owners[index] = "?"
+        if (owners[index] == BOOTSTRAP_COMPILE_PACKAGE_TREE) owners[index] = ""
         index = index + 1
     }
     owners
@@ -1898,6 +1912,8 @@ fun bootstrapPlanCompilePackageGrants(
                     val capability = bootstrapCompileEffectName(effect)
                     diagnostics = if (package == "?")
                         "${diagnostics}error[E_COMPILE_CAPABILITY_UNDECLARED]: module '${snapshot.path}' requests compile capability '$capability' (#compilerGrant), but it is in no package the build grants to: a package copy the project at '$rootDirectory' doesn't lock, or a file outside it that no package's code imports\n"
+                    else if (bootstrapCompilePackageOf(rootDirectory, snapshot.path, locked) == "")
+                        "${diagnostics}error[E_COMPILE_CAPABILITY_UNDECLARED]: module '${snapshot.path}' is in the project's tree, but only dependency '$package' imports it, so it is that dependency's code; it requests compile capability '$capability' (#compilerGrant), which the dependency's abla.toml doesn't declare in compileCapabilities\n"
                     else
                         "${diagnostics}error[E_COMPILE_CAPABILITY_UNDECLARED]: module '${snapshot.path}' of dependency '$package' requests compile capability '$capability' (#compilerGrant), which its abla.toml doesn't declare in compileCapabilities\n"
                 }
