@@ -7,7 +7,8 @@ import { createServer } from "node:http";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { brotliCompressSync, constants } from "node:zlib";
+import { promisify } from "node:util";
+import { brotliCompress, constants } from "node:zlib";
 
 const [directory, limitsJson = "{}"] = process.argv.slice(2);
 const limits = { wasmBytes: 8 * 1048576, wasmBrotliBytes: 2 * 1048576, stdlibBytes: 1.2 * 1048576, ...JSON.parse(limitsJson) };
@@ -24,10 +25,16 @@ if (!manifest.compiler.file.includes(manifest.compiler.sha256.slice(0, 16))) fai
 if (!manifest.stdlib.file.includes(manifest.stdlib.sha256)) fail("the bundle's name does not carry its hash");
 
 const wasm = readFileSync(join(directory, manifest.compiler.file));
-const brotli = brotliCompressSync(wasm, { params: { [constants.BROTLI_PARAM_QUALITY]: 11, [constants.BROTLI_PARAM_SIZE_HINT]: wasm.length } }).length;
 if (wasm.length > limits.wasmBytes) fail(`the module is ${wasm.length} bytes, over ${limits.wasmBytes}`);
-if (brotli > limits.wasmBrotliBytes) fail(`the module is ${brotli} bytes with brotli, over ${limits.wasmBrotliBytes}`);
 if (manifest.stdlib.bytes > limits.stdlibBytes) fail(`the stdlib bundle is ${manifest.stdlib.bytes} bytes, over ${limits.stdlibBytes}`);
+
+// Compress on a worker while the main thread validates and runs the Wasm.
+const compressedSize = promisify(brotliCompress)(wasm, {
+    params: { [constants.BROTLI_PARAM_QUALITY]: 11, [constants.BROTLI_PARAM_SIZE_HINT]: wasm.length },
+}).then(bytes => {
+    if (bytes.length > limits.wasmBrotliBytes) fail(`the module is ${bytes.length} bytes with brotli, over ${limits.wasmBrotliBytes}`);
+    return bytes.length;
+}, error => fail(`Brotli compression failed: ${error.message}`));
 
 const server = createServer((request, response) => {
     const file = join(directory, request.url.slice(1));
@@ -94,6 +101,7 @@ try {
     if (missingStdlib.ok || !missingStdlib.diagnostics.includes("E_IMPORT_NOT_FOUND") || missingStdlib.diagnostics.includes(hint)) {
         fail(`unexpected companion-file guidance for a missing standard module: ${missingStdlib.diagnostics}`);
     }
+    const brotli = await compressedSize;
     console.log(`playground package ${manifest.version}: module ${(wasm.length / 1048576).toFixed(2)} MB (${(brotli / 1048576).toFixed(2)} MB brotli), stdlib bundle ${(manifest.stdlib.bytes / 1048576).toFixed(2)} MB; hashes match, the bundle loads over HTTP, a program runs`);
 } finally {
     server.close();
