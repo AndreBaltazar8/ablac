@@ -124,7 +124,10 @@ for profile in o1 fast; do
     # The --o1 run keeps its reload modules (ABLA_LIVE_DUMP_MODULE), for the thread-local check below.
     dump=
     [[ $profile == o1 ]] && dump=$PWD/$out/module
-    ABLA_LIVE_DUMP_MODULE=$dump ABLA_LIVE_NOTE_BYTES=$limit limited "$compiler" run "--$profile" --live "$reload" -- "$reload" \
+    (
+        if [[ $profile == o1 ]]; then export ABLA_LIVE_DUMP_DISPATCHER=1; fi
+        ABLA_LIVE_DUMP_MODULE=$dump ABLA_LIVE_NOTE_BYTES=$limit limited "$compiler" run "--$profile" --live "$reload" -- "$reload"
+    ) \
         > "$out/reload-$profile.out" 2> "$out/reload-$profile.err" || status=$?
     if [[ $status -ne 42 ]] || grep -q ': FAIL' "$out/reload-$profile.out"; then
         printf 'live jit (reload, %s): exit status %s (42 expected)\n' "$profile" "$status" >&2
@@ -148,15 +151,11 @@ done
 # dispatcher takes it: AArch64 passes sret in x8, so without it the other dispatcher read the output where its
 # closure belongs and trapped (arm64 Macs, runs 44586994389 to 44654107874). x86-64 passes sret as the first
 # argument, so this reads the IR, which shows it on any host.
-cp tests/cases/live-jit/reload.ab "$reload"
-status=0
-ABLA_LIVE_DUMP_DISPATCHER=1 limited "$compiler" run --o1 --live "$reload" -- "$reload" \
-    > "$out/forward.out" 2> "$out/forward.err" || status=$?
 forward=$(awk '/IR of abla_llvm_call_indirect_live/ { inside = 1 } inside && /^live\.forward:/ { getline; print; exit }' \
-    "$out/forward.err")
-if [[ $status -ne 42 || $forward != *'(ptr sret(%AblaValue) '* ]]; then
-    printf 'live jit (forward): exit status %s; the forward to a new lambda'"'"'s dispatcher is not sret: %s\n' \
-        "$status" "${forward:-(no dispatcher printed)}" >&2
+    "$out/reload-o1.err")
+if [[ $forward != *'(ptr sret(%AblaValue) '* ]]; then
+    printf 'live jit (forward): the forward to a new lambda'"'"'s dispatcher is not sret: %s\n' \
+        "${forward:-(no dispatcher printed)}" >&2
     exit 1
 fi
 # A reload brings its own copies of runtime functions the running program never emitted (the new variables'
@@ -175,26 +174,37 @@ if [[ $modules -eq 0 || $named -eq 0 || $numbered -ne 0 ]]; then
     exit 1
 fi
 rm -f "$out"/module-*.ll
-# ABLA_LIVE_JIT_REPEAT=n: the --o1 reload n times more, for a failure that comes now and then (a Mac run trapped
-# in the new lambda's call, run 44586994389); each failure says where, and on macOS a run under lldb follows it
-# (the backtrace, registers and code at the stop).
+# ABLA_LIVE_JIT_REPEAT=n: the cold --o1 reload n times more, for an intermittent failure in a new lambda's call
+# (run 44586994389). Each round edits its own source and records its own stdout, diagnostics, and exit status.
+run_repeat() {
+    local round_dir=$out/repeat-$1 status=0
+    local source=$PWD/$round_dir/main.ab
+    mkdir -p "$round_dir"
+    cp tests/cases/live-jit/reload.ab "$source"
+    touch "$round_dir/started"
+    limited "$compiler" run --o1 --live "$source" -- "$source" \
+        > "$round_dir/stdout" 2> "$round_dir/stderr" || status=$?
+    printf '%s\n' "$status" > "$round_dir/status"
+}
 repeat=${ABLA_LIVE_JIT_REPEAT:-0}
 [[ $repeat =~ ^[0-9]+$ ]] || { echo "live jit: ABLA_LIVE_JIT_REPEAT must be a count, got $repeat" >&2; exit 1; }
 if ((repeat > 0)); then
+    workers=${JOBS:-1}
+    [[ $workers =~ ^[1-9][0-9]*$ ]] || { echo "live jit: JOBS must be positive, got $workers" >&2; exit 1; }
+    # A round runs the compiler and live threads. Leave CPUs for them even in a wide suite.
+    ((workers <= 2)) || workers=2
+    export -f limited run_repeat
+    export compiler out
+    seq "$repeat" | xargs -n 1 -P "$workers" bash -euo pipefail -c 'run_repeat "$1"' _
     failed=0
     for round in $(seq "$repeat"); do
-        cp tests/cases/live-jit/reload.ab "$reload"
-        touch "$started"
-        status=0
-        limited "$compiler" run --o1 --live "$reload" -- "$reload" \
-            > "$out/repeat.out" 2> "$out/repeat.err" || status=$?
-        [[ $status -eq 42 ]] && ! grep -q ': FAIL' "$out/repeat.out" && continue
+        round_dir=$out/repeat-$round
+        status=$(< "$round_dir/status")
+        [[ $status -eq 42 ]] && ! grep -q ': FAIL' "$round_dir/stdout" && continue
         failed=$((failed + 1))
         printf 'live jit (repeat %s): exit status %s (42 expected)\n' "$round" "$status" >&2
-        grep -v ': ok' "$out/repeat.out" >&2 || true
-        died "repeat $round" "$status" "$out/repeat.out"
-        cp "$out/repeat.out" "$out/repeat-$round.out"
-        cp "$out/repeat.err" "$out/repeat-$round.err"
+        grep -v ': ok' "$round_dir/stdout" >&2 || true
+        started=$round_dir/started died "repeat $round" "$status" "$round_dir/stdout"
     done
     echo "live jit: the reload again $repeat times, $failed failed"
     ((failed > 0)) && under_lldb o1
