@@ -2606,16 +2606,17 @@ private trusted fun __ablaRuntimeWindowsMilliseconds(scratch: int): int {
     ticks / frequency * 1000 + ticks % frequency * 1000 / frequency
 }
 
-// One stop of the watched thread at its deadline: true when it is done (redirected, deferred, an interrupt of an interpreted
-// site, or the thread is gone or disarmed), false to try again a millisecond later.
-private trusted fun __ablaRuntimeWindowsWatchStop(block: int, armed: int): bool {
+// One stop of the watched thread at its deadline: 1 when it is done (redirected, deferred, an interrupt of an interpreted
+// site, or the thread is gone), 0 to try again a millisecond later, 2 when the watch it read is no longer the one armed
+// (disarmed, or armed again): the deadline is then the new watch's, or 0, and is not the watchdog's to clear.
+private trusted fun __ablaRuntimeWindowsWatchStop(block: int, armed: int): int {
     val target = ablaRuntimeLoadI64(block + 16)
-    if ((int(SuspendThread(target)) & 4294967295) == 4294967295) return true
+    if ((int(SuspendThread(target)) & 4294967295) == 4294967295) return 1
     // Disarmed or armed again since the deadline was read: nothing to stop (the thread itself arms and disarms, and it is
     // suspended now).
     if ((ablaRuntimeAtomicLoadI64(block) & 4294967295) != armed || ablaRuntimeAtomicLoadI64(block + 8) == 0) {
         int(ResumeThread(target))
-        return true
+        return 2
     }
     val context = block + 128
     abla_windows_context_prepare(context)
@@ -2624,18 +2625,26 @@ private trusted fun __ablaRuntimeWindowsWatchStop(block: int, armed: int): bool 
     val state = if (check == 0) 3 else ablaUnsafeCallMain(check)
     if (read && state == 2 && __ablaRuntimeWindowsImageOf(abla_windows_context_pc(context), block + 1536) == 0) {
         abla_windows_redirect(context, ablaRuntimeLoadI64(block + 32), 14, 0)
-        val set = int(SetThreadContext(target, context)) != 0
-        int(ResumeThread(target))
-        if (set) return true
-    } else int(ResumeThread(target))
+        if (int(SetThreadContext(target, context)) != 0) {
+            int(ResumeThread(target))
+            return 1
+        }
+    }
+    // The interrupt goes in while the thread is still suspended: once it runs it may disarm this watch and arm the next, and an
+    // interrupt word set or a read cancelled after that would stop the next watch's call (a stale EINTR) instead of this one.
     ablaRuntimeAtomicStoreI64(ablaRuntimeLoadI64(block + 48), 1)
     val other = ablaRuntimeLoadI64(block + 40)
     if (other != 0) ablaRuntimeAtomicStoreI64(other, 1)
     int(CancelSynchronousIo(target))
-    state == 1 || state == 3
+    int(ResumeThread(target))
+    if (state == 1 || state == 3) 1 else 0
 }
 
-// The watchdog thread: waits for a deadline, stops the watched thread at it, and waits again.
+// The watchdog thread: waits for a deadline, stops the watched thread at it, and waits again. The arming count and the
+// deadline are two loads, and the thread can disarm and arm again between them (or the watchdog can be descheduled after the
+// first for longer than a watch lasts, under load): the deadline read can then belong to a newer watch than the count. The
+// stop sees the count changed and does nothing, and the loop reads both again; clearing the deadline there would end the
+// newer watch before it stopped anything (a JIT spin that ran for ever, a 30 s sleep slept out: CI 45886293838).
 private @noinline trusted fun __ablaRuntimeWindowsWatchdog(block: int): int {
     while (true) {
         val armed = ablaRuntimeAtomicLoadI64(block) & 4294967295
@@ -2644,11 +2653,14 @@ private @noinline trusted fun __ablaRuntimeWindowsWatchdog(block: int): int {
         val now = __ablaRuntimeWindowsMilliseconds(block + 64)
         if (deadline == 0) int(WaitOnAddress(block, block + 80, 4, 4294967295))
         else if (now < deadline) int(WaitOnAddress(block, block + 80, 4, deadline - now))
-        else if (__ablaRuntimeWindowsWatchStop(block, armed)) {
-            // An interpreted site is interrupted again every second; a native call's watch ends (its thread disarms it).
-            val next = if (ablaRuntimeLoadI64(block + 24) == 0) now + 1000 else 0
-            ablaRuntimeAtomicCompareExchangeI64(block + 8, deadline, next)
-        } else Sleep(1)
+        else {
+            val stopped = __ablaRuntimeWindowsWatchStop(block, armed)
+            if (stopped == 1) {
+                // An interpreted site is interrupted again every second; a native call's watch ends (its thread disarms it).
+                val next = if (ablaRuntimeLoadI64(block + 24) == 0) now + 1000 else 0
+                ablaRuntimeAtomicCompareExchangeI64(block + 8, deadline, next)
+            } else if (stopped == 0) Sleep(1)
+        }
     }
     0
 }
