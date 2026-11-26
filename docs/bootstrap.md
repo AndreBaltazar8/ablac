@@ -6,7 +6,7 @@ multi-stage source bootstrap are no longer part of the repository.
 
 A compiler cannot translate itself on an empty machine without an existing
 executable translator. Clean builds therefore begin with a checksum-pinned
-native `v0.2.74` host artifact for Linux x86-64, Intel macOS, or Apple Silicon.
+native `v0.2.77` host artifact for Linux x86-64, Intel macOS, or Apple Silicon.
 Mach-O artifacts can be emitted and linked on Linux with LLVM, an Apple SDK,
 and ABI stubs for the target libraries. The resulting artifact is then
 executed by the matching Mac release gate.
@@ -67,7 +67,7 @@ cmp published build/rebuilt
 
 (`chmod +x` it first.) Since v0.2.28 release CI uses the default shell, whose LLVM and OpenSSL store paths
 are in the binary's RUNPATH, so `ABLA_NIX_XTENSA=0` or an edit to `shell.nix` changes those
-bytes and nothing else (up to v0.2.74 the shell's own lib directory was in the RUNPATH too, so the
+bytes and nothing else (up to v0.2.77 the shell's own lib directory was in the RUNPATH too, so the
 rebuild differed in that path and the build id; `shell.nix` now keeps it out). Releases up to v0.2.27 were built without Xtensa and cut the module
 by the machine's processors, so they match only with `ABLA_NIX_XTENSA=0 ABLA_NATIVE_JOBS=4`.
 `tools/test-reproducible-elsewhere.sh` guards this; `--self` is the release's gate.
@@ -267,7 +267,7 @@ Mach-O linker. Removing those hosted dependencies is a separate freestanding goa
 The v0.2.14 release is the bootstrap bridge for `ablaRuntimeValueWord0`, which
 v0.2.13 cannot compile. The v0.2.15 source tag pins that bridge's host binaries
 and checksums. Current clean builds start directly from the checksum-pinned
-v0.2.74 stable host binaries. LLVM 23 has been used since v0.2.16.
+v0.2.77 stable host binaries. LLVM 23 has been used since v0.2.16.
 
 The v0.2.14 tag preserves the bridge source and its reproducible source chain
 from v0.2.13. The historical `tools/bootstrap-word0-bridge.sh` helper has been
@@ -296,7 +296,7 @@ compile-time JIT code against the new standard library (it reads `+24` as
 the slots). A stage-1 compiler built by v0.2.18 has that old runtime: rebuild
 it once more to produce stage 2 before running tests, parity or releases.
 The v0.2.19 release completed that rebuild on every platform. The current
-v0.2.74 bootstrap retains the new object layout for clean builds.
+v0.2.77 bootstrap retains the new object layout for clean builds.
 The release workflow retains the stage-2 rebuild and self-rebuild fixed-point
 check for future code-generator changes.
 
@@ -313,5 +313,5 @@ and tag, bit 48 set) where it used to pass its index, and a class's descriptor
 this runtime makes typed instances only. A compiler from before typed
 instances (v0.2.22 is one) can't build a compiler that
 runs on it: its code would pass field counts, on which the runtime traps.
-The pinned v0.2.74 compiler makes typed instances and builds the current
+The pinned v0.2.77 compiler makes typed instances and builds the current
 runtime directly. Earlier compilers need a historical bridge compiler.
