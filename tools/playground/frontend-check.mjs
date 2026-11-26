@@ -64,8 +64,17 @@ for (const [root, cwd] of [["/work", "/work"], ["/", "/"], ["/work", "/"]]) {
 const fib = 'import "abla/io"\n\nfun fib(n: int): int = if (n < 2) n else fib(n - 1) + fib(n - 2)\n\nfun main: int {\n    println("fib = ${fib(20)}")\n    3\n}\n';
 const ran = await run(module, base, new Map([["main.ab", fib]]));
 check("run: output and exit status", ran.ok && ran.stdout === "fib = 6765\n" && ran.status === 3, JSON.stringify({ status: ran.status, stdout: ran.stdout }));
-const bad = await run(module, base, new Map([["main.ab", 'import "abla/io"\n\nfun main: int {\n    val items: array<int> = [1, 2]\n    println("${items[5]}")\n    0\n}\n']]));
-check("run: a runtime error names itself", !bad.ok && /out of bounds/.test(bad.diagnostics), bad.diagnostics.split("\n")[0]);
+const logged = await run(module, base, new Map([["main.ab",
+    'import "abla/io"\nfun main: int { eprintln("exit=12"); eprintln("errors=0 from application"); eprintln("lowered: application message"); eprint("tail"); 7 }\n',
+]]));
+check("run: program stderr stays separate from the exit status",
+    logged.ok && logged.status === 7 && logged.diagnostics === "exit=12\nerrors=0 from application\nlowered: application message\ntail",
+    JSON.stringify({ status: logged.status, diagnostics: logged.diagnostics }));
+const bad = await run(module, base, new Map([["main.ab", 'import "abla/io"\n\nfun main: int {\n    eprintln("exit=12")\n    val items: array<int> = [1, 2]\n    println("${items[5]}")\n    0\n}\n']]));
+check("run: a runtime error names itself and retains program stderr",
+    !bad.ok && bad.status === 1 && bad.diagnostics.startsWith("exit=12\n") &&
+    /out of bounds/.test(bad.diagnostics) && !bad.diagnostics.includes("abla-playground-exit="),
+    bad.diagnostics);
 const echo = 'import "abla/io"\n\nfun main {\n    val line = readLine()\n    println("got ${line}")\n}\n';
 const input = await run(module, base, new Map([["main.ab", echo]]), { stdin: "ping\n" });
 check("run: standard input", input.ok && input.stdout === "got ping\n", JSON.stringify({ stdout: input.stdout, diagnostics: input.diagnostics.slice(0, 160) }));

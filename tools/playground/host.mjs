@@ -107,15 +107,28 @@ export async function run(module, base, files, { stdin = "" } = {}) {
     const source = files.get("main.ab");
     const text = typeof source === "string" ? source : new TextDecoder().decode(source);
     const returnsInt = /^fun\s+main\s*(?:\(\s*\))?\s*:\s*(?:int|i64)\b/m.test(text);
-    const call = returnsInt ? "val result = user.main()\n    eprintln(\"exit=$result\")\n    result" : "user.main()\n    eprintln(\"exit=0\")\n    0";
+    // A program may leave stderr midway through a line.
+    const call = returnsInt ? "val result = user.main()\n    eprintln(\"\\nabla-playground-exit=$result\")\n    result" : "user.main()\n    eprintln(\"\\nabla-playground-exit=0\")\n    0";
     const wrapper = `import "abla/io"\nimport "abla/compiler"\n#compilerGrant("clock")\n#compilerGrant("random")\n#compilerGrant("process.io")\nimport "./main.ab" as user\n\nfun evalWrap: int {\n    ${call}\n}\n\nval evalCode = #evalWrap()\n\nfun main: int = 0\n`;
     const all = new Map(files);
     all.set("eval.ab", wrapper);
     all.set("abla.toml", 'compileCapabilities = ["clock", "random", "process.io"]\n');
     const result = await compile(module, base, all, { entry: "eval.ab", stdin: typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin });
-    const exit = /^exit=(-?\d+)$/m.exec(result.stderr);
-    let diagnostics = result.stderr.split("\n").filter((line) => !/^(exit=|lowered:|errors=)/.test(line)).join("\n").trim();
-    const ok = exit !== null && /errors=0 /.test(result.stderr) && !result.outputTruncated;
+    // The compiler can print timing notes between the wrapper's result and its
+    // final reports. Keep those notes and ordinary program stderr.
+    const lines = result.stderr.split("\n");
+    const report = result.outputTruncated || result.memoryLimit ? -1 : lines.findLastIndex(line =>
+        /^errors=\d+ parser=\d+ extension=\d+ semantic=\d+ ir=\d+$/.test(line));
+    const marker = /^abla-playground-exit=(-?\d+)$/;
+    const exitAt = lines.findLastIndex((line, index) => index < report && marker.test(line));
+    const exit = exitAt < 0 ? null : marker.exec(lines[exitAt]);
+    if (report >= 0) {
+        const lowered = /^lowered: \d+ functions, \d+ instructions$/.test(lines[report - 1]);
+        lines.splice(lowered ? report - 1 : report, lowered ? 2 : 1);
+    }
+    if (exit !== null) lines.splice(exitAt, 1);
+    let diagnostics = lines.join("\n").trim();
+    const ok = result.status === 0 && exit !== null;
     if (result.outputTruncated) diagnostics += `\n\nThe program's output passed ${outputLimitBytes} bytes and the run stopped.`;
     if (result.memoryLimit) diagnostics += `\n\nThe program used more than ${compilerMemoryPages / 16} MiB of memory and the run stopped.`;
     if (!ok && /^error\[E_SEMANTIC\]: compile\.(?:effect-denied|capability-not-authorized):/m.test(diagnostics)) {
