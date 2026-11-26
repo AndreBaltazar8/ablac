@@ -391,4 +391,4 @@ runtime's system call 4007, loaded from System32 on first use; IPv4 servers only
 hosts file is the one under `%SystemRoot%\System32\drivers\etc` (`dnsConfigurationText`, `dnsHostsText`); an explicit path or name server
 in the options is used as given. `tests/cases/windows/dns-default.ab` checks both. Accepting `coff` in a generic target descriptor proves
 neither a working Windows linker/runtime nor Windows hosting. See
-[the Windows design](design/windows-target.md).
+[the Windows design](design/windows-target.md); the options for a compiler without the static C runtime are in [design/windows-crt-free-compiler.md](design/windows-crt-free-compiler.md).
