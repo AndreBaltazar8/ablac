@@ -28,11 +28,11 @@ source_of() {
         *) echo "tests/cases/libc-$1/main.ab" ;;
     esac
 }
-for name in math-functions correct-rounding iconv spawn wcsftime qsort stack-chk-fail; do
+for name in math-functions correct-rounding iconv spawn wcsftime qsort memalign stack-chk-fail; do
     "$compiler" build "$(source_of "$name")" -o "$out/$name" --no-cache > "$out/$name.build.log" 2>&1 ||
         { echo "libc functions: libc-$name did not build" >&2; tail -20 "$out/$name.build.log" >&2; exit 1; }
 done
-for name in math-functions correct-rounding iconv spawn wcsftime qsort; do
+for name in math-functions correct-rounding iconv spawn wcsftime qsort memalign; do
     code=0
     timeout 60 "$out/$name" > "$out/$name.out" 2>&1 < /dev/null || code=$?
     [[ $code == 42 ]] || { echo "libc functions: libc-$name exited $code" >&2; cat "$out/$name.out" >&2; exit 1; }
@@ -63,11 +63,11 @@ echo 'libc functions: the fortified memcpy, memset, vsnprintf and realpath refus
 # The same modules for AArch64 Linux (#806 step C, the static compiler's second target): the programs that do not run another program are
 # built with --target aarch64-linux and run under qemu-aarch64 (posix_spawn's test starts the host's /bin/sh, which the guest cannot).
 if aarch64_runner_available; then
-    for name in math-functions correct-rounding iconv wcsftime qsort stack-chk-fail; do
+    for name in math-functions correct-rounding iconv wcsftime qsort memalign stack-chk-fail; do
         "$compiler" build "$(source_of "$name")" -o "$out/$name.aarch64" --target aarch64-linux --no-cache > "$out/$name.aarch64.build.log" 2>&1 ||
             { echo "libc functions: libc-$name did not build for aarch64-linux" >&2; tail -20 "$out/$name.aarch64.build.log" >&2; exit 1; }
     done
-    for name in math-functions correct-rounding iconv wcsftime qsort; do
+    for name in math-functions correct-rounding iconv wcsftime qsort memalign; do
         code=0
         aarch64_run -- "$out/$name.aarch64" > "$out/$name.aarch64.out" 2>&1 < /dev/null || code=$?
         [[ $code == 42 ]] || { echo "libc functions: libc-$name exited $code on AArch64" >&2; cat "$out/$name.aarch64.out" >&2; exit 1; }
