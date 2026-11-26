@@ -20,6 +20,8 @@ rm -rf "$out"
 mkdir -p "$out"
 "$cc" -O1 -w tests/cases/libc-parse/parse.c -o "$out/parse"
 "$out/parse" gen "$seed" "$count" > "$out/cases.txt"
+# The decimal midpoints between neighbouring doubles and floats with the deciding digit at 767 to 810 significant digits (tools/fuzz/f64-boundary.mjs).
+if command -v node > /dev/null; then node tools/fuzz/f64-boundary.mjs libc "$seed" 12 >> "$out/cases.txt"; fi
 "$out/parse" < "$out/cases.txt" > "$out/c.txt"
 # string.ab cannot be imported by an ordinary program (its exported memcpy and friends clash with the runtime's own): the test builds from a copy without the @export lines.
 sed -e '/^@export/d' -e 's|^import "\./|import "../../src/static_libc/|' src/static_libc/string.ab > "$out/strto.ab"
@@ -31,6 +33,15 @@ total=$(wc -l < "$out/cases.txt")
 paste -d'\t' "$out/cases.txt" "$out/c.txt" "$out/abla.txt" | awk -F'\t' '$2 != $3 { print $1 "\thost [" $2 "] abla [" $3 "]" }' > "$out/differences.txt"
 known=tools/libc-parse-known.txt
 awk -F'\t' 'FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF) skip[$1] = 1; next } !($1 in skip) { print }' "$known" "$out/differences.txt" > "$out/new-differences.txt"
+# One class of difference is known and not listed line by line: glibc reports ERANGE when the exact value is below the smallest normal number but rounds up to it
+# (tininess before rounding; the midpoint between the largest subnormal and the smallest normal does), the static libc only for a subnormal or zero result. The value and
+# the end offset are the same, and only ERANGE on the host's side with the smallest normal double (4503599627370496) or float (8388608) is let through.
+awk -F'\t' '{
+    n = split($2, t, /[][ ]+/)
+    if (n >= 8 && t[1] == "host" && t[5] == "abla" && t[4] == "34" && t[8] == "0" && t[2] == t[6] && t[3] == t[7] &&
+        (t[2] == "4503599627370496" || t[2] == "8388608")) next
+    print
+}' "$out/new-differences.txt" > "$out/new-differences.filtered" && mv "$out/new-differences.filtered" "$out/new-differences.txt"
 if [[ -s $out/new-differences.txt ]]; then
     head -20 "$out/new-differences.txt" >&2
     echo "libc parse: $total cases, $(wc -l < "$out/new-differences.txt") differ from the host C library's answers and are not in $known" >&2

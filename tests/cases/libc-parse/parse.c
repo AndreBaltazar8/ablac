@@ -70,12 +70,12 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
-    char line[1024];
+    char line[16384];
     while (fgets(line, sizeof line, stdin)) {
         char kind = line[0];
         int base = atoi(line + 2);
         const char *hex = strchr(line + 2, ' ') + 1;
-        char text[512];
+        char text[8192];
         size_t length = 0;
         while (hex[0] && hex[1] && hex[0] != '\n') {
             unsigned byte;
