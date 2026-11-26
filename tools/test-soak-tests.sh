@@ -5,7 +5,7 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/tools" "$work/build"
-cp "$root/tools/soak-tests.sh" "$root/tools/run-tests.sh" "$work/tools/"
+cp "$root/tools/"{soak-tests,run-tests,suite-wall-limit}.sh "$work/tools/"
 printf 'fixture compiler\n' >"$work/build/ablac"
 cp "$work/build/ablac" "$work/build/ablac.bin"
 export RUN_TESTS_COMMANDS=$work/commands.txt JOBS=2 RUN_TESTS_MIN_FREE=0

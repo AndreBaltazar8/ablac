@@ -123,6 +123,7 @@ test-serial: ablac
 	tools/test-release-check-static.sh
 	tools/test-release-check-static-input.sh
 	tools/test-shards.sh $(COMPILER)
+	tools/test-suite-load.sh $(COMPILER)
 	tools/test-static-compiler-aarch64.sh $(COMPILER)
 	tools/test-libsystem-imports.sh $(COMPILER)
 	tools/test-libc-memory-routines.sh $(COMPILER)

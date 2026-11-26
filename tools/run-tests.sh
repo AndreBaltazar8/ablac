@@ -23,7 +23,7 @@
 # source locations, which a build without debug information cannot.
 #
 # Environment:
-#   JOBS                 commands run at once (default: the number of CPUs)
+#   JOBS                 concurrent command slots (default: the number of CPUs)
 #   RUN_TESTS_MIN_FREE   no command starts while the system's free memory is
 #                        under this percentage, unless none is running
 #                        (default 25; 0 turns the check off)
@@ -241,8 +241,29 @@ done < <(order)
 # RUN_TESTS_LIST=1: print the numbers of the selected commands, one per line (the parallel ones, then the ones waiting for test-self-hosted.sh), and stop.
 if [[ -n ${RUN_TESTS_LIST:-} ]]; then printf '%s\n' ${parallel[@]+"${parallel[@]}"} ${serial[@]+"${serial[@]}"}; exit 0; fi
 
+# The playground test builds two release archives concurrently, and the
+# editor stress requests can use parallel marking. Reserve slots for some
+# of that internal work when the suite is already oversubscribed.
+source "$project_root/tools/suite-wall-limit.sh"
+suite_cpus=$(suite_cpu_count "$jobs")
+command_slots=()
+if [[ $suite_cpus =~ ^[1-9][0-9]*$ ]] && ((jobs > suite_cpus)); then
+    for n in ${parallel[@]+"${parallel[@]}"} ${serial[@]+"${serial[@]}"}; do
+        case ${commands[n-1]} in
+            *tools/test-playground-build.sh*) slots=3 ;;
+            *tools/test-analysis-gc-stress.sh*) slots=2 ;;
+            *) continue ;;
+        esac
+        if ((slots > jobs)); then slots=$jobs; fi
+        command_slots[n]=$slots
+        printf 'suite: %s CPUs, reserving %s of %s slots for %s\n' \
+            "$suite_cpus" "$slots" "$jobs" "${commands[n-1]}"
+    done
+fi
+
 running_pids=()
 running_ns=()
+running_slots=0
 failed=0
 passed=0
 started_at=$(seconds_now)
@@ -278,6 +299,7 @@ start() { # n
     ) &
     running_pids+=("$!")
     running_ns+=("$n")
+    running_slots=$((running_slots + ${command_slots[n]:-1}))
 }
 
 # Records every command that has ended; keeps the rest running.
@@ -288,6 +310,7 @@ reap() {
         n=${running_ns[$index]}
         if [[ -f $output/$n.done ]]; then
             wait "${running_pids[$index]}" 2>/dev/null
+            running_slots=$((running_slots - ${command_slots[n]:-1}))
             read -r status seconds cpu <"$output/$n.done"
             rm -f "$output/$n.done"
             command=${commands[n-1]}
@@ -332,7 +355,7 @@ self_hosted_active() {
 run_all() { # limit n...
     local limit=$1
     shift
-    local pending=("$@") free
+    local pending=("$@") free next
     while ((${#pending[@]} > 0 || ${#running_ns[@]} > 0 || ${#serial[@]} > 0)); do
         reap
         if ((${#serial[@]} > 0)) && ! self_hosted_active; then
@@ -340,12 +363,14 @@ run_all() { # limit n...
             pending=("${serial[@]}" ${pending[@]+"${pending[@]}"})
             serial=()
         fi
-        while ((${#pending[@]} > 0 && ${#running_ns[@]} < limit)); do
+        while ((${#pending[@]} > 0 && running_slots < limit)); do
+            next=${pending[0]}
+            ((running_slots + ${command_slots[next]:-1} <= limit)) || break
             if ((${#running_ns[@]} > 0 && min_free > 0)); then
                 free=$(free_percent)
                 ((free >= min_free)) || break
             fi
-            start "${pending[0]}"
+            start "$next"
             pending=(${pending[@]+"${pending[@]:1}"})
         done
         ((${#running_ns[@]} > 0)) && sleep 0.2
