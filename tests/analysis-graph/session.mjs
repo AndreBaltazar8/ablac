@@ -1655,13 +1655,13 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
                 : operators
                 ? (i % 2 ? '(left / (right + ' + n + ')) % 7' : 'left << 2 | right ^ ' + n + ' & 255 >> 1 >>> 0')
                 : locals
-                ? (i % 2 ? block('val t = left * ' + n, 't % 7 + right') : block('val t = (right + ' + n + ') / 2', 't - left'))
+                ? (i % 2 ? block('val t: int = left * ' + n, 't % 7 + right') : block('val t = (right + ' + n + ') / 2', 't - left'))
                 : (i % 2 ? 'right + ' + n : 'left * ' + n + ' + right');
             await edit(expression, ++hits);
         }
         // Another local: the document's symbols change, so full typing.
         if (locals) await edit(block('val t = left', 'val u = t + 1', 'u'), hits);
-        // A written local type: full typing too.
+        // Back to one local: the symbols change again, so full typing.
         if (locals) await edit(block('val t: int = left', 't'), hits);
         await edit(calls ? 'step(true)' : operators ? 'left / true' : locals ? block('val t: bool = left', '1') : 'true', hits);
         await edit(initial, hits);
