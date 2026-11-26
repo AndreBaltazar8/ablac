@@ -1614,6 +1614,93 @@ async function checkedScalarBody(calls = false) {
 
 tests.checked_scalar = checkedScalarBody;
 tests.checked_calls = () => checkedScalarBody(true);
+
+tests.checked_interface = async () => {
+    const base = 'fun interfaceSample(): int = 2+2\n';
+    const reader = 'import "./provider.ab"\nfun sameSample(): bool = interfaceSample() == interfaceSample()\n';
+    const root = fixture('checked-interface', {
+        'abla.toml': 'name = "checked-interface"\nentry = "main.ab"\nvisibility = "imports"\n',
+        'main.ab': 'import "./reader.ab"\nfun main: int = if (sameSample()) 0 else 1\n',
+        'reader.ab': reader,
+        'provider.ab': base,
+    });
+    const provider = uri(path.join(root, 'provider.ab'));
+    const dependent = uri(path.join(root, 'reader.ab'));
+    const offset = bytes(reader.slice(0, reader.indexOf('interfaceSample')));
+    const env = { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TRACE: '1' };
+    const replay = await start(root, { mode: 'graph-v2', unusedImports: true,
+        env: { ...env, ABLA_ANALYSIS_INCREMENTAL_TYPING: '2', ABLA_ANALYSIS_CHECK: '1' }, log: 'interface.stderr' });
+    const full = await start(root, { mode: 'graph-v2', unusedImports: true,
+        env: { ...env, ABLA_ANALYSIS_INCREMENTAL_TYPING: '0', ABLA_ANALYSIS_CHECK: '0' }, log: 'full.stderr' });
+    const sessions = [replay, full];
+    let revision;
+    const check = async expected => {
+        const [actual, oracle] = await Promise.all(sessions.map(s => s.analyze()));
+        assert.deepEqual(actual, oracle);
+        if (revision !== undefined) {
+            const [delta, ref] = await Promise.all(sessions.map(s => s.rpc('analyze', { since: revision })));
+            assert.deepEqual(delta, ref);
+        }
+        revision = actual.revision;
+        for (const method of ['query/definition', 'query/hover', 'query/references']) {
+            const params = { uri: dependent, offset, revision };
+            const [reply, ref] = await Promise.all(sessions.map(s => s.rpc(method, params)));
+            assert.deepEqual(reply, ref);
+        }
+        const log = fs.readFileSync(replay.log, 'utf8');
+        assert.equal(log.match(/rechecked scalar interface and dependents/g)?.length ?? 0, expected, log);
+        assert.doesNotMatch(log, /abla-analysis-check.*(?:DIFFERENT|FAILED)/);
+    };
+    try {
+        await check(0);
+        let seed = 8917;
+        for (let i = 1; i <= 10; i++) {
+            seed ^= seed << 13;
+            seed ^= seed >>> 17;
+            seed ^= seed << 5;
+            const digit = (seed >>> 0) % 10;
+            const body = i % 2 ? 'f64 = ' + digit + '.0' : 'int = ' + digit + '+1';
+            for (const session of sessions) {
+                const reply = await session.rpc(i === 1 ? 'document/open' : 'document/change', {
+                    uri: provider, version: i, text: 'fun interfaceSample(): ' + body + '\n',
+                });
+                assert.ok(!('error' in reply));
+            }
+            await check(i);
+        }
+        const start = base.indexOf('int =');
+        const [checked, oracle] = await Promise.all(sessions.map(s => s.rpc('refactor/validate', {
+            baseRevision: revision, edits: [{ uri: provider, start, end: bytes(base) - 1, newText: 'f64 = 4.0' }],
+        })));
+        assert.deepEqual(checked, oracle);
+        assert.equal(checked.result.valid, true, checked.result.reason);
+        const extraReader = reader + 'fun anotherCondition(): bool = true\n' +
+            'fun withAnotherCall(): bool = anotherCondition() && (interfaceSample() == interfaceSample())\n';
+        for (const session of sessions) {
+            const reply = await session.rpc('document/open', { uri: dependent, version: 1, text: extraReader });
+            assert.ok(!('error' in reply));
+        }
+        await check(10);
+        for (const session of sessions) {
+            const reply = await session.rpc('document/change', {
+                uri: provider, version: 11, text: 'fun interfaceSample(): f64 = 4.0\n',
+            });
+            assert.ok(!('error' in reply));
+        }
+        await check(10);
+        assert.match(fs.readFileSync(replay.log, 'utf8'), /fallback: interface dependencies/);
+        for (const session of sessions) {
+            const reply = await session.rpc('document/change', {
+                uri: provider, version: 12, text: 'fun interfaceSample(): bool = true\n',
+            });
+            assert.ok(!('error' in reply));
+        }
+        await check(10);
+    } finally {
+        await Promise.all(sessions.map(s => s.close()));
+    }
+};
+
 const filter = process.env.ANALYSIS_TEST_FILTER ? process.env.ANALYSIS_TEST_FILTER.split(',') : null;
 for (const [name, test] of Object.entries(tests)) {
     if (filter && !filter.includes(name)) continue;

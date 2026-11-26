@@ -7,6 +7,8 @@ import "frontend.ab"
 import "frontend_diagnostics.ab"
 import "module.ab"
 import "module_paths.ab"
+import "lexer.ab"
+import "overload.ab"
 import "parser.ab"
 import "sema.ab"
 import "source_rewrite.ab"
@@ -924,7 +926,8 @@ class BootstrapAnalysisReplaySnapshot(
     val generated: Map<string, Json>,
     val fingerprints: Map<string, string>,
     val uris: array<string>,
-    val checkedScalar: bool = false
+    val checkedScalar: bool = false,
+    val checkedInterface: bool = false
 )
 
 fun bootstrapAnalysisRejectReplay(reason: string): BootstrapAnalysisReplaySnapshot? {
@@ -986,11 +989,193 @@ fun bootstrapAnalysisCheckScalarBody(document: BootstrapAnalysisGraphDocument, e
         parsed.declarations, semantic, aliases)
 }
 
+// Inspect the prepared expressions as well as the prior resolved occurrences.
+// A function value, aliased call or implicit/member lookup is unproven here.
+fun bootstrapAnalysisInterfaceReads(expression: BootstrapExpression, name: string): int {
+    var count = 0
+    if (bootstrapCanonicalDeclarationHasSourceName(expression.text, name)) {
+        if (expression.kind != "call" || expression.text != name || expression.children.size != 0) return -1
+        count = 1
+    }
+    for (child in expression.children) {
+        val nested = bootstrapAnalysisInterfaceReads(child, name)
+        if (nested < 0) return -1
+        count = count + nested
+    }
+    count
+}
+
+fun bootstrapAnalysisInterfaceHeaderReads(declaration: BootstrapDeclaration, name: string): bool {
+    for (value in declaration.parameterDefaults) if (bootstrapAnalysisInterfaceReads(value, name) != 0) return true
+    for (value in declaration.annotationArguments) if (bootstrapAnalysisInterfaceReads(value, name) != 0) return true
+    for (method in declaration.methods) {
+        if (bootstrapAnalysisInterfaceReads(method.expression, name) != 0 ||
+            bootstrapAnalysisInterfaceHeaderReads(method, name)) return true
+    }
+    false
+}
+
+class BootstrapAnalysisInterfaceReader(val document: int, val declaration: BootstrapDeclaration, val reads: int)
+
+// The prepared candidate bucket for the provider must have one exact entry.
+// Dependent bodies must have an unchanged checking interface and no outside
+// call bucket. Both conditions must hold before any prior rows are reused.
+fun bootstrapAnalysisInterfaceReaders(documents: array<BootstrapAnalysisGraphDocument>,
+    project: BootstrapParseResult, provider: BootstrapDeclaration): array<BootstrapAnalysisInterfaceReader>? {
+    val name = provider.name
+    for (action in project.actions) if (bootstrapAnalysisInterfaceReads(action, name) != 0) return null
+    val readers: array<BootstrapAnalysisInterfaceReader> = []
+    var providerCount = 0
+    for (prepared in project.declarations) {
+        if (bootstrapAnalysisBudgetExpired()) return null
+        if (bootstrapIsOperatorDeclaration(prepared) || bootstrapAnalysisInterfaceHeaderReads(prepared, name)) return null
+        for (method in prepared.methods) if (bootstrapIsOperatorDeclaration(method)) return null
+        if (bootstrapCanonicalDeclarationHasSourceName(prepared.name, name)) {
+            if (prepared.name != name || prepared.begin != provider.begin ||
+                !bootstrapAnalysisScalarInterfaceMatches(provider, prepared, false)) return null
+            providerCount = providerCount + 1
+        }
+        val reads = bootstrapAnalysisInterfaceReads(prepared.expression, name)
+        if (reads == 0) continue
+        if (reads < 0 || readers.size >= 16 || !bootstrapAnalysisScalarFunction(prepared, true)) return null
+        val names: Map<string, int> = Map()
+        bootstrapAnalysisScalarCallNames(prepared.expression, names)
+        if (names.size != 1 || !names.has(name)) return null
+        var found = false
+        for (index in 0 until documents.size) {
+            val document = documents[index]
+            if (document.document.path != prepared.sourceIdentity) continue
+            if (document.hostSource != "" || document.rewrite.rewrittenBegins.size != 0) return null
+            for (declaration in document.parsed.declarations) {
+                if (declaration.begin != prepared.begin || declaration.name != prepared.name) continue
+                if (!bootstrapAnalysisScalarFunction(declaration, true) ||
+                    !bootstrapAnalysisScalarInterfaceMatches(declaration, prepared, true) ||
+                    bootstrapAnalysisInterfaceReads(declaration.expression, name) != reads) return null
+                val writtenCalls: Map<string, int> = Map()
+                bootstrapAnalysisScalarCallNames(declaration.expression, writtenCalls)
+                if (writtenCalls.size != 1 || !writtenCalls.has(name)) return null
+                readers.append(BootstrapAnalysisInterfaceReader(index, declaration, reads))
+                found = true
+                break
+            }
+            break
+        }
+        if (!found) return null
+    }
+    if (providerCount != 1 || readers.size == 0) return null
+    readers
+}
+
+fun bootstrapAnalysisCheckInterface(previous: BootstrapAnalysisGraphQueryIndex,
+    documents: array<BootstrapAnalysisGraphDocument>, project: BootstrapParseResult,
+    names: Map<string, string>, builtins: Map<string, string>, changed: int,
+    splice: BootstrapAnalysisBodyInsert): Map<string, BootstrapAnalysisOccurrenceSet>? {
+    val edited = documents[changed]
+    if (edited.rewrite.rewrittenBegins.size != 0) return null
+    for (provider in edited.parsed.declarations) {
+        if (provider.begin != splice.declarationBegin) continue
+        val target = bootstrapAnalysisGraphStable(edited, bootstrapAnalysisDeclarationId(provider))
+        val readers = bootstrapAnalysisInterfaceReaders(documents, project, provider)
+        val oldTarget = previous.symbols.get(target)
+        if (readers == null || oldTarget == null) return null
+        val targetAt = oldTarget.get("selectionRange").getInt("start")
+        var oldReads = 0
+        for (index in 0 until documents.size) {
+            if (bootstrapAnalysisBudgetExpired()) return null
+            val document = documents[index].document
+            val key = bootstrapAnalysisGraphPath(document.uri)
+            val before = previous.documents.get(key)
+            val set = previous.occurrences.get(key)
+            if (before == null || set == null) return null
+            val source = before.getString("text")
+            for (item in 0 until set.ids.size) {
+                val start = set.begins[item]
+                val end = set.ends[item]
+                if (set.ids[item] != target && (end - start != provider.name.size ||
+                    !bootstrapRegionEquals(source, start, end, provider.name))) continue
+                if (set.ids[item] != target) return null
+                if (index == changed && start == targetAt) continue
+                var known = false
+                for (reader in readers) {
+                    if (reader.document == index && start >= reader.declaration.expression.begin &&
+                        end <= reader.declaration.expression.end) known = true
+                }
+                if (!known || set.types[item] == "") return null
+                oldReads = oldReads + 1
+            }
+        }
+        val declarations = [provider]
+        val begins: array<int> = []
+        val ends: array<int> = []
+        val kinds: array<string> = []
+        val sources: array<string> = []
+        var reads = 0
+        for (reader in readers) {
+            declarations.append(reader.declaration)
+            bootstrapAnalysisCollectDeclarationRequests(reader.declaration, begins, ends, kinds, sources)
+            reads = reads + reader.reads
+        }
+        if (reads != oldReads) return null
+        // An attempted check must leave the full check's import-use collector
+        // alone if the result or occurrence splice is later rejected.
+        val importUses = bootstrapImportUses
+        bootstrapImportUses = Map()
+        val semantic = bootstrapFrontendAnalyzeRequested(BootstrapParseResult(declarations, [], 0, 0, [], [], ""),
+            begins, ends, kinds, sources)
+        bootstrapImportUses = importUses
+        if (semantic.errors != 0 || semantic.extensionErrors != 0 || semantic.diagnostics != "" ||
+            semantic.typedCalls.size != reads) return null
+        val aliases: Map<string, string> = Map()
+        bootstrapAnalysisGraphLocalAliases(edited, aliases)
+        for (reader in readers) bootstrapAnalysisGraphLocalAliases(documents[reader.document], aliases)
+        val builtinPath = bootstrapAnalysisGraphBuiltinsPath()
+        for (document in documents) {
+            if (document.document.path == builtinPath) bootstrapAnalysisGraphLocalAliases(document, aliases)
+        }
+        val lookup = BootstrapAnalysisGraphLookup()
+        val mapped = bootstrapAnalysisGraphSemantic(semantic, documents, names, lookup, aliases, builtins)
+        if (mapped.typedCalls.size != reads) return null
+        for (call in mapped.typedCalls) if (call.canonicalTargetId != target) return null
+        val occurrences = bootstrapAnalysisOccurrenceIndex(declarations, mapped, builtins)
+        val updates: Map<string, BootstrapAnalysisOccurrenceSet> = Map()
+        for (index in 0 until documents.size) {
+            val document = documents[index]
+            val key = bootstrapAnalysisGraphPath(document.document.uri)
+            var affected = index == changed
+            for (reader in readers) if (reader.document == index) affected = true
+            if (!affected) continue
+            val old = previous.occurrences.get(key)
+            if (old == null) return null
+            var set: BootstrapAnalysisOccurrenceSet = old
+            val fresh = bootstrapAnalysisOccurrenceSet(document.document.text, document.document.path,
+                document.parsed, declarations, mapped, aliases, true, occurrences)
+            if (index == changed) {
+                val replaced = bootstrapAnalysisReplayScalarOccurrence(set, fresh, splice, false)
+                if (replaced == null) return null
+                set = replaced
+            }
+            for (reader in readers) {
+                if (reader.document != index) continue
+                val body = reader.declaration.expression
+                val width = body.end - body.begin
+                val bodySplice = BootstrapAnalysisBodyInsert(body.begin, width, body.begin, "", 0, 0, "", width)
+                val replaced = bootstrapAnalysisReplayScalarOccurrence(set, fresh, bodySplice)
+                if (replaced == null) return null
+                set = replaced
+            }
+            updates.set(key, set)
+        }
+        return updates
+    }
+    null
+}
+
 // Reuse the previous checked graph for one proved splice or checked body.
 fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQueryIndex,
     documents: array<BootstrapAnalysisGraphDocument>, entry: string, project: BootstrapFrontendHostProject,
     before: BootstrapAnalysisReplayInputs, after: BootstrapAnalysisReplayInputs,
-    checkScalar: bool): BootstrapAnalysisReplaySnapshot? {
+    checkScalar: bool, names: Map<string, string>,
+    builtins: Map<string, string>): BootstrapAnalysisReplaySnapshot? {
     if (!previous.snapshot.get("complete").asBoolean() ||
         previous.snapshot.getString("entry") != entry ||
         previous.snapshot.get("documents").values.size != documents.size) return bootstrapAnalysisRejectReplay("old snapshot")
@@ -1021,9 +1206,13 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
     val inert = plain != null && bootstrapAnalysisPlainBodyChange(doc.parsed, plain)
     val scalar = if (!inert && checkScalar) bootstrapAnalysisScalarChange(oldText, doc.document.text,
         doc.parsed, project.written) else null
-    val splice = if (scalar != null) scalar.splice else plain
-    if (splice == null || (!inert && scalar == null) ||
-        !bootstrapAnalysisReplayInputsAgree(before, after, changedPath, splice, scalar != null)) return bootstrapAnalysisRejectReplay("body edit or parser inputs")
+    val interfaceEdit = if (!inert && scalar == null && checkScalar)
+        bootstrapAnalysisScalarResultChange(oldText, doc.document.text, doc.parsed) else null
+    val splice = if (scalar != null) scalar.splice else if (interfaceEdit != null) interfaceEdit else plain
+    if (splice == null || (!inert && scalar == null && interfaceEdit == null) ||
+        !bootstrapAnalysisReplayInputsAgree(before, after, changedPath, splice, scalar != null || interfaceEdit != null)) {
+        return bootstrapAnalysisRejectReplay("body edit or parser inputs")
+    }
     val oldSymbols = original.get("symbols").values
     val growth = if (splice.name != "" && splice.removed == 0) 1 else 0
     if (doc.exported.values.size != oldSymbols.size + growth) return bootstrapAnalysisRejectReplay("symbol count")
@@ -1057,7 +1246,11 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
     val path = bootstrapAnalysisGraphPath(doc.document.uri)
     val oldSet = previous.occurrences.get(path)
     if (oldSet == null) return bootstrapAnalysisRejectReplay("old occurrences missing")
-    val updated = if (scalar == null) bootstrapAnalysisReplayOccurrence(oldSet, splice, added)
+    val dependentSets = if (interfaceEdit != null)
+        bootstrapAnalysisCheckInterface(previous, documents, project.written, names, builtins, changed, splice) else null
+    if (interfaceEdit != null && dependentSets == null) return bootstrapAnalysisRejectReplay("interface dependencies")
+    val updated = if (dependentSets != null) dependentSets.get(path)
+        else if (scalar == null) bootstrapAnalysisReplayOccurrence(oldSet, splice, added)
         else {
             val checked = bootstrapAnalysisCheckScalarBody(doc, scalar)
             if (checked == null) return bootstrapAnalysisRejectReplay("scalar body did not check")
@@ -1084,7 +1277,8 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
         val document = documents[index]
         val uri = document.document.uri
         val key = bootstrapAnalysisGraphPath(uri)
-        val set = if (index == changed) updated else previous.occurrences.get(key)
+        val rechecked = if (dependentSets != null) dependentSets.get(key) else null
+        val set = if (rechecked != null) rechecked else if (index == changed) updated else previous.occurrences.get(key)
         if (set == null) return bootstrapAnalysisRejectReplay("set missing")
         // Graph-v2 normally exports stable IDs. Any residual offset-based
         // target into the edited module must go through full typing.
@@ -1098,8 +1292,8 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
         if (index != changed && diagnosticText != jsonStringify(old.get("diagnostics"))) {
             return bootstrapAnalysisRejectReplay("untouched diagnostics changed")
         }
-        val fingerprint = if (index == changed)
-            "${document.document.version}|${document.key}|${bootstrapAnalysisGraphSetHash(updated)}|${bootstrapAnalysisGraphHash(diagnosticText)}"
+        val fingerprint = if (index == changed || rechecked != null)
+            "${document.document.version}|${document.key}|${bootstrapAnalysisGraphSetHash(set)}|${bootstrapAnalysisGraphHash(diagnosticText)}"
             else this.graphFingerprint("${previous.revision}", uri)
         if (fingerprint == "") return bootstrapAnalysisRejectReplay("fingerprint missing")
         fingerprints.set(uri, fingerprint)
@@ -1118,7 +1312,7 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
         if (symbol != null) generated.set(id, symbol)
     }
     val snapshot = bootstrapAnalysisGraphSnapshotJson(this.revision, values, this.graphModeName(), true, [], entry)
-    BootstrapAnalysisReplaySnapshot(snapshot, sets, generated, fingerprints, uris, scalar != null)
+    BootstrapAnalysisReplaySnapshot(snapshot, sets, generated, fingerprints, uris, scalar != null, interfaceEdit != null)
 }
 
 fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
@@ -1277,7 +1471,8 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
         val prior = this.graphQueryIndex
         val before = this.graphReplayInputs
         if (prior != null && before != null) {
-            val reused = this.graphReplayBody(prior, documents, entry, project, before, replayInputs, setting.value == "2")
+            val reused = this.graphReplayBody(prior, documents, entry, project, before, replayInputs,
+                setting.value == "2", names, builtinIds)
             if (bootstrapAnalysisBudgetExpired()) return this.graphBudgetIncomplete()
             if (reused != null) {
                 this.graphReplayInputs = BootstrapAnalysisReplayInputs(replayInputs.syntax.copy(),
@@ -1287,7 +1482,8 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
                 this.graphIndexRevision = this.revision
                 this.graphRememberGeneration(BootstrapAnalysisGraphGeneration(reused.snapshot.getString("revision"), reused.fingerprints, reused.uris))
                 if (linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TRACE").value == "1") {
-                    linuxPrintStandardError(if (reused.checkedScalar) "abla-analysis-typing rechecked one scalar body\n"
+                    linuxPrintStandardError(if (reused.checkedInterface) "abla-analysis-typing rechecked scalar interface and dependents\n"
+                        else if (reused.checkedScalar) "abla-analysis-typing rechecked one scalar body\n"
                         else "abla-analysis-typing replayed a type-inert body edit\n")
                 }
                 bootstrapAnalysisSampleMemory("answer built")
