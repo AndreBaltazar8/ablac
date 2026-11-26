@@ -80,7 +80,7 @@ fixtures=(
     ct_fix_rsa_pkcs1:@0 ct_fix_rsa_oaep:@0,@2
     ct_fix_rsa_implicit_length:@0 ct_fix_rsa_implicit_select:@1,@2
     ct_fix_secret_division:@0,@1 ct_fix_secret_exact:@0,@1 ct_fix_secret_reduce:@0,@1 ct_fix_secret_divsteps:@0,@1 ct_fix_secret_gcd:@0,@1 ct_fix_secret_inverse:@0,@1
-    ct_fix_rsa_subtract_one:@1 ct_fix_rsa_greater:@0,@1
+    ct_fix_rsa_subtract_one:@1 ct_fix_rsa_greater:@0,@1 ct_fix_rsa_miller_rabin:@0,@1,@2,@3
     ct_fix_base64:0
     ct_pbe_sha1:@0,@1,@2 ct_pbe_sha256:@0,@1,@2
     ct_pbe_hmac1:@0 ct_pbe_hmac256:@0 ct_pbe_xor1:@0 ct_pbe_xor256:@0
@@ -99,7 +99,7 @@ while IFS= read -r spec; do fixtures+=("$spec"); done < "$cases/crypto-generated
 # Xtensa passes later pointer parameters on the stack; its checker cannot yet
 # taint those parameters, so this separate-pointer shape is read on these ABIs.
 host_fixtures=(ct_fix_big_add:@0,@1,@2,@3,@5 ct_fix_big_sub:@0,@1,@2,@3 ct_fix_big_select:0,@1,@2,@3 ct_fix_wide_separate:@0,@1,@2,@3,@5 ct_fix_montgomery64:@0,@1,@2,@3 ct_fix_lookup64:0,@1,@2 ct_fix_residue64:@0,@1,@3 ct_fix_chacha_xor_vector:@0,@1)
-leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_trap:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0 ct_x25519_leak_branch:0,@1,@2 ct_x25519_leak_index:@0,@1 ct_ed25519_leak_branch:0,@1,@2 ct_ed25519_leak_index:@0,@1 ct_leak_chacha_index:@0,@1 ct_leak_poly_branch:@0,@1 ct_leak_sha256:@0,@1,@2 ct_leak_sha512:@0,@1,@2)
+leaks=(ct_leak_branch:0 ct_leak_callee:0 ct_leak_callee_store:0 ct_leak_index:0 ct_leak_trap:0 ct_leak_compare:@0,@1 ct_leak_divide:0,1 ct_pbe_leak:@0 ct_x25519_leak_branch:0,@1,@2 ct_x25519_leak_index:@0,@1 ct_ed25519_leak_branch:0,@1,@2 ct_ed25519_leak_index:@0,@1 ct_leak_chacha_index:@0,@1 ct_leak_poly_branch:@0,@1 ct_leak_sha256:@0,@1,@2 ct_leak_sha512:@0,@1,@2 ct_leak_rsa_miller_rabin:@0,@1,@2,@3)
 while IFS= read -r spec; do leaks+=("$spec"); done < "$cases/crypto-generated.leaks"
 
 # Hand-written spill regressions ensure the test includes the actual assembly pattern.

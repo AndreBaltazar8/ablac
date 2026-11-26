@@ -1210,6 +1210,28 @@ private @inline trusted fun rsaGreaterMask(a: int, b: int, words: int): secretU3
     ctIsZero(borrow) & ctIsNonZero(different)
 }
 
+// Return an all-ones mask if the `words` limbs at a and b are equal.
+private @inline trusted fun rsaEqualMask(a: int, b: int, words: int): secretU32 {
+    var difference = secretU32(u32(0))
+    for (i in 0 until words) difference = difference | (bnLoad(a + i * 4) ^ bnLoad(b + i * 4))
+    ctIsZero(difference)
+}
+
+/** One Miller-Rabin round's squarings for a candidate prime n = 2^shifts * d + 1: `x` holds base^d in Montgomery form (it is squared in place),
+ *  `one` and `minusOne` are 1 and n - 1 in Montgomery form, `modulus` the n limbs, `inverse` bnInverseWord's word, `scratch` 2 * words + 2 words.
+ *  Returns all ones if x is 1 or n - 1, or if n - 1 is among its next shifts - 1 squarings (the round passes). Always shifts - 1 squarings: no
+ *  exit at the step where n - 1 appears, which depends on the prime the key keeps. `shifts`, the power of two in n - 1, is public (as BoringSSL
+ *  treats it). */
+private @inline trusted fun rsaMillerRabinPassed(x: int, one: int, minusOne: int, modulus: int, inverse: int, words: int, scratch: int,
+    shifts: int): secretU32 {
+    var passed = rsaEqualMask(x, one, words) | rsaEqualMask(x, minusOne, words)
+    for (step in 1 until shifts) {
+        bnMontgomeryMultiplyBody(x, x, x, modulus, inverse, words, scratch)
+        passed = passed | rsaEqualMask(x, minusOne, words)
+    }
+    passed
+}
+
 // END RSA SECRET BIGNUM PRIMITIVES
 
 // Prime search deliberately has data-dependent running time; key derivation
@@ -1267,6 +1289,7 @@ private trusted fun rsaProbablePrime(candidate: string, rounds: int): int {
     bnStore(one, secretU32(u32(1)))
     rsaSubtractOne(minusOne, modulus.value(), words)
     bnCopy(exponent, minusOne, words)
+    // The power of two in n - 1 (shifts) is made public, as BoringSSL treats it: a few bits of the candidate, and the loop bounds below need it.
     var shifts = 0
     while ((bnLoad(exponent).declassify() & u32(1)) == u32(0)) {
         var carry = secretU32(u32(0))
@@ -1296,14 +1319,11 @@ private trusted fun rsaProbablePrime(candidate: string, rounds: int): int {
         if (verdict == 1) {
             bnExpSecret(modulus, x, base, exponent, words * 32)
             bnEncode(modulus, x, x)
-            var passed = bnEqual(x, modulus.one(), words) || bnEqual(x, encodedMinusOne, words)
-            var step = 1
-            while (!passed && step < shifts) {
-                bnMultiply(modulus, x, x, x)
-                passed = bnEqual(x, encodedMinusOne, words)
-                step = step + 1
-            }
-            if (!passed) verdict = 0
+            // Only each round's verdict is made public. A candidate found composite is thrown away at once: its timing shows nothing about
+            // the prime that is kept, which passes every round and so takes the same time whatever it is.
+            val passed = rsaMillerRabinPassed(x, modulus.one(), encodedMinusOne, modulus.value(), modulus.inverse(), words, modulus.scratch(),
+                shifts)
+            if (passed.declassify() == u32(0)) verdict = 0
         }
         round = round + 1
     }
