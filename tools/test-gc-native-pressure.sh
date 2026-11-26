@@ -12,6 +12,7 @@ mkdir -p "$out"
 awk '
     /^define / { native = ""; entry = 0; loop = 0 }
     /call .*@fixture_scalar\(/ { native = "scalar" }
+    /call .*@fixture_scalar_once\(/ { native = "once" }
     /call .*@fixture_escaping\(/ { native = "escaping" }
     /call .*@fixture_blocking\(/ { native = "blocking" }
     /call .*@fixture_pointer\(/ { native = "pointer" }
@@ -21,13 +22,14 @@ awk '
     /call .*@abla_runtime_memory_pressure_loop\(/ { loop = 1 }
     /^}/ && native != "" {
         seen[native]++
-        if (native == "scalar" ? (entry || loop) : !entry) {
+        # A loop of such calls keeps a poll on its back edge (it may wait through C: a collection must be able to stop it); straight-line code has none.
+        if (native == "scalar" ? !loop : (native == "once" ? (entry || loop) : !entry)) {
             printf "gc native pressure: unexpected poll placement for %s (entry=%d loop=%d)\n", native, entry, loop
             failure = 1
         }
     }
     END {
-        if (!seen["scalar"] || !seen["escaping"] || !seen["blocking"] ||
+        if (!seen["scalar"] || !seen["once"] || !seen["escaping"] || !seen["blocking"] ||
             !seen["pointer"] || !seen["cstring"] || !seen["heap"]) {
             print "gc native pressure: missing fixture call in generated IR"
             failure = 1
@@ -35,4 +37,4 @@ awk '
         exit failure
     }
 ' "$out/main.ll"
-echo 'gc native pressure: scalar loop omits polls; escaping, blocking, pointer, cstring and heap-returning calls retain them'
+echo 'gc native pressure: scalar calls outside a loop omit polls and a scalar loop keeps its back-edge poll; escaping, blocking, pointer, cstring and heap-returning calls retain them'

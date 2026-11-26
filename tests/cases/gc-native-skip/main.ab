@@ -1,0 +1,91 @@
+// A worker loops over noescape C calls with a scalar result (time(0), labs: b6f548d65 gives such a call no memory-pressure poll) and
+// allocates nothing in its loop, while main allocates garbage (#1139 area 10, round 2). Two things must hold:
+//   - every collection of main's thread can stop the worker: its loop keeps a safe point (the same shape as tests/cases/gc-spin,
+//     whose spin reads an atomic word); without one the stop waits its 20 ms, is abandoned, and the heap grows while the worker runs;
+//   - what the worker holds across those calls (strings, an array, an object, a map, built before the loop and read in it) survives
+//     the collections that stop it: it is rooted at that safe point, which ABLA_GC_POISON=1 and ABLA_GC_STRESS=1 make visible.
+// ABLA_SKIP_ROUNDS (default 1500) is the number of 1 MB strings main makes; ABLA_SKIP_SECONDS (default 4) how long the worker runs.
+import "abla/io"
+import "abla/memory"
+import "abla/process/environment"
+import "abla/runtime/memory"
+import "abla/text"
+import "abla/integer"
+
+noescape extern:"c" fun time(zero: i64): i64
+noescape extern:"c" fun labs(value: i64): i64
+
+class Held(val name: string, val values: array<int>)
+
+fun expected(index: int): string = "held-$index-${"abc".repeat(40)}"
+
+fun buildStrings(): array<string> {
+    val strings: array<string> = []
+    for (index in 0 until 64) strings.append(expected(index))
+    strings
+}
+
+fun buildSizes(): array<int> {
+    val sizes: array<int> = []
+    for (index in 0 until 64) sizes.append(expected(index).size)
+    sizes
+}
+
+fun buildObject(): Held = Held("object-${"x".repeat(100)}", [1, 2, 3, 4, 5, 6, 7, 8])
+
+/** The number of held values that are not what was built. */
+fun verify(strings: array<string>, object: Held): int {
+    var wrong = 0
+    for (index in 0 until 64) if (strings[index] != expected(index)) wrong = wrong + 1
+    if (object.name != "object-${"x".repeat(100)}" || object.values[7] != 8) wrong = wrong + 1
+    wrong
+}
+
+/** The loop's function allocates nothing itself (the objects it holds come from calls, the checks after the loop from another call), so
+ *  the only safe point it has is the one its loop keeps, and what it holds in its own locals must be rooted there. */
+fun scan(seconds: int): int {
+    val strings = buildStrings()
+    val sizes = buildSizes()
+    val object = buildObject()
+    val end = int(time(i64(0))) + seconds
+    var calls = 0
+    var wrong = 0
+    // The argument of labs is computed from objects held across the call, in the same expression.
+    while (int(time(i64(0))) < end) {
+        val index = calls % 64
+        val sum = int(labs(i64(strings[index].size + object.values[calls % 8] + object.name.size)))
+        if (sum != sizes[index] + object.values[calls % 8] + object.name.size) wrong = wrong + 1
+        calls = calls + 1
+    }
+    wrong + verify(strings, object)
+}
+
+fun worker(): int {
+    val seconds: int = processEnvironmentOr("ABLA_SKIP_SECONDS", "4").parseInt() ?? 4
+    scan(seconds)
+}
+
+fun main: int {
+    val rounds: int = processEnvironmentOr("ABLA_SKIP_ROUNDS", "1500").parseInt() ?? 1500
+    val worker = thread { worker() }
+    var kept = 0
+    var round = 0
+    while (round < rounds) {
+        val garbage = "x".repeat(1000000)
+        kept = kept + garbage.size % 7
+        round = round + 1
+    }
+    val abandoned = runtimeMemoryHeapStat(8)
+    val stopped = runtimeMemoryHeapStat(7)
+    val wrong = await worker
+    if (wrong != 0) {
+        println("FAIL: the worker's held objects were wrong $wrong times ($stopped collections stopped it)")
+        return 1
+    }
+    if (abandoned > 1 || stopped == 0 || kept != rounds) {
+        println("FAIL: $stopped collections stopped the worker, $abandoned stops abandoned")
+        return 1
+    }
+    println("gc native skip ok: $stopped collections")
+    0
+}

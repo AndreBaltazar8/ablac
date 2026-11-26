@@ -898,8 +898,11 @@ fun bootstrapLlvmLoopSafePoints(function: BootstrapIrFunction, pressure: bool,
         allocations.append(allocations[allocations.size - 1] +
             if (pressure && bootstrapLlvmInstructionMayAllocate(instruction) &&
                 !bootstrapLlvmNativeOmitsPressure(instruction, program, nativeIndex)) 1 else 0)
+        // (a native call that has no poll of its own counts as a wait too: a loop of such calls is a loop that waits for a clock, a
+        // register or another thread through C, and must reach a safe point to be stopped)
         waits.append(waits[waits.size - 1] +
-            if (pressure && pollable && bootstrapLlvmSharedMemoryAccess(instruction)) 1 else 0)
+            if (pressure && pollable && (bootstrapLlvmSharedMemoryAccess(instruction) ||
+                bootstrapLlvmNativeOmitsPressure(instruction, program, nativeIndex))) 1 else 0)
     }
     if (!pressure) return points
     val loops = bootstrapLlvmLoops(function)
@@ -913,6 +916,31 @@ fun bootstrapLlvmLoopSafePoints(function: BootstrapIrFunction, pressure: bool,
         loop = loop + 1
     }
     points
+}
+
+/** Whether a loop of the function calls a native that gets no pressure poll (bootstrapLlvmNativeOmitsPressure): a loop that may be
+ *  waiting through C, so it gets a safe point on its back edge as a spin wait does (a thread that never reaches one cannot be
+ *  stopped for another thread's collection, which gives up after 20 ms and lets the heap grow). Straight-line code with such calls
+ *  keeps none. */
+fun bootstrapLlvmHasNativeLoop(function: BootstrapIrFunction, program: BootstrapIrProgram,
+    nativeIndex: BootstrapLlvmNameIndex): bool {
+    if (bootstrapLlvmRuntimeFunction(function)) return false
+    var silent = false
+    for (instruction in function.instructions) {
+        if (bootstrapLlvmNativeOmitsPressure(instruction, program, nativeIndex)) silent = true
+    }
+    if (!silent) return false
+    val loops = bootstrapLlvmLoops(function)
+    var loop = 0
+    while (loop < loops.starts.size) {
+        var index = loops.starts[loop]
+        while (index <= loops.ends[loop]) {
+            if (bootstrapLlvmNativeOmitsPressure(function.instructions[index], program, nativeIndex)) return true
+            index = index + 1
+        }
+        loop = loop + 1
+    }
+    false
 }
 
 // An atomic or volatile access of memory another thread may write: what a loop waiting for another thread reads.
