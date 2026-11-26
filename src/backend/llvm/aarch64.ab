@@ -250,6 +250,8 @@ fun bootstrapLlvmAarch64StartAssembly(): string {
     ".pushsection .bss\n.p2align 3\n" +
     ".globl abla_start_phdr\n.globl abla_start_phnum\n.globl abla_start_base\n" +
     "abla_start_phdr: .zero 8\nabla_start_phnum: .zero 8\nabla_start_base: .zero 8\n" +
+    // The canary global that code built with -fstack-protector reads (set from AT_RANDOM below; it was a constant in the static libc's data before).
+    ".popsection\n.pushsection .data\n.p2align 3\n.globl __stack_chk_guard\n.type __stack_chk_guard,%object\n.size __stack_chk_guard,8\n__stack_chk_guard: .quad 0\n" +
     ".popsection\n" +
     ".globl abla_start\n.hidden abla_start\n.type abla_start,@function\n" +
     "abla_start:\n" +
@@ -260,10 +262,11 @@ fun bootstrapLlvmAarch64StartAssembly(): string {
     "    add x22, x21, x20, lsl #3\n    add x22, x22, #8\n" +
     "    mov x23, x22\n" +
     "1:  ldr x0, [x23], #8\n    cbnz x0, 1b\n" +
-    "    mov x24, #0\n    mov x25, #0\n" +
+    "    mov x24, #0\n    mov x25, #0\n    mov x12, #0\n" +
     "2:  ldp x0, x1, [x23], #16\n    cbz x0, 3f\n" +
     "    cmp x0, #3\n    csel x24, x1, x24, eq\n" +
     "    cmp x0, #5\n    csel x25, x1, x25, eq\n" +
+    "    cmp x0, #25\n    csel x12, x1, x12, eq\n" +
     "    b 2b\n" +
     "3:  adrp x9, abla_start_phdr\n    str x24, [x9, :lo12:abla_start_phdr]\n" +
     "    adrp x9, abla_start_phnum\n    str x25, [x9, :lo12:abla_start_phnum]\n" +
@@ -292,6 +295,13 @@ fun bootstrapLlvmAarch64StartAssembly(): string {
     // No dynamic section: no relocations and no init_array.
     "27:\n" +
     "28:\n" +
+    // The stack protector's canary (a global on AArch64, __stack_chk_guard; x86-64 keeps it at fs:0x28): AT_RANDOM's first 8 bytes with the low byte
+    // cleared, as glibc does, so that a string routine can neither read it out nor write it back. Stored here, after the relocations and before the TLS
+    // block, the init_array constructors and main: everything that ran so far is this assembly, so no protected frame is live yet. Threads read the same
+    // global (set once, before any thread exists); a forked child keeps it (its frames were saved with it); only exec gives a new one.
+    "    cbz x12, 29f\n    ldr x10, [x12]\n    lsr x10, x10, #8\n    lsl x10, x10, #8\n" +
+    "    adrp x9, __stack_chk_guard\n    str x10, [x9, :lo12:__stack_chk_guard]\n" +
+    "29:\n" +
     // The main thread's TLS block: mapped here, never unmapped.
     "    mov x0, x24\n    mov x1, x25\n    bl abla_tls_bytes\n" +
     "    tbnz x0, #63, 99f\n" +
