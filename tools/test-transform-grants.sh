@@ -10,7 +10,8 @@
 # A `$name` subparser handler of a dependency is likewise judged by the dependency's grants, not by the file that uses its syntax (handler-undeclared, handler-declared),
 # and so is a `#` site the handler builds (syntaxCompile) into the using file (site-undeclared, site-nested, site-declared), and the finalizer of an
 # extension request it records, within the grants of the recording handler and of the file that declares the finalizer (finalizer-undeclared,
-# finalizer-declared; finalizer-package, finalizer-package-declared: a handler that passes another package's finalizer).
+# finalizer-declared; finalizer-package, finalizer-handler-package, finalizer-package-declared: a handler that passes another
+# package's finalizer).
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -240,8 +241,8 @@ use_finalizer finalizer-declared '$word 1;'
 build finalizer-declared
 [[ $status == 0 ]] && grep -q "\[$ABLA_GRANT_PROBE\]" "$out/finalizer-declared.log" ||
     fail "finalizer-declared: the declared finalizer did not read it (status $status): $(grep -m3 'error\|value' "$out/finalizer-declared.log")"
-# A handler may pass another package's finalizer: the finalizer runs within that package's grants too, not only the handler's. The handler's package
-# (middle-dep) declares environment and is granted it; the finalizer is in its own dependency (deep-dep).
+# A handler may pass another package's finalizer: the finalizer runs within that package's grants and within the handler's. The handler is in
+# middle-dep, the finalizer in middle-dep's own dependency, deep-dep.
 middle_handler='import "abla/compiler"
 import "abla/compiler/parser"
 import "deep-provider.ab"
@@ -254,7 +255,6 @@ compile fun wordParse(cursor: ParserCursor): SyntaxExpression {
     syntaxString("w")
 }
 #compilerRegisterSubparser("word", wordParse)
-#compilerGrant("environment")
 fun dependencyValue: string = "ok"'
 deep_finalizer='import "abla/compiler"
 import "abla/compiler/parser"
@@ -262,22 +262,30 @@ compile fun deepFinalize(payload: string, expression: SyntaxExpression): string 
     val seen = compilerEnvironment("ABLA_GRANT_PROBE")
     "fun finalizerProbe(): string = \"[$seen]\"\n"
 }'
-deep_case() { # deep_case <case> <deep-dep's declared capabilities> <deep-dep's grant line>
-    repository "$out/$1/deep-dep" deep-dep "$2" "$deep_finalizer"$'\n'"$3"
+granted='#compilerGrant("environment")'
+deep_case() { # deep_case <case> <middle-dep declares environment: yes or no> <deep-dep declares it: yes or no>
+    local middle_declared='' middle_grant='' deep_declared='' deep_grant=''
+    [[ $2 == no ]] || { middle_declared='"environment"'; middle_grant=$granted; }
+    [[ $3 == no ]] || { deep_declared='"environment"'; deep_grant=$granted; }
+    repository "$out/$1/deep-dep" deep-dep "$deep_declared" "$deep_finalizer"$'\n'"$deep_grant"
     commit "$out/$1/deep-dep" leaf
-    repository "$out/$1/middle-dep" middle-dep '"environment"' "$middle_handler"
+    repository "$out/$1/middle-dep" middle-dep "$middle_declared" "$middle_handler"$'\n'"$middle_grant"
     provider "$out/$1/middle-dep/src/deep-provider.ab" deepSource deep-dep "$out/$1/deep-dep"
     commit "$out/$1/middle-dep" middle
     application "$1" '"environment"' middle-dep
     use_finalizer "$1" '$word 1;'
     build "$1"
 }
-# finalizer-package: the finalizer's package declares nothing: refused, although the handler's package has the grant.
-deep_case finalizer-package '' ''
+# finalizer-package: the finalizer's package declares nothing: refused, although the handler's package is granted environment.
+deep_case finalizer-package yes no
 [[ $status != 0 ]] && ! grep -q "$ABLA_GRANT_PROBE" "$out/finalizer-package.log" ||
     fail "finalizer-package: another package's finalizer read the environment with the handler's grants (status $status): $(grep -m3 'error\|value' "$out/finalizer-package.log")"
+# finalizer-handler-package: the handler's package declares nothing: refused, although the finalizer's package is granted environment.
+deep_case finalizer-handler-package no yes
+[[ $status != 0 ]] && ! grep -q "$ABLA_GRANT_PROBE" "$out/finalizer-handler-package.log" ||
+    fail "finalizer-handler-package: a finalizer passed by a handler that has no grant read the environment (status $status): $(grep -m3 'error\|value' "$out/finalizer-handler-package.log")"
 # finalizer-package-declared: both packages declare and request it: the finalizer reads it (the control).
-deep_case finalizer-package-declared '"environment"' '#compilerGrant("environment")'
+deep_case finalizer-package-declared yes yes
 [[ $status == 0 ]] && grep -q "\[$ABLA_GRANT_PROBE\]" "$out/finalizer-package-declared.log" ||
     fail "finalizer-package-declared: the declared finalizer did not read it (status $status): $(grep -m3 'error\|value' "$out/finalizer-package-declared.log")"
 echo "transform grants: a dependency's subparser handler, the sites it builds and its extension finalizers run with the dependency's grants"
