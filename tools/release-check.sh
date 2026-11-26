@@ -166,7 +166,7 @@ actual=$(mktemp)
 # only exists when nothing was given with --artifacts, and also removes the two temporary lists.)
 trap 'rm -f -- "$expected" "$actual"; [[ -z ${source_dir:-} || -n $artifacts ]] || rm -rf -- "$source_dir"' EXIT
 ( cd "$out" && ls ) | sort >"$actual"   # (ls leaves out the .release-check marker)
-# The static compilers (#806 step C, one per architecture: x86_64 and aarch64) and the dynamic one that ships beside the static default for one release
+# The static compilers (#806 step C, one per architecture: x86_64 and aarch64) and the dynamic one that ships beside the static default as an opt-in
 # (decision #90 A: `ablac-x86_64-linux` is then the static compiler, `ablac-dynamic-x86_64-linux` the dynamic one) are optional extras: their names are
 # neither expected nor an extra; check 4 judges the dynamic one and check 7 each static one that is present.
 switched=0
@@ -393,7 +393,7 @@ if ((switched)) && [[ -f $out/ablac-dynamic-x86_64-linux ]]; then
     fi
 fi
 
-# 8. toolchain: when the release ships the dynamic toolchain archive beside the default (abla-toolchain-dynamic-x86_64-linux.tar.gz, one release, like
+# 8. toolchain: when the release ships the dynamic toolchain archive beside the default (abla-toolchain-dynamic-x86_64-linux.tar.gz, an opt-in, like
 # decision #90 A), `abla-toolchain-x86_64-linux.tar.gz` is the static package (tools/package-linux-static-toolchain.sh): no PT_INTERP and no
 # DT_NEEDED in libexec/ablac.bin and libexec/abla-install-xtensa-native, no shared library, libLLVM, libclang-cpp, clang, ld.lld, opt or llc in
 # it, at most 60 MB as an archive and 150 MB unpacked, and its launcher prints the version with an empty PATH.

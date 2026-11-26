@@ -24,9 +24,9 @@ a second Abla frontend or evaluator. LLVM/LLD, their archives and their build
 toolchain remain native dependencies.
 
 The v0.2.65 release workflow makes the static x86-64 compiler the default raw
-Linux asset and retains the dynamic one for the transition. From v0.2.66 the
+Linux asset and keeps the dynamic one as an opt-in asset (compile-time `dlopen`, stage 2 proof). From v0.2.66 the
 installable Linux toolchain archive is the static one too; the dynamic compiler
-and its libraries ship for one more release as `abla-toolchain-dynamic-x86_64-linux`.
+and its libraries ship as the opt-in `abla-toolchain-dynamic-x86_64-linux`.
 macOS has its own libSystem/Homebrew/SDK boundary. See
 [toolchain.md](toolchain.md), [bootstrap.md](bootstrap.md), and
 [targets.md](targets.md) for those distinctions.

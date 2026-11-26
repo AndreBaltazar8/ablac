@@ -88,7 +88,7 @@ static compiler, the standard library and runtime, compiler-rt's builtins and th
 `PATH`. The programs it builds need no libc at all unless they bring a C library (docs/toolchain.md). The
 standalone `ablac-x86_64-linux` release binary is the same statically linked compiler (a static-pie
 executable whose self-build is a fixpoint, which the release checks) and the bootstrap compiler. It has no
-`dlopen`: compile-time `nativeLibraries` need the dynamic compiler, shipped for one more release as
+`dlopen`: compile-time `nativeLibraries` need the dynamic compiler, shipped as an opt-in asset (the only Linux compiler that can run them, and the release's stage 2 reproducibility proof):
 `ablac-dynamic-x86_64-linux` (it names a Nix-store dynamic loader and finds libLLVM, libssl and libcrypto
 through Nix-store RUNPATH entries, so it runs only where those store paths exist, and is the byte-reproducible
 one) and as the `abla-toolchain-dynamic-x86_64-linux` archive. That archive bundles Abla's patched LLVM tools

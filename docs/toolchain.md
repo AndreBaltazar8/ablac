@@ -25,7 +25,7 @@ children), links with LLD in process, and starts wasm-ld and lld-link as childre
 asks for the external opt and llc on the `PATH` instead.
 
 The static compiler cannot `dlopen`, so compile-time `nativeLibraries` need the dynamically linked compiler. It
-ships for one more release as `ablac-dynamic-x86_64-linux`, the compiler built in the Nix shell (byte-reproducible;
+stays as the opt-in asset `ablac-dynamic-x86_64-linux` (the only Linux compiler with compile-time `dlopen`, and the release's stage 2 cmp proof until a static one can replace it), the compiler built in the Nix shell (byte-reproducible;
 it names a Nix-store dynamic loader and finds libLLVM through Nix-store RUNPATH entries, so it runs only where those
 store paths exist), and as the `abla-toolchain-dynamic-x86_64-linux` archive. That archive requires glibc 2.35 or
 later: Ubuntu 22.04, Debian 12 and later, and RHEL 9 and its rebuilds, whose glibc 2.34 carries the one 2.35
