@@ -31,7 +31,9 @@ head -c 3145728 /dev/urandom > "$out/docroot/big.bin"
 
 h2o_pid=
 server_pid=
+client_pid=
 cleanup() {
+    [[ -z $client_pid ]] || kill "$client_pid" 2> /dev/null || true
     [[ -z $h2o_pid ]] || kill "$h2o_pid" 2> /dev/null || true
     [[ -z $server_pid ]] || kill "$server_pid" 2> /dev/null || true
 }
@@ -46,7 +48,17 @@ free_port() {   # a port below the ephemeral range that nobody listens on
     return 1
 }
 
-# h2o on a TLS port and a plain one (HTTP/2 over cleartext needs no setup on h2o's side): /small.txt and /big.bin from the docroot, /echo (mruby: the request body back), /slow (2 s).
+wait_for_h2o_log() {
+    local message=$1
+    for _ in $(seq 600); do
+        grep -F "$message" "$out/h2o.log" > /dev/null && return 0
+        kill -0 "$h2o_pid" 2> /dev/null || break
+        sleep 0.1
+    done
+    return 1
+}
+
+# h2o on a TLS port and a plain one. The /slow handler waits for the script to release the response.
 start_h2o() {
     tls_port=$(free_port)
     plain_port=$(free_port)
@@ -54,11 +66,13 @@ start_h2o() {
     while [[ $plain_port == "$tls_port" ]]; do plain_port=$(free_port); done
     cat > "$out/h2o.conf" << EOF
 listen:
+  host: 127.0.0.1
   port: $tls_port
   ssl:
     certificate-file: $root/$out/p256.pem
     key-file: $root/$out/p256.key
 listen:
+  host: 127.0.0.1
   port: $plain_port
 http2-graceful-shutdown-timeout: 10
 hosts:
@@ -75,18 +89,16 @@ hosts:
         mruby.handler: |
           Proc.new do |env|
             File.open("$root/$out/slow-started", "w") { |marker| marker.write("started") }
-            sleep 2
+            sleep 0.1 until File.exist?("$root/$out/slow-release")
             [200, {"content-type" => "text/plain"}, ["slow\n"]]
           end
 EOF
-    h2o -c "$out/h2o.conf" > "$out/h2o.log" 2>&1 &
+    : > "$out/h2o.log"
+    h2o -c "$out/h2o.conf" >> "$out/h2o.log" 2>&1 &
     h2o_pid=$!
-    for _ in $(seq 600); do
-        ss -ltn "sport = :$tls_port" 2> /dev/null | grep LISTEN > /dev/null && ss -ltn "sport = :$plain_port" 2> /dev/null | grep LISTEN > /dev/null && return 0
-        kill -0 "$h2o_pid" 2> /dev/null || break
-        sleep 0.1
-    done
-    echo "http2 h2o: h2o did not start: $(head -5 "$out/h2o.log")" >&2
+    # A socket on the chosen port can belong to another process or address family.
+    wait_for_h2o_log "h2o server (pid:$h2o_pid) is ready to serve requests" && return 0
+    echo "http2 h2o: h2o did not start: $(tail -12 "$out/h2o.log")" >&2
     exit 1
 }
 stop_h2o() {
@@ -111,19 +123,24 @@ run_client "default options over plain http (HTTP/1.1)" "$plain_port" - default 
 run_client "http2 = false over TLS (HTTP/1.1)" "$tls_port" "$out/p256.pem" off "$out/docroot"
 stop_h2o
 for transport in tls plain; do
+    rm -f "$out/slow-started" "$out/slow-release"
     start_h2o
     if [[ $transport == tls ]]; then port=$tls_port; ca=$out/p256.pem; else port=$plain_port; ca=-; fi
     "$root/tools/run-limited.sh" "$out/h2o" "$port" "$ca" goaway "$out/docroot" > "$out/goaway.out" 2>&1 &
     client_pid=$!
-    for _ in $(seq 600); do grep -q '^sent' "$out/goaway.out" 2> /dev/null && break; sleep 0.1; done
-    grep -q '^sent' "$out/goaway.out" || { cat "$out/goaway.out" >&2; echo "http2 h2o: the client never sent the slow request" >&2; exit 1; }
-    # SIGTERM goes once h2o is running /slow (its handler leaves the marker), not after a pause: on a loaded
-    # machine the request may not have reached h2o 0.3 s after the client wrote it, and h2o would refuse it.
-    for _ in $(seq 600); do [[ -e $out/slow-started ]] && break; sleep 0.1; done
-    [[ -e $out/slow-started ]] || { cat "$out/goaway.out" >&2; echo "http2 h2o: h2o never began the slow request" >&2; exit 1; }
-    rm -f "$out/slow-started"
+    for _ in $(seq 600); do
+        [[ -e $out/slow-started ]] && break
+        kill -0 "$client_pid" "$h2o_pid" 2> /dev/null || break
+        sleep 0.1
+    done
+    [[ -e $out/slow-started ]] || { cat "$out/goaway.out" >&2; echo "http2 h2o ($transport): h2o never began the slow request" >&2; exit 1; }
     kill -TERM "$h2o_pid"
+    # Keep the request in flight until h2o has acted on SIGTERM, even if this script was descheduled.
+    wait_for_h2o_log 'received SIGTERM, gracefully shutting down' ||
+        { cat "$out/goaway.out" "$out/h2o.log" >&2; echo "http2 h2o ($transport): h2o did not start graceful shutdown" >&2; exit 1; }
+    : > "$out/slow-release"
     wait "$client_pid" || { cat "$out/goaway.out" >&2; echo "http2 h2o (GOAWAY, $transport): the client failed" >&2; exit 1; }
+    client_pid=
     grep -q '^http2 h2o goaway ok' "$out/goaway.out" || { cat "$out/goaway.out" >&2; echo "http2 h2o (GOAWAY, $transport)" >&2; exit 1; }
     wait "$h2o_pid" 2> /dev/null || true
     h2o_pid=
