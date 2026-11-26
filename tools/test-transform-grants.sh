@@ -7,7 +7,8 @@
 #   - inject: the dependency's transform puts `#compilerRunProcess` into the root's function: refused, nothing runs;
 #   - plain: the same transform with an ordinary body: the root's function is replaced (the control);
 #   - own: the root's own transform with the same body: allowed, the process runs (the grants are the same).
-# A `$name` subparser handler of a dependency is likewise judged by the dependency's grants, not by the file that uses its syntax (handler-undeclared, handler-declared).
+# A `$name` subparser handler of a dependency is likewise judged by the dependency's grants, not by the file that uses its syntax (handler-undeclared, handler-declared),
+# and so is a `#` site the handler builds (syntaxCompile) into the using file (site-undeclared, site-nested, site-declared).
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -149,4 +150,50 @@ use_word handler-declared
 build handler-declared
 [[ $status == 0 ]] && grep -q "${ABLA_GRANT_PROBE}x" "$out/handler-declared.log" ||
     fail "handler-declared: the declared handler did not read it (status $status): $(grep -m3 'error\|value' "$out/handler-declared.log")"
-echo "transform grants: a dependency's subparser handler runs with the dependency's grants"
+# A `#` site a handler builds (syntaxCompile) is a node of the using file, but the handler's package made it: it runs within the handler's grants too.
+site_handler='import "abla/compiler"
+import "abla/compiler/parser"
+compile fun wordParse(cursor: ParserCursor): SyntaxExpression {
+    parserRawSkipWhitespace(cursor)
+    val origin = parserParseAblaExpression(cursor)
+    parserRawExpect(cursor, ";")
+    syntaxCompile(syntaxCall("compilerEnvironment", [syntaxString("ABLA_GRANT_PROBE")]), origin)
+}
+#compilerRegisterSubparser("word", wordParse)
+fun dependencyValue: string = "ok"'
+use_site() { # use_site <case> <the expression that uses the word>
+    cat > "$out/$1/application/src/main.ab" <<EOT
+import "abla/io"
+import "abla/compiler"
+import "provider.ab"
+import dependencySource()
+#compilerGrant("environment")
+fun main { println("dependency value: '\${dependencyValue()}' \${$2}") }
+EOT
+}
+# site-undeclared: the dependency declares nothing; the root authorizes environment for its own file: the site the handler built is refused.
+repository "$out/site-undeclared/quiet-dep" quiet-dep '' "$site_handler"
+commit "$out/site-undeclared/quiet-dep" dependency
+application site-undeclared '"environment"' quiet-dep
+use_site site-undeclared '$word 1;'
+build site-undeclared
+[[ $status != 0 ]] && ! grep -q "$ABLA_GRANT_PROBE" "$out/site-undeclared.log" ||
+    fail "site-undeclared: a `#` site the dependency's handler built read the root's environment (status $status): $(grep -m3 'error\|value' "$out/site-undeclared.log")"
+# site-nested: the root's own `#` holds the handler's form: the site inside it is still the handler's.
+repository "$out/site-nested/quiet-dep" quiet-dep '' "$site_handler"
+commit "$out/site-nested/quiet-dep" dependency
+application site-nested '"environment"' quiet-dep
+use_site site-nested '#($word 1;)'
+build site-nested
+[[ $status != 0 ]] && ! grep -q "$ABLA_GRANT_PROBE" "$out/site-nested.log" ||
+    fail "site-nested: a handler's site inside the root's own `#` read the root's environment (status $status): $(grep -m3 'error\|value' "$out/site-nested.log")"
+# site-declared: the dependency declares environment and the root authorizes it: the site reads it (the control).
+repository "$out/site-declared/quiet-dep" quiet-dep '"environment"' "$site_handler"$'\n#compilerGrant("environment")'
+commit "$out/site-declared/quiet-dep" dependency
+application site-declared '"environment"' quiet-dep
+use_site site-declared '$word 1;'
+build site-declared
+[[ $status == 0 ]] && grep -q "$ABLA_GRANT_PROBE" "$out/site-declared.log" ||
+    fail "site-declared: the declared handler's site did not read it (status $status): $(grep -m3 'error\|value' "$out/site-declared.log")"
+echo "transform grants: a dependency's subparser handler and the sites it builds run with the dependency's grants"
+

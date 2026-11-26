@@ -172,6 +172,9 @@ var bootstrapCompileRoundSite: string = ""
 /** The file of the subparser use being expanded ("" outside one): the directory its handler's paths are read
  *  against (#95). */
 var bootstrapSubparserSourceFile: string = ""
+// The file that declares the `$` handler now running ("" outside one): a compile site the handler builds (syntaxCompile) is tagged with it, so that it runs
+// within that file's grants and not only the grants of the file that uses the syntax (ctNativeSiteGrants).
+var bootstrapSubparserHandlerFile: string = ""
 
 /** The file of a "<file>:<begin>:<end>" site ("" when it does not have that form). */
 fun bootstrapSiteFile(site: string): string {
@@ -199,6 +202,13 @@ fun bootstrapBuildCallDirectory(evaluator: BootstrapEvaluator): string {
     val file = bootstrapBuildCallFile(evaluator)
     if (file == "") return ""
     Path(file).parent().text
+}
+
+/** The tag of a compile site a `$` handler builds: the file that declares the handler (the site then runs within that file's grants as well as the using file's),
+ *  "" for a standard-library handler (its code is the root's: `$json` and the like keep the using file's grants) or outside a handler. */
+fun bootstrapSyntaxCompileTag(): string {
+    val file = bootstrapSubparserHandlerFile
+    if (file == "" || bootstrapStandardLibraryModuleSource(file)) "" else file
 }
 
 /** The source file a build call or file operation acts for (its paths are read against its directory), "" for none. */
@@ -367,7 +377,7 @@ fun bootstrapResolveCompilePath(var evaluator: BootstrapEvaluator, path: string,
     val directory = Path(file).parent().text
     // A dependency's absolute read needs filesystem.read by name (#112 A); without it its reads stay in its own tree.
     if (Path(path).isAbsolute() && !write) {
-        if (ctNativeAbsoluteReadAllowed(file)) return path
+        if (ctNativeAbsoluteReadAllowed(file) && ctNativeTagsAbsoluteReadAllowed()) return path
         return bootstrapContainBuildCallPath(evaluator, directory, path,
             "a dependency's compile-time code's (its absolute reads need filesystem.read named for it in the root's [dependencyCompileCapabilities])", followLast)
     }
@@ -577,20 +587,91 @@ fun bootstrapCompilerProgramChange(
     if (!ctNativeModuleGrantsActive || handle < 0 || handle >= evaluator.declarations.size) return ""
     val actor = if (bootstrapCompilerTransformActive && bootstrapCompilerTransformActionFile != "") bootstrapCompilerTransformActionFile
         else bootstrapBuildCallFile(evaluator)
+    // A `#` site a dependency's `$` handler built also acts for the handler's file (ctNativeSiteTags): every one of them must be allowed.
+    val declaration = evaluator.declarations[handle]
+    var refused = bootstrapProgramChangeRefusal(evaluator.allowedCompileEffects, actor, declaration, operation)
+    if (!bootstrapCompilerTransformActive) {
+        for (tag in ctNativeSiteTagList) {
+            if (refused == "") refused = bootstrapProgramChangeRefusal(evaluator.allowedCompileEffects, tag, declaration, operation)
+        }
+    }
+    refused
+}
+
+/** Why the compile-time code of the file `actor` may not change `declaration` ("" when it may): the rule of bootstrapCompilerProgramChange. */
+fun bootstrapProgramChangeRefusal(
+    allowed: int,
+    actor: string,
+    declaration: BootstrapDeclaration,
+    operation: string
+): string {
     if (actor == "") return ""
     val actingPackage = ctNativePackageAt(actor)
     if (actingPackage == "") return ""
-    val declaration = evaluator.declarations[handle]
     val source = declaration.sourceIdentity
     if (bootstrapStandardLibraryModuleSource(source) || source.startsWith("<generated:")) return ""
     val targetPackage = ctNativePackageAt(source)
     if (targetPackage == actingPackage) return ""
-    if ((ctNativeGrantsAt(actor, evaluator.allowedCompileEffects) & BOOTSTRAP_COMPILE_TRANSFORM_PROGRAM) != 0) return ""
+    if ((ctNativeGrantsAt(actor, allowed) & BOOTSTRAP_COMPILE_TRANSFORM_PROGRAM) != 0) return ""
     val owner = if (actingPackage == "?") "the module $actor" else "dependency '$actingPackage'"
     val of = if (targetPackage == "") "the root project" else if (targetPackage == "?") "no package of this build" else "package '$targetPackage'"
     "error[E_COMPILER_TRANSFORM_PROGRAM]: $operation can't change `${declaration.name}`: it belongs to $of, and a transform of $owner rewrites only its own package's functions; " +
         "the root project may grant it `transform.program` (add it to the root's `compileCapabilities`, name it for the package in `[dependencyCompileCapabilities]` " +
         "and request it with `#compilerGrant(\"transform.program\")` in the transform's module)\n"
+}
+
+/** The indexes in `declarations` of the class, interface and named-type (`type Meters = int`) declarations an extension's `owner` type (`Item`, `Box<int>`, `Item?`,
+ *  `pkg.Item`) names. Empty when it names none (a built-in type, or a mistake sema reports). A named type is a type of its own, not an alias of what it holds. */
+fun bootstrapExtensionTargets(declarations: array<BootstrapDeclaration>, owner: string): array<int> {
+    var cut = owner.size
+    var index = 0
+    while (index < owner.size) {
+        if ((owner[index] == 60 || owner[index] == 63) && index < cut) cut = index
+        index = index + 1
+    }
+    var name = owner.slice(0, cut)
+    var dot = name.size
+    while (dot > 0 && name[dot - 1] != 46) dot = dot - 1
+    name = name.slice(dot, name.size)
+    var found: array<int> = []
+    var at = 0
+    while (at < declarations.size) {
+        val declaration = declarations[at]
+        if (declaration.name == name && declaration.extensionOwner == "" &&
+            (declaration.kind == "class" || declaration.kind == "interface" || declaration.kind == "type")) found.append(at)
+        at = at + 1
+    }
+    found
+}
+
+/** The errors ("" for none) of the extensions a generated module added, the declarations of `generated` among `declarations`: a module's compile-time code
+ *  (`actor`, the module that held the generating call or transform) adds `extend T : I`, an extension function or an extension field only to a type of
+ *  its own package unless it holds `transform.program` (the rule of compiler.addConformance and compiler.addExtensionField, which a generated module's
+ *  source would otherwise walk around). The owner is resolved against the whole program. */
+fun bootstrapGeneratedExtensionRefusals(
+    declarations: array<BootstrapDeclaration>,
+    generated: array<int>,
+    actor: string,
+    allowed: int
+): string {
+    var errors = ""
+    for (at in generated) {
+        val added = declarations[at]
+        val owner = if (added.kind == "extend") added.name else added.extensionOwner
+        if (owner != "") {
+            var refused = ""
+            val targets = bootstrapExtensionTargets(declarations, owner)
+            var ownPackage = false
+            for (target in targets) {
+                if (bootstrapProgramChangeRefusal(allowed, actor, declarations[target], "a generated module's extension of `${owner}`") == "") ownPackage = true
+            }
+            if (targets.size > 0 && !ownPackage) {
+                refused = bootstrapProgramChangeRefusal(allowed, actor, declarations[targets[0]], "a generated module's extension of `${owner}`")
+            }
+            if (refused != "") errors = "$errors$refused"
+        }
+    }
+    errors
 }
 
 /** bootstrapCompilerTransformTarget and bootstrapCompilerProgramChange for one change a transform or a `#` site asks for. */
@@ -13334,7 +13415,7 @@ fun bootstrapEvaluateCallHost(
         }
         // A dependency's site reaching another package's tree is an absolute-read-like reach (#112 A): it needs
         // filesystem.read named for it in the root's [dependencyCompileCapabilities], as an absolute path does.
-        if (sitePackage != "" && !ctNativeAbsoluteReadAllowed(ctNativeSiteFile)) {
+        if (sitePackage != "" && !(ctNativeAbsoluteReadAllowed(ctNativeSiteFile) && ctNativeTagsAbsoluteReadAllowed())) {
             evaluator.errors = evaluator.errors + 1
             evaluator.recordEvaluatorDiagnostic("E_PACKAGE_FILE_DENIED",
                 "dependency '${dependency.text}' file '${relative.text}': package '$sitePackage' reads another package's tree only with filesystem.read named for it in the root's [dependencyCompileCapabilities]")
@@ -13933,7 +14014,7 @@ fun bootstrapEvaluateCallSyntax(
                 "invalid", "", origin.begin, origin.end, []
             ))
         } else result = evaluator.syntaxValue(BootstrapExpression(
-            "compile", "", origin.begin, origin.end, [child]
+            "compile", bootstrapSyntaxCompileTag(), origin.begin, origin.end, [child]
         ))
     }
     if (targetName == "syntaxIdentifier") {
@@ -15328,9 +15409,11 @@ fun bootstrapInvokeSubparserHandlerIn(
     // The handler is its declaring package's code: it runs with what the file that declares it is granted, within what the using file has
     // (a dependency's handler, used from the root's file, does not get the root's grants; a standard-library handler is the root's).
     var allowedCompileEffects = siteCompileEffects
+    var handlerFile = ""
     for (candidate in declarations) {
         if (candidate.name == handler && candidate.extensionOwner == "" && candidate.kind == "compile.fun") {
             allowedCompileEffects = allowedCompileEffects & ctNativeGrantsAt(candidate.sourceIdentity, siteCompileEffects)
+            handlerFile = candidate.sourceIdentity
         }
     }
     val stopsBefore = bootstrapEvalDepthStops
@@ -15377,7 +15460,9 @@ fun bootstrapInvokeSubparserHandlerIn(
     )
     // The paths the handler names are the using file's (#95), not the subparser library's.
     val outerSubparserFile = bootstrapSubparserSourceFile
+    val outerHandlerFile = bootstrapSubparserHandlerFile
     bootstrapSubparserSourceFile = bootstrapGenericSourceFile(cursor.sourceIdentity)
+    bootstrapSubparserHandlerFile = handlerFile
     val result = evaluator.evaluate(BootstrapExpression(
         "call",
         handler,
@@ -15392,6 +15477,7 @@ fun bootstrapInvokeSubparserHandlerIn(
         )]
     ))
     bootstrapSubparserSourceFile = outerSubparserFile
+    bootstrapSubparserHandlerFile = outerHandlerFile
     var expression = BootstrapExpression(
         "invalid",
         "subparser-result",

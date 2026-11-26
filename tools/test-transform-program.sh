@@ -10,7 +10,10 @@
 #   - own: the dependency's transform replaces its own package's function: allowed (the control);
 #   - granted: the root grants transform.program to the dependency (named, pinned, requested): the root's function is replaced;
 #   - registered: the root names the dependency's handler in its own `#compiler.transform`: allowed (the root vouches for it);
-#   - root: the root's own transform on its own function: allowed.
+#   - root: the root's own transform on its own function: allowed;
+#   - generated-*: a module the dependency's transform generates (compilerGenerateModule) may not add an extension function, field or conformance to a type of
+#     the root either, by the name of a class or of a named type (generated-function, generated-field, generated-named, generated-extend); its own package's type
+#     (generated-own) and a granted one (generated-granted) are allowed.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -141,4 +144,46 @@ $replace_root
 build root
 [[ $status == 0 ]] && grep -q "dependency value: 'ok' 42" "$out/root.log" ||
     fail "root: the root's own transform was refused (status $status): $(grep -m3 'error\|value' "$out/root.log")"
-echo "transform program: a dependency's transform rewrites only its own package's functions unless the root grants transform.program by name; the root's own transforms are unchanged"
+# A generated module is source the program's modules see as written, so what a transform may not do by compiler.addConformance and compiler.addExtensionField
+# it may not do by compilerGenerateModule either: an extension of another package's type is judged on the parsed declarations.
+generate() { # generate <module source of the generated code> <dependency's own top-level lines>
+    printf '%s\n' 'import "abla/compiler"' "${2:-}" 'compile fun configure(): void {' "    compilerGenerateModule(\"gen\", \"$1\")" '    return' '}' '#compiler.transform(configure)' 'fun dependencyValue: string = "ok"'
+}
+generated_root() { # generated_root <case> <the use in main's output>
+    cat > "$out/$1/application/src/main.ab" <<EOT
+import "abla/io"
+import "provider.ab"
+import dependencySource()
+interface Tagged {}
+class Item(val n: int)
+type Meters = int
+fun main { println("dependency value: '\${dependencyValue()}' $2") }
+EOT
+}
+generated_case() { # generated_case <case> <generated source> <use> <wanted output or ""> <capabilities> <dependency lines>
+    repository "$out/$1/quiet-dep" quiet-dep "${5:+\"transform.program\"}" "$(generate "$2" "${6:-}")"
+    [[ -z ${5:-} ]] || printf '%s\n' '#compilerGrant("transform.program")' >> "$out/$1/quiet-dep/src/quiet-dep.ab"
+    commit "$out/$1/quiet-dep" dependency
+    application "$1" "${5:+\"transform.program\"}" quiet-dep "${5:+$(printf '[dependencyCompileCapabilities]\nquiet-dep = ["transform.program"]')}"
+    generated_root "$1" "$3"
+    build "$1"
+}
+refused_generated() { # refused_generated <case> <generated source> <use>
+    generated_case "$1" "$2" "$3" ""
+    [[ $status != 0 ]] && grep -q 'E_COMPILER_TRANSFORM_PROGRAM' "$out/$1.log" ||
+        fail "$1: a dependency's generated module extended the root's type (status $status): $(grep -m3 'error\|value' "$out/$1.log")"
+}
+refused_generated generated-function 'fun Item.hello(): int = 77\n' '${Item(1).hello()}'
+refused_generated generated-field 'var Item.extra: int = 5\n' '${Item(1).extra}'
+refused_generated generated-named 'fun Meters.twice(): int = 2\n' '${Meters(1).twice()}'
+refused_generated generated-extend 'extend Item : Tagged\n' '${Item(1).n}'
+# generated-own: an extension of the dependency's own class, in the generated module: allowed (the control).
+generated_case generated-own 'fun Mine.hello(): int = 77\n' '' "" "" 'class Mine(val n: int)'
+[[ $status == 0 ]] && grep -q "dependency value: 'ok'" "$out/generated-own.log" ||
+    fail "generated-own: an extension of the dependency's own class was refused (status $status): $(grep -m3 'error\|value' "$out/generated-own.log")"
+# generated-granted: the root names transform.program for the dependency: the extension of the root's class is allowed.
+generated_case generated-granted 'fun Item.hello(): int = 77\n' '${Item(1).hello()}' '' grant
+[[ $status == 0 ]] && grep -q "dependency value: 'ok' 77" "$out/generated-granted.log" ||
+    fail "generated-granted: the named transform.program grant did not let the generated extension through (status $status): $(grep -m3 'error\|value' "$out/generated-granted.log")"
+echo "transform program: a dependency's transform, and the modules it generates, change only its own package's types and functions unless the root grants transform.program by name; the root's own transforms are unchanged"
+

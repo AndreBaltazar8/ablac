@@ -561,14 +561,17 @@ Code that runs for one package does not borrow another's grants:
 
 - A subparser handler (`#compilerRegisterSubparser`) runs with the grants of the file that declares it, within what the file that uses the syntax
   has: a dependency's handler gets the dependency's grants, not those of the root file that writes `$name ...`. A standard-library handler is
-  the root's.
+  the root's. A `#` site that a handler builds into the using file (`syntaxCompile`) runs within the handler's file's grants as well, however many
+  handlers' sites it holds.
 - A transform (or `#` site) of a dependency changes only functions of its own package: `compiler.replaceFunctionBody`,
   `addFunctionAnnotation`, `addConformance`, `addExtensionField` and `removeExtensionField` on a function or class of another package are
   `E_COMPILER_TRANSFORM_PROGRAM`, naming `transform.program`, unless the root gives it: the root lists `transform.program` in its own
   `compileCapabilities`, names it for that package in `[dependencyCompileCapabilities]` (it holds only while `abla.lock` pins the package, as
   for `trusted.native`), and the transform's module requests it with `#compilerGrant("transform.program")`. The root's own transforms are not
   held to it (a root that registers a dependency's handler with its own `#compiler.transform(handler)` vouches for it), the standard library is
-  governed by `transform.library`, and what a transform generated is its own. A package that rewrites the
+  governed by `transform.library`, and what a transform generated is its own. A module a dependency's transform generates (`compilerGenerateModule`)
+  may not add an extension function, an extension field or an `extend` to a type of another package either (class, interface or named type), judged
+  on the parsed declarations. A package that rewrites the
   functions its users annotate therefore needs that line from each root that uses it.
 - A body a transform installs (`compiler.replaceFunctionBody`) may carry compile-time code (`#`, `$`) only when the transform's own grants
   include those of the file the function is in; otherwise `E_COMPILER_TRANSFORM_GRANTS`. A body without such code is runtime code: a `#` site
@@ -616,7 +619,7 @@ so it is held for as few packages as possible and never by default.
   its own `#compilerGrant` cannot give it. The standard library's own raw memory (a byte buffer it allocates and owns) is contained and asks for
   nothing; the network scopes of `abla/tls/pure` and `abla/platform/host/tls` ask for `network` only.
 - **It is not lent.** Code that runs for a package runs with that package's grants, whichever file it stands in: a subparser handler runs with the
-  grants of the file that declares it, within those of the file that uses the syntax; a body a transform installs may carry compile-time code
+  grants of the file that declares it, within those of the file that uses the syntax, and so does a `#` site it builds; a body a transform installs may carry compile-time code
   (`#`, `$`) only if the transform's own grants cover the grants of the file the function is in. (A program a build call builds is its own
   project, authorized by its own `abla.toml`: the code that builds it vouches for that tree.)
 - **At run time** it means nothing: a compiled program's `trusted` code runs as any program does, with no sandbox, and a program that is built needs
