@@ -33,6 +33,13 @@ fun probeLoad(lows: KernelU32Buffer, highs: KernelU32Buffer, f: KernelF32Buffer,
     }
 }
 
+/** atomicAdd of 3 at each index, the old value (0 outside the buffer) kept in `out`: every index is its own thread's, so the sums are deterministic. */
+@kernel
+fun probeAtomic(lows: KernelU32Buffer, highs: KernelU32Buffer, w: KernelU32Buffer, out: KernelU32Buffer, n: int) {
+    val t = kernelGlobalId()
+    if (t < n) out.store(t, w.atomicAdd(probeIndex(lows, highs, t), 3))
+}
+
 /** One store of a recognisable value to each buffer, at each index. */
 @kernel
 fun probeStore(lows: KernelU32Buffer, highs: KernelU32Buffer, f: KernelF32Buffer, w: KernelU32Buffer, h: KernelU16Buffer, r: KernelU8Buffer, n: int) {
@@ -77,6 +84,10 @@ trusted fun probeImage(kind: int, count: int, start: int, total: int): NativeByt
     image
 }
 
+/** The little-endian 32-bit word at byte `offset` of `buffer`. */
+trusted fun probeWord(buffer: NativeByteBuffer, offset: int): int =
+    buffer.load(offset) | (buffer.load(offset + 1) << 8) | (buffer.load(offset + 2) << 16) | (buffer.load(offset + 3) << 24)
+
 /** The bytes of two images that differ. */
 trusted fun probeDifferences(a: NativeByteBuffer, b: NativeByteBuffer): int {
     var different = 0
@@ -88,7 +99,8 @@ trusted fun probeDifferences(a: NativeByteBuffer, b: NativeByteBuffer): int {
 trusted fun probeModel(image: NativeByteBuffer, kind: int, count: int, start: int): int {
     var wrong = 0
     val width = probeWidth(kind)
-    val sentinel = if (kind == 0) int(f32ToBits(f32(77.0))) else if (kind == 1) 2863311530 else if (kind == 2) 48059 else 204
+    // (the u32 buffer was then added 3 at the same indices by probeAtomic)
+    val sentinel = if (kind == 0) int(f32ToBits(f32(77.0))) else if (kind == 1) (2863311530 + 3) & 4294967295 else if (kind == 2) 48059 else 204
     for (b in 0 until image.capacity) {
         if (b < start || b >= start + count * width) {
             if (image.load(b) != 90) wrong += 1
@@ -137,6 +149,10 @@ trusted fun probeCases(var device: CudaKernelDevice): int {
     val cOut = KernelU32Buffer(nativePointerAddress(cpuOut.address), n * 10)
     kernelRunCpu((n + 63) / 64, 64) { probeLoad(cpuLows, cpuHighs, cf, cw, ch, cr, cOut, n) }
     kernelRunCpu((n + 63) / 64, 64) { probeStore(cpuLows, cpuHighs, cf, cw, ch, cr, n) }
+    val cpuAtomic = nativeByteBuffer(n * 4)
+    val gpuAtomic = nativeByteBuffer(n * 4)
+    val cAtomic = KernelU32Buffer(nativePointerAddress(cpuAtomic.address), n)
+    kernelRunCpu((n + 63) / 64, 64) { probeAtomic(cpuLows, cpuHighs, cw, cAtomic, n) }
 
     val dLows = device.allocate(n * 4)
     val dHighs = device.allocate(n * 4)
@@ -145,7 +161,8 @@ trusted fun probeCases(var device: CudaKernelDevice): int {
     val dW = device.allocate(totals[1])
     val dH = device.allocate(totals[2])
     val dR = device.allocate(totals[3])
-    if (dLows == null || dHighs == null || dOut == null || dF == null || dW == null || dH == null || dR == null) {
+    val dAtomic = device.allocate(n * 4)
+    if (dLows == null || dHighs == null || dOut == null || dF == null || dW == null || dH == null || dR == null || dAtomic == null) {
         println("probe: ${device.error}")
         return 1
     }
@@ -158,13 +175,15 @@ trusted fun probeCases(var device: CudaKernelDevice): int {
         !device.launch("probeLoad", (n + 63) / 64, 64, cudaKernelArguments().buffer(dLows.words()).buffer(dHighs.words()).buffer(gf).buffer(gw)
             .buffer(gh).buffer(gr).buffer(dOut.words()).integer(n)) || !device.download(dOut, gpuOut) ||
         !device.launch("probeStore", (n + 63) / 64, 64, cudaKernelArguments().buffer(dLows.words()).buffer(dHighs.words()).buffer(gf).buffer(gw)
-            .buffer(gh).buffer(gr).integer(n)) || !device.download(dF, gpuImages[0]) || !device.download(dW, gpuImages[1]) ||
+            .buffer(gh).buffer(gr).integer(n)) ||
+        !device.launch("probeAtomic", (n + 63) / 64, 64, cudaKernelArguments().buffer(dLows.words()).buffer(dHighs.words()).buffer(gw)
+            .buffer(dAtomic.words()).integer(n)) || !device.download(dAtomic, gpuAtomic) || !device.download(dF, gpuImages[0]) || !device.download(dW, gpuImages[1]) ||
         !device.download(dH, gpuImages[2]) || !device.download(dR, gpuImages[3])) {
         println("probe: ${device.error}")
         return 1
     }
     var wrong = 0
-    val loadDifferences = probeDifferences(cpuOut, gpuOut)
+    val loadDifferences = probeDifferences(cpuOut, gpuOut) + probeDifferences(cpuAtomic, gpuAtomic)
     var storeDifferences = 0
     var modelWrong = 0
     for (kind in 0 until 4) {
@@ -179,6 +198,12 @@ trusted fun probeCases(var device: CudaKernelDevice): int {
         if ((cpuOut.loadI64(t * 40) & 4294967295) != want) loadModelWrong += 1
         val byteWant = if (index >= 0 && index < counts[3]) probeInitial(3, index) else 0
         if ((cpuOut.load(t * 40 + 12)) != byteWant) loadModelWrong += 1
+    }
+    // atomicAdd's old values on the CPU backend: the stored sentinel inside the buffer, 0 outside.
+    for (t in 0 until n) {
+        val index = PROBE_INDICES[t]
+        val want = if (index >= 0 && index < counts[1]) 2863311530 else 0
+        if (probeWord(cpuAtomic, t * 4) != want) loadModelWrong += 1
     }
     println("probe: ${n} indices on 4 buffer types: loads differ in $loadDifferences bytes, stores in $storeDifferences, model errors $modelWrong, load model errors $loadModelWrong")
     wrong = loadDifferences + storeDifferences + modelWrong + loadModelWrong
