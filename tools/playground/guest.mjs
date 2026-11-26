@@ -53,7 +53,8 @@ export async function runGuest(bytes, stdoutBudget = outputLimitBytes) {
     }
     if (!Number.isInteger(status)) throw new Error("Invalid playground guest status");
     return {
-        status,
+        // As the operating system reports it for the CLI's build of the same program: the low eight bits of main's value.
+        status: status & 255,
         stdout: new TextDecoder().decode(output.subarray(0, length)),
         outputTruncated,
         memoryBytes: memory.buffer.byteLength,

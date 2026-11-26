@@ -7,6 +7,8 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 import { boundedCompiler, compile, compileGuest, createBase, run } from "./host.mjs";
 import { runGuest } from "./guest.mjs";
+import { runGuestWithDeadline } from "./guest-host.mjs";
+import { nodeGuestWorker } from "./node-guest-worker.mjs";
 
 const [wasmPath, root, wasiDirectory] = process.argv.slice(2);
 const module = await WebAssembly.compile(readFileSync(wasmPath));
@@ -146,5 +148,34 @@ const initialized = await compileGuest(bounded, base, new Map([["main.ab",
 check("compiled mode rejects project runtime initialization",
     !initialized.ok && initialized.wasm === null && /without runtime global initializers/.test(initialized.stderr),
     initialized.stderr.trim());
+
+// Compile-phase output counts against the guest's budget; the limits of the subset refuse instead of emitting; a loop that never ends is
+// stopped by the page's deadline (#1139 area 11).
+const noisy = await compileGuest(bounded, base, new Map([["main.ab",
+    'import "abla/io"\n\nfun noise(): int {\n    println("compile-time noise")\n    1\n}\n\nfun main: int {\n    val k = #noise()\n    println("hi")\n    k\n}\n',
+]]));
+check("compile-phase stdout is subtracted from the guest's output budget",
+    noisy.ok && noisy.stdout === "compile-time noise\n" && noisy.stdoutBudget === 1048576 - 19, JSON.stringify({ ok: noisy.ok, stdout: noisy.stdout, budget: noisy.stdoutBudget, stderr: noisy.stderr.slice(0, 100) }));
+const longLiteral = await compileGuest(bounded, base, new Map([["main.ab", `import "abla/io"\n\nfun main: int {\n    println("${"x".repeat(70000)}")\n    0\n}\n`]]));
+check("a literal that does not fit the 64 KiB memory is refused", !longLiteral.ok && longLiteral.wasm === null && /unsupported lowered operation/.test(longLiteral.stderr), longLiteral.stderr.slice(0, 120));
+let manyLines = 'import "abla/io"\n\nfun main: int {\n';
+for (let line = 0; line < 600; line++) manyLines += `    println("${"y".repeat(120)}")\n`;
+manyLines += "    0\n}\n";
+const crowded = await compileGuest(bounded, base, new Map([["main.ab", manyLines]]));
+check("literals that together pass 64 KiB are refused", !crowded.ok && crowded.wasm === null && /unsupported lowered operation/.test(crowded.stderr), crowded.stderr.slice(0, 120));
+let straight = "fun main: int {\n    var a = 1\n";
+for (let line = 0; line < 3000; line++) straight += "    a = a + 1\n";
+straight += "    a\n}\n";
+const tooLong = await compileGuest(bounded, base, new Map([["main.ab", straight]]));
+check("a main with more than 4096 lowered instructions is refused", !tooLong.ok && tooLong.wasm === null && /the prototype accepts/.test(tooLong.stderr), tooLong.stderr.slice(0, 120));
+const spin = await compileGuest(bounded, base, new Map([["main.ab", "fun main: int {\n    var i = 0\n    while (i != 12345678901) {\n        i = i + 2\n    }\n    0\n}\n"]]));
+check("an endless loop compiles to a guest", spin.ok && WebAssembly.validate(spin.wasm), spin.stderr.slice(0, 120));
+if (spin.ok) {
+    const stopped = await Promise.race([runGuestWithDeadline(spin.wasm, spin.stdoutBudget, { timeoutMilliseconds: 800, spawn: nodeGuestWorker }), new Promise((resolve) => setTimeout(() => resolve({ hung: true }), 6000))]);
+    check("the page stops an endless loop at its deadline", stopped.timedOut === true, JSON.stringify(stopped));
+}
+const reader = 'import "abla/fs"\n\nfun size(): int = path("main.ab").readText().size\n\nfun main: int {\n    val n = #size()\n    n\n}\n';
+const hostile = await compileGuest(bounded, base, new Map([["main.ab", reader], ["abla.toml", 'compileCapabilities = ["filesystem.read", "filesystem.write", "trusted.native"]\n']]));
+check("a project's own abla.toml cannot grant the compile-time site a capability", !hostile.ok && hostile.wasm === null && /compile\.effect-denied|capability/.test(hostile.stderr), hostile.stderr.slice(0, 160));
 
 process.exit(failed ? 1 : 0);

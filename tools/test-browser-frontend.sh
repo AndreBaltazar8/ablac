@@ -23,3 +23,5 @@ if command -v wasmtime >/dev/null; then
 fi
 node "$project_root/tools/playground/frontend-check.mjs" \
     "$output_directory/browser-frontend.wasm" "$project_root" "$output_directory"
+node "$project_root/tools/playground/guest-check.mjs"
+node "$project_root/tools/playground/guest-fuzz.mjs" "$output_directory/browser-frontend.wasm" "$project_root" 40 1
