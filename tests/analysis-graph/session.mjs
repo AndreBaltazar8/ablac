@@ -1740,27 +1740,35 @@ async function unchangedInputs() {
 }
 
 const tests = { unchanged_inputs: unchangedInputs, compound_assignment: () => compoundAssignmentFix('graph-v1'), compound_assignment_v2: () => compoundAssignmentFix('graph-v2'), index_loop: () => indexLoopFix('graph-v1'), index_loop_v2: () => indexLoopFix('graph-v2'), logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
-async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false, strings = false, fields = false, extended = false, parens = false, loops = false, imported = false, globals = false, arrays = false) {
-    // An imported class: declared in its own module.
-    const head = (imported ? 'import "./point.ab"\n' : '') + (arrays ? 'fun answer(left: int, right: int, xs: array<int>): int ' : locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
+async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false, strings = false, fields = false, extended = false, parens = false, loops = false, imported = false, globals = false, arrays = false, importedCalls = false) {
+    // An imported class: declared in its own module. Imported functions: of two modules of the project and the standard library.
+    const head = (imported ? 'import "./point.ab"\n' : '') + (importedCalls ? 'import "./lib.ab"\nimport "./other.ab"\nimport "abla/bits"\n' : '') + (arrays ? 'fun answer(left: int, right: int, xs: array<int>): int ' : locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
         : fields ? 'fun answer(left: int, right: int, p: Point): int = ' : 'fun answer(left: int, right: int): int = ');
     // A field of another type (`tags`) is never read, but does not keep the class from the checker.
     const point = 'class Point(val x: int, var y: int, val label: string = "p", val tags: array<string> = [], val weights: array<int> = []) {\n    fun total(): int = this.x + this.y\n    fun scaled(k: int): int = this.x * k\n    fun name(): string = this.label\n}\n';
     const block = (...lines) => '{\n' + lines.map(line => '    ' + line + '\n').join('') + '}';
     const initial = calls ? 'step(left) + right' : locals ? block('val t = left + right', 't') : returns ? block('if (left < 0) return right', 'left + right') : strings ? 'text.size + left' : fields ? 'p.x + left'
-        : globals ? 'LIMIT + left' : arrays ? block('var s = xs.size', 'for (x in xs) s += x', 's + left') : loops ? block('var s = 0', 'for (i in 0 until left) s += i', 's + right') : 'left + right';
+        : globals ? 'LIMIT + left' : importedCalls ? 'twice(left) + other(right) + bitAnd(left, right)' : arrays ? block('var s = xs.size', 'for (x in xs) s += x', 's + left') : loops ? block('var s = 0', 'for (i in 0 until left) s += i', 's + right') : 'left + right';
     // A global `i`: the loop's `i` ends with the loop, so a later `i` is the global, left to full typing.
     const rest = '\nfun later(): int = 7\n' + (loops ? 'val i: int = 3\n' : '')
         // Global values after the function: their offsets move with each edit. `NAMES` is not a scalar.
         + (globals ? 'val LIMIT: int = 40\nval scale = 3\nvar counter: int = 0\nval NAMES: array<string> = []\n' : '') + (calls
         ? 'fun step(n: int): int = n + 1\nfun shift(n: int): int = n * 2\n' : '') + (fields && !imported ? point : '');
-    const main = 'import "./dep.ab"\n' + (imported ? 'import "./point.ab"\n' : '') + (extended ? 'import "./ext.ab"\n' : '') + 'fun main: int = answer(2, 3' + (arrays ? ', [1, 2, 3]' : strings ? ', "abc"' : fields ? ', Point(4, 5)' : '') + ') + later()\n';
-    const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : locals ? 'checked-locals' : returns ? 'checked-returns' : strings ? 'checked-strings' : extended ? 'checked-extended' : imported ? 'checked-imported' : globals ? 'checked-globals' : arrays ? 'checked-arrays' : loops ? 'checked-loops' : parens ? 'checked-parens' : fields ? 'checked-fields' : 'checked-scalar', {
+    const main = 'import "./dep.ab"\n' + (imported ? 'import "./point.ab"\n' : '') + (importedCalls ? 'import "./shadow.ab"\n' : '') + (extended ? 'import "./ext.ab"\n' : '') + 'fun main: int = answer(2, 3' + (arrays ? ', [1, 2, 3]' : strings ? ', "abc"' : fields ? ', Point(4, 5)' : '') + ') + later()\n';
+    const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : locals ? 'checked-locals' : returns ? 'checked-returns' : strings ? 'checked-strings' : extended ? 'checked-extended' : imported ? 'checked-imported' : globals ? 'checked-globals' : importedCalls ? 'checked-calls-imported' : arrays ? 'checked-arrays' : loops ? 'checked-loops' : parens ? 'checked-parens' : fields ? 'checked-fields' : 'checked-scalar', {
         'abla.toml': 'name = "checked-scalar"\nentry = "main.ab"\nvisibility = "imports"\n',
         'main.ab': main,
         'dep.ab': head + initial + rest,
         // An extension of the class: `p.x` is left to full typing.
         ...(imported ? { 'point.ab': point } : {}),
+        // `hidden` is private, `pair` overloaded, `withDefault` defaulted, and `bitOr` shadows the standard library's.
+        ...(importedCalls ? {
+            'lib.ab': 'fun twice(n: int): int = n * 2\nfun third(n: int): int = n / 3\nprivate fun hidden(n: int): int = n\n' +
+                'fun pair(a: int): int = a\nfun pair(a: int, b: int): int = a + b\nfun withDefault(n: int, k: int = 1): int = n * k\n',
+            'other.ab': 'fun other(n: int): int = n - 1\n',
+            // Not imported by dep.ab, whose `bitOr` is the standard library's, but the project has two of that name.
+            'shadow.ab': 'fun bitOr(left: int, right: int): int = left + right\n',
+        } : {}),
         ...(extended ? { 'ext.ab': 'import "./dep.ab"\nfun Point.twice(): int = this.x * 2\n' } : {}),
     });
     const file = path.join(p, 'dep.ab');
@@ -1835,6 +1843,8 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
                 // Bodies that end in a closing parenthesis, which the parsed expression ends before.
                 : parens
                 ? (i % 2 ? '(left + ' + n + ')' : 'left * (right - ' + n + ')')
+                : importedCalls
+                ? (i % 2 ? 'twice(right + ' + n + ') + other(left) + bitXor(left, ' + n + ')' : 'third(left) * ' + n + ' + other(right) - bitAnd(right, ' + n + ')')
                 // An array parameter's size, elements and iteration.
                 : arrays
                 ? (i % 2 ? block('var s = 0', 'for (x in xs) s += x * ' + n, 'return s + xs[left % xs.size]')
@@ -1867,6 +1877,40 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         if (fields) await edit('p.tags.size + left', hits);
         // A global that is not a scalar: full typing. (A local that shadows a global: checked_loops, its global `i`.)
         if (globals) await edit('NAMES.size + left', hits);
+        if (importedCalls) {
+            // The last use of `other.ab` goes: the import uses change (and W_UNUSED_IMPORT with them), so full typing. Then rechecked
+            // alone, and the use comes back: full typing again.
+            await edit('twice(left) + bitAnd(left, right)', hits);
+            await edit('twice(right) + bitAnd(left, right)', ++hits);
+            await edit('twice(left) + other(right) + bitAnd(left, right)', hits);
+            await edit('twice(left) + other(left) + bitAnd(left, right)', ++hits);
+            // A private function, an overload, a defaulted parameter and a name the standard library shares: full typing (and each
+            // edit after one, whose old body was not checked alone).
+            for (const call of ['hidden(left)', 'pair(left)', 'withDefault(left)', 'bitOr(left, right)', 'twice(right)']) {
+                await edit(call + ' + other(left) + bitAnd(left, right)', hits);
+            }
+            await edit('twice(left) + other(left) + bitAnd(left, right)', ++hits);
+            // The callee's interface changes in an unsaved buffer, then the caller's body: each answer is full typing's.
+            const library = path.join(p, 'lib.ab');
+            const original = fs.readFileSync(library, 'utf8');
+            let libraryVersion = 0;
+            const change = async text => {
+                libraryVersion++;
+                for (const session of sessions) {
+                    assert.ok(!('error' in await session.rpc(libraryVersion === 1 ? 'document/open' : 'document/change', { uri: uri(library), version: libraryVersion, text })));
+                }
+                const [actual, expected] = await Promise.all(sessions.map(s => s.analyze()));
+                assert.deepEqual(actual, expected);
+                revision = actual.revision;
+            };
+            // While `twice` returns `bool`, the body is an error, which full typing reports. Once the library is back (fully typed again,
+            // clean), the next body edits are rechecked alone, against the restored interface.
+            await change(original.replace('fun twice(n: int): int = n * 2', 'fun twice(n: int): bool = n > 2'));
+            await edit('twice(right) + other(left) + bitAnd(left, right)', hits);
+            await change(original);
+            await edit('twice(left) + other(left) + bitAnd(left, right)', ++hits);
+            await edit('twice(left) + other(right) + bitAnd(left, right)', ++hits);
+        }
         // A call of an array's method: full typing (and again from there), then rechecked alone.
         if (arrays) await edit(block('var s = 0', 'for (x in xs) s += x', 'xs.indexOf(s) + s'), hits);
         if (arrays) await edit(block('var s = 0', 'for (x in xs) s += x', 's - xs[0]'), hits);
@@ -1881,9 +1925,9 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         if (loops) await edit(block('var s = 0', 'for (i in later() until left) s += i', 's'), hits);
         // Back to the first loop: rechecked alone.
         if (loops) await edit(block('var s = 1', 'for (i in 0 until right) s *= 2', 's'), ++hits);
-        await edit(calls ? 'step(true)' : operators ? 'left / true' : loops ? block('var s = 0', 'for (i in 0 until left) s += true', 's') : globals ? 'LIMIT + true' : arrays ? block('var s = 0', 'for (x in xs) s += true', 's') : locals ? block('val t: bool = left', '1') : returns ? block('if (left) return 1', '0') : strings ? 'text[true]' : fields ? 'p.label + 1' : 'true', hits);
+        await edit(importedCalls ? 'twice(true) + other(left) + bitAnd(left, right)' : calls ? 'step(true)' : operators ? 'left / true' : loops ? block('var s = 0', 'for (i in 0 until left) s += true', 's') : globals ? 'LIMIT + true' : arrays ? block('var s = 0', 'for (x in xs) s += true', 's') : locals ? block('val t: bool = left', '1') : returns ? block('if (left) return 1', '0') : strings ? 'text[true]' : fields ? 'p.label + 1' : 'true', hits);
         await edit(initial, hits);
-        await edit(calls ? 'missing(left)' : arrays ? block('var s = 0', 'for (x in xs) s += missing', 's') : loops ? block('var s = 0', 'for (i in 0 until left) s += missing', 's') : locals ? block('val left = 1', 'left') : returns ? block('if (left < 1) return missing', 'left') : fields ? 'p.z + left' : 'left + missing', hits);
+        await edit(importedCalls ? 'twice(left) + other(left) + missing(left)' : calls ? 'missing(left)' : arrays ? block('var s = 0', 'for (x in xs) s += missing', 's') : loops ? block('var s = 0', 'for (i in 0 until left) s += missing', 's') : locals ? block('val left = 1', 'left') : returns ? block('if (left < 1) return missing', 'left') : fields ? 'p.z + left' : 'left + missing', hits);
         await edit(calls ? 'step(right)' : locals || returns || loops || arrays ? block('right') : 'right', hits);
         await edit(calls ? 'shift(left)' : locals || returns || loops || arrays ? block('return left') : 'left', extended ? hits : ++hits);
     } finally {
@@ -1901,6 +1945,7 @@ tests.checked_fields = () => checkedScalarBody(false, false, false, false, false
 tests.checked_parens = () => checkedScalarBody(false, false, false, false, false, false, false, true);
 tests.checked_loops = () => checkedScalarBody(false, false, false, false, false, false, false, false, true);
 tests.checked_arrays = () => checkedScalarBody(false, false, false, false, false, false, false, false, false, false, false, true);
+tests.checked_calls_imported = () => checkedScalarBody(false, false, false, false, false, false, false, false, false, false, false, false, true);
 tests.checked_globals = () => checkedScalarBody(false, false, false, false, false, false, false, false, false, false, true);
 tests.checked_fields_imported = () => checkedScalarBody(false, false, false, false, false, true, false, false, false, true);
 tests.checked_fields_extended = () => checkedScalarBody(false, false, false, false, false, true, true);

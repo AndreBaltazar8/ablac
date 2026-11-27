@@ -152,8 +152,8 @@ fun bootstrapAnalysisPlainBodyChange(parsed: BootstrapParseResult, change: Boots
     false
 }
 
-// `records`: the project's classes whose fields the body reads (bootstrapAnalysisScalarRecord) and the document's global values it reads
-// (bootstrapAnalysisScalarGlobal).
+// `records`: the project's classes whose fields the body reads (bootstrapAnalysisScalarRecord), the functions of other modules it calls
+// (bootstrapAnalysisScalarSignature), and the document's global values it reads (bootstrapAnalysisScalarGlobal).
 class BootstrapAnalysisScalarEdit(val splice: BootstrapAnalysisBodyInsert, val declaration: int, val callees: array<int>,
     val records: array<BootstrapDeclaration> = [])
 
@@ -317,6 +317,33 @@ fun bootstrapAnalysisScalarRecord(declaration: BootstrapDeclaration): bool {
     true
 }
 
+/** Whether `declaration`, a function of another module, is one a checked body may call: a public plain function of scalar, string or
+ *  scalar-array parameters without defaults and a scalar result. */
+fun bootstrapAnalysisScalarSignature(declaration: BootstrapDeclaration): bool {
+    if (declaration.kind != "fun" || !bootstrapAnalysisScalarType(declaration.resultType) || declaration.isPrivate ||
+        declaration.isTrusted || declaration.isResource || declaration.isNoEscape || declaration.annotations.size != 0 ||
+        declaration.typeParameters.size != 0 || declaration.extensionOwner != "" || declaration.externalLibrary != "" ||
+        declaration.generatedNamespace != "" || declaration.name.startsWith("__abla_") ||
+        declaration.parameterKinds.size != declaration.parameters.size ||
+        declaration.parameterDefaults.size != declaration.parameters.size) return false
+    for (index in 0 until declaration.parameters.size) {
+        val type = declaration.parameterTypes[index]
+        if (declaration.parameterKinds[index] != "parameter" || declaration.parameterDefaults[index].kind != "missing" ||
+            (!bootstrapAnalysisScalarType(type) && type != "string" && !bootstrapAnalysisScalarArray(type))) return false
+    }
+    true
+}
+
+/** The modules `source` (the module at `path`) imports directly, by path: neither under an alias nor only for their contract. */
+fun bootstrapAnalysisDirectImports(source: string, path: string): Map<string, bool> {
+    val modules: Map<string, bool> = Map()
+    val scan = bootstrapScanImportsWithIdentity(source, path)
+    for (edge in scan.edges) {
+        if (edge.alias == "" && !edge.contractOnly && !edge.provider) modules.set(bootstrapResolveImport(path, edge.source), true)
+    }
+    modules
+}
+
 /** Whether `declaration` is a global value a checked body may read: a plain top-level `val` or `var` of a written scalar type, or of an
  *  inferred one with a literal initializer. The checker is given it with a placeholder initializer (bootstrapAnalysisCheckScalarBody). */
 fun bootstrapAnalysisScalarGlobal(declaration: BootstrapDeclaration): bool {
@@ -464,10 +491,12 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
                 candidate.extensionOwner == "" && candidate.kind != "fun"))) return null
             for (method in candidate.methods) if (bootstrapIsOperatorDeclaration(method)) return null
             if (used.has(candidate.extensionOwner)) return null
-            val known = candidates.get(candidate.name)
+            // By source name, the standard library's declarations included: a module-private one is prepared under its mangled name.
+            val sourceName = bootstrapCanonicalDeclarationSourceName(candidate.name)
+            val known = candidates.get(sourceName)
             if (candidate.extensionOwner == "" && known != null) {
                 if (known != 0) return null
-                candidates.set(candidate.name, item + 1)
+                candidates.set(sourceName, item + 1)
             }
         }
         val own = candidates.get(declaration.name) ?? 0
@@ -475,6 +504,8 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
         // Only a same-module, call-free scalar function can be reused as a
         // signature. It has no outgoing lookup, imported use or global effect.
         val callees: array<int> = []
+        val local: Map<string, int> = Map()
+        local.set(declaration.name, 0)
         for (item in 0 until parsed.declarations.size) {
             val callee = parsed.declarations[item]
             if (item == index || !candidates.has(callee.name)) continue
@@ -483,8 +514,23 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
                 !bootstrapAnalysisScalarFunction(callee) ||
                 !bootstrapAnalysisScalarInterfaceMatches(callee, project.declarations[target - 1], false)) return null
             callees.append(item)
+            local.set(callee.name, 0)
         }
-        if (callees.size + 1 != candidates.keys().size) return null
+        // A function of another module: one of a module this document imports directly (no alias, not only its contract), so the name
+        // resolves as in full typing and its import is used by name (the syntax use facts, compared by the caller). Its interface, as
+        // prepared (its document is unchanged), is what the checker gets; its body is not read.
+        val external: array<BootstrapDeclaration> = []
+        var imports: Map<string, bool>? = null
+        for (name in candidates.keys()) {
+            if (local.has(name)) continue
+            val target = candidates.get(name) ?? 0
+            if (target == 0) return null
+            val callee = project.declarations[target - 1]
+            if (callee.sourceIdentity == declaration.sourceIdentity || !bootstrapAnalysisScalarSignature(callee)) return null
+            if (imports == null) imports = bootstrapAnalysisDirectImports(after, declaration.sourceIdentity)
+            if (!(imports?.has(callee.sourceIdentity) ?? false)) return null
+            external.append(callee)
+        }
         val splice = BootstrapAnalysisBodyInsert(start, end - start, start, "", 0, 0,
             after.slice(start, end), oldEnd - start, before.slice(start, oldEnd))
         val records: array<BootstrapDeclaration> = []
@@ -507,6 +553,7 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
             }
             if (!found) return null
         }
+        for (callee in external) records.append(callee)
         // The global values it reads.
         val read: Map<string, int> = Map()
         bootstrapAnalysisScalarIdentifierNames(body, read)
