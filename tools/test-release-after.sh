@@ -122,9 +122,9 @@ root4=$work/root4
 make_root "$root4"
 rows=$work/times.tsv
 for n in $(seq 120); do printf '%s\t0\t1.5\ttools/test-fake-%s.sh\t1.2\n' "$n" "$n"; done > "$rows"
+shard_logs "$work/release-logs"
 # A CI runner has no git identity, and --commit commits: give it one for this copy only.
 GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
-shard_logs "$work/release-logs"
 "$root4/tools/release-after.sh" v8.8.8 --dir "$release" --root "$root4" --times "$rows" --release-times "$work/release-logs" --commit > "$work/out.txt" 2>&1 || { cat "$work/out.txt" >&2; fail "release-after --commit refused a good release"; }
 [[ $(git -C "$root4" rev-list --count HEAD) -eq 5 ]] || fail "--commit did not make four commits"
 [[ -z $(git -C "$root4" status --porcelain) ]] || fail "--commit left changes"
