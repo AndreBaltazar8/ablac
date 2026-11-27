@@ -6,7 +6,8 @@
 # campaign (hosted tasks, panics, hostless capabilities, shared globals, compile-time tiers, strict-versus-flat imports, integer stores,
 # module and subparser graphs with their cache
 # phases, cross-target tiers, subparser refusals), and the regex campaign: abla/regex against the independent oracle on
-# two fixed seeds, the oracle against the recorded Python results, and a planted oracle fault. Long
+# two fixed seeds, the oracle against the recorded Python results, and a planted oracle fault; and the editor's checked scalar bodies
+# against full typing (tools/fuzz/analysis-scalar.mjs). Long
 # campaigns run outside the suite (tools/fuzz/run --seeds ...).
 set -euo pipefail
 
@@ -55,7 +56,7 @@ echo "fuzz: the build-paths axis agrees with the other modes and reports a plant
 
 fuzz --seeds 100000-100001 --checks 12
 fuzz --replay
-fuzz --control-oracle default_owner_check,ownership_lifetime_check,fresh_select_check,json_check,yaml_check,gzip_check,region_member_check,logical_assign_check
+fuzz --control-oracle default_owner_check,ownership_lifetime_check,fresh_select_check,json_check,yaml_check,gzip_check,region_member_check,logical_assign_check,static_concat_check,gc_churn_check
 fuzz --hosted-tasks --seeds 100000 --checks 8
 fuzz --panics --seeds 100008 --checks 2
 tools/fuzz/test-targets.sh "$compiler"
@@ -78,3 +79,7 @@ fuzz --control-regex
 regex_corpus=build/fuzz-abla/regex-corpus.tsv
 zcat tests/cases/regex/corpus.tsv.gz >"$regex_corpus"
 fuzz --regex-corpus "$regex_corpus"
+# The editor's checked scalar bodies (#1132) against full typing over seeded edits: the planted difference always, the seeds in the full form
+# (each seed is about 20 s of two editor services).
+node tools/fuzz/analysis-scalar.mjs "$compiler" --control --work build/fuzz-analysis-scalar/control
+if [[ -n ${RUN_TESTS_FULL:-} ]]; then node tools/fuzz/analysis-scalar.mjs "$compiler" --seeds 1-3 --edits 16; fi

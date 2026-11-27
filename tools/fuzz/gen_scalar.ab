@@ -1,0 +1,94 @@
+// scalar_mix_check (#648): the plain check's typed expressions over scalar places that are not locals: module `var`s of
+// each scalar type, fields of each scalar type (`var` and `val`), elements of typed arrays (array<f64>, array<f32>,
+// array<bool>, array<u8>, array<i32>, array<u64>), bytes of a string (`text[k]`) and a nullable int read through `??`.
+// These are the instructions the LLVM backend's scalar plan types one by one (global.load/store, field.get/set.indexed
+// of i64/f64/f32/bool, array.get of each element type, string.get, value.is.null). Statements between the reads write
+// to the same places (plain and compound assignments), so a value the plan keeps in the wrong representation shows up
+// in a later read. No oracle: the modes must agree.
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+
+val FUZZ_SCALAR_TYPES: array<string> = ["int", "i32", "u8", "u16", "u64", "f64", "f32", "bool"]
+val FUZZ_SCALAR_ARRAYS: array<string> = ["f64", "f32", "bool", "u8", "i32", "u64"]
+val FUZZ_SCALAR_TEXTS: array<string> = ["héllo", "abc", "日本語!", "0123456789"]
+
+/** A literal of a scalar type (no variables). */
+fun FuzzGen.scalarLit(ty: string): string = this.expr(ty, 0, fuzzEnv())
+
+/** `place = value` or, for an integer or float place, `place op= value`. */
+fun FuzzGen.scalarWrite(place: string, ty: string, env: FuzzEnv, indent: string): string {
+    val value = this.expr(ty, 2, env)
+    if (ty == "bool") return "$indent$place = $value"
+    if (this.r.chance(0.5)) return "$indent$place = $value"
+    val op = this.r.pick(["+=", "-=", "*="])
+    "$indent$place $op $value"
+}
+
+fun FuzzGen.scalarMixCheck(index: int): FuzzCheck {
+    val lines: array<string> = []
+    val env = fuzzEnv()
+    val writable: array<string> = []
+    val writableTypes: array<string> = []
+    // module values
+    for (k in 0 until this.r.range(1, 3)) {
+        val ty = this.r.pick(FUZZ_SCALAR_TYPES)
+        val name = "smG${index}x$k"
+        lines.append("var $name: $ty = ${this.scalarLit(ty)}")
+        env.add(name, ty)
+        writable.append(name)
+        writableTypes.append(ty)
+    }
+    // a class with a field of each drawn type; the last is a `val`
+    val fieldTypes: array<string> = []
+    val fields: array<string> = []
+    val fieldCount = this.r.range(2, 4)
+    for (k in 0 until fieldCount) {
+        val ty = this.r.pick(FUZZ_SCALAR_TYPES)
+        fieldTypes.append(ty)
+        fields.append("${if (k == fieldCount - 1) "val" else "var"} f$k: $ty")
+    }
+    lines.append("class SmObj$index(${textJoin(fields, ", ")})")
+    val body: array<string> = []
+    val initial: array<string> = []
+    for (ty in fieldTypes) initial.append(this.scalarLit(ty))
+    body.append("    val o = SmObj$index(${textJoin(initial, ", ")})")
+    for (k in 0 until fieldCount) {
+        env.add("o.f$k", fieldTypes[k])
+        if (k < fieldCount - 1) {
+            writable.append("o.f$k")
+            writableTypes.append(fieldTypes[k])
+        }
+    }
+    // typed arrays of three elements, read and written at constant indexes
+    for (k in 0 until this.r.range(1, 3)) {
+        val ty = this.r.pick(FUZZ_SCALAR_ARRAYS)
+        val elements: array<string> = []
+        for (i in 0 until 3) elements.append(this.scalarLit(ty))
+        body.append("    val sa$k: array<$ty> = [${textJoin(elements, ", ")}]")
+        for (i in 0 until 3) env.add("sa$k[$i]", ty)
+        val at = this.r.below(3)
+        writable.append("sa$k[$at]")
+        writableTypes.append(ty)
+    }
+    // string bytes and a nullable int
+    val text = this.r.pick(FUZZ_SCALAR_TEXTS)
+    body.append("    val st = \"$text\"")
+    env.add("st[${this.r.below(text.size)}]", "int")
+    body.append("    val sn: int? = if (${this.boolExpr(1, env)}) ${this.intLit("int")} else null")
+    env.add("(sn ?? ${this.intLit("int")})", "int")
+    // writes and statements, interleaved
+    for (round in 0 until this.r.range(2, 4)) {
+        for (w in 0 until this.r.range(1, 3)) {
+            val at = this.r.below(writable.size)
+            body.append(this.scalarWrite(writable[at], writableTypes[at], env, "    "))
+        }
+        for (line in this.statements(env, this.depthLimit - 2, this.r.range(1, 2))) body.append(line)
+    }
+    val result = this.r.pick(["int", "u8", "u64", "i32", "f64", "f32", "bool", "str"])
+    lines.append("fun c$index(): ${fuzzTypeName(result)} {")
+    for (line in body) lines.append(line)
+    lines.append("    ${this.expr(result, this.depthLimit, env)}")
+    lines.append("}")
+    FuzzCheck(lines, "c$index()", result, index)
+}

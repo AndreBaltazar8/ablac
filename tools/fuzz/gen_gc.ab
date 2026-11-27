@@ -1,0 +1,119 @@
+// gc_churn_check (#648): enough garbage of changing sizes that every collector collects, and the Wasm runtime's
+// reclaim (parked blocks merged before linear memory grows, ordered by the bitmap in the collector's scratch) and its
+// sweep over the sorted ranges both run. A check lowers the collection growth (memorySetCollectionGrowth), then runs
+// two to four phases; each makes strings (slices of a 2 MiB pattern) or boxes holding an int array, of one size,
+// keeps every k-th one, replaces some kept ones (the old one becomes garbage while its neighbours stay live), and
+// may collect at its end. Sizes span the small classes, the 1 MiB large-block minimum and the space between. At the end
+// every survivor is compared with what its id says it holds, byte for byte and element for element, and the bytes
+// made and survivors counted are compared with what the generator computed. The growth is put back to 64 MiB, so a
+// later check (and, under `#`, the compiler) is not left collecting every few kilobytes.
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+
+val FUZZ_GC_SIZES: array<int> = [1, 8, 15, 16, 24, 100, 500, 2000, 4095, 9000, 40000, 65536, 300000, 1048560, 1048576,
+    1100000]
+val FUZZ_GC_GROWTH: array<int> = [16384, 65536, 262144, 1048576, 4194304]
+val FUZZ_GC_PATTERN = "0123456789abcdefghijklmnopqrstuv"
+
+
+fun FuzzGen.gcChurnCheck(index: int): FuzzCheck {
+    val box = "GcBox$index"
+    val growth = this.r.pickInt(FUZZ_GC_GROWTH)
+    val lines: array<string> = [
+        "class $box(val xs: array<int>, val id: int)",
+        "fun gcText$index(base: string, id: int, size: int): string {",
+        "    val at = (id * 7) % 1000",
+        "    base.slice(at, at + size) + \"!\"",
+        "}",
+        "fun gcBox$index(id: int, size: int): $box {",
+        "    val xs: array<int> = []",
+        "    for (j in 0 until size) xs.append(id * 31 + j)",
+        "    $box(xs, id)",
+        "}",
+        "fun c$index(): string {",
+        "    memorySetCollectionGrowth($growth)",
+        "    var base = \"$FUZZ_GC_PATTERN\"",
+        "    while (base.size < 1200000) base = base + base",
+        "    val texts: array<string> = []",
+        "    val textIds: array<int> = []",
+        "    val textSizes: array<int> = []",
+        "    val boxes: array<$box> = []",
+        "    val boxSizes: array<int> = []",
+        "    var made = 0"]
+    var made = 0
+    var keptTexts = 0
+    var keptBoxes = 0
+    val phases = this.r.range(2, 4)
+    for (p in 0 until phases) {
+        val isBox = this.r.chance(0.35)
+        var size = this.r.pickInt(FUZZ_GC_SIZES)
+        // a box's array is filled one element at a time (the interpreter pays for each): at most 40000 elements
+        if (isBox && size > 40000) size = this.r.pickInt([100, 2000, 9000, 40000])
+        val unit = if (isBox) size * 8 + 64 else size + 17
+        var count = (this.r.range(1, 6) * 1048576) / unit
+        if (count > 5000) count = 5000
+        if (isBox && count * size > 300000) count = 300000 / size
+        if (count < 2) count = 2
+        val every = this.r.pickInt([1, 2, 3, 5, 11, 50])
+        val replace = this.r.pickInt([0, 0, 3, 7])
+        val id = (p + 1) * 100000
+        lines.append("    for (i in 0 until $count) {")
+        if (isBox) {
+            lines.append("        val b = gcBox$index($id + i, $size)")
+            lines.append("        made = made + b.xs.size")
+            lines.append("        if (i % $every == 0) {")
+            lines.append("            boxes.append(b)")
+            lines.append("            boxSizes.append($size)")
+            lines.append("        }")
+            if (replace > 0) {
+                lines.append("        if (i % $replace == 1 && boxes.size > 0) {")
+                lines.append("            val at = (i / $replace) % boxes.size")
+                lines.append("            boxes[at] = gcBox$index(boxes[at].id, boxSizes[at])")
+                lines.append("        }")
+            }
+        } else {
+            lines.append("        val s = gcText$index(base, $id + i, $size)")
+            lines.append("        made = made + s.size")
+            lines.append("        if (i % $every == 0) {")
+            lines.append("            texts.append(s)")
+            lines.append("            textIds.append($id + i)")
+            lines.append("            textSizes.append($size)")
+            lines.append("        }")
+            if (replace > 0) {
+                lines.append("        if (i % $replace == 1 && texts.size > 0) {")
+                lines.append("            val at = (i / $replace) % texts.size")
+                lines.append("            texts[at] = gcText$index(base, textIds[at], textSizes[at])")
+                lines.append("        }")
+            }
+        }
+        lines.append("    }")
+        // the generator's count of what this phase made and kept (replacements make garbage, not survivors)
+        for (i in 0 until count) {
+            made = made + (if (isBox) size else size + 1)
+            if (i % every == 0) {
+                if (isBox) keptBoxes = keptBoxes + 1 else keptTexts = keptTexts + 1
+            }
+        }
+        if (this.r.chance(0.5)) lines.append("    memoryCollect()")
+    }
+    for (line in [
+        "    var bad = 0",
+        "    for (k in 0 until texts.size) {",
+        "        if (texts[k] != gcText$index(base, textIds[k], textSizes[k])) bad = bad + 1",
+        "    }",
+        "    for (k in 0 until boxes.size) {",
+        "        val b = boxes[k]",
+        "        if (b.xs.size != boxSizes[k]) bad = bad + 1",
+        "        for (j in 0 until b.xs.size) {",
+        "            if (b.xs[j] != b.id * 31 + j) bad = bad + 1",
+        "        }",
+        "    }",
+        "    memorySetCollectionGrowth(67108864)",
+        "    val actual = \"made=\$made;texts=\${texts.size};boxes=\${boxes.size};bad=\$bad\"",
+        "    val gcExpected = \"made=$made;texts=$keptTexts;boxes=$keptBoxes;bad=0\"",
+        "    if (actual != gcExpected) return \"FUZZ_ORACLE_FAILURE:\" + actual",
+        "    actual",
+        "}"]) lines.append(line)
+    FuzzCheck(lines, "c$index()", "str", index)
+}
