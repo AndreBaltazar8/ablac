@@ -34,6 +34,25 @@ ABLA_STATIC_TARGET=aarch64-linux tools/build-static-compiler.sh "$compiler" "$ou
 file -b "$out/ablac-static" | grep 'ARM aarch64.*static-pie linked' > /dev/null || { echo 'static compiler aarch64: not an AArch64 static-pie image' >&2; exit 1; }
 needed=$(readelf -d "$out/ablac-static" | grep -c '(NEEDED)' || true)
 [[ $needed == 0 ]] || { echo "static compiler aarch64: $needed needed libraries" >&2; exit 1; }
+# End to end: with STATIC_AARCH64_MODULES=1 the AArch64 half of the module-program check (tests/cases/modules built --fast for aarch64-linux link no
+# C library, tools/test-libc-free-programs.sh) has this compiler, under qemu, as its builder; no x86-64 compiler builds a program. About nine minutes on
+# eight cores, 24 on a four-CPU CI runner: STATIC_AARCH64_PART=1, 2 or 3 builds one third of the programs (CI runs the parts on three runners), and
+# parts 2 and 3 skip the checks below, which part 1 (and a run without a part) makes. ABLA_STATIC_LLVM_LIB is left out of that run so the programs
+# that import LLVM stay the exceptions the allowlist names.
+part=${STATIC_AARCH64_PART:-0}
+[[ $part == [0-3] ]] || { echo "static compiler aarch64: STATIC_AARCH64_PART must be 1, 2 or 3, got $part" >&2; exit 2; }
+check_modules() {
+    [[ ${STATIC_AARCH64_MODULES:-0} == 1 ]] || return 0
+    local part_options=()
+    ((part == 0)) || part_options=(--part "$part/3")
+    env -u ABLA_STATIC_LLVM_LIB LIBC_FREE_TARGETS=a64 LIBC_FREE_RUNNER=qemu-aarch64 ABLA_TEST_JOBS=${ABLA_TEST_JOBS:-4} \
+        tools/test-libc-free-programs.sh "$PWD/$out/ablac-static" "${part_options[@]}"
+}
+if ((part > 1)); then
+    echo "static compiler aarch64: static-pie, no needed library (part $part/3: the other checks are part 1's)"
+    check_modules
+    exit
+fi
 export ABLA_NATIVE_JOBS=1 ABLA_CODEGEN_JOBS=1
 # Under qemu-user a compiler cannot start itself as a child (/proc/self/exe is the emulator's, status 127), which the in-process code generation does for its parts of a
 # big program (src/codegen_units.ab, the --emit-object child): these builds make their objects with the external llc as before, and the empty-PATH check below, a program
@@ -141,10 +160,4 @@ for tier in interp jit auto; do
 done
 [[ $(head -n 1 "$out/hello.static.out") == hello ]] || { echo 'static compiler aarch64: the hello it built did not print hello' >&2; exit 1; }
 echo "static compiler aarch64: static-pie, no needed library, the default target is AArch64, $count program outputs match the ordinary compiler's cross builds, ablac run and the three compile-time tiers work (jit runs the site as native code), hello runs"
-# End to end: with STATIC_AARCH64_MODULES=1 the AArch64 half of the module-program check (tests/cases/modules built --fast for aarch64-linux link no
-# C library, tools/test-libc-free-programs.sh) has this compiler, under qemu, as its builder; no x86-64 compiler builds a program. About nine minutes on
-# eight cores. ABLA_STATIC_LLVM_LIB is left out of that run so the programs that import LLVM stay the exceptions the allowlist names.
-if [[ ${STATIC_AARCH64_MODULES:-0} == 1 ]]; then
-    env -u ABLA_STATIC_LLVM_LIB LIBC_FREE_TARGETS=a64 LIBC_FREE_RUNNER=qemu-aarch64 ABLA_TEST_JOBS=${ABLA_TEST_JOBS:-4} \
-        tools/test-libc-free-programs.sh "$PWD/$out/ablac-static"
-fi
+check_modules

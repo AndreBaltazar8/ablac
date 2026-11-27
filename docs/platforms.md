@@ -47,7 +47,7 @@ the definitions and evidence together when promoting a tier.
 ## Linux x86-64
 
 In [CI](../.github/workflows/ci.yml), job `linux`, named **Linux suite (shard
-${{ matrix.shard }}/2)**, runs `make test` split into two shards after rebuilding
+${{ matrix.shard }}/4)**, runs `make test` split into four shards after rebuilding
 the compiler with its own backend. This includes the x86-64 module-program
 libc-free guard. Job `static-compiler`, named **Static compiler (no loader, no
 libc)**, builds the static compiler, checks no loader/no needed library, builds
@@ -76,10 +76,10 @@ v0.2.64 asset inventory above.
 programs link no libc (AArch64)**, cross-builds module programs and compares
 exceptions to the checked-in allowlist. Its program parity step runs the
 selected images under QEMU.
-Job `static-compiler-aarch64`, **Static compiler for AArch64 under qemu**,
-cross-builds the compiler and executes its program builds, `ablac run`, and
-compile-time evaluation tiers under qemu. With `STATIC_AARCH64_MODULES=1`, it
-also uses the emulated compiler to build the module corpus; known emulator
+Job `static-compiler-aarch64`, **Static compiler for AArch64 under qemu
+(1/3 to 3/3)**, cross-builds the compiler and executes its program builds, `ablac run`, and
+compile-time evaluation tiers under qemu (part 1). With `STATIC_AARCH64_MODULES=1`, it
+also uses the emulated compiler to build the module corpus, a third per part; known emulator
 exceptions are recorded separately. See
 [test-static-compiler-aarch64.sh](../tools/test-static-compiler-aarch64.sh).
 

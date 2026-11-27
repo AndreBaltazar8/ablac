@@ -74,13 +74,15 @@ defaults:
 jobs:
   linux:
     if: ${{ !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control }}
-    name: ${{ inputs.xtensa_compiler_memory_probe && 'Xtensa compiler memory probe' || format('Linux suite (shard {0}/3)', matrix.shard) }}
+    name: ${{ inputs.xtensa_compiler_memory_probe && 'Xtensa compiler memory probe' || format('Linux suite (shard {0}/4)', matrix.shard) }}
     # Each Linux shard builds the compiler, then runs its partition from tools/test-times.tsv.
     # tools/test-shards.sh checks the partition. The Xtensa memory probe needs just one runner.
+    # The suite is CPU-bound on a four-CPU runner (15,600 CPU seconds in run 45897364434, its three shard steps 1,407, 1,454 and 1,143 s):
+    # four shards (tools/test-times.tsv's split) replay at 966 to 980 s on that run's times and 892 to 921 s on 45892064909's.
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(inputs.xtensa_compiler_memory_probe && '[1]' || '[1,2,3]') }}
+        shard: ${{ fromJSON(inputs.xtensa_compiler_memory_probe && '[1]' || '[1,2,3,4]') }}
     runs-on: ubuntu-24.04
     # About 29 minutes on a typical runner (2026-11-13); a slow runner is ~1.5x on every test.
     # 2026-11-19: 39, 40, 53 and 40 min on 3376d248, 70483a17, 88510e64, 0baf373f; 4a03e7be hit 60 with 484 tests
@@ -88,9 +90,11 @@ jobs:
     # 2026-11-21: the suite step took 47, 48 and 56 min, then 70 on a slow runner (5830b1a0: all 538 passed, x25519
     # alone 2370 s) and the job hit 75: 90.
     timeout-minutes: 90
+    # No ABLA_TEST_JOBS: test-self-hosted.sh (886 s at 1 worker in run 45897364434, with seven commands waiting for it) and
+    # the other tests that run builds of their own take their suite default of 2 workers, so its chain stays under a
+    # four-shard step (as in static-suite.yml).
     env:
       JOBS: '8'
-      ABLA_TEST_JOBS: '1'
       ABLA_NATIVE_JOBS: '1'
       ABLA_CODEGEN_JOBS: '1'
       ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1800'
@@ -185,7 +189,7 @@ jobs:
       - name: Run the Linux suite
         if: ${{ !inputs.xtensa_compiler_memory_probe }}
         env:
-          RUN_TESTS_SHARD: ${{ matrix.shard }}/3
+          RUN_TESTS_SHARD: ${{ matrix.shard }}/4
           ABLA_DOC_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           if [[ $ABLA_DOC_COVERAGE_BASE == 0000000000000000000000000000000000000000 ]]; then
@@ -605,10 +609,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {runner: macos-15, name: macOS host tests (Apple Silicon), tests: host, logs: arm64-host}
-          - {runner: macos-15, name: macOS host and compiler fixed point, tests: live, logs: arm64}
-          - {runner: macos-15-intel, name: macOS host and compiler fixed point (Intel), tests: host, logs: x86_64}
-          - {runner: macos-15-intel, name: macOS live compiler tests (Intel), tests: live, logs: x86_64-live}
+          # import_guard: the lane that checks the libSystem import guard. On Intel the host lane was the longest Mac job (1,555 and
+          # 1,655 s in runs 45897364434 and 45892064909, the guard 218 and 195 s of it) and the live lane ended 6 to 8 minutes earlier.
+          - {runner: macos-15, name: macOS host tests (Apple Silicon), tests: host, logs: arm64-host, import_guard: true}
+          - {runner: macos-15, name: macOS host and compiler fixed point, tests: live, logs: arm64, import_guard: false}
+          - {runner: macos-15-intel, name: macOS host and compiler fixed point (Intel), tests: host, logs: x86_64, import_guard: false}
+          - {runner: macos-15-intel, name: macOS live compiler tests (Intel), tests: live, logs: x86_64-live, import_guard: true}
     runs-on: ${{ matrix.runner }}
     # Intel took 28 min on 89e3a628 and passed 35 on 576a47ef (stage builds and host paths are slower there).
     # The last five green runs took 32 to 38 min (59f5309c 32, a1950bc6 38, 428aff92 35, 681f64fe 33, 5a01101e 36),
@@ -769,7 +775,7 @@ jobs:
       # and mutex imports it would catch returning were traced by tools/macos-import-origin.sh, now a manual tool: none
       # is imported since #826.
       - name: Check the libSystem import guard
-        if: ${{ always() && matrix.tests != 'live' }}
+        if: ${{ always() && matrix.import_guard }}
         run: |
           tools/test-libsystem-imports.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-libsystem-imports.log
@@ -1119,12 +1125,19 @@ jobs:
   # qemu-aarch64 (tools/test-static-compiler-aarch64.sh). Its AArch64 LLVM archives and the target's libstdc++.a, libz.a and libgcc.a come from nixpkgs'
   # native aarch64-linux packages, which cache.nixos.org has built (nix/aarch64-static-native-deps.nix: a download, no build); the cross packages the
   # first version used (pkgsCross.aarch64-multiplatform) are in no cache and built from source in about two hours.
+  # The module programs the emulated compiler builds took 24 of the job's 36 to 44 minutes on one runner, the longest lane of master CI (runs
+  # 45892064909, 45897364434): each of three runners builds the static compiler and a third of them, and part 1 also makes the other checks.
   static-compiler-aarch64:
     if: ${{ !inputs.xtensa_companion_routing_probe && !inputs.xtensa_companion_embedded_probe && !inputs.xtensa_companion_install_probe && !inputs.macos_published_rebuild && !inputs.macos_runtime_bench && !inputs.android_pointer_tags_control && !inputs.xtensa_compiler_memory_probe }}
-    name: Static compiler for AArch64 under qemu
+    name: Static compiler for AArch64 under qemu (${{ matrix.part }}/3)
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:
+      STATIC_AARCH64_PART: ${{ matrix.part }}
       ABLA_NATIVE_JOBS: '4'
       ABLA_CODEGEN_JOBS: '1'
       ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1800'
@@ -1153,12 +1166,12 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: static-compiler-aarch64-logs
+          name: static-compiler-aarch64-logs-${{ matrix.part }}
           path: |
             build/ci-logs/
             build/static-compiler-aarch64/*.log
-            build/libc-free-programs/*.log
-            build/libc-free-programs/*.txt
+            build/libc-free-programs-part-${{ matrix.part }}/*.log
+            build/libc-free-programs-part-${{ matrix.part }}/*.txt
           retention-days: 3
           if-no-files-found: ignore
 

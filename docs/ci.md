@@ -11,11 +11,11 @@ repository permissions.
 
 | Job ID | Runner and scope |
 |---|---|
-| `linux` | Ubuntu 24.04, two shards of `make test`, each building the checksum-pinned bootstrap and then rebuilding the compiler with its own backend; job name `Linux suite (shard ${{ matrix.shard }}/2)` |
+| `linux` | Ubuntu 24.04, four shards of `make test`, each building the checksum-pinned bootstrap and then rebuilding the compiler with its own backend; job name `Linux suite (shard ${{ matrix.shard }}/4)` |
 | `macos` | Native Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) compiler/host checks; matrix names `macOS host and compiler fixed point` and `macOS host and compiler fixed point (Intel)` |
 | `libc-free-aarch64` | Ubuntu cross-builds the module corpus for AArch64 and guards libc-free links and the explicit exceptions |
 | `static-compiler` | Ubuntu builds the x86-64 static compiler; checks no loader/no needed library, a child compile/run and the static compiler fixpoint |
-| `static-compiler-aarch64` | Ubuntu cross-builds the static AArch64 compiler, then runs its selected compiler/program/JIT/compile-time/module checks under qemu; no native AArch64 full suite |
+| `static-compiler-aarch64` | Ubuntu cross-builds the static AArch64 compiler on three runners (`STATIC_AARCH64_PART`), each building a third of the module corpus with it under qemu; part 1 also runs its compiler/program/JIT/compile-time checks; no native AArch64 full suite |
 
 The Linux shards are chosen by `RUN_TESTS_SHARD` in `tools/run-tests.sh`, using
 checked-in cost history to keep the partition stable across runners. They run
