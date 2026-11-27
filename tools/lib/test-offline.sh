@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Sourced by suite tests that run the release tools (release-check.sh and the scripts it calls): a suite test must never
 # depend on the network, because a slow or rate-limited GitHub API can hang a gate (it did on 2026-11-27).
 #
