@@ -31,9 +31,11 @@ for (const limit of [1048576n, 2097152n]) {
     const reclaims = exports.stat(7n);
     console.log(JSON.stringify({
         limit: Number(limit), peakLive: Number(peakLive), memoryGrown: Number(grown),
-        collections: Number(exports.stat(5n)), reclaims: Number(reclaims)
+        collections: Number(exports.stat(5n)), reclaims: Number(reclaims), bitmapReclaims: Number(exports.stat(11n))
     }));
     if (exports.stat(5n) < 2n) throw new Error(`limit ${limit}: the garbage was never collected`);
     if (reclaims < 1n) throw new Error(`limit ${limit}: no reclaim ran, so the thresholds did not follow the limit`);
+    // After the first collection its scratch block holds the reclaim's bitmap: the blocks are put in address order in linear time.
+    if (exports.stat(11n) < 1n) throw new Error(`limit ${limit}: no reclaim ordered its blocks by the bitmap`);
     if (grown > limit * 5n) throw new Error(`limit ${limit}: memory grew ${grown} bytes`);
 }

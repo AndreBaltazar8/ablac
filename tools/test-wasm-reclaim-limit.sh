@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The Wasm runtime's reclaim thresholds follow a memory limit: garbage of many
-# sizes under a limit below the default thresholds gets its parked memory merged,
+# sizes under a limit below the default thresholds gets its parked memory merged (after
+# the first collection with the bitmap in the collector's scratch, not a sort),
 # and the program finishes with its live bytes within the limit.
 set -euo pipefail
 

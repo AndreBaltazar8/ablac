@@ -263,6 +263,8 @@ var __ablaRuntimeWasmReclaimAt: int = 4194304
 var __ablaRuntimeWasmReclaimStep: int = 1048576
 /// Counts reclamation passes over guest free blocks.
 var __ablaRuntimeWasmReclaims: int = 0
+/// Counts the reclaims that ordered the parked blocks with the bitmap (__ablaRuntimeWasmReclaimBitmap) rather than a sort.
+var __ablaRuntimeWasmReclaimsByBitmap: int = 0
 /// Counts the merged blocks found while reclaiming guest free space.
 var __ablaRuntimeWasmReclaimMerged: int = 0
 // The span being carved [cursor, end) and the list of further spans, each
@@ -402,7 +404,7 @@ var __ablaRuntimeWasmSortBuckets: int = 0
 /// Gives the number of radix buckets used to sort guest block addresses.
 val __ablaRuntimeWasmSortBucketCount: int = 4096
 
-// Sort a list of free payloads (linked through their first word) by address:
+// Sort a list of free payloads (linked through their first word) by address (when __ablaRuntimeWasmReclaimBitmap gives no bitmap):
 // dealt into buckets that each cover a narrow slice of the heap, each bucket
 // merge-sorted, the buckets joined in order. One merge sort over the whole list
 // chased every block across the heap once per pass; a bucket's blocks sit close
@@ -457,6 +459,51 @@ trusted fun __ablaRuntimeWasmSortByAddress(list: int): int {
         i = i + 1
     }
     head
+}
+
+// The bitmap a reclaim can order the parked blocks with, in the collector's scratch block (idle between collections, kept
+// from the last one): one bit per 16-byte granule of the heap, cleared. 0 when the scratch is missing, in use or too small:
+// the reclaim then sorts.
+trusted fun __ablaRuntimeWasmReclaimBitmap(): int {
+    if (__ablaRuntimeWasmCollectionWorklist != 0 || __ablaRuntimeWasmCollectionScratch == 0) return 0
+    val low = (ablaRuntimeWasmHeapBase() + 15) & -16
+    val words = ((__ablaRuntimeWasmHeapCursor - low) / 16 + 63) / 64
+    if (words * 8 > __ablaRuntimeWasmCollectionScratchBytes) return 0
+    val bitmap = __ablaRuntimeWasmCollectionScratch
+    var word = 0
+    while (word < words) {
+        ablaRuntimeStoreI64(bitmap + word * 8, 0)
+        word = word + 1
+    }
+    bitmap
+}
+
+// Settle one run [runBegin, runEnd) of physically adjacent parked blocks: a large block or more becomes one large free
+// block, a span or more a span, and a shorter run goes back on its class lists block by block, in address order.
+trusted fun __ablaRuntimeWasmReclaimRun(runBegin: int, runEnd: int): void {
+    if (runEnd - runBegin >= 16 + __ablaRuntimeWasmLargeMinimum) {
+        ablaRuntimeStoreI64(runBegin, runEnd - runBegin - 16)
+        ablaRuntimeStoreI64(runBegin + 16, __ablaRuntimeWasmLargeFree)
+        __ablaRuntimeWasmLargeFree = runBegin + 16
+        __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + runEnd - runBegin
+        __ablaRuntimeWasmReclaimMerged = __ablaRuntimeWasmReclaimMerged + runEnd - runBegin
+    } else if (runEnd - runBegin >= __ablaRuntimeWasmSpanMinimum) {
+        ablaRuntimeStoreI64(runBegin, __ablaRuntimeWasmSpans)
+        ablaRuntimeStoreI64(runBegin + 8, runEnd)
+        __ablaRuntimeWasmSpans = runBegin
+        __ablaRuntimeWasmReclaimMerged = __ablaRuntimeWasmReclaimMerged + runEnd - runBegin
+    } else {
+        var at = runBegin
+        while (at < runEnd) {
+            val kind = ablaRuntimeLoadI64(at)
+            val head = __ablaRuntimeWasmFreeLists + kind * 8
+            ablaRuntimeStoreI64(at + 16, ablaRuntimeLoadI64(head))
+            ablaRuntimeStoreI64(head, at + 16)
+            val bytes = 16 + __ablaRuntimeWasmClassBytes(kind)
+            __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + bytes
+            at = at + bytes
+        }
+    }
 }
 
 // Sort a list of free payloads (linked through their first word) by address.
@@ -517,68 +564,82 @@ trusted fun __ablaRuntimeWasmReclaim(): void {
         __ablaRuntimeWasmShatter(__ablaRuntimeWasmSpanCursor, __ablaRuntimeWasmSpanEnd)
         __ablaRuntimeWasmSpanCursor = 0
     }
+    // With a bitmap each parked block sets its header's bit as the lists are emptied (one pass over the blocks, in list
+    // order), and one scan of the bitmap meets them in address order (a second pass, sequential): a run is settled as
+    // soon as it ends. Without one, the blocks are linked into one list and sorted.
+    val bitmap = __ablaRuntimeWasmReclaimBitmap()
+    val low = (ablaRuntimeWasmHeapBase() + 15) & -16
     var all = 0
     var sizeClass = 0
-    while (sizeClass < __ablaRuntimeWasmClassCount) {
-        val head = __ablaRuntimeWasmFreeLists + sizeClass * 8
-        var block = ablaRuntimeLoadI64(head)
-        ablaRuntimeStoreI64(head, 0)
+    while (sizeClass <= __ablaRuntimeWasmClassCount) {
+        // The class lists, then (as class `count`) the large list.
+        var block = 0
+        if (sizeClass < __ablaRuntimeWasmClassCount) {
+            val head = __ablaRuntimeWasmFreeLists + sizeClass * 8
+            block = ablaRuntimeLoadI64(head)
+            ablaRuntimeStoreI64(head, 0)
+        } else {
+            block = __ablaRuntimeWasmLargeFree
+            __ablaRuntimeWasmLargeFree = 0
+        }
         while (block != 0) {
             val next = ablaRuntimeLoadI64(block)
-            ablaRuntimeStoreI64(block, all)
-            all = block
+            if (bitmap != 0) {
+                val granule = (block - 16 - low) / 16
+                val slot = bitmap + (granule >>> 6) * 8
+                ablaRuntimeStoreI64(slot, ablaRuntimeLoadI64(slot) | (1 << (granule & 63)))
+            } else {
+                ablaRuntimeStoreI64(block, all)
+                all = block
+            }
             block = next
         }
         sizeClass = sizeClass + 1
     }
-    var large = __ablaRuntimeWasmLargeFree
-    __ablaRuntimeWasmLargeFree = 0
-    while (large != 0) {
-        val next = ablaRuntimeLoadI64(large)
-        ablaRuntimeStoreI64(large, all)
-        all = large
-        large = next
-    }
     __ablaRuntimeWasmParked = 0
     __ablaRuntimeWasmReclaims = __ablaRuntimeWasmReclaims + 1
-    var block = __ablaRuntimeWasmSortByAddress(all)
-    while (block != 0) {
-        val first = block
-        val runBegin = block - 16
-        var runEnd = block + __ablaRuntimeWasmBlockBytes(ablaRuntimeLoadI64(block - 16))
-        var count = 1
-        block = ablaRuntimeLoadI64(block)
-        while (block != 0 && block - 16 == runEnd) {
-            runEnd = block + __ablaRuntimeWasmBlockBytes(ablaRuntimeLoadI64(block - 16))
-            count = count + 1
-            block = ablaRuntimeLoadI64(block)
+    var runBegin = 0
+    var runEnd = 0
+    if (bitmap != 0) {
+        __ablaRuntimeWasmReclaimsByBitmap = __ablaRuntimeWasmReclaimsByBitmap + 1
+        val words = ((__ablaRuntimeWasmHeapCursor - low) / 16 + 63) / 64
+        var word = 0
+        while (word < words) {
+            var bits = ablaRuntimeLoadI64(bitmap + word * 8)
+            var granule = word * 64
+            while (bits != 0) {
+                if ((bits & 1) != 0) {
+                    val header = low + granule * 16
+                    val end = header + 16 + __ablaRuntimeWasmBlockBytes(ablaRuntimeLoadI64(header))
+                    if (runBegin != 0 && header == runEnd) {
+                        runEnd = end
+                    } else {
+                        if (runBegin != 0) __ablaRuntimeWasmReclaimRun(runBegin, runEnd)
+                        runBegin = header
+                        runEnd = end
+                    }
+                }
+                bits = bits >>> 1
+                granule = granule + 1
+            }
+            word = word + 1
         }
-        if (runEnd - runBegin >= 16 + __ablaRuntimeWasmLargeMinimum) {
-            ablaRuntimeStoreI64(runBegin, runEnd - runBegin - 16)
-            ablaRuntimeStoreI64(runBegin + 16, __ablaRuntimeWasmLargeFree)
-            __ablaRuntimeWasmLargeFree = runBegin + 16
-            __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + runEnd - runBegin
-            __ablaRuntimeWasmReclaimMerged = __ablaRuntimeWasmReclaimMerged + runEnd - runBegin
-        } else if (runEnd - runBegin >= __ablaRuntimeWasmSpanMinimum) {
-            ablaRuntimeStoreI64(runBegin, __ablaRuntimeWasmSpans)
-            ablaRuntimeStoreI64(runBegin + 8, runEnd)
-            __ablaRuntimeWasmSpans = runBegin
-            __ablaRuntimeWasmReclaimMerged = __ablaRuntimeWasmReclaimMerged + runEnd - runBegin
-        } else {
-            var each = first
-            while (count > 0) {
-                val next = ablaRuntimeLoadI64(each)
-                val kind = ablaRuntimeLoadI64(each - 16)
-                val head = __ablaRuntimeWasmFreeLists + kind * 8
-                ablaRuntimeStoreI64(each, ablaRuntimeLoadI64(head))
-                ablaRuntimeStoreI64(head, each)
-                __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + 16 +
-                    __ablaRuntimeWasmClassBytes(kind)
-                each = next
-                count = count - 1
+    } else {
+        var block = __ablaRuntimeWasmSortByAddress(all)
+        while (block != 0) {
+            val header = block - 16
+            val end = block + __ablaRuntimeWasmBlockBytes(ablaRuntimeLoadI64(header))
+            block = ablaRuntimeLoadI64(block)
+            if (runBegin != 0 && header == runEnd) {
+                runEnd = end
+            } else {
+                if (runBegin != 0) __ablaRuntimeWasmReclaimRun(runBegin, runEnd)
+                runBegin = header
+                runEnd = end
             }
         }
     }
+    if (runBegin != 0) __ablaRuntimeWasmReclaimRun(runBegin, runEnd)
     // The next growth reclaims again once another MiB has been freed.
     __ablaRuntimeWasmReclaimAt = __ablaRuntimeWasmParked + __ablaRuntimeWasmReclaimStep
     return
@@ -1074,6 +1135,7 @@ trusted fun __ablaRuntimePlatformMemoryHeapStat(which: int): int {
     if (which == 8) return __ablaRuntimeWasmReclaimMerged
     if (which == 9) return __ablaRuntimeWasmParked
     if (which == 10) return __ablaRuntimeWasmRegionPageCacheCount
+    if (which == 11) return __ablaRuntimeWasmReclaimsByBitmap
     // 16 + k: bytes parked on size class k's free list.
     if (which >= 16 && which < 16 + __ablaRuntimeWasmClassCount && __ablaRuntimeWasmFreeLists !=
         0) {
@@ -1377,6 +1439,8 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     val scratchBytes = (allocationCount * 2 + indexCapacity) * 4
     if (scratchBytes > __ablaRuntimeWasmCollectionScratchBytes) {
         __ablaRuntimeWasmMallocFree(__ablaRuntimeWasmCollectionScratch)
+        // Freed, the old block is on a free list: a reclaim in the allocation below must not take it for its bitmap.
+        __ablaRuntimeWasmCollectionScratch = 0
         __ablaRuntimeWasmCollectionScratchBytes = scratchBytes + scratchBytes / 4
         __ablaRuntimeWasmCollectionScratch =
             __ablaRuntimeWasmMalloc(__ablaRuntimeWasmCollectionScratchBytes)
