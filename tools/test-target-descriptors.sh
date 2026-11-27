@@ -25,6 +25,20 @@ set -e
 grep -q "unsupported target 'imaginary-none'" "$directory/invalid.err"
 [[ ! -e "$directory/invalid" ]] || exit 1
 
+# The standard library on the freestanding x86_64-windows, which has no runtime: the runtime's names are missing, and
+# the build says why once and names the hosted target, instead of only listing them.
+set +e
+"$compiler" build "$project_root/tests/cases/target-descriptors/freestanding-io.ab" \
+    --fast --no-cache --target x86_64-windows -o "$directory/freestanding-io.obj" \
+    >"$directory/freestanding-io.out" 2>"$directory/freestanding-io.err"
+freestanding_status=$?
+set -e
+[[ $freestanding_status -ne 0 ]] || exit 1
+[[ $(grep -c 'target x86_64-windows is freestanding' "$directory/freestanding-io.err") -eq 1 ]] ||
+    { cat "$directory/freestanding-io.err" >&2; exit 1; }
+grep 'help: .*--target x86_64-windows-hosted' "$directory/freestanding-io.err" > /dev/null ||
+    { cat "$directory/freestanding-io.err" >&2; exit 1; }
+
 "$compiler" build \
     "$project_root/tests/cases/target-descriptors/generic-object-build.ab" \
     --fast --no-cache -o "$directory/generic-driver"
