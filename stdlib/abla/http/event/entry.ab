@@ -5,6 +5,7 @@ import "abla/http"
 import "abla/http/stream"
 import "abla/memory"
 import "abla/net"
+import "abla/sys/linux"
 import "abla/sys/linux/process"
 import "abla/text"
 import "abla/unsafe/memory"
@@ -590,6 +591,35 @@ fun httpEventResponsePortable(
     output
 }
 
+// A slot's reads and small writes go by its descriptor: a TcpConnection made for each call (and disarmed so that its drop
+// does not close the socket) and a SocketWriteResult were three allocations a request.
+
+// Reads up to `maximum` bytes from `descriptor`, as TcpConnection.readCompact does.
+private fun httpEventRead(descriptor: int, maximum: int): string =
+    if (descriptor >= 0 && maximum > 0 && maximum <= 1048576) ablaLinuxTcpReadCompact(descriptor, maximum) else ""
+
+// The written count and the errno a send stopped at, packed in one int (httpEventSendWritten, httpEventSendError).
+private val HTTP_EVENT_SEND_ERROR_SHIFT = 1099511627776
+
+/** Sends `contents` to `descriptor` as TcpConnection.writeResult does (MSG_NOSIGNAL, until all of it is written, an error
+ *  stops it or the kernel would block: EAGAIN 11), and returns the bytes written plus the errno that stopped it (0: none;
+ *  9 for a closed descriptor, 5 for a zero-byte send) times HTTP_EVENT_SEND_ERROR_SHIFT. */
+private trusted fun httpEventSend(descriptor: int, contents: string): int {
+    val address = nativeStringDataAddress(contents)
+    var written = 0
+    var errorCode = if (descriptor >= 0) 0 else 9
+    while (errorCode == 0 && written < contents.size) {
+        val amount = linuxSyscall6(44, descriptor, address + written, contents.size - written, 16384, 0, 0)
+        if (amount > 0) written = written + amount
+        if (amount == 0) errorCode = 5
+        if (amount < 0 && amount != -4) errorCode = -amount
+    }
+    written + errorCode * HTTP_EVENT_SEND_ERROR_SHIFT
+}
+
+private fun httpEventSendWritten(packed: int): int = packed % HTTP_EVENT_SEND_ERROR_SHIFT
+private fun httpEventSendError(packed: int): int = packed / HTTP_EVENT_SEND_ERROR_SHIFT
+
 // Bounds-check every copy even though the capacity is computed first.
 private trusted fun httpEventResponseCopy(
     address: int, capacity: int, offset: int, value: string
@@ -725,26 +755,34 @@ fun HttpEventServer.dispatchNoEscape(slot: int, request: HttpRequest, http10: bo
     if (framedResponse.size > this.options.maximumPendingBytes) {
         this.closeSlot(slot)
     } else if (this.descriptors[slot] >= 0) {
-        val connection = TcpConnection(this.descriptors[slot])
         // Scatter/gather avoids copying large segmented bodies, while
-        // the contiguous writer remains cheaper for small responses.
-        val written = if (framedResponse.size >= 4096) {
-            connection.writeCompact(framedResponse)
-        } else connection.writeResult(framedResponse)
-        connection.descriptor = -1
-        if (written.written > 0 &&
-            written.written < framedResponse.size) {
+        // the contiguous writer remains cheaper for small responses (by the descriptor: httpEventSend).
+        var sent = 0
+        var sendError = 0
+        if (framedResponse.size >= 4096) {
+            val connection = TcpConnection(this.descriptors[slot])
+            val written = connection.writeCompact(framedResponse)
+            connection.descriptor = -1
+            sent = written.written
+            if (written.failed()) sendError = written.errorCode
+        } else {
+            val packed = httpEventSend(this.descriptors[slot], framedResponse)
+            sent = httpEventSendWritten(packed)
+            sendError = httpEventSendError(packed)
+        }
+        if (sent > 0 &&
+            sent < framedResponse.size) {
             this.lastActivityMilliseconds[slot] =
                 this.passMilliseconds
         }
-        if (written.failed() && written.errorCode != 11) {
+        if (sendError != 0 && sendError != 11) {
             this.closeSlot(slot)
-        } else if (written.written >= framedResponse.size) {
+        } else if (sent >= framedResponse.size) {
             this.outputOffsets[slot] = 0
             if (this.closing[slot]) this.closeSlot(slot)
         } else {
             this.outputs[slot] = memoryPromoteString(framedResponse)
-            this.outputOffsets[slot] = written.written
+            this.outputOffsets[slot] = sent
             if (!this.writeWatching[slot] &&
                 this.poller.modifyDescriptor(
                     this.descriptors[slot], false, true
@@ -1000,13 +1038,11 @@ fun HttpEventServer.readReady(slot: int): void {
                 // rather than copying every full receive into the GC heap.
                 // Bound the region even for a continuously sending client.
                 while (accumulating) {
-                    val connection = TcpConnection(this.descriptors[slot])
                     var receiveMaximum = this.options.maximumHeaderBytes +
                         this.options.maximumBodyBytes - pending.size + 1
                     if (receiveMaximum > 131072) receiveMaximum = 131072
                     if (receiveMaximum > roomLeft) receiveMaximum = roomLeft
-                    val incoming = connection.readCompact(receiveMaximum)
-                    connection.descriptor = -1
+                    val incoming = httpEventRead(this.descriptors[slot], receiveMaximum)
                     reads = reads + 1
                     roomLeft = roomLeft - incoming.size
                     continueReading = false
@@ -1076,12 +1112,10 @@ fun HttpEventServer.readReady(slot: int): void {
                 if (this.descriptors[slot] < 0 || this.outputs[slot].size > 0) reading = false
             }
         } else {
-            val connection = TcpConnection(this.descriptors[slot])
             // Read a typical API body and its headers in one receive
             // operation, continuing after a full edge-triggered chunk.
             val plainRead = if (budgetRoom < 32768) budgetRoom else 32768
-            val incoming = connection.readCompact(plainRead)
-            connection.descriptor = -1
+            val incoming = httpEventRead(this.descriptors[slot], plainRead)
             if (incoming.size > 0) {
                 this.lastActivityMilliseconds[slot] =
                     this.passMilliseconds
@@ -1125,18 +1159,18 @@ fun HttpEventServer.readReady(slot: int): void {
 fun HttpEventServer.writeReady(slot: int): void {
     if (slot >= 0 && this.descriptors[slot] >= 0 &&
         this.outputOffsets[slot] < this.outputs[slot].size) {
-        val connection = TcpConnection(this.descriptors[slot])
         val remaining = this.outputs[slot].slice(
             this.outputOffsets[slot], this.outputs[slot].size
         )
-        val written = connection.writeResult(remaining)
-        connection.descriptor = -1
-        if (written.written > 0) {
+        val packed = httpEventSend(this.descriptors[slot], remaining)
+        val sent = httpEventSendWritten(packed)
+        val sendError = httpEventSendError(packed)
+        if (sent > 0) {
             this.lastActivityMilliseconds[slot] = this.passMilliseconds
         }
         this.outputOffsets[slot] =
-            this.outputOffsets[slot] + written.written
-        if (written.failed() && written.errorCode != 11) this.closeSlot(slot)
+            this.outputOffsets[slot] + sent
+        if (sendError != 0 && sendError != 11) this.closeSlot(slot)
         else if (this.outputOffsets[slot] >= this.outputs[slot].size) {
             this.outputs[slot] = ""
             this.outputOffsets[slot] = 0
