@@ -6,6 +6,8 @@
 #   - a use of freed memory through the runtime's memcpy (extern:"c") is reported: a native buffer read after close() and
 #     a string's bytes read after a collection freed the string (tests/cases/valgrind/use-after-free.ab), each as an
 #     invalid read inside a freed block; without an argument the same program reports nothing;
+#   - a planted runtime bug (a copy of the standard library whose sweep writes into each object it frees) is reported in
+#     the sweep, as an invalid write inside a freed block;
 #   - a build for valgrind and a plain one never share the prebuilt runtime object (src/toolchain.ab,
 #     bootstrapFastRuntimeEligible): built one after the other, the plain program makes no requests (memcheck counts no
 #     heap block) and the valgrind one does.
@@ -77,6 +79,26 @@ done
 grep -q 'memory.NativeByteBuffer.close' "$out/use-after-free-buffer.vg" || fail 'the buffer was not freed by its close()'
 grep -q '__ablaRuntimeHostCollectionSweep' "$out/use-after-free-collected.vg" || fail 'the string was not freed by a sweep'
 
+# A planted runtime bug: a copy of the standard library whose collector, right after it frees an object, writes a word into
+# it. memcheck must report that write in the sweep, with the stacks of the object's allocation and its free; the same
+# program built from the unchanged standard library reported nothing above.
+planted=$out/planted
+mkdir -p "$planted"
+cp -R stdlib "$planted/stdlib"
+host=$planted/stdlib/abla/runtime/platform/host.ab
+freed='                if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindFreed(payload)'
+awk -v freed="$freed" '{ print } $0 == freed { print "                ablaRuntimeStoreI64(payload, 0)" }' \
+    stdlib/abla/runtime/platform/host.ab > "$host"
+plants=$(grep -c '^                ablaRuntimeStoreI64(payload, 0)$' "$host" || true)
+[[ $plants -ge 1 ]] || fail "the planted runtime bug found no sweep to go into (the line it follows: $freed)"
+ABLA_STDLIB=$planted/stdlib build tests/cases/modules/bytes.ab "$out/planted-bytes" flag
+ABLA_GC_STRESS=1 memcheck "$out/planted-bytes.vg" "$out/planted-bytes"
+[[ $status == 9 ]] || fail "the planted runtime bug was not reported (status $status)"
+grep -q 'Invalid write of size 8' "$out/planted-bytes.vg" &&
+    grep -qE "is 0 bytes inside a block of size [0-9,]+ free'd" "$out/planted-bytes.vg" &&
+    grep -q '__ablaRuntimeHostCollectionSweep' "$out/planted-bytes.vg" ||
+    fail "the planted runtime bug: $(grep -m4 -E 'Invalid|inside|at 0x|ERROR SUMMARY' "$out/planted-bytes.vg")"
+
 # No shared runtime object: valgrind, plain, valgrind again, with the prebuilt runtime object allowed.
 source=tests/cases/valgrind/use-after-free.ab
 for step in valgrind-1:flag plain:plain valgrind-2:env; do
@@ -95,4 +117,4 @@ done
 if "$compiler" build tests/cases/valgrind/use-after-free.ab -o "$out/windows.exe" --target x86_64-windows-hosted --fast --no-cache \
     --valgrind > "$out/windows.log" 2>&1; then fail "a Windows build took --valgrind"; fi
 grep -q 'E_BUILD_VALGRIND_TARGET' "$out/windows.log" || fail "the Windows refusal: $(head -3 "$out/windows.log")"
-echo "valgrind: ${#programs[@]} programs built with --valgrind report nothing under memcheck (GC stress on and off), two uses of freed memory are reported, a plain build next to a valgrind one (--valgrind, ABLA_VALGRIND=1) makes no requests, and a Windows target is refused"
+echo "valgrind: ${#programs[@]} programs built with --valgrind report nothing under memcheck (GC stress on and off), two uses of freed memory and a planted collector write after free are reported, a plain build next to a valgrind one (--valgrind, ABLA_VALGRIND=1) makes no requests, and a Windows target is refused"
