@@ -203,6 +203,46 @@ fun h2Flood(budget: int): H2Flood {
     H2Flood(held, 10 * CONNECTIONS - refused, refused, freshRefused, answered, after)
 }
 
+// A connection whose read waited for room is read again once there is some: `holder` and `second` fill the budget with bodies they never finish,
+// `waiter` sends a head and part of its body (held, then paused when the budget is used up) and the rest while paused. The kernel
+// says nothing new about `waiter` after that, so only the end of a pass can read it again: when the holders leave, the rest is read
+// and the request answered. Returns whether it was answered.
+fun pausedResumes(): bool {
+    val router = httpRouter()
+    router.post("/", answer)
+    val server = httpEventServer(router, ipv4Loopback(0), eventOptions(BUDGET, 30000))
+    val port = server.listener.localPort()
+    // Two holders, each under the body limit (1 MiB) and together over the budget.
+    val holder = connect(port)
+    val second = connect(port)
+    holder.write(postHead(900000))
+    second.write(postHead(900000))
+    val piece = "h".repeat(16384)
+    for (round in 0 until 40) {
+        holder.write(piece)
+        second.write(piece)
+        server.step(0)
+    }
+    for (k in 0 until 10) server.step(10)
+    val waiter = connect(port)
+    waiter.write(postHead(60000) + "w".repeat(20000))
+    for (k in 0 until 10) server.step(10)
+    waiter.write("w".repeat(40000))
+    for (k in 0 until 10) server.step(10)
+    var early = waiter.readCompact(4096)
+    holder.close()
+    second.close()
+    var answered = early.indexOf("got 60000") >= 0
+    for (k in 0 until 60) {
+        server.step(10)
+        if (!answered) answered = waiter.readCompact(4096).indexOf("got 60000") >= 0
+    }
+    if (early.indexOf("got 60000") >= 0) fail("paused: the waiting request was answered while the budget was used up (it was never paused)")
+    waiter.close()
+    for (k in 0 until 10) server.step(10)
+    answered
+}
+
 // ---- accounting ----
 
 // Requests that complete, are reset, lose their connection, are a parse error or time out leave nothing held.
@@ -232,6 +272,8 @@ fun accountingH1(): int {
     var midway = server.heldRequestBytes()
     for (k in 0 until 60) server.step(20)
     if (midway < 20000) fail("accounting h1: nothing was held midway ($midway)")
+    // The count the server reads and pauses by is the one counted afresh, also after a connection that timed out (closed outside a read).
+    if (server.budget.held != server.heldRequestBytes()) fail("accounting h1: the server counts ${server.budget.held} bytes held, ${server.heldRequestBytes()} are")
     server.heldRequestBytes()
 }
 
@@ -302,6 +344,8 @@ fun main: int {
     if (!h2.freshAnswered) fail("h2: a new stream after the clients left was not answered")
     val h2Off = h2Flood(0)
     if (h2Off.held <= BUDGET + h2Slack) fail("h2, budget off: ${h2Off.held} bytes held, the flood does not exceed the bound")
+
+    if (!pausedResumes()) fail("paused: a connection that waited for room was not read again once there was some")
 
     val a1 = accountingH1()
     if (a1 != 0) fail("accounting h1: $a1 bytes held at the end")
