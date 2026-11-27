@@ -538,6 +538,7 @@ test-serial: ablac
 	tools/test-websocket-server-drip.sh $(COMPILER)
 	tools/test-http-request-line.sh $(COMPILER)
 	tools/test-http2-review.sh $(COMPILER)
+	tools/test-http-response-splitting.sh $(COMPILER)
 	tools/test-websocket-pipelined.sh $(COMPILER)
 	tools/test-dns-hardening.sh $(COMPILER)
 	tools/test-tls-resume-review.sh $(COMPILER)

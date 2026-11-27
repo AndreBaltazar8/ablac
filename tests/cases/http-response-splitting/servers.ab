@@ -1,0 +1,123 @@
+// Response splitting (#1139 area 4, round 8), on the running servers: the event server (a router, a handler, a handler that cannot retain its
+// request) and the HTTPS event server without TLS (a router and a streaming route), each in one thread with a client stepping it. A handler
+// answers with a header from main.ab's hostile cases (a Location, an echoed request id, Set-Cookie values with CR or LF, a NUL, names that are
+// not tokens): every server sends a plain 500 with none of it; an ordinary response is sent as before; trailers that cannot be sent end the
+// streamed response without its last chunk. Prints "response splitting servers ok".
+import "abla/io"
+import "abla/text"
+import "abla/net"
+import "abla/http"
+import "abla/http/event"
+import "abla/http/event/tls"
+
+fun hostile(): array<HttpHeader> = [
+    HttpHeader("Location", "/next\r\nSet-Cookie: admin=1"),
+    HttpHeader("X-Request-Id", "abc\r\n\r\nHTTP/1.1 200 OK\r\nSet-Cookie: admin=1"),
+    HttpHeader("Set-Cookie", "session=1\nSet-Cookie: admin=1"),
+    HttpHeader("Set-Cookie", "session=1\rSet-Cookie: admin=1"),
+    HttpHeader("X-Nul", "a\u0000b"),
+    HttpHeader("Bad Name", "admin"),
+    HttpHeader("X\r\nSet-Cookie", "admin=1"),
+    HttpHeader("", "admin")
+]
+
+// The case the handlers answer with: an index into hostile(), or -1 for an ordinary response.
+var chosen = -1
+
+fun answerHeaders(): array<HttpHeader> =
+    if (chosen < 0) [HttpHeader("Location", "/next?a=b"), HttpHeader("Content-Type", "text/plain")]
+    else [HttpHeader("Content-Type", "text/plain"), hostile()[chosen]]
+
+fun answer(request: HttpRequest): HttpResponse = HttpResponse(302, answerHeaders(), "secret body")
+
+noescape fun answerNoEscape(request: HttpRequest): HttpResponse = HttpResponse(302, answerHeaders(), "secret body")
+
+// A streaming route that answers with the chosen headers, or (trailerCase) answers ordinarily and ends with the chosen header as a trailer.
+var trailerCase = false
+
+class Streamer : HttpStreamHandler {
+    fun onRequest(exchange: HttpStreamExchange): HttpStreamStep =
+        if (trailerCase) HttpStreamStep(respond = true, status = 200, headers = [HttpHeader("Content-Type", "text/plain")], length = -1, write = "part",
+            finish = true, trailers = [hostile()[chosen]])
+        else HttpStreamStep(respond = true, status = 302, headers = answerHeaders(), length = 11, write = "secret body", finish = true)
+    fun onData(exchange: HttpStreamExchange, chunk: string): HttpStreamStep = HttpStreamStep()
+    fun onEnd(exchange: HttpStreamExchange, trailers: array<HttpHeader>): HttpStreamStep = HttpStreamStep()
+    fun onWritable(exchange: HttpStreamExchange): HttpStreamStep = HttpStreamStep()
+    fun onAbort(exchange: HttpStreamExchange, reason: string): void {
+        return
+    }
+}
+
+// 0 the event server with a router, 1 with a handler, 2 with a no-escape handler, 3 the HTTPS server's router, 4 its streaming route.
+fun exchange(kind: int): string {
+    val request = "GET ${if (kind == 4) "/up" else "/"} HTTP/1.1\r\nHost: a\r\n\r\n"
+    var received = ""
+    if (kind <= 2) {
+        val router = httpRouter()
+        router.get("/", answer)
+        val server = if (kind == 0) httpEventServer(router, ipv4Loopback(0))
+            else if (kind == 1) httpEventServerHandler(answer, ipv4Loopback(0))
+            else httpEventServerNoEscapeHandler(answerNoEscape, ipv4Loopback(0))
+        var client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
+        client.setNonblocking()
+        client.write(request)
+        for (k in 0 until 20) {
+            server.step(10)
+            received = received + client.readCompact(4096)
+        }
+        client.close()
+    } else {
+        val router = httpRouter()
+        router.get("/", answer)
+        val server = httpsEventServer(router, ipv4Loopback(0), null)
+        server.streamRoute("GET", "/up", Streamer())
+        var client = tcpConnectIpv4("127.0.0.1", server.listener.localPort(), 2000)
+        client.setNonblocking()
+        client.write(request)
+        for (k in 0 until 20) {
+            server.step(10)
+            received = received + client.readCompact(4096)
+        }
+        client.close()
+    }
+    received
+}
+
+var failures = 0
+
+fun expect(cond: bool, what: string): void {
+    if (!cond) {
+        failures = failures + 1
+        println("FAIL $what")
+    }
+    return
+}
+
+fun main: int {
+    val kinds = ["the event server (router)", "the event server (handler)", "the event server (no-escape handler)", "the HTTPS server (router)",
+        "the HTTPS server (streaming route)"]
+    for (kind in 0 until 5) {
+        for (index in 0 until hostile().size) {
+            chosen = index
+            trailerCase = false
+            val answered = exchange(kind)
+            expect(answered.startsWith("HTTP/1.1 500 Internal Server Error\r\n") && !answered.contains("admin") && !answered.contains("secret") &&
+                !answered.contains("text/plain"), "${kinds[kind]}, case $index: a plain 500 [${answered.slice(0, if (answered.size < 120) answered.size else 120)}]")
+        }
+        chosen = -1
+        val ordinary = exchange(kind)
+        expect(ordinary.startsWith("HTTP/1.1 302 Found\r\n") && ordinary.contains("\r\nLocation: /next?a=b\r\n") && ordinary.contains("secret body"),
+            "${kinds[kind]}: an ordinary response is sent as before [$ordinary]")
+    }
+    // Trailers that cannot be sent: the connection closes (what was queued of the response may not go out either), never with the last chunk or the
+    // trailer, so a client cannot take the response for a whole one.
+    for (index in 0 until hostile().size) {
+        chosen = index
+        trailerCase = true
+        val answered = exchange(4)
+        expect(!answered.contains("admin") && !answered.contains("\r\n0\r\n"),
+            "streamed trailers, case $index: no last chunk, no trailer [$answered]")
+    }
+    if (failures == 0) println("response splitting servers ok")
+    if (failures == 0) 0 else 1
+}

@@ -118,7 +118,21 @@ class H2Server(
     var maximumHeldHeaderBytes: int = H2_MAX_HELD_HEADER_BYTES,
     // Set by the event server while the server-wide budget of request bytes (HttpEventServerOptions.maximumBufferedRequestBytes) is used up: a new stream is refused (REFUSED_STREAM) and no
     // receive credit is returned until it is lifted (`budgetRelease`), so a client cannot send more body to a server that has no room.
-    var budgetFull: bool = false)
+    var budgetFull: bool = false,
+    // Whether this connection has had a response refused (httpResponseFieldsError) and logged: one line per connection.
+    var refusalLogged: bool = false)
+
+/** Whether response or trailer `fields` can be sent as they are (httpResponseFieldsError), with one line on standard error for the connection's first refusal
+ *  (`instead` says what went out in its place). */
+private fun H2Server.fieldsSendable(fields: array<HttpHeader>, instead: string): bool {
+    val error = httpResponseFieldsError(fields)
+    if (error == "") return true
+    if (!this.refusalLogged) {
+        this.refusalLogged = true
+        httpResponseRefusalLog(error, instead)
+    }
+    false
+}
 
 /** The request bytes this connection holds for streams whose handler has not run: the decoded header bytes of the open streams and the body bytes buffered for them. */
 fun H2Server.heldBytes(): int {
@@ -217,6 +231,8 @@ fun H2Server.consumed(stream: int, bytes: int): void {
  *  writeResponse and endResponse. Returns false for a stream that is not a streaming one, was answered already, or a status outside 200..599. */
 fun H2Server.respondStream(stream: int, status: int, headers: array<HttpHeader>, length: int): bool {
     if (this.closed) return false
+    // Headers that cannot be sent as they are (httpResponseFieldsError): a plain 500 with no body, and the stream takes no more of the response.
+    if (!this.fieldsSendable(headers, "a 500 went out instead")) return this.respondStream(stream, 500, [], 0)
     val at = this.indexOf(stream)
     if (at < 0 || !this.streams[at].streaming || this.streams[at].responding || status < 200 || status > 599 || this.overflow) return false
     val fields: array<HpackField> = [HpackField(":status", "${status}", false)]
@@ -280,6 +296,11 @@ fun H2Server.writeResponse(stream: int, chunk: string): int {
 fun H2Server.endResponse(stream: int, trailers: array<HttpHeader> = []): void {
     val at = this.indexOf(stream)
     if (this.closed || at < 0 || !this.streams[at].streaming || !this.streams[at].responding || this.streams[at].bodyFinished) return
+    // Trailers that cannot be sent as they are come after a body already under way: the stream is reset (INTERNAL_ERROR), not ended as if whole.
+    if (!this.fieldsSendable(trailers, "the stream was reset")) {
+        this.streamError(stream, H2_INTERNAL_ERROR)
+        return
+    }
     this.streams[at].bodyFinished = true
     val kept: array<HttpHeader> = []
     for (t in trailers) kept.append(t)
@@ -419,6 +440,8 @@ fun H2Server.tick(now: int): void {
  *  200..599 or a stream that is not waiting is ignored (returns false). */
 fun H2Server.respond(stream: int, status: int, headers: array<HttpHeader>, body: string): bool {
     if (this.closed) return false
+    // Headers that cannot be sent as they are (httpResponseFieldsError): a plain 500, none of the response's headers or body.
+    if (!this.fieldsSendable(headers, "a 500 went out instead")) return this.respond(stream, 500, [], "")
     val at = this.indexOf(stream)
     if (at < 0 || this.streams[at].responding || status < 200 || status > 599 || this.overflow) return false
     // Answered before the request ended (413, an early answer): the rest of the request is dropped and never reaches a handler.

@@ -1,0 +1,175 @@
+// Response splitting (#1139 area 4, round 8): a response header whose name is not a token, or whose value has a CR, LF or NUL, is never written as
+// given. Each server path sends a plain 500 with none of the application's headers in its place (httpResponseFieldsError, httpResponseRefused):
+// HttpResponse.render and renderHead (serveHttp), the event servers' encoder (httpEventResponse), httpChunkedResponse, and HTTP/2's respond and
+// respondStream; HTTP/2 trailers that cannot be sent reset their stream. The cases are what a program reflects into a header from its input: a
+// Location from a query, an echoed request id, a Set-Cookie value. Ordinary responses (a tab in a value included) are written as before.
+// Prints "response splitting ok".
+import "abla/io"
+import "abla/crypto"
+import "abla/http"
+import "abla/http/event"
+import "abla/http/stream"
+import "abla/http/h2"
+import "abla/http/h2/hpack"
+import "abla/http/h2/server"
+import "abla/text"
+
+var failures = 0
+
+fun expect(cond: bool, what: string): void {
+    if (!cond) {
+        failures = failures + 1
+        println("FAIL $what")
+    }
+    return
+}
+
+// The cases a program could take from its input; each must be refused.
+fun hostile(): array<HttpHeader> = [
+    HttpHeader("Location", "/next\r\nSet-Cookie: admin=1"),
+    HttpHeader("X-Request-Id", "abc\r\n\r\nHTTP/1.1 200 OK\r\nSet-Cookie: admin=1"),
+    HttpHeader("Set-Cookie", "session=1\nSet-Cookie: admin=1"),
+    HttpHeader("Set-Cookie", "session=1\rSet-Cookie: admin=1"),
+    HttpHeader("X-Nul", "a\u0000b"),
+    HttpHeader("Bad Name", "v"),
+    HttpHeader("X\r\nSet-Cookie", "admin=1"),
+    HttpHeader("", "v")
+]
+
+val refusedBytes = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+fun renderPaths(): void {
+    var index = 0
+    for (header in hostile()) {
+        val response = HttpResponse(302, [HttpHeader("Content-Type", "text/plain"), header], "secret body")
+        expect(httpResponseFieldsError(response.headers) != "", "case $index is refused by httpResponseFieldsError")
+        expect(response.render() == refusedBytes, "case $index: render sends the plain 500")
+        expect(response.renderHead() == refusedBytes, "case $index: renderHead sends the plain 500")
+        expect(!response.renderHeaders().contains("admin"), "case $index: renderHeaders writes none of it")
+        expect(httpChunkedResponse(["a"], 200, [header]) == refusedBytes, "case $index: httpChunkedResponse sends the plain 500")
+        val request = httpParseRequest("GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+        val event = httpEventResponse(request, response, true, 1073741824)
+        expect(event.startsWith("HTTP/1.1 500 Internal Server Error\r\n") && !event.contains("admin") && !event.contains("secret") &&
+            !event.contains("text/plain"), "case $index: the event encoder sends the plain 500 [$event]")
+        index = index + 1
+    }
+    // Ordinary responses are written as they were: a tab in a value is allowed (RFC 9110 5.5).
+    val normal = HttpResponse(302, [HttpHeader("Location", "/next?a=b"), HttpHeader("Set-Cookie", "s=1; Path=/; HttpOnly"),
+        HttpHeader("X-Tab", "a\tb")], "x")
+    expect(httpResponseFieldsError(normal.headers) == "", "an ordinary response is sendable")
+    expect(normal.render() == "HTTP/1.1 302 Found\r\nLocation: /next?a=b\r\nSet-Cookie: s=1; Path=/; HttpOnly\r\nX-Tab: a\tb\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+        "an ordinary response renders as before [${normal.render()}]")
+    val request = httpParseRequest("GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+    val event = httpEventResponse(request, normal, true, 1073741824)
+    expect(event.startsWith("HTTP/1.1 302 Found\r\nLocation: /next?a=b\r\nSet-Cookie: s=1; Path=/; HttpOnly\r\nX-Tab: a\tb\r\n"),
+        "the event encoder writes an ordinary response as before [$event]")
+    return
+}
+
+// ---- HTTP/2 in process, as tests/cases/http2/server-stream.ab drives H2Server ----
+fun frame(kind: int, flags: int, stream: int, payload: string): string {
+    val n = payload.size
+    cryptoByteString([(n >> 16) & 255, (n >> 8) & 255, n & 255, kind, flags, (stream >> 24) & 127, (stream >> 16) & 255, (stream >> 8) & 255, stream & 255]) + payload
+}
+
+class Seen(val kind: int, val flags: int, val stream: int, val payload: string)
+
+fun frames(output: string): array<Seen> {
+    val list: array<Seen> = []
+    var at = 0
+    while (at + 9 <= output.size) {
+        val n = (output[at] << 16) | (output[at + 1] << 8) | output[at + 2]
+        list.append(Seen(output[at + 3], output[at + 4], ((output[at + 5] & 127) << 24) | (output[at + 6] << 16) | (output[at + 7] << 8) | output[at + 8], output.slice(at + 9, at + 9 + n)))
+        at = at + 9 + n
+    }
+    list
+}
+
+fun hf(name: string, value: string): HpackField = HpackField(name, value, false)
+
+fun block(fields: array<HpackField>): string {
+    var e = hpackEncoderNew(0)
+    e.encode(fields)
+}
+
+fun ready(): H2Server {
+    var s = h2ServerNew()
+    s.streamRoute("GET", "/events", 0)
+    s.feed(H2_PREFACE + frame(4, 0, 0, ""), 0)
+    s.takeOutput()
+    s
+}
+
+fun get(path: string): string = frame(1, 5, 1, block([hf(":method", "GET"), hf(":scheme", "https"), hf(":path", path), hf(":authority", "example.com")]))
+
+// The fields of the response HEADERS frames in `out`, in one string ("name=value;" each), decoded with one decoder as a client would.
+fun responseFields(out: array<Seen>): string {
+    val decoder = hpackDecoderNew(4096, 65536, 16384, 1000)
+    var text = ""
+    for (s in out) {
+        if (s.kind == 1) {
+            val decoded = decoder.decode(s.payload)
+            for (f in decoded.fields) text = text + "${f.name}=${f.value};"
+        }
+    }
+    text
+}
+
+fun resetCode(out: array<Seen>, stream: int): int {
+    for (s in out) {
+        if (s.kind == 3 && s.stream == stream) return (s.payload[0] << 24) | (s.payload[1] << 16) | (s.payload[2] << 8) | s.payload[3]
+    }
+    -1
+}
+
+fun http2Paths(): void {
+    var index = 0
+    for (header in hostile()) {
+        var s = ready()
+        s.feed(get("/"), 0)
+        for (request in s.takeRequests()) s.respond(request.stream, 302, [HttpHeader("content-type", "text/plain"), header], "secret body")
+        val out = frames(s.takeOutput())
+        val fields = responseFields(out)
+        var body = ""
+        for (f in out) {
+            if (f.kind == 0) body = body + f.payload
+        }
+        expect(fields.startsWith(":status=500;") && !fields.contains("admin") && !fields.contains("text/plain") && body == "",
+            "h2 case $index: respond sends a plain 500 [$fields] [$body]")
+        // A streaming response.
+        var t = ready()
+        t.feed(get("/events"), 0)
+        t.takeEvents()
+        expect(t.respondStream(1, 200, [header], -1), "h2 case $index: respondStream answers")
+        expect(t.writeResponse(1, "secret") == -1, "h2 case $index: the refused stream takes no body")
+        val streamed = frames(t.takeOutput())
+        val streamedFields = responseFields(streamed)
+        expect(streamedFields.startsWith(":status=500;") && !streamedFields.contains("admin"), "h2 case $index: respondStream sends a plain 500 [$streamedFields]")
+        // Trailers after a body that went out: the stream is reset.
+        var u = ready()
+        u.feed(get("/events"), 0)
+        u.takeEvents()
+        u.respondStream(1, 200, [], -1)
+        u.writeResponse(1, "body")
+        u.takeOutput()
+        u.endResponse(1, [header])
+        val trailed = frames(u.takeOutput())
+        expect(resetCode(trailed, 1) == H2_INTERNAL_ERROR && !responseFields(trailed).contains("admin"),
+            "h2 case $index: trailers that cannot be sent reset the stream (code ${resetCode(trailed, 1)})")
+        index = index + 1
+    }
+    // An ordinary h2 response is answered as before.
+    var s = ready()
+    s.feed(get("/"), 0)
+    for (request in s.takeRequests()) s.respond(request.stream, 302, [HttpHeader("location", "/next?a=b"), HttpHeader("x-tab", "a\tb")], "x")
+    val fields = responseFields(frames(s.takeOutput()))
+    expect(fields.startsWith(":status=302;location=/next?a=b;x-tab=a\tb;"), "an ordinary h2 response is answered as before [$fields]")
+    return
+}
+
+fun main: int {
+    renderPaths()
+    http2Paths()
+    if (failures == 0) println("response splitting ok")
+    if (failures == 0) 0 else 1
+}

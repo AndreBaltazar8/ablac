@@ -3,6 +3,7 @@
 
 import "abla/net"
 import "abla/sys/linux/process"
+import "abla/sys/linux/io"
 import "abla/text"
 import "abla/bytes"
 import "abla/unsafe/memory"
@@ -358,8 +359,91 @@ fun httpStatusReason(status: int): string {
     reason
 }
 
-// Serializes the HTTP/1.1 status line and headers, ending each with CRLF. Adds missing Content-Length and Connection headers except for status 101. The blank line and body are left to the caller.
+/** Why `headers` cannot be sent as they are, or "" when they can: a name that is empty or not a token (RFC 9110 5.6.2), or a value with CR, LF or NUL
+ *  (RFC 9110 5.5). Either would be written to the wire as given, and a CR LF from a program's input (a Location from a query, an echoed request id, a
+ *  cookie value) would start another header or another response: response splitting. The servers send `httpResponseRefused()` instead. Every
+ *  response is checked, so the common answer is a native scan of the bytes; the message is made only for a response that is refused. */
+fun httpResponseFieldsError(headers: array<HttpHeader>): string =
+    if (ablaCompileTimeNativeHost()) (if (httpResponseFieldsValidNative(headers)) "" else httpResponseFieldsErrorText(headers))
+    else if (ablaAtCompileTime()) httpResponseFieldsErrorText(headers)
+    else if (httpResponseFieldsValidNative(headers)) "" else httpResponseFieldsErrorText(headers)
+
+// The bytes of every name and value, read in place: a name byte must be of class 0 (a token byte) in httpNameClasses, a value byte not CR, LF or NUL.
+private trusted fun httpResponseFieldsValidNative(headers: array<HttpHeader>): bool {
+    // The table first: its first use may flatten it, an allocation that must not fall after a field's address is taken.
+    val classes = ablaUnsafeStringAddress(httpNameClasses)
+    for (header in headers) {
+        val name = header.name
+        val nameSize = name.size
+        if (nameSize == 0) return false
+        val nameAt = ablaUnsafeStringAddress(name)
+        var i = 0
+        while (i < nameSize) {
+            if (ablaUnsafeLoadU8(nativePointerFromAddress(classes + ablaUnsafeLoadU8(nativePointerFromAddress(nameAt + i)))) != 0) return false
+            i = i + 1
+        }
+        val value = header.value
+        val valueSize = value.size
+        val valueAt = ablaUnsafeStringAddress(value)
+        var j = 0
+        // Eight bytes a step: (x - 0x0e) & ~x has the high bit of a byte below 14 set (a borrow only reaches bytes after one that is), and only such a
+        // word (a tab, or another control byte) is looked at byte by byte.
+        while (j + 8 <= valueSize) {
+            val word = ablaUnsafeLoadI64(nativePointerFromAddress(valueAt + j))
+            if (((word - 1012762419733073422) & ~word & -9187201950435737472) != 0) {
+                var k = j
+                while (k < j + 8) {
+                    val byte = ablaUnsafeLoadU8(nativePointerFromAddress(valueAt + k))
+                    if (byte == 13 || byte == 10 || byte == 0) return false
+                    k = k + 1
+                }
+            }
+            j = j + 8
+        }
+        while (j < valueSize) {
+            val byte = ablaUnsafeLoadU8(nativePointerFromAddress(valueAt + j))
+            if (byte < 14 && (byte == 13 || byte == 10 || byte == 0)) return false
+            j = j + 1
+        }
+    }
+    true
+}
+
+// httpResponseFieldsError's answer with its message, by checked reads (the compile-time evaluator's path, and a refused response's).
+private fun httpResponseFieldsErrorText(headers: array<HttpHeader>): string {
+    for (header in headers) {
+        if (header.name.size == 0) return "a response header name is empty"
+        for (i in 0 until header.name.size) {
+            if (!httpTokenByte(header.name[i])) return "a response header name is not a token"
+        }
+        for (i in 0 until header.value.size) {
+            val byte = header.value[i]
+            if (byte == 13 || byte == 10 || byte == 0) {
+                return "the response header ${header.name} has a CR, LF or NUL in its value"
+            }
+        }
+    }
+    ""
+}
+
+/** The response the servers send in place of one whose headers `httpResponseFieldsError` refuses: a plain 500, none of the application's headers or body. */
+fun httpResponseRefused(): HttpResponse = HttpResponse(500, [], "")
+
+/** `response` when its headers can be sent as they are, else `httpResponseRefused()` (fail closed: nothing of the refused response is written). */
+fun httpResponseSendable(response: HttpResponse): HttpResponse =
+    if (httpResponseFieldsError(response.headers) == "") response else httpResponseRefused()
+
+/** One line on standard error for a refused response (`error` from httpResponseFieldsError; the value itself is not printed). The servers write it once
+ *  per connection. */
+fun httpResponseRefusalLog(error: string, instead: string = "a 500 went out instead"): void {
+    linuxPrintStandardError("http: a response was not sent as given ($error); $instead\n")
+    return
+}
+
+// Serializes the HTTP/1.1 status line and headers, ending each with CRLF. Adds missing Content-Length and Connection headers except for status 101. The blank
+// line and body are left to the caller. A response whose headers cannot be sent as they are (httpResponseFieldsError) is rendered as httpResponseRefused().
 fun HttpResponse.renderHeaders(): string {
+    if (httpResponseFieldsError(this.headers) != "") return httpResponseRefused().renderHeaders()
     var output = "HTTP/1.1 ${this.status} ${httpStatusReason(this.status)}\r\n"
     var hasLength = false
     var hasConnection = false
@@ -384,11 +468,14 @@ fun HttpResponse.renderHeaders(): string {
     output
 }
 
-// Returns the HTTP/1.1 response bytes, including the blank line and body.
-fun HttpResponse.render(): string = "${this.renderHeaders()}\r\n${this.body}"
+// Returns the HTTP/1.1 response bytes, including the blank line and body (httpResponseRefused()'s for headers that cannot be sent as they are).
+fun HttpResponse.render(): string {
+    val sendable = httpResponseSendable(this)
+    "${sendable.renderHeaders()}\r\n${sendable.body}"
+}
 
 // Returns the HTTP/1.1 status and headers followed by a blank line. Content-Length still describes the underlying body.
-fun HttpResponse.renderHead(): string = "${this.renderHeaders()}\r\n"
+fun HttpResponse.renderHead(): string = "${httpResponseSendable(this).renderHeaders()}\r\n"
 
 // Serializes an HTTP/1.1 request and body. Uses `authority` for Host when absent and fills missing Content-Length and Connection headers.
 // Returns "" for a request whose parts cannot be sent as they are (httpClientRequestError): nothing of it is written.
@@ -1891,6 +1978,9 @@ private fun httpServeConnection(router: HttpRouter, connection: TcpConnection, o
     if (read.timedOut) return -1
     val request = httpRequestOriginForm(httpRequestWithPeer(httpParseRequest(read.request), connection.descriptor))
     val response = router.dispatch(request)
+    // One connection, one response: a refused one is logged here, and render() sends httpResponseRefused() for it.
+    val refusal = httpResponseFieldsError(response.headers)
+    if (refusal != "") httpResponseRefusalLog(refusal)
     var rendered = response.render()
     if (request.method == "HEAD") rendered = response.renderHead()
     if (options.responseTimeoutMilliseconds > 0) {

@@ -185,7 +185,9 @@ resource class HttpsEventServer(
     // The clocks of the HTTP/1 request being received and the response being sent, per connection (see HttpEventServerOptions).
     val deadlines: HttpEventDeadlines = httpEventDeadlines(),
     // The server-wide budget of buffered request bytes, HTTP/1 and HTTP/2 together (see HttpEventServerOptions.maximumBufferedRequestBytes).
-    val budget: HttpEventBudget = httpEventBudget()
+    val budget: HttpEventBudget = httpEventBudget(),
+    // Whether the connection has had a response refused (httpResponseFieldsError) and logged: one line per connection.
+    val refusalLogged: array<bool> = []
 ) {
     /// Closes the active sockets, poller and listener when the server is dropped.
     fun drop(): void {
@@ -311,6 +313,11 @@ private fun HttpsEventServer.xRespond(index: int, status: int, headers: array<Ht
     val slot = this.exchanges[index].slot
     if (!this.exchanges[index].h1) return this.h2[slot].respondStream(this.exchanges[index].stream, status, headers, length)
     if (status < 200 || status > 599 || this.exchanges[index].exchange.responded) return false
+    // Headers that cannot be sent as they are (httpResponseFieldsError): a plain 500 with no body in their place.
+    if (httpResponseFieldsError(headers) != "") {
+        this.sendable(slot, HttpResponse(status, headers, ""))
+        return this.xRespond(index, 500, [], 0)
+    }
     var head = "HTTP/1.1 $status ${httpStatusReason(status)}\r\n"
     for (h in headers) {
         val name = h.name.lowercase()
@@ -362,6 +369,18 @@ private fun HttpsEventServer.xEnd(index: int, trailers: array<HttpHeader>): void
         return
     }
     if (this.exchanges[index].chunkedResponse && !this.exchanges[index].responseDone) {
+        // Trailers that cannot be sent as they are (httpResponseFieldsError) come after the body: the connection is closed without the last chunk,
+        // so the client sees an incomplete response, not a whole one with forged fields.
+        val refusal = httpResponseFieldsError(trailers)
+        if (refusal != "") {
+            if (slot >= 0 && slot < this.refusalLogged.size && !this.refusalLogged[slot]) {
+                this.refusalLogged[slot] = true
+                httpResponseRefusalLog(refusal, "the connection was closed")
+            }
+            this.exchanges[index].responseDone = true
+            this.closeSlot(slot)
+            return
+        }
         var end = "0\r\n"
         for (t in trailers) end = end + "${t.name}: ${t.value}\r\n"
         this.xAppend(slot, end + "\r\n")
@@ -893,6 +912,7 @@ private fun HttpsEventServer.allocate(descriptor: int): int {
         this.chunkStates.append(httpEventChunkState())
         this.deadlines.deadlineGrow()
         this.budget.paused.append(false)
+        this.refusalLogged.append(false)
     } else {
         this.descriptors[slot] = descriptor
         this.peers[slot] = peer
@@ -909,10 +929,23 @@ private fun HttpsEventServer.allocate(descriptor: int): int {
         this.chunkStates[slot].reset()
         this.deadlines.deadlineReset(slot)
         this.budget.paused[slot] = false
+        this.refusalLogged[slot] = false
     }
     while (this.descriptorSlots.size <= descriptor) this.descriptorSlots.append(-1)
     this.descriptorSlots[descriptor] = slot
     slot
+}
+
+/// The response the connection at `slot` is sent for `response`: itself, or httpResponseRefused() when its headers cannot be sent as they are
+/// (httpResponseFieldsError), with one line on standard error the first time a connection has one.
+fun HttpsEventServer.sendable(slot: int, response: HttpResponse): HttpResponse {
+    val error = httpResponseFieldsError(response.headers)
+    if (error == "") return response
+    if (slot >= 0 && slot < this.refusalLogged.size && !this.refusalLogged[slot]) {
+        this.refusalLogged[slot] = true
+        httpResponseRefusalLog(error)
+    }
+    httpResponseRefused()
 }
 
 /// Closes the socket for a connection slot and releases its server state.
@@ -1189,7 +1222,7 @@ private fun HttpsEventServer.serveHttp1(slot: int): void {
             this.requestCounts[slot] = this.requestCounts[slot] + 1
             val keepAlive = (if (frame.http10) httpHeaderTokenContains(request.header("Connection"), "keep-alive") && httpRequestKeepAlive(request) else httpRequestKeepAlive(request)) &&
                 !this.draining && this.requestCounts[slot] < base.maximumRequestsPerConnection
-            this.outputs[slot] = httpEventResponse(request, response, keepAlive, base.gzipMinimumBytes)
+            this.outputs[slot] = httpEventResponseChecked(request, this.sendable(slot, response), keepAlive, base.gzipMinimumBytes)
             this.outputOffsets[slot] = 0
             this.closing[slot] = !keepAlive
             if (this.outputs[slot].size > base.maximumPendingBytes) {

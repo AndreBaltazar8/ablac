@@ -173,7 +173,9 @@ resource class HttpEventServer(
     // The clocks of the request being received and the response being sent, per connection (see HttpEventServerOptions).
     val deadlines: HttpEventDeadlines = httpEventDeadlines(),
     // The server-wide budget of buffered request bytes (see HttpEventServerOptions.maximumBufferedRequestBytes).
-    val budget: HttpEventBudget = httpEventBudget()
+    val budget: HttpEventBudget = httpEventBudget(),
+    // Whether the connection has had a response refused (httpResponseFieldsError) and logged: one line per connection.
+    val refusalLogged: array<bool> = []
 ) {
     // Closes the open client descriptors when the server is released.
     fun drop(): void {
@@ -316,6 +318,7 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.chunkStates.append(httpEventChunkState())
         this.deadlines.deadlineGrow()
         this.budget.paused.append(false)
+        this.refusalLogged.append(false)
     } else {
         this.descriptors[slot] = descriptor
         this.peerAddresses[slot] = peer
@@ -331,12 +334,25 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.chunkStates[slot].reset()
         this.deadlines.deadlineReset(slot)
         this.budget.paused[slot] = false
+        this.refusalLogged[slot] = false
     }
     while (this.descriptorSlots.size <= descriptor) {
         this.descriptorSlots.append(-1)
     }
     this.descriptorSlots[descriptor] = slot
     slot
+}
+
+// The response the connection at `slot` is sent for `response`: itself, or httpResponseRefused() when its headers cannot be sent as they are
+// (httpResponseFieldsError), with one line on standard error the first time a connection has one.
+fun HttpEventServer.sendable(slot: int, response: HttpResponse): HttpResponse {
+    val error = httpResponseFieldsError(response.headers)
+    if (error == "") return response
+    if (slot >= 0 && slot < this.refusalLogged.size && !this.refusalLogged[slot]) {
+        this.refusalLogged[slot] = true
+        httpResponseRefusalLog(error)
+    }
+    httpResponseRefused()
 }
 
 // Closes and clears an active connection slot, ignoring invalid or already closed slots.
@@ -548,16 +564,25 @@ fun httpEventFrame(
     HttpEventFrame(length, framedRequest, http10, need, head, partial, trim)
 }
 
-// Renders a response with request-aware body suppression and optional gzip compression.
+// Renders a response with request-aware body suppression and optional gzip compression. A response whose headers cannot be sent as they are
+// (httpResponseFieldsError: a name that is not a token, a CR, LF or NUL in a value) is sent as httpResponseRefused(), a plain 500.
 fun httpEventResponse(
+    request: HttpRequest,
+    response: HttpResponse,
+    keepAlive: bool,
+    gzipMinimumBytes: int
+): string = httpEventResponseChecked(request, httpResponseSendable(response), keepAlive, gzipMinimumBytes)
+
+// httpEventResponse of a response already checked (HttpEventServer.sendable): the same bytes, without scanning the headers a second time.
+fun httpEventResponseChecked(
     request: HttpRequest,
     response: HttpResponse,
     keepAlive: bool,
     gzipMinimumBytes: int
 ): string {
     var encoded = response
-    if (response.body.size >= gzipMinimumBytes) {
-        encoded = httpGzipResponse(request, response, gzipMinimumBytes)
+    if (encoded.body.size >= gzipMinimumBytes) {
+        encoded = httpGzipResponse(request, encoded, gzipMinimumBytes)
     }
     if (ablaCompileTimeNativeHost()) httpEventResponseNative(request, encoded, keepAlive)
     else if (ablaAtCompileTime()) httpEventResponsePortable(request, encoded, keepAlive)
@@ -775,8 +800,8 @@ fun HttpEventServer.dispatchNoEscape(slot: int, request: HttpRequest, http10: bo
         !this.draining &&
         this.requestCounts[slot] <
             this.options.maximumRequestsPerConnection
-    val framedResponse = httpEventResponse(
-        request, response, keepAlive,
+    val framedResponse = httpEventResponseChecked(
+        request, this.sendable(slot, response), keepAlive,
         this.options.gzipMinimumBytes
     )
     this.closing[slot] = !keepAlive
@@ -986,8 +1011,8 @@ fun HttpEventServer.processSlot(slot: int): void {
                 this.requestCounts[slot] <
                     this.options.maximumRequestsPerConnection
             this.outputs[slot] = region {
-                memoryPromoteString(httpEventResponse(
-                    request, response, keepAlive,
+                memoryPromoteString(httpEventResponseChecked(
+                    request, this.sendable(slot, response), keepAlive,
                     this.options.gzipMinimumBytes
                 ))
             }
