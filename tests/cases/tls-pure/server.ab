@@ -202,6 +202,26 @@ fun main: int {
         lateServer.takeOutput()
         lateServer.feed(junk)
         if (!lateServer.failed()) fail("records that do not deprotect were skipped without an early_data extension")
+        // Skipping ends at the first record that deprotects (section 4.2.10: it starts the client's second flight): the client's Finished in two records, a record
+        // that does not deprotect between them, is a bad_record_mac. The control (the same two records, nothing between) connects, so the records are right.
+        for (injected in [false, true]) {
+            var splitServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+            splitServer.feed(tlsPlaintextRecord(TLS_HANDSHAKE, 771, earlyHello))
+            splitServer.takeOutput()
+            splitServer.feed(junk)
+            var clientHandshake = tlsRecordProtection(splitServer.aead,
+                tlsTrafficKey(splitServer.hash, splitServer.clientHandshakeSecret, splitServer.keyLength),
+                tlsTrafficIv(splitServer.hash, splitServer.clientHandshakeSecret))
+            val finished = tlsHandshakeMessage(TLS_FINISHED,
+                tlsFinishedVerifyData(splitServer.hash, splitServer.clientHandshakeSecret, splitServer.transcript.hash(splitServer.hash)))
+            splitServer.feed(tlsProtectRecord(clientHandshake, TLS_HANDSHAKE, finished.slice(0, 2)).bytes)
+            if (injected) splitServer.feed(tlsPlaintextRecord(23, 771, random(60)))
+            splitServer.feed(tlsProtectRecord(clientHandshake, TLS_HANDSHAKE, finished.slice(2, finished.size)).bytes)
+            if (!injected && !splitServer.connected()) fail("a Finished split over two records after skipped early data: ${splitServer.error}")
+            if (injected && (!splitServer.failed() || !splitServer.error.contains("bad record MAC"))) {
+                fail("a record that does not deprotect, after one that did, was skipped as early data: [${splitServer.error}]")
+            }
+        }
     }
     // A ClientHello that declares more than 2^17 bytes is refused at its header; twenty thousand one-byte records of
     // handshake data (no quadratic copying) end in the refusal of the whole message too.
@@ -310,6 +330,21 @@ fun main: int {
     kuClient.send("after the update")
     pump(kuClient, kuServer)
     if (kuServer.takeApplicationData() != "after the update") fail("data after a KeyUpdate")
+    // A KeyUpdate ends its record (RFC 8446 section 5.1): anything after it in the same record is unexpected_message, both ways. Two KeyUpdates in one record,
+    // and one followed by the first bytes of another message.
+    for (tail in [tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)), tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)).slice(0, 2)]) {
+        // (A pair per direction: the side that fails wipes its keys.)
+        var alignServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+        var alignClient = clientFor(edStore, "localhost")
+        pump(alignClient, alignServer)
+        alignServer.feed(tlsProtectRecord(alignClient.write, TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)) + tail).bytes)
+        if (!alignServer.failed() || !alignServer.error.contains("after a KeyUpdate")) fail("the server took data after a KeyUpdate in its record: [${alignServer.error}]")
+        var peerServer = tlsServerNew(TlsServerConfig(ed, [TLS_SUITE_AES_128_GCM_SHA256], [TLS_GROUP_X25519], [], random, false, false, acceptAny))
+        var peerClient = clientFor(edStore, "localhost")
+        pump(peerClient, peerServer)
+        peerClient.feed(tlsProtectRecord(peerServer.write, TLS_HANDSHAKE, tlsHandshakeMessage(TLS_KEY_UPDATE, tlsU8(0)) + tail).bytes)
+        if (!peerClient.failed() || !peerClient.error.contains("after a KeyUpdate")) fail("the client took data after a KeyUpdate in its record: [${peerClient.error}]")
+    }
 
     // Refusals by the server: a ClientHello without TLS 1.3, no common suite, a garbled hello.
     val plainHello = tlsBuildClientHello(random(32), "", [TLS_SUITE_AES_128_GCM_SHA256], "localhost", [TLS_GROUP_X25519],

@@ -146,7 +146,8 @@ class TlsServer(
     /** The identity picked for this connection from `config.identities` by its ClientHello (null: `config.identity`). */
     var chosenIdentity: TlsIdentity? = null,
     /** The ClientHello offered early_data, which this server does not accept: the records the client sends under the early traffic key are skipped (RFC 8446
-     *  section 4.2.10), up to `TLS_EARLY_SKIP_LIMIT` bytes of them, until the client's Finished. */
+     *  section 4.2.10), up to `TLS_EARLY_SKIP_LIMIT` bytes of them, until the first record that deprotects under the handshake key (the start of the client's second
+     *  flight: the flag is cleared there, and a record that fails after it is a bad_record_mac). */
     var earlyOffered: bool = false,
     var earlySkipped: int = 0
 )
@@ -768,6 +769,11 @@ private fun TlsServer.handleKeyUpdate(body: string): void {
         this.fail(TLS_ALERT_DECODE_ERROR, "tls: a malformed KeyUpdate")
         return
     }
+    // RFC 8446 section 5.1: a KeyUpdate precedes a key change, so it ends its record; handshake data after it would be read across the change.
+    if (!this.handshakeBuffer.empty()) {
+        this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: data after a KeyUpdate in its record")
+        return
+    }
     this.keyUpdateRun = this.keyUpdateRun + 1
     if (this.keyUpdateRun > TLS_MAX_EMPTY_RUN) {
         this.fail(TLS_ALERT_UNEXPECTED_MESSAGE, "tls: too many KeyUpdates in a row")
@@ -920,6 +926,8 @@ private fun TlsServer.handleRecord(record: string, header: TlsRecordHeader): voi
                 opened.error)
             return
         }
+        // "Once a record is deprotected successfully, it is treated as the start of the client's second flight" (section 4.2.10): nothing after it is skipped.
+        this.earlyOffered = false
         type = opened.type
         content = opened.content
     } else {
