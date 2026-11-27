@@ -620,6 +620,31 @@ private trusted fun httpEventSend(descriptor: int, contents: string): int {
 private fun httpEventSendWritten(packed: int): int = packed % HTTP_EVENT_SEND_ERROR_SHIFT
 private fun httpEventSendError(packed: int): int = packed / HTTP_EVENT_SEND_ERROR_SHIFT
 
+// The decimal digits of a non-negative `value` (a status code, a body length): how many, and written into the response at
+// `offset` (-1 when they do not fit, as httpEventResponseCopy), so that neither number needs a string of its own.
+private fun httpEventDecimalSize(value: int): int {
+    var size = 1
+    var rest = value
+    while (rest >= 10) {
+        rest = rest / 10
+        size = size + 1
+    }
+    size
+}
+
+private trusted fun httpEventResponseDecimal(address: int, capacity: int, offset: int, value: int): int {
+    val size = httpEventDecimalSize(value)
+    if (offset < 0 || offset > capacity || size > capacity - offset) return -1
+    var at = offset + size - 1
+    var rest = value
+    while (at >= offset) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(address + at), 48 + rest % 10)
+        rest = rest / 10
+        at = at - 1
+    }
+    offset + size
+}
+
 // Bounds-check every copy even though the capacity is computed first.
 private trusted fun httpEventResponseCopy(
     address: int, capacity: int, offset: int, value: string
@@ -634,11 +659,14 @@ private trusted fun httpEventResponseCopy(
 trusted fun httpEventResponseNative(
     request: HttpRequest, encoded: HttpResponse, keepAlive: bool
 ): string {
-    val statusText = "${encoded.status}"
+    // The status and the body length are written as digits into the response (httpEventResponseDecimal); a negative
+    // status (not one a handler should give) keeps its text.
+    val statusText = if (encoded.status < 0) "${encoded.status}" else ""
+    val statusSize = if (encoded.status < 0) statusText.size else httpEventDecimalSize(encoded.status)
     val reason = httpStatusReason(encoded.status)
     val connection = if (keepAlive) "Connection: keep-alive\r\n" else "Connection: close\r\n"
     val body = if (request.method == "HEAD") "" else encoded.body
-    var total = 9 + statusText.size + 1 + reason.size + 2 + connection.size + 2 + body.size
+    var total = 9 + statusSize + 1 + reason.size + 2 + connection.size + 2 + body.size
     var hasLength = false
     for (header in encoded.headers) {
         if (!httpAsciiEqualInsensitive(header.name, "Connection")) {
@@ -647,14 +675,14 @@ trusted fun httpEventResponseNative(
         }
     }
     val addLength = !hasLength && encoded.status != 101
-    val lengthText = if (addLength) "${encoded.body.size}" else ""
-    if (addLength) total = total + 16 + lengthText.size + 2
+    if (addLength) total = total + 16 + httpEventDecimalSize(encoded.body.size) + 2
     val output = adoptNativeString(
         ablaUnsafePointerAddress(ablaUnsafeAllocate(total + 1)), total
     )
     val address = ablaUnsafeStringAddress(output)
     var offset = httpEventResponseCopy(address, total, 0, "HTTP/1.1 ")
-    offset = httpEventResponseCopy(address, total, offset, statusText)
+    offset = if (encoded.status < 0) httpEventResponseCopy(address, total, offset, statusText)
+        else httpEventResponseDecimal(address, total, offset, encoded.status)
     offset = httpEventResponseCopy(address, total, offset, " ")
     offset = httpEventResponseCopy(address, total, offset, reason)
     offset = httpEventResponseCopy(address, total, offset, "\r\n")
@@ -669,7 +697,7 @@ trusted fun httpEventResponseNative(
     offset = httpEventResponseCopy(address, total, offset, connection)
     if (addLength) {
         offset = httpEventResponseCopy(address, total, offset, "Content-Length: ")
-        offset = httpEventResponseCopy(address, total, offset, lengthText)
+        offset = httpEventResponseDecimal(address, total, offset, encoded.body.size)
         offset = httpEventResponseCopy(address, total, offset, "\r\n")
     }
     offset = httpEventResponseCopy(address, total, offset, "\r\n")
