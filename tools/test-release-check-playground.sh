@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # tools/release-check.sh and the browser compiler (tools/build-playground.sh, #1138): abla-playground-<version>.tar.gz is an optional extra (neither
 # expected nor an extra in the `assets` check), judged by `playground` when present: a manifest that names the tag's version, a module that matches its
-# hash, a stdlib bundle that carries its hash. Fake artifacts, no network.
+# hash, a stdlib bundle that carries its hash. Fake artifacts and no network (tools/lib/test-offline.sh): a call that reaches for it fails the test.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/tools/lib/test-offline.sh"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
+offline_setup "$work"
 mkdir artifacts
 printf '#!/bin/sh\necho "ablac 9.9.9"\n' > artifacts/ablac-x86_64-linux
 chmod +x artifacts/ablac-x86_64-linux
@@ -14,7 +16,7 @@ cp artifacts/ablac-x86_64-linux stage2
 (cd artifacts && sha256sum ablac-x86_64-linux > ablac-x86_64-linux.sha256)
 ls artifacts | sort > expected
 run() { # OUT -> the output lines
-    "$root/tools/release-check.sh" v9.9.9 1 stage2 --artifacts artifacts --assets-from expected --out "$1" --source-ref 0000000000000000000000000000000000000000 2>&1 || true
+    PATH="$offline:$PATH" "$root/tools/release-check.sh" v9.9.9 1 stage2 --artifacts artifacts --assets-from expected --out "$1" "${offline_flags[@]}" 2>&1 || true
 }
 line() { grep -E "^(PASS|FAIL|SKIP) +$1 " <<< "$2" || true; }
 package() { # VERSION-IN-MANIFEST: a fake package, packed as the real one is
@@ -63,4 +65,5 @@ tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf artifacts/ab
 (cd artifacts && sha256sum abla-playground-9.9.9.tar.gz > abla-playground-9.9.9.tar.gz.sha256)
 tampered=$(run out4)
 [[ $(line playground "$tampered") == FAIL*"does not match its hash"* ]] || { echo "a tampered module passed: $(line playground "$tampered")" >&2; exit 1; }
+offline_check
 echo "release-check playground: an optional extra, judged by its manifest, its module hash and its stdlib bundle"

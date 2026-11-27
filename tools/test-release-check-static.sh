@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # tools/release-check.sh and the static compiler (#806 step C): the static asset is an optional extra (neither expected nor an extra in
 # the `assets` check, with or without it in the previous release's names), checked by `static` when present, and that check fails a
-# file that is not a static-pie executable. Fake artifacts, no network: the convergence line fails without a run and is not judged.
+# file that is not a static-pie executable. Fake artifacts and no network (tools/lib/test-offline.sh): the convergence check reads a
+# recorded comparison.json, gh, curl and wget are fakes on the PATH, and a call that reaches for the network fails the test.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+. "$root/tools/lib/test-offline.sh"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
+offline_setup "$work"
 mkdir artifacts
 printf '#!/bin/sh\necho "ablac 9.9.9"\n' > artifacts/ablac-x86_64-linux
 chmod +x artifacts/ablac-x86_64-linux
@@ -15,10 +18,12 @@ printf 'toolchain' > artifacts/abla-toolchain-x86_64-linux.tar.gz
 for name in ablac-x86_64-linux abla-toolchain-x86_64-linux.tar.gz; do (cd artifacts && sha256sum "$name" > "$name.sha256"); done
 ls artifacts | sort > expected-without
 run() { # EXPECTED-FILE OUT -> the output lines
-    "$root/tools/release-check.sh" v9.9.9 1 stage2 --artifacts artifacts --assets-from "$1" --out "$2" --source-ref 0000000000000000000000000000000000000000 2>&1 || true
+    PATH="$offline:$PATH" "$root/tools/release-check.sh" v9.9.9 1 stage2 --artifacts artifacts --assets-from "$1" --out "$2" "${offline_flags[@]}" 2>&1 || true
 }
 line() { grep -E "^(PASS|FAIL|SKIP) +$1 " <<< "$2" || true; }
 without=$(run expected-without out1)
+# The recorded comparison is read, so the convergence line is judged now (it passes) without the network.
+[[ $(line convergence "$without") == PASS* ]] || { echo "convergence from the recorded comparison: $(line convergence "$without")" >&2; exit 1; }
 [[ $(line assets "$without") == PASS* ]] || { echo "assets without the static asset: $(line assets "$without")" >&2; exit 1; }
 [[ -z $(line static "$without") ]] || { echo "a static line without a static asset" >&2; exit 1; }
 # a static asset that is a script, not an executable image
@@ -40,11 +45,12 @@ if command -v qemu-aarch64 > /dev/null || [[ $(uname -m) == aarch64 ]]; then
     [[ $(line static-aarch64 "$aarch") == FAIL* ]] || { echo "a script passed as the aarch64 static compiler: $(line static-aarch64 "$aarch")" >&2; exit 1; }
 fi
 bin=$(mktemp -d)
-for tool in bash env ls sort uniq comm diff grep awk sed mktemp rm cat tr head tail cmp dirname uname readelf sha256sum date printf mv cp mkdir chmod wc cut basename tee find xargs ln; do
+for tool in bash env ls sort uniq comm diff grep awk sed mktemp rm cat tr head tail cmp dirname uname readelf sha256sum date printf mv cp mkdir chmod wc cut basename tee find xargs ln node; do
     path=$(command -v "$tool" 2> /dev/null || true)
     [[ -z $path ]] || ln -s "$path" "$bin/$tool"
 done
-noqemu=$(PATH=$bin "$root/tools/release-check.sh" v9.9.9 1 stage2 --artifacts artifacts --assets-from expected-without --out out5 --source-ref 0000000000000000000000000000000000000000 2>&1 || true)
+for tool in gh curl wget; do ln -s "$offline/$tool" "$bin/$tool"; done
+noqemu=$(PATH=$bin "$root/tools/release-check.sh" v9.9.9 1 stage2 --artifacts artifacts --assets-from expected-without --out out5 "${offline_flags[@]}" 2>&1 || true)
 ! grep -q "command not found" <<< "$noqemu" || { echo "the restricted PATH lacks a tool release-check uses: $(grep "command not found" <<< "$noqemu" | head -2)" >&2; exit 1; }
 rm -rf -- "$bin"
 if [[ $(uname -m) != aarch64 ]]; then
@@ -94,4 +100,6 @@ done
 rm -f artifacts/abla-toolchain-x86_64-linux.tar.gz artifacts/abla-toolchain-x86_64-linux.tar.gz.sha256
 notc=$(run expected-without out9)
 [[ $(line toolchain "$notc") == FAIL* ]] || { echo "no default toolchain archive passed check 8: $(line toolchain "$notc")" >&2; exit 1; }
+# No run of release-check reached for the network.
+offline_check
 echo "release-check static: the optional assets (x86-64 and AArch64) and the static toolchain package are judged by their own checks"
