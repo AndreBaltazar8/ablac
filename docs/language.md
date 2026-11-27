@@ -3149,8 +3149,12 @@ the program (`nativeStaticAllocate`, `nativeStaticBytes`, `nativeStaticU32s` and
 their mutable, linked, section and thread-local forms, `nativeLinkerSymbolAddress`,
 `nativeFunctionAddress`), so a module value such as
 `val table = nativeStaticU32s([nativeFunctionAddress(handler)])` needs no trusted
-function: the address cannot dangle, and using it still needs trusted code. In
-v0.2.72 a restricted use is a warning (`warning[E_SEMANTIC]: native.trust:...`,
+function: the address cannot dangle, and using it still needs trusted code. A
+field of a class whose raw constructor is restricted (`closed` of a buffer or a
+cell, `error` of a `CudaKernelDevice`) can be read anywhere, but written only
+from trusted code (decision #161): its own functions rely on what it holds, so
+`buffer.closed = false` in an ordinary function is
+`native.trust:NativeByteBuffer.closed`. In v0.2.72 a restricted use is a warning (`warning[E_SEMANTIC]: native.trust:...`,
 "from 0.2.73"); from v0.2.73 it is an error. The full list is `tools/unsafe-trusted-only.tsv`; each of those
 declarations carries the standard library's own `@__abla_trusted_only` marker,
 which a program cannot use (`annotation.reserved`).

@@ -12,6 +12,9 @@
 #     function as a value from code that is not trusted (run-time or compile-time code alike) are `native.trust:<name>` with the
 #     help, and the same call inside a trusted function, the factory, the checked methods and module values made with the
 #     open producers of a program-lifetime address (static storage, a function's address) are accepted;
+#   - a write of a field of a marked class (reopening a closed buffer) from code that is not trusted is
+#     `native.trust:<class>.<field>` (decision #161 A; a warning in the warn phase), and the same write in a trusted function and a
+#     read of the field from ordinary code are accepted;
 #   - the marker on a program's own declaration is annotation.reserved.
 set -euo pipefail
 compiler=${1:-build/ablac}
@@ -55,6 +58,9 @@ build "$out/warn-stdlib" plain-call
 [[ $status == 0 ]] || fail "plain-call did not build in the warn phase: $(head -4 "$out/plain-call.log")"
 grep -q 'warning\[E_SEMANTIC\]: native.trust:nativePointerAddress' "$out/plain-call.log" || fail "plain-call: no warning: $(head -4 "$out/plain-call.log")"
 grep -q 'from 0.2.73' "$out/plain-call.log" || fail 'plain-call: the warning does not name the release'
+build "$out/warn-stdlib" field-write
+[[ $status == 0 ]] && grep -q 'warning\[E_SEMANTIC\]: native.trust:NativeByteBuffer.closed' "$out/field-write.log" ||
+    fail "field-write: the warn phase did not build with a warning: $(head -4 "$out/field-write.log")"
 for program in tests/cases/modules/bytes.ab tests/cases/modules/linux-net.ab tests/cases/modules/http-async.ab; do
     name=$(basename "$program" .ab)
     "$compiler" build "$program" -o "$out/stdlib-$name" --fast --no-cache > "$out/stdlib-$name.log" 2>&1 ||
@@ -64,7 +70,8 @@ done
 
 # Phase "error" (the standard library as it is: every marker is at "error").
 for refused in plain-call:nativePointerAddress constructor:NativeByteBuffer reference:nativePointerAddress \
-    compile-time:nativePointerAddress plain-syscall:linuxSyscall1; do
+    compile-time:nativePointerAddress plain-syscall:linuxSyscall1 field-write:NativeByteBuffer.closed \
+    field-extension:NativeByteBuffer.closed; do
     IFS=: read -r name what <<< "$refused"
     build "$root/stdlib" "$name"
     [[ $status != 0 ]] || fail "$name built with the marker at error"
@@ -73,7 +80,10 @@ done
 grep -q 'help: allocate one with nativeByteBuffer(capacity)' "$out/constructor.log" || fail "constructor: no factory help: $(head -5 "$out/constructor.log")"
 grep -q 'help: wrap the call in a trusted function' "$out/plain-call.log" || fail "plain-call: no help: $(head -5 "$out/plain-call.log")"
 grep -q 'help: call the abla/sys wrapper' "$out/plain-syscall.log" || fail "plain-syscall: no help: $(head -5 "$out/plain-syscall.log")"
-for accepted in trusted-call open trusted-syscall; do
+grep -q 'help: .NativeByteBuffer.'"'"'s own functions change its fields' "$out/field-write.log" || fail "field-write: no help: $(head -5 "$out/field-write.log")"
+[[ $(grep -c 'native.trust:NativeByteBuffer.closed' "$out/field-extension.log") -ge 2 ]] ||
+    fail "field-extension: the write by this. and by the bare name are not both refused: $(head -6 "$out/field-extension.log")"
+for accepted in trusted-call open trusted-syscall trusted-field; do
     build "$root/stdlib" "$accepted"
     [[ $status == 0 ]] || fail "$accepted was refused: $(head -4 "$out/$accepted.log")"
     ! grep -q 'native.trust' "$out/$accepted.log" || fail "$accepted warned: $(head -3 "$out/$accepted.log")"
