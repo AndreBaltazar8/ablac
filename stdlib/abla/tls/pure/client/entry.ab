@@ -118,12 +118,21 @@ fun TlsClientConfig.checksStaples(): bool = this.revocation > 0 && this.stapleVe
 /** An ephemeral key pair offered in the key_share extension. */
 class TlsKeyPair(val group: int, val publicKey: string, val privateKey: string)
 
+/** The key bytes a loaded TlsIdentity's signing function holds, which TlsIdentity.wipe clears: the key's DER and, for an
+ *  ECDSA key, its padded scalar ("" for none). Only the loaders (tlsIdentityFromPem, tlsIdentityFromPkcs12) make one, from
+ *  strings they made, so a wipe clears no string anyone else holds. */
+@__abla_trusted_only("error: an identity's key bytes come from tlsIdentityFromPem or tlsIdentityFromPkcs12; a hand-made one would have TlsIdentity.wipe clear strings of your choosing")
+class TlsIdentityKeys(val key: string, val scalar: string)
+
+/** No key bytes: an identity whose signing function keeps its key somewhere else (a hand-made one), which `wipe` leaves as it is. */
+trusted fun tlsIdentityNoKeys(): TlsIdentityKeys = TlsIdentityKeys("", "")
+
 /** A certificate and its key, a client's for mutual TLS or a server's: the chain (DER, end entity first), the signature
  *  schemes its key can make, and the signing function (scheme and the content to sign give the signature, "" on
- *  failure). `secrets` are the key bytes the signing function holds, which `wipe` clears (the loaders,
- *  tlsIdentityFromPem and tlsIdentityFromPkcs12, fill them in). */
+ *  failure). `keys` are the key bytes the signing function holds, which `wipe` clears: only the loaders,
+ *  tlsIdentityFromPem and tlsIdentityFromPkcs12, have any; an identity made by hand has none (its signer's key is its own). */
 class TlsIdentity(val chain: array<string>, val schemes: array<int>, val sign: (int, string) -> string,
-    val error: string = "", val secrets: array<string> = []) {
+    val error: string = "", val keys: TlsIdentityKeys = tlsIdentityNoKeys()) {
     /** True for an identity with a certificate and a key that signs. */
     fun ok(): bool = this.error == "" && this.chain.size > 0
 }
@@ -131,7 +140,8 @@ class TlsIdentity(val chain: array<string>, val schemes: array<int>, val sign: (
 /** Clears the key bytes the identity holds: it signs nothing after this. For when it is done with (a connection's
  *  identity after its handshake, a listener's when it closes). */
 fun TlsIdentity.wipe(): void {
-    for (secret in this.secrets) tlsClientWipeOwned(secret)
+    if (this.keys.key != "") tlsClientWipeOwned(this.keys.key)
+    if (this.keys.scalar != "") tlsClientWipeOwned(this.keys.scalar)
     return
 }
 
@@ -248,20 +258,24 @@ fun tlsGroupIsClassic(group: int): bool =
     group == TLS_GROUP_X25519 || group == TLS_GROUP_SECP256R1 || group == TLS_GROUP_SECP384R1
 
 /** A key pair for `group` from the bytes of `random` (32 for X25519 and P-256, 48 for P-384, 64 and 32 for the hybrid's seeds and
- *  its X25519 key): null for another group. The private key is made of the random source's bytes, which the machine that uses
- *  the pair clears when it is done (tlsWipe): `random` returns fresh bytes, as tlsPureRandom does. */
+ *  its X25519 key): null for another group. The private key is a copy of the random source's bytes in a buffer of its own
+ *  (tlsOwnedCopy), which the machine that uses the pair clears when it is done (tlsWipe); what `random` returned stays the
+ *  caller's (it may hold it, or return a string it shares), and nothing here clears it. */
 fun tlsGenerateKeyPair(group: int, random: (int) -> string): TlsKeyPair? {
     if (group == TLS_GROUP_X25519) {
-        val privateKey = random(32)
+        val privateKey = tlsOwnedCopy(random(32))
         val publicKey = x25519PublicKey(privateKey)
-        if (!publicKey.ok) return null
+        if (!publicKey.ok) {
+            tlsClientWipeOwned(privateKey)
+            return null
+        }
         return TlsKeyPair(group, publicKey.bytes, privateKey)
     }
     if (group == TLS_GROUP_SECP256R1) {
         // A random 32-byte string is a valid scalar but for one value in 2^32: ask again.
         var attempt = 0
         while (attempt < 4) {
-            val privateKey = random(32)
+            val privateKey = tlsOwnedCopy(random(32))
             val publicKey = p256PublicKey(privateKey)
             if (publicKey.ok) return TlsKeyPair(group, publicKey.bytes, privateKey)
             tlsClientWipeOwned(privateKey)
@@ -272,7 +286,7 @@ fun tlsGenerateKeyPair(group: int, random: (int) -> string): TlsKeyPair? {
         // A random 48-byte string is a valid scalar but for one value in 2^190 or so (or a wrong length from a failing source).
         var attempt = 0
         while (attempt < 4) {
-            val privateKey = random(48)
+            val privateKey = tlsOwnedCopy(random(48))
             val publicKey = p384PublicKey(privateKey)
             if (publicKey.ok) return TlsKeyPair(group, publicKey.bytes, privateKey)
             tlsClientWipeOwned(privateKey)
@@ -280,8 +294,8 @@ fun tlsGenerateKeyPair(group: int, random: (int) -> string): TlsKeyPair? {
         }
     }
     if (group == TLS_GROUP_X25519_MLKEM768) {
-        val seeds = random(64)
-        val scalar = random(32)
+        val seeds = tlsOwnedCopy(random(64))
+        val scalar = tlsOwnedCopy(random(32))
         var pair: TlsKeyPair? = null
         if (seeds.size == 64 && scalar.size == 32) {
             val decapsulationKey = mlkem768KeyGenFromSeeds(seeds.slice(0, 32), seeds.slice(32, 64))
@@ -343,7 +357,7 @@ fun tlsServerExchange(group: int, clientShare: string, random: (int) -> string):
     if (!mlkem768CheckEncapsulationKey(encapsulationKey)) {
         return tlsServerExchangeFailed(TLS_ALERT_ILLEGAL_PARAMETER, "tls: the ML-KEM encapsulation key is not valid")
     }
-    val message = random(32)
+    val message = tlsOwnedCopy(random(32))
     val pair = tlsGenerateKeyPair(TLS_GROUP_X25519, random)
     if (message.size != 32 || pair == null) {
         tlsClientWipeOwned(message)

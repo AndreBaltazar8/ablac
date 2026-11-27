@@ -88,11 +88,11 @@ grep -q 'help: .NativeByteBuffer.'"'"'s own functions change its fields' "$out/f
 build "$root/stdlib" sealed-memory
 [[ $status != 0 ]] || fail "sealed-memory built"
 for what in ByteBuffer.stage ByteBuffer.staged AesKey AesGcmKey RsaPrivateKey Keccak Keccak.closed LlvmOrcSession.closed \
-    LlvmOrcGeneration.closed cryptoWipeString tlsWipe; do
+    LlvmOrcGeneration.closed cryptoWipeString tlsWipe TlsIdentityKeys; do
     grep "error\[E_SEMANTIC\]: native.trust:$what\($\|@\|:\)" "$out/sealed-memory.log" > /dev/null ||
         fail "sealed-memory: $what is not refused: $(head -4 "$out/sealed-memory.log")"
 done
-for accepted in trusted-call open trusted-syscall trusted-field; do
+for accepted in trusted-call open trusted-syscall trusted-field caller-strings; do
     build "$root/stdlib" "$accepted"
     [[ $status == 0 ]] || fail "$accepted was refused: $(head -4 "$out/$accepted.log")"
     ! grep -q 'native.trust' "$out/$accepted.log" || fail "$accepted warned: $(head -3 "$out/$accepted.log")"

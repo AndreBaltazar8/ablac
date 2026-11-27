@@ -1,0 +1,48 @@
+// The string wipes are trusted-only (decision #165), and the public functions that wipe keep to strings they made: an identity
+// made by hand has no key bytes for TlsIdentity.wipe to clear (only the loaders' sealed TlsIdentityKeys do), and a key
+// generation or a server's key exchange clears its own copies of what the random source returned, never the source's strings
+// (which a program may share: a literal would fault). Exit 0 when every string the program handed over is as it was.
+import "abla/io"
+import "abla/tls/pure/client"
+import "abla/tls/pure/handshake"
+import "abla/text"
+
+fun owned(text: string): string = "$text$text".slice(0, text.size)
+
+// Whether `value` still reads as `expected` (a string of its own, made the same way).
+fun intact(label: string, value: string, expected: string): bool {
+    if (value == expected) return true
+    println("caller-strings: $label was wiped")
+    false
+}
+
+fun main: int {
+    val shared = owned("0123456789abcdef0123456789abcdef")
+    val identity = TlsIdentity([shared], [], { scheme: int, data: string -> shared })
+    identity.wipe()
+    if (!intact("a hand-made identity's chain", shared, owned("0123456789abcdef0123456789abcdef"))) return 11
+    // X25519: the private key is a copy, which the server's exchange clears.
+    val x = owned("a".repeat(32))
+    tlsServerExchange(TLS_GROUP_X25519, "\x09" + "\x00".repeat(31), { n: int -> x })
+    if (!intact("X25519's random bytes", x, owned("a".repeat(32)))) return 12
+    // P-256 and P-384: a scalar of ff bytes is above the order, so refused (and asked for again); the refused copies are cleared,
+    // the source's not.
+    val high32 = owned("\xff".repeat(32))
+    val high48 = owned("\xff".repeat(48))
+    if (tlsGenerateKeyPair(TLS_GROUP_SECP256R1, { n: int -> high32 }) != null) println("caller-strings: an ff P-256 scalar")
+    if (tlsGenerateKeyPair(TLS_GROUP_SECP384R1, { n: int -> high48 }) != null) println("caller-strings: an ff P-384 scalar")
+    if (!intact("a refused P-256 scalar", high32, owned("\xff".repeat(32))) ||
+        !intact("a refused P-384 scalar", high48, owned("\xff".repeat(48)))) return 13
+    // The hybrid: its seeds and X25519 scalar are cleared once the pair is made, and the server's encapsulation message.
+    val seeds = owned("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    val scalar = owned("fedcba9876543210fedcba9876543210")
+    val pair = tlsGenerateKeyPair(TLS_GROUP_X25519_MLKEM768, { n: int -> if (n == 64) seeds else scalar })
+    if (pair == null) return 14
+    if (!intact("the hybrid's seeds", seeds, owned("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")) ||
+        !intact("the hybrid's X25519 scalar", scalar, owned("fedcba9876543210fedcba9876543210"))) return 15
+    val message = owned("m".repeat(32))
+    tlsServerExchange(TLS_GROUP_X25519_MLKEM768, pair.publicKey, { n: int -> message })
+    if (!intact("the server's ML-KEM message and X25519 key", message, owned("m".repeat(32)))) return 16
+    println("caller-strings: every string the program handed over is as it was")
+    0
+}
