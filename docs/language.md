@@ -3091,7 +3091,32 @@ value. Ordinary code does not make a buffer from an address: abla/kernel/cuda's
 `CudaKernelMemory.floats()`, `words()`, `halves()` and `raw()` give the device
 memory's, and a trusted function that owns host memory and keeps it alive
 builds one for the CPU (the raw constructors are trusted-only,
-[#1226](#trusted-native-implementations)). The same function runs:
+[#1226](#trusted-native-implementations)).
+
+A thread's own small array is a `KernelArray<T>(count)` of `f32`, `int` or
+`u32`, all 0 at first, read with `get(index)` and written with `set(index,
+value)` (CUDA's `float acc[4]`). On a GPU it lives in registers, so its count
+is a literal from 1 to 1024 (else `kernel.array-size`) and every index a
+literal, the variable of an `@unroll` loop over literal bounds, or `+`, `-`,
+`*` or `%` of those (else `kernel.array-index`); an index outside it reads 0
+and writes nothing, as a buffer's does:
+
+```abla
+import "abla/kernel"
+
+@kernel
+fun sums(x: KernelF32Buffer, out: KernelF32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) {
+        val acc = KernelArray<f32>(4)
+        @unroll
+        for (k in 0 until 4) acc.set(k, x.load(i * 4 + k))
+        out.store(i, (acc.get(0) + acc.get(1)) + (acc.get(2) + acc.get(3)))
+    }
+}
+```
+
+The same function runs:
 
 - on the CPU through `kernelRunCpu(groups, groupSize) { kernel(...) }`, which
   runs each thread in turn on the calling thread (a subgroup there is one

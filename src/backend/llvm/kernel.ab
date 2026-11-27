@@ -207,10 +207,11 @@ fun bootstrapKernelSymbol(name: string): string {
 }
 
 /** Reports `rule` for `detail` in function `function` (a kernel or something one calls). */
-fun bootstrapKernelFail(var emitter: BootstrapKernelEmitter, function: string, rule: string, detail: string): void {
+fun bootstrapKernelFail(var emitter: BootstrapKernelEmitter, function: string, rule: string, detail: string, help: string = ""): void {
     emitter.diagnostics = "${emitter.diagnostics}error[E_SEMANTIC]: kernel.$rule:$detail: `$function` is part of a @kernel " +
         "function, which runs on a GPU: only scalars, abla/kernel's buffers and ids, arithmetic, branches, loops and calls " +
         "to such functions\n"
+    if (help != "") emitter.diagnostics = "${emitter.diagnostics}help: $help\n"
     emitter.errors = emitter.errors + 1
 }
 
@@ -447,7 +448,7 @@ fun bootstrapKernelBinary(var emitter: BootstrapKernelEmitter, var state: Bootst
 
 /** The LLVM element type of a kernel buffer type ("buffer.f32" -> float, "buffer.u32" -> i32, "buffer.u16" -> i16). */
 fun bootstrapKernelElement(type: string): string =
-    if (type == "buffer.f32") "float" else if (type == "buffer.u16") "i16" else if (type == "buffer.u8") "i8" else "i32"
+    if (type == "buffer.f32") "float" else if (type == "buffer.u16") "i16" else if (type == "buffer.u8") "i8" else if (type == "buffer.i64") "i64" else "i32"
 
 /** A bounds-checked load from or store to a kernel buffer: an index outside it loads 0 and stores nothing. Buffers are
  *  generic pointers (global or shared memory); after inlining, opt's address-space inference makes each access a
@@ -468,7 +469,7 @@ fun bootstrapKernelBufferAccess(
         return
     }
     val element = bootstrapKernelElement(buffer.type)
-    val bytes = if (element == "i16") 2 else if (element == "i8") 1 else 4
+    val bytes = if (element == "i16") 2 else if (element == "i8") 1 else if (element == "i64") 8 else 4
     val index = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
     if (index == "") return
     state.counter = state.counter + 1
@@ -484,7 +485,7 @@ fun bootstrapKernelBufferAccess(
     if (store) {
         val stored = bootstrapKernelGet(state, instruction.operands[2])
         val operand = bootstrapKernelConvert(emitter, state, stored,
-            if (element == "float") "f32" else if (element == "i16") "u16" else if (element == "i8") "u8" else "u32")
+            if (element == "float") "f32" else if (element == "i16") "u16" else if (element == "i8") "u8" else if (element == "i64") "i64" else "u32")
         if (operand == "") return
         bootstrapKernelLine(state, "store $element $operand, ptr $address, align $bytes")
         bootstrapKernelBlock(state, "$label.end")
@@ -496,8 +497,8 @@ fun bootstrapKernelBufferAccess(
     bootstrapKernelBlock(state, "$label.end")
     val joined = bootstrapKernelFresh(state)
     bootstrapKernelLine(state, "$joined = phi $element [ $loaded, %$label.in ], [ ${if (element == "float") "0.0" else "0"}, %$before ]")
-    if (element == "float") {
-        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(joined, "f32", ""))
+    if (element == "float" || element == "i64") {
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(joined, if (element == "float") "f32" else "i64", ""))
     } else {
         val wide = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$wide = zext $element $joined to i64")
@@ -666,6 +667,118 @@ fun bootstrapKernelLoad4(var emitter: BootstrapKernelEmitter, var state: Bootstr
     val result = bootstrapKernelFresh(state)
     bootstrapKernelLine(state, "$result = phi <$lanes x $element> [ $vector, %$label.vector ], [ $built, %$scalarEnd ]")
     bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, if (float) "f32x$lanes" else "u32x$lanes", ""))
+}
+
+/** `KernelArray<T>(count)` (#1299): `count` elements in an alloca, zeroed where the array is made, as a buffer of them
+ *  (its count the literal), which opt's SROA keeps in registers once every index is constant. */
+fun bootstrapKernelArrayCreate(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState,
+    instruction: BootstrapInstruction): void {
+    val lane = instruction.text.slice(26, instruction.text.size)
+    val element = if (lane == "f32") "float" else if (lane == "u32") "i32" else if (lane == "i64" || lane == "int") "i64" else ""
+    if (element == "") { bootstrapKernelFail(emitter, state.name, "type", "KernelArray<$lane> (its elements are f32, int or u32)"); return }
+    val functionIndex = bootstrapKernelFunctionIndex(emitter.program, state.name)
+    val instructions = if (functionIndex >= 0) emitter.program.functions[functionIndex].instructions else []
+    val count = if (instruction.operands.size > 0) bootstrapKernelLiteral(instructions, instruction.operands[0]) else ""
+    if (!bootstrapKernelIsDigits(count) || count.size > 4 || count == "0" || bootstrapKernelDigitsValue(count) > 1024) {
+        bootstrapKernelFail(emitter, state.name, "array-size", "count", "a KernelArray's count is a literal from 1 to 1024")
+        return
+    }
+    state.counter = state.counter + 1
+    val name = "%ka${state.counter}"
+    state.allocas = "${state.allocas}  $name = alloca [$count x $element], align 16\n"
+    bootstrapKernelLine(state, "store [$count x $element] zeroinitializer, ptr $name")
+    val buffer = if (element == "float") "buffer.f32" else if (element == "i32") "buffer.u32" else "buffer.i64"
+    bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(name, buffer, count))
+}
+
+/** The text of the integer literal value `id` is, through the `val` a named argument passes it in (local.load of a local
+ *  declared once from it), or "". */
+fun bootstrapKernelLiteral(instructions: array<BootstrapInstruction>, id: int): string {
+    val definition = bootstrapKernelDefinition(instructions, id) ?? return ""
+    if (definition.opcode == "const.i64") return definition.text
+    if (definition.opcode != "local.load") return ""
+    var literal = ""
+    var declarations = 0
+    for (instruction in instructions) {
+        if ((instruction.opcode == "local.declare" || instruction.opcode == "local.set" || instruction.opcode == "local.assign") &&
+            instruction.text == definition.text) {
+            declarations = declarations + 1
+            val source = bootstrapKernelDefinition(instructions, instruction.left)
+            literal = if (source != null && source.opcode == "const.i64") source.text else ""
+        }
+    }
+    if (declarations == 1) literal else ""
+}
+
+/** The value of decimal `digits`. */
+fun bootstrapKernelDigitsValue(digits: string): int {
+    var value = 0
+    for (byte in digits) value = value * 10 + byte - 48
+    value
+}
+
+/** The locals of a function's fully unrolled loops (`@unroll` on a `for`, #1296): the index each loop's header loads and
+ *  the loop variable its body declares from it. */
+fun bootstrapKernelUnrolledVariables(instructions: array<BootstrapInstruction>): array<string> {
+    val names: array<string> = []
+    var position = 0
+    while (position < instructions.size) {
+        val instruction = instructions[position]
+        if (instruction.opcode == "branch" && bootstrapIrUnrollOf(instruction.text).spec == "full") {
+            val header = bootstrapIrUnrollOf(instruction.text).header
+            var back = position - 1
+            while (back >= 0 && !(instructions[back].opcode == "label" && instructions[back].target == header)) {
+                if (instructions[back].opcode == "local.load") names.append(instructions[back].text)
+                back = back - 1
+            }
+        }
+        position = position + 1
+    }
+    // The body's loop variable: a local declared from a load of an index above.
+    for (instruction in instructions) {
+        if (instruction.opcode == "local.declare") {
+            val source = bootstrapKernelDefinition(instructions, instruction.left)
+            if (source != null && source.opcode == "local.load" && bootstrapKernelHas(names, source.text)) names.append(instruction.text)
+        }
+    }
+    names
+}
+
+/** The instruction whose result is `id`, or null. */
+fun bootstrapKernelDefinition(instructions: array<BootstrapInstruction>, id: int): BootstrapInstruction? {
+    if (id < 0) return null
+    for (instruction in instructions) if (instruction.result == id) return instruction
+    null
+}
+
+/** Whether value `id` is an index a KernelArray keeps in registers with: a literal, a local of `unrolled`, or +, -, *
+ *  or % of such (a conversion of one too). */
+fun bootstrapKernelConstantIndex(instructions: array<BootstrapInstruction>, id: int, unrolled: array<string>, depth: int): bool {
+    if (depth > 32) return false
+    val definition = bootstrapKernelDefinition(instructions, id) ?? return false
+    val op = definition.opcode
+    if (op.startsWith("const.")) return true
+    if (op == "local.load") return bootstrapKernelHas(unrolled, definition.text)
+    if (op == "scalar.cast" || op == "neg") return bootstrapKernelConstantIndex(instructions, definition.left, unrolled, depth + 1)
+    if (op == "+" || op == "-" || op == "*" || op == "%") {
+        return bootstrapKernelConstantIndex(instructions, definition.left, unrolled, depth + 1) &&
+            bootstrapKernelConstantIndex(instructions, definition.right, unrolled, depth + 1)
+    }
+    false
+}
+
+/** KernelArray's get and set: a buffer load or store, once the index is shown constant (else kernel.array-index). */
+fun bootstrapKernelArrayAccess(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState,
+    instruction: BootstrapInstruction, store: bool): void {
+    val functionIndex = bootstrapKernelFunctionIndex(emitter.program, state.name)
+    val instructions = if (functionIndex >= 0) emitter.program.functions[functionIndex].instructions else []
+    if (instruction.operands.size < 2 ||
+        !bootstrapKernelConstantIndex(instructions, instruction.operands[1], bootstrapKernelUnrolledVariables(instructions), 0)) {
+        bootstrapKernelFail(emitter, state.name, "array-index", "index",
+            "a KernelArray index is a literal, the variable of an @unroll for loop over literal bounds, or +, -, * or % of those (else the array would leave registers)")
+        return
+    }
+    bootstrapKernelBufferAccess(emitter, state, instruction, store)
 }
 
 /** The loop headers of the function being lowered that `@unroll` marks (#1296), and their llvm.loop metadata ids. */
@@ -900,6 +1013,10 @@ fun bootstrapKernelBuiltin(
         result = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$result = extractelement ${bootstrapKernelLlvmType(vector.type)} ${vector.operand}, i64 $masked")
         type = if (float) "f32" else "u32"
+    } else if (name.startsWith("extension_KernelArray__abla_generic_") &&
+        (name.indexOf("_get") > 35 || name.indexOf("_set") > 35)) {
+        bootstrapKernelArrayAccess(emitter, state, instruction, name.indexOf("_set") > 35)
+        return true
     } else if (name == "kernelSharedF32" || name == "kernelSharedU32") {
         // A group's shared memory: an addrspace(3) array per call, its size the constant count.
         if (instruction.operands.size < 1) return false
@@ -1480,6 +1597,14 @@ fun bootstrapKernelInstruction(var emitter: BootstrapKernelEmitter, var state: B
         else if (op == "not") bootstrapKernelLine(state, "$result = xor i1 $operand, true")
         else bootstrapKernelLine(state, "$result = xor $ty $operand, -1")
         bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, type, ""))
+    } else if (op == "borrow.mutate") {
+        // An ownership marker (a KernelArray's set): no code.
+    } else if (op == "object.create" && instruction.text.startsWith("KernelArray__abla_generic_")) {
+        bootstrapKernelArrayCreate(emitter, state, instruction)
+    } else if (op == "array.create" && instruction.operands.size == 0) {
+        // An empty array: the CPU backend's storage of a KernelArray (its `words`), which a GPU has no use for; any
+        // other use of it fails on its type.
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "kernel.array.storage", ""))
     } else if (op == "call") {
         if (!bootstrapKernelBuiltin(emitter, state, instruction)) bootstrapKernelCall(emitter, state, instruction)
     } else if (op == "extern.intrinsic") {
