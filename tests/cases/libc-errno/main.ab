@@ -1,0 +1,44 @@
+// errno of the statically linked compiler's C library (src/static_libc/errno.ab, #1139 area 14) is the calling thread's own: the main thread
+// sets it, then threads are started one at a time until one has a thread id equal to the main thread's modulo 256 (the old table's key, which
+// gave such threads one shared cell), and that thread sets its own. The main thread's errno must be what it set, and each new thread's must
+// start at 0. Built by tools/test-libc-functions.sh. Exits 42.
+import "abla/io"
+import "abla/runtime/scalar"
+import "abla/sys/linux"
+import "../../../src/static_libc/errno.ab"
+
+trusted fun errnoValue(): int = ablaRuntimeLoadI64(libcErrnoAddress())
+
+// The thread's own work: its id, its errno when it starts, then it sets errno to 2222. Returns id * 4096 + its starting errno (below 4096).
+trusted fun probe(): int {
+    val id = linuxSyscall0(186)
+    val before = errnoValue()
+    libcSetErrno(2222)
+    id * 4096 + (if (before >= 0 && before < 4096) before else 4095)
+}
+
+trusted fun main: int {
+    val mainId = linuxSyscall0(186)
+    libcSetErrno(1111)
+    var tries = 0
+    var collided = false
+    while (!collided && tries < 4096) {
+        val worker = thread { probe() }
+        val result = await worker
+        val id = result / 4096
+        val before = result % 4096
+        if (before != 0) {
+            println("libc-errno: thread $id started with errno $before (main $mainId)")
+            return 1
+        }
+        collided = id != mainId && id % 256 == mainId % 256
+        tries += 1
+    }
+    val after = errnoValue()
+    if (after != 1111) {
+        println("libc-errno: the main thread's errno is $after after another thread set its own (main $mainId, $tries threads)")
+        return 1
+    }
+    if (!collided) println("libc-errno: no thread id equal to the main thread's modulo 256 in $tries threads (the check still ran)")
+    42
+}
