@@ -10,6 +10,7 @@ chmod 700 "$out"
 sed -e 's/^private @noinline trusted fun rsaPrivateExportDer/trusted fun rsaPrivateExportDer/' \
     -e 's/^private @noinline trusted fun rsaPrivateExportPem/trusted fun rsaPrivateExportPem/' \
     -e 's/^private trusted fun rsaExportLimbs/trusted fun rsaExportLimbs/' \
+    -e '/^@__abla_trusted_only/d' \
     "$root/stdlib/abla/crypto/rsa/entry.ab" | sed -e 's|^import "raw.ab"$|import "rsa-raw-copy.ab"|' -e 's|^import "../bignum/core.ab"$|import "abla/crypto/bignum/core.ab"|' > "$out/rsa-copy.ab"
 # The library's raw.ab names the real entry.ab's types: the copy of it names the copy of entry.ab.
 sed -e 's|^import "entry.ab"$|import "rsa-copy.ab"|' -e 's|^import "../bignum/core.ab"$|import "abla/crypto/bignum/core.ab"|' "$root/stdlib/abla/crypto/rsa/raw.ab" > "$out/rsa-raw-copy.ab"

@@ -83,6 +83,15 @@ grep -q 'help: call the abla/sys wrapper' "$out/plain-syscall.log" || fail "plai
 grep -q 'help: .NativeByteBuffer.'"'"'s own functions change its fields' "$out/field-write.log" || fail "field-write: no help: $(head -5 "$out/field-write.log")"
 [[ $(grep -c 'native.trust:NativeByteBuffer.closed' "$out/field-extension.log") -ge 2 ]] ||
     fail "field-extension: the write by this. and by the bare name are not both refused: $(head -6 "$out/field-extension.log")"
+# The classes that own raw memory, or whose fields trusted code writes at, and the string wipes (decision #165): made, written or
+# called from ordinary code, each is refused.
+build "$root/stdlib" sealed-memory
+[[ $status != 0 ]] || fail "sealed-memory built"
+for what in ByteBuffer.stage ByteBuffer.staged AesKey AesGcmKey RsaPrivateKey Keccak Keccak.closed LlvmOrcSession.closed \
+    LlvmOrcGeneration.closed cryptoWipeString tlsWipe; do
+    grep "error\[E_SEMANTIC\]: native.trust:$what\($\|@\|:\)" "$out/sealed-memory.log" > /dev/null ||
+        fail "sealed-memory: $what is not refused: $(head -4 "$out/sealed-memory.log")"
+done
 for accepted in trusted-call open trusted-syscall trusted-field; do
     build "$root/stdlib" "$accepted"
     [[ $status == 0 ]] || fail "$accepted was refused: $(head -4 "$out/$accepted.log")"
