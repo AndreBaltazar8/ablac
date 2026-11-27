@@ -185,6 +185,13 @@ if ! "$compiler" build tests/cases/libc-imports-library/main.ab --emit shared-li
     tail -n 20 "$out/library.log" >&2
     exit 1
 fi
+# Its #exportFunction runs as a compile-time slice in this process, which must not get the library's own memory and jump
+# routines: ORC reported them as "JIT session error: Unexpected definitions ... memcpy, _longjmp, memmove, _setjmp".
+if [[ -s "$out/library.log" ]]; then
+    echo "libc imports: building the shared library printed:" >&2
+    cat "$out/library.log" >&2
+    exit 1
+fi
 if readelf -d "$out/library.so" | grep -E 'NEEDED.*(lib(c|pthread|ssl|crypto)\.so)' >/dev/null; then
     echo "libc imports: a shared library that brings no C library names one" >&2
     readelf -d "$out/library.so" | grep NEEDED >&2
