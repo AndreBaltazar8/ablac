@@ -84,7 +84,9 @@ can use the self-closing syntax inside their corresponding roots.
 Use trusted template structure for tag and computed attribute names. The
 serializer escapes HTML syntax and leaves URL, CSS and JavaScript policies to
 the application. Supply trusted script and style bodies as explicit raw
-markup.
+markup: a text child of `script` or `style` is left out when rendered, inside
+SVG and MathML too (an SVG `script` runs as well), as is one of the other
+raw-text elements such as `iframe` or `noscript` outside them.
 
 An unquoted literal attribute value is a compile error.
 
