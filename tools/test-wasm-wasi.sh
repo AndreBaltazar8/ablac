@@ -56,5 +56,12 @@ for profile in release fast; do
         "$out/files-$profile.wasm" "$PWD/$out/preopen/nested/round-trip.txt" > "$out/files.stdout"
     cmp "$out/files.expected" "$out/files.stdout"
     cmp "$out/files.expected" "$out/preopen/nested/round-trip.txt"
+    # The Wasm runtime's collector keeps a checkpoint marker and the allocation list's order (the sweep reads the sorted
+    # ranges, not the list): a reset after a collection frees only what came after the checkpoint (exit 42).
+    "$compiler" build tests/cases/modules/runtime-memory-checkpoint-collect.ab --target wasm32-wasi \
+        --no-debug --no-cache "${flags[@]}" -o "$out/checkpoint-$profile.wasm"
+    actual=0
+    "$runtime" run "$out/checkpoint-$profile.wasm" || actual=$?
+    [[ $actual == 42 ]] || { echo "wasm-wasi: $profile checkpoint after a collection exited $actual, expected 42" >&2; exit 1; }
 done
-echo 'wasm-wasi: startup, args, environment, stdio, clocks, randomness, exit paths and preopen-scoped files pass in release and fast builds'
+echo 'wasm-wasi: startup, args, environment, stdio, clocks, randomness, exit paths, preopen-scoped files and a checkpoint across a collection pass in release and fast builds'
