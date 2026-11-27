@@ -7,8 +7,10 @@ import "abla/simd/target"
 import "abla/sys/linux"
 import "abla/unsafe/native"
 import "abla/sys/linux/process"
+import "abla/unsafe/memory/raw"
 import "./errno.ab"
 import "./fs.ab"
+import "./pthread.ab"
 
 @export("getenv")
 trusted fun libcGetenv(name: int): int = ablaRuntimePointerAddress(__ablaRuntimeHostGetenv(ablaRuntimePointerFromAddress(name)))
@@ -16,28 +18,47 @@ trusted fun libcGetenv(name: int): int = ablaRuntimePointerAddress(__ablaRuntime
 @export("secure_getenv")
 trusted fun libcSecureGetenv(name: int): int = libcGetenv(name)
 
-// atexit handlers, run in reverse order by exit() (static destructors of LLVM register through __cxa_atexit).
-var libcExitHandlers: int = 0
-var libcExitCount: int = 0
-var libcExitCapacity: int = 0
+// atexit handlers, run in reverse order by exit() (static destructors of LLVM register through __cxa_atexit). Any thread may register one: LLVM
+// registers a function-local static's destructor when a thread first reaches it, so the table (grown by copying, the old one freed) and its
+// count are changed under a lock, as glibc's are. Without it two threads could both take one slot, or one could write its entry into the table
+// the other had just freed. The table's address, count and capacity are three words of static storage, the lock word a fourth.
+trusted fun libcExitState(): int = nativeStaticAllocate(32)
+
+trusted fun libcExitHandlers(): int = ablaRuntimeLoadI64(libcExitState())
+
+trusted fun libcExitCount(): int = ablaRuntimeLoadI64(libcExitState() + 8)
+
+trusted fun libcExitLock(): int = libcExitState() + 24
 
 trusted fun libcRegisterExit(function: int, argument: int): int {
-    if (libcExitCount == libcExitCapacity) {
-        val capacity = if (libcExitCapacity == 0) 64 else libcExitCapacity * 2
-        val grown = __ablaRuntimeHostHeapAllocate(capacity * 16, true)
+    libcLockWord(libcExitLock())
+    val result = libcRegisterExitLocked(function, argument)
+    libcUnlockWord(libcExitLock())
+    result
+}
+
+trusted fun libcRegisterExitLocked(function: int, argument: int): int {
+    val state = libcExitState()
+    var handlers = ablaRuntimeLoadI64(state)
+    val count = ablaRuntimeLoadI64(state + 8)
+    val capacity = ablaRuntimeLoadI64(state + 16)
+    if (count == capacity) {
+        val grownCapacity = if (capacity == 0) 64 else capacity * 2
+        val grown = __ablaRuntimeHostHeapAllocate(grownCapacity * 16, true)
         if (grown == 0) return -1
         var at = 0
-        while (at < libcExitCount * 2) {
-            ablaRuntimeStoreI64(grown + at * 8, ablaRuntimeLoadI64(libcExitHandlers + at * 8))
+        while (at < count * 2) {
+            ablaRuntimeStoreI64(grown + at * 8, ablaRuntimeLoadI64(handlers + at * 8))
             at = at + 1
         }
-        if (libcExitHandlers != 0) __ablaRuntimeHostHeapFree(libcExitHandlers)
-        libcExitHandlers = grown
-        libcExitCapacity = capacity
+        if (handlers != 0) __ablaRuntimeHostHeapFree(handlers)
+        handlers = grown
+        ablaRuntimeStoreI64(state, grown)
+        ablaRuntimeStoreI64(state + 16, grownCapacity)
     }
-    ablaRuntimeStoreI64(libcExitHandlers + libcExitCount * 16, function)
-    ablaRuntimeStoreI64(libcExitHandlers + libcExitCount * 16 + 8, argument)
-    libcExitCount = libcExitCount + 1
+    ablaRuntimeStoreI64(handlers + count * 16, function)
+    ablaRuntimeStoreI64(handlers + count * 16 + 8, argument)
+    ablaRuntimeStoreI64(state + 8, count + 1)
     0
 }
 
@@ -50,11 +71,23 @@ trusted fun libcAtexit(function: int): int = libcRegisterExit(function, 0)
 @export("exit")
 trusted fun libcExit(status: int): void {
     // The registered functions, last first (an __cxa_atexit one takes its argument; an atexit one ignores it, as C's calling convention allows).
-    while (libcExitCount > 0) {
-        libcExitCount = libcExitCount - 1
-        val function = ablaRuntimeLoadI64(libcExitHandlers + libcExitCount * 16)
-        val argument = ablaRuntimeLoadI64(libcExitHandlers + libcExitCount * 16 + 8)
-        ablaUnsafeCallAddressPointer(function, ablaRuntimePointerFromAddress(argument))
+    // Each is taken from the table under the lock and called without it, so a handler may register another.
+    val state = libcExitState()
+    var running = true
+    while (running) {
+        libcLockWord(libcExitLock())
+        val count = ablaRuntimeLoadI64(state + 8)
+        if (count == 0) {
+            libcUnlockWord(libcExitLock())
+            running = false
+        } else {
+            ablaRuntimeStoreI64(state + 8, count - 1)
+            val entry = ablaRuntimeLoadI64(state) + (count - 1) * 16
+            val function = ablaRuntimeLoadI64(entry)
+            val argument = ablaRuntimeLoadI64(entry + 8)
+            libcUnlockWord(libcExitLock())
+            ablaUnsafeCallAddressPointer(function, ablaRuntimePointerFromAddress(argument))
+        }
     }
     linuxSyscall1(231, libcInt(status))
     return

@@ -1,0 +1,68 @@
+// __cxa_atexit of the statically linked compiler's C library (src/static_libc/process.ab, #1139 area 14) from many threads at once: eight
+// threads register 3000 handlers each while the table grows under them; afterwards every one of the 24000 entries is in it exactly once (no
+// slot taken twice, none written into a table another thread had freed). Nothing is run: exit() is not called. Built by
+// tools/test-libc-functions.sh against a copy of the library without its @export lines. Exits 42.
+import "abla/io"
+import "abla/runtime/scalar"
+import "abla/unsafe/memory/raw"
+import "../../../src/static_libc/process.ab"
+import "../../../src/static_libc/pthread.ab"
+
+val perThread = 3000
+
+// The next thread's number, in static storage (a thread cannot capture an int), taken by compare-and-swap.
+trusted fun counterCell(): int = nativeStaticAllocate(8)
+
+trusted fun nextThread(): int {
+    while (true) {
+        val seen = ablaRuntimeLoadI32(counterCell()) & 4294967295
+        if (libcCas(counterCell(), seen, seen + 1) == seen) return seen
+    }
+    0
+}
+
+// One thread's registrations: the argument is (its number << 32) | i + 1, so none is 0.
+trusted fun register(): int {
+    val number = nextThread()
+    for (i in 0 until perThread) {
+        if (libcCxaAtexit(1, (number << 32) | (i + 1), 0) != 0) return 1
+    }
+    0
+}
+
+trusted fun main: int {
+    val w0 = thread { register() }
+    val w1 = thread { register() }
+    val w2 = thread { register() }
+    val w3 = thread { register() }
+    val w4 = thread { register() }
+    val w5 = thread { register() }
+    val w6 = thread { register() }
+    val w7 = thread { register() }
+    val failed = (await w0) + (await w1) + (await w2) + (await w3) + (await w4) + (await w5) + (await w6) + (await w7)
+    val expected = 8 * perThread
+    val count = libcExitCount()
+    val handlers = libcExitHandlers()
+    if (failed != 0 || count != expected) {
+        println("libc-atexit: $count entries ($failed threads failed), expected $expected")
+        return 1
+    }
+    // Each (thread, i) once.
+    val seen = __ablaRuntimeHostHeapAllocate(expected, true)
+    for (at in 0 until expected) {
+        val argument = ablaRuntimeLoadI64(handlers + at * 16 + 8)
+        val number = argument >> 32
+        val index = (argument & 4294967295) - 1
+        if (ablaRuntimeLoadI64(handlers + at * 16) != 1 || number < 0 || number >= 8 || index < 0 || index >= perThread) {
+            println("libc-atexit: entry $at is not one that was registered")
+            return 1
+        }
+        val cell = seen + number * perThread + index
+        if (ablaRuntimeLoadU8(cell) != 0) {
+            println("libc-atexit: thread $number's entry $index is in the table twice")
+            return 1
+        }
+        ablaRuntimeStoreU8(cell, 1)
+    }
+    42
+}
