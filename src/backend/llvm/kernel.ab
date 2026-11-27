@@ -1098,6 +1098,51 @@ fun bootstrapKernelBuiltin(
         bootstrapKernelLine(state, "call void @llvm.nvvm.membar.gl()")
         bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "void", ""))
         return true
+    } else if (name == "kernelDp4a" || name == "kernelBytePerm") {
+        // dp4a.s32.s32 (CUDA's __dp4a: four signed byte products plus c, a 32-bit int) and prmt.b32 (__byte_perm, the
+        // selector's nibbles taken by their low 3 bits), on the operands' low 32 bits.
+        if (instruction.operands.size < 3) return false
+        val operands: array<string> = []
+        for (position in 0 until 3) {
+            val value = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[position]), "u32")
+            if (value == "") return true
+            operands.append(value)
+        }
+        val raw = bootstrapKernelFresh(state)
+        result = bootstrapKernelFresh(state)
+        if (name == "kernelDp4a") {
+            bootstrapKernelLine(state, "$raw = call i32 asm \"dp4a.s32.s32 \$0, \$1, \$2, \$3;\", \"=r,r,r,r\"(i32 ${operands[0]}, i32 ${operands[1]}, i32 ${operands[2]})")
+            bootstrapKernelLine(state, "$result = sext i32 $raw to i64")
+        } else {
+            val selector = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$selector = and i32 ${operands[2]}, 30583")
+            bootstrapKernelLine(state, "$raw = call i32 asm \"prmt.b32 \$0, \$1, \$2, \$3;\", \"=r,r,r,r\"(i32 ${operands[0]}, i32 ${operands[1]}, i32 $selector)")
+            bootstrapKernelLine(state, "$result = zext i32 $raw to i64")
+        }
+    } else if (name == "extension_KernelF32Buffer_atomicAdd") {
+        // One indivisible float add (CUDA's atomicAdd on a float: red/atom.add.f32, relaxed), checked as a load is.
+        if (instruction.operands.size < 3) return false
+        val buffer = bootstrapKernelGet(state, instruction.operands[0])
+        if (buffer.type != "buffer.f32") { bootstrapKernelFail(emitter, state.name, "type", buffer.type); return true }
+        val index = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
+        val addend = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[2]), "f32")
+        if (index == "" || addend == "") return true
+        state.counter = state.counter + 1
+        val label = "kf${state.counter}"
+        val inside = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$inside = icmp ult i64 $index, ${buffer.count}")
+        val before = state.block
+        bootstrapKernelLine(state, "br i1 $inside, label %$label.in, label %$label.end")
+        state.terminated = true
+        bootstrapKernelBlock(state, "$label.in")
+        val address = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$address = getelementptr inbounds float, ptr ${buffer.operand}, i64 $index")
+        val previous = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$previous = atomicrmw fadd ptr $address, float $addend monotonic, align 4")
+        bootstrapKernelBlock(state, "$label.end")
+        result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = phi float [ $previous, %$label.in ], [ 0.0, %$before ]")
+        type = "f32"
     } else if (name == "extension_KernelU32Buffer_atomicAdd") {
         // One indivisible add (CUDA's atomicAdd, relaxed; kernelFence orders it), checked as a load is: outside the buffer it
         // adds nothing and gives 0.

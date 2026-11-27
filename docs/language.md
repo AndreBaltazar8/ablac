@@ -3164,9 +3164,12 @@ A kernel, and every function it calls, may use:
   sm_89, Ada) and `kernelRoundToInt` (`__float2int_rn`), each the GPU's
   instruction on CUDA and an exact integer version on the CPU, the same bits on
   both (NaN results 0x7fff);
-- `KernelU32Buffer.atomicAdd` (one indivisible add, giving the old value) and
-  `kernelFence()` (CUDA's `__threadfence`), with which the last group to finish
-  can combine every group's results.
+- `kernelDp4a(a, b, c)` (the dot product of four signed bytes plus `c`, CUDA's
+  `__dp4a`) and `kernelBytePerm(a, b, selector)` (four of eight bytes,
+  `__byte_perm`);
+- `KernelU32Buffer.atomicAdd` and `KernelF32Buffer.atomicAdd` (one indivisible
+  add, giving the old value) and `kernelFence()` (CUDA's `__threadfence`), with
+  which the last group to finish can combine every group's results.
 
 Anything else (a string, an array, a class value, a closure, an
 allocation, I/O, a native call) is refused when the program is built, naming

@@ -382,6 +382,44 @@ fun KernelU32Buffer.atomicAdd(index: int, value: int): int {
     previous
 }
 
+/** Adds `value` to element `index` as one indivisible step and gives the element as it was before (0.0, adding nothing,
+ *  outside the buffer): CUDA's atomicAdd on a float, relaxed like KernelU32Buffer.atomicAdd. Additions from many threads
+ *  land in any order, so their sum may round differently from run to run unless every partial sum is exact. On the CPU, one
+ *  thread at a time, a plain read and write. */
+fun KernelF32Buffer.atomicAdd(index: int, value: f32): f32 {
+    if (index < 0 || index >= this.count) return f32(0.0)
+    val previous = this.load(index)
+    this.store(index, previous + value)
+    previous
+}
+
+/** `value`'s low 32 bits as a signed 32-bit int (the wrap of CUDA's `int`). */
+fun kernelWrap32(value: int): int {
+    val low = value & 4294967295
+    if (low >= 2147483648) low - 4294967296 else low
+}
+
+/** The dot product of the four signed bytes of `a` and of `b` (little-endian in their low 32 bits, each -128 to 127) plus
+ *  `c`, wrapping as a 32-bit int (CUDA's __dp4a, one instruction from sm_61): the int8 inner product of a quantized matrix
+ *  product. */
+fun kernelDp4a(a: int, b: int, c: int): int {
+    var sum = c
+    for (k in 0 until 4) sum = sum + ((((a >> (8 * k)) & 255) ^ 128) - 128) * ((((b >> (8 * k)) & 255) ^ 128) - 128)
+    kernelWrap32(sum)
+}
+
+/** Four bytes picked from the eight of `a` (bytes 0 to 3, its low 32 bits) and `b` (bytes 4 to 7): result byte n is the
+ *  one nibble n of `selector` names, by its low 3 bits (CUDA's __byte_perm, PTX prmt.b32), as 0 to 2^32 - 1. */
+fun kernelBytePerm(a: int, b: int, selector: int): int {
+    val bytes = (a & 4294967295) | ((b & 4294967295) << 32)
+    var result = 0
+    for (n in 0 until 4) {
+        val pick = (selector >> (4 * n)) & 7
+        result = result | (((bytes >>> (8 * pick)) & 255) << (8 * n))
+    }
+    result
+}
+
 /** `value` from the lane whose index is this lane's xor `distance` (CUDA's __shfl_xor_sync over the whole subgroup), or this
  *  lane's own `value` when that lane is outside the subgroup; every lane must call it together. A butterfly of these
  *  (distances 16, 8, ..., 1) combines a value across the subgroup in any way a kernel needs, a (score, index) maximum

@@ -122,7 +122,7 @@ if [[ -n $library ]]; then
             grep -q "on the GPU and the CPU true" "$out/kernel-cuda.out" &&
             grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" &&
             grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "kernelTanh: .*: true" "$out/kernel-cuda.out" && grep -q "kernelSigmoid: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" && grep -q "quad4: .* true" "$out/kernel-cuda.out" && grep -q "words4: .* true" "$out/kernel-cuda.out" && grep -q "pairs2: .* true" "$out/kernel-cuda.out" &&
-            grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" && grep -q "subgroups: .* true" "$out/kernel-cuda.out" && grep -q "arrays: .* true, in registers true" "$out/kernel-cuda.out" && grep -q "launch: .* true" "$out/kernel-cuda.out" &&
+            grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" && grep -q "subgroups: .* true" "$out/kernel-cuda.out" && grep -q "arrays: .* true, in registers true" "$out/kernel-cuda.out" && grep -q "launch: .* true" "$out/kernel-cuda.out" && grep -q "intrinsics: .* true" "$out/kernel-cuda.out" &&
             grep -q "launch guards: .* true" "$out/kernel-cuda.out" && grep -q "edge indices: .* true" "$out/kernel-cuda.out" &&
             grep -q "half: .* the same bits: true" "$out/kernel-cuda.out" ||
             fail "kernel-cuda: $(cat "$out/kernel-cuda.out")"

@@ -14,6 +14,7 @@ import "words.ab"
 import "subgroups.ab"
 import "arrays.ab"
 import "launch.ab"
+import "intrinsics.ab"
 import "groups.ab"
 import "q8fast.ab"
 import "guards.ab"
@@ -461,6 +462,58 @@ trusted fun main: int {
         if (floatAt(cpuChunks, 0) != floatAt(chunkX, length - 1)) launchWhy = "$launchWhy (chunk $length not reversed)"
     }
     println("launch: @launchBounds in the PTX and a wider launch refused, dynamic shared memory of 4000 and 60000 bytes on the GPU and the CPU ${launchWhy == ""}$launchWhy")
+
+    // intrinsics (#1304): dp4a, prmt and float atomics, the same words on both backends, and worked values on the CPU.
+    val intrinsicThreads = 4096
+    val wordsA = nativeByteBuffer(intrinsicThreads * 4)
+    val wordsB = nativeByteBuffer(intrinsicThreads * 4)
+    for (i in 0 until intrinsicThreads) {
+        storeWord(wordsA, i * 4, (i * 2246822519 + 3266489917) & 4294967295)
+        storeWord(wordsB, i * 4, (i * 3266489917 + 668265263) & 4294967295)
+    }
+    val intrinsicResults: array<array<int>> = []
+    for (gpu in [false, true]) {
+        val dots = nativeByteBuffer(intrinsicThreads * 4)
+        val perms = nativeByteBuffer(intrinsicThreads * 4)
+        val sums = floats(8) { i -> f32(0.0) }
+        if (!gpu) {
+            val cpuA = KernelU32Buffer(nativePointerAddress(wordsA.address), intrinsicThreads)
+            val cpuB = KernelU32Buffer(nativePointerAddress(wordsB.address), intrinsicThreads)
+            val cpuDots = KernelU32Buffer(nativePointerAddress(dots.address), intrinsicThreads)
+            val cpuPerms = KernelU32Buffer(nativePointerAddress(perms.address), intrinsicThreads)
+            val cpuSums = KernelF32Buffer(nativePointerAddress(sums.address), 7)
+            kernelRunCpu(intrinsicThreads / 256, 256) { intrinsics(cpuA, cpuB, cpuDots, cpuPerms, cpuSums, intrinsicThreads) }
+        } else {
+            val da = device.allocate(intrinsicThreads * 4)
+            val dbw = device.allocate(intrinsicThreads * 4)
+            val ddots = device.allocate(intrinsicThreads * 4)
+            val dperms = device.allocate(intrinsicThreads * 4)
+            val dsums = device.allocate(7 * 4)
+            if (da == null || dbw == null || ddots == null || dperms == null || dsums == null) { println("kernel-cuda: ${device.error}"); return 1 }
+            val zeros = floats(7) { i -> f32(0.0) }
+            if (!device.upload(da, wordsA) || !device.upload(dbw, wordsB) || !device.upload(dsums, zeros) ||
+                !device.launch("intrinsics", intrinsicThreads / 256, 256, cudaKernelArguments().buffer(da.words()).buffer(dbw.words())
+                    .buffer(ddots.words()).buffer(dperms.words()).buffer(dsums.floats()).integer(intrinsicThreads)) ||
+                !device.download(ddots, dots) || !device.download(dperms, perms) || !device.download(dsums, sums)) {
+                println("kernel-cuda: intrinsics: ${device.error}")
+                return 1
+            }
+        }
+        val words: array<int> = []
+        val dotWords = KernelU32Buffer(nativePointerAddress(dots.address), intrinsicThreads)
+        val permWords = KernelU32Buffer(nativePointerAddress(perms.address), intrinsicThreads)
+        val sumWords = KernelU32Buffer(nativePointerAddress(sums.address), 7)
+        for (i in 0 until intrinsicThreads) {
+            words.append(dotWords.load(i))
+            words.append(permWords.load(i))
+        }
+        for (i in 0 until 7) words.append(sumWords.load(i))
+        intrinsicResults.append(words)
+    }
+    var intrinsicsRight = kernelDp4a(0x01ff7f80, 0x02020202, 10) == 8 && kernelBytePerm(0x33221100, 0x77665544, 0x7654) == 0x77665544 &&
+        kernelBytePerm(0x33221100, 0x77665544, 0x0123) == 0x00112233
+    for (k in 0 until intrinsicResults[0].size) if (intrinsicResults[1][k] != intrinsicResults[0][k]) intrinsicsRight = false
+    println("intrinsics: $intrinsicThreads dp4a, prmt and float atomic adds, GPU equal to CPU $intrinsicsRight")
 
     // NVFP4 matvec: one subgroup per row on the GPU (8 warps per group), one thread per row on the CPU.
     val rows = 1000
