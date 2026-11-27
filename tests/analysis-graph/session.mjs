@@ -1745,7 +1745,7 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
     const head = (imported ? 'import "./point.ab"\n' : '') + (arrays ? 'fun answer(left: int, right: int, xs: array<int>): int ' : locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
         : fields ? 'fun answer(left: int, right: int, p: Point): int = ' : 'fun answer(left: int, right: int): int = ');
     // A field of another type (`tags`) is never read, but does not keep the class from the checker.
-    const point = 'class Point(val x: int, var y: int, val label: string = "p", val tags: array<string> = []) {\n    fun total(): int = this.x + this.y\n    fun scaled(k: int): int = this.x * k\n    fun name(): string = this.label\n}\n';
+    const point = 'class Point(val x: int, var y: int, val label: string = "p", val tags: array<string> = [], val weights: array<int> = []) {\n    fun total(): int = this.x + this.y\n    fun scaled(k: int): int = this.x * k\n    fun name(): string = this.label\n}\n';
     const block = (...lines) => '{\n' + lines.map(line => '    ' + line + '\n').join('') + '}';
     const initial = calls ? 'step(left) + right' : locals ? block('val t = left + right', 't') : returns ? block('if (left < 0) return right', 'left + right') : strings ? 'text.size + left' : fields ? 'p.x + left'
         : globals ? 'LIMIT + left' : arrays ? block('var s = xs.size', 'for (x in xs) s += x', 's + left') : loops ? block('var s = 0', 'for (i in 0 until left) s += i', 's + right') : 'left + right';
@@ -1851,6 +1851,9 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         }
         // String values: a literal, compared with a string field, a string parameter or a local of written type `string`.
         if (fields) await edit('(if (p.label == "p") p.x else p.y) + left', extended ? hits : ++hits);
+        // Member chains on string and scalar-array fields: their size and elements. Another array field's size: full typing.
+        if (fields) await edit('p.label.size + p.weights.size * left', extended ? hits : ++hits);
+        if (fields) await edit('p.weights[left] + p.label[0]', extended ? hits : ++hits);
         if (strings) await edit('if (text == "abc") left else right', ++hits);
         if (locals) await edit(block('val t: string = "ab"', 'if (t != "ab") left else right'), ++hits);
         // Another local: the document's symbols change, so full typing.
@@ -1861,6 +1864,7 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         if (fields) await edit('p.total() + p.scaled(left + 1) * right', extended ? hits : ++hits);
         if (fields) await edit('p.scaled(right) - p.x', extended ? hits : ++hits);
         if (fields) await edit('p.name().size + left', hits);
+        if (fields) await edit('p.tags.size + left', hits);
         // A global that is not a scalar: full typing. (A local that shadows a global: checked_loops, its global `i`.)
         if (globals) await edit('NAMES.size + left', hits);
         // A call of an array's method: full typing (and again from there), then rechecked alone.
