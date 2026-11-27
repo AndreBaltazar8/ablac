@@ -20,6 +20,7 @@ rm -rf -- "$work"
 mkdir -p "$work/tests/cases/modules"
 cp "$project_root/tests/cases/modules/run-built.ab" \
     "$project_root/tests/cases/modules/main-unannotated.ab" \
+    "$project_root/tests/cases/modules/run-exit-two.ab" \
     "$work/tests/cases/modules/"
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 cd "$work"
@@ -63,4 +64,13 @@ check --built --fast
 # An unannotated main exits 0 either way.
 "$compiler" run tests/cases/modules/main-unannotated.ab > /dev/null
 "$compiler" run --built tests/cases/modules/main-unannotated.ab > /dev/null
-echo "run: in process (--o1, --fast) and built (cached, exec'd), with arguments, environment, directory and input"
+# A program that exits 2 exits 2, and ablac prints no usage: the status is the program's, not a command line ablac refused.
+for mode in "" --built; do
+    set +e
+    "$compiler" run $mode tests/cases/modules/run-exit-two.ab > /dev/null 2> "$work/exit-two.err"
+    status=$?
+    set -e
+    [[ $status -eq 2 ]] || { printf 'run %s: a program exiting 2 gave %s\n' "$mode" "$status" >&2; exit 1; }
+    ! grep -q '^usage:' "$work/exit-two.err" || { printf 'run %s: a program exiting 2 printed the usage\n' "$mode" >&2; exit 1; }
+done
+echo "run: in process (--o1, --fast) and built (cached, exec'd), with arguments, environment, directory, input and exit status (2 too)"
