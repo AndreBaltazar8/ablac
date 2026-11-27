@@ -1,0 +1,292 @@
+// The Windows compiler's own C library (decision #163, B), locale and time. The locale is always the C one: setlocale answers "C" and
+// accepts "C" and "" (the user's default is taken to be C), the classification table is ASCII's, and the C++ library's time names
+// (_Getdays, _Getmonths, _Gettnames and their wide forms) are null, for which libcpmt uses the C locale's own. strftime is ../time.ab's,
+// which reads only the nine ints Microsoft's struct tm has. Local time is Windows' (SystemTimeToTzSpecificLocalTime), as the /MT
+// build's library gives it.
+import "abla/runtime/scalar"
+import "abla/unsafe/memory/raw"
+import "../errno.ab"
+import "../string.ab"
+import "../time.ab"
+import "./process.ab"
+
+/** kernel32 WideCharToMultiByte: converts UTF-16 text to a code page (65001 is UTF-8); returns the bytes written or needed, 0 when it fails. */
+private trusted noescape extern:"c" fun WideCharToMultiByte(page: int, flags: int, wide: int, wideCount: int, narrow: int, narrowCount: int, defaultCharacter: int, usedDefault: int): i32
+/** kernel32 MultiByteToWideChar: converts text of a code page (65001 is UTF-8) to UTF-16; returns the characters written or needed, 0 when it fails. */
+private trusted noescape extern:"c" fun MultiByteToWideChar(page: int, flags: int, text: int, count: int, wide: int, wideCount: int): i32
+/** kernel32 GetSystemTimePreciseAsFileTime: stores the system time in 100 ns intervals since 1601 at value; never fails. */
+private trusted noescape extern:"c" fun GetSystemTimePreciseAsFileTime(value: int): void
+/** kernel32 SystemTimeToTzSpecificLocalTime: the local SYSTEMTIME of a UTC one in a time zone (0: the current one); non-zero on success. */
+private trusted noescape extern:"c" fun SystemTimeToTzSpecificLocalTime(zone: int, universal: int, local: int): i32
+/** kernel32 GetTimeZoneInformation: fills the 172-byte TIME_ZONE_INFORMATION of the current time zone; the zone id, or 0xFFFFFFFF on failure. */
+private trusted noescape extern:"c" fun GetTimeZoneInformation(information: int): i32
+
+// ---- the locale ----
+
+@export("setlocale")
+trusted fun windowsSetlocale(category: int, locale: int): int {
+    val which = category & 4294967295
+    if (which > 5) {
+        libcSetErrno(22)
+        return 0
+    }
+    if (locale == 0) return nativeStaticBytes("C\x00")
+    val first = ablaRuntimeLoadU8(locale)
+    if (first == 0 || (first == 67 && ablaRuntimeLoadU8(locale + 1) == 0)) return nativeStaticBytes("C\x00")
+    0
+}
+
+// struct lconv (locale.h): ten char pointers, eight chars (CHAR_MAX: not available), eight wchar_t pointers; the C locale's values.
+trusted fun windowsLconv(): int = nativeStaticAllocate(152)
+
+@export("localeconv")
+trusted fun windowsLocaleconv(): int {
+    val conv = windowsLconv()
+    val point = nativeStaticBytes(".\x00")
+    val empty = nativeStaticBytes("\x00\x00")
+    ablaRuntimeStoreI64(conv, point)
+    var field = 1
+    while (field < 10) {
+        ablaRuntimeStoreI64(conv + field * 8, empty)
+        field = field + 1
+    }
+    var c = 0
+    while (c < 8) {
+        ablaRuntimeStoreU8(conv + 80 + c, 127)
+        c = c + 1
+    }
+    ablaRuntimeStoreI64(conv + 88, nativeStaticBytes(".\x00\x00\x00"))
+    field = 1
+    while (field < 8) {
+        ablaRuntimeStoreI64(conv + 88 + field * 8, empty)
+        field = field + 1
+    }
+    conv
+}
+
+// The C locale's code pages: 0 (none: its text is bytes).
+@export("___lc_codepage_func")
+fun windowsCodepage(): int = 0
+
+@export("___lc_collate_cp_func")
+fun windowsCollateCodepage(): int = 0
+
+// The names of the locale's categories, LC_ALL to LC_TIME: all null, which is how the C library marks the C locale.
+@export("___lc_locale_name_func")
+trusted fun windowsLocaleNames(): int = nativeStaticAllocate(48)
+
+@export("___mb_cur_max_func")
+fun windowsMbCurMax(): int = 1
+
+// The locale never changes, so its lock guards nothing.
+@export("_lock_locales")
+fun windowsLockLocales(): void {
+    return
+}
+
+@export("_unlock_locales")
+fun windowsUnlockLocales(): void {
+    return
+}
+
+// The classification of the C locale (ctype.h's _UPPER 1, _LOWER 2, _DIGIT 4, _SPACE 8, _PUNCT 0x10, _CONTROL 0x20, _BLANK 0x40,
+// _HEX 0x80, _ALPHA 0x100): 257 unsigned shorts, the first for EOF (-1), made at the first call (two threads making it at once write
+// the same values).
+trusted fun windowsCtypeTable(): int = nativeStaticAllocate(528)
+
+trusted fun windowsCtypeEntry(c: int): int {
+    var bits = 0
+    if (c < 32 || c == 127) bits = 32
+    if (c >= 9 && c <= 13) bits = bits | 8
+    if (c == 32) bits = 8 | 64
+    if (c >= 48 && c <= 57) bits = 4 | 128
+    if (c >= 65 && c <= 90) bits = 1 | 256 | (if (c <= 70) 128 else 0)
+    if (c >= 97 && c <= 122) bits = 2 | 256 | (if (c <= 102) 128 else 0)
+    if ((c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126)) bits = 16
+    bits
+}
+
+@export("__pctype_func")
+trusted fun windowsPctype(): int {
+    val table = windowsCtypeTable()
+    // The word at 520, after the 257 entries, is 1 once they are filled.
+    if (ablaRuntimeAtomicLoadI64(table + 520) == 0) {
+        var c = 0
+        while (c < 128) {
+            val bits = windowsCtypeEntry(c)
+            ablaRuntimeStoreU8(table + 2 + c * 2, bits & 255)
+            ablaRuntimeStoreU8(table + 3 + c * 2, bits >> 8)
+            c = c + 1
+        }
+        ablaRuntimeAtomicStoreI64(table + 520, 1)
+    }
+    table + 2
+}
+
+// ---- the C++ library's time names ----
+
+@export("_Getdays")
+fun windowsGetdays(): int = 0
+
+@export("_Getmonths")
+fun windowsGetmonths(): int = 0
+
+@export("_Gettnames")
+fun windowsGettnames(): int = 0
+
+@export("_W_Getdays")
+fun windowsWideGetdays(): int = 0
+
+@export("_W_Getmonths")
+fun windowsWideGetmonths(): int = 0
+
+@export("_W_Gettnames")
+fun windowsWideGettnames(): int = 0
+
+// strftime with the C++ library's time names (null, see above): the C locale's.
+@export("_Strftime")
+trusted fun windowsStrftime(buffer: int, size: int, format: int, tm: int, names: int): int = libcStrftimeInto(buffer, size, format, tm)
+
+// The wide form: the format as UTF-8, ../time.ab's text, back to UTF-16.
+@export("_Wcsftime")
+trusted fun windowsWcsftime(buffer: int, size: int, format: int, tm: int, names: int): int {
+    if (buffer == 0 || format == 0 || size <= 0) return 0
+    var units = 0
+    while (windowsLoadWide(format, units) != 0) units = units + 1
+    val narrowFormat = __ablaRuntimeHostHeapAllocate(units * 3 + 1, false)
+    val narrowText = __ablaRuntimeHostHeapAllocate(size * 3 + 1, false)
+    var result = 0
+    if (narrowFormat != 0 && narrowText != 0) {
+        val formatBytes = if (units == 0) 0 else int(WideCharToMultiByte(65001, 0, format, units, narrowFormat, units * 3, 0, 0)) & 4294967295
+        ablaRuntimeStoreU8(narrowFormat + formatBytes, 0)
+        val textBytes = libcStrftimeInto(narrowText, size * 3 + 1, narrowFormat, tm)
+        if (textBytes > 0 || ablaRuntimeLoadU8(narrowFormat) == 0) {
+            val wide = if (textBytes == 0) 0 else int(MultiByteToWideChar(65001, 0, narrowText, textBytes, buffer, size - 1)) & 4294967295
+            if (textBytes == 0 || wide > 0) {
+                windowsStoreWide(buffer, wide, 0)
+                result = wide
+            }
+        }
+    }
+    if (narrowFormat != 0) __ablaRuntimeHostHeapFree(narrowFormat)
+    if (narrowText != 0) __ablaRuntimeHostHeapFree(narrowText)
+    if (result == 0) windowsStoreWide(buffer, 0, 0)
+    result
+}
+
+@export("__strncnt")
+trusted fun windowsStrncnt(text: int, count: int): int {
+    var at = 0
+    while (at < count && ablaRuntimeLoadU8(text + at) != 0) at = at + 1
+    at
+}
+
+// ---- time ----
+
+// Seconds since 1970 from the system time (FILETIME: 100 ns intervals since 1601, 11644473600 s earlier).
+@export("_time64")
+trusted fun windowsTime64(result: int): int {
+    val cell = nativeStackAllocate(8)
+    GetSystemTimePreciseAsFileTime(cell)
+    val seconds = ablaRuntimeLoadI64(cell) / 10000000 - 11644473600
+    if (result != 0) ablaRuntimeStoreI64(result, seconds)
+    seconds
+}
+
+// Microsoft's range for the 64-bit time functions: 1970 to the end of 3000.
+fun windowsTimeInRange(seconds: int): bool = seconds >= 0 && seconds <= 32535215999
+
+trusted fun windowsTmInvalid(tm: int): void {
+    var field = 0
+    while (field < 9) {
+        ablaRuntimeStoreI32(tm + field * 4, -1)
+        field = field + 1
+    }
+    return
+}
+
+@export("_gmtime64_s")
+trusted fun windowsGmtime64S(tm: int, timer: int): int {
+    if (tm == 0) {
+        libcSetErrno(22)
+        return 22
+    }
+    if (timer == 0 || !windowsTimeInRange(ablaRuntimeLoadI64(timer))) {
+        windowsTmInvalid(tm)
+        libcSetErrno(22)
+        return 22
+    }
+    libcStoreCivilTime(ablaRuntimeLoadI64(timer), tm)
+    0
+}
+
+// Days since 1970 of a civil date (Howard Hinnant's days_from_civil, the inverse of ../time.ab's civil_from_days).
+fun windowsDaysFromCivil(year: int, month: int, day: int): int {
+    val y = if (month <= 2) year - 1 else year
+    val era = (if (y >= 0) y else y - 399) / 400
+    val yearOfEra = y - era * 400
+    val dayOfYear = (153 * (if (month > 2) month - 3 else month + 9) + 2) / 5 + day - 1
+    val dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+    era * 146097 + dayOfEra - 719468
+}
+
+trusted fun windowsSystemTimeField(time: int, index: int): int = windowsLoadWide(time, index)
+
+// The local time of `seconds` (UTC) in the current time zone, with tm_isdst: 1 when the zone's offset then is its daylight one.
+trusted fun windowsLocalTime(seconds: int, tm: int): int {
+    // The UTC SYSTEMTIME (eight unsigned shorts: year, month, weekday, day, hour, minute, second, milliseconds), from the tm fields.
+    libcStoreCivilTime(seconds, tm)
+    val universal = nativeStackAllocate(16)
+    val local = nativeStackAllocate(16)
+    windowsStoreWide(universal, 0, ablaRuntimeLoadI32(tm + 20) + 1900)
+    windowsStoreWide(universal, 1, ablaRuntimeLoadI32(tm + 16) + 1)
+    windowsStoreWide(universal, 2, ablaRuntimeLoadI32(tm + 24))
+    windowsStoreWide(universal, 3, ablaRuntimeLoadI32(tm + 12))
+    windowsStoreWide(universal, 4, ablaRuntimeLoadI32(tm + 8))
+    windowsStoreWide(universal, 5, ablaRuntimeLoadI32(tm + 4))
+    windowsStoreWide(universal, 6, ablaRuntimeLoadI32(tm))
+    windowsStoreWide(universal, 7, 0)
+    if (int(SystemTimeToTzSpecificLocalTime(0, universal, local)) == 0) {
+        windowsTmInvalid(tm)
+        libcSetErrno(22)
+        return 22
+    }
+    val localSeconds = windowsDaysFromCivil(windowsSystemTimeField(local, 0), windowsSystemTimeField(local, 1),
+        windowsSystemTimeField(local, 3)) * 86400 + windowsSystemTimeField(local, 4) * 3600 + windowsSystemTimeField(local, 5) * 60 +
+        windowsSystemTimeField(local, 6)
+    libcStoreCivilTime(localSeconds, tm)
+    // TIME_ZONE_INFORMATION: Bias (minutes, UTC = local + bias) at 0, StandardBias at 84, DaylightDate's month at 154, DaylightBias at 168.
+    val zone = nativeStackAllocate(176)
+    if ((int(GetTimeZoneInformation(zone)) & 4294967295) != 4294967295 && windowsLoadWide(zone, 77) != 0) {
+        val standard = 0 - (ablaRuntimeLoadI32(zone) + ablaRuntimeLoadI32(zone + 84)) * 60
+        val daylight = 0 - (ablaRuntimeLoadI32(zone) + ablaRuntimeLoadI32(zone + 168)) * 60
+        val offset = localSeconds - seconds
+        if (daylight != standard && offset == daylight) ablaRuntimeStoreI32(tm + 32, 1)
+    }
+    0
+}
+
+@export("_localtime64_s")
+trusted fun windowsLocaltime64S(tm: int, timer: int): int {
+    if (tm == 0) {
+        libcSetErrno(22)
+        return 22
+    }
+    if (timer == 0 || !windowsTimeInRange(ablaRuntimeLoadI64(timer))) {
+        windowsTmInvalid(tm)
+        libcSetErrno(22)
+        return 22
+    }
+    windowsLocalTime(ablaRuntimeLoadI64(timer), tm)
+}
+
+// localtime: the thread's own struct tm, as Microsoft's library keeps one for each thread; null for a time out of range.
+trusted fun windowsLocaltimeCell(): int =
+    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+
+@export("_localtime64")
+trusted fun windowsLocaltime64(timer: int): int {
+    val tm = windowsLocaltimeCell()
+    if (windowsLocaltime64S(tm, timer) != 0) return 0
+    tm
+}

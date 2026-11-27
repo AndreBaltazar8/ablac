@@ -1,0 +1,296 @@
+// The Windows compiler's own C library (decision #163, B; docs/design/windows-crt-free-compiler.md), the process side: the heap's
+// Microsoft names, threads, exit and abort, the environment, signals and the random numbers the C++ in LLVM's, lld's and Microsoft's
+// C++ library archives (libcpmt) call. Written from the documented interfaces (the SDK headers' declarations and Microsoft's documentation
+// of each function), never from Microsoft's objects. malloc, calloc, realloc and free are memory.ab's abla_libc_* (the runtime declares
+// those four names itself), bound to the C names by the link's /alternatename (tools/windows/static-compiler/CMakeLists.txt).
+//
+// The arguments are the C ABI's 64-bit words: an `int` or `unsigned` parameter's upper half is undefined on x64 and ARM64, so it is
+// masked to its 32 bits before use.
+import "abla/runtime/scalar"
+import "abla/unsafe/native"
+import "abla/unsafe/memory/raw"
+import "../memory.ab"
+import "../errno.ab"
+import "../fs.ab"
+import "../string.ab"
+
+// kernel32 and bcryptprimitives, declared as the Windows runtime declares them (its declarations are its own module's).
+/** kernel32 ExitProcess: ends the process with the given status; does not return. */
+private trusted noescape extern:"c" fun ExitProcess(code: int): void
+/** kernel32 GetCurrentProcess: the pseudo-handle of the calling process. */
+private trusted noescape extern:"c" fun GetCurrentProcess(): int
+/** kernel32 TerminateProcess: ends a process with the given status at once; returns non-zero on success. */
+private trusted noescape extern:"c" fun TerminateProcess(process: int, code: int): i32
+/** kernel32 GetEnvironmentStringsW: the process's environment block, to be released with FreeEnvironmentStringsW; 0 when it cannot be read. */
+private trusted noescape extern:"c" fun GetEnvironmentStringsW(): int
+/** kernel32 FreeEnvironmentStringsW: releases a block GetEnvironmentStringsW returned; returns non-zero on success. */
+private trusted noescape extern:"c" fun FreeEnvironmentStringsW(block: int): i32
+/** kernel32 WideCharToMultiByte: converts UTF-16 text to a code page (65001 is UTF-8); returns the bytes written or needed, 0 when it fails. */
+private trusted noescape extern:"c" fun WideCharToMultiByte(page: int, flags: int, wide: int, wideCount: int, narrow: int, narrowCount: int, defaultCharacter: int, usedDefault: int): i32
+/** bcryptprimitives ProcessPrng: fills size bytes at buffer with cryptographically secure random bytes; returns non-zero. */
+private trusted noescape extern:"c" fun ProcessPrng(buffer: int, size: int): i32
+/** kernel32 CreateThread: starts a thread at start with parameter; returns its handle, or 0 when it fails. */
+private trusted noescape extern:"c" fun CreateThread(attributes: int, stack: int, start: int, parameter: int, flags: int, id: int): int
+/** kernel32 ExitThread: ends the calling thread with the given exit code; does not return. */
+private trusted noescape extern:"c" fun ExitThread(code: int): void
+/** tools/windows/static-compiler/crt-free-start.cpp: runs the functions atexit recorded, the last recorded first; each runs once. */
+private trusted noescape extern:"c" fun abla_crt_run_exit_table(): void
+
+// The status a fail-fast ends the process with (STATUS_STACK_BUFFER_OVERRUN): what Microsoft's library ends with when a check fails.
+val windowsFailFastStatus = 3221226505
+
+// What Microsoft's default invalid-parameter handler does when a function of the library is given an argument it refuses (a destination
+// too small for strcpy_s, say): ends the process at once, as the /MT build's library does.
+trusted fun windowsInvalidParameter(): void {
+    TerminateProcess(GetCurrentProcess(), windowsFailFastStatus)
+    return
+}
+
+@export("_invoke_watson")
+trusted fun windowsInvokeWatson(expression: int, function: int, file: int, line: int, reserved: int): void = windowsInvalidParameter()
+
+// errno (errno.h's `(*_errno())`): ../errno.ab's cell of the calling thread, which the shared modules set.
+@export("_errno")
+trusted fun windowsErrno(): int = libcErrnoAddress()
+
+// ---- the heap ----
+
+@export("_aligned_malloc")
+trusted fun windowsAlignedMalloc(size: int, alignment: int): int {
+    // The alignment must be a power of two (EINVAL otherwise); memory.ab's posix_memalign keeps what free needs to release the block.
+    if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
+        libcSetErrno(22)
+        return 0
+    }
+    val cell = nativeStackAllocate(8)
+    val status = libcPosixMemalign(cell, if (alignment < 8) 8 else alignment, size)
+    if (status != 0) {
+        libcSetErrno(status)
+        return 0
+    }
+    ablaRuntimeLoadI64(cell)
+}
+
+@export("_aligned_free")
+trusted fun windowsAlignedFree(address: int): void = libcFree(address)
+
+// The heap is the Abla heap, which has no walk: the walk ends at once (_HEAPEND), as on a heap with nothing in it, so LLVM's
+// sys::Process::GetMallocUsage reports 0.
+@export("_heapwalk")
+trusted fun windowsHeapwalk(entry: int): int = -5
+
+trusted fun windowsNewHandlerCell(): int = nativeStaticAllocate(8)
+
+// The handler operator new calls when the heap is out of memory (crt-free-start.cpp's operator new fails fast without one).
+@export("_set_new_handler")
+trusted fun windowsSetNewHandler(handler: int): int {
+    val cell = windowsNewHandlerCell()
+    val previous = ablaRuntimeLoadI64(cell)
+    ablaRuntimeStoreI64(cell, handler)
+    previous
+}
+
+// ---- threads ----
+
+// std::thread (libcpmt) and LLVM's thread pool start their threads here. The heap is made safe for several threads first (as
+// src/static_lld.ab does before lld's), then the thread is kernel32's: the start routine has CreateThread's signature on x64 and ARM64.
+@export("_beginthreadex")
+trusted fun windowsBeginThreadEx(security: int, stackSize: int, start: int, argument: int, flags: int, threadId: int): int {
+    __ablaRuntimeHostThreadsShare()
+    val handle = CreateThread(security, stackSize & 4294967295, start, argument, flags & 4294967295, threadId)
+    if (handle == 0) libcSetErrno(11)
+    handle
+}
+
+@export("_endthreadex")
+trusted fun windowsEndThreadEx(code: int): void {
+    ExitThread(code & 4294967295)
+    return
+}
+
+// ---- exit and abort ----
+
+// The functions atexit recorded (the C++ static destructors among them: llvm::outs() flushes in its own), then the process ends.
+@export("exit")
+trusted fun windowsExit(status: int): void {
+    abla_crt_run_exit_table()
+    ExitProcess(status & 4294967295)
+    return
+}
+
+trusted fun windowsAbortBehaviourCell(): int = nativeStaticMutableBytes("\x03\x00\x00\x00\x00\x00\x00\x00")
+
+// _WRITE_ABORT_MSG (1; Microsoft's release library writes nothing for it either) and _CALL_REPORTFAULT (2: abort fails fast).
+@export("_set_abort_behavior")
+trusted fun windowsSetAbortBehavior(flags: int, mask: int): int {
+    val cell = windowsAbortBehaviourCell()
+    val previous = ablaRuntimeLoadI64(cell) & 4294967295
+    ablaRuntimeStoreI64(cell, (previous & (4294967295 - (mask & 4294967295))) | (flags & mask & 4294967295))
+    previous
+}
+
+// SIGABRT's handler runs first (LLVM's raises the exception its crash report catches); then the process fails fast with
+// _CALL_REPORTFAULT set, or exits with status 3.
+@export("abort")
+trusted fun windowsAbort(): void {
+    windowsRaise(22)
+    if ((ablaRuntimeLoadI64(windowsAbortBehaviourCell()) & 2) != 0) windowsInvalidParameter()
+    ExitProcess(3)
+    return
+}
+
+@export("terminate")
+trusted fun windowsTerminate(): void = windowsAbort()
+
+trusted fun windowsErrorModeCell(): int = nativeStaticAllocate(8)
+
+// Where the library would report a run-time error: kept and returned, as nothing here reports one.
+@export("_set_error_mode")
+trusted fun windowsSetErrorMode(mode: int): int {
+    val cell = windowsErrorModeCell()
+    val previous = ablaRuntimeLoadI64(cell)
+    val wanted = mode & 4294967295
+    // _REPORT_ERRMODE (3) only asks.
+    if (wanted == 3) return previous
+    if (wanted > 2) {
+        libcSetErrno(22)
+        return -1
+    }
+    ablaRuntimeStoreI64(cell, wanted)
+    previous
+}
+
+// ---- signals ----
+
+// The handlers signal installed, one word for each signal number up to SIGABRT (22): SIG_DFL (0), SIG_IGN (1) or a function.
+trusted fun windowsSignalTable(): int = nativeStaticAllocate(23 * 8)
+
+// The signals Microsoft's library knows: SIGINT, SIGILL, SIGFPE, SIGSEGV, SIGTERM, SIGBREAK and SIGABRT (SIGABRT_COMPAT is SIGABRT).
+fun windowsSignalNumber(signal: int): int {
+    val number = signal & 4294967295
+    if (number == 6) return 22
+    if (number == 2 || number == 4 || number == 8 || number == 11 || number == 15 || number == 21 || number == 22) return number
+    -1
+}
+
+@export("signal")
+trusted fun windowsSignal(signal: int, handler: int): int {
+    val number = windowsSignalNumber(signal)
+    // SIG_GET, SIG_SGE and SIG_ACK (2 to 4) are not handlers.
+    if (number < 0 || (handler >= 2 && handler <= 4)) {
+        libcSetErrno(22)
+        return -1
+    }
+    val slot = windowsSignalTable() + number * 8
+    val previous = ablaRuntimeLoadI64(slot)
+    ablaRuntimeStoreI64(slot, handler)
+    previous
+}
+
+// The handler of `number` runs (reset to SIG_DFL first, as C asks); SIG_DFL and SIG_IGN do nothing here: the caller decides what follows.
+trusted fun windowsRaise(number: int): void {
+    val slot = windowsSignalTable() + number * 8
+    val handler = ablaRuntimeLoadI64(slot)
+    if (handler == 0 || handler == 1) return
+    ablaRuntimeStoreI64(slot, 0)
+    ablaUnsafeCallI32I32(handler, number)
+    return
+}
+
+// ---- the environment ----
+
+// A UTF-8 copy of the process's environment block ("NAME=value" strings, each NUL-ended, an empty one at the end), made at the first
+// getenv: Microsoft's library also answers getenv from its own copy, made at start-up.
+trusted fun windowsEnvironmentCell(): int = nativeStaticAllocate(8)
+
+trusted fun windowsEnvironment(): int {
+    val cell = windowsEnvironmentCell()
+    val have = ablaRuntimeAtomicLoadI64(cell)
+    if (have != 0) return have
+    val block = GetEnvironmentStringsW()
+    if (block == 0) return 0
+    // The block's length in UTF-16 units with its final empty string: up to the first two NULs in a row.
+    var units = 0
+    while (windowsLoadWide(block, units) != 0 || windowsLoadWide(block, units + 1) != 0) units = units + 1
+    units = units + 2
+    val bytes = int(WideCharToMultiByte(65001, 0, block, units, 0, 0, 0, 0)) & 4294967295
+    var copy = 0
+    if (bytes > 0) {
+        copy = __ablaRuntimeHostHeapAllocate(bytes, false)
+        if (copy != 0 && int(WideCharToMultiByte(65001, 0, block, units, copy, bytes, 0, 0)) == 0) {
+            __ablaRuntimeHostHeapFree(copy)
+            copy = 0
+        }
+    }
+    int(FreeEnvironmentStringsW(block))
+    if (copy == 0) return 0
+    val seen = ablaRuntimeAtomicCompareExchangeI64(cell, 0, copy)
+    if (seen != 0) {
+        __ablaRuntimeHostHeapFree(copy)
+        return seen
+    }
+    copy
+}
+
+// ASCII letters folded to lower case: Windows compares variable names without case.
+fun windowsFold(c: int): int = if (c >= 65 && c <= 90) c + 32 else c
+
+@export("getenv")
+trusted fun windowsGetenv(name: int): int {
+    if (name == 0) return 0
+    val environment = windowsEnvironment()
+    if (environment == 0) return 0
+    var entry = environment
+    while (ablaRuntimeLoadU8(entry) != 0) {
+        var at = 0
+        // A name may start with '=' (the per-drive directories, "=C:=C:\..."): the name ends at the first '=' after its first character.
+        while (ablaRuntimeLoadU8(name + at) != 0 && windowsFold(ablaRuntimeLoadU8(name + at)) == windowsFold(ablaRuntimeLoadU8(entry + at)) &&
+            !(at > 0 && ablaRuntimeLoadU8(entry + at) == 61)) at = at + 1
+        if (ablaRuntimeLoadU8(name + at) == 0 && at > 0 && ablaRuntimeLoadU8(entry + at) == 61) return entry + at + 1
+        entry = entry + libcStrlen(entry) + 1
+    }
+    0
+}
+
+// ---- random numbers ----
+
+// rand_s: the system's cryptographically secure generator (std::random_device, libcpmt).
+@export("rand_s")
+trusted fun windowsRandS(result: int): int {
+    if (result == 0) {
+        libcSetErrno(22)
+        return 22
+    }
+    int(ProcessPrng(result, 4))
+    0
+}
+
+// rand and srand as Microsoft's: RAND_MAX is 0x7fff, the generator the linear congruence (214013, 2531011) modulo 2^32 whose bits 16
+// to 30 are the result, a state for each thread, seeded with 1.
+trusted fun windowsRandCell(): int = nativeThreadLocalBytes("\x01\x00\x00\x00\x00\x00\x00\x00")
+
+@export("srand")
+trusted fun windowsSrand(seed: int): void {
+    ablaRuntimeStoreI64(windowsRandCell(), seed & 4294967295)
+    return
+}
+
+@export("rand")
+trusted fun windowsRand(): int {
+    val cell = windowsRandCell()
+    val next = (ablaRuntimeLoadI64(cell) * 214013 + 2531011) & 4294967295
+    ablaRuntimeStoreI64(cell, next)
+    (next >> 16) & 32767
+}
+
+// ---- UTF-16 ----
+
+/** The UTF-16 unit at index `at` of the text at `wide`. */
+trusted fun windowsLoadWide(wide: int, at: int): int = ablaRuntimeLoadU8(wide + at * 2) + ablaRuntimeLoadU8(wide + at * 2 + 1) * 256
+
+/** Stores the UTF-16 unit `unit` at index `at` of the text at `wide`. */
+trusted fun windowsStoreWide(wide: int, at: int, unit: int): void {
+    ablaRuntimeStoreU8(wide + at * 2, unit & 255)
+    ablaRuntimeStoreU8(wide + at * 2 + 1, (unit >> 8) & 255)
+    return
+}

@@ -5,8 +5,8 @@
 //
 // - wmainCRTStartup: the stack cookie, the C and C++ initializers between the .CRT$XIA/XIZ and .CRT$XCA/XCZ markers
 //   (LLVM's static cl::opts and registries), then wmain (crt-start.cpp), which enters the Abla runtime;
-// - atexit: records the function. Nothing runs the table, as before: the Abla runtime ends the process with
-//   ExitProcess, which ran no C runtime exit handlers under /MT either;
+// - atexit: records the function; C's exit (called by LLVM's and lld's C++) runs the table, last first. The Abla runtime
+//   ends the process with ExitProcess, which ran no C runtime exit handlers under /MT either;
 // - the thread-safe static guards (_Init_thread_header/footer/abort, _Init_thread_epoch) in the MSVC ABI;
 // - the /GS cookie and __security_check_cookie (the __GSHandlerCheck handlers and ARM64's __security_push_cookie and
 //   __security_pop_cookie are Microsoft's own, from libcmt.lib: CMakeLists.txt links those members);
@@ -182,6 +182,19 @@ extern "C" int __cdecl atexit(abla_pvfv function) {
     }
     ReleaseSRWLockExclusive(&abla_exit_lock);
     return status;
+}
+
+// exit() (src/static_libc/windows/process.ab) runs the table, the last recorded first, as C's exit does: the C++ static destructors
+// (llvm::outs() flushes in its own) and what LLVM registered. Each entry is taken out before it runs, under the lock, so a function that
+// calls exit itself, or records another, sees only what is left.
+extern "C" void __cdecl abla_crt_run_exit_table() {
+    for (;;) {
+        AcquireSRWLockExclusive(&abla_exit_lock);
+        abla_pvfv function = abla_exit_count != 0 ? abla_exit_table[--abla_exit_count] : nullptr;
+        ReleaseSRWLockExclusive(&abla_exit_lock);
+        if (!function) return;
+        function();
+    }
 }
 
 // --- thread-safe statics (the MSVC ABI: 0 not started, -1 running, then the epoch it finished in) ----------------------

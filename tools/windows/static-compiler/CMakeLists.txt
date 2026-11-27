@@ -38,17 +38,22 @@ target_link_options(ablac PRIVATE
 # archive provided. None of them is shipped.
 option(ABLA_CRT_INVENTORY "Define the C runtime inventory links" OFF)
 if(ABLA_CRT_INVENTORY)
+  # The probes link the shipped compiler object; the candidate links ABLA_CANDIDATE_OBJECT when it is given (the same
+  # compiler with the Windows C library of src/orc_windows_main_crtfree.ab, steps 2 to 6), with its own import libraries.
+  set(abla_probe_object "${ABLA_COMPILER_OBJECT}")
+  set(abla_probe_import_directory "${ABLA_IMPORT_DIR}")
+  set(abla_probe_import_libraries ${windows_imports})
   function(abla_crt_probe name)
-    add_executable(${name} "${ABLA_COMPILER_OBJECT}" "../../../runtime/abla_lld_shim.cpp" crt-start.cpp)
+    add_executable(${name} "${abla_probe_object}" "../../../runtime/abla_lld_shim.cpp" crt-start.cpp)
     set_property(TARGET ${name} PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded)
     target_compile_features(${name} PRIVATE cxx_std_17)
     target_compile_definitions(${name} PRIVATE _HAS_EXCEPTIONS=0)
     target_compile_options(${name} PRIVATE /GR- /EHs-c-)
     target_include_directories(${name} PRIVATE ${LLVM_INCLUDE_DIRS} ${LLD_INCLUDE_DIRS})
-    target_link_libraries(${name} PRIVATE lldCOFF lldELF lldWasm LLVMOptDriver LLVMOrcJIT ${windows_imports})
+    target_link_libraries(${name} PRIVATE lldCOFF lldELF lldWasm LLVMOptDriver LLVMOrcJIT ${abla_probe_import_libraries})
     target_link_options(${name} PRIVATE
       /entry:wmainCRTStartup /subsystem:console "/machine:${ABLA_WINDOWS_MACHINE}" /brepro /stack:134217728
-      "/def:${ABLA_IMPORT_DIR}/exports.def" ${ARGN})
+      "/def:${abla_probe_import_directory}/exports.def" ${ARGN})
   endfunction()
   # /lldmap gives each input section's bytes but names a member without its archive; the MSVC-style /map names
   # archive:member for each public symbol. CMake's vs_link_exe drops a successful link's /verbose output.
@@ -61,9 +66,19 @@ if(ABLA_CRT_INVENTORY)
   # Decision #163 (B): the candidate link, without the C library and its start-up, with VCRuntime named because libcmt's
   # objects are what bring its default-library directive. Each step of the plan lowers its undefined count; at 0 the
   # shipped link can switch.
+  if(ABLA_CANDIDATE_OBJECT)
+    set(abla_probe_object "${ABLA_CANDIDATE_OBJECT}")
+    set(abla_probe_import_directory "${ABLA_CANDIDATE_IMPORT_DIR}")
+    file(GLOB abla_probe_import_libraries "${ABLA_CANDIDATE_IMPORT_DIR}/*.lib")
+    set_source_files_properties("${ABLA_CANDIDATE_OBJECT}" PROPERTIES EXTERNAL_OBJECT TRUE)
+  endif()
+  # The C names the Abla runtime declares itself are exported under others (src/static_libc/memory.ab and windows/string.ab) and
+  # bound here, as the Linux link's --defsym binds them.
   abla_crt_probe(ablac-crt-candidate /nodefaultlib:libucrt.lib /nodefaultlib:libcmt.lib /defaultlib:libvcruntime.lib
-    /errorlimit:0)
-  # Step 1: libcmt's start-up and C++ support of our own (crt-free-start.cpp: no stack cookie checks, no default library).
+    /alternatename:malloc=abla_libc_malloc /alternatename:calloc=abla_libc_calloc /alternatename:free=abla_libc_free
+    /alternatename:realloc=abla_libc_realloc /alternatename:atoi=abla_windows_atoi /errorlimit:0)
+  # Step 1: libcmt's start-up and C++ support of our own (crt-free-start.cpp, built without /GS checks of its own, as it
+  # defines them, and naming no default library).
   target_sources(ablac-crt-candidate PRIVATE crt-free-start.cpp)
   set_source_files_properties(crt-free-start.cpp PROPERTIES COMPILE_OPTIONS "/GS-;/Zl")
   # The /GS exception handlers (__GSHandlerCheck and its _SEH/_EH/_EH4 forms, which check a frame's cookie when an

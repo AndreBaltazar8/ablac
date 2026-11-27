@@ -279,6 +279,40 @@ objects leaves exactly CI's 157 / 153 undefined names.
     the C runtime's exit table.
   - `thread_local` destructors are not run (`__tlregdtor` records nothing). lld's ELF reader's thread-locals hold
     only memory.
+- **Steps 2 to 6.** The C library is src/static_libc/windows (process.ab, io.ab, locale.ab, string.ab). It is written
+  from the SDK headers' declarations and Microsoft's documentation. The candidate's undefined count goes 130 → 69 → 0
+  on x64 (locally):
+  - 130 → 69 from the Linux modules src/orc_windows_main_crtfree.ab imports (math, strings, number parsing);
+  - 69 → 0 from the Windows modules.
+
+  The x64 candidate links, imports no C runtime DLL, and builds and runs a hello world under Wine. Its output was
+  compared with the `/MT` compiler built from the same tree, both run from the same package path, building hello
+  world and tests/cases/compile-eval-jit/scalars.ab. The output is byte-identical, release and `--fast`. (Run from
+  different directories, the `--fast` builds differ only in the paths their DWARF records.)
+
+  The shared modules no longer export the names whose C types or behaviour differ between LP64 and LLP64. Those are
+  `read`, `lseek`, `strtol`, `strtoul`, `atol`, `rand`/`srand` and printf's `va_list` entry points. Their Linux forms
+  are in src/static_libc/lp64.ab, which only src/orc_main_static.ab imports; the Windows modules export the Windows
+  forms. VCRuntime defines a `vsnprintf` of its own, which is what found the printf entry points.
+
+  Choices made on the way:
+  - **Descriptors** are the runtime's. `_open_osfhandle` and `_get_osfhandle` are the runtime's Windows-only calls
+    4009 and 4010, so LLVM's descriptors and the shared `open`/`close`/`read` are one table. Every descriptor is binary.
+  - **printf** is format.ab's: a Windows `va_list` (a pointer to 8-byte slots), `l` 32 bits, `I64`/`I32`/`I`, `%p`
+    as 16 upper-case digits. `sscanf` reads integers, strings and scan sets, with no floating conversions (LLVM's
+    only call is `"v%d."`).
+  - **errno** is errno.ab's thread-local cell (`_errno` returns it), which the shared modules set.
+  - **exit** runs the `atexit` table, last first (crt-free-start.cpp), as C's exit does under `/MT`.
+  - **abort** runs the SIGABRT handler. Then it fails fast when `_CALL_REPORTFAULT` is set, as the CRT does, or
+    exits with status 3.
+  - **Invalid parameters** (`strcpy_s` or `sprintf_s` overflow, `_invoke_watson`) end the process with
+    0xC0000409, as the default handler does.
+  - **Local time** is Windows' (SystemTimeToTzSpecificLocalTime, with `tm_isdst`), not UTC as the plan first said:
+    the `/MT` compiler gives local time.
+  - **Threads** are CreateThread's. The runtime has no thread start on Windows, and the loader gives each thread
+    its TLS, including the interrupt word. The heap's lock is turned on before the first one starts.
+  - **The C++ time names** (`_Getdays`, `_Gettnames` and their wide forms) are null, for which libcpmt falls back
+    to the C locale's names.
 
 ### Not changed
 

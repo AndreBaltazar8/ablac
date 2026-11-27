@@ -1,0 +1,410 @@
+// The Windows compiler's own C library (decision #163, B), descriptors and streams. A descriptor is the Windows runtime's
+// (stdlib/abla/runtime/platform/windows/entry.ab: a table over handles, 0 to 2 the standard ones), so the C++ code's descriptors and the
+// shared modules' open, close and fstat (../fs.ab, over the runtime's translation of the Linux calls) are one table: LLVM opens a file
+// with CreateFileW and hands the handle to _open_osfhandle (the runtime's call 4009), _get_osfhandle is call 4010. Every descriptor
+// is binary: nothing translates "\n" to "\r\n" (the /MT build's library did for a descriptor in text mode, the standard streams'
+// default; LLVM sets the ones it writes binary data to binary itself).
+//
+// A FILE is a word holding its descriptor, as in ../stdio.ab, whose fputs, fputc, fwrite, puts, putchar and fflush serve these too:
+// stdin, stdout and stderr are __acrt_iob_func(0 to 2). printf's conversions are ../format.ab's with Microsoft's conventions.
+import "abla/runtime/scalar"
+import "abla/sys/linux"
+import "abla/unsafe/memory/raw"
+import "../errno.ab"
+import "../fs.ab"
+import "../string.ab"
+import "../stdio.ab"
+import "../format.ab"
+import "./process.ab"
+
+// ---- descriptors ----
+
+@export("_write")
+trusted fun windowsWrite(descriptor: int, buffer: int, count: int): int =
+    libcResult(linuxSyscall3(1, libcInt(descriptor), buffer, count & 4294967295))
+
+@export("read")
+trusted fun windowsRead(descriptor: int, buffer: int, count: int): int =
+    libcResult(linuxSyscall3(0, libcInt(descriptor), buffer, count & 4294967295))
+
+// lseek's offset and result are a 32-bit long: a position past 2^31 - 1 is EINVAL, as Microsoft's _lseek reports it.
+@export("lseek")
+trusted fun windowsLseek(descriptor: int, offset: int, origin: int): int {
+    val position = libcResult(linuxSyscall3(8, libcInt(descriptor), libcInt(offset), libcInt(origin)))
+    if (position > 2147483647) {
+        libcSetErrno(22)
+        return -1
+    }
+    position
+}
+
+@export("_lseeki64")
+trusted fun windowsLseeki64(descriptor: int, offset: int, origin: int): int =
+    libcResult(linuxSyscall3(8, libcInt(descriptor), offset, libcInt(origin)))
+
+// The file's length set to `size` (ftruncate: cut, or extended with zeros); 0, or the error number (errno is set too).
+@export("_chsize_s")
+trusted fun windowsChsizeS(descriptor: int, size: int): int {
+    if (size < 0) {
+        libcSetErrno(22)
+        return 22
+    }
+    val result = linuxSyscall2(77, libcInt(descriptor), size)
+    if (result < 0) {
+        libcSetErrno(0 - result)
+        return 0 - result
+    }
+    0
+}
+
+@export("_open_osfhandle")
+trusted fun windowsOpenOsfhandle(handle: int, flags: int): int = libcResult(linuxSyscall1(4009, handle))
+
+@export("_get_osfhandle")
+trusted fun windowsGetOsfhandle(descriptor: int): int {
+    val handle = linuxSyscall1(4010, libcInt(descriptor))
+    if (handle < 0 && handle > -4096) {
+        libcSetErrno(0 - handle)
+        return -1
+    }
+    handle
+}
+
+// Every descriptor is binary already: the mode it had is _O_BINARY (0x8000) for any mode asked, EBADF for a descriptor that is not open.
+@export("_setmode")
+trusted fun windowsSetmode(descriptor: int, mode: int): int {
+    if (windowsGetOsfhandle(descriptor) == -1) return -1
+    32768
+}
+
+// ---- streams ----
+
+trusted fun windowsStreams(): int = nativeStaticAllocate(24)
+
+// stdin, stdout and stderr: each FILE is the word holding its descriptor.
+@export("__acrt_iob_func")
+trusted fun windowsIobFunc(index: int): int {
+    val which = index & 4294967295
+    if (which > 2) return 0
+    val stream = windowsStreams() + which * 8
+    ablaRuntimeStoreI64(stream, which)
+    stream
+}
+
+@export("_fileno")
+trusted fun windowsFileno(stream: int): int {
+    if (stream == 0) {
+        libcSetErrno(22)
+        return -1
+    }
+    ablaRuntimeLoadI64(stream)
+}
+
+// ---- printf ----
+
+// ../format.ab over a Windows va_list (the address of the first argument's slot), into `out`: the length of the whole text, or -1 with
+// errno set for a format the formatter refuses (EINVAL, EOVERFLOW, EILSEQ: LibcOut's error).
+trusted fun windowsFormatOut(var out: LibcOut, format: int, arguments: int): int {
+    val cursor = nativeStackAllocate(8)
+    ablaRuntimeStoreI64(cursor, arguments)
+    libcFormatFor(out, format, cursor, true)
+    if (out.error == 0 && out.count > libcIntMax) out.error = 75
+    if (out.error != 0) {
+        libcSetErrno(out.error)
+        return -1
+    }
+    out.count
+}
+
+// Into `size` bytes at `buffer`, of which the last is kept for the NUL (not written here): the length of the whole text, as if the buffer
+// had no end, or -1.
+trusted fun windowsFormatInto(buffer: int, size: int, format: int, arguments: int): int = windowsFormatOut(LibcOut(buffer, size, 0, 0, -1, 0), format, arguments)
+
+// What the UCRT's printf family (the inline functions of its stdio.h) calls. options: the _CRT_INTERNAL_PRINTF_* bits of
+// corecrt_stdio_config.h; the locale is the C one, the only one here. The text goes to the stream's descriptor through a 4096-byte
+// buffer written out each time it fills, as ../format.ab's fprintf does.
+@export("__stdio_common_vfprintf")
+trusted fun windowsVfprintf(options: int, stream: int, format: int, locale: int, arguments: int): int {
+    if (stream == 0 || format == 0) {
+        windowsInvalidParameter()
+        return -1
+    }
+    val buffer = __ablaRuntimeHostHeapAllocate(4096, false)
+    if (buffer == 0) {
+        libcSetErrno(12)
+        return -1
+    }
+    val out = LibcOut(buffer, 4096, 0, 0, ablaRuntimeLoadI64(stream), 0)
+    val length = windowsFormatOut(out, format, arguments)
+    out.flush()
+    __ablaRuntimeHostHeapFree(buffer)
+    length
+}
+
+// snprintf and vsnprintf (_CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR, 2): C's: the text cut to count - 1 bytes and a NUL, the
+// whole length returned. Without it (_vsnprintf, sprintf: count is SIZE_MAX there) up to count bytes, a NUL when there is room, and -1
+// for a text that does not fit (with _CRT_INTERNAL_PRINTF_LEGACY_VSPRINTF_NULL_TERMINATION, 1, its last byte the NUL).
+@export("__stdio_common_vsprintf")
+trusted fun windowsVsprintf(options: int, buffer: int, count: int, format: int, locale: int, arguments: int): int {
+    if (format == 0 || (buffer == 0 && count != 0)) {
+        windowsInvalidParameter()
+        return -1
+    }
+    // A count of 2^63 or more (sprintf's SIZE_MAX is -1 here) has no end.
+    val endless = count < 0 || count == 9223372036854775807
+    if ((options & 2) != 0) {
+        val length = windowsFormatInto(buffer, if (endless) 9223372036854775807 else count, format, arguments)
+        if (length < 0) {
+            if (count != 0) ablaRuntimeStoreU8(buffer, 0)
+            return -1
+        }
+        if (count != 0) ablaRuntimeStoreU8(buffer + (if (endless || length < count - 1) length else count - 1), 0)
+        return length
+    }
+    // count + 1 lets the output take all count bytes.
+    val length = windowsFormatInto(buffer, if (endless) 9223372036854775807 else count + 1, format, arguments)
+    if (length < 0) {
+        if (count != 0) ablaRuntimeStoreU8(buffer, 0)
+        return -1
+    }
+    if (endless || length < count) {
+        ablaRuntimeStoreU8(buffer + length, 0)
+        return length
+    }
+    if (length == count) return length
+    if ((options & 1) != 0 && count > 0) ablaRuntimeStoreU8(buffer + count - 1, 0)
+    -1
+}
+
+// sprintf_s and vsprintf_s: a text that does not fit is an invalid parameter, which ends the process as Microsoft's default handler does.
+@export("__stdio_common_vsprintf_s")
+trusted fun windowsVsprintfS(options: int, buffer: int, count: int, format: int, locale: int, arguments: int): int {
+    if (format == 0 || buffer == 0 || count == 0) {
+        windowsInvalidParameter()
+        return -1
+    }
+    val length = windowsFormatInto(buffer, if (count < 0) 9223372036854775807 else count, format, arguments)
+    if (length < 0) {
+        ablaRuntimeStoreU8(buffer, 0)
+        return -1
+    }
+    if (count > 0 && length >= count) {
+        ablaRuntimeStoreU8(buffer, 0)
+        windowsInvalidParameter()
+        return -1
+    }
+    ablaRuntimeStoreU8(buffer + length, 0)
+    length
+}
+
+// ---- scanf ----
+
+fun windowsScanSpace(c: int): bool = c == 32 || (c >= 9 && c <= 13)
+
+// The value of digit character c in `base`, or -1.
+fun windowsScanDigit(c: int, base: int): int {
+    var value = 99
+    if (c >= 48 && c <= 57) value = c - 48
+    else if (c >= 97 && c <= 122) value = c - 87
+    else if (c >= 65 && c <= 90) value = c - 55
+    if (value < base) value else -1
+}
+
+// Stores the low `size` bytes of value at address.
+trusted fun windowsScanStore(address: int, size: int, value: int): void {
+    if (size == 8) ablaRuntimeStoreI64(address, value)
+    else if (size == 4) ablaRuntimeStoreI32(address, value)
+    else if (size == 2) {
+        ablaRuntimeStoreU8(address, value & 255)
+        ablaRuntimeStoreU8(address + 1, (value >> 8) & 255)
+    } else ablaRuntimeStoreU8(address, value & 255)
+    return
+}
+
+// sscanf and its relatives over the `count` bytes at `text` (SIZE_MAX: up to its NUL): the conversions %d %i %u %o %x %X %c %s %[...]
+// %n and %%, with a width, * (no assignment) and the length modifiers hh h l ll z j t L I I32 I64 (l is 32 bits). sscanf_s
+// (_CRT_INTERNAL_SCANF_SECURECRT, 1) also takes each %c, %s and %[ destination's size, and refuses a text longer than it. No floating
+// conversion: nothing the compiler links reads one (LLVM's only call reads "v%d."). Returns the assignments made, or -1 (EOF) when the
+// text ended before the first conversion.
+@export("__stdio_common_vsscanf")
+trusted fun windowsVsscanf(options: int, text: int, count: int, format: int, locale: int, arguments: int): int {
+    if (text == 0 || format == 0) {
+        windowsInvalidParameter()
+        return -1
+    }
+    val secure = (options & 1) != 0
+    val cursor = nativeStackAllocate(8)
+    ablaRuntimeStoreI64(cursor, arguments)
+    val limit = if (count < 0) 9223372036854775807 else count
+    var at = 0
+    var fi = 0
+    var assigned = 0
+    var converted = false
+    while (true) {
+        val f = ablaRuntimeLoadU8(format + fi)
+        if (f == 0) break
+        if (windowsScanSpace(f)) {
+            while (windowsScanSpace(ablaRuntimeLoadU8(format + fi))) fi = fi + 1
+            while (at < limit && windowsScanSpace(ablaRuntimeLoadU8(text + at))) at = at + 1
+            continue
+        }
+        if (f != 37 || ablaRuntimeLoadU8(format + fi + 1) == 37) {
+            if (f == 37) {
+                fi = fi + 1
+                while (at < limit && windowsScanSpace(ablaRuntimeLoadU8(text + at))) at = at + 1
+            }
+            if (at >= limit || ablaRuntimeLoadU8(text + at) == 0) {
+                if (!converted) return -1
+                break
+            }
+            if (ablaRuntimeLoadU8(text + at) != f) break
+            at = at + 1
+            fi = fi + 1
+            continue
+        }
+        fi = fi + 1
+        var suppress = false
+        if (ablaRuntimeLoadU8(format + fi) == 42) {
+            suppress = true
+            fi = fi + 1
+        }
+        var width = 0
+        while (ablaRuntimeLoadU8(format + fi) >= 48 && ablaRuntimeLoadU8(format + fi) <= 57) {
+            width = width * 10 + ablaRuntimeLoadU8(format + fi) - 48
+            fi = fi + 1
+        }
+        var size = 4
+        var longs = 0
+        var scanning = true
+        while (scanning) {
+            val m = ablaRuntimeLoadU8(format + fi)
+            if (m == 108) {
+                longs = longs + 1
+                size = if (longs >= 2) 8 else 4
+            } else if (m == 104) size = if (size == 2) 1 else 2
+            else if (m == 122 || m == 106 || m == 116 || m == 76) size = 8
+            else if (m == 73) {
+                val next = ablaRuntimeLoadU8(format + fi + 1)
+                val after = ablaRuntimeLoadU8(format + fi + 2)
+                if (next == 54 && after == 52) {
+                    size = 8
+                    fi = fi + 2
+                } else if (next == 51 && after == 50) {
+                    size = 4
+                    fi = fi + 2
+                } else size = 8
+            } else scanning = false
+            if (scanning) fi = fi + 1
+        }
+        val conversion = ablaRuntimeLoadU8(format + fi)
+        if (conversion == 0) break
+        fi = fi + 1
+        if (conversion == 110) {
+            if (!suppress) windowsScanStore(libcVaSlot(cursor), size, at)
+            continue
+        }
+        // %c and %[ do not skip white space; the others do.
+        if (conversion != 99 && conversion != 91) {
+            while (at < limit && windowsScanSpace(ablaRuntimeLoadU8(text + at))) at = at + 1
+        }
+        if (at >= limit || ablaRuntimeLoadU8(text + at) == 0) {
+            if (!converted) return -1
+            break
+        }
+        converted = true
+        val most = if (width > 0) width else 9223372036854775807
+        if (conversion == 100 || conversion == 105 || conversion == 117 || conversion == 111 || conversion == 120 || conversion == 88) {
+            var base = if (conversion == 111) 8 else if (conversion == 120 || conversion == 88) 16 else if (conversion == 105) 0 else 10
+            var taken = 0
+            var negative = false
+            val sign = ablaRuntimeLoadU8(text + at)
+            if ((sign == 45 || sign == 43) && taken < most) {
+                negative = sign == 45
+                at = at + 1
+                taken = taken + 1
+            }
+            if ((base == 0 || base == 16) && taken + 1 < most && at + 1 < limit && ablaRuntimeLoadU8(text + at) == 48 &&
+                (ablaRuntimeLoadU8(text + at + 1) | 32) == 120 && windowsScanDigit(ablaRuntimeLoadU8(text + at + 2), 16) >= 0) {
+                at = at + 2
+                taken = taken + 2
+                base = 16
+            } else if (base == 0) base = if (ablaRuntimeLoadU8(text + at) == 48) 8 else 10
+            var value = 0
+            var digits = 0
+            while (taken < most && at < limit) {
+                val digit = windowsScanDigit(ablaRuntimeLoadU8(text + at), base)
+                if (digit < 0) break
+                value = value * base + digit
+                at = at + 1
+                taken = taken + 1
+                digits = digits + 1
+            }
+            if (digits == 0) break
+            if (!suppress) {
+                windowsScanStore(libcVaSlot(cursor), size, if (negative) 0 - value else value)
+                assigned = assigned + 1
+            }
+            continue
+        }
+        if (conversion == 99 || conversion == 115 || conversion == 91) {
+            // The scan set of %[: the characters up to the closing ], a leading ^ inverting it, a ] first being one of them.
+            var setStart = fi
+            var invert = false
+            var setEnd = fi
+            if (conversion == 91) {
+                if (ablaRuntimeLoadU8(format + fi) == 94) {
+                    invert = true
+                    fi = fi + 1
+                }
+                setStart = fi
+                if (ablaRuntimeLoadU8(format + fi) == 93) fi = fi + 1
+                while (ablaRuntimeLoadU8(format + fi) != 0 && ablaRuntimeLoadU8(format + fi) != 93) fi = fi + 1
+                setEnd = fi
+                if (ablaRuntimeLoadU8(format + fi) == 93) fi = fi + 1
+            }
+            val destination = if (suppress) 0 else libcVaSlot(cursor)
+            var room = 9223372036854775807
+            if (secure && !suppress) room = libcVaSlot(cursor) & 4294967295
+            val wanted = if (conversion == 99 && width == 0) 1 else most
+            var taken = 0
+            while (taken < wanted && at < limit) {
+                val c = ablaRuntimeLoadU8(text + at)
+                if (c == 0) break
+                if (conversion == 115 && windowsScanSpace(c)) break
+                if (conversion == 91) {
+                    var member = false
+                    var s = setStart
+                    while (s < setEnd) {
+                        if (ablaRuntimeLoadU8(format + s + 1) == 45 && s + 2 < setEnd) {
+                            if (c >= ablaRuntimeLoadU8(format + s) && c <= ablaRuntimeLoadU8(format + s + 2)) member = true
+                            s = s + 3
+                        } else {
+                            if (c == ablaRuntimeLoadU8(format + s)) member = true
+                            s = s + 1
+                        }
+                    }
+                    if (member == invert) break
+                }
+                if (destination != 0) {
+                    // sscanf_s: the text and (but for %c) its NUL must fit the size given.
+                    if (taken + (if (conversion == 99) 1 else 2) > room) {
+                        if (room > 0) ablaRuntimeStoreU8(destination, 0)
+                        return assigned
+                    }
+                    ablaRuntimeStoreU8(destination + taken, c)
+                }
+                taken = taken + 1
+                at = at + 1
+            }
+            if (taken == 0) break
+            if (destination != 0) {
+                if (conversion != 99) ablaRuntimeStoreU8(destination + taken, 0)
+                assigned = assigned + 1
+            }
+            continue
+        }
+        // A conversion not listed above (a floating one, say) is a matching failure.
+        break
+    }
+    assigned
+}

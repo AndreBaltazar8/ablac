@@ -102,6 +102,16 @@ trusted fun libcVaLongDouble(list: int): f64 {
     libcX87ToF64(ablaRuntimeLoadI64(area), ablaRuntimeLoadI32(area + 8) & 65535)
 }
 
+// The next argument of a Windows va_list (x64 and ARM64 alike): a pointer to the arguments' 8-byte slots, a double's bits in its own
+// slot (long double is double there), held at `list` and advanced past the slot it reads.
+trusted fun libcVaSlot(list: int): int {
+    val cursor = ablaRuntimeLoadI64(list)
+    ablaRuntimeStoreI64(list, cursor + 8)
+    ablaRuntimeLoadI64(cursor)
+}
+
+trusted fun libcVaWord(list: int, windows: bool): int = if (windows) libcVaSlot(list) else libcVaInt(list)
+
 // The double nearest (ties to even) to significand * 2^(exponent - 63), the significand's leading bit at bit 63 and `sticky` set when nonzero
 // bits were cut below it: overflow is an infinity, a value below half the smallest subnormal a zero.
 fun libcRoundToF64(negative: bool, significand: u64, exponent: int, sticky: bool): f64 {
@@ -260,7 +270,13 @@ trusted fun libcFormatDigitsEnd(format: int, start: int): int {
     at
 }
 
-trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
+trusted fun libcFormat(var out: LibcOut, format: int, list: int): void = libcFormatFor(out, format, list, false)
+
+// `windows`: the Windows C library's conventions (src/static_libc/windows/io.ab): `list` holds the va_list pointer (libcVaSlot), long is
+// 32 bits (l takes the low 32 bits, ll the whole word), long double is double, wchar_t is 2 bytes, the Microsoft length modifiers I64, I32
+// and I (a pointer's size) are read (so I is not glibc's locale-digits flag), and %p is the pointer as 16 upper-case hexadecimal digits,
+// as Microsoft's printf writes it.
+trusted fun libcFormatFor(var out: LibcOut, format: int, list: int, windows: bool): void {
     var at = 0
     while (true) {
         val c = ablaRuntimeLoadU8(format + at)
@@ -284,13 +300,13 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
             else if (f == 35) alternate = true
             else if (f == 48) zero = true
             // ' (thousands grouping) and I (the locale's digits) change nothing in the C locale.
-            else if (f == 39 || f == 73) flags = true
+            else if (f == 39 || (f == 73 && !windows)) flags = true
             else flags = false
             if (flags) at = at + 1
         }
         var width = 0
         if (ablaRuntimeLoadU8(format + at) == 42) {
-            width = libcVaInt(list) & 4294967295
+            width = libcVaWord(list, windows) & 4294967295
             if (width >= 2147483648) {
                 // A negative width is the - flag and its magnitude (INT_MIN's is past INT_MAX).
                 width = 4294967296 - width
@@ -315,7 +331,7 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
             at = at + 1
             precision = 0
             if (ablaRuntimeLoadU8(format + at) == 42) {
-                precision = libcVaInt(list) & 4294967295
+                precision = libcVaWord(list, windows) & 4294967295
                 if (precision >= 2147483648) precision = -1
                 at = at + 1
             } else {
@@ -332,9 +348,25 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
         var long = false
         var longDouble = false
         var scanning = true
+        var longs = 0
         while (scanning) {
             val m = ablaRuntimeLoadU8(format + at)
-            if (m == 108 || m == 122 || m == 106 || m == 116 || m == 76 || m == 113) {
+            if (windows && m == 108) {
+                longs = longs + 1
+                size = if (longs >= 2) 8 else 4
+                long = true
+            } else if (windows && m == 73) {
+                // I64 and I32 name their width; a bare I is a pointer's (size_t, ptrdiff_t).
+                val next = ablaRuntimeLoadU8(format + at + 1)
+                val after = ablaRuntimeLoadU8(format + at + 2)
+                if (next == 54 && after == 52) {
+                    size = 8
+                    at = at + 2
+                } else if (next == 51 && after == 50) {
+                    size = 4
+                    at = at + 2
+                } else size = 8
+            } else if (m == 108 || m == 122 || m == 106 || m == 116 || m == 76 || m == 113) {
                 size = 8
                 if (m == 108) long = true
                 if (m == 76) longDouble = true
@@ -372,7 +404,7 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
             out.put(37)
             continue
         } else if (conversion == 100 || conversion == 105) {
-            var value = libcVaInt(list)
+            var value = libcVaWord(list, windows)
             if (size == 4) {
                 value = value & 4294967295
                 if (value >= 2147483648) value = value - 4294967296
@@ -394,7 +426,7 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
             }
         } else if (conversion == 117 || conversion == 120 || conversion == 88 || conversion == 111 || conversion == 98 || conversion == 66) {
             // %b and %B are C23's binary (glibc 2.35 on): they take an argument, so reading none would put every later one out of place.
-            var value = libcVaInt(list)
+            var value = libcVaWord(list, windows)
             if (size == 4) value = value & 4294967295
             else if (size == 2) value = value & 65535
             else if (size == 1) value = value & 255
@@ -410,8 +442,13 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
             }
         } else if (conversion == 112) {
             // %p is glibc's %#lx (its + and space flags too) and "(nil)" for NULL, which takes no precision or zeros.
-            val value = libcVaInt(list)
-            if (value == 0) {
+            val value = libcVaWord(list, windows)
+            if (windows) {
+                var digits = libcDigits(value, 16, true)
+                while (digits.size < 16) digits = "0" + digits
+                body = digits
+                precision = -1
+            } else if (value == 0) {
                 body = "(nil)"
                 precision = -1
             } else {
@@ -420,7 +457,7 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
                 body = libcDigits(value, 16, false)
             }
         } else if (conversion == 99 || conversion == 67) {
-            val value = libcVaInt(list) & 4294967295
+            val value = libcVaWord(list, windows) & 4294967295
             if ((long || conversion == 67) && value > 127) {
                 // %lc: a wint_t, one byte in the C locale; a character past 127 has none (EILSEQ).
                 out.error = 84
@@ -432,15 +469,17 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
             out.padding(if (left) width - 1 else 0, 32)
             continue
         } else if (conversion == 115 || conversion == 83) {
-            val text = libcVaInt(list)
+            val text = libcVaWord(list, windows)
             // A NULL string is "(null)" as glibc writes it, which a precision under its 6 bytes leaves out altogether rather than cutting.
             if (text == 0) body = if (precision >= 0 && precision < 6) "" else "(null)"
             else if (long || conversion == 83) {
-                // %ls: wchar_t units (4 bytes) to the terminator or the precision's bytes; one byte each in the C locale, EILSEQ past 127.
+                // %ls: wchar_t units (4 bytes; 2 on Windows) to the terminator or the precision's bytes; one byte each in the C locale, EILSEQ
+                // past 127.
                 var copy = ""
                 var i = 0
                 while (precision < 0 || i < precision) {
-                    val unit = ablaRuntimeLoadI32(text + i * 4) & 4294967295
+                    val unit = if (windows) ablaRuntimeLoadU8(text + i * 2) + ablaRuntimeLoadU8(text + i * 2 + 1) * 256
+                        else ablaRuntimeLoadI32(text + i * 4) & 4294967295
                     if (unit == 0) break
                     if (unit > 127) {
                         out.error = 84
@@ -464,7 +503,7 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
             precision = -1
         } else if (conversion == 102 || conversion == 70 || conversion == 101 || conversion == 69 || conversion == 103 || conversion == 71 ||
             conversion == 97 || conversion == 65) {
-            val value = if (longDouble) libcVaLongDouble(list) else libcVaDouble(list)
+            val value = if (windows) f64FromBits(libcVaSlot(list)) else if (longDouble) libcVaLongDouble(list) else libcVaDouble(list)
             body = libcFloat(value, conversion, precision, alternate)
             if (body.size > 0 && body[0] == 45) {
                 sign = "-"
@@ -528,7 +567,7 @@ trusted fun libcFormatList(var out: LibcOut, format: int, list: int): void {
     return
 }
 
-@export("vsnprintf")
+// Exported by lp64.ab (its va_list is System V's, AAPCS64's or RV64's; Windows' printf family is in windows/io.ab).
 trusted fun libcVsnprintf(buffer: int, size: int, format: int, list: int): int {
     // size is a size_t: 2^63 and more (sprintf's SIZE_MAX) are negative here and mean no limit, not no room.
     val room = if (size < 0) 9223372036854775807 else size
@@ -560,21 +599,21 @@ trusted fun libcVprintfTo(descriptor: int, format: int, list: int): int {
 }
 
 // printf to stdout from the assembly shim __printf_chk.
-@export("abla_libc_vprintf")
+// Exported by lp64.ab (its va_list is System V's, AAPCS64's or RV64's; Windows' printf family is in windows/io.ab).
 trusted fun libcVprintf(format: int, list: int): int = libcVprintfTo(1, format, list)
 
 // vprintf (the plain name), vfprintf and the fortified forms: the text goes to the stream's descriptor (first word of its FILE).
-@export("vprintf")
+// Exported by lp64.ab (its va_list is System V's, AAPCS64's or RV64's; Windows' printf family is in windows/io.ab).
 trusted fun libcVprintfPlain(format: int, list: int): int = libcVprintf(format, list)
 
-@export("abla_libc_vfprintf")
+// Exported by lp64.ab (its va_list is System V's, AAPCS64's or RV64's; Windows' printf family is in windows/io.ab).
 trusted fun libcVfprintf(file: int, format: int, list: int): int = libcVprintfTo(ablaRuntimeLoadI64(file), format, list)
 
-@export("vfprintf")
+// Exported by lp64.ab (its va_list is System V's, AAPCS64's or RV64's; Windows' printf family is in windows/io.ab).
 trusted fun libcVfprintfPlain(file: int, format: int, list: int): int = libcVfprintf(file, format, list)
 
-@export("__vfprintf_chk")
+// Exported by lp64.ab (its va_list is System V's, AAPCS64's or RV64's; Windows' printf family is in windows/io.ab).
 trusted fun libcVfprintfChk(file: int, flag: int, format: int, list: int): int = libcVfprintf(file, format, list)
 
-@export("__vprintf_chk")
+// Exported by lp64.ab (its va_list is System V's, AAPCS64's or RV64's; Windows' printf family is in windows/io.ab).
 trusted fun libcVprintfChk(flag: int, format: int, list: int): int = libcVprintf(format, list)

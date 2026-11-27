@@ -23,7 +23,8 @@ jobs:
   cross-compile:
     name: Compile the Windows compiler object on Linux
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    # An inventory run emits a second object (the candidate).
+    timeout-minutes: ${{ inputs.crt_inventory && 55 || 35 }}
     env:
       ABLA_NATIVE_JOBS: '4'
       ABLA_CODEGEN_JOBS: '4'
@@ -40,12 +41,26 @@ jobs:
         run: |
           nix-shell shell.nix --run 'make ablac'
           nix-shell shell.nix --run 'tools/windows/cross-compiler-object.sh build/ablac src/orc_windows_main.ab build/windows-compiler-coff "$TARGET"'
+      # The inventory's candidate link (decision #163): the same compiler on Abla's own Windows C library.
+      - name: Emit the candidate compiler object without Microsoft's C library
+        if: ${{ inputs.crt_inventory }}
+        run: |
+          nix-shell shell.nix --run 'tools/windows/cross-compiler-object.sh build/ablac src/orc_windows_main_crtfree.ab build/windows-compiler-candidate "$TARGET"'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-compiler-coff
           path: |
             build/windows-compiler-coff/ablac.exe.o
             build/windows-compiler-coff/ablac.exe.imports/
+          if-no-files-found: error
+          retention-days: 3
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ inputs.crt_inventory }}
+        with:
+          name: windows-compiler-candidate
+          path: |
+            build/windows-compiler-candidate/ablac.exe.o
+            build/windows-compiler-candidate/ablac.exe.imports/
           if-no-files-found: error
           retention-days: 3
 
@@ -65,6 +80,11 @@ jobs:
         with:
           name: windows-compiler-coff
           path: build/windows-compiler-coff
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        if: ${{ inputs.crt_inventory }}
+        with:
+          name: windows-compiler-candidate
+          path: build/windows-compiler-candidate
       - name: Install the verified Windows LLVM SDK
         shell: pwsh
         run: ./tools/windows/install-static-llvm.ps1 -Destination build/llvm -Architecture $env:ARCHITECTURE
@@ -72,11 +92,18 @@ jobs:
         shell: pwsh
         run: |
           $inventory = $env:CRT_INVENTORY -eq 'true'
+          $candidate = @{}
+          if ($inventory) {
+            $candidate = @{
+              CandidateObject = 'build/windows-compiler-candidate/ablac.exe.o'
+              CandidateImportDirectory = 'build/windows-compiler-candidate/ablac.exe.imports'
+            }
+          }
           ./tools/windows/build-static-compiler.ps1 `
             -CompilerObject build/windows-compiler-coff/ablac.exe.o `
             -ImportDirectory build/windows-compiler-coff/ablac.exe.imports `
             -LlvmRoot build/llvm -BuildDirectory build/windows-compiler -Architecture $env:ARCHITECTURE `
-            -CrtInventory:$inventory
+            -CrtInventory:$inventory @candidate
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-compiler-${{ inputs.architecture }}

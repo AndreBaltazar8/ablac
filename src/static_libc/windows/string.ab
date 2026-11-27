@@ -1,0 +1,157 @@
+// The Windows compiler's own C library (decision #163, B), strings and numbers: wchar_t is a UTF-16 unit (2 bytes, not Linux's 4, so
+// ../wide.ab is not used), long is 32 bits (strtol and strtoul narrow ../string.ab's 64-bit parse, with ERANGE at the 32-bit limits), the
+// secure strcpy_s ends the process for a destination too small (Microsoft's default invalid-parameter handler), and the floating-point
+// classification functions math.h's inline functions call. atoi is exported as abla_windows_atoi and bound by the link's /alternatename,
+// since the runtime declares atoi itself.
+import "abla/runtime/scalar"
+import "abla/float"
+import "../errno.ab"
+import "../string.ab"
+import "./process.ab"
+
+// ---- numbers ----
+
+// Whether the text at `text` has a minus sign after its leading white space, as strtoul reads it.
+trusted fun windowsNegativeText(text: int): bool {
+    var at = 0
+    while (libcIsspace(ablaRuntimeLoadU8(text + at)) != 0) at = at + 1
+    ablaRuntimeLoadU8(text + at) == 45
+}
+
+@export("strtol")
+trusted fun windowsStrtol(text: int, end: int, base: int): int {
+    val value = libcStrto(text, end, base, true, false)
+    if (value > 2147483647) {
+        libcSetErrno(34)
+        return 2147483647
+    }
+    if (value < -2147483648) {
+        libcSetErrno(34)
+        return -2147483648
+    }
+    value
+}
+
+// strtoul: the magnitude must fit 32 bits (ULONG_MAX and ERANGE otherwise); a minus sign negates it modulo 2^32.
+@export("strtoul")
+trusted fun windowsStrtoul(text: int, end: int, base: int): int {
+    val negative = windowsNegativeText(text)
+    val value = libcStrto(text, end, base, false, false)
+    val magnitude = if (negative) 0 - value else value
+    if (u64(magnitude) > u64(4294967295)) {
+        libcSetErrno(34)
+        return 4294967295
+    }
+    value & 4294967295
+}
+
+@export("abla_windows_atoi")
+trusted fun windowsAtoi(text: int): int = windowsStrtol(text, 0, 10)
+
+@export("atol")
+trusted fun windowsAtol(text: int): int = windowsStrtol(text, 0, 10)
+
+// ---- byte strings ----
+
+@export("strcpy_s")
+trusted fun windowsStrcpyS(destination: int, size: int, source: int): int {
+    if (destination == 0 || size == 0 || source == 0) {
+        if (destination != 0 && size != 0) ablaRuntimeStoreU8(destination, 0)
+        windowsInvalidParameter()
+        return 22
+    }
+    val length = libcStrlen(source)
+    if (u64(length) >= u64(size)) {
+        ablaRuntimeStoreU8(destination, 0)
+        windowsInvalidParameter()
+        return 34
+    }
+    var at = 0
+    while (at <= length) {
+        ablaRuntimeStoreU8(destination + at, ablaRuntimeLoadU8(source + at))
+        at = at + 1
+    }
+    0
+}
+
+// ---- wide strings ----
+
+@export("wcslen")
+trusted fun windowsWcslen(text: int): int {
+    var at = 0
+    while (windowsLoadWide(text, at) != 0) at = at + 1
+    at
+}
+
+@export("wcsnlen")
+trusted fun windowsWcsnlen(text: int, count: int): int {
+    var at = 0
+    while (u64(at) < u64(count) && windowsLoadWide(text, at) != 0) at = at + 1
+    at
+}
+
+@export("wcsncmp")
+trusted fun windowsWcsncmp(first: int, second: int, count: int): int {
+    var at = 0
+    while (u64(at) < u64(count)) {
+        val a = windowsLoadWide(first, at)
+        val b = windowsLoadWide(second, at)
+        if (a != b) return if (a < b) -1 else 1
+        if (a == 0) return 0
+        at = at + 1
+    }
+    0
+}
+
+@export("_wcsdup")
+trusted fun windowsWcsdup(text: int): int {
+    if (text == 0) return 0
+    val units = windowsWcslen(text) + 1
+    val copy = __ablaRuntimeHostHeapAllocate(units * 2, false)
+    if (copy == 0) {
+        libcSetErrno(12)
+        return 0
+    }
+    var at = 0
+    while (at < units * 2) {
+        ablaRuntimeStoreU8(copy + at, ablaRuntimeLoadU8(text + at))
+        at = at + 1
+    }
+    copy
+}
+
+// ---- floating-point classification ----
+
+// math.h's FP_INFINITE (1), FP_NAN (2), FP_NORMAL (-1), FP_SUBNORMAL (-2) and FP_ZERO (0) of a double; long double is double on Windows.
+fun windowsDoubleClass(x: f64): int {
+    val bits = f64ToBits(x)
+    val exponent = (bits >> 52) & 2047
+    val fraction = bits & 4503599627370495
+    if (exponent == 2047) return if (fraction == 0) 1 else 2
+    if (exponent == 0) return if (fraction == 0) 0 else -2
+    -1
+}
+
+@export("_dclass")
+fun windowsDclass(x: f64): int = windowsDoubleClass(x)
+
+@export("_ldclass")
+fun windowsLdclass(x: f64): int = windowsDoubleClass(x)
+
+// Non-zero when the sign bit is set (signbit is _dsign(x) != 0).
+@export("_dsign")
+fun windowsDsign(x: f64): int = if (f64ToBits(x) < 0) 32768 else 0
+
+// float.h's _FPCLASS_* bits: signalling NaN 1, quiet NaN 2, -inf 4, -normal 8, -denormal 0x10, -0 0x20, +0 0x40, +denormal 0x80,
+// +normal 0x100, +inf 0x200.
+@export("_fpclass")
+fun windowsFpclass(x: f64): int {
+    val bits = f64ToBits(x)
+    val negative = bits < 0
+    val kind = windowsDoubleClass(x)
+    if (kind == 2) return if ((bits & 2251799813685248) != 0) 2 else 1
+    if (kind == 1) return if (negative) 4 else 512
+    if (kind == 0) return if (negative) 32 else 64
+    if (kind == -2) return if (negative) 16 else 128
+    if (negative) 8 else 256
+}
