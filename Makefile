@@ -180,6 +180,7 @@ test-serial: ablac
 	tools/test-compile-path-symlinks.sh $(COMPILER)
 	tools/test-compile-path-race.sh $(COMPILER)
 	tools/test-transform-grants.sh $(COMPILER)
+	tools/test-regex-factory-grants.sh $(COMPILER)
 	tools/test-transform-program.sh $(COMPILER)
 	tools/test-compile-package-grants.sh $(COMPILER)
 	tools/test-package-trusted-grants.sh $(COMPILER)
