@@ -2590,7 +2590,7 @@ private trusted noescape extern:"c" fun abla_windows_context_pc(context: int): i
 private trusted noescape extern:"c" fun abla_windows_redirect(context: int, target: int, first: int, second: int): void
 
 // The watchdog's block (one for the process, zeroed): 0 the arming count (32 bits, what the watchdog waits on), 8 the deadline in
-// milliseconds of the performance counter (0: disarmed), 16 the watched thread's handle, 24 the check function, 32 the
+// milliseconds of the performance counter (0: disarmed), 16 the watched thread's id (0: none), 24 the check function, 32 the
 // redirect target, 40 another interrupt word to set (0: none), 48 the thread's own interrupt word, 56 the watchdog thread's
 // handle (0: not started), 64 and 72 the watchdog's clock scratch, 80 its copy of the arming count,
 // from 128 the CONTEXT (16-aligned, as GetThreadContext requires; x64's is 1232 bytes, ARM64's 912), from 1536 the
@@ -2609,18 +2609,34 @@ private trusted fun __ablaRuntimeWindowsMilliseconds(scratch: int): int {
 // One stop of the watched thread at its deadline: 1 when it is done (redirected, deferred, an interrupt of an interpreted
 // site, or the thread is gone), 0 to try again a millisecond later, 2 when the watch it read is no longer the one armed
 // (disarmed, or armed again): the deadline is then the new watch's, or 0, and is not the watchdog's to clear.
+// The watchdog opens its own handle to the thread for each stop and closes it after resuming the thread. When the thread's
+// own handle was used, the thread could close it while disarming: SuspendThread returns before the thread has stopped, so the
+// thread ran on into CloseHandle, then stopped, and ResumeThread on the closed handle failed. The thread then stayed
+// suspended for ever (CI 45983612520, ARM64: "runtime sleep" hung; 9 of 150 runs under Wine on 8 CPUs).
 private trusted fun __ablaRuntimeWindowsWatchStop(block: int, armed: int): int {
-    val target = ablaRuntimeLoadI64(block + 16)
+    val id = ablaRuntimeLoadI64(block + 16)
+    if (id == 0) return 2
+    // THREAD_ALL_ACCESS: suspend and resume, the context, CancelSynchronousIo's THREAD_TERMINATE.
+    val target = OpenThread(2097151, 0, id)
+    if (target == 0) return 1
+    val stopped = __ablaRuntimeWindowsWatchStopThread(block, armed, target)
+    int(CloseHandle(target))
+    stopped
+}
+
+private trusted fun __ablaRuntimeWindowsWatchStopThread(block: int, armed: int, target: int): int {
     if ((int(SuspendThread(target)) & 4294967295) == 4294967295) return 1
+    // GetThreadContext returns once the thread has stopped (SuspendThread returns before that), so the watch is read
+    // below only after the thread has stopped changing it.
+    val context = block + 128
+    abla_windows_context_prepare(context)
+    val read = int(GetThreadContext(target, context)) != 0
     // Disarmed or armed again since the deadline was read: nothing to stop (the thread itself arms and disarms, and it is
     // suspended now).
     if ((ablaRuntimeAtomicLoadI64(block) & 4294967295) != armed || ablaRuntimeAtomicLoadI64(block + 8) == 0) {
         int(ResumeThread(target))
         return 2
     }
-    val context = block + 128
-    abla_windows_context_prepare(context)
-    val read = int(GetThreadContext(target, context)) != 0
     val check = ablaRuntimeLoadI64(block + 24)
     val state = if (check == 0) 3 else ablaUnsafeCallMain(check)
     if (read && state == 2 && __ablaRuntimeWindowsImageOf(abla_windows_context_pc(context), block + 1536) == 0) {
@@ -2697,11 +2713,7 @@ private trusted fun __ablaRuntimeWindowsWatch(request: int): int {
     // Disarm (or re-arm): the deadline goes first, so a watchdog that wakes meanwhile finds nothing to stop.
     ablaRuntimeAtomicStoreI64(block + 8, 0)
     ablaRuntimeAtomicStoreI64(block, (ablaRuntimeLoadI64(block) + 1) & 4294967295)
-    val previous = ablaRuntimeLoadI64(block + 16)
-    if (previous != 0) {
-        int(CloseHandle(previous))
-        ablaRuntimeStoreI64(block + 16, 0)
-    }
+    ablaRuntimeAtomicStoreI64(block + 16, 0)
     val other = ablaRuntimeLoadI64(block + 40)
     if (other != 0) ablaRuntimeAtomicStoreI64(other, 0)
     ablaRuntimeAtomicStoreI64(cell, 0)
@@ -2709,10 +2721,7 @@ private trusted fun __ablaRuntimeWindowsWatch(request: int): int {
         WakeByAddressAll(block)
         return 0
     }
-    // THREAD_ALL_ACCESS: suspend and resume, the context, CancelSynchronousIo's THREAD_TERMINATE.
-    val target = OpenThread(2097151, 0, int(GetCurrentThreadId()))
-    if (target == 0) return __ablaRuntimeWindowsErrno()
-    ablaRuntimeStoreI64(block + 16, target)
+    ablaRuntimeAtomicStoreI64(block + 16, int(GetCurrentThreadId()) & 4294967295)
     ablaRuntimeStoreI64(block + 24, ablaRuntimeLoadI64(request + 8))
     ablaRuntimeStoreI64(block + 32, ablaRuntimeLoadI64(request + 16))
     ablaRuntimeStoreI64(block + 40, ablaRuntimeLoadI64(request + 24))
