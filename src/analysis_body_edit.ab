@@ -172,29 +172,12 @@ fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameter
         return false
     }
     if (kind == "integer" || kind == "float" || kind == "true" || kind == "false") return true
-    // A block of immutable scalar locals, guards and a scalar result: each `val` is a new name (no shadowing) of inferred or written scalar
-    // type, initialized from the parameters and the locals before it; a guard is `if (condition) return value` without an else; the
-    // result may be a `return`.
+    // A block of statements (bootstrapAnalysisScalarStatement) and a scalar result, which may be a `return`.
     if (kind == "block" && expression.children.size >= 1) {
         val scope: array<string> = []
         for (name in parameters) scope.append(name)
         for (index in 0 until expression.children.size - 1) {
-            val statement = expression.children[index]
-            // A guard: `if (condition) return value`, without an else.
-            if (statement.kind == "if" && statement.children.size == 3) {
-                if (statement.children[2].kind != "missing" ||
-                    !bootstrapAnalysisScalarExpression(statement.children[0], scope, depth + 1, calls, strings, members) ||
-                    !bootstrapAnalysisScalarReturn(statement.children[1], scope, depth + 1, calls, strings, members)) return false
-                continue
-            }
-            if (statement.kind != "local.val" || statement.children.size != 2 || statement.children[1].kind != "type") return false
-            val declared = statement.children[1].text
-            if (declared != "inferred" && !bootstrapAnalysisScalarType(declared)) return false
-            for (name in scope) if (name == statement.text) return false
-            for (name in strings) if (name == statement.text) return false
-            for (member in members) if (member.startsWith("${statement.text}.")) return false
-            if (!bootstrapAnalysisScalarExpression(statement.children[0], scope, depth + 1, calls, strings, members)) return false
-            scope.append(statement.text)
+            if (!bootstrapAnalysisScalarStatement(expression.children[index], scope, depth + 1, calls, strings, members)) return false
         }
         val result = expression.children[expression.children.size - 1]
         return if (result.kind == "return") bootstrapAnalysisScalarReturn(result, scope, depth + 1, calls, strings, members)
@@ -580,11 +563,11 @@ fun bootstrapAnalysisReplayScalarOccurrence(old: BootstrapAnalysisOccurrenceSet,
         if (!inserted && (atEnd || old.begins[index] >= change.at)) {
             for (item in 0 until fresh.begins.size) {
                 if (fresh.begins[item] < change.at || fresh.begins[item] >= newEnd) continue
-                // A local's own name and a written built-in type carry no type in any analysis (the full one neither): they are a binding
-                // and a type, not typed expressions.
+                // A local's or loop variable's own name and a written built-in type carry no type in any analysis (the full one neither):
+                // they are a binding and a type, not typed expressions.
                 if (fresh.ends[item] > newEnd || fresh.ids[item] == "" ||
                     (requireTypes && fresh.types[item] == "" && !fresh.ids[item].contains("/local:") &&
-                     !fresh.ids[item].contains("/abla/builtins/declarations.ab#"))) return null
+                     !fresh.ids[item].contains("/for:") && !fresh.ids[item].contains("/abla/builtins/declarations.ab#"))) return null
                 begins.append(fresh.begins[item])
                 ends.append(fresh.ends[item])
                 ids.append(fresh.ids[item])
@@ -643,11 +626,95 @@ fun bootstrapAnalysisBodyEnd(text: string, start: int, end: int): int {
     if (open == 0) closed else end
 }
 
-/** The names of the `val` locals in `expression`. */
+/** The names of the locals and loop variables in `expression`. */
 fun bootstrapAnalysisScalarLocalNames(expression: BootstrapExpression, var names: Map<string, int>): void {
-    if (expression.kind == "local.val") names.set(expression.text, 0)
+    if (expression.kind == "local.val" || expression.kind == "local.var") names.set(expression.text, 0)
+    if (expression.kind == "for") names.set(bootstrapForName(expression), 0)
     for (child in expression.children) bootstrapAnalysisScalarLocalNames(child, names)
     return
+}
+
+/** Whether `statement`, in a block of a checked body, is one the subset checker types alone, adding the names it declares to `scope`:
+ *  - `val` or `var` of a new name (no shadowing) of inferred or written scalar type, initialized from the names in scope; a `var` is
+ *    listed as `var:name` as well;
+ *  - an assignment (or compound assignment) of a `var` in scope;
+ *  - `return` of a scalar expression;
+ *  - `if` with statement branches, the else optional;
+ *  - an unlabeled `while`, `do … while` or `for` over `a until b` or `a..b`, with a new name, and a statement body;
+ *  - an unlabeled `break` or `continue`;
+ *  - a block of these.
+ *  A nested body's declarations end with it. */
+fun bootstrapAnalysisScalarStatement(statement: BootstrapExpression, var scope: array<string>, depth: int, calls: bool,
+    strings: array<string> = [], members: array<string> = []): bool {
+    if (depth > 24) return false
+    val kind = statement.kind
+    if (kind == "local.val" || kind == "local.var") {
+        if (statement.children.size != 2 || statement.children[1].kind != "type") return false
+        val declared = statement.children[1].text
+        if (declared != "inferred" && !bootstrapAnalysisScalarType(declared)) return false
+        if (!bootstrapAnalysisScalarNewName(statement.text, scope, strings, members) ||
+            !bootstrapAnalysisScalarExpression(statement.children[0], scope, depth + 1, calls, strings, members)) return false
+        scope.append(statement.text)
+        if (kind == "local.var") scope.append("var:${statement.text}")
+        return true
+    }
+    if (kind == "assign") {
+        if (statement.children.size != 1) return false
+        var mutable = false
+        for (name in scope) if (name == "var:${statement.text}") mutable = true
+        return mutable && bootstrapAnalysisScalarExpression(statement.children[0], scope, depth + 1, calls, strings, members)
+    }
+    if (kind == "return") return bootstrapAnalysisScalarReturn(statement, scope, depth + 1, calls, strings, members)
+    if (kind == "if" && statement.children.size == 3) {
+        return bootstrapAnalysisScalarExpression(statement.children[0], scope, depth + 1, calls, strings, members) &&
+            bootstrapAnalysisScalarBody(statement.children[1], scope, depth + 1, calls, strings, members) &&
+            (statement.children[2].kind == "missing" ||
+             bootstrapAnalysisScalarBody(statement.children[2], scope, depth + 1, calls, strings, members))
+    }
+    if (kind == "while" && statement.children.size == 2 && statement.text == "") {
+        return bootstrapAnalysisScalarExpression(statement.children[0], scope, depth + 1, calls, strings, members) &&
+            bootstrapAnalysisScalarBody(statement.children[1], scope, depth + 1, calls, strings, members)
+    }
+    // The condition sees only the names outside the body.
+    if (kind == "do.while" && statement.children.size == 2 && statement.text == "") {
+        return bootstrapAnalysisScalarBody(statement.children[0], scope, depth + 1, calls, strings, members) &&
+            bootstrapAnalysisScalarExpression(statement.children[1], scope, depth + 1, calls, strings, members)
+    }
+    // A range is built in: its bounds must be `i64`, whatever the project declares (bootstrapInferRange).
+    if (kind == "for" && statement.children.size == 2 && bootstrapForLabelAt(statement.text) < 0) {
+        val source = statement.children[0]
+        if ((source.kind != "range.until" && source.kind != "range.closed") || source.children.size != 2 ||
+            !bootstrapAnalysisScalarNewName(statement.text, scope, strings, members) ||
+            !bootstrapAnalysisScalarExpression(source.children[0], scope, depth + 1, calls, strings, members) ||
+            !bootstrapAnalysisScalarExpression(source.children[1], scope, depth + 1, calls, strings, members)) return false
+        val inner: array<string> = []
+        for (name in scope) inner.append(name)
+        inner.append(statement.text)
+        return bootstrapAnalysisScalarBody(statement.children[1], inner, depth + 1, calls, strings, members)
+    }
+    if (kind == "break" || kind == "continue") return statement.text == "" && statement.children.size == 0
+    if (kind == "block") return bootstrapAnalysisScalarBody(statement, scope, depth + 1, calls, strings, members)
+    false
+}
+
+/** Whether `body`, a branch or loop body, is a statement or a block of them (bootstrapAnalysisScalarStatement), in a scope of its own. */
+fun bootstrapAnalysisScalarBody(body: BootstrapExpression, scope: array<string>, depth: int, calls: bool,
+    strings: array<string> = [], members: array<string> = []): bool {
+    val inner: array<string> = []
+    for (name in scope) inner.append(name)
+    if (body.kind != "block") return bootstrapAnalysisScalarStatement(body, inner, depth + 1, calls, strings, members)
+    for (statement in body.children) {
+        if (!bootstrapAnalysisScalarStatement(statement, inner, depth + 1, calls, strings, members)) return false
+    }
+    true
+}
+
+/** Whether a local may be named `name`: no parameter, local or loop variable in scope has that name, nor a class parameter. */
+fun bootstrapAnalysisScalarNewName(name: string, scope: array<string>, strings: array<string>, members: array<string>): bool {
+    for (other in scope) if (other == name) return false
+    for (other in strings) if (other == name) return false
+    for (member in members) if (member.startsWith("$name.")) return false
+    true
 }
 
 /** Whether `statement` is `return <scalar expression>`, alone or as the one statement of a block. */
