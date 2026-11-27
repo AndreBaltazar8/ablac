@@ -20,6 +20,7 @@ import "generic_ownership.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/sys/linux/fs"
+import "abla/process/exit"
 import "parser.ab"
 import "unused_declarations.ab"
 import "json_construction.ab"
@@ -18849,6 +18850,47 @@ fun bootstrapTransactionalClasses(
  *  which a program naming TVar has): only then are the transactions'
  *  checks recorded (bootstrapCheckStm). */
 fun bootstrapProgramUsesStm(declarations: array<BootstrapDeclaration>, scanBodies: bool): bool {
+    // Inside a pre-semantic pipeline whose input has neither, a probe's program has neither: it is that input rewritten, and
+    // no rewrite makes an `atomic` (only the parser does) or a declaration named Transactional. The first probe to ask scans
+    // its own program, as outside a pipeline (one that asks once costs what it did); the second scans the input
+    // (bootstrapStmPipelineInput) for it and every later one. A first probe that finds one knows the input has one.
+    if (scanBodies && bootstrapStmPipelineState == 1) {
+        val found = bootstrapProgramUsesStmScan(declarations, true)
+        bootstrapStmPipelineState = if (found) 3 else 4
+        return found
+    }
+    if (scanBodies && bootstrapStmPipelineState == 4) {
+        bootstrapStmPipelineState = if (bootstrapProgramUsesStmScan(bootstrapStmPipelineInput, true)) 3 else 2
+    }
+    if (scanBodies && bootstrapStmPipelineState == 2) {
+        if (bootstrapCheckStmScan() && bootstrapProgramUsesStmScan(declarations, true)) {
+            panic("a pre-semantic rewrite made an `atomic` or a Transactional the pipeline's input did not have (ABLA_CHECK_STM_SCAN)")
+        }
+        return false
+    }
+    bootstrapProgramUsesStmScan(declarations, scanBodies)
+}
+
+// Set by bootstrapPreSemanticPipeline (frontend.ab) while it runs: its input's declarations, and what is known of them
+// (0 outside a pipeline, 1 no probe has asked, 4 one has and found neither in its program, 2 the input has no `atomic` and
+// no Transactional, 3 it has one).
+var bootstrapStmPipelineInput: array<BootstrapDeclaration> = []
+var bootstrapStmPipelineState: int = 0
+
+// ABLA_CHECK_STM_SCAN as read once (-1 not read yet, 0 off, 1 on).
+var bootstrapCheckStmScanSetting: int = -1
+
+/** Whether ABLA_CHECK_STM_SCAN=1 asks every skipped probe scan to be made anyway and to end the build if it finds one. */
+fun bootstrapCheckStmScan(): bool {
+    if (bootstrapCheckStmScanSetting < 0) {
+        val configured = linuxEnvironment("ABLA_CHECK_STM_SCAN")
+        bootstrapCheckStmScanSetting = if (configured.found && configured.value == "1") 1 else 0
+    }
+    bootstrapCheckStmScanSetting == 1
+}
+
+/** bootstrapProgramUsesStm's scan of `declarations`. */
+fun bootstrapProgramUsesStmScan(declarations: array<BootstrapDeclaration>, scanBodies: bool): bool {
     for (declaration in declarations) {
         if (declaration.kind == "interface" && declaration.name == "Transactional") return true
         if (scanBodies && bootstrapExpressionUsesStm(declaration.expression)) return true
