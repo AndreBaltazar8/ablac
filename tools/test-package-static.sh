@@ -21,7 +21,7 @@ args=("$compiler" "$root" "$out/package.tar.gz")
 report=$(tools/package-linux-static-toolchain.sh "${args[@]}" 2> "$out/package.log") || { tail -5 "$out/package.log" >&2; fail "the package did not build"; }
 tar -C "$out/unpacked" -xzf "$out/package.tar.gz"
 pkg=$out/unpacked/${ABLA_PACKAGE_NAME:-abla-toolchain-static-x86_64-linux}
-for part in bin/ablac libexec/ablac.bin libexec/abla-install-xtensa-native share/abla/stdlib share/abla/stdlib-discovery-v1 share/abla/release-collector-v1/record share/abla/runtime lib/clang/23/lib/linux/libclang_rt.builtins-x86_64.a share/licenses/abla.txt; do
+for part in bin/ablac libexec/ablac.bin libexec/abla-install-xtensa-native share/abla/stdlib share/abla/stdlib-discovery-v1 share/abla/release-collector-v1/record share/abla/fast-runtime-v1 share/abla/runtime lib/clang/23/lib/linux/libclang_rt.builtins-x86_64.a share/licenses/abla.txt; do
     [[ -e $pkg/$part ]] || fail "the package lacks $part"
 done
 # no shared library, no libLLVM, no tool of an LLVM install
@@ -56,6 +56,22 @@ touch -r "$out/host.original.ab" "$collector_source"
 hello hello-edit cache-edit
 if grep -Fq "release-collector.hit" "$out/hello-edit.log"; then fail "edited collector used the packaged object"; fi
 [[ $("$out/hello-edit") == hello ]] || fail "edited collector did not build a working hello"
+cp -p "$out/host.original.ab" "$collector_source"
+# The prebuilt --fast runtime: a fresh cache takes the package's object (both debug settings) and compiles no runtime; an edited
+# runtime source is another key, which the package does not have, so that build compiles its own.
+fast_hello() { # output name, cache name, debug flag
+    env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/$2" ABLA_COMPILER_MEMORY_TRACE=1 "$PWD/$pkg/bin/ablac" build tests/cases/libc-imports/hello.ab \
+        --fast "$3" -o "$out/$1" > "$out/$1.log" 2>&1 || { tail -5 "$out/$1.log" >&2; fail "hello --fast $3 did not build with an empty PATH"; }
+    [[ $("$out/$1") == hello ]] || fail "hello --fast $3 did not print hello"
+}
+for debug in --debug --no-debug; do
+    fast_hello "fast$debug" "cache-fast$debug" "$debug"
+    grep -Fq 'fast-runtime.shipped' "$out/fast$debug.log" || fail "hello --fast $debug did not take the packaged runtime"
+    if grep -Fq 'fast-runtime.compile' "$out/fast$debug.log"; then fail "hello --fast $debug compiled the runtime"; fi
+done
+sed "s/__ablaRuntimeHostGcWorkersSet(4)/__ablaRuntimeHostGcWorkersSet(3)/" "$out/host.original.ab" > "$collector_source"
+fast_hello fast-edit cache-fast-edit --debug
+grep -Fq 'fast-runtime.compile' "$out/fast-edit.log" || fail "an edited runtime used the packaged --fast runtime"
 cp -p "$out/host.original.ab" "$collector_source"
 # a program with a compile-time action and a second module build too (the standard library is the package's own)
 env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/cache3" "$PWD/$pkg/bin/ablac" run tests/cases/libc-imports/strings-arrays.ab > "$out/run.log" 2>&1 ||

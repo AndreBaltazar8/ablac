@@ -127,6 +127,41 @@ cp "$program" "$scratch/ordinary-staged"
 "$compiler" build "$scratch/staged.ab" --fast --no-cache -o "$program"
 cmp "$scratch/ordinary-staged" "$program"
 
+# The object's DWARF names no program and no machine's paths: another program in another cache gets the same object, and the
+# standard library is under the fixed prefix that `ablac symbolize` maps back (docs/debugging.md), not this sysroot.
+printf 'import "abla/io"\nfun main: int { println("other"); 0 }\n' > "$scratch/other.ab"
+ABLA_CACHE_DIR=$scratch/other-program-cache "$compiler" build "$scratch/other.ab" --fast -g --no-cache -o "$scratch/other"
+first_objects=("$scratch"/debug-cache-a/fast-runtime-v1/*/runtime.o)
+other_objects=("$scratch"/other-program-cache/fast-runtime-v1/*/runtime.o)
+[[ ${#first_objects[@]} == 1 && ${#other_objects[@]} == 1 ]]
+cmp "${first_objects[0]}" "${other_objects[0]}"
+grep -aFq '/abla-toolchain/stdlib' "${first_objects[0]}"
+if grep -aFq "$ABLA_SYSROOT" "${first_objects[0]}"; then echo "fast runtime: the object names the sysroot $ABLA_SYSROOT" >&2; exit 1; fi
+
+# A toolchain that ships the entry (ABLA_SEED_FAST_RUNTIME=1, as the packagers and `make ablac` do): a fresh cache takes it, runs
+# no front end or code generation for the runtime, and the program is the same bytes.
+ABLA_CACHE_DIR=$scratch/seed-cache ABLA_SEED_FAST_RUNTIME=1 "$compiler" build "$source_file" --fast --no-cache -o "$program"
+cmp "$scratch/cold" "$program"
+shipped=("$ABLA_SYSROOT"/fast-runtime-v1/*/record)
+[[ ${#shipped[@]} == 1 && -s ${shipped[0]} ]]
+shipped_build() { # cache name: a fresh-cache build, its trace in $scratch/<cache name>.trace
+    ABLA_CACHE_DIR=$scratch/$1 ABLA_COMPILER_MEMORY_TRACE=1 "$compiler" build "$source_file" --fast --no-cache -o "$program" \
+        2> "$scratch/$1.trace"
+}
+shipped_build shipped-cache
+grep -aFq 'fast-runtime.shipped' "$scratch/shipped-cache.trace"
+if grep -aFq 'fast-runtime.compile' "$scratch/shipped-cache.trace"; then echo 'fast runtime: compiled although the toolchain ships it' >&2; exit 1; fi
+cmp "$scratch/cold" "$program"
+# A shipped object that does not match its record is not taken: the build compiles its own.
+shipped_object=${shipped[0]%/record}/runtime.o
+cp "$shipped_object" "$scratch/shipped-object"
+printf 'bad!' | dd of="$shipped_object" conv=notrunc status=none
+shipped_build damaged-shipped-cache
+grep -aFq 'fast-runtime.compile' "$scratch/damaged-shipped-cache.trace"
+if grep -aFq 'fast-runtime.shipped' "$scratch/damaged-shipped-cache.trace"; then echo 'fast runtime: took a damaged shipped object' >&2; exit 1; fi
+cmp "$scratch/cold" "$program"
+cp "$scratch/shipped-object" "$shipped_object"
+
 host=$ABLA_SYSROOT/stdlib/abla/runtime/platform/host.ab
 grep -q '^var __ablaRuntimeHostLimit: int = 4611686018427387903$' "$host"
 sed -e 's/^var __ablaRuntimeHostLimit: int = 4611686018427387903$/var __ablaRuntimeHostLimit: int = 66846720/' \

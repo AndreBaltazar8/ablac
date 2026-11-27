@@ -37,6 +37,22 @@ for expected in '#0 ' '__ablaRuntimePanicArrayIndex' 'crash.ab:7'; do
     [[ $symbolized == *"$expected"* ]] ||
         { echo "symbolize: no \"$expected\" in the symbolized stack" >&2; cat "$out/crash.txt" "$out/symbolized.txt" >&2; exit 1; }
 done
+# A --fast build on x86-64 Linux links the prebuilt runtime, whose DWARF names the standard library under /abla-toolchain/stdlib
+# (llvm-symbolizer says so): symbolize names the installed file instead, one that exists.
+if [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]]; then
+    "$compiler" build "$project_root/tests/cases/symbolize/crash.ab" -o "$out/fast" --fast -g --no-cache
+    set +e
+    "$out/fast" > /dev/null 2> "$out/fast.txt"
+    set -e
+    "$compiler" symbolize "$out/fast" "$out/fast.txt" > "$out/fast-symbolized.txt"
+    runtime_frame=$(grep -m 1 -o '[^ ]*/abla/runtime/self/entry\.ab' "$out/fast-symbolized.txt" || true)
+    [[ -n $runtime_frame && -f $runtime_frame && $runtime_frame != /abla-toolchain/* ]] ||
+        { echo "symbolize: the --fast runtime frame names [$runtime_frame], not the installed file" >&2; cat "$out/fast-symbolized.txt" >&2; exit 1; }
+    [[ $(< "$out/fast-symbolized.txt") == *'crash.ab:7'* ]] ||
+        { echo 'symbolize: no crash.ab:7 in the --fast stack' >&2; cat "$out/fast-symbolized.txt" >&2; exit 1; }
+    grep -aFq '/abla-toolchain/stdlib' "$out/fast" ||
+        { echo 'symbolize: the --fast program did not link the prebuilt runtime (no /abla-toolchain/stdlib in its DWARF)' >&2; exit 1; }
+fi
 # A --backtrace build (ELF) ships without DWARF: its line tables are in <output>.debug beside it, under the same build
 # id, which symbolize follows (the program's debug link); without that file the same stack has no file:line.
 if [[ $(uname -s) == Linux ]]; then

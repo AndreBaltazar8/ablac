@@ -179,6 +179,15 @@ done
 ln -s ../libexec/abla-install-xtensa-native "$bundle/bin/abla-install-xtensa"
 
 "$bundle/bin/ablac" --seed-stdlib-discovery
+# The prebuilt runtime of --fast builds (src/toolchain.ab, bootstrapFastRuntimeShip), with debug information (the default) and
+# without, built by the packaged compiler as installed (after its patchelf above: the key names the compiler's image).
+printf 'import "abla/io"\nfun main: int { println("hello"); 0 }\n' > "$working/native-build/fast-seed.ab"
+for debug in --debug --no-debug; do
+    ABLA_CACHE_DIR="$working/fast-runtime-cache" ABLA_SEED_FAST_RUNTIME=1 \
+        "$bundle/bin/ablac" build "$working/native-build/fast-seed.ab" --fast "$debug" --no-cache -o "$working/native-build/fast-seed"
+done
+shipped_runtimes=("$bundle"/share/abla/fast-runtime-v1/*/record)
+[[ ${#shipped_runtimes[@]} == 2 && -s ${shipped_runtimes[0]} && -s ${shipped_runtimes[1]} ]]
 
 mkdir -p "$(dirname "$output")"
 tar -C "$working" -czf "$output" abla-toolchain-x86_64-linux

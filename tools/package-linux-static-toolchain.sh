@@ -126,6 +126,14 @@ AB
 env -i PATH="$working/native-build" HOME="$working" ABLA_SEED_RELEASE_COLLECTOR=1 \
     "$bundle/bin/ablac" build "$working/native-build/collector-seed.ab" --no-cache -o "$working/native-build/collector-seed"
 [[ -s $bundle/share/abla/release-collector-v1/record ]]
+# The prebuilt runtime of --fast builds (src/toolchain.ab, bootstrapFastRuntimeShip), with debug information (the default) and
+# without: the object a first --fast build in a fresh cache would otherwise compile, in share/abla/fast-runtime-v1.
+for debug in --debug --no-debug; do
+    env -i PATH="$working/native-build" HOME="$working" ABLA_CACHE_DIR="$working/fast-runtime-cache" ABLA_SEED_FAST_RUNTIME=1 \
+        "$bundle/bin/ablac" build "$working/native-build/collector-seed.ab" --fast "$debug" --no-cache -o "$working/native-build/fast-seed"
+done
+shipped_runtimes=("$bundle"/share/abla/fast-runtime-v1/*/record)
+[[ ${#shipped_runtimes[@]} == 2 && -s ${shipped_runtimes[0]} && -s ${shipped_runtimes[1]} ]]
 
 tar -C "$working" -czf "$output" "$name"
 (

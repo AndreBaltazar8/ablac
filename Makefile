@@ -2,6 +2,7 @@ BUILD_DIR := build
 COMPILER := $(BUILD_DIR)/ablac
 COMPILER_PAYLOAD := $(BUILD_DIR)/ablac.bin
 COMPILER_ENTRY := src/orc_main.ab
+FAST_RUNTIME_SEED := $(BUILD_DIR)/.fast-runtime-seeded
 COMPILER_SOURCES := $(shell find src stdlib -name '*.ab' -type f | sort) \
 	tools/value-abi-probe.ab
 
@@ -53,7 +54,14 @@ bootstrap: | $(BUILD_DIR)
 	fi
 	$(install_launcher)
 
-ablac: $(COMPILER)
+ablac: $(COMPILER) $(FAST_RUNTIME_SEED)
+
+# The prebuilt --fast runtime of the compiler in build/ablac.bin, shipped in this tree's toolchain (fast-runtime-v1,
+# tools/seed-fast-runtime.sh), so that a fresh cache does not compile the runtime. Again whenever the compiler is replaced
+# (a CI runner's rebuild of the compiler by itself moves a new build/ablac.bin in before `make test`).
+$(FAST_RUNTIME_SEED): $(COMPILER_PAYLOAD) tools/seed-fast-runtime.sh | $(COMPILER)
+	tools/seed-fast-runtime.sh $(COMPILER)
+	touch $@
 
 # Compiler-development loop: rebuild the current sources with --fast (skips the
 # whole-module O2 pipeline, ~20s instead of ~3min). The result compiles programs

@@ -169,6 +169,23 @@ By hand, `atos -o build/app -l <load address> <address>` (macOS) or
 `addr2line -f -i -e build/app <address less the load address>` (Linux) give the
 same.
 
+On x86-64 Linux the runtime of a `--fast` program is a prebuilt object (the
+toolchain ships it, or the first `--fast` build in a cache compiles it), and its
+debug information names the standard library's files under
+`/abla-toolchain/stdlib` rather than where this toolchain is installed, so that
+the object is the same wherever it was built. `ablac symbolize` puts the
+installed standard library back. A debugger is told once (the standard library
+is `<toolchain>/share/abla/stdlib` in a package, `stdlib` in a source tree):
+
+```sh
+# gdb
+set substitute-path /abla-toolchain/stdlib /path/to/toolchain/share/abla/stdlib
+# lldb
+settings set target.source-map /abla-toolchain/stdlib /path/to/toolchain/share/abla/stdlib
+```
+
+addr2line prints the `/abla-toolchain/stdlib/...` names as they are.
+
 macOS crash reports (`~/Library/Logs/DiagnosticReports`) show the readable
 names for every frame thanks to the frame-pointer chain.
 

@@ -51,8 +51,13 @@ ablac serve app.ab
 Native x86-64 Linux `ablac build --fast` executables use a prebuilt runtime.
 Set `ABLA_FAST_RUNTIME_OBJECT=0` to use the ordinary runtime build. The compiler
 builds and caches the runtime object for the installed compiler, runtime sources
-and build options.
-Editing the runtime selects a new cache entry. `--no-cache` still skips the
+and build options. A Linux toolchain package ships the object for its compiler,
+with debug information and without (`share/abla/fast-runtime-v1`; `make ablac`
+does the same in a source tree), and a cache that has none takes it, checked
+against its digests, instead of compiling the runtime.
+Editing the runtime selects a new cache entry, which the shipped object is not.
+The object's debug information names the standard library under
+`/abla-toolchain/stdlib` (docs/debugging.md). `--no-cache` still skips the
 program cache. Builds with an unavailable runtime cache, compile-time code,
 the background collector, an explicit import of the runtime platform, or
 an OpenSSL ABI module use the regular runtime build. With

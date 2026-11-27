@@ -4752,12 +4752,8 @@ private fun bootstrapFastRuntimePrepare(
     val root = bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
     var identity = "abla-fast-runtime-v1\n${bootstrapRunningImageSize}:${bootstrapRunningImageFirst}:${bootstrapRunningImageSecond}:${bootstrapRunningImageTail}"
     identity = "$identity\n${target.name}:${target.llvmTriple}:${target.objectFormat}:${llvmLibraryVersion()}"
+    // (Not the --path-prefix-map: the object's DWARF names the standard library under a fixed prefix, bootstrapFastRuntimeProduce.)
     identity = "$identity\n${bootstrapFastInlineThreshold()}:${bootstrapLlvmDebugInfo}:${bootstrapLlvmBacktrace}:${bootstrapLlvmOutOfProcess()}:${bootstrapKeepLlvmText()}"
-    if (bootstrapLlvmDebugInfo) {
-        for (prefix in bootstrapLlvmDebugPrefixMap) {
-            identity = "$identity\nprefix:${prefix.size}:$prefix"
-        }
-    }
     if (bootstrapLlvmOutOfProcess() || bootstrapKeepLlvmText()) {
         identity = "$identity\n${bootstrapToolIdentity(bootstrapHostLlvmTool("opt"))}"
         identity = "$identity\n${bootstrapToolIdentity(bootstrapHostLlvmTool("llc"))}"
@@ -4768,8 +4764,13 @@ private fun bootstrapFastRuntimePrepare(
         identity = "$identity\n$relative:${snapshot.size}:${snapshot.firstFingerprint}:${snapshot.secondFingerprint}"
     }
     val key = bootstrapFastRuntimeDigest(identity)
-    bootstrapFastRuntimeCached(target, hostPath, state.acquire(hostPath).source, emitObject,
+    val artifact = bootstrapFastRuntimeCached(target, hostPath, state.acquire(hostPath).source, emitObject,
         Path("${bootstrapCacheDirectory()}/fast-runtime-v1"), key)
+    if (artifact.objectPath != "" && linuxEnvironment("ABLA_SEED_FAST_RUNTIME").value == "1" &&
+        !bootstrapFastRuntimeShip(artifact)) {
+        return BootstrapFastRuntimeArtifact(error = "cannot write the fast runtime into ${bootstrapShippedFastRuntimeDirectory().text}")
+    }
+    artifact
 }
 
 // An entry is immutable after publication. Record the producer's observations
@@ -4795,6 +4796,67 @@ private fun bootstrapFastRuntimeCacheRead(path: Path, key: string, descriptor: i
     }
     BootstrapFastRuntimeArtifact(path.child("runtime.o").text, path.child("host.ab").text,
         key, descriptor = descriptor)
+}
+
+// A toolchain can ship the entries its packager built (ABLA_SEED_FAST_RUNTIME=1, tools/package-linux-*.sh; `make ablac` for a source
+// tree) in <toolchain>/fast-runtime-v1/<key>: the same runtime.o and host.ab as a cache entry, and a record of their digests, which a
+// copy keeps (a cache entry's record is of the files' inodes and change times). A cache that has no entry for the key takes the
+// shipped one, read once and checked against its record, instead of compiling the runtime; the key covers the compiler, the
+// runtime sources and the options, so an edited runtime or another compiler finds none and builds its own.
+val BOOTSTRAP_FAST_RUNTIME_SHIPPED = "abla-fast-runtime-shipped-1"
+val BOOTSTRAP_FAST_RUNTIME_FILE_LIMIT = 67108864
+
+fun bootstrapShippedFastRuntimeDirectory(): Path = Path(bootstrapToolchainRoot()).child("fast-runtime-v1")
+
+private fun bootstrapFastRuntimeShippedRecord(key: string, object: string, source: string): string =
+    "$BOOTSTRAP_FAST_RUNTIME_SHIPPED\n$key\n${bootstrapFastRuntimeDigest(object)}\n${bootstrapFastRuntimeDigest(source)}\n"
+
+// The shipped entry for `key`, published into the cache entry `destination` (under its exclusive lease); false when there is none,
+// or its files do not match its record.
+private fun bootstrapFastRuntimeImportShipped(directory: Path, destination: Path, key: string): bool {
+    val shipped = bootstrapShippedFastRuntimeDirectory().child(key)
+    val expected = shipped.child("record").readText()
+    if (expected == "") return false
+    val object = bootstrapReleaseCollectorFile(shipped.child("runtime.o"), BOOTSTRAP_FAST_RUNTIME_FILE_LIMIT)
+    val source = bootstrapReleaseCollectorFile(shipped.child("host.ab"), BOOTSTRAP_FAST_RUNTIME_FILE_LIMIT)
+    if (object == "" || source == "" || expected != bootstrapFastRuntimeShippedRecord(key, object, source)) {
+        if (bootstrapBuildVerbose) linuxPrintStandardError("note: the shipped fast runtime at ${shipped.text} does not match its record\n")
+        return false
+    }
+    val scratch = directory.child("$key.tmp.${linuxProcessId()}")
+    scratch.removeTree()
+    var published = false
+    if (scratch.createDirectories() && scratch.child("runtime.o").writeText(object) &&
+        scratch.child("host.ab").writeText(source)) {
+        val record = bootstrapFastRuntimeRecord(scratch, key)
+        if (record != "" && scratch.child("record").writeText(record)) {
+            destination.removeTree()
+            published = scratch.moveTo(destination)
+        }
+    }
+    scratch.removeTree()
+    if (published) bootstrapFrontendTraceMemory("fast-runtime.shipped")
+    published
+}
+
+// ABLA_SEED_FAST_RUNTIME=1: the entry this build uses, written into the toolchain for the builds of every cache (a packager's step).
+private fun bootstrapFastRuntimeShip(artifact: BootstrapFastRuntimeArtifact): bool {
+    val object = bootstrapReleaseCollectorFile(Path(artifact.objectPath), BOOTSTRAP_FAST_RUNTIME_FILE_LIMIT)
+    val source = bootstrapReleaseCollectorFile(Path(artifact.sourcePath), BOOTSTRAP_FAST_RUNTIME_FILE_LIMIT)
+    val shipped = bootstrapShippedFastRuntimeDirectory()
+    if (object == "" || source == "" || !shipped.createDirectories()) return false
+    val scratch = shipped.child("${artifact.key}.tmp.${linuxProcessId()}")
+    val destination = shipped.child(artifact.key)
+    scratch.removeTree()
+    var published = false
+    if (scratch.createDirectories() && scratch.child("runtime.o").writeText(object) &&
+        scratch.child("host.ab").writeText(source) &&
+        scratch.child("record").writeText(bootstrapFastRuntimeShippedRecord(artifact.key, object, source))) {
+        destination.removeTree()
+        published = scratch.moveTo(destination)
+    }
+    scratch.removeTree()
+    published
 }
 
 private fun bootstrapFastRuntimeUnavailable(reason: string): BootstrapFastRuntimeArtifact {
@@ -4831,10 +4893,12 @@ private trusted fun bootstrapFastRuntimeCached(
     // Another producer may have published while this build waited.
     val winner = bootstrapFastRuntimeCacheRead(path, key, lock.descriptor)
     if (winner.objectPath == "") {
-        val failure = bootstrapFastRuntimePublish(target, hostPath, original, emitObject, directory, path, key)
-        if (failure != "") {
-            linuxSyscall1(3, lock.descriptor)
-            return BootstrapFastRuntimeArtifact(error = failure)
+        if (!bootstrapFastRuntimeImportShipped(directory, path, key)) {
+            val failure = bootstrapFastRuntimePublish(target, hostPath, original, emitObject, directory, path, key)
+            if (failure != "") {
+                linuxSyscall1(3, lock.descriptor)
+                return BootstrapFastRuntimeArtifact(error = failure)
+            }
         }
         bootstrapFastRuntimeSweep(directory, key)
     }
@@ -4906,6 +4970,7 @@ private fun bootstrapFastRuntimeProduce(
     emitObject: (string, string) -> int,
     scratch: Path
 ): string {
+    bootstrapFrontendTraceMemory("fast-runtime.compile")
     val state = bootstrapModuleState()
     // An empty input supplies a graph root. The producer emits an object
     // without standalone startup, using executable TLS for its final link.
@@ -4929,10 +4994,20 @@ private fun bootstrapFastRuntimeProduce(
     bootstrapUnusedParametersRequested = false
     bootstrapUnusedDeclarationsRequested = false
     bootstrapJsonConstructionRequested = false
+    // The object's DWARF names no program and no machine's paths, so that one built anywhere (a package's, shipped in the toolchain,
+    // or this cache's) is the same bytes: its unit is "<abla>", not the entry of the build that first needed it, and the standard
+    // library's files are under BOOTSTRAP_FAST_RUNTIME_DEBUG_STDLIB, whatever --path-prefix-map the build was given.
+    // `ablac symbolize` maps the prefix back to the installed standard library; a debugger is told to (docs/debugging.md).
+    val debugEntry = bootstrapLlvmDebugEntry
+    val debugPrefixMap = bootstrapLlvmDebugPrefixMap
+    bootstrapLlvmDebugEntry = "<abla>"
+    bootstrapLlvmDebugPrefixMap = [bootstrapFastRuntimeStandardLibraryRoot(), BOOTSTRAP_FAST_RUNTIME_DEBUG_STDLIB]
     val compiled = bootstrapNativeBuildWithEmitterStateCache(
         root, output.text, emitObject, "inprocess-fast", state, bootstrapIrCacheState(),
         false, target, "object", fastRuntimeExports = view.exports
     )
+    bootstrapLlvmDebugEntry = debugEntry
+    bootstrapLlvmDebugPrefixMap = debugPrefixMap
     bootstrapUnusedImportsRequested = unusedImportsRequested
     bootstrapUnusedImportsDeclined = unusedImportsDeclined
     bootstrapUnusedLocalsRequested = unusedLocalsRequested
