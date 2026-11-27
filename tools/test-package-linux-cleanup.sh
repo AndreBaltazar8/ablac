@@ -5,13 +5,6 @@ root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 compiler=${1:-$root/build/ablac.bin}
 compiler=$(realpath "$compiler")
 cd "$root"
-# The packager runs the packaged compiler, which names the generic loader /lib64/ld-linux-x86-64.so.2 (the archive is for any
-# glibc Linux). A NixOS host has only a stub there that refuses to start it, so the test runs where that loader works (CI's
-# Ubuntu runners) and says it was skipped elsewhere.
-if ! /lib64/ld-linux-x86-64.so.2 --version > /dev/null 2>&1; then
-    echo 'package-linux-cleanup: skipped: this host cannot start a generic-Linux dynamic executable (/lib64/ld-linux-x86-64.so.2)'
-    exit 0
-fi
 out="$root/build/package-linux-cleanup-test"
 restore_test_permissions() {
     local status=$?
@@ -42,6 +35,20 @@ exec "$ABLA_TEST_REAL_CLANG" "$@"
 SH
 chmod 0755 "$out/bin/clang"
 export PATH="$out/bin:$PATH" TMPDIR="$out/work"
+# The packager points the packaged compiler at the generic loader /lib64/ld-linux-x86-64.so.2 with the host's C library (the
+# archive is for any glibc Linux), then runs it. This compiler was built against its build shell's glibc: a NixOS host's
+# loader is a stub that refuses it, and an Ubuntu runner's older glibc lacks its symbol versions (master CI 45983612520:
+# "GLIBC_2.44 not found"). What this test judges is the packager's cleanup, so the payload is a script that runs the
+# compiler as built: patchelf and ldd leave a script alone. The packaged launcher puts the bundle's relinked tools first
+# on PATH; the script restores this PATH for the compiler. ABLA_SYSROOT stays the bundle's, so what it writes stays there.
+mkdir -p "$out/payload"
+cat > "$out/payload/ablac.bin" <<'SH'
+#!/usr/bin/env bash
+PATH=$ABLA_TEST_COMPILER_PATH exec "$ABLA_TEST_REAL_COMPILER" "$@"
+SH
+chmod 0755 "$out/payload/ablac.bin"
+export ABLA_TEST_REAL_COMPILER="$compiler" ABLA_TEST_COMPILER_PATH="$PATH"
+compiler=$out/payload/ablac.bin
 tools/package-linux-toolchain.sh "$compiler" "$root" "$out/success.tar.gz"
 test -f "$out/success.tar.gz"
 test -z "$(ls -A "$out/work")"
