@@ -134,7 +134,7 @@ measure() {
     esac
     case $metric in
         jit)
-            sed -n 's/^note\[ct-jit\]: generation 1: .* analysis \([0-9][0-9]*\) ms, lowering \([0-9][0-9]*\) ms, emission \([0-9][0-9]*\) ms, code \([0-9][0-9]*\) ms$/\1 \2 \3 \4/p' "$root/build.err" |
+            sed -n 's/^note\[ct-jit\]: generation 1 CPU: analysis \([0-9][0-9]*\) ms, lowering \([0-9][0-9]*\) ms, emission \([0-9][0-9]*\) ms, code \([0-9][0-9]*\) ms$/\1 \2 \3 \4/p' "$root/build.err" |
                 awk -v shape="$shape" 'NF == 4 {
                     if (shape=="chains") print $2
                     if (shape=="regions") print $4
@@ -146,10 +146,11 @@ measure() {
     esac
 }
 
-# The jit rows are phase times the compiler reports in wall-clock milliseconds, which a busy shared runner inflates at
-# random (release run 45898824396: regions codegen 727 -> 4063 ms, 727 again on a rerun). Each size is measured three times
-# and each phase keeps its minimum: interference only ever adds time, so the minimum is the phase's own cost, and a phase
-# that really grows faster than linearly does so in every repeat.
+# The jit rows are the phase times the compiler reports in CPU milliseconds (its threads and its code generation units'
+# child compilers). Its wall-clock figures were bounded before, and a busy shared runner inflated them at random (release
+# run 45898824396: regions codegen 727 -> 4063 ms, 727 again on a rerun; master run 46017227075: 936 -> 3341 ms even as
+# the minimum of three). CPU time moves much less, and each size is still measured three times with each phase keeping
+# its minimum: interference only adds time, and a phase that really grows faster than linearly does so in every repeat.
 measure_min() {
     local shape=$1 size=$2 repeat value values=()
     for repeat in 1 2 3; do
@@ -177,7 +178,7 @@ check_growth() {
         fail_check "missing measurements for $label"
         return
     fi
-    printf 'compiler scaling: %-31s %s -> %s (bound %sx + %s)\n' "$label" "$small" "$large" "$limit" "$slack"
+    printf 'compiler scaling: %-33s %s -> %s (bound %sx + %s)\n' "$label" "$small" "$large" "$limit" "$slack"
     if ((large > limit * small + slack)); then
         fail_check "$label exceeded its growth bound: $small -> $large, more than ${limit}x + $slack"
     fi
@@ -185,18 +186,18 @@ check_growth() {
 
 small=$(measure_min chains 1024)
 large=$(measure_min chains 2048)
-check_growth 'chains 1024/2048 lowering ms' "$small" "$large" 3 100
+check_growth 'chains 1024/2048 lowering CPU ms' "$small" "$large" 3 100
 
 small=$(measure_min regions 2048)
 large=$(measure_min regions 4096)
-check_growth 'regions 2048/4096 codegen ms' "$small" "$large" 3 100
+check_growth 'regions 2048/4096 codegen CPU ms' "$small" "$large" 3 100
 
 small=$(measure_min when 4096)
 large=$(measure_min when 12288)
 read -r small_front small_code <<< "$small"
 read -r large_front large_code <<< "$large"
-check_growth 'when 4096/12288 frontend ms' "$small_front" "$large_front" 5 100
-check_growth 'when 4096/12288 codegen ms' "$small_code" "$large_code" 5 150
+check_growth 'when 4096/12288 frontend CPU ms' "$small_front" "$large_front" 5 100
+check_growth 'when 4096/12288 codegen CPU ms' "$small_code" "$large_code" 5 150
 
 metric=cpu
 unit='CPU cs'

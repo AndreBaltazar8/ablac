@@ -2720,6 +2720,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     // (The generation's note splits its time here: preparing the slice, which includes the write analysis noted on
     // its own, then analyzing it. One figure from the start counted the write analysis twice in reading.)
     val prepared = linuxMonotonicMilliseconds()
+    val preparedCpu = bootstrapCtCpuMilliseconds()
     val analyzingSlice = bootstrapCtAnalyzingSlice
     val targetsWasm = bootstrapSemanticTargetsWasm
     val wasmUnwinds = bootstrapSemanticWasmUnwinds
@@ -2731,6 +2732,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     bootstrapSemanticTargetsWasm = targetsWasm
     bootstrapSemanticWasmUnwinds = wasmUnwinds
     val analysisDone = linuxMonotonicMilliseconds()
+    val analysisCpu = bootstrapCtCpuMilliseconds()
     if (analyzed.errors > 0) {
         bootstrapCtNote("slice analysis failed:\n${analyzed.diagnostics}")
         bootstrapCtFailReady("slice analysis: ${bootstrapCtFirstLine(analyzed.diagnostics)}")
@@ -2798,6 +2800,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     bootstrapCtLoweringSlice = false
     bootstrapCtRestoreCollectionGrowth()
     val loweringDone = linuxMonotonicMilliseconds()
+    val loweringCpu = bootstrapCtCpuMilliseconds()
     var context = nativeNullPointer()
     var module = nativeNullPointer()
     var failure = ""
@@ -2852,6 +2855,7 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
         return
     }
     val emissionDone = linuxMonotonicMilliseconds()
+    val emissionCpu = bootstrapCtCpuMilliseconds()
     bootstrapCtInstallGuard(context, module, generation)
     if (bootstrapCtSliceWindows()) bootstrapCtWindowsNames(module)
     bootstrapCtSetEnvironment(context, module, bootstrapBuildCompileEffectGrants(
@@ -2962,7 +2966,28 @@ fun bootstrapCtPrepareWith(parsed: BootstrapParseResult, targetTriple: string,
     // so "code" is machine code generation and linking).
     val generationCosts = "generation $generation: ${sliceDeclarations.size} declarations, ${program.functions.size} functions; preparation ${prepared - started} ms (with the write analysis), analysis ${analysisDone - prepared} ms, lowering ${loweringDone - analysisDone} ms, emission ${emissionDone - loweringDone} ms, code ${linuxMonotonicMilliseconds() - emissionDone} ms"
     bootstrapCtNote(generationCosts)
+    // The same phases in CPU time, which a busy machine does not inflate as it does the wall-clock figures above: the
+    // scaling matrix bounds these (tools/test-compiler-scaling-matrix.sh).
+    bootstrapCtNote("generation $generation CPU: analysis ${analysisCpu - preparedCpu} ms, lowering ${loweringCpu - analysisCpu} ms, emission ${emissionCpu - loweringCpu} ms, code ${bootstrapCtCpuMilliseconds() - emissionCpu} ms")
     if (bootstrapCtTimes()) bootstrapCtGenerationCosts.append(generationCosts)
+}
+
+// User and system CPU time, in milliseconds, of this process's threads and of its waited-for children (the code generation
+// units' compilers): getrusage of RUSAGE_SELF (0) and RUSAGE_CHILDREN (-1), each struct rusage starting with two
+// timevals. 0 when it cannot be read: on macOS, whose runtime leaves getrusage untranslated (ENOSYS), the note's CPU
+// figures read 0 and its wall-clock ones remain (tools/darwin-syscalls-untranslated.tsv); the scaling matrix that bounds
+// them runs on Linux. (No libSystem call here: the static libc's getrusage would have to match its signature.)
+trusted fun bootstrapCtCpuMilliseconds(): int {
+    val usage = nativeByteBuffer(144)
+    var microseconds = 0
+    for (who in [0, -1]) {
+        if (linuxSyscall2(98, who, nativePointerAddress(usage.address)) == 0) {
+            microseconds = microseconds + (usage.loadI64(0) + usage.loadI64(16)) * 1000000 +
+                usage.loadI64(8) + usage.loadI64(24)
+        }
+    }
+    usage.close()
+    microseconds / 1000
 }
 
 // A large generation is generated as code generation units (codegen_units.ab), by child compilers at once, and its

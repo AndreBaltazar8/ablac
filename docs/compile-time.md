@@ -1311,6 +1311,10 @@ compile-time evaluation times:
   generation 1: 845 declarations, 327 functions; preparation 34 ms (with the write analysis), analysis 49 ms, lowering 59 ms, emission 57 ms, code 345 ms
 ```
 
+These are wall-clock times. `ABLA_COMPILE_EVAL_TRACE=1` notes each generation's costs too, followed by the same phases in
+CPU time (the compiler's threads and its code generation units' child compilers), which a busy machine inflates much less:
+`note[ct-jit]: generation 1 CPU: analysis 48 ms, lowering 58 ms, emission 56 ms, code 610 ms`.
+
 The action journal (`ABLA_ACTION_JOURNAL`) records evaluated actions only:
 when it is on and `ABLA_COMPILE_EVAL` names no tier, the tier is `interp`.
 
