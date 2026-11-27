@@ -61,11 +61,11 @@ implementation or proof against a compromised shared seed.
 Every test script runs from the suite's recipe (`make test-serial`), a workflow,
 `tests/abla-tests.json` or another script, except the few listed with their
 reasons in [tests-outside-suite.txt](../tools/tests-outside-suite.txt): tests
-that need an AArch64 board, a live network or about a quarter of an hour. Run
-those by hand when their area changes. `tools/test-test-reachability.sh`, a
-suite guard, fails on a test script that has neither a caller nor an entry
-there. Lists that only select from the suite, such as `tools/test-quick.txt`,
-do not count as callers.
+that need an AArch64 board, a live network, a Go module from the local cache or
+about a quarter of an hour. Run those by hand when their area changes.
+`tools/test-test-reachability.sh`, a suite guard, fails on a test script that
+has neither a caller nor an entry there. Lists that only select from the suite,
+such as `tools/test-quick.txt`, do not count as callers.
 
 ## Releases and logs
 
