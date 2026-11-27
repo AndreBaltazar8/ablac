@@ -4,7 +4,9 @@ param(
     [Parameter(Mandatory)][string]$LlvmRoot,
     [Parameter(Mandatory)][string]$BuildDirectory,
     [ValidateSet('interp', 'native')][string]$Tier = 'interp',
-    [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64'
+    [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64',
+    # The C library the self-builds link (build-static-compiler.ps1): abla builds src/orc_windows_main_crtfree.ab.
+    [ValidateSet('msvc', 'abla')][string]$CLibrary = 'msvc'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +30,7 @@ $bundleArchitecture = if ($Architecture -eq 'arm64') { 'aarch64' } else { 'x86_6
 $target = if ($Architecture -eq 'arm64') { 'aarch64-windows' } else { 'x86_64-windows-hosted' }
 $machine = if ($Architecture -eq 'arm64') { 'IMAGE_FILE_MACHINE_ARM64' } else { 'IMAGE_FILE_MACHINE_AMD64' }
 $seed = Join-Path $seedRoot "abla-toolchain-$bundleArchitecture-windows/bin/ablac.exe"
+$entry = if ($CLibrary -eq 'abla') { 'src/orc_windows_main_crtfree.ab' } else { 'src/orc_windows_main.ab' }
 $coff = Join-Path $work 'coff'
 $link = Join-Path $work 'link'
 
@@ -138,7 +141,7 @@ function Build-Stage([string]$Compiler, [string]$Stage) {
     # The program linker generates the COFF inputs, then fails to link the
     # compiler without its CRT and LLVM. The SDK link below supplies both.
     $PSNativeCommandUseErrorActionPreference = $false
-    & $Compiler build src/orc_windows_main.ab --target $target --no-cache -o $output *> $log
+    & $Compiler build $entry --target $target --no-cache -o $output *> $log
     $result = $LASTEXITCODE
     $PSNativeCommandUseErrorActionPreference = $true
     if ($result -ne 1 -or !(Test-Path -LiteralPath $object -PathType Leaf) -or
@@ -153,7 +156,7 @@ function Build-Stage([string]$Compiler, [string]$Stage) {
         throw 'The self-built COFF object does not reference the in-process shim'
     }
     & (Join-Path $PSScriptRoot 'build-static-compiler.ps1') -CompilerObject $object `
-        -ImportDirectory $imports -LlvmRoot $sdk -BuildDirectory $link -Architecture $Architecture
+        -ImportDirectory $imports -LlvmRoot $sdk -BuildDirectory $link -Architecture $Architecture -CLibrary $CLibrary
     $exe = Join-Path $Stage 'ablac.exe'
     Move-Item -LiteralPath (Join-Path $link 'ablac.exe') -Destination $exe
     Check-CompilerImage $exe
@@ -194,7 +197,7 @@ try {
     if ((& $hello | Out-String).Trim() -cne 'hello') { throw 'Stage 3 hello output differs' }
 
     if ($Tier -eq 'native') { Test-NativeSite $compiler 'stage3' }
-    Write-Host "Windows stage2 == stage3 ($Tier)"
+    Write-Host "Windows stage2 == stage3 ($Tier, C library $CLibrary)"
 } finally {
     Pop-Location
 }

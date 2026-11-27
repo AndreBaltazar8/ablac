@@ -314,6 +314,29 @@ objects leaves exactly CI's 157 / 153 undefined names.
   - **The C++ time names** (`_Getdays`, `_Gettnames` and their wide forms) are null, for which libcpmt falls back
     to the C locale's names.
 
+- **Step 7, prepared.** The shipped link takes the C library as a choice: `ABLA_C_LIBRARY` in
+  tools/windows/static-compiler/CMakeLists.txt, `-CLibrary msvc|abla` in build-static-compiler.ps1 and
+  check-compiler-fixpoint.ps1, and `c_library` in the x64 and ARM64 toolchain workflows. With `abla`, ablac.exe is
+  the candidate link: the object of src/orc_windows_main_crtfree.ab, crt-free-start.cpp and libcmt's /GS handler
+  members. `msvc` stays the default, so releases are unchanged.
+
+  .github/workflows/windows-crt-switch.yml (workflow_dispatch) runs the switch criteria. It builds both toolchains on
+  both runners from one commit, and each build's own jobs cover start-up, the release and `--fast` builds with only
+  System32 on `PATH`, and the import and provenance checks. On top of that it runs:
+  - **The /GS check** (tools/windows/check-gs-handler.ps1). MSVC's `cl` compiles static-compiler/gs-probe.cpp, because
+    clang-cl gives no frame `__GSHandlerCheck`. The script checks the object names the handler, then the probe is
+    linked as ablac.exe is, with gs-probe.cpp's `wmain` in place of crt-start.cpp's. An exception dispatched through
+    a frame whose cookie is intact must reach its handler. With the cookie overwritten, the process must end with
+    0xC0000409. The check runs for both C libraries.
+  - **Stage 2 == stage 3** of the `abla` build, natively, with the native compile-time probes: x64 in the workflow's
+    own job, ARM64 in the toolchain workflow's fixpoint job.
+  - **Speed and size** (tools/windows/measure-crt-switch.ps1): cold hello, cold JSON and the self-build's object,
+    alternating between the two compilers. The `abla` build fails when a median is more than 5% slower than the
+    `/MT` build's, or when its ablac.exe or zip is larger.
+
+  The switch itself is the `c_library` default becoming `abla`. It lands after a green run and the lead's go, and
+  today's packages and seed stay until then.
+
 ### Not changed
 
 - `libcpmt` and `libvcruntime` stay. `memcpy`/`memset`/`memchr`/`strchr`/`strstr`/`strrchr`/`wcschr`, exception

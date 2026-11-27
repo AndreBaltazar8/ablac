@@ -5,6 +5,12 @@ param(
     [Parameter(Mandatory)][string]$LlvmRoot,
     [Parameter(Mandatory)][string]$BuildDirectory,
     [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64',
+    # The C library ablac.exe links (docs/design/windows-crt-free-compiler.md, step 7): msvc, the static UCRT and libcmt
+    # (/MT), or abla, Abla's own, which needs the object of src/orc_windows_main_crtfree.ab as -CompilerObject.
+    [ValidateSet('msvc', 'abla')][string]$CLibrary = 'msvc',
+    # Also link the /GS exception-dispatch probe (tools/windows/check-gs-handler.ps1): this object, gs-probe.cpp compiled by
+    # cl, linked as ablac.exe is, to abla-gs-probe.exe in the build directory.
+    [string]$GsProbeObject,
     # Also run the C runtime inventory links (crt-inventory.ps1) after ablac.exe; ablac.exe itself is linked as without it.
     [switch]$CrtInventory,
     # With -CrtInventory: the object of src/orc_windows_main_crtfree.ab and its import libraries, which the ablac-crt-candidate
@@ -24,11 +30,16 @@ $compiler = (Resolve-Path -LiteralPath $CompilerObject).Path
 $imports = (Resolve-Path -LiteralPath $ImportDirectory).Path
 $llvm = (Resolve-Path -LiteralPath $LlvmRoot).Path
 $build = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildDirectory)
-$targetOptions = @()
+$targetOptions = @("-DABLA_C_LIBRARY=$CLibrary")
 $machine = 'IMAGE_FILE_MACHINE_AMD64'
 if ($Architecture -eq 'arm64') {
     $machine = 'IMAGE_FILE_MACHINE_ARM64'
     $targetOptions += '-DCMAKE_CXX_COMPILER_TARGET=aarch64-pc-windows-msvc'
+}
+$targets = @('ablac')
+if ($GsProbeObject) {
+    $targetOptions += "-DABLA_GS_PROBE_OBJECT=$((Resolve-Path -LiteralPath $GsProbeObject).Path)"
+    $targets += 'abla-gs-probe'
 }
 if ($CrtInventory) { $targetOptions += '-DABLA_CRT_INVENTORY=ON' }
 if ($CrtInventory -and $CandidateObject) {
@@ -40,7 +51,7 @@ cmake -G Ninja -S (Join-Path $PSScriptRoot 'static-compiler') -B $build `
     '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CXX_COMPILER=$clang" "-DCMAKE_LINKER=$linker" `
     "-DABLA_COMPILER_OBJECT=$compiler" "-DABLA_IMPORT_DIR=$imports" "-DABLA_LLVM_ROOT=$llvm" `
     "-DABLA_WINDOWS_MACHINE=$Architecture" @targetOptions
-cmake --build $build --target ablac
+cmake --build $build --target @targets
 
 $exe = Join-Path $build 'ablac.exe'
 $readobj = Join-Path $llvm 'bin/llvm-readobj.exe'

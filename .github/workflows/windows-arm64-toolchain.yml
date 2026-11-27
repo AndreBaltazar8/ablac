@@ -9,6 +9,14 @@ on:
       fixpoint_tier:
         type: string
         default: ''
+      c_library:
+        description: The C library ablac.exe links, msvc (/MT) or abla (docs/design/windows-crt-free-compiler.md, step 7)
+        type: string
+        default: msvc
+      gs_check:
+        description: Also link and run the /GS exception-dispatch probe (tools/windows/check-gs-handler.ps1)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -35,12 +43,15 @@ jobs:
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz
       - name: Build the compiler object, import libraries and PE reader
+        # The compiler with Abla's own Windows C library is src/orc_windows_main_crtfree.ab (decision #163).
+        env:
+          ENTRY: ${{ inputs.c_library == 'abla' && 'src/orc_windows_main_crtfree.ab' || 'src/orc_windows_main.ab' }}
         run: |
           nix-shell shell.nix --run '
             set -euo pipefail
             make ablac
             out=build/windows-arm64-coff
-            tools/windows/cross-compiler-object.sh build/ablac src/orc_windows_main.ab "$out" aarch64-windows
+            tools/windows/cross-compiler-object.sh build/ablac "$ENTRY" "$out" aarch64-windows
             llvm-readobj --file-headers "$out/ablac.exe.o" > "$out/machine.txt"
             grep -q "Machine: IMAGE_FILE_MACHINE_ARM64" "$out/machine.txt"
             build/ablac build tools/pe-info/main.ab -o "$out/pe-info" --fast --no-cache
@@ -49,7 +60,7 @@ jobs:
           '
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: windows-arm64-compiler-coff
+          name: windows-arm64-compiler-coff${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: |
             build/windows-arm64-coff/ablac.exe.o
             build/windows-arm64-coff/ablac.exe.imports/
@@ -73,22 +84,31 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
         with:
-          name: windows-arm64-compiler-coff
+          name: windows-arm64-compiler-coff${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: build/windows-arm64-coff
       - name: Install the verified ARM64 SDK
         shell: pwsh
         run: ./tools/windows/install-static-llvm.ps1 -Destination build/llvm-arm64 -Architecture arm64
       - name: Link ablac.exe
         shell: pwsh
+        env:
+          C_LIBRARY: ${{ inputs.c_library }}
+          GS_CHECK: ${{ inputs.gs_check }}
         run: |
+          $probe = @{}
+          if ($env:GS_CHECK -eq 'true') {
+            ./tools/windows/check-gs-handler.ps1 -Compile -Directory build/gs-probe -Architecture arm64
+            $probe = @{ GsProbeObject = 'build/gs-probe/gs-probe.obj' }
+          }
           ./tools/windows/build-static-compiler.ps1 `
             -CompilerObject build/windows-arm64-coff/ablac.exe.o `
             -ImportDirectory build/windows-arm64-coff/ablac.exe.imports `
-            -LlvmRoot build/llvm-arm64 -BuildDirectory build/windows-arm64-compiler -Architecture arm64
+            -LlvmRoot build/llvm-arm64 -BuildDirectory build/windows-arm64-compiler -Architecture arm64 -CLibrary $env:C_LIBRARY @probe
+          if ($env:GS_CHECK -eq 'true') { ./tools/windows/check-gs-handler.ps1 -Probe build/windows-arm64-compiler/abla-gs-probe.exe }
           Copy-Item build/llvm-arm64/bin/llvm-objcopy.exe build/windows-arm64-compiler/llvm-objcopy.exe
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: windows-arm64-compiler
+          name: windows-arm64-compiler${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: |
             build/windows-arm64-compiler/ablac.exe
             build/windows-arm64-compiler/llvm-objcopy.exe
@@ -107,11 +127,11 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
         with:
-          name: windows-arm64-compiler-coff
+          name: windows-arm64-compiler-coff${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: build/windows-arm64-coff
       - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
         with:
-          name: windows-arm64-compiler
+          name: windows-arm64-compiler${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: build/windows-arm64-compiler
       - name: Inspect both ARM64 PE images and build the zip
         run: |
@@ -125,7 +145,7 @@ jobs:
           (cd build/windows-arm64-release && sha256sum ablac-windows-arm64.zip > ablac-windows-arm64.zip.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ablac-windows-arm64-toolchain
+          name: ablac-windows-arm64-toolchain${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: build/windows-arm64-release/
           if-no-files-found: error
 
@@ -141,11 +161,11 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
         with:
-          name: windows-arm64-compiler-coff
+          name: windows-arm64-compiler-coff${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: build/windows-arm64-coff
       - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
         with:
-          name: ablac-windows-arm64-toolchain
+          name: ablac-windows-arm64-toolchain${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: build/windows-arm64-release
       - name: Check the toolchain move against a sharing violation
         shell: pwsh
@@ -173,7 +193,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
         with:
-          name: ablac-windows-arm64-toolchain
+          name: ablac-windows-arm64-toolchain${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: build/windows-arm64-release
       - name: Install the verified ARM64 SDK
         shell: pwsh
@@ -182,15 +202,16 @@ jobs:
         shell: pwsh
         env:
           FIXPOINT_TIER: ${{ inputs.fixpoint_tier }}
+          C_LIBRARY: ${{ inputs.c_library }}
         run: |
           ./tools/windows/check-compiler-fixpoint.ps1 `
             -Archive build/windows-arm64-release/ablac-windows-arm64.zip `
             -LlvmRoot build/llvm-arm64 -BuildDirectory build/windows-arm64-fixpoint `
-            -Architecture arm64 -Tier $env:FIXPOINT_TIER
+            -Architecture arm64 -Tier $env:FIXPOINT_TIER -CLibrary $env:C_LIBRARY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ !cancelled() }}
         with:
-          name: windows-arm64-fixpoint-logs
+          name: windows-arm64-fixpoint-logs${{ inputs.c_library == 'abla' && '-abla' || '' }}
           path: |
             build/windows-arm64-fixpoint/stage*/compile.log
             build/windows-arm64-fixpoint/native-*/compile.log

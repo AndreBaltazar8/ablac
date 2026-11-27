@@ -1,0 +1,137 @@
+# The switch criteria of the Windows compiler without Microsoft's C library (decision #163 B, step 7 of
+# docs/design/windows-crt-free-compiler.md), on the native runners: the toolchain built both ways, x64 and ARM64, from
+# the same commit, and
+#   - each toolchain's own jobs: the link's import check, the package's import and archive provenance checks, and the
+#     exercise with only System32 on the PATH (start-up, release and --fast builds, the moved toolchain);
+#   - the /GS exception-dispatch check (tools/windows/check-gs-handler.ps1) for both C libraries: a corrupted frame
+#     cookie must end the process natively, so the Abla build is no weaker than /MT there;
+#   - stage 2 == stage 3 of the Abla build, natively on x64 and ARM64, with the native compile-time probes;
+#   - speed and size against the /MT build on the same runner (tools/windows/measure-crt-switch.ps1).
+# Nothing here publishes or changes what ships: the release keeps c_library msvc until the switch commit.
+name: Windows C library switch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x64-msvc:
+    uses: ./.github/workflows/windows-x64-toolchain.yml
+    with:
+      source_ref: ${{ github.sha }}
+      c_library: msvc
+      gs_check: true
+
+  x64-abla:
+    uses: ./.github/workflows/windows-x64-toolchain.yml
+    with:
+      source_ref: ${{ github.sha }}
+      c_library: abla
+      gs_check: true
+
+  arm64-msvc:
+    uses: ./.github/workflows/windows-arm64-toolchain.yml
+    with:
+      source_ref: ${{ github.sha }}
+      c_library: msvc
+      gs_check: true
+
+  # The ARM64 workflow's own fixpoint job compares the Abla build's native self-builds.
+  arm64-abla:
+    uses: ./.github/workflows/windows-arm64-toolchain.yml
+    with:
+      source_ref: ${{ github.sha }}
+      c_library: abla
+      gs_check: true
+      fixpoint_tier: native
+
+  x64-abla-fixpoint:
+    name: Compare two native x64 self-builds of the Abla C library compiler
+    needs: x64-abla
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: ablac-windows-toolchain-abla
+          path: build/windows-release
+      - name: Install the verified Windows LLVM SDK
+        shell: pwsh
+        run: ./tools/windows/install-static-llvm.ps1 -Destination build/llvm
+      - name: Compare two native self-builds
+        shell: pwsh
+        run: |
+          ./tools/windows/check-compiler-fixpoint.ps1 `
+            -Archive build/windows-release/abla-toolchain-x86_64-windows.zip `
+            -LlvmRoot build/llvm -BuildDirectory build/windows-fixpoint -Tier native -CLibrary abla
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: windows-fixpoint-logs-abla
+          path: |
+            build/windows-fixpoint/stage*/compile.log
+            build/windows-fixpoint/native-*/compile.log
+          retention-days: 7
+
+  x64-measure:
+    name: Measure the x64 compilers (Abla C library against /MT)
+    needs: [x64-msvc, x64-abla]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: ablac-windows-toolchain
+          path: build/msvc
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: ablac-windows-toolchain-abla
+          path: build/abla
+      - name: Measure cold hello, JSON and self-build, and the sizes
+        shell: pwsh
+        run: |
+          ./tools/windows/measure-crt-switch.ps1 -Baseline build/msvc/abla-toolchain-x86_64-windows.zip `
+            -Candidate build/abla/abla-toolchain-x86_64-windows.zip -Directory build/measure
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: windows-crt-switch-measure-x64
+          path: build/measure/measure.json
+          retention-days: 30
+
+  arm64-measure:
+    name: Measure the ARM64 compilers (Abla C library against /MT)
+    needs: [arm64-msvc, arm64-abla]
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: ablac-windows-arm64-toolchain
+          path: build/msvc
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          name: ablac-windows-arm64-toolchain-abla
+          path: build/abla
+      - name: Measure cold hello, JSON and self-build, and the sizes
+        shell: pwsh
+        run: |
+          ./tools/windows/measure-crt-switch.ps1 -Baseline build/msvc/ablac-windows-arm64.zip `
+            -Candidate build/abla/ablac-windows-arm64.zip -Directory build/measure -Architecture arm64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: windows-crt-switch-measure-arm64
+          path: build/measure/measure.json
+          retention-days: 30
