@@ -2406,7 +2406,8 @@ fun main {
   ```
 
   A label is unrelated to an annotation, which is `@name` before a
-  declaration. A `while (true)` that `break@` its own label can end, so its
+  declaration or, as with `@unroll` below, before a loop and its label.
+  A `while (true)` that `break@` its own label can end, so its
   type is `void`, not `never`.
 - `@unroll(n)` before a loop (on its line or the one above, before any
   label) asks the optimizer to copy its body `n` times per iteration, and
@@ -3007,8 +3008,9 @@ end of input.
 
 ## Annotations
 
-An annotation is `@name` or `@name(argument)` before a declaration. A
-declaration may carry several, each at most once.
+An annotation is `@name` or `@name(argument)` before a declaration (or,
+for `@unroll`, before a loop). A declaration may carry several, each at
+most once.
 
 | Annotation | On | Effect |
 |---|---|---|
@@ -3019,6 +3021,7 @@ declaration may carry several, each at most once.
 | `@naked` | trusted function | emits the body as raw assembly without a prologue ([llvm-backend.md](llvm-backend.md)) |
 | `@kernel` | top-level function | a GPU kernel: checked against the kernel subset and also compiled for CUDA ([GPU kernels](#gpu-kernels)) |
 | `@section("name")` | function | places it in a linker section ([llvm-backend.md](llvm-backend.md)) |
+| `@unroll`, `@unroll(n)` | `for` or `while` loop | asks the optimizer to unroll it fully, or `n` times per iteration, on the CPU and in kernels ([control flow](#control-flow)) |
 | `@wasmImport("module")` | `extern:"c"` declaration | imports it from that Wasm module; `["module", "field"]` also renames it ([toolchain.md](toolchain.md)) |
 | `@hostImport` | `extern:"c"` declaration | the application that loads the shared library defines it: a macOS dylib leaves it undefined (an ELF library leaves any undefined symbol to the loader), and any other symbol the library does not find fails its link |
 
@@ -3146,7 +3149,9 @@ measured on an RTX 4090 against CUDA C:
 - Issue independent loads before their first use, so they are in flight
   together. A loop whose loads each wait on a check, or on the previous
   iteration, waits a full memory latency per load. A loop with a constant trip
-  count (`while (k < 18)`) unrolls, so its loads go out together.
+  count (`while (k < 18)`) unrolls, so its loads go out together;
+  `@unroll(n)` asks for it where the count is not constant
+  ([control flow](#control-flow)).
 - Keep helpers on the hot path branch-free: compute both candidates and choose
   with an `if` value (a select) rather than returning early. An early return
   becomes a real branch, and loads after it cannot be scheduled before it.
