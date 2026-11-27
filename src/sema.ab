@@ -4001,6 +4001,20 @@ fun bootstrapTextContains(text: string, needle: string): bool =
     textFindSequence(text, needle, 0, text.size) >= 0
 
 fun bootstrapCompileBuiltinEffect(name: string): int {
+    // A function of the name only, asked for every call an effect summary walks (five substring searches each were 2% of
+    // a self-build's semantic analysis): remembered per name for the life of the compiler.
+    val known = bootstrapCompileBuiltinEffects.get(name)
+    if (known != null) return known
+    val effect = bootstrapCompileBuiltinEffectOf(name)
+    bootstrapCompileBuiltinEffects.set(name, effect)
+    effect
+}
+
+// bootstrapCompileBuiltinEffect's answers so far, by name.
+var bootstrapCompileBuiltinEffects: Map<string, int> = Map()
+
+/** The compile effect a call of `name` has by its name alone: 2 (the compiler's parser API) or 0. */
+fun bootstrapCompileBuiltinEffectOf(name: string): int {
     var effect = 0
     if (bootstrapTextContains(name, "compiler") ||
         bootstrapTextContains(name, "Parser") ||
@@ -7879,7 +7893,10 @@ fun bootstrapDeclarationsOverload(
 }
 
 // The operator a binary or unary expression may name, or "".
-fun bootstrapOperatorFunctionName(kind: string): string = when (kind) {
+fun bootstrapOperatorFunctionName(kind: string): string =
+    // Most kinds asked are words ("identifier", "member.call"): only one that starts as an operator below can be one, and
+    // the generic comparisons of the `when` were 2% of the pre-semantic passes of a self-build.
+    if (kind.size == 0 || kind.size > 6 || !bootstrapOperatorFunctionStart(kind[0])) "" else when (kind) {
     "+" -> "plus"
     "-" -> "minus"
     "*" -> "times"
@@ -7894,6 +7911,11 @@ fun bootstrapOperatorFunctionName(kind: string): string = when (kind) {
     ">>" -> "shr"
     else -> ""
 }
+
+/** Whether `byte` begins one of bootstrapOperatorFunctionName's operators: + - * / % & | ^ < > or `unary`. */
+fun bootstrapOperatorFunctionStart(byte: int): bool =
+    byte == 43 || byte == 45 || byte == 42 || byte == 47 || byte == 37 || byte == 117 || byte == 38 || byte == 124 ||
+    byte == 94 || byte == 60 || byte == 62
 
 // A function's locals by name: the last local of each name, and for each local
 // the one of its name before it (-1 none), for the first `count` locals.
@@ -8136,8 +8158,21 @@ class BootstrapAnalyzer(
     // sema picks the branch for a built-in from the receiver's type, which is not known afterwards (see bootstrapBuiltinMemberKey).
     val builtinMembers: Map<string, string> = Map(),
     // Whether a function's every result is an object it makes (regionFunctionResultIsFresh): 1 yes, 2 no, 0 while it is decided.
-    val regionFreshResults: Map<string, int> = Map()
+    val regionFreshResults: Map<string, int> = Map(),
+    // functionIndexOf's last question and answer (-2: none yet).
+    var lastFunctionName: string = "",
+    var lastFunctionIndex: int = -2
 ) {
+    /** functionDeclarations.find, remembering the last name: a call asks for its function's parameter count, then each
+     *  parameter's type, then its library, of the same name (hashing it each time was 4% of the analysis of a JSON build). */
+    fun functionIndexOf(name: string): int {
+        if (this.lastFunctionIndex != -2 && this.lastFunctionName == name) return this.lastFunctionIndex
+        val index = this.functionDeclarations.find(name)
+        this.lastFunctionName = name
+        this.lastFunctionIndex = index
+        index
+    }
+
     /** Whether `type` is a class conforming to Transactional (a TVar, or a
      *  library's transactional delegate): reads and writes through it are
      *  its transaction's. */
@@ -8814,7 +8849,7 @@ class BootstrapAnalyzer(
 
     fun contractModuleForFunction(name: string): string {
         var moduleIdentity = ""
-        val index = this.functionDeclarations.find(name)
+        val index = this.functionIndexOf(name)
         if (index >= 0) {
             val declaration = this.declarations[index]
             val prefix = "contract:"
@@ -10237,7 +10272,7 @@ class BootstrapAnalyzer(
     // read through the same declaration tables as ordinary calls; `owner` is
     // "" for a free function.
     fun overloadDeclarationIndex(owner: string, name: string): int =
-        if (owner == "") this.functionDeclarations.find(name)
+        if (owner == "") this.functionIndexOf(name)
         else this.methodDeclarations.find(owner, name)
 
     fun overloadDeclaration(owner: string, index: int): BootstrapDeclaration =
@@ -10493,7 +10528,7 @@ class BootstrapAnalyzer(
 
     /** Whether `name` is the standard library's intrinsic, not a program's function. */
     fun simdIntrinsicDeclared(name: string): bool {
-        val found = this.functionDeclarations.find(name)
+        val found = this.functionIndexOf(name)
         if (found < 0) return false
         val declaration = this.declarations[found]
         declaration.kind == "extern" && declaration.externalLibrary == "intrinsic"
@@ -10652,7 +10687,7 @@ class BootstrapAnalyzer(
 
     fun functionParameterCount(name: string): int {
         var result = -1
-        val index = this.functionDeclarations.find(name)
+        val index = this.functionIndexOf(name)
         if (index >= 0) {
             result = this.declarations[index].parameters.size
         }
@@ -10662,7 +10697,7 @@ class BootstrapAnalyzer(
     /** Whether `name` is the compiler's own API (`extern:"compiler"` or
      *  `extern:"parser"`), which exists only while the program compiles. */
     fun functionIsCompilerApi(name: string): bool {
-        val index = this.functionDeclarations.find(name)
+        val index = this.functionIndexOf(name)
         if (index < 0) return false
         val declaration = this.declarations[index]
         declaration.kind == "extern" &&
@@ -10671,7 +10706,7 @@ class BootstrapAnalyzer(
 
     fun functionRequiresTrust(name: string): bool {
         var requiresTrust = false
-        val index = this.functionDeclarations.find(name)
+        val index = this.functionIndexOf(name)
         if (index >= 0) {
             val declaration = this.declarations[index]
             if (declaration.kind == "extern" &&
@@ -10684,7 +10719,7 @@ class BootstrapAnalyzer(
 
     // The `@__abla_trusted_only` spec (#1226) of the function, extern or class `name` resolves to, "" when it has none.
     fun trustedOnlySpec(name: string): string {
-        val function = this.functionDeclarations.find(name)
+        val function = this.functionIndexOf(name)
         if (function >= 0) return bootstrapTrustedOnlySpec(this.declarations[function])
         val type = this.typeDeclarations.find(name)
         if (type >= 0) return bootstrapTrustedOnlySpec(this.declarations[type])
@@ -10718,7 +10753,7 @@ class BootstrapAnalyzer(
 
     fun functionExternalLibrary(name: string): string {
         var library = ""
-        val index = this.functionDeclarations.find(name)
+        val index = this.functionIndexOf(name)
         if (index >= 0 && this.declarations[index].kind == "extern") {
             library = this.declarations[index].externalLibrary
         }
@@ -10727,7 +10762,7 @@ class BootstrapAnalyzer(
 
     fun functionIsNoEscape(name: string): bool {
         var noEscape = false
-        val index = this.functionDeclarations.find(name)
+        val index = this.functionIndexOf(name)
         if (index >= 0 && this.declarations[index].kind == "extern") {
             noEscape = this.declarations[index].isNoEscape
         }
@@ -11210,7 +11245,7 @@ class BootstrapAnalyzer(
             fresh = bootstrapIsBorrowType(declared) && !bootstrapIsBorrowType(result)
         }
         if (!fresh && expression.kind == "call" && depth < 32) {
-            val declaration = this.functionDeclarations.find(
+            val declaration = this.functionIndexOf(
                 expression.text
             )
             if (declaration >= 0) {
@@ -11622,7 +11657,7 @@ class BootstrapAnalyzer(
 
     fun functionRequiredParameterCount(name: string): int {
         var result = -1
-        val index = this.functionDeclarations.find(name)
+        val index = this.functionIndexOf(name)
         if (index >= 0) {
             val declaration = this.declarations[index]
             result = 0
@@ -11641,7 +11676,7 @@ class BootstrapAnalyzer(
 
     fun functionParameterType(name: string, parameter: int): string {
         var result = "unknown"
-        val index = this.functionDeclarations.find(name)
+        val index = this.functionIndexOf(name)
         if (index >= 0) {
             val declaration = this.declarations[index]
             if (parameter < declaration.parameterTypes.size) {
@@ -11655,7 +11690,7 @@ class BootstrapAnalyzer(
 
     fun functionParameterKind(name: string, parameter: int): string {
         var result = "parameter"
-        val index = this.functionDeclarations.find(name)
+        val index = this.functionIndexOf(name)
         if (index >= 0) {
             val declaration = this.declarations[index]
             if (parameter < declaration.parameterKinds.size) {
@@ -11778,7 +11813,7 @@ class BootstrapAnalyzer(
     }
 
     fun topLevelFunctionHandle(name: string): int {
-        this.functionDeclarations.find(name)
+        this.functionIndexOf(name)
     }
 
     fun selectedMethodHandle(owner: string, name: string): int {
