@@ -152,7 +152,8 @@ fun bootstrapAnalysisPlainBodyChange(parsed: BootstrapParseResult, change: Boots
     false
 }
 
-// `records`: the project's classes whose fields the body reads (bootstrapAnalysisScalarRecord), as prepared.
+// `records`: the project's classes whose fields the body reads (bootstrapAnalysisScalarRecord) and the document's global values it reads
+// (bootstrapAnalysisScalarGlobal).
 class BootstrapAnalysisScalarEdit(val splice: BootstrapAnalysisBodyInsert, val declaration: int, val callees: array<int>,
     val records: array<BootstrapDeclaration> = [])
 
@@ -162,13 +163,15 @@ fun bootstrapAnalysisScalarType(type: string): bool =
 // No global reads. Direct calls, when admitted, still need a separate proof
 // for their complete lookup bucket and the callee's checking interface.
 // `strings` are the names of string parameters: read only through `.size` and a byte index. `members` are the scalar fields of class
-// parameters, as `p.x`.
+// parameters, as `p.x`, and the global values it may read, as `global:name`.
 fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameters: array<string>, depth: int, calls: bool,
     strings: array<string> = [], members: array<string> = []): bool {
     if (depth > 24) return false
     val kind = expression.kind
     if (kind == "identifier") {
         for (name in parameters) if (name == expression.text) return true
+        // A global value of the document (bootstrapAnalysisScalarGlobal), listed as `global:name`.
+        for (member in members) if (member == "global:${expression.text}") return true
         return false
     }
     if (kind == "integer" || kind == "float" || kind == "true" || kind == "false") return true
@@ -225,7 +228,7 @@ fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameter
 }
 
 fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration, calls: bool = false,
-    classes: Map<string, BootstrapDeclaration> = Map()): bool {
+    classes: Map<string, BootstrapDeclaration> = Map(), globals: Map<string, BootstrapDeclaration> = Map()): bool {
     if (declaration.kind != "fun" || !bootstrapAnalysisScalarType(declaration.resultType) ||
         declaration.isTrusted || declaration.isResource || declaration.isNoEscape ||
         declaration.annotations.size != 0 || declaration.typeParameters.size != 0 ||
@@ -252,6 +255,12 @@ fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration, calls: bo
                 if (bootstrapAnalysisScalarMethod(record, method)) members.append("$name.${method.name}(${method.parameters.size}")
             }
         } else return false
+    }
+    // The global values it names.
+    if (globals.size > 0) {
+        val names: Map<string, int> = Map()
+        bootstrapAnalysisScalarIdentifierNames(declaration.expression, names)
+        for (name in names.keys()) if (globals.has(name)) members.append("global:$name")
     }
     for (kind in declaration.parameterKinds) if (kind != "parameter") return false
     for (defaultValue in declaration.parameterDefaults) if (defaultValue.kind != "missing") return false
@@ -289,7 +298,8 @@ fun bootstrapAnalysisScalarRecord(declaration: BootstrapDeclaration): bool {
         val kind = declaration.parameterKinds[index]
         val type = declaration.parameterTypes[index]
         val value = declaration.parameterDefaults[index]
-        if (kind != "val" && kind != "var") return false
+        // A delegated property is rewritten into other declarations (delegated_properties.ab).
+        if ((kind != "val" && kind != "var") || value.kind == "delegate.initializer") return false
         // A field of another type is never read; the checker is given it as an `int` without a default (bootstrapAnalysisScalarRecordView).
         if ((bootstrapAnalysisScalarType(type) || type == "string") && value.kind != "missing" &&
             !bootstrapAnalysisScalarExpression(value, [], 0, false) &&
@@ -299,6 +309,27 @@ fun bootstrapAnalysisScalarRecord(declaration: BootstrapDeclaration): bool {
     true
 }
 
+/** Whether `declaration` is a global value a checked body may read: a plain top-level `val` or `var` of a written scalar type, or of an
+ *  inferred one with a literal initializer. The checker is given it with a placeholder initializer (bootstrapAnalysisCheckScalarBody). */
+fun bootstrapAnalysisScalarGlobal(declaration: BootstrapDeclaration): bool {
+    if ((declaration.kind != "val" && declaration.kind != "var") || declaration.extensionOwner != "" ||
+        declaration.annotations.size != 0 || declaration.typeParameters.size != 0 || declaration.isTrusted ||
+        declaration.isResource || declaration.isNoEscape || declaration.externalLibrary != "" ||
+        declaration.generatedNamespace != "" || declaration.name.startsWith("__abla_")) return false
+    val value = declaration.expression
+    if (value.kind == "delegate.initializer") return false
+    if (bootstrapAnalysisScalarType(declaration.resultType)) return true
+    declaration.resultType == "inferred" && value.children.size == 0 &&
+        (value.kind == "integer" || value.kind == "float" || value.kind == "true" || value.kind == "false")
+}
+
+/** The identifiers `expression` reads. */
+fun bootstrapAnalysisScalarIdentifierNames(expression: BootstrapExpression, var names: Map<string, int>): void {
+    if (expression.kind == "identifier") names.set(expression.text, 0)
+    for (child in expression.children) bootstrapAnalysisScalarIdentifierNames(child, names)
+    return
+}
+
 fun bootstrapAnalysisScalarCallNames(expression: BootstrapExpression, var names: Map<string, int>): void {
     if (expression.kind == "call") names.set(expression.text, 0)
     for (child in expression.children) bootstrapAnalysisScalarCallNames(child, names)
@@ -306,8 +337,8 @@ fun bootstrapAnalysisScalarCallNames(expression: BootstrapExpression, var names:
 }
 
 fun bootstrapAnalysisScalarInterfaceMatches(surface: BootstrapDeclaration, prepared: BootstrapDeclaration, calls: bool,
-    classes: Map<string, BootstrapDeclaration> = Map()): bool =
-    bootstrapAnalysisScalarFunction(prepared, calls, classes) && surface.sourceIdentity == prepared.sourceIdentity &&
+    classes: Map<string, BootstrapDeclaration> = Map(), globals: Map<string, BootstrapDeclaration> = Map()): bool =
+    bootstrapAnalysisScalarFunction(prepared, calls, classes, globals) && surface.sourceIdentity == prepared.sourceIdentity &&
     surface.resultType == prepared.resultType &&
     bootstrapAnalysisReplayStrings(surface.parameters, prepared.parameters) &&
     bootstrapAnalysisReplayStrings(surface.parameterTypes, prepared.parameterTypes) &&
@@ -363,13 +394,21 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
     // text outside the edited body is the same before and after, so their fields are the same now. Each is the only top-level declaration
     // of its name in the project.
     val classes: Map<string, BootstrapDeclaration> = Map()
-    val classNames: Map<string, int> = Map()
+    val names: Map<string, int> = Map()
     for (candidate in project.declarations) {
         if (candidate.extensionOwner != "") continue
-        classNames.set(candidate.name, (classNames.get(candidate.name) ?? 0) + 1)
+        // By source name: a module-private declaration is prepared as `__abla_module_<hex>__name`.
+        val name = bootstrapCanonicalDeclarationSourceName(candidate.name)
+        names.set(name, (names.get(name) ?? 0) + 1)
         if (bootstrapAnalysisScalarRecord(candidate)) classes.set(candidate.name, candidate)
     }
-    for (name in classes.keys()) if ((classNames.get(name) ?? 0) != 1) classes.remove(name)
+    for (name in classes.keys()) if ((names.get(name) ?? 0) != 1) classes.remove(name)
+    // The document's global values a checked body may read, as parsed now (their offsets, after the edited body, have moved), each the
+    // only top-level declaration of its name in the project. Another module's would need its import, which the body's reads keep used.
+    val globals: Map<string, BootstrapDeclaration> = Map()
+    for (candidate in parsed.declarations) {
+        if (bootstrapAnalysisScalarGlobal(candidate) && (names.get(candidate.name) ?? 0) == 1) globals.set(candidate.name, candidate)
+    }
     for (index in 0 until parsed.declarations.size) {
         val declaration = parsed.declarations[index]
         val body = declaration.expression
@@ -379,10 +418,10 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
         if (changed < start || changed >= end || end - start > 1024 ||
             oldEnd <= start || oldEnd > before.size || oldEnd - start > 1024 ||
             before.slice(oldEnd, before.size) != after.slice(end, after.size) ||
-            !bootstrapAnalysisScalarFunction(declaration, true, classes)) continue
+            !bootstrapAnalysisScalarFunction(declaration, true, classes, globals)) continue
         val old = bootstrapParseWithIdentity(before.slice(declaration.begin, oldEnd), declaration.sourceIdentity)
         if (old.errors != 0 || old.extensionErrors != 0 || old.declarations.size != 1 ||
-            !bootstrapAnalysisScalarFunction(old.declarations[0], true, classes) ||
+            !bootstrapAnalysisScalarFunction(old.declarations[0], true, classes, globals) ||
             bootstrapAnalysisBodyStart(before.slice(declaration.begin, oldEnd), old.declarations[0].expression.begin) != start - declaration.begin ||
             bootstrapAnalysisBodyEnd(before.slice(declaration.begin, oldEnd), start - declaration.begin,
                 old.declarations[0].expression.end) != oldEnd - declaration.begin) return null
@@ -423,7 +462,7 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
             }
         }
         val own = candidates.get(declaration.name) ?? 0
-        if (own == 0 || !bootstrapAnalysisScalarInterfaceMatches(declaration, project.declarations[own - 1], true, classes)) return null
+        if (own == 0 || !bootstrapAnalysisScalarInterfaceMatches(declaration, project.declarations[own - 1], true, classes, globals)) return null
         // Only a same-module, call-free scalar function can be reused as a
         // signature. It has no outgoing lookup, imported use or global effect.
         val callees: array<int> = []
@@ -458,6 +497,13 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
                 break
             }
             if (!found) return null
+        }
+        // The global values it reads.
+        val read: Map<string, int> = Map()
+        bootstrapAnalysisScalarIdentifierNames(body, read)
+        for (name in read.keys()) {
+            val global = globals.get(name)
+            if (global != null) records.append(global)
         }
         return BootstrapAnalysisScalarEdit(splice, index, callees, records)
     }
@@ -711,7 +757,8 @@ fun bootstrapAnalysisScalarBody(body: BootstrapExpression, scope: array<string>,
     true
 }
 
-/** Whether a local may be named `name`: no parameter, local or loop variable in scope has that name, nor a class parameter. */
+/** Whether a local may be named `name`: no parameter, local or loop variable in scope has that name, nor a class parameter. A global
+ *  value of that name is shadowed where the local is in scope, as the identifier lookup has it (scope first). */
 fun bootstrapAnalysisScalarNewName(name: string, scope: array<string>, strings: array<string>, members: array<string>): bool {
     for (other in scope) if (other == name) return false
     for (other in strings) if (other == name) return false
