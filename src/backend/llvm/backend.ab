@@ -27,6 +27,7 @@ import "functions.ab"
 import "runtime.ab"
 import "../../eval.ab"
 import "abla/llvm/aot"
+import "abla/llvm/orc"
 import "abla/unsafe/memory"
 import "bindings.ab"
 import "dispatch.ab"
@@ -1296,6 +1297,144 @@ fun bootstrapValgrindStrip(expression: BootstrapExpression): BootstrapExpression
     BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
 }
 
+// Whether the compiler itself runs on macOS (its own build's target).
+private noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
+
+/** The host intrinsics `ablaHostIsMacOS()`, `ablaHostIsIOS()` and `ablaHostOwnsRuntime()` as this build may fold them before the
+ *  analysis: "" for one it leaves alone, else "true" or "false" (`[macOS, iOS, ownsRuntime]`). They are constants of the target
+ *  (functions.ab lowers them so), but compile-time code reads them too, as the compiler's host (ct_native.ab, and a CT JIT
+ *  slice built for the host's triple from these same declarations), so one is folded only where the target's value is the
+ *  host's: an x86-64 Linux target on an x86-64 Linux host (false, false, true) and a macOS target on a macOS host (true,
+ *  false, false). A cross build, or another host, folds nothing (#811, compile speed). */
+fun bootstrapHostFoldValues(targetTriple: string): array<string> {
+    val none = ["", "", ""]
+    val hostMacOS = ablaHostIsMacOS()
+    if (linuxHostIsWindows()) return none
+    val targetLinuxX64 = targetTriple.startsWith("x86_64-") && bootstrapTextContains(targetTriple, "linux") &&
+        !bootstrapTextContains(targetTriple, "android")
+    val targetMacOS = (bootstrapTextContains(targetTriple, "apple-macos") || bootstrapTextContains(targetTriple, "apple-darwin")) &&
+        !bootstrapTextContains(targetTriple, "apple-ios")
+    if (targetMacOS && hostMacOS) return ["true", "false", "false"]
+    if (targetLinuxX64 && !hostMacOS && bootstrapHostFoldLinuxX64()) return ["false", "false", "true"]
+    none
+}
+
+// bootstrapHostFoldLinuxX64's answer: 0 not asked yet, 1 yes, 2 no.
+var bootstrapHostFoldLinuxX64Known: int = 0
+
+/** Whether the compiler runs on x86-64 Linux (asked once: LLVM's default triple is the host's). */
+fun bootstrapHostFoldLinuxX64(): bool {
+    if (bootstrapHostFoldLinuxX64Known == 0) {
+        val triple = llvmDefaultTargetTriple()
+        bootstrapHostFoldLinuxX64Known = if (triple.startsWith("x86_64-") && bootstrapTextContains(triple, "linux")) 1 else 2
+    }
+    bootstrapHostFoldLinuxX64Known == 1
+}
+
+/** `parsed` with the host intrinsics folded where bootstrapHostFoldValues says, in the files that declare them as intrinsics
+ *  (the runtime's and the standard library's: a program's own function of that name is not one): each call becomes its
+ *  literal, `!`, `&&` and `||` over literals reduce, and an `if` on a literal keeps the branch it takes (the `else`, or an
+ *  empty block when it has none; a taken `then` without an `else` stays an `if (true)`). The other branch is then neither
+ *  analysed nor demanded nor lowered: on Linux the runtime's macOS and libc paths, which LLVM folded away only after the
+ *  front end had checked and lowered them. */
+fun bootstrapHostFoldParse(parsed: BootstrapParseResult, targetTriple: string): BootstrapParseResult {
+    val values = bootstrapHostFoldValues(targetTriple)
+    if (values[0] == "" && values[1] == "" && values[2] == "") return parsed
+    // The files whose declarations name the intrinsics: an extern:"intrinsic" declaration of one of the three.
+    val files: Map<string, bool> = Map()
+    for (declaration in parsed.declarations) {
+        if (declaration.externalLibrary == "intrinsic" && bootstrapHostFoldIndex(declaration.name) >= 0) {
+            files.set(declaration.sourceIdentity, true)
+        }
+    }
+    if (files.size == 0) return parsed
+    var changed = false
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) {
+        if (declaration.kind == "fun" && files.has(declaration.sourceIdentity) &&
+            bootstrapHostFoldNames(declaration.expression, values)) {
+            declarations.append(bootstrapDeclarationWithExpression(declaration,
+                bootstrapHostFold(declaration.expression, values)))
+            changed = true
+        } else declarations.append(declaration)
+    }
+    if (!changed) return parsed
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics,
+        parsed.declarationEdits, parsed.stackDepthStoppedSources, parsed.subparserSpans, parsed.subparserUses,
+        parsed.actionSources
+    )
+}
+
+/** The index in bootstrapHostFoldValues of the intrinsic `name`, or -1. A private declaration and its calls carry its
+ *  module's prefix by now (`__abla_module_<hex of the path>__ablaHostIsMacOS`), as every file declares these privately. */
+fun bootstrapHostFoldIndex(name: string): int {
+    if (!bootstrapTextContains(name, "ablaHost")) return -1
+    var plain = name
+    if (name.startsWith("__abla_module_")) {
+        var index = name.size - 2
+        while (index > 14 && !(name[index] == 95 && name[index + 1] == 95)) index = index - 1
+        if (index <= 14) return -1
+        plain = name.slice(index + 2, name.size)
+    }
+    if (plain == "ablaHostIsMacOS") 0 else if (plain == "ablaHostIsIOS") 1 else if (plain == "ablaHostOwnsRuntime") 2 else -1
+}
+
+/** The literal `expression` folds to ("true", "false"), or "" when it is not a folded call of an intrinsic. */
+fun bootstrapHostFoldCall(expression: BootstrapExpression, values: array<string>): string {
+    if (expression.kind != "call" || expression.children.size != 0) return ""
+    val index = bootstrapHostFoldIndex(expression.text)
+    if (index < 0) "" else values[index]
+}
+
+/** Whether `expression` calls a folded intrinsic anywhere. */
+fun bootstrapHostFoldNames(expression: BootstrapExpression, values: array<string>): bool {
+    if (bootstrapHostFoldCall(expression, values) != "") return true
+    for (child in expression.children) if (bootstrapHostFoldNames(child, values)) return true
+    false
+}
+
+/** A literal `true` or `false` where `at` was. */
+fun bootstrapHostFoldLiteral(value: bool, at: BootstrapExpression): BootstrapExpression {
+    val text = if (value) "true" else "false"
+    BootstrapExpression(text, text, at.begin, at.end, [])
+}
+
+/** `expression` with the folded intrinsics replaced and what they decide reduced (bootstrapHostFoldParse). */
+fun bootstrapHostFold(expression: BootstrapExpression, values: array<string>): BootstrapExpression {
+    val literal = bootstrapHostFoldCall(expression, values)
+    if (literal != "") return bootstrapHostFoldLiteral(literal == "true", expression)
+    if (!bootstrapHostFoldNames(expression, values)) return expression
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapHostFold(child, values))
+    if (expression.kind == "unary!" && children.size == 1 &&
+        (children[0].kind == "true" || children[0].kind == "false")) {
+        return bootstrapHostFoldLiteral(children[0].kind == "false", expression)
+    }
+    if ((expression.kind == "&&" || expression.kind == "||") && expression.text == expression.kind && children.size == 2) {
+        val left = children[0]
+        val right = children[1]
+        val and = expression.kind == "&&"
+        // The left side decides alone: false && y, true || y.
+        if (left.kind == (if (and) "false" else "true")) return left
+        // The left side is the identity: true && y, false || y.
+        if (left.kind == (if (and) "true" else "false")) return right
+        // x && true, x || false: x (x is evaluated either way).
+        if (right.kind == (if (and) "true" else "false")) return left
+    }
+    if (expression.kind == "if" && expression.text == "" && children.size == 3) {
+        val test = children[0]
+        if (test.kind == "false") {
+            val alternative = children[2]
+            return if (alternative.kind == "missing") BootstrapExpression("block", "", expression.begin, expression.end, [])
+                else alternative
+        }
+        if (test.kind == "true" && children[2].kind != "missing") return children[1]
+    }
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
 // Rounds of lowering that commit compile-time code's edits, at most.
 val BOOTSTRAP_COMPILE_EDIT_ROUNDS = 8
 
@@ -1406,7 +1545,9 @@ private @noinline fun bootstrapPrepareLlvmCompilation(
     }
     // (Not for a program that runs code at compile time: a fallback would run it twice.)
     // A build that is not for valgrind loses the runtime's valgrind requests here, before the prune and the analysis see them.
-    val unguarded = if (bootstrapLlvmValgrind) written else bootstrapValgrindStripParse(written)
+    // And the host intrinsics are folded for the target where its host agrees (bootstrapHostFoldParse).
+    val unguarded = bootstrapHostFoldParse(
+        if (bootstrapLlvmValgrind) written else bootstrapValgrindStripParse(written), targetTriple)
     var prunedWritten = unguarded
     bootstrapRuntimePruned = false
     bootstrapRuntimeHint = []

@@ -677,6 +677,7 @@ test-serial: ablac
 	tools/test-valgrind.sh $(COMPILER)
 	tools/test-gc-threads.sh $(COMPILER)
 	tools/test-x64-library.sh $(COMPILER)
+	tools/test-host-fold.sh $(COMPILER)
 	tools/test-android-rpc-example.sh $(COMPILER)
 	tools/test-hot-reload.sh $(COMPILER)
 	tools/test-orc-session.sh $(COMPILER)
