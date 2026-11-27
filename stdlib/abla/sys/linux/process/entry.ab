@@ -1015,15 +1015,198 @@ fun linuxMonotonicClock(): LinuxMonotonicClock = LinuxMonotonicClock(
 // capability policy remains the compiler evaluator's responsibility.
 fun linuxMonotonicNanoseconds(): int = linuxClockNanosecondsOnStack(1)
 
+private noescape extern:"intrinsic" fun ablaUnsafeCallAddressPointerPointer(address: int, first: i64*, second: i64*): int
+
+// The vDSO's clock_gettime once looked up, in one static 64-bit word: 0 not yet, -1 none (the system call is used), else its
+// address. Not a `var`, which a thread could not reach (as linuxHostWindowsCell). Every thread finds the same answer, so a race
+// only looks it up twice.
+private trusted fun linuxClockVdsoCell(): i64* = nativePointerFromAddress(nativeStaticAllocate(8))
+
+/** The address of the kernel's vDSO clock_gettime (__vdso_clock_gettime at LINUX_2.6 on x86-64, __kernel_clock_gettime at
+ *  LINUX_2.6.39 on AArch64), or 0 where there is none to use: at compile time (the evaluator and the compile-time JIT read
+ *  the clock by the system call), in a program that does not own its start (the auxiliary vector is found after the
+ *  environment only then), on other targets, and where the kernel maps no vDSO or it lacks the symbol (seccomp sandboxes,
+ *  qemu-user). Looked up once. */
+trusted fun linuxClockVdsoAddress(): int {
+    if (ablaAtCompileTime()) return 0
+    val cell = linuxClockVdsoCell()
+    var known = ablaUnsafeLoadI64(cell)
+    if (known == 0) {
+        known = linuxVdsoLookup()
+        if (known == 0) known = -1
+        ablaUnsafeStoreI64(cell, known)
+    }
+    if (known > 0) known else 0
+}
+
+// The vDSO image from the auxiliary vector's AT_SYSINFO_EHDR (33), then its clock_gettime: 0 when either is missing.
+private trusted fun linuxVdsoLookup(): int {
+    val arch = ablaSimdTargetArch()
+    if ((arch != 1 && arch != 2) || ablaHostIsMacOS() || ablaHostIsIOS() || !ablaHostOwnsRuntime() || linuxHostIsWindows()) return 0
+    var cursor = nativePointerAddress(ablaLinuxEnvironmentPointer())
+    if (cursor == 0) return 0
+    while (linuxLoadI64(cursor) != 0) cursor = cursor + 8
+    cursor = cursor + 8
+    var base = 0
+    var type = linuxLoadI64(cursor)
+    while (type != 0) {
+        if (type == 33) base = linuxLoadI64(cursor + 8)
+        cursor = cursor + 16
+        type = linuxLoadI64(cursor)
+    }
+    if (base == 0 || (base & 4095) != 0) return 0
+    if (arch == 1) linuxVdsoSymbol(base, "__vdso_clock_gettime", "LINUX_2.6")
+    else linuxVdsoSymbol(base, "__kernel_clock_gettime", "LINUX_2.6.39")
+}
+
+private trusted fun linuxLoadI64(address: int): int = ablaUnsafeLoadI64(nativePointerFromAddress(address))
+private trusted fun linuxLoadU32(address: int): int = ablaUnsafeLoadU32(nativePointerFromAddress(address))
+private trusted fun linuxLoadU16(address: int): int = ablaUnsafeLoadU16(nativePointerFromAddress(address))
+private trusted fun linuxLoadU8(address: int): int = ablaUnsafeLoadU8(nativePointerFromAddress(address))
+
+// Whether the NUL-terminated string at `address` is `name` (the vDSO's string table: names of a few dozen bytes).
+private trusted fun linuxVdsoNameIs(address: int, name: string): bool {
+    var index = 0
+    while (index < name.size) {
+        if (linuxLoadU8(address + index) != name[index]) return false
+        index = index + 1
+    }
+    linuxLoadU8(address + index) == 0
+}
+
+/** The address of the function `name` at version `version` in the vDSO image at `base` (a 64-bit ELF shared object the
+ *  kernel maps), as the kernel's own parse_vdso.c finds it: the load bias from the first PT_LOAD, the dynamic section's
+ *  symbol, string, hash and version tables, then a defined global or weak function of that name whose version (when the
+ *  image has versions) is `version`. 0 when the image is not what is expected or has no such function. */
+private trusted fun linuxVdsoSymbol(base: int, name: string, version: string): int {
+    // ELF magic, ELFCLASS64, little endian, ET_DYN.
+    if (linuxLoadU32(base) != 1179403647 || linuxLoadU8(base + 4) != 2 || linuxLoadU8(base + 5) != 1 ||
+        linuxLoadU16(base + 16) != 3) return 0
+    val programHeaders = base + linuxLoadI64(base + 32)
+    val entrySize = linuxLoadU16(base + 54)
+    val count = linuxLoadU16(base + 56)
+    if (entrySize < 56 || count == 0 || count > 64) return 0
+    var bias = 0
+    var biasKnown = false
+    var dynamic = 0
+    var index = 0
+    while (index < count) {
+        val header = programHeaders + index * entrySize
+        val kind = linuxLoadU32(header)
+        if (kind == 1 && !biasKnown) {
+            // PT_LOAD: where the image's addresses land (p_offset - p_vaddr from the base).
+            bias = base + linuxLoadI64(header + 8) - linuxLoadI64(header + 16)
+            biasKnown = true
+        } else if (kind == 2) dynamic = linuxLoadI64(header + 16)
+        index = index + 1
+    }
+    if (!biasKnown || dynamic == 0) return 0
+    var symbols = 0
+    var strings = 0
+    var hash = 0
+    var gnuHash = 0
+    var versions = 0
+    var definitions = 0
+    var entry = bias + dynamic
+    var tag = linuxLoadI64(entry)
+    var guard = 0
+    while (tag != 0 && guard < 256) {
+        val value = linuxLoadI64(entry + 8)
+        if (tag == 6) symbols = bias + value
+        else if (tag == 5) strings = bias + value
+        else if (tag == 4) hash = bias + value
+        else if (tag == 1879047925) gnuHash = bias + value
+        else if (tag == 1879048176) versions = bias + value
+        else if (tag == 1879048188) definitions = bias + value
+        entry = entry + 16
+        tag = linuxLoadI64(entry)
+        guard = guard + 1
+    }
+    if (symbols == 0 || strings == 0) return 0
+    val symbolCount = if (hash != 0) linuxLoadU32(hash + 4) else if (gnuHash != 0) linuxVdsoGnuHashCount(gnuHash) else 0
+    if (symbolCount <= 0 || symbolCount > 4096) return 0
+    // Without version tables any version is taken, as parse_vdso.c does.
+    val versionIndex = if (versions != 0 && definitions != 0) linuxVdsoVersionIndex(definitions, strings, version) else -1
+    if (versions != 0 && definitions != 0 && versionIndex < 0) return 0
+    var symbol = 0
+    while (symbol < symbolCount) {
+        val record = symbols + symbol * 24
+        val information = linuxLoadU8(record + 4)
+        val binding = information >> 4
+        // STT_FUNC, STB_GLOBAL or STB_WEAK, defined (st_shndx not SHN_UNDEF).
+        if ((information & 15) == 2 && (binding == 1 || binding == 2) && linuxLoadU16(record + 6) != 0 &&
+            linuxVdsoNameIs(strings + linuxLoadU32(record), name) &&
+            (versionIndex < 0 || (linuxLoadU16(versions + symbol * 2) & 32767) == versionIndex)) {
+            val value = linuxLoadI64(record + 8)
+            return if (value != 0) bias + value else 0
+        }
+        symbol = symbol + 1
+    }
+    0
+}
+
+// The index (vd_ndx) of the version definition named `version` in the image's Elf64_Verdef list, or -1.
+private trusted fun linuxVdsoVersionIndex(definitions: int, strings: int, version: string): int {
+    var definition = definitions
+    var guard = 0
+    while (guard < 64) {
+        // vd_version 0, vd_flags 2, vd_ndx 4, vd_cnt 6, vd_hash 8, vd_aux 12, vd_next 16; the first aux names it (vda_name 0).
+        val flags = linuxLoadU16(definition + 2)
+        val auxiliary = definition + linuxLoadU32(definition + 12)
+        // VER_FLG_BASE (1) is the file's own name, not a version.
+        if ((flags & 1) == 0 && linuxVdsoNameIs(strings + linuxLoadU32(auxiliary), version)) return linuxLoadU16(definition + 4) & 32767
+        val next = linuxLoadU32(definition + 16)
+        if (next == 0) return -1
+        definition = definition + next
+        guard = guard + 1
+    }
+    -1
+}
+
+// The symbol count of a DT_GNU_HASH table (an image without DT_HASH): one past the last symbol any bucket's chain reaches.
+private trusted fun linuxVdsoGnuHashCount(table: int): int {
+    val buckets = linuxLoadU32(table)
+    val offset = linuxLoadU32(table + 4)
+    val bloomWords = linuxLoadU32(table + 8)
+    if (buckets == 0 || buckets > 4096 || bloomWords > 4096) return 0
+    val bucketBase = table + 16 + bloomWords * 8
+    val chains = bucketBase + buckets * 4
+    var last = 0
+    var bucket = 0
+    while (bucket < buckets) {
+        val start = linuxLoadU32(bucketBase + bucket * 4)
+        if (start > last) last = start
+        bucket = bucket + 1
+    }
+    if (last < offset) return offset
+    var guard = 0
+    while ((linuxLoadU32(chains + (last - offset) * 4) & 1) == 0 && guard < 4096) {
+        last = last + 1
+        guard = guard + 1
+    }
+    last + 1
+}
+
 // clock_gettime of `clock` into 16 bytes of this frame's stack, in nanoseconds, or 0 when it fails (as
 // linuxClockNanosecondsWithBuffer). An event server reads the clock every pass: a heap buffer allocated and freed
 // for each read, and its checked stores and loads, were most of the read's instructions.
-private trusted fun linuxClockNanosecondsOnStack(clock: int): int {
+private trusted fun linuxClockNanosecondsOnStack(clock: int): int =
+    linuxClockNanosecondsThrough(clock, linuxClockVdsoAddress())
+
+/** The nanoseconds of `clock` (0 CLOCK_REALTIME, 1 CLOCK_MONOTONIC) read through the kernel's vDSO clock_gettime at
+ *  `vdso` (linuxClockVdsoAddress), or by the clock_gettime system call when `vdso` is 0; 0 when the read fails or the
+ *  answer is out of range. Both ways give the same clock: the vDSO reads the kernel's time pages without entering the
+ *  kernel, and falls back to the system call itself for a clock it cannot read there. */
+trusted fun linuxClockNanosecondsThrough(clock: int, vdso: int): int {
     val timestamp = nativeStackAllocate(16)
     ablaUnsafeStoreI64(nativePointerFromAddress(timestamp), 0)
     ablaUnsafeStoreI64(nativePointerFromAddress(timestamp + 8), 0)
     var result = 0
-    if (linuxSyscall2(228, clock, timestamp) == 0) {
+    // The vDSO function returns a C int: only the low 32 bits of the register are its answer.
+    val status = if (vdso != 0) ablaUnsafeCallAddressPointerPointer(
+        vdso, nativePointerFromAddress(clock), nativePointerFromAddress(timestamp)
+    ) & 4294967295 else linuxSyscall2(228, clock, timestamp)
+    if (status == 0) {
         val seconds = ablaUnsafeLoadI64(nativePointerFromAddress(timestamp))
         val nanoseconds = ablaUnsafeLoadI64(nativePointerFromAddress(timestamp + 8))
         if (seconds >= 0 && seconds <= 9223372035 &&

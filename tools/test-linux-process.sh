@@ -18,13 +18,16 @@ if has_project_c_platform_symbol "$program"; then
     echo 'raw Linux process linked a project C platform symbol' >&2
     exit 1
 fi
+# A native x86-64 Linux host maps a vDSO: the program must have found its clock_gettime there (elsewhere it may fall back).
+expect=()
+[[ $(uname -s)/$(uname -m) == Linux/x86_64 ]] && expect=(expect-vdso)
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=15 \
-    "$project_root/tools/run-limited.sh" "$program"
+    "$project_root/tools/run-limited.sh" "$program" "${expect[@]}"
 status=$?
 set -e
-[[ $status -eq 42 ]] || exit 1
-printf '%s\n' 'raw Linux process: PATH + fork/exec + wait + capture + graceful stop'
+[[ $status -eq 42 ]] || { echo "raw Linux process: status $status (3: a clock read, 4: the vDSO clock)" >&2; exit 1; }
+printf '%s\n' 'raw Linux process: PATH + fork/exec + wait + capture + graceful stop; clocks through the vDSO and the system call'
 
 "$compiler" build "$project_root/tests/cases/modules/tool-support.ab" \
     -o "$directory/tool-support"
