@@ -78,6 +78,7 @@ only its parse errors.
 | `E_PARSE_DELEGATED_PARAMETER` | `by` on a function's parameter, or on a constructor parameter that isn't `val`/`var`: only a class property is delegated ([delegated properties](language.md#delegated-class-properties)) |
 | `E_PARSE_RESOURCE_DECLARATION` | `resource` before something other than `class` |
 | `E_PARSE_ANNOTATION`, `E_PARSE_ANNOTATED_DECLARATION` | a duplicate annotation, or one not followed by a declaration |
+| `E_PARSE_UNROLL_COUNT`, `E_PARSE_UNROLL_TARGET` | an `@unroll(n)` count that is not a whole number from 1 to 9999, or `@unroll` not followed by a loop |
 | `E_PARSE_DEFER_BODY`, `E_PARSE_REGION_BODY`, `E_PARSE_SUSPENDING_BODY` | `defer`, `region`, `generator`, `task` or `thread` without a block |
 | `E_PARSE_DECLARATION_BLOCK_*` | a malformed [declaration block](compile-time.md#declaration-blocks) |
 | `E_PARSE_*_PROGRESS` | the parser couldn't continue at that point; see the previous error |
@@ -239,6 +240,7 @@ fun main {}
 | `map.untyped`, `map.key-type`, `map.<method>.*` | [Map](language.md#maps) errors |
 | `type.underlying`, `type.constructor-*` | [nominal type](language.md#nominal-types) errors |
 | `if.condition`, `while.condition`, `do-while.condition`, `for.source`, `range.bound-type` | control-flow operands of the wrong type |
+| `unroll.trip-count` | `@unroll` (no count) on a loop without a constant trip count: only a `for` over integer-literal bounds unrolls fully |
 | `when.non-exhaustive`, `when.duplicate`, `when.else-last`, `when.else-duplicate`, `when.empty` | see [control flow](language.md#control-flow) |
 | `break.outside-loop`, `continue.outside-loop`, `return.outside-function` | control transfer outside its construct |
 | `E_NAMED_ARGUMENT_UNKNOWN`, `_DUPLICATE`, `_ORDER`, `_REQUIRED`, `_TARGET`, `_ARITY` | named-argument errors ([functions](language.md#functions)) |

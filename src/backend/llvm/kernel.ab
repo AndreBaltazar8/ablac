@@ -663,6 +663,33 @@ fun bootstrapKernelLoad4(var emitter: BootstrapKernelEmitter, var state: Bootstr
     bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, if (float) "f32x4" else "u32x4", ""))
 }
 
+/** The loop headers of the function being lowered that `@unroll` marks (#1296), and their llvm.loop metadata ids. */
+var bootstrapKernelUnrollHeaders: array<int> = []
+var bootstrapKernelUnrollNodes: array<int> = []
+// The next free metadata id (the module has no other numbered metadata).
+var bootstrapKernelUnrollNext = 0
+
+/** A distinct llvm.loop node asking for `spec` ("full" or a count), declared in the module; its id. */
+fun bootstrapKernelUnrollNode(var emitter: BootstrapKernelEmitter, spec: string): int {
+    val id = bootstrapKernelUnrollNext
+    bootstrapKernelUnrollNext = bootstrapKernelUnrollNext + 2
+    bootstrapKernelDeclare(emitter, "!$id = distinct !{!$id, !${id + 1}}")
+    bootstrapKernelDeclare(emitter, if (spec == "full") "!${id + 1} = !{!\"llvm.loop.unroll.full\"}"
+        else "!${id + 1} = !{!\"llvm.loop.unroll.count\", i32 $spec}")
+    id
+}
+
+/** ", !llvm.loop !<id>" for a branch to an `@unroll` loop's header (its back edge; LLVM ignores it on the edge into the
+ *  loop), else "". */
+fun bootstrapKernelUnrollSuffix(targets: array<int>): string {
+    for (index in 0 until bootstrapKernelUnrollHeaders.size) {
+        for (target in targets) {
+            if (target == bootstrapKernelUnrollHeaders[index]) return ", !llvm.loop !${bootstrapKernelUnrollNodes[index]}"
+        }
+    }
+    ""
+}
+
 /** The PTX shuffle mode of abla/kernel's subgroup shuffle `name` (bfly, idx, up, down), or "" for another name. */
 fun bootstrapKernelShuffleMode(name: string): string {
     if (name == "kernelSubgroupShuffleXor" || name == "kernelSubgroupShuffleXorInt") return "bfly"
@@ -1174,12 +1201,12 @@ fun bootstrapKernelInstruction(var emitter: BootstrapKernelEmitter, var state: B
         state.terminated = false
     }
     if (op == "jump") {
-        bootstrapKernelLine(state, "br label %L${instruction.target}")
+        bootstrapKernelLine(state, "br label %L${instruction.target}${bootstrapKernelUnrollSuffix([instruction.target])}")
         state.terminated = true
     } else if (op == "branch") {
         val condition = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.left), "bool")
         if (condition == "") return
-        bootstrapKernelLine(state, "br i1 $condition, label %L${instruction.target}, label %L${instruction.alternate}")
+        bootstrapKernelLine(state, "br i1 $condition, label %L${instruction.target}, label %L${instruction.alternate}${bootstrapKernelUnrollSuffix([instruction.target, instruction.alternate])}")
         state.terminated = true
     } else if (op == "return") {
         val resultLlvm = bootstrapKernelLlvmType(state.resultType)
@@ -1352,10 +1379,29 @@ fun bootstrapKernelEmitFunction(var emitter: BootstrapKernelEmitter, functionInd
     }
     emitter.active.append(function.name)
     val errorsBefore = emitter.errors
+    // `@unroll` loops (#1296): this function's loop headers and their llvm.loop nodes (a call lowers its callee in the
+    // middle of this function, so the caller's are kept and put back).
+    val callerHeaders = bootstrapKernelUnrollHeaders
+    val callerNodes = bootstrapKernelUnrollNodes
+    val headers: array<int> = []
+    val nodes: array<int> = []
+    for (instruction in function.instructions) {
+        if (instruction.opcode == "branch") {
+            val unroll = bootstrapIrUnrollOf(instruction.text)
+            if (unroll.header >= 0) {
+                headers.append(unroll.header)
+                nodes.append(bootstrapKernelUnrollNode(emitter, unroll.spec))
+            }
+        }
+    }
+    bootstrapKernelUnrollHeaders = headers
+    bootstrapKernelUnrollNodes = nodes
     for (instruction in function.instructions) {
         bootstrapKernelInstruction(emitter, state, instruction)
         if (emitter.errors > errorsBefore) break
     }
+    bootstrapKernelUnrollHeaders = callerHeaders
+    bootstrapKernelUnrollNodes = callerNodes
     val _left = emitter.active.removeLast()
     if (emitter.errors > errorsBefore) return
     if (!state.terminated) bootstrapKernelLine(state, if (entry || resultLlvm == "") "ret void" else "unreachable")
@@ -1435,6 +1481,7 @@ trusted fun bootstrapKernelBuild(parsed: BootstrapParseResult, var program: Boot
         return BootstrapKernelResult("", 0)
     }
 
+    bootstrapKernelUnrollNext = 0
     val emitter = BootstrapKernelEmitter(program, "", [], "", 0, [], [])
     val module = bootstrapKernelCudaModule(emitter, names)
 

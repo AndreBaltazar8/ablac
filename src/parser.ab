@@ -158,19 +158,36 @@ fun bootstrapForLabelAt(text: string): int {
     -1
 }
 
+/** A loop's text without its `@unroll` hint: an `@unroll` loop's text ends in "#unroll" or "#unroll=<count>" (`#`
+ *  is in no identifier, so no label or variable holds one). */
+fun bootstrapLoopBaseText(text: string): string {
+    val hash = text.indexOf("#")
+    if (hash < 0) text else text.slice(0, hash)
+}
+
+/** A loop's `@unroll` hint: "" for none, "full" for `@unroll`, else the count of `@unroll(n)`. */
+fun bootstrapLoopUnroll(loop: BootstrapExpression): string {
+    if (loop.kind != "while" && loop.kind != "do.while" && loop.kind != "for") return ""
+    val hash = loop.text.indexOf("#unroll")
+    if (hash < 0) return ""
+    if (hash + 7 == loop.text.size) "full" else loop.text.slice(hash + 8, loop.text.size)
+}
+
 /** The label of a `while`, `do … while` or `for` loop ("" when it has
  *  none). */
 fun bootstrapLoopLabel(loop: BootstrapExpression): string {
-    if (loop.kind == "while" || loop.kind == "do.while") return loop.text
+    val text = bootstrapLoopBaseText(loop.text)
+    if (loop.kind == "while" || loop.kind == "do.while") return text
     if (loop.kind != "for") return ""
-    val at = bootstrapForLabelAt(loop.text)
-    if (at < 0) "" else loop.text.slice(at + 1, loop.text.size)
+    val at = bootstrapForLabelAt(text)
+    if (at < 0) "" else text.slice(at + 1, text.size)
 }
 
 /** The variable a `for` loop binds: its text without a label. */
 fun bootstrapForName(loop: BootstrapExpression): string {
-    val at = bootstrapForLabelAt(loop.text)
-    if (at < 0) loop.text else loop.text.slice(0, at)
+    val text = bootstrapLoopBaseText(loop.text)
+    val at = bootstrapForLabelAt(text)
+    if (at < 0) text else text.slice(0, at)
 }
 
 class BootstrapParameters(
@@ -1306,6 +1323,8 @@ class BootstrapParser(
                 statements.append(this.parseReturn())
             } else if (this.at(BOOTSTRAP_TOKEN_DEFER)) {
                 statements.append(this.parseDefer())
+            } else if (this.atUnroll()) {
+                statements.append(this.parseUnrolledLoop())
             } else if (this.atLoopLabel()) {
                 statements.append(this.parseLabeledLoop())
             } else if (this.at(BOOTSTRAP_TOKEN_BREAK) || this.at(BOOTSTRAP_TOKEN_CONTINUE)) {
@@ -1503,6 +1522,8 @@ class BootstrapParser(
                 statements.append(this.parseReturn())
             } else if (this.at(BOOTSTRAP_TOKEN_DEFER)) {
                 statements.append(this.parseDefer())
+            } else if (this.atUnroll()) {
+                statements.append(this.parseUnrolledLoop())
             } else if (this.atLoopLabel()) {
                 statements.append(this.parseLabeledLoop())
             } else if (this.at(BOOTSTRAP_TOKEN_BREAK) || this.at(BOOTSTRAP_TOKEN_CONTINUE)) {
@@ -1540,6 +1561,7 @@ class BootstrapParser(
             this.parseLoopControl()
         }
         else if (this.at(BOOTSTRAP_TOKEN_FOR)) this.parseFor()
+        else if (this.atUnroll()) this.parseUnrolledLoop()
         else if (this.atLoopLabel()) this.parseLabeledLoop()
         else if (this.at(BOOTSTRAP_TOKEN_LBRACE)) this.parseBlock()
         else this.parseExpression()
@@ -1648,6 +1670,48 @@ class BootstrapParser(
             else this.parseFor()
         val text = if (loop.kind == "for") "${loop.text}@$label" else label
         BootstrapExpression(loop.kind, text, name.begin, loop.end, loop.children)
+    }
+
+    // `@unroll` or `@unroll(n)` before a loop (on its line or the one above): a hint to copy the body n times per
+    // iteration, or all of them (the loop needs a constant trip count: sema checks).
+    fun atUnroll(): bool {
+        if (!this.at(BOOTSTRAP_TOKEN_AT) || this.position + 1 >= this.tokens.size) return false
+        val name = this.tokens[this.position + 1]
+        name.kind == BOOTSTRAP_TOKEN_IDENTIFIER && name.begin == this.tokens[this.position].end &&
+            bootstrapTokenText(this.source, name) == "unroll"
+    }
+
+    // An `@unroll` loop: the loop's node, beginning at the annotation, its text ending in "#unroll" or
+    // "#unroll=<count>" (bootstrapLoopUnroll).
+    fun parseUnrolledLoop(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.position = this.position + 2
+        var hint = "#unroll"
+        if (this.consume(BOOTSTRAP_TOKEN_LPAREN)) {
+            val count = this.tokens[this.position]
+            val text = if (count.kind == BOOTSTRAP_TOKEN_INTEGER) bootstrapTokenText(this.source, count) else ""
+            var digits = text != "" && text.size <= 4
+            for (byte in text) if (byte < 48 || byte > 57) digits = false
+            if (!digits || text == "0" || text[0] == 48) {
+                this.fail("UNROLL_COUNT", "@unroll(n) takes a whole number from 1 to 9999",
+                    "write the count as a literal, as in `@unroll(4)`; `@unroll` alone unrolls a loop with a constant trip count fully")
+            } else hint = "#unroll=$text"
+            while (!this.at(BOOTSTRAP_TOKEN_RPAREN) && !this.at(BOOTSTRAP_TOKEN_NEWLINE) && !this.at(BOOTSTRAP_TOKEN_END)) {
+                this.position = this.position + 1
+            }
+            this.expect(BOOTSTRAP_TOKEN_RPAREN)
+        }
+        while (this.at(BOOTSTRAP_TOKEN_NEWLINE)) this.position = this.position + 1
+        val loop =
+            if (this.at(BOOTSTRAP_TOKEN_WHILE)) this.parseWhile()
+            else if (this.at(BOOTSTRAP_TOKEN_DO)) this.parseDoWhile()
+            else if (this.at(BOOTSTRAP_TOKEN_FOR)) this.parseFor()
+            else if (this.atLoopLabel()) this.parseLabeledLoop()
+            else {
+                this.fail("UNROLL_TARGET", "@unroll must precede a loop: `while`, `do … while` or `for`")
+                return this.parseExpression()
+            }
+        BootstrapExpression(loop.kind, "${loop.text}$hint", start.begin, loop.end, loop.children)
     }
 
     fun parseReturn(): BootstrapExpression {

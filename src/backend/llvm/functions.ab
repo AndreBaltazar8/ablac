@@ -8026,6 +8026,20 @@ fun bootstrapLlvmCommitLoopGlobal(backend: BootstrapLlvmBackend, state: Bootstra
     return
 }
 
+/** Gives `branch` the llvm.loop node of the `@unroll` loop whose header one of `targets` is (#1296): on a back edge it
+ *  asks LLVM's loop unroller to unroll the loop; on the edge into the loop, LLVM ignores it. */
+fun bootstrapLlvmMarkUnroll(backend: BootstrapLlvmBackend, branch: i64*, targets: array<int>, headers: array<int>,
+    nodes: array<i64*>): void {
+    for (index in 0 until headers.size) {
+        for (target in targets) {
+            if (target == headers[index]) {
+                LLVMSetMetadata(branch, LLVMGetMDKindIDInContext(backend.context, "llvm.loop", i32(9)), nodes[index])
+                return
+            }
+        }
+    }
+}
+
 fun bootstrapLlvmEmitFunction(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -8167,6 +8181,19 @@ fun bootstrapLlvmEmitFunction(
     val pressureRootSites = mayPoll && (directlyAllocates || spin)
     // A loop that allocates also runs the safe point on its back edge (see there).
     val loopSafePoints = bootstrapLlvmLoopSafePoints(function, pressure, program, nativeIndex)
+    // `@unroll` loops (#1296): their headers' labels, from the condition branches' text, and the llvm.loop node every
+    // branch into a header carries (LLVM reads it from the back edges).
+    val unrollHeaders: array<int> = []
+    val unrollNodes: array<i64*> = []
+    for (instruction in function.instructions) {
+        if (instruction.opcode == "branch") {
+            val unroll = bootstrapIrUnrollOf(instruction.text)
+            if (unroll.header >= 0) {
+                unrollHeaders.append(unroll.header)
+                unrollNodes.append(bootstrapLlvmUnrollLoopNode(backend.context, backend.i32Type, unroll.spec))
+            }
+        }
+    }
     var rootValues: array<bool> = []
     if (collecting) rootValues = bootstrapLlvmGcRootPlan(
         function, functionIndex, mayCollect, loopSafePoints
@@ -9030,12 +9057,15 @@ fun bootstrapLlvmEmitFunction(
                     backend, "abla_runtime_memory_pressure_loop", [], "", false, []
                 )
             }
-            if (!pointerIsNull(target)) LLVMBuildBr(backend.builder, target)
+            if (!pointerIsNull(target)) {
+                val jump = LLVMBuildBr(backend.builder, target)
+                bootstrapLlvmMarkUnroll(backend, jump, [instruction.target], unrollHeaders, unrollNodes)
+            }
             terminated = true
         }
         if (reachable && (opcodeHead == 98 && opcode == "branch")) {
             matched = true
-            if (instruction.text == BOOTSTRAP_IR_SMALL_LOOP_NEST &&
+            if (instruction.text.startsWith(BOOTSTRAP_IR_SMALL_LOOP_NEST) &&
                 bootstrapLlvmDetectReleaseOptimizations && !bootstrapLlvmRuntimeFunction(function) &&
                 LLVMGetNamedMetadataNumOperands(backend.module, BOOTSTRAP_LLVM_SMALL_LOOP_NEST) == 0) {
                 val marker = bootstrapLlvmMetadataNode(backend.context, [])
@@ -9061,7 +9091,8 @@ fun bootstrapLlvmEmitFunction(
                         backend, "abla_runtime_memory_pressure_loop", [], "", false, []
                     )
                 }
-                LLVMBuildCondBr(backend.builder, condition, yes, no)
+                val branch = LLVMBuildCondBr(backend.builder, condition, yes, no)
+                bootstrapLlvmMarkUnroll(backend, branch, [instruction.target, instruction.alternate], unrollHeaders, unrollNodes)
             }
             terminated = true
         }

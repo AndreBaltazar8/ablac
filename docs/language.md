@@ -2408,6 +2408,30 @@ fun main {
   A label is unrelated to an annotation, which is `@name` before a
   declaration. A `while (true)` that `break@` its own label can end, so its
   type is `void`, not `never`.
+- `@unroll(n)` before a loop (on its line or the one above, before any
+  label) asks the optimizer to copy its body `n` times per iteration, and
+  `@unroll` alone to unroll it fully, which needs a constant trip count: a
+  `for` over `a until b` or `a .. b` with integer literals. It is a hint, on
+  the CPU and in a [kernel](#gpu-kernels) alike (CUDA's `#pragma unroll`): it
+  never changes what the loop computes, an unoptimized (`--fast`) build
+  ignores it, and `@unroll(1)` keeps a loop rolled. A count that is not a
+  whole number from 1 to 9999 is `E_PARSE_UNROLL_COUNT`, `@unroll` on a loop
+  without a constant trip count is `unroll.trip-count`, and `@unroll` before
+  anything but a loop is `E_PARSE_UNROLL_TARGET`:
+
+  ```abla
+  import "abla/io"
+
+  fun main {
+      var total = 0
+      @unroll
+      for (i in 0 until 4) total = total + i
+      @unroll(2) while (total < 100) total = total * 3
+      println("$total")
+  }
+  // output:
+  // 162
+  ```
 - `return` leaves the innermost function or lambda; a bare `return` returns
   `void` (`return.type`, `return.outside-function`).
 - Conditions must be `bool` (`if.condition`, `while.condition`,
