@@ -146,6 +146,23 @@ measure() {
     esac
 }
 
+# The jit rows are phase times the compiler reports in wall-clock milliseconds, which a busy shared runner inflates at
+# random (release run 45898824396: regions codegen 727 -> 4063 ms, 727 again on a rerun). Each size is measured three times
+# and each phase keeps its minimum: interference only ever adds time, so the minimum is the phase's own cost, and a phase
+# that really grows faster than linearly does so in every repeat.
+measure_min() {
+    local shape=$1 size=$2 repeat value values=()
+    for repeat in 1 2 3; do
+        value=$(measure "$shape" "$size" jit) || return
+        values+=("$value")
+    done
+    printf '%s\n' "${values[@]}" | awk '{
+            for (i = 1; i <= NF; i++) if (NR == 1 || $i < low[i]) low[i] = $i
+            if (NF > fields) fields = NF
+        }
+        END { for (i = 1; i <= fields; i++) printf "%s%s", low[i], i < fields ? " " : "\n" }'
+}
+
 failed=0
 check_growth() {
     local label=$1 small=$2 large=$3 limit=$4 slack=$5
@@ -161,16 +178,16 @@ check_growth() {
     fi
 }
 
-small=$(measure chains 1024 jit)
-large=$(measure chains 2048 jit)
+small=$(measure_min chains 1024)
+large=$(measure_min chains 2048)
 check_growth 'chains 1024/2048 lowering ms' "$small" "$large" 3 100
 
-small=$(measure regions 2048 jit)
-large=$(measure regions 4096 jit)
+small=$(measure_min regions 2048)
+large=$(measure_min regions 4096)
 check_growth 'regions 2048/4096 codegen ms' "$small" "$large" 3 100
 
-small=$(measure when 4096 jit)
-large=$(measure when 12288 jit)
+small=$(measure_min when 4096)
+large=$(measure_min when 12288)
 read -r small_front small_code <<< "$small"
 read -r large_front large_code <<< "$large"
 check_growth 'when 4096/12288 frontend ms' "$small_front" "$large_front" 5 100
