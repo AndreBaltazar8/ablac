@@ -577,8 +577,16 @@ printf 'compiler from `v9.9.8`\n' >"$signed_root/README.md"
 printf 'native `v9.9.8` artifact\n' >"$signed_root/docs/bootstrap.md"
 ssh-keygen -q -t ed25519 -N '' -C test -f "$work/sign-key" >/dev/null
 cp "$work/sign-key.pub" "$signed_root/release-signing.pub"
+printf '9.9.9 - %s\n' "$(cat "$work/sign-key.pub")" >"$signed_root/tools/release-signing-keys"
+# The bill of materials of DIR as the publish job makes it (tools/release-sbom.sh), put into DIR.
+sbom_into() {
+    rm -f "$1/.release-check"
+    "$project_root/tools/release-sbom.sh" v9.9.9 "$1" "$work/sbom.json" >/dev/null && mv "$work/sbom.json" "$1/ablac-9.9.9.spdx.json"
+}
 signed_release() { # a copy of the made-up release with SHA256SUMS signed by the key given (default: the repository's test key)
     rm -rf "$work/signed-release"; cp -r "$release" "$work/signed-release"
+    # A signed release lists its own bill of materials (verify-release.sh --version checks it names this release; release-check's sbom check reads it).
+    sbom_into "$work/signed-release"
     (cd "$work/signed-release" && sha256sum -- * >SHA256SUMS)
     ssh-keygen -Y sign -f "${1:-$work/sign-key}" -n abla-release "$work/signed-release/SHA256SUMS" >/dev/null 2>&1
 }
@@ -602,7 +610,21 @@ cp "$check" "$convergence" "$signed_root/tools/"
 output=$(check="$signed_root/tools/release-check.sh" run_check "$work/signed-release" v9.9.9 "$stage2" \
     --out "$work/signed-check-out") || { echo "$output" >&2; fail "release-check refused a good signed release"; }
 grep -q '^PASS  signature' <<<"$output" || { echo "$output" >&2; fail "no PASS line for the signature"; }
+grep -q '^PASS  sbom' <<<"$output" || { echo "$output" >&2; fail "no PASS line for the bill of materials"; }
 [[ -f $work/signed-check-out/.release-check ]] || fail "release-check did not mark its output directory"
+# A bill of materials that gives an asset another sha256 (signed as it is, so the signature still passes) fails the sbom check.
+signed_release
+sed -i 's/\("fileName": "ablac-x86_64-linux", "checksums": \[{"algorithm": "SHA256", "checksumValue": "\)[0-9a-f]\{64\}/\1'"$(printf '0%.0s' {1..64})"'/' \
+    "$work/signed-release/ablac-9.9.9.spdx.json"
+grep -q "$(printf '0%.0s' {1..64})" "$work/signed-release/ablac-9.9.9.spdx.json" || fail "the test could not change the bill of materials"
+rm "$work/signed-release/SHA256SUMS" "$work/signed-release/SHA256SUMS.sig"
+(cd "$work/signed-release" && sha256sum -- * >SHA256SUMS)
+ssh-keygen -Y sign -f "$work/sign-key" -n abla-release "$work/signed-release/SHA256SUMS" >/dev/null 2>&1
+check="$signed_root/tools/release-check.sh" expect_fail "a bill of materials with another sha256 for an asset" \
+    run_check "$work/signed-release" v9.9.9 "$stage2" --out "$work/sbom-check-out"
+grep -q '^PASS  signature' "$work/out.txt" && grep -q '^FAIL  sbom.*differ' "$work/out.txt" ||
+    { cat "$work/out.txt" >&2; fail "the sbom check did not catch a bill of materials with another sha256"; }
+signed_release
 printf 'extra\n' >"$work/signed-release/.unlisted"
 check="$signed_root/tools/release-check.sh" expect_fail "a signed release containing an unlisted file" \
     run_check "$work/signed-release" v9.9.9 "$stage2" --out "$work/signed-check-out"
@@ -615,6 +637,8 @@ output=$(check="$signed_root/tools/release-check.sh" run_check "$release" v9.9.9
     --out "$manual_out") || { echo "$output" >&2; fail "release-check refused unsigned manual artifacts"; }
 expected_paths=$(printf -- '--artifacts %q --out %q' "$manual_out" "$manual_out.verified")
 grep -Fq -- "$expected_paths" <<<"$output" || fail "manual release instructions did not give a separate verification output"
+# sign-release.sh --tag would write the bill of materials (release-sbom.sh from a release checkout: the project's here).
+sbom_into "$manual_out"
 "$signed_root/tools/sign-release.sh" "$manual_out" "$work/sign-key" >/dev/null 2>&1 || fail "could not sign the checked manual artifacts"
 output=$(check="$signed_root/tools/release-check.sh" run_check "$manual_out" v9.9.9 "$stage2" \
     --out "$manual_out.verified") || { echo "$output" >&2; fail "release-check refused the signed manual artifacts"; }

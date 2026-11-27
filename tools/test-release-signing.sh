@@ -81,6 +81,50 @@ fresh; ghost ab186c87ae549a4a732441f983e56f70b09770bc0260ef83db103d1914e7e9dd ot
 refuses "a missing file with v0.2.67's list hash under another name" "$work/rel"
 echo 'a listed file missing from the directory refused (the v0.2.67-v0.2.73 scratch lines tolerated)'
 
+# The key table (tools/release-signing-keys) and --version, after a rotation: 1.0.0-1.0.4 signed by the old key ("good"),
+# 1.0.5 on by the new one ("bad" here). A release verifies only under its own range's key, and only as the release asked for.
+table="$work/table"; mkdir -p "$table/tools"
+cp "$root/tools/verify-release.sh" "$table/tools/"
+cp "$work/good.pub" "$table/release-signing.pub"
+printf '# a comment\n1.0.0 1.0.4 %s\n1.0.5 - %s\n' "$(cat "$work/good.pub")" "$(cat "$work/bad.pub")" > "$table/tools/release-signing-keys"
+release() { # version, key, [bill of materials names...]
+    local version=$1 key=$2; shift 2
+    rm -rf "$work/vrel"; mkdir "$work/vrel"
+    printf 'compiler %s\n' "$version" > "$work/vrel/ablac-x86_64-linux"
+    local names=("$@"); ((${#names[@]})) || names=("ablac-$version.spdx.json")
+    for name in "${names[@]}"; do printf '{}\n' > "$work/vrel/$name"; done
+    (cd "$work/vrel" && if command -v sha256sum >/dev/null 2>&1; then sha256sum ablac-x86_64-linux "${names[@]}"; else shasum -a 256 ablac-x86_64-linux "${names[@]}"; fi > SHA256SUMS)
+    ssh-keygen -Y sign -f "$key" -n abla-release "$work/vrel/SHA256SUMS" >/dev/null 2>&1
+}
+tverify() { "$table/tools/verify-release.sh" --version "$@" > "$work/out" 2>&1; }
+taccepts() { tverify "$@" || { cat "$work/out" >&2; fail "the key table refused: $*"; }; }
+trefuses() {
+    local what=$1; shift
+    if tverify "$@"; then fail "the key table accepted $what"; fi
+    grep -q REFUSED "$work/out" || { cat "$work/out" >&2; fail "$what: no refusal message"; }
+}
+release 1.0.3 "$work/good"; taccepts 1.0.3 "$work/vrel"; taccepts v1.0.3 "$work/vrel" ablac-x86_64-linux
+release 1.0.3 "$work/bad"; trefuses 'an old release signed by the new key' 1.0.3 "$work/vrel"
+release 1.0.6 "$work/bad"; taccepts 1.0.6 "$work/vrel"
+release 1.0.6 "$work/good"; trefuses 'a later release signed by the old key' 1.0.6 "$work/vrel"
+release 1.0.4 "$work/good"; taccepts 1.0.4 "$work/vrel"
+release 1.0.5 "$work/good"; trefuses 'the first release of the new range signed by the old key' 1.0.5 "$work/vrel"
+release 0.9.0 "$work/good"; trefuses 'a version in no range' 0.9.0 "$work/vrel"
+trefuses 'a version that is not one' latest "$work/vrel"
+release 1.0.3 "$work/good"; trefuses "1.0.3's signed files asked for as 1.0.4" 1.0.4 "$work/vrel"
+release 1.0.3 "$work/good" other.txt; trefuses 'a signed list without a bill of materials' 1.0.3 "$work/vrel"
+release 1.0.3 "$work/good" ablac-1.0.3.spdx.json ablac-1.0.2.spdx.json; trefuses 'a signed list with two bills of materials' 1.0.3 "$work/vrel"
+printf '1.0.0 - %s\n1.0.3 - %s\n' "$(cat "$work/good.pub")" "$(cat "$work/bad.pub")" > "$table/tools/release-signing-keys"
+release 1.0.3 "$work/good"; trefuses 'a version in two ranges that overlap' 1.0.3 "$work/vrel"
+# The repository's own table: one open row, its key release-signing.pub, the first row's FIRST tools/first-signed-release.
+rows=$(grep -v '^[[:space:]]*\(#\|$\)' "$root/tools/release-signing-keys")
+[[ $(awk '$2 == "-"' <<< "$rows" | wc -l) -eq 1 ]] || fail 'tools/release-signing-keys has no single open row'
+[[ $(awk '$2 == "-" { $1 = ""; $2 = ""; sub(/^  /, ""); print }' <<< "$rows") == "$(cat "$root/release-signing.pub")" ]] ||
+    fail "the open row's key in tools/release-signing-keys is not release-signing.pub"
+[[ $(head -n 1 <<< "$rows" | awk '{ print $1 }') == "$(head -n 1 "$root/tools/first-signed-release" | sed 's/^v//')" ]] ||
+    fail "the first row of tools/release-signing-keys does not start at tools/first-signed-release"
+echo 'key table: each release under its own range key only, as the release asked for; the repository table matches release-signing.pub'
+
 # The real signer: sign-release.sh signs a directory and verifies it against the repository's public key, so with
 # a key that is not the project's it must refuse (the guard against shipping with the wrong secret).
 fresh; rm "$work/rel/SHA256SUMS" "$work/rel/SHA256SUMS.sig"
@@ -93,6 +137,7 @@ grep -q REFUSED "$work/out" || fail "sign-release.sh: no refusal for a foreign k
 local_root="$work/local-root"; mkdir -p "$local_root/tools" "$local_root/nix"
 cp "$root/tools/sign-release.sh" "$root/tools/verify-release.sh" "$root/tools/release-sbom.sh" "$local_root/tools/"
 cp "$work/good.pub" "$local_root/release-signing.pub"
+printf '0.0.1 - %s\n' "$(cat "$work/good.pub")" > "$local_root/tools/release-signing-keys"
 if command -v git >/dev/null 2>&1; then
     mkdir -p "$local_root/tools" "$local_root/nix"
     cp "$root/tools/bootstrap-compiler.sh" "$root/tools/xtensa-companions.json" "$root/tools/llvm-linux-portable-pins.sh" "$root/tools/llvm-macos-pins.sh" "$local_root/tools/"
@@ -142,6 +187,7 @@ fi
 proj="$work/proj"; mkdir -p "$proj/tools" "$work/serve"
 cp "$root/tools/bootstrap-compiler.sh" "$root/tools/verify-release.sh" "$root/tools/first-signed-release" "$proj/tools/"
 cp "$work/good.pub" "$proj/release-signing.pub"
+printf '0.0.1 - %s\n' "$(cat "$work/good.pub")" > "$proj/tools/release-signing-keys"
 sed -i.bak 's/^version=.*/version=v9.9.9/' "$proj/tools/bootstrap-compiler.sh"; rm -f "$proj/tools/bootstrap-compiler.sh.bak"
 case "$(uname -s)/$(uname -m)" in
     Linux/x86_64) artifact=ablac-x86_64-linux ;;
@@ -153,9 +199,10 @@ if [[ -n $artifact ]]; then
     seed() { # name of the key to sign with, or none
         rm -rf "$work/serve"; mkdir "$work/serve"
         printf '#!/bin/sh\necho seed\n' > "$work/serve/$artifact"
-        (cd "$work/serve" && if command -v sha256sum >/dev/null 2>&1; then sha256sum "$artifact"; else shasum -a 256 "$artifact"; fi > SHA256SUMS)
+        printf '{}\n' > "$work/serve/ablac-${2:-9.9.9}.spdx.json"
+        (cd "$work/serve" && if command -v sha256sum >/dev/null 2>&1; then sha256sum "$artifact" "ablac-${2:-9.9.9}.spdx.json"; else shasum -a 256 "$artifact" "ablac-${2:-9.9.9}.spdx.json"; fi > SHA256SUMS)
         [[ -z ${1:-} ]] || ssh-keygen -Y sign -f "$1" -n abla-release "$work/serve/SHA256SUMS" >/dev/null 2>&1
-        sum=$(cut -d' ' -f1 "$work/serve/SHA256SUMS")
+        sum=$(awk -v n="$artifact" '$2 == n { print $1 }' "$work/serve/SHA256SUMS")
     }
     bootstrap() { rm -f "$work/seed.bin"; ABLA_BOOTSTRAP_URL="file://$work/serve/$artifact" ABLA_BOOTSTRAP_SHA256="$sum" ABLA_BOOTSTRAP_REQUIRE_SIGNATURE=1 "$proj/tools/bootstrap-compiler.sh" "$work/seed.bin" > "$work/out" 2>&1; }
     seed "$work/good"; bootstrap || { cat "$work/out" >&2; fail "bootstrap-compiler.sh refused a signed seed"; }
@@ -163,6 +210,8 @@ if [[ -n $artifact ]]; then
     seed "$work/bad"; bootstrap && fail "bootstrap-compiler.sh accepted a seed signed by another key"
     seed "$work/good"; printf 'x' >> "$work/serve/$artifact"; sum=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$work/serve/$artifact"; else shasum -a 256 "$work/serve/$artifact"; fi | cut -d' ' -f1)
     bootstrap && fail "bootstrap-compiler.sh accepted a tampered seed whose own checksum was updated"
-    echo 'bootstrap-compiler.sh: signed seed accepted; unsigned, foreign-signed and tampered refused'
+    # Another release's signed files (its bill of materials names 9.9.8) served for the 9.9.9 the script pins.
+    seed "$work/good" 9.9.8; bootstrap && fail "bootstrap-compiler.sh accepted the signed files of another release"
+    echo 'bootstrap-compiler.sh: signed seed accepted; unsigned, foreign-signed, tampered and another release refused'
 fi
 echo 'release signing: good accepted; tampering, foreign keys, missing and extra files refused'

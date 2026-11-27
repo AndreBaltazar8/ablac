@@ -8,7 +8,9 @@
 # check, PASS or FAIL, then exits 1 when any failed:
 #   assets      every asset name of the previous release is here, and no other
 #   sha256      every `.sha256` file matches its asset, and every asset has one
-#   version     the Linux binary's --version prints `ablac <tag without v>`
+#   signature   (a published release) SHA256SUMS verifies under the key tools/release-signing-keys gives the tag, and is the tag's
+#   sbom        (a published release) ablac-VERSION.spdx.json names this version and lists exactly the assets with their sha256
+#   version    the Linux binary's --version prints `ablac <tag without v>`
 #   stage2      the Linux binary is byte for byte the local stage 2 (cmp)
 #   convergence a green bootstrap-convergence run exists for the release's source commit (tools/release-convergence.sh);
 #               required: without --source-ref (or the tag) and a run, this check fails
@@ -253,15 +255,44 @@ else
 fi
 
 # 2b. signature: SHA256SUMS is made and signed by the publish job, so a run's artifacts have none (SKIP); a directory that
-# has them (a published release downloaded with --artifacts) must verify against release-signing.pub, assets and all.
+# has them (a published release downloaded with --artifacts) must verify, assets and all, under the key that
+# tools/release-signing-keys gives this tag, and be this tag's (its bill of materials is ablac-VERSION.spdx.json).
 if [[ -f $out/SHA256SUMS || -f $out/SHA256SUMS.sig ]]; then
-    if verification=$("$(dirname -- "${BASH_SOURCE[0]}")/verify-release.sh" "$out" 2>&1); then
+    if verification=$("$(dirname -- "${BASH_SOURCE[0]}")/verify-release.sh" --version "$tag" "$out" 2>&1); then
         report PASS signature "$verification"
     else
         report FAIL signature "$(tr '\n' ' ' <<< "$verification")"
     fi
 else
     report SKIP signature "unsigned before publish (the publish job signs SHA256SUMS)"
+fi
+
+# 2c. sbom: the bill of materials (made by the publish job, so SKIP before it) names this version and lists exactly the
+# release's assets, each with its sha256: a file it does not list, one it lists that is not there, or another hash is a FAIL.
+sbom=$out/ablac-$version.spdx.json
+if [[ -f $sbom ]]; then
+    sbom_problem=
+    grep -q "\"SPDXID\": \"SPDXRef-ablac\", \"name\": \"ablac\", \"versionInfo\": \"$version\"" "$sbom" || sbom_problem="it does not name ablac $version"
+    sed -n 's/.*"fileName": "\([^"]*\)", "checksums": \[{"algorithm": "SHA256", "checksumValue": "\([0-9a-f]\{64\}\)"}\].*/\2  \1/p' "$sbom" |
+        LC_ALL=C sort > "$out.sbom-files"
+    : > "$out.sbom-assets"
+    while IFS= read -r path; do
+        name=${path#"$out"/}
+        case $name in SHA256SUMS | SHA256SUMS.sig | .release-check | "ablac-$version.spdx.json") continue ;; esac
+        printf '%s  %s\n' "$(sha256 "$path")" "$name" >> "$out.sbom-assets"
+    done < <(find "$out" -type f | LC_ALL=C sort)
+    LC_ALL=C sort -o "$out.sbom-assets" "$out.sbom-assets"
+    if [[ -z $sbom_problem ]] && ! cmp -s "$out.sbom-files" "$out.sbom-assets"; then
+        sbom_problem="its files differ from the release's: $(diff "$out.sbom-files" "$out.sbom-assets" | grep '^[<>]' | head -n 3 | tr '\n' ' ')"
+    fi
+    if [[ -z $sbom_problem ]]; then
+        report PASS sbom "ablac $version, $(wc -l < "$out.sbom-assets") files with their sha256"
+    else
+        report FAIL sbom "$sbom_problem"
+    fi
+    rm -f "$out.sbom-files" "$out.sbom-assets"
+else
+    report SKIP sbom "no ablac-$version.spdx.json before publish (the publish job makes it)"
 fi
 # Verify all collected files before adding the marker that lets a later run reuse --out.
 [[ -f $out/.release-check ]] || : >"$out/.release-check"

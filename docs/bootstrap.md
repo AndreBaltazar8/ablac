@@ -137,11 +137,15 @@ checked: it writes the SBOM, `SHA256SUMS` and `SHA256SUMS.sig` there and verifie
 `signature` check passes, and every file of the directory is uploaded.
 
 To check a download by hand, put `SHA256SUMS`, `SHA256SUMS.sig` and the assets in one directory and run
-`tools/verify-release.sh DIR [ASSET...]`. It refuses a release without a signature, a signature that does not verify
-against `release-signing.pub`, and any asset that is not listed or does not match. The consumers verify the same way and
+`tools/verify-release.sh --version vX.Y.Z DIR [ASSET...]`. It refuses a release without a signature, a signature that does not verify
+under the key `tools/release-signing-keys` gives that version, signed files whose bill of materials is another release's,
+and any asset that is not listed or does not match. Without `--version` it checks against `release-signing.pub`, the
+current key. `tools/release-signing-keys` maps each range of releases to the key that signs it, so a replaced key keeps
+verifying the releases it signed and nothing later; the open range's key is `release-signing.pub`. The consumers verify the same way and
 fail closed for a signed release: `setup-abla` (the toolchain archive), `tools/bootstrap-compiler.sh` (the seed, besides
-its pinned sha256), `tools/release-pin.sh` (the release it pins) and `tools/release-check.sh` (the `signature` check,
-a SKIP before publish: the publish job signs). Releases before the first signed one have only the checksum files; the
+its pinned sha256), `tools/release-pin.sh` (the release it pins) and `tools/release-check.sh` (the `signature` check, and
+the `sbom` check that the bill of materials lists exactly the assets with their sha256; both are SKIP before publish,
+since the publish job makes and signs them). Releases before the first signed one have only the checksum files; the
 bootstrap seed's pinned sha256 in the repository covers them. `tools/test-release-signing.sh` runs the accept and
 refuse cases with throwaway keys.
 

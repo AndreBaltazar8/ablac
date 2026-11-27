@@ -138,7 +138,7 @@ if [[ $(printf '%s\n%s\n' "$first_signed" "$tag" | sort -V | head -n 1) == "$fir
             names+=("$artifact")
         fi
     done
-    "$root/tools/verify-release.sh" --key "$root/release-signing.pub" "$work/signed" "${names[@]}" ||
+    "$root/tools/verify-release.sh" --version "$tag" "$work/signed" "${names[@]}" ||
         { echo "release-pin: $tag's signature does not verify, refusing to pin it" >&2; exit 1; }
 fi
 

@@ -58,4 +58,5 @@ fi
 )
 cp "$scratch/SHA256SUMS" "$dir/SHA256SUMS"
 ssh-keygen -Y sign -f "$key" -n abla-release "$dir/SHA256SUMS" >/dev/null
-"$here/verify-release.sh" "$dir"
+# With --tag, the key of that version's range in tools/release-signing-keys (and its own bill of materials); without, release-signing.pub.
+if [[ -n $tag ]]; then "$here/verify-release.sh" --version "$tag" "$dir"; else "$here/verify-release.sh" "$dir"; fi

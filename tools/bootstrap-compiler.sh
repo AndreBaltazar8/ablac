@@ -82,7 +82,7 @@ if signature_required; then
         curl --fail --location --retry 3 --output "$signed/SHA256SUMS.sig" "$base/SHA256SUMS.sig" ||
         { printf 'bootstrap compiler %s: no signed SHA256SUMS in its release; refusing it\n' "$version" >&2; exit 1; }
     ln -f "$temporary" "$signed/$artifact" 2>/dev/null || cp "$temporary" "$signed/$artifact"
-    "$project_root/tools/verify-release.sh" "$signed" "$artifact" >&2 || exit 1
+    "$project_root/tools/verify-release.sh" --version "$version" "$signed" "$artifact" >&2 || exit 1
 fi
 
 chmod +x "$temporary"
