@@ -461,7 +461,9 @@ valgrind --error-exitcode=9 --suppressions=tools/valgrind.supp ./app
 `tools/test-valgrind.sh` runs standard-library programs this way, with and
 without `ABLA_GC_STRESS=1`, and requires that memcheck reports nothing. It
 also requires reports for two planted uses of freed memory read through the
-runtime's `memcpy` (`tests/cases/valgrind/use-after-free.ab`), and that a
+runtime's `memcpy` (`tests/cases/valgrind/use-after-free.ab`) and for a
+planted runtime bug (built from a copy of the standard library whose collector
+writes into each object it has just freed, reported in the sweep), and that a
 plain build next to a valgrind one shares no prebuilt runtime object.
 `tools/valgrind.supp` is where a runtime report that cannot be avoided would
 go, with its reason. There is none.
