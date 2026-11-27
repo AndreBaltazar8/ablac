@@ -1,0 +1,289 @@
+// sealed_when_check (#648): `when` over a sealed subject whose arms are all `is` and that has no else, the shape whose last
+// arm is lowered without a type test and without a non-exhaustive panic. Each check declares its own hierarchy: a sealed
+// interface S with a method, a sub-interface R (B and C) and classes A and D, and a generic sealed Res<T> (Ok, Err). The
+// arms cover the classes in a random order and grouping: a class, the interface R as one arm or B and C apart, shared
+// groups `is A, is D -> ...`, so that any of them can be last. Forms: an expression `when` over a subject that counts its
+// evaluations (it must run once per `when`), a statement `when` in a loop whose arms add, continue, break or return, a
+// generic Res<int> or Res<string> subject, a nullable subject with a `null` arm anywhere (that one keeps every test),
+// and a `when` nested in another's arm. The generator evaluates each the same way; the check compares its text.
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+
+val SW_MODULUS = 1000003
+
+/** The tag each class's method gives for `v` (A, B, C, D). */
+fun swTag(cls: int, v: int): int = if (cls == 0) v * 3 + 1 else if (cls == 1) v * 5 + 2 else if (cls == 2) v * 7 + 3 else v * 11 + 4
+
+fun swMix(total: int, value: int): int = ((total * 31 + value) % SW_MODULUS + SW_MODULUS) % SW_MODULUS
+
+/** One arm: the classes it covers (0 A, 1 B, 2 C, 3 D), its patterns, and its value: kind 0 a constant `c`, 1 `s.tag()`,
+ *  2 `s.v * c` (a single class arm only). */
+class SwArm(val classes: array<int>, val patterns: array<string>, val kind: int, val c: int)
+
+fun swClassName(cls: int, index: int): string = ["SwA", "SwB", "SwC", "SwD"][cls] + "$index"
+
+fun FuzzGen.swArms(index: int): array<SwArm> {
+    // units: A, D, and either R (B and C under one pattern) or B and C apart
+    val unitClasses: array<array<int>> = [[0], [3]]
+    val unitPatterns: array<string> = ["is SwA$index", "is SwD$index"]
+    if (this.r.chance(0.5)) {
+        unitClasses.append([1, 2])
+        unitPatterns.append("is SwR$index")
+    } else {
+        unitClasses.append([1])
+        unitPatterns.append("is SwB$index")
+        unitClasses.append([2])
+        unitPatterns.append("is SwC$index")
+    }
+    val order = this.r.permutation(unitClasses.size, unitClasses.size)
+    val arms: array<SwArm> = []
+    var at = 0
+    while (at < order.size) {
+        val take = if (at + 1 < order.size && this.r.chance(0.3)) 2 else 1
+        val classes: array<int> = []
+        val patterns: array<string> = []
+        for (k in 0 until take) {
+            for (cls in unitClasses[order[at + k]]) classes.append(cls)
+            patterns.append(unitPatterns[order[at + k]])
+        }
+        at = at + take
+        val single = classes.size == 1
+        val kind = if (single) this.r.below(3) else this.r.below(2)
+        arms.append(SwArm(classes, patterns, kind, this.r.range(-20, 99)))
+    }
+    arms
+}
+
+fun swArmOf(arms: array<SwArm>, cls: int): SwArm {
+    for (arm in arms) {
+        for (c in arm.classes) {
+            if (c == cls) return arm
+        }
+    }
+    arms[0]
+}
+
+fun swArmIndex(arms: array<SwArm>, cls: int): int {
+    for (k in 0 until arms.size) {
+        for (c in arms[k].classes) {
+            if (c == cls) return k
+        }
+    }
+    0
+}
+
+fun swArmValue(arm: SwArm, cls: int, v: int): int = if (arm.kind == 0) arm.c else if (arm.kind == 1) swTag(cls, v) else v * arm.c
+
+fun swArmText(arm: SwArm): string =
+    if (arm.kind == 0) "(${arm.c})" else if (arm.kind == 1) "s.tag()" else "s.v * (${arm.c})"
+
+fun swArmsText(arms: array<SwArm>, bodies: array<string>): string {
+    val parts: array<string> = []
+    for (k in 0 until arms.size) parts.append("${textJoin(arms[k].patterns, ", ")} -> ${bodies[k]}")
+    textJoin(parts, "; ")
+}
+
+fun FuzzGen.sealedWhenCheck(index: int): FuzzCheck {
+    val sealed = "SwS$index"
+    val lines: array<string> = [
+        "sealed interface $sealed {",
+        "    fun tag(): int",
+        "}",
+        "interface SwR$index : $sealed",
+        "class SwA$index(val v: int) : $sealed {",
+        "    fun tag(): int = this.v * 3 + 1",
+        "}",
+        "class SwB$index(val v: int) : SwR$index {",
+        "    fun tag(): int = this.v * 5 + 2",
+        "}",
+        "class SwC$index(val v: int) : SwR$index {",
+        "    fun tag(): int = this.v * 7 + 3",
+        "}",
+        "class SwD$index(val v: int) : $sealed {",
+        "    fun tag(): int = this.v * 11 + 4",
+        "}",
+        "sealed interface SwRes$index<T>",
+        "class SwOk$index<T>(val value: T) : SwRes$index<T>",
+        "class SwErr$index<T>(val code: int) : SwRes$index<T>",
+        "var swPicks$index = 0",
+        "fun swPick$index(items: array<$sealed>, k: int): $sealed {",
+        "    swPicks$index += 1",
+        "    items[k]",
+        "}",
+        "fun swMix$index(total: int, value: int): int = ((total * 31 + value) % $SW_MODULUS + $SW_MODULUS) % $SW_MODULUS"]
+    val body: array<string> = ["    var out = \"\""]
+    // the items: classes and values
+    val count = this.r.range(2, 6)
+    val classes: array<int> = []
+    val values: array<int> = []
+    val made: array<string> = []
+    for (k in 0 until count) {
+        val cls = this.r.below(4)
+        val v = this.r.range(-5, 40)
+        classes.append(cls)
+        values.append(v)
+        made.append("${swClassName(cls, index)}(${fuzzIntConst(v, "int")})")
+    }
+    body.append("    val items: array<$sealed> = [${textJoin(made, ", ")}]")
+    val expected: array<string> = []
+    var picks = 0
+    val forms = this.r.range(2, 4)
+    for (f in 0 until forms) {
+        val form = this.r.below(5)
+        val arms = this.swArms(index)
+        if (form == 0) {
+            // an expression `when` over a counted subject
+            // a call as the subject: the arms cannot name it, so constants; else the subject is bound to `s` first
+            val direct = this.r.chance(0.5)
+            if (direct) {
+                for (k in 0 until arms.size) arms[k] = SwArm(arms[k].classes, arms[k].patterns, 0, arms[k].c)
+            }
+            val bodies: array<string> = []
+            for (arm in arms) bodies.append(swArmText(arm))
+            body.append("    var t${f} = 0")
+            body.append("    for (k in 0 until items.size) {")
+            if (!direct) body.append("        val s = swPick$index(items, k)")
+            body.append("        val r = when (${if (direct) "swPick$index(items, k)" else "s"}) { ${swArmsText(arms, bodies)} }")
+            body.append("        t$f = swMix$index(t$f, r)")
+            body.append("    }")
+            body.append("    out = out + \"\$t$f;\"")
+            var total = 0
+            for (k in 0 until count) total = swMix(total, swArmValue(swArmOf(arms, classes[k]), classes[k], values[k]))
+            picks = picks + count
+            expected.append("$total;")
+        } else if (form == 1) {
+            // a statement `when` in a loop: each arm adds, continues, breaks or returns
+            val actions: array<int> = []
+            val bodies: array<string> = []
+            for (arm in arms) {
+                val action = this.r.below(4)
+                actions.append(action)
+                val value = swArmText(arm)
+                bodies.append(if (action == 0) "acc = swMix$index(acc, $value)" else if (action == 1) "continue"
+                    else if (action == 2) "break" else "return acc * 7 + ($value)")
+            }
+            lines.append("fun swLoop${index}x$f(items: array<$sealed>): int {")
+            lines.append("    var acc = 1")
+            lines.append("    for (s in items) {")
+            lines.append("        when (s) { ${swArmsText(arms, bodies)} }")
+            lines.append("        acc = acc + 1")
+            lines.append("    }")
+            lines.append("    acc")
+            lines.append("}")
+            body.append("    out = out + \"\${swLoop${index}x$f(items)};\"")
+            var acc = 1
+            var result = 0
+            var returned = false
+            for (k in 0 until count) {
+                if (returned) break
+                val at = swArmIndex(arms, classes[k])
+                val value = swArmValue(arms[at], classes[k], values[k])
+                val action = actions[at]
+                if (action == 1) continue
+                if (action == 2) break
+                if (action == 3) {
+                    result = acc * 7 + value
+                    returned = true
+                } else {
+                    acc = swMix(acc, value)
+                    acc = acc + 1
+                }
+            }
+            expected.append("${if (returned) result else acc};")
+        } else if (form == 2) {
+            // a generic sealed subject
+            val text = this.r.chance(0.5)
+            val ty = if (text) "string" else "int"
+            val okFirst = this.r.chance(0.5)
+            val made2: array<string> = []
+            var total = 0
+            for (k in 0 until this.r.range(1, 4)) {
+                if (this.r.chance(0.5)) {
+                    val word = this.r.pick(["", "a", "héllo", "日本"])
+                    val n = this.r.range(0, 50)
+                    made2.append(if (text) "SwOk$index<string>(\"$word\")" else "SwOk$index<int>($n)")
+                    total = swMix(total, if (text) word.size else n)
+                } else {
+                    val code = this.r.range(0, 50)
+                    made2.append("SwErr$index<$ty>($code)")
+                    total = swMix(total, 0 - code)
+                }
+            }
+            val okArm = "is SwOk$index<$ty> -> ${if (text) "r.value.size" else "r.value"}"
+            val errArm = "is SwErr$index<$ty> -> -r.code"
+            body.append("    var g$f = 0")
+            body.append("    val rs$f: array<SwRes$index<$ty>> = [${textJoin(made2, ", ")}]")
+            body.append("    for (x in rs$f) {")
+            body.append("        g$f = swMix$index(g$f, when (x) { ${(if (okFirst) okArm + "; " + errArm else errArm + "; " + okArm).replace("r.", "x.")} })")
+            body.append("    }")
+            body.append("    out = out + \"\$g$f;\"")
+            expected.append("$total;")
+        } else if (form == 3) {
+            // a nullable subject with a `null` arm anywhere
+            val bodies: array<string> = []
+            for (arm in arms) bodies.append(swArmText(arm))
+            val nullValue = this.r.range(-9, 9)
+            val parts: array<string> = []
+            val nullAt = this.r.below(arms.size + 1)
+            for (k in 0 until arms.size) {
+                if (k == nullAt) parts.append("null -> ($nullValue)")
+                parts.append("${textJoin(arms[k].patterns, ", ")} -> ${bodies[k]}")
+            }
+            if (nullAt == arms.size) parts.append("null -> ($nullValue)")
+            val nulls: array<bool> = []
+            for (k in 0 until count) nulls.append(this.r.chance(0.3))
+            body.append("    var n$f = 0")
+            body.append("    for (k in 0 until items.size) {")
+            val pattern: array<string> = []
+            for (k in 0 until count) pattern.append(if (nulls[k]) "true" else "false")
+            body.append("        val s: $sealed? = if ([${textJoin(pattern, ", ")}][k]) null else items[k]")
+            body.append("        n$f = swMix$index(n$f, when (s) { ${textJoin(parts, "; ")} })")
+            body.append("    }")
+            body.append("    out = out + \"\$n$f;\"")
+            var total = 0
+            for (k in 0 until count) {
+                total = swMix(total, if (nulls[k]) nullValue else swArmValue(swArmOf(arms, classes[k]), classes[k], values[k]))
+            }
+            expected.append("$total;")
+        } else {
+            // a `when` nested in an arm of another: the inner subject is the next item, counted too
+            val inner = this.swArms(index)
+            for (k in 0 until inner.size) inner[k] = SwArm(inner[k].classes, inner[k].patterns, 0, inner[k].c)
+            val innerBodies: array<string> = []
+            for (arm in inner) innerBodies.append(swArmText(arm))
+            val nestAt = this.r.below(arms.size)
+            val bodies: array<string> = []
+            for (k in 0 until arms.size) {
+                bodies.append(if (k == nestAt) "(when (swPick$index(items, (k + 1) % items.size)) { ${swArmsText(inner, innerBodies)} }) + 1000"
+                    else swArmText(arms[k]))
+            }
+            body.append("    var w$f = 0")
+            body.append("    for (k in 0 until items.size) {")
+            body.append("        val s = items[k]")
+            body.append("        w$f = swMix$index(w$f, when (s) { ${swArmsText(arms, bodies)} })")
+            body.append("    }")
+            body.append("    out = out + \"\$w$f;\"")
+            var total = 0
+            for (k in 0 until count) {
+                val at = swArmIndex(arms, classes[k])
+                var value = swArmValue(arms[at], classes[k], values[k])
+                if (at == nestAt) {
+                    val next = (k + 1) % count
+                    value = swArmValue(swArmOf(inner, classes[next]), classes[next], values[next]) + 1000
+                    picks = picks + 1
+                }
+                total = swMix(total, value)
+            }
+            expected.append("$total;")
+        }
+    }
+    body.append("    val actual = out + \"picks=\$swPicks$index\"")
+    body.append("    val swExpected = \"${textJoin(expected, "")}picks=$picks\"")
+    body.append("    if (swExpected != actual) return \"FUZZ_ORACLE_FAILURE:\" + actual")
+    body.append("    actual")
+    lines.append("fun c$index(): string {")
+    for (line in body) lines.append(line)
+    lines.append("}")
+    FuzzCheck(lines, "c$index()", "str", index)
+}
