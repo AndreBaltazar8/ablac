@@ -92,10 +92,30 @@ fun KernelU8Buffer.loadU16(index: int): int = this.load(index) | (this.load(inde
 fun KernelU8Buffer.loadU32(index: int): int =
     this.load(index) | (this.load(index + 1) << 8) | (this.load(index + 2) << 16) | (this.load(index + 3) << 24)
 
+/** Byte `index` as a signed byte, -128 to 127 (GGML's Q8 quants), or 0 when `index` is outside the buffer. */
+fun KernelU8Buffer.loadS8(index: int): int = (this.load(index) ^ 128) - 128
+
+/** The four little-endian u32 at bytes `index` to `index + 15`, at any alignment (bytes outside the buffer count 0), as
+ *  loadU32 reads each. A trusted kernel that shows the 16 bytes are inside and 16-byte aligned reads them in one load
+ *  with loadU32x4Aligned. */
+fun KernelU8Buffer.loadU32x4(index: int): u32x4 =
+    u32x4(u32(this.loadU32(index)), u32(this.loadU32(index + 4)), u32(this.loadU32(index + 8)), u32(this.loadU32(index + 12)))
+
 /** Elements `index` to `index + 3` as one vector, each 0 when outside the buffer. On a GPU, four elements inside the buffer
  *  at a 16-byte-aligned address are one 16-byte load (CUDA's float4); anywhere else, four loads. */
 fun KernelF32Buffer.load4(index: int): f32x4 =
     f32x4(this.load(index), this.load(index + 1), this.load(index + 2), this.load(index + 3))
+
+/** Elements `index` to `index + 3` as one vector, each 0 when outside the buffer. On a GPU, four elements inside the buffer
+ *  at a 16-byte-aligned address are one 16-byte load (CUDA's uint4); anywhere else, four loads. */
+fun KernelU32Buffer.loadU32x4(index: int): u32x4 =
+    u32x4(u32(this.load(index)), u32(this.load(index + 1)), u32(this.load(index + 2)), u32(this.load(index + 3)))
+
+/** Stores the four lanes of `value` as elements `index` to `index + 3`, each only when inside the buffer. On a GPU, four
+ *  elements inside the buffer at a 16-byte-aligned address are one 16-byte store; anywhere else, four stores. */
+fun KernelU32Buffer.storeU32x4(index: int, value: u32x4): void {
+    for (lane in 0 until 4) this.store(index + lane, int(value.get(lane)))
+}
 
 /** Whether element `index`'s address is a multiple of `bytes` (a power of two), so a kernel can pick its aligned fast
  *  path once (a buffer may start anywhere: an offset into device memory). Reads no memory. */
@@ -171,6 +191,29 @@ trusted fun KernelU8Buffer.loadU32Aligned(index: int): int {
         panic("KernelU8Buffer.loadU32Aligned: index $index outside a buffer of ${this.count} or not 4-byte aligned")
     }
     ablaUnsafeLoadU32(nativePointerFromAddress(this.address + index))
+}
+
+/** Elements `index` to `index + 3` as one 16-byte load, which the caller guarantees are inside the buffer at a 16-byte-
+ *  aligned address (see the unchecked fast path). */
+@__abla_trusted_only("error: use loadU32x4(index), which checks the index and the alignment; loadU32x4Aligned is for trusted kernels that show both")
+trusted fun KernelU32Buffer.loadU32x4Aligned(index: int): u32x4 {
+    if (index < 0 || index + 3 >= this.count || (this.address + index * 4) % 16 != 0) {
+        panic("KernelU32Buffer.loadU32x4Aligned: index $index outside a buffer of ${this.count} or not 16-byte aligned")
+    }
+    u32x4(u32(this.loadUnchecked(index)), u32(this.loadUnchecked(index + 1)), u32(this.loadUnchecked(index + 2)),
+        u32(this.loadUnchecked(index + 3)))
+}
+
+/** The four little-endian u32 at bytes `index` to `index + 15` as one 16-byte load: the caller guarantees the 16 bytes are
+ *  inside the buffer at a 16-byte-aligned address (see the unchecked fast path). */
+@__abla_trusted_only("error: use loadU32x4(index), which checks the index and the alignment; loadU32x4Aligned is for trusted kernels that show both")
+trusted fun KernelU8Buffer.loadU32x4Aligned(index: int): u32x4 {
+    if (index < 0 || index + 15 >= this.count || (this.address + index) % 16 != 0) {
+        panic("KernelU8Buffer.loadU32x4Aligned: index $index outside a buffer of ${this.count} or not 16-byte aligned")
+    }
+    val at = this.address + index
+    u32x4(u32(ablaUnsafeLoadU32(nativePointerFromAddress(at))), u32(ablaUnsafeLoadU32(nativePointerFromAddress(at + 4))),
+        u32(ablaUnsafeLoadU32(nativePointerFromAddress(at + 8))), u32(ablaUnsafeLoadU32(nativePointerFromAddress(at + 12))))
 }
 
 // Where the CPU backend is in a launch: the thread kernelRunCpu is running. One launch at a time. Private to this module: its shared

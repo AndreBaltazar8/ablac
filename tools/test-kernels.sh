@@ -66,6 +66,12 @@ status=0
 [[ $status != 0 ]] || fail "refused-unchecked built"
 grep -q "error\[E_SEMANTIC\]: native\.trust:.*loadUnchecked" "$out/refused-unchecked.log" ||
     fail "refused-unchecked: no native.trust error naming loadUnchecked: $(head -3 "$out/refused-unchecked.log")"
+status=0
+"$compiler" build "$cases/refused-unchecked-wide.ab" -o "$out/refused-unchecked-wide" --fast --no-cache > "$out/refused-unchecked-wide.log" 2>&1 ||
+    status=$?
+[[ $status != 0 ]] || fail "refused-unchecked-wide built"
+grep -q "error\[E_SEMANTIC\]: native\.trust:.*loadU32x4Aligned" "$out/refused-unchecked-wide.log" ||
+    fail "refused-unchecked-wide: no native.trust error naming loadU32x4Aligned: $(head -3 "$out/refused-unchecked-wide.log")"
 "$compiler" build "$cases/unchecked-cpu.ab" -o "$out/unchecked-cpu" --fast --no-cache > "$out/unchecked-cpu.log" 2>&1 ||
     fail "unchecked-cpu did not build: $(head -4 "$out/unchecked-cpu.log")"
 status=0
@@ -94,7 +100,7 @@ if [[ -n $library ]]; then
         grep -q "GPU equal to CPU true" "$out/kernel-cuda.out" && grep -q "within 1e-5 of CPU true" "$out/kernel-cuda.out" &&
             grep -q "on the GPU and the CPU true" "$out/kernel-cuda.out" &&
             grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" &&
-            grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" && grep -q "quad4: .* true" "$out/kernel-cuda.out" &&
+            grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" && grep -q "quad4: .* true" "$out/kernel-cuda.out" && grep -q "words4: .* true" "$out/kernel-cuda.out" &&
             grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" &&
             grep -q "launch guards: .* true" "$out/kernel-cuda.out" && grep -q "edge indices: .* true" "$out/kernel-cuda.out" ||
             fail "kernel-cuda: $(cat "$out/kernel-cuda.out")"

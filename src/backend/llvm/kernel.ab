@@ -162,6 +162,7 @@ fun bootstrapKernelLlvmType(type: string): string {
     if (type == "f32") return "float"
     if (type == "f64") return "double"
     if (type == "f32x4") return "<4 x float>"
+    if (type == "u32x4") return "<4 x i32>"
     ""
 }
 
@@ -521,11 +522,13 @@ fun bootstrapKernelUncheckedLoad(
     val address = bootstrapKernelFresh(state)
     bootstrapKernelLine(state, "$address = getelementptr inbounds $element, ptr ${buffer.operand}, i64 $index")
     val loadType = if (wide == "") element else wide
-    val align = if (loadType == "<4 x float>") 16 else if (loadType == "i8") 1 else if (loadType == "i16") 2 else 4
+    val align = if (loadType == "<4 x float>" || loadType == "<4 x i32>") 16 else if (loadType == "i8") 1 else if (loadType == "i16") 2 else 4
     val loaded = bootstrapKernelFresh(state)
     bootstrapKernelLine(state, "$loaded = load $loadType, ptr $address, align $align")
     if (loadType == "<4 x float>") {
         bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(loaded, "f32x4", ""))
+    } else if (loadType == "<4 x i32>") {
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(loaded, "u32x4", ""))
     } else if (loadType == "float") {
         bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(loaded, "f32", ""))
     } else {
@@ -535,18 +538,12 @@ fun bootstrapKernelUncheckedLoad(
     }
 }
 
-/** KernelF32Buffer.load4: elements index..index + 3 as an f32x4, each 0 outside the buffer. When all four are inside and
- *  the address is 16-byte aligned it is one vector load (ld.v4.f32), else four bounds-checked loads. */
-fun bootstrapKernelLoad4(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState, instruction: BootstrapInstruction): void {
-    if (instruction.operands.size < 2) { bootstrapKernelFail(emitter, state.name, "operation", instruction.text); return }
-    val buffer = bootstrapKernelGet(state, instruction.operands[0])
-    if (buffer.type != "buffer.f32") { bootstrapKernelFail(emitter, state.name, "type", buffer.type); return }
-    val index = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
-    if (index == "") return
-    state.counter = state.counter + 1
-    val label = "kv${state.counter}"
-    val address = bootstrapKernelFresh(state)
-    bootstrapKernelLine(state, "$address = getelementptr float, ptr ${buffer.operand}, i64 $index")
+/** Whether all four elements `index`..`index + 3` of `buffer` are inside it and the first is 16-byte aligned (an i1), with
+ *  its address in `address`: the test KernelF32Buffer.load4, KernelU32Buffer.loadU32x4 and storeU32x4 take one 16-byte
+ *  access on. */
+fun bootstrapKernelVectorFast(var state: BootstrapKernelFunctionState, buffer: BootstrapKernelValue, element: string,
+    index: string, address: string): string {
+    bootstrapKernelLine(state, "$address = getelementptr $element, ptr ${buffer.operand}, i64 $index")
     val last = bootstrapKernelFresh(state)
     bootstrapKernelLine(state, "$last = add i64 $index, 3")
     val inside = bootstrapKernelFresh(state)
@@ -563,11 +560,74 @@ fun bootstrapKernelLoad4(var emitter: BootstrapKernelEmitter, var state: Bootstr
     bootstrapKernelLine(state, "$both = and i1 $inside, $nonNegative")
     val fast = bootstrapKernelFresh(state)
     bootstrapKernelLine(state, "$fast = and i1 $both, $aligned")
+    fast
+}
+
+/** KernelU32Buffer.storeU32x4: the four lanes as elements index..index + 3, each stored only inside the buffer. When all
+ *  four are inside and the address is 16-byte aligned it is one vector store (st.v4.u32), else four checked stores. */
+fun bootstrapKernelStore4(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState, instruction: BootstrapInstruction): void {
+    if (instruction.operands.size < 3) { bootstrapKernelFail(emitter, state.name, "operation", instruction.text); return }
+    val buffer = bootstrapKernelGet(state, instruction.operands[0])
+    if (buffer.type != "buffer.u32") { bootstrapKernelFail(emitter, state.name, "type", buffer.type); return }
+    val index = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
+    val value = bootstrapKernelGet(state, instruction.operands[2])
+    if (index == "") return
+    if (value.type != "u32x4") { bootstrapKernelFail(emitter, state.name, "type", value.type); return }
+    state.counter = state.counter + 1
+    val label = "ks${state.counter}"
+    val address = bootstrapKernelFresh(state)
+    val fast = bootstrapKernelVectorFast(state, buffer, "i32", index, address)
+    bootstrapKernelLine(state, "br i1 $fast, label %$label.vector, label %$label.l0")
+    state.terminated = true
+    bootstrapKernelBlock(state, "$label.vector")
+    bootstrapKernelLine(state, "store <4 x i32> ${value.operand}, ptr $address, align 16")
+    bootstrapKernelLine(state, "br label %$label.end")
+    state.terminated = true
+    var lane = 0
+    while (lane < 4) {
+        val next = if (lane == 3) "$label.end" else "$label.l${lane + 1}"
+        bootstrapKernelBlock(state, "$label.l$lane")
+        val laneIndex = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$laneIndex = add i64 $index, $lane")
+        val laneInside = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$laneInside = icmp ult i64 $laneIndex, ${buffer.count}")
+        bootstrapKernelLine(state, "br i1 $laneInside, label %$label.l$lane.in, label %$next")
+        state.terminated = true
+        bootstrapKernelBlock(state, "$label.l$lane.in")
+        val laneAddress = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$laneAddress = getelementptr inbounds i32, ptr ${buffer.operand}, i64 $laneIndex")
+        val laneValue = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$laneValue = extractelement <4 x i32> ${value.operand}, i32 $lane")
+        bootstrapKernelLine(state, "store i32 $laneValue, ptr $laneAddress, align 4")
+        bootstrapKernelLine(state, "br label %$next")
+        state.terminated = true
+        lane = lane + 1
+    }
+    bootstrapKernelBlock(state, "$label.end")
+    bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("", "void", ""))
+}
+
+/** KernelF32Buffer.load4 and KernelU32Buffer.loadU32x4: elements index..index + 3 as an f32x4 or u32x4, each 0 outside
+ *  the buffer. When all four are inside and the address is 16-byte aligned it is one vector load (ld.v4.f32, ld.v4.u32),
+ *  else four bounds-checked loads. */
+fun bootstrapKernelLoad4(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState, instruction: BootstrapInstruction): void {
+    if (instruction.operands.size < 2) { bootstrapKernelFail(emitter, state.name, "operation", instruction.text); return }
+    val buffer = bootstrapKernelGet(state, instruction.operands[0])
+    if (buffer.type != "buffer.f32" && buffer.type != "buffer.u32") { bootstrapKernelFail(emitter, state.name, "type", buffer.type); return }
+    val float = buffer.type == "buffer.f32"
+    val element = if (float) "float" else "i32"
+    val zero = if (float) "0.0" else "0"
+    val index = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
+    if (index == "") return
+    state.counter = state.counter + 1
+    val label = "kv${state.counter}"
+    val address = bootstrapKernelFresh(state)
+    val fast = bootstrapKernelVectorFast(state, buffer, element, index, address)
     bootstrapKernelLine(state, "br i1 $fast, label %$label.vector, label %$label.scalar")
     state.terminated = true
     bootstrapKernelBlock(state, "$label.vector")
     val vector = bootstrapKernelFresh(state)
-    bootstrapKernelLine(state, "$vector = load <4 x float>, ptr $address, align 16")
+    bootstrapKernelLine(state, "$vector = load <4 x $element>, ptr $address, align 16")
     bootstrapKernelLine(state, "br label %$label.end")
     state.terminated = true
     bootstrapKernelBlock(state, "$label.scalar")
@@ -585,22 +645,22 @@ fun bootstrapKernelLoad4(var emitter: BootstrapKernelEmitter, var state: Bootstr
         state.terminated = true
         bootstrapKernelBlock(state, "$laneLabel.in")
         val laneAddress = bootstrapKernelFresh(state)
-        bootstrapKernelLine(state, "$laneAddress = getelementptr inbounds float, ptr ${buffer.operand}, i64 $laneIndex")
+        bootstrapKernelLine(state, "$laneAddress = getelementptr inbounds $element, ptr ${buffer.operand}, i64 $laneIndex")
         val laneValue = bootstrapKernelFresh(state)
-        bootstrapKernelLine(state, "$laneValue = load float, ptr $laneAddress, align 4")
+        bootstrapKernelLine(state, "$laneValue = load $element, ptr $laneAddress, align 4")
         bootstrapKernelBlock(state, "$laneLabel.end")
         val joined = bootstrapKernelFresh(state)
-        bootstrapKernelLine(state, "$joined = phi float [ $laneValue, %$laneLabel.in ], [ 0.0, %$before ]")
+        bootstrapKernelLine(state, "$joined = phi $element [ $laneValue, %$laneLabel.in ], [ $zero, %$before ]")
         val next = bootstrapKernelFresh(state)
-        bootstrapKernelLine(state, "$next = insertelement <4 x float> $built, float $joined, i32 $lane")
+        bootstrapKernelLine(state, "$next = insertelement <4 x $element> $built, $element $joined, i32 $lane")
         built = next
         lane = lane + 1
     }
     val scalarEnd = state.block
     bootstrapKernelBlock(state, "$label.end")
     val result = bootstrapKernelFresh(state)
-    bootstrapKernelLine(state, "$result = phi <4 x float> [ $vector, %$label.vector ], [ $built, %$scalarEnd ]")
-    bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, "f32x4", ""))
+    bootstrapKernelLine(state, "$result = phi <4 x $element> [ $vector, %$label.vector ], [ $built, %$scalarEnd ]")
+    bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, if (float) "f32x4" else "u32x4", ""))
 }
 
 /** A call to abla/kernel's ids, subgroup operations and fma, which each backend answers itself; false when `name` is
@@ -681,24 +741,34 @@ fun bootstrapKernelBuiltin(
     } else if (name == "extension_KernelF32Buffer_load4Aligned") {
         bootstrapKernelUncheckedLoad(emitter, state, instruction, "<4 x float>")
         return true
+    } else if (name == "extension_KernelU32Buffer_loadU32x4Aligned" || name == "extension_KernelU8Buffer_loadU32x4Aligned") {
+        bootstrapKernelUncheckedLoad(emitter, state, instruction, "<4 x i32>")
+        return true
+    } else if (name == "extension_KernelU32Buffer_loadU32x4") {
+        bootstrapKernelLoad4(emitter, state, instruction)
+        return true
+    } else if (name == "extension_KernelU32Buffer_storeU32x4") {
+        bootstrapKernelStore4(emitter, state, instruction)
+        return true
     } else if (name == "extension_KernelU8Buffer_loadU16Aligned" || name == "extension_KernelU8Buffer_loadU32Aligned") {
         bootstrapKernelUncheckedLoad(emitter, state, instruction, if (name == "extension_KernelU8Buffer_loadU16Aligned") "i16" else "i32")
         return true
     } else if (name == "extension_KernelF32Buffer_load4") {
         bootstrapKernelLoad4(emitter, state, instruction)
         return true
-    } else if (name == "extension_f32x4_get") {
-        // A lane of an f32x4 (the index taken modulo 4: a kernel has no panic to stop with).
+    } else if (name == "extension_f32x4_get" || name == "extension_u32x4_get") {
+        // A lane of an f32x4 or u32x4 (the index taken modulo 4: a kernel has no panic to stop with).
         if (instruction.operands.size < 2) return false
+        val float = name == "extension_f32x4_get"
         val vector = bootstrapKernelGet(state, instruction.operands[0])
-        if (vector.type != "f32x4") { bootstrapKernelFail(emitter, state.name, "type", vector.type); return true }
+        if (vector.type != (if (float) "f32x4" else "u32x4")) { bootstrapKernelFail(emitter, state.name, "type", vector.type); return true }
         val lane = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[1]), "i64")
         if (lane == "") return true
         val masked = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$masked = and i64 $lane, 3")
         result = bootstrapKernelFresh(state)
-        bootstrapKernelLine(state, "$result = extractelement <4 x float> ${vector.operand}, i64 $masked")
-        type = "f32"
+        bootstrapKernelLine(state, "$result = extractelement ${bootstrapKernelLlvmType(vector.type)} ${vector.operand}, i64 $masked")
+        type = if (float) "f32" else "u32"
     } else if (name == "kernelSharedF32" || name == "kernelSharedU32") {
         // A group's shared memory: an addrspace(3) array per call, its size the constant count.
         if (instruction.operands.size < 1) return false
@@ -911,20 +981,23 @@ fun bootstrapKernelIntrinsic(
     instruction: BootstrapInstruction
 ): bool {
     val name = instruction.text
-    if (name == "ablaSimd_make_f32x4") {
-        // f32x4(a, b, c, d): the four lanes in order, each converted to f32 (#1298).
+    if (name == "ablaSimd_make_f32x4" || name == "ablaSimd_make_u32x4") {
+        // f32x4(a, b, c, d) and u32x4(a, b, c, d): the four lanes in order, each converted to the lane type (#1298, #1301).
         if (instruction.operands.size != 4) return false
+        val float = name == "ablaSimd_make_f32x4"
+        val laneType = if (float) "f32" else "u32"
+        val laneLlvm = if (float) "float" else "i32"
         var vector = "poison"
         var lane = 0
         while (lane < 4) {
-            val value = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[lane]), "f32")
+            val value = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[lane]), laneType)
             if (value == "") return true
             val next = bootstrapKernelFresh(state)
-            bootstrapKernelLine(state, "$next = insertelement <4 x float> $vector, float $value, i64 $lane")
+            bootstrapKernelLine(state, "$next = insertelement <4 x $laneLlvm> $vector, $laneLlvm $value, i64 $lane")
             vector = next
             lane = lane + 1
         }
-        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(vector, "f32x4", ""))
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(vector, if (float) "f32x4" else "u32x4", ""))
         return true
     }
     if (instruction.operands.size != 1) return false

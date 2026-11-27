@@ -10,6 +10,7 @@ import "q8.ab"
 import "exp.ab"
 import "pick4.ab"
 import "quad.ab"
+import "words.ab"
 import "groups.ab"
 import "q8fast.ab"
 import "guards.ab"
@@ -135,6 +136,70 @@ trusted fun main: int {
         if (floatAt(cpuQuad, i) != f32(0.0)) quadNonzero = quadNonzero + 1
     }
     println("quad4: $quadCount built f32x4 dots, GPU bits equal to CPU ${quadEqual && quadNonzero > quadCount / 2}")
+
+    // words4 (#1301): u32x4 loads and stores and signed bytes, at word offsets 0 (one 16-byte access on the GPU) and 1
+    // (four), the last thread's reads and store partly past the buffers' ends; words4Aligned, the trusted one-load forms,
+    // gives the checked kernel's words wherever it runs.
+    val wordThreads = 1000
+    val srcCount = wordThreads * 4 + 1
+    val byteCount = wordThreads * 16 - 3
+    val dstCount = wordThreads * 4 - 2
+    val srcData = nativeByteBuffer(srcCount * 4)
+    for (k in 0 until srcCount) storeWord(srcData, k * 4, (k * 2654435761 + 12345) & 0xffffffff)
+    val byteData = nativeByteBuffer(byteCount)
+    for (k in 0 until byteCount) byteData.store(k, (k * 151 + k / 7) & 255)
+    val cpuSrc = KernelU32Buffer(nativePointerAddress(srcData.address), srcCount)
+    val cpuBytes = KernelU8Buffer(nativePointerAddress(byteData.address), byteCount)
+    val dsrc = device.allocate(srcCount * 4)
+    val dbytes = device.allocate(byteCount)
+    val ddst = device.allocate(dstCount * 4)
+    val dsums = device.allocate(wordThreads * 4)
+    if (dsrc == null || dbytes == null || ddst == null || dsums == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    if (!device.upload(dsrc, srcData) || !device.upload(dbytes, byteData)) { println("kernel-cuda: ${device.error}"); return 1 }
+    var wordsEqual = true
+    var negativeSums = 0
+    val checkedOffsetZero = nativeByteBuffer(dstCount * 4)
+    for (offset in [0, 1]) {
+        val cpuDst = nativeByteBuffer(dstCount * 4)
+        val cpuSums = nativeByteBuffer(wordThreads * 4)
+        for (k in 0 until dstCount) storeWord(cpuDst, k * 4, 0x55555555)
+        for (k in 0 until wordThreads) storeWord(cpuSums, k * 4, 0x55555555)
+        val gpuDst = nativeByteBuffer(dstCount * 4)
+        val gpuSums = nativeByteBuffer(wordThreads * 4)
+        val cpuDstBuffer = KernelU32Buffer(nativePointerAddress(cpuDst.address), dstCount)
+        val cpuSumsBuffer = KernelU32Buffer(nativePointerAddress(cpuSums.address), wordThreads)
+        kernelRunCpu((wordThreads + 255) / 256, 256) { words4(cpuSrc, cpuBytes, cpuDstBuffer, cpuSumsBuffer, wordThreads, offset) }
+        if (!device.upload(ddst, cpuDst) || !device.upload(dsums, cpuSums)) { println("kernel-cuda: ${device.error}"); return 1 }
+        if (!device.launch("words4", (wordThreads + 255) / 256, 256, cudaKernelArguments().buffer(dsrc.words()).buffer(dbytes.raw())
+            .buffer(ddst.words()).buffer(dsums.words()).integer(wordThreads).integer(offset)) ||
+            !device.download(ddst, gpuDst) || !device.download(dsums, gpuSums)) {
+            println("kernel-cuda: words4: ${device.error}")
+            return 1
+        }
+        val gpuDstBuffer = KernelU32Buffer(nativePointerAddress(gpuDst.address), dstCount)
+        val gpuSumsBuffer = KernelU32Buffer(nativePointerAddress(gpuSums.address), wordThreads)
+        for (k in 0 until dstCount) if (gpuDstBuffer.load(k) != cpuDstBuffer.load(k)) wordsEqual = false
+        for (k in 0 until wordThreads) {
+            if (gpuSumsBuffer.load(k) != cpuSumsBuffer.load(k)) wordsEqual = false
+            if (cpuSumsBuffer.load(k) >= 0x80000000) negativeSums = negativeSums + 1
+        }
+        // The last store is partly outside dst: its first two words are written, the last thread's loads read zeros there.
+        if (cpuDstBuffer.load(dstCount - 1) == 0x55555555) wordsEqual = false
+        if (offset == 0) for (k in 0 until dstCount) storeWord(checkedOffsetZero, k * 4, cpuDstBuffer.load(k))
+    }
+    val alignedDst = nativeByteBuffer(dstCount * 4)
+    for (k in 0 until dstCount) storeWord(alignedDst, k * 4, 0x55555555)
+    if (!device.upload(ddst, alignedDst) || !device.launch("words4Aligned", (wordThreads + 255) / 256, 256,
+        cudaKernelArguments().buffer(dsrc.words()).buffer(dbytes.raw()).buffer(ddst.words()).integer(wordThreads)) ||
+        !device.download(ddst, alignedDst)) {
+        println("kernel-cuda: words4Aligned: ${device.error}")
+        return 1
+    }
+    val alignedBuffer = KernelU32Buffer(nativePointerAddress(alignedDst.address), dstCount)
+    val checkedBuffer = KernelU32Buffer(nativePointerAddress(checkedOffsetZero.address), dstCount)
+    // Every thread but the last (whose bytes run past the end) takes the one-load path on device memory, which is aligned.
+    for (k in 0 until (wordThreads - 1) * 4) if (alignedBuffer.load(k) != checkedBuffer.load(k)) wordsEqual = false
+    println("words4: $wordThreads u32x4 quads, byte quads and signed-byte sums at offsets 0 and 1, and the aligned forms, GPU equal to CPU ${wordsEqual && negativeSums > 0}")
 
     // Atomics: countThreads over vadd's 100000 threads, and sumGroups (the last group adds the partials), twice each.
     val words = nativeByteBuffer(4 * 400)

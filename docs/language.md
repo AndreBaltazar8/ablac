@@ -3004,8 +3004,11 @@ A `@kernel` function is a GPU kernel written in ordinary Abla (#1233,
 [design/gpu-kernels.md](design/gpu-kernels.md)). It runs once per thread of a
 launch, finds its thread with abla/kernel's ids, and reads and writes memory
 only through its buffers: `KernelF32Buffer`, `KernelU32Buffer`,
-`KernelU16Buffer` and `KernelU8Buffer` (bytes, with `loadU16` and `loadU32` at
-any alignment for packed data such as GGML blocks). A buffer is an address and
+`KernelU16Buffer` and `KernelU8Buffer` (bytes, with `loadU16`, `loadU32` and
+`loadU32x4` at any alignment for packed data such as GGML blocks, and `loadS8`
+for a signed byte). `KernelU32Buffer.loadU32x4(i)` and `storeU32x4(i, v)` move
+four words as a `u32x4`, one 16-byte access on a GPU when they are inside the
+buffer and aligned. A buffer is an address and
 an element count: an index outside it loads 0 and stores nothing, on every
 backend. `KernelF32Buffer.load4(i)` reads four elements as an `f32x4`, one
 16-byte load on a GPU when they are inside the buffer and aligned; a kernel also
@@ -3060,8 +3063,9 @@ that strides by `kernelGroupSize()` runs on both.
 Every buffer access above is checked, which costs a compare and a branch per
 load. A kernel that shows its indexes are inside can skip them on the unchecked
 fast path: `loadUnchecked(index)` on every buffer, `KernelF32Buffer.load4Aligned`
-(one 16-byte load at a 16-byte-aligned address) and `KernelU8Buffer.loadU16Aligned`
-and `loadU32Aligned`. They are trusted-only
+(one 16-byte load at a 16-byte-aligned address), `loadU32x4Aligned` on
+`KernelU32Buffer` and `KernelU8Buffer` (the same for four words), and
+`KernelU8Buffer.loadU16Aligned` and `loadU32Aligned`. They are trusted-only
 ([#1226](#trusted-native-implementations)), so the kernel, and any function
 of it that calls one, is a `trusted fun` whose comment gives the argument. On
 a GPU nothing checks them: an index outside reads whatever memory is there, and
