@@ -2,7 +2,7 @@
 # An import inside a fetched dependency must not follow a symbolic link out of the dependency: `leak.ab -> /abs/file` or
 # `-> ../../file` would read a file of the developer's machine as source. The fetch keeps the link (the checkout is the
 # tree that was locked) but the build refuses to read through it, naming it; a link that stays inside the package
-# (`alias.ab -> real.ab`) works.
+# (`alias.ab -> real.ab`) works. Links are judged by where they really lead: a chain of links that each stay inside by their text is refused too.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -46,9 +46,21 @@ for case in "absolute|$test_root/outside.ab|alias.ab" "up|../../../../../outside
     grep -q "alias.ab (a symbolic link out of its package)" "$test_root/run-out-$name.log" || fail "no diagnostic naming the link ($name)" "$test_root/run-out-$name.log"
 done
 
+# A chain of links that each stay inside the package by their own text but together climb out of it (a lexical check let it through):
+# a/b -> .. (the package root), up1 -> a/b/.. (its parent), up(k+1) -> up(k)/.. up to the file system root, alias.ab -> up31/<the file>.
+# The file outside defines real(), so reading it would build and run 99.
+echo 'fun real(): int = 99' > "$test_root/outside-real.ab"
+new_dep "up31$test_root/outside-real.ab" alias.ab
+(cd "$dep" && mkdir a && ln -s .. a/b && ln -s a/b/.. up1 && for k in $(seq 1 30); do ln -s "up$k/.." "up$((k + 1))"; done)
+commit
+update out-chain || fail 'update failed (chain)' "$test_root/out-chain.log"
+status=$(run out-chain)
+[ "$status" != 99 ] || fail 'the import went through a chain of in-package links out of the package (it read the file outside)'
+grep -q "alias.ab (a symbolic link out of its package)" "$test_root/run-out-chain.log" || fail "no diagnostic naming the link (chain)" "$test_root/run-out-chain.log"
+
 new_dep real.ab alias.ab
 commit
 update inside || fail 'a link inside the package was refused' "$test_root/inside.log"
 [ "$(run inside)" = 7 ] || fail 'the package with an inner link does not build' "$test_root/run-inside.log"
 
-echo "package symlink: an import through a link leaving a fetched package is refused naming it; a link inside the package works"
+echo "package symlink: an import through a link leaving a fetched package, also by a chain of links, is refused naming it; a link inside the package works"

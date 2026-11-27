@@ -1018,29 +1018,6 @@ fun bootstrapPackageCacheValid(package: BootstrapLockedPackage): bool {
     valid && bootstrapPackageDirectoryDigest(source, false) == package.digest
 }
 
-// Whether a symbolic link at `linkPath` (relative to the package root) pointing at `target` leaves the package: an
-// absolute target, or `..` steps that climb above the root.
-fun bootstrapPackageSymlinkEscapes(linkPath: string, target: string): bool {
-    if (target.size == 0 || target[0] == 47) return true
-    var depth = 0
-    val directory = linkPath.split("/")
-    var index = 0
-    while (index + 1 < directory.size) {
-        depth = depth + 1
-        index = index + 1
-    }
-    var escapes = false
-    for (part in target.split("/")) {
-        if (part == "..") {
-            depth = depth - 1
-            if (depth < 0) escapes = true
-        } else if (part != "." && part != "") {
-            depth = depth + 1
-        }
-    }
-    escapes
-}
-
 // The root of the dependency copy (`.../.abla/packages/<name>/source` or a checked-in `.../vendor/<name>`) a module path
 // lies in, or "".
 fun bootstrapPackageCopyRootOf(path: string): string {
@@ -1098,23 +1075,27 @@ fun bootstrapPackagePublishEntry(temporary: string, root: string, package: Boots
 
 // Whether the module at `path` is reached through a symbolic link of its dependency copy that leaves the package. An
 // import inside a dependency (`import "leak.ab"`, `leak.ab -> /home/me/.ssh/id`) would otherwise read the target as
-// source.
+// source. A link is judged by where it really leads, not by its text: a chain of links that each stay inside by their own text
+// (`a/b -> ..`, `up -> a/b/..`, `leak.ab -> up/...`) climbs out of the package all the same. A path with no link in it under
+// the copy's root (the common case) costs one lstat per component and nothing more.
 fun bootstrapPackageImportThroughEscapingLink(path: string): bool {
     val root = bootstrapPackageCopyRootOf(path)
-    var escapes = false
-    if (root != "") {
-        val relative = path.slice(root.size + 1, path.size)
-        var prefix = 0
-        while (prefix <= relative.size && !escapes) {
-            if (prefix == relative.size || relative[prefix] == 47) {
-                val part = relative.slice(0, prefix)
-                val link = Path("$root/$part")
-                if (part != "" && link.isSymbolicLink() && bootstrapPackageSymlinkEscapes(part, link.linkTarget())) escapes = true
-            }
-            prefix = prefix + 1
+    if (root == "") return false
+    val relative = path.slice(root.size + 1, path.size)
+    var linked = false
+    var prefix = 0
+    while (prefix <= relative.size && !linked) {
+        if (prefix == relative.size || relative[prefix] == 47) {
+            val part = relative.slice(0, prefix)
+            if (part != "" && Path("$root/$part").isSymbolicLink()) linked = true
         }
+        prefix = prefix + 1
     }
-    escapes
+    if (!linked) return false
+    // Both real paths, every link followed ("" for a loop or more than 40 links: refused as leaving).
+    val realRoot = bootstrapBuildCallRealPath(bootstrapBuildCallAbsolute(root))
+    val real = bootstrapBuildCallRealPath(bootstrapBuildCallAbsolute(path))
+    realRoot == "" || real == "" || !bootstrapPathUnder(realRoot, real)
 }
 
 // A limit from the environment that can only lower the default (the tests use small ones): a value outside 64 KiB .. the default is the default.
