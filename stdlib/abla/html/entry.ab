@@ -4,8 +4,8 @@ import "abla/bytes"
 import "abla/compiler/parser"
 import "abla/text"
 
-/// An attribute in rendering order. A null value represents a bare attribute.
-class HtmlAttribute(val name: string, val value: string?, val sourceQuote: string = "")
+/// An attribute in rendering order. A null value represents a bare attribute. One that skipsPolicy (ablaHtmlTrustedAttribute) is not held to the URL and event-handler policy.
+class HtmlAttribute(val name: string, val value: string?, val sourceQuote: string = "", val skipsPolicy: bool = false)
 
 /// A phase-safe node. Kind 0 is missing, 1 is an element, 2 is text, and 3 is explicit raw markup.
 class Html(
@@ -33,6 +33,79 @@ private fun ablaHtmlVoid(tag: string): bool = when (tag) {
     "area", "base", "br", "col", "embed", "hr", "img", "input",
     "link", "meta", "param", "source", "track", "wbr" -> true
     else -> false
+}
+
+/// Whether a lowercase attribute name takes a URL that a browser follows or loads (href, src, action, formaction and the like).
+fun ablaHtmlUrlAttribute(name: string): bool = when (name) {
+    "href", "src", "action", "formaction", "poster", "cite", "xlink:href", "background", "longdesc", "usemap", "codebase",
+    "classid", "data", "manifest", "icon", "ping", "lowsrc", "dynsrc", "archive", "profile" -> true
+    else -> false
+}
+
+/// Whether a lowercase attribute name is an event handler (on...), whose value runs as script.
+fun ablaHtmlEventAttribute(name: string): bool = name.size > 2 && name[0] == 111 && name[1] == 110
+
+/// The value written in place of a URL whose scheme runs script or carries a document.
+val ablaHtmlUnsafeUrl = "about:invalid#abla-unsafe-url"
+
+// One character reference at `at` (after its "&"): the decoded byte (only ASCII matters to a scheme) and where it ends, or -1.
+private fun ablaHtmlReferenceByte(value: string, at: int): array<int> {
+    if (at < value.size && value[at] == 35) {
+        var i = at + 1
+        val hex = i < value.size && (value[i] == 120 || value[i] == 88)
+        if (hex) i = i + 1
+        var code = 0
+        val digits = i
+        while (i < value.size && i - digits < 8) {
+            val b = value[i]
+            val digit = if (b >= 48 && b <= 57) b - 48
+                else if (hex && b >= 97 && b <= 102) b - 87
+                else if (hex && b >= 65 && b <= 70) b - 55
+                else -1
+            if (digit < 0) break
+            code = code * (if (hex) 16 else 10) + digit
+            i = i + 1
+        }
+        if (i == digits) return [-1, at]
+        if (i < value.size && value[i] == 59) i = i + 1
+        return [if (code < 128) code else 128, i]
+    }
+    for (named in [["colon;", "58"], ["tab;", "9"], ["newline;", "10"]]) {
+        val name = named[0]
+        if (at + name.size <= value.size && value.slice(at, at + name.size).lowercase() == name) return [ablaHtmlDecimal(named[1]), at + name.size]
+    }
+    [-1, at]
+}
+
+private fun ablaHtmlDecimal(text: string): int {
+    var value = 0
+    for (b in text) value = value * 10 + b - 48
+    value
+}
+
+/// `value` if it is safe in a URL attribute, else ablaHtmlUnsafeUrl: its scheme, read as a browser does (character references decoded,
+/// whitespace and control characters anywhere dropped, any case), must not be javascript:, vbscript: or data:.
+fun ablaHtmlSafeUrl(value: string): string {
+    // The scheme so far, lowercase; any byte but a letter is "_" (no refused scheme has one).
+    var scheme = ""
+    val letters = "abcdefghijklmnopqrstuvwxyz"
+    var i = 0
+    var length = 0
+    while (i < value.size && length < 16) {
+        var b = value[i]
+        i = i + 1
+        if (b == 38) {
+            val decoded = ablaHtmlReferenceByte(value, i)
+            if (decoded[0] >= 0) { b = decoded[0]; i = decoded[1] }
+        }
+        if (b <= 32 || b == 127) continue
+        if (b == 58) return if (scheme == "javascript" || scheme == "vbscript" || scheme == "data") ablaHtmlUnsafeUrl else value
+        if (b == 47 || b == 63 || b == 35) return value
+        val lower = if (b >= 65 && b <= 90) b + 32 else b
+        scheme = if (lower >= 97 && lower <= 122) "$scheme${letters.slice(lower - 97, lower - 96)}" else "${scheme}_"
+        length = length + 1
+    }
+    value
 }
 
 private fun ablaHtmlRawText(tag: string): bool = when (tag) {
@@ -100,6 +173,7 @@ private compile fun ablaHtmlParseElement(cursor: ParserCursor, depth: int, insid
             } else {
                 parserRawSkipWhitespace(cursor)
                 val value = if (parserRawConsume(cursor, "{")) {
+                    if (ablaHtmlEventAttribute(key)) return ablaHtmlReject(cursor, "an Abla expression cannot fill the event handler attribute $name: its value runs as script (for a handler the program wrote, put ablaHtmlTrustedAttribute(\"$name\", code) in an attribute group)")
                     syntaxCall("ablaHtmlAttribute", [attrName, ablaHtmlReadHole(cursor)])
                 } else {
                     val quote = if (parserRawConsume(cursor, "\"")) "\"" else if (parserRawConsume(cursor, "'")) "'" else ""
@@ -162,6 +236,10 @@ fun ablaHtmlElementWithAttributes(tag: string, children: array<Html>, groups: ar
 /// Returns an attribute whose value is escaped on serialization. Invalid names are omitted when rendered.
 fun ablaHtmlAttribute(name: string, value: string): HtmlAttribute = HtmlAttribute(name, value)
 
+/// Returns an attribute that skips the URL and event-handler policy (its value is still escaped): the escape hatch for a URL with a scheme the
+/// policy refuses, or an event handler. Pass only a value the program wrote or fully checked, never one a user supplied.
+fun ablaHtmlTrustedAttribute(name: string, value: string): HtmlAttribute = HtmlAttribute(name, value, "", true)
+
 /// Returns a bare attribute. Invalid names are omitted when rendered.
 fun ablaHtmlBooleanAttribute(name: string): HtmlAttribute = HtmlAttribute(name, null)
 
@@ -204,10 +282,16 @@ private fun ablaHtmlWriteEscaped(var output: ByteBuffer, value: string, preserve
 
 private fun ablaHtmlWriteAttribute(var output: ByteBuffer, attribute: HtmlAttribute): void {
     if (!ablaHtmlNameValid(attribute.name, true)) return
+    // A value from Abla (a hole, or ablaHtmlAttribute) is held to the policy; authored and trusted ones are not. An event handler from Abla
+    // is left out (a hole in one does not compile); a URL whose scheme runs script or carries a document is replaced.
+    val dynamic = attribute.sourceQuote == "" && !attribute.skipsPolicy
+    val key = attribute.name.lowercase()
+    if (dynamic && attribute.value != null && ablaHtmlEventAttribute(key)) return
     output.appendText(" ")
     output.appendText(attribute.name)
-    val value = attribute.value
-    if (value == null) return
+    val written = attribute.value
+    if (written == null) return
+    val value = if (dynamic && ablaHtmlUrlAttribute(key)) ablaHtmlSafeUrl(written) else written
     val quote = if (attribute.sourceQuote == "'") "'" else "\""
     val preserve = attribute.sourceQuote == "'" || attribute.sourceQuote == "\""
     output.appendText("=")

@@ -82,11 +82,65 @@ Void elements such as `img` and `meta` have no closing tag. SVG and MathML eleme
 can use the self-closing syntax inside their corresponding roots.
 
 Use trusted template structure for tag and computed attribute names. The
-serializer escapes HTML syntax and leaves URL, CSS and JavaScript policies to
-the application. Supply trusted script and style bodies as explicit raw
-markup: a text child of `script` or `style` is left out when rendered, inside
-SVG and MathML too (an SVG `script` runs as well), as is one of the other
-raw-text elements such as `iframe` or `noscript` outside them.
+serializer escapes HTML syntax. Supply trusted script and style bodies as
+explicit raw markup: a text child of `script` or `style` is left out when
+rendered, inside SVG and MathML too (an SVG `script` runs as well), as is one
+of the other raw-text elements such as `iframe` or `noscript` outside them.
+
+### URLs and event handlers
+
+A value from Abla in a URL attribute (`href`, `src`, `action`, `formaction`,
+`poster`, `cite`, `xlink:href` and the like, through a hole or
+`ablaHtmlAttribute`) is checked when rendered: one whose scheme is
+`javascript:`, `vbscript:` or `data:` is written as
+`about:invalid#abla-unsafe-url`. The scheme is read as a browser reads it, in
+any case, with whitespace and control characters anywhere dropped and
+character references decoded, so `JaVaScRiPt:`, `java\tscript:` and
+`&#106;avascript:` are refused too. Other URLs, relative ones included, are
+written as given (escaped).
+
+```abla
+import "abla/html"
+import "abla/io"
+
+fun main {
+    val link = "JaVaScRiPt:alert(1)"
+    println(($html <a href={link}>Open</a>).render())
+    println(($html <a href={"/search?q=1"}>Search</a>).render())
+}
+// output:
+// <a href="about:invalid#abla-unsafe-url">Open</a>
+// <a href="/search?q=1">Search</a>
+```
+
+An event handler (`on...`) runs its value as script, so a hole that fills one
+is a compile error, and an `ablaHtmlAttribute` named `on...` is left out when
+rendered.
+
+```abla error
+import "abla/html"
+
+fun invalid(code: string): Html = $html <button onclick={code}>Go</button>
+// error: an Abla expression cannot fill the event handler attribute onclick
+```
+
+Authored (quoted) attribute values are not checked. For a value the program
+wrote or fully checked, such as a `data:` image or a handler of its own,
+`ablaHtmlTrustedAttribute(name, value)` in an attribute group skips both
+checks; its value is still escaped. It is the only way past them, so a search
+for that name finds every exception.
+
+```abla
+import "abla/html"
+import "abla/io"
+
+fun main {
+    val own = [ablaHtmlTrustedAttribute("src", "data:image/gif;base64,R0lGODlhAQABAAAAACw="), ablaHtmlTrustedAttribute("onload", "ready()")]
+    println(($html <img {own}>).render())
+}
+// output:
+// <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" onload="ready()">
+```
 
 An unquoted literal attribute value is a compile error.
 
