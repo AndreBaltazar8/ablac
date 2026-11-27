@@ -296,11 +296,13 @@ fun KernelArray<u32>.set(index: int, value: u32): void {
 private class KernelCpuState(
     var group: int, var groupY: int, var local: int, var groupSize: int,
     // The group's shared memory: slot n is the n-th kernelShared call of the thread being run (sharedNext counts them).
-    var sharedNext: int, val sharedAddresses: array<int>, val sharedBytes: array<int>
+    var sharedNext: int, val sharedAddresses: array<int>, val sharedBytes: array<int>,
+    // The launch's dynamic shared memory (kernelRunCpuShared): its bytes and where they are.
+    var dynamicBytes: int, var dynamicAddress: int
 )
 
 // The CPU backend's launch position.
-private val kernelCpuState = KernelCpuState(0, 0, 0, 1, 0, [], [])
+private val kernelCpuState = KernelCpuState(0, 0, 0, 1, 0, [], [], 0, 0)
 
 /** The thread's index in the whole launch: group * group size + local index. */
 fun kernelGlobalId(): int = kernelCpuState.group * kernelCpuState.groupSize + kernelCpuState.local
@@ -335,6 +337,14 @@ trusted fun kernelSharedF32(count: int): KernelF32Buffer = KernelF32Buffer(kerne
 
 /** The workgroup's shared memory for `count` u32 values (see kernelSharedF32). */
 trusted fun kernelSharedU32(count: int): KernelU32Buffer = KernelU32Buffer(kernelCpuShared(count, 4), count)
+
+/** The group's dynamic shared memory as f32 values: the bytes the launch gives each group (CudaKernelDevice.launch's `sharedBytes`,
+ *  kernelRunCpuShared on the CPU) over 4, sized at launch where kernelSharedF32's count is fixed at compile time (CUDA's
+ *  `extern __shared__`). Every call, and kernelSharedU32Dynamic, is the same memory; its contents start undefined. */
+trusted fun kernelSharedF32Dynamic(): KernelF32Buffer = KernelF32Buffer(kernelCpuState.dynamicAddress, kernelCpuState.dynamicBytes / 4)
+
+/** The group's dynamic shared memory as u32 values (see kernelSharedF32Dynamic). */
+trusted fun kernelSharedU32Dynamic(): KernelU32Buffer = KernelU32Buffer(kernelCpuState.dynamicAddress, kernelCpuState.dynamicBytes / 4)
 
 /** The most elements a kernelShared call takes on the CPU backend (4 MiB of 4-byte elements, far above a GPU's 48 KiB per group). */
 val KERNEL_SHARED_MAX_ELEMENTS = 1048576
@@ -658,6 +668,20 @@ fun kernelRunCpuGrid(groups: int, groupsY: int, groupSize: int, body: () -> void
     kernelCpuState.groupY = 0
     kernelCpuState.local = 0
     kernelCpuState.groupSize = 1
+}
+
+/** kernelRunCpu with `sharedBytes` of dynamic shared memory per group (kernelSharedF32Dynamic), 0 to KERNEL_SHARED_MAX_ELEMENTS * 4. */
+trusted fun kernelRunCpuShared(groups: int, groupSize: int, sharedBytes: int, body: () -> void): void {
+    if (sharedBytes < 0 || sharedBytes > KERNEL_SHARED_MAX_ELEMENTS * 4) {
+        panic("kernelRunCpuShared: a group has 0 to ${KERNEL_SHARED_MAX_ELEMENTS * 4} bytes of dynamic shared memory, not $sharedBytes")
+    }
+    val memory = ablaUnsafeAllocate(if (sharedBytes > 0) sharedBytes else 4)
+    kernelCpuState.dynamicAddress = nativePointerAddress(memory)
+    kernelCpuState.dynamicBytes = sharedBytes
+    kernelRunCpuGrid(groups, 1, groupSize, body)
+    kernelCpuState.dynamicBytes = 0
+    kernelCpuState.dynamicAddress = 0
+    ablaUnsafeFree(memory)
 }
 
 /** The PTX of every `@kernel` function of the program, one entry per kernel under its name, for the CUDA driver

@@ -21,6 +21,44 @@ fun bootstrapKernelNames(parsed: BootstrapParseResult): array<string> {
     names
 }
 
+/** A `@kernel` function's `@launchBounds(threads[, minBlocks])` (#1303): the most threads a group of it has and the
+ *  fewest groups a multiprocessor should hold at once (0 for none of either), or what is wrong with it in `error`. */
+class BootstrapKernelBounds(val threads: int, val blocks: int, val error: string)
+
+/** The value of an @launchBounds argument's decimal digits. */
+fun bootstrapKernelBoundValue(digits: string): int {
+    var value = 0
+    for (byte in digits) value = value * 10 + byte - 48
+    value
+}
+
+fun bootstrapKernelBoundsOf(declaration: BootstrapDeclaration): BootstrapKernelBounds {
+    var index = 0
+    while (index < declaration.annotations.size) {
+        if (declaration.annotations[index] == "launchBounds") {
+            val argument = declaration.annotationArguments[index]
+            val items = if (argument.kind == "annotation.arguments") argument.children else [argument]
+            if (argument.kind == "missing" || items.size > 2) {
+                return BootstrapKernelBounds(0, 0, "@launchBounds takes the threads per group and, optionally, the fewest groups per multiprocessor")
+            }
+            for (item in items) {
+                if (item.kind != "integer" || !bootstrapKernelIsDigits(item.text) || item.text.size > 6) {
+                    return BootstrapKernelBounds(0, 0, "@launchBounds takes integer literals")
+                }
+            }
+            val threads = bootstrapKernelBoundValue(items[0].text)
+            val blocks = if (items.size == 2) bootstrapKernelBoundValue(items[1].text) else 0
+            if (threads < 1 || threads > 1024) return BootstrapKernelBounds(0, 0, "a group has 1 to 1024 threads, not $threads")
+            if (items.size == 2 && (blocks < 1 || blocks > 64)) {
+                return BootstrapKernelBounds(0, 0, "the fewest groups per multiprocessor is 1 to 64, not $blocks")
+            }
+            return BootstrapKernelBounds(threads, blocks, "")
+        }
+        index = index + 1
+    }
+    BootstrapKernelBounds(0, 0, "")
+}
+
 /** Whether the program declares abla/kernel's kernelPtx (so a call to it may need replacing) or any kernel. */
 fun bootstrapKernelWanted(parsed: BootstrapParseResult): bool {
     for (declaration in parsed.declarations) {
@@ -1017,6 +1055,21 @@ fun bootstrapKernelBuiltin(
         (name.indexOf("_get") > 35 || name.indexOf("_set") > 35)) {
         bootstrapKernelArrayAccess(emitter, state, instruction, name.indexOf("_set") > 35)
         return true
+    } else if (name == "kernelSharedF32Dynamic" || name == "kernelSharedU32Dynamic") {
+        // The group's dynamic shared memory (#1303, CUDA's `extern __shared__`): one external addrspace(3) array, its size
+        // the launch's, read from %dynamic_smem_size, in 4-byte elements.
+        bootstrapKernelDeclare(emitter, "@abla_shared_dynamic = external addrspace(3) global [0 x i32], align 16")
+        val address = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$address = addrspacecast ptr addrspace(3) @abla_shared_dynamic to ptr")
+        val bytes = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$bytes = call i32 asm \"mov.u32 \$0, %dynamic_smem_size;\", \"=r\"()")
+        val elements = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$elements = lshr i32 $bytes, 2")
+        val count = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$count = zext i32 $elements to i64")
+        bootstrapKernelSet(state, instruction.result,
+            BootstrapKernelValue(address, if (name == "kernelSharedF32Dynamic") "buffer.f32" else "buffer.u32", count))
+        return true
     } else if (name == "kernelSharedF32" || name == "kernelSharedU32") {
         // A group's shared memory: an addrspace(3) array per call, its size the constant count.
         if (instruction.operands.size < 1) return false
@@ -1782,14 +1835,53 @@ trusted fun bootstrapKernelBuild(parsed: BootstrapParseResult, var program: Boot
     if (processEnvironmentOr("ABLA_KERNEL_DUMP_IR", "") != "") {
         for (function in program.functions) linuxWriteStandardError(bootstrapKernelFunctionText(function))
     }
+    // @launchBounds (#1303): on a @kernel function only, with literals in range.
+    var boundsErrors = ""
+    var boundsCount = 0
+    val boundNames: array<string> = []
+    val boundThreads: array<int> = []
+    val boundBlocks: array<int> = []
+    for (declaration in parsed.declarations) {
+        if (declaration.kind != "fun" || !bootstrapDeclarationHasAnnotation(declaration, "launchBounds")) continue
+        val bounds = bootstrapKernelBoundsOf(declaration)
+        val problem = if (!bootstrapDeclarationHasAnnotation(declaration, "kernel")) "@launchBounds goes on a @kernel function"
+            else bounds.error
+        if (problem != "") {
+            boundsErrors = "${boundsErrors}error[E_SEMANTIC]: kernel.launch-bounds:${declaration.name}: $problem\n"
+            boundsCount = boundsCount + 1
+        } else {
+            boundNames.append(declaration.name)
+            boundThreads.append(bounds.threads)
+            boundBlocks.append(bounds.blocks)
+        }
+    }
+    if (boundsCount > 0) return BootstrapKernelResult(boundsErrors, boundsCount)
     if (names.size == 0) {
         bootstrapKernelReplacePtx(program, "")
         return BootstrapKernelResult("", 0)
     }
 
+
     bootstrapKernelUnrollNext = 0
     val emitter = BootstrapKernelEmitter(program, "", [], "", 0, [], [])
-    val module = bootstrapKernelCudaModule(emitter, names)
+    var module = bootstrapKernelCudaModule(emitter, names)
+    // Their PTX directives (.maxntid, .minnctapersm), from nvvm.annotations on each entry.
+    if (boundNames.size > 0) {
+        var operands = ""
+        var nodes = ""
+        for (index in 0 until boundNames.size) {
+            val symbol = bootstrapKernelSymbol(boundNames[index])
+            val id = bootstrapKernelUnrollNext
+            bootstrapKernelUnrollNext = bootstrapKernelUnrollNext + 2
+            nodes = "$nodes!$id = !{ptr @$symbol, !\"maxntidx\", i32 ${boundThreads[index]}}\n"
+            operands = if (operands == "") "!$id" else "$operands, !$id"
+            if (boundBlocks[index] > 0) {
+                nodes = "$nodes!${id + 1} = !{ptr @$symbol, !\"minctasm\", i32 ${boundBlocks[index]}}\n"
+                operands = "$operands, !${id + 1}"
+            }
+        }
+        module = "$module!nvvm.annotations = !{$operands}\n$nodes"
+    }
 
     if (emitter.errors > 0) return BootstrapKernelResult(emitter.diagnostics, emitter.errors)
     if (processEnvironmentOr("ABLA_KERNEL_DUMP_LLVM", "") != "") linuxWriteStandardError(module)
@@ -1806,6 +1898,10 @@ trusted fun bootstrapKernelBuild(parsed: BootstrapParseResult, var program: Boot
     if (ptx != "") {
         // Each kernel's parameters, for abla/kernel/cuda's launch to check its arguments against ("// abla-kernel <name> <kinds>").
         for (name in names) ptx = "$ptx// abla-kernel ${bootstrapKernelSymbol(name)} ${bootstrapKernelSignature(program, name)}\n"
+        // And each @launchBounds kernel's most threads per group, which the launch refuses to exceed.
+        for (index in 0 until boundNames.size) {
+            ptx = "$ptx// abla-kernel-bounds ${bootstrapKernelSymbol(boundNames[index])} ${boundThreads[index]}\n"
+        }
     }
     bootstrapKernelReplacePtx(program, ptx)
     BootstrapKernelResult("", 0)

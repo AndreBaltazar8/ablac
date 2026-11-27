@@ -27,6 +27,7 @@ private trusted noescape extern:"c" fun cuLaunchKernel(
     blockX: u32, blockY: u32, blockZ: u32, sharedBytes: u32,
     stream: i64*, params: i64*, extra: i64*
 ): i32
+private trusted noescape extern:"c" fun cuFuncSetAttribute(function: i64*, attribute: i32, value: i32): i32
 
 // What this module has made and not yet released, which no other code can write: the contexts (a context and its module each: the
 // driver may give a closed context's handle to a later one, and a device record of the closed one must not pass for it) and the device
@@ -265,6 +266,23 @@ private fun cudaKernelSignature(name: string): string {
     "?"
 }
 
+/** The most dynamic shared memory a group of a launch takes (the 4090's per-block limit, 99 KiB; the driver refuses more on smaller GPUs). */
+val CUDA_KERNEL_DYNAMIC_SHARED_MAX = 101376
+
+/** The most threads per group kernel `name` declares with @launchBounds ("// abla-kernel-bounds <name> <threads>" in the PTX), or
+ *  1024 (a group's most) when it declares none. */
+private fun cudaKernelBound(name: string): int {
+    val prefix = "// abla-kernel-bounds $name "
+    for (line in kernelPtx().split("\n")) {
+        if (line.startsWith(prefix)) {
+            var value = 0
+            for (byte in line.slice(prefix.size, line.size).trim()) value = value * 10 + byte - 48
+            return value
+        }
+    }
+    1024
+}
+
 /** Why `arguments` do not fit kernel `name` on `device` (not the kernel's parameters in number or kind, or a buffer not inside live device
  *  memory of this device), or "" when they do. */
 private fun cudaKernelArgumentProblem(device: CudaKernelDevice, name: string, arguments: CudaKernelArguments): string {
@@ -292,11 +310,23 @@ private fun cudaKernelArgumentProblem(device: CudaKernelDevice, name: string, ar
 }
 
 /** Runs kernel `name` over `groups` (x) by `groupsY` (y) groups of `groupSize` threads with `arguments`, and waits for it. The arguments
- *  must be the kernel's parameters in kind and number, each buffer inside live memory of this device (else false, the reason in `error`). */
-trusted fun CudaKernelDevice.launch(name: string, groups: int, groupSize: int, arguments: CudaKernelArguments, groupsY: int = 1): bool {
+ *  must be the kernel's parameters in kind and number, each buffer inside live memory of this device, and `groupSize` at most its
+ *  @launchBounds (else false, the reason in `error`). `sharedBytes` is each group's dynamic shared memory (kernelSharedF32Dynamic), 0 to
+ *  CUDA_KERNEL_DYNAMIC_SHARED_MAX bytes. */
+trusted fun CudaKernelDevice.launch(name: string, groups: int, groupSize: int, arguments: CudaKernelArguments, groupsY: int = 1,
+    sharedBytes: int = 0): bool {
     if (!this.ready()) return false
     if (groups < 1 || groups > 2147483647 || groupsY < 1 || groupsY > 65535 || groupSize < 1 || groupSize > 1024) {
         this.error = "a launch has 1 to 2^31 - 1 by 1 to 65535 groups of 1 to 1024 threads"
+        return false
+    }
+    if (sharedBytes < 0 || sharedBytes > CUDA_KERNEL_DYNAMIC_SHARED_MAX) {
+        this.error = "a group has 0 to $CUDA_KERNEL_DYNAMIC_SHARED_MAX bytes of dynamic shared memory, not $sharedBytes"
+        return false
+    }
+    val bound = cudaKernelBound(name)
+    if (groupSize > bound) {
+        this.error = "kernel $name declares @launchBounds($bound): a launch of $groupSize threads per group is refused"
         return false
     }
     val problem = cudaKernelArgumentProblem(this, name, arguments)
@@ -311,6 +341,12 @@ trusted fun CudaKernelDevice.launch(name: string, groups: int, groupSize: int, a
         cudaLeave()
         return false
     }
+    // Above 48 KiB a kernel has to ask for its dynamic shared memory.
+    if (sharedBytes > 49152 && !cudaKernelOk(this, cuFuncSetAttribute(function.load(), i32(8), i32(sharedBytes)),
+        "cuFuncSetAttribute($name, dynamic shared memory)")) {
+        cudaLeave()
+        return false
+    }
     // The driver reads the parameter bytes during cuLaunchKernel.
     val count = arguments.words.size
     val values = nativeByteBuffer(if (count == 0) 8 else count * 8)
@@ -320,7 +356,7 @@ trusted fun CudaKernelDevice.launch(name: string, groups: int, groupSize: int, a
         values.storeI64(index * 8, arguments.words[index])
         pointers.storePointer(index * 8, nativePointerFromAddress(base + index * 8))
     }
-    val launched = cudaKernelOk(this, cuLaunchKernel(function.load(), u32(groups), u32(groupsY), 1, u32(groupSize), 1, 1, 0,
+    val launched = cudaKernelOk(this, cuLaunchKernel(function.load(), u32(groups), u32(groupsY), 1, u32(groupSize), 1, 1, u32(sharedBytes),
         nativeNullPointer(), pointers.address, nativeNullPointer()), "cuLaunchKernel($name)") &&
         cudaKernelOk(this, cuCtxSynchronize(), "cuCtxSynchronize")
     cudaLeave()

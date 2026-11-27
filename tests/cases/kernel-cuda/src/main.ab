@@ -13,6 +13,7 @@ import "quad.ab"
 import "words.ab"
 import "subgroups.ab"
 import "arrays.ab"
+import "launch.ab"
 import "groups.ab"
 import "q8fast.ab"
 import "guards.ab"
@@ -67,7 +68,7 @@ fun nvfp4Weights(rows: int, cols: int): NativeByteBuffer {
 }
 
 trusted fun main: int {
-    val device = cudaKernelDevice()
+    var device = cudaKernelDevice()
     if (!device.ready()) {
         println("kernel-cuda: skipped (${device.error})")
         return 0
@@ -420,6 +421,46 @@ trusted fun main: int {
     if (next > 0) section = section.slice(0, next)
     val registers = section != "" && section.indexOf(".local") < 0
     println("arrays: $arrayThreads threads with f32, int and u32 KernelArrays, GPU bits equal to CPU ${arraysEqual && arraysNonzero > arrayThreads / 2}, in registers $registers")
+    // launch (#1303): bounded's PTX directives and its refused wide launch; reverseChunks through dynamic shared memory sized
+    // at launch (1000 floats, and 15000 = 60000 bytes, past the 48 KiB a kernel gets without asking), GPU equal to CPU.
+    val launchPtx = kernelPtx()
+    val boundedAt = launchPtx.indexOf(".entry bounded(")
+    var boundedSection = if (boundedAt < 0) "" else launchPtx.slice(boundedAt, launchPtx.size)
+    val boundedEnd = boundedSection.indexOf("{")
+    if (boundedEnd > 0) boundedSection = boundedSection.slice(0, boundedEnd)
+    // llc writes `.maxntid 128` (older ones `.maxntid 128, 1, 1`).
+    var launchWhy = if (boundedSection.indexOf(".maxntid 128") >= 0 && boundedSection.indexOf(".minnctapersm 2") >= 0) "" else " (no .maxntid 128 and .minnctapersm 2)"
+    val dbounded = device.allocate(1024 * 4)
+    if (dbounded == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    if (!device.launch("bounded", 8, 128, cudaKernelArguments().buffer(dbounded.floats()).integer(1024))) launchWhy = "$launchWhy (bounded: ${device.error})"
+    if (device.launch("bounded", 4, 256, cudaKernelArguments().buffer(dbounded.floats()).integer(1024)) ||
+        device.error.indexOf("@launchBounds(128)") < 0) launchWhy = "$launchWhy (the wide launch: ${device.error})"
+    device.error = ""
+    for (length in [1000, 15000]) {
+        val groups = 3
+        val total = groups * length
+        val chunkX = floats(total) { i -> f32FromInt((i * 13) % 1001) }
+        val cpuChunks = floats(total) { i -> f32(0.0) }
+        val cpuChunkX = KernelF32Buffer(nativePointerAddress(chunkX.address), total)
+        val cpuChunkOut = KernelF32Buffer(nativePointerAddress(cpuChunks.address), total)
+        kernelRunCpuShared(groups, 1, length * 4) { reverseChunks(cpuChunkX, cpuChunkOut) }
+        val dchunkX = device.allocate(total * 4)
+        val dchunkOut = device.allocate(total * 4)
+        if (dchunkX == null || dchunkOut == null) { println("kernel-cuda: ${device.error}"); return 1 }
+        val gpuChunks = floats(total) { i -> f32(0.0) }
+        if (!device.upload(dchunkX, chunkX) || !device.launch("reverseChunks", groups, 256,
+            cudaKernelArguments().buffer(dchunkX.floats()).buffer(dchunkOut.floats()), 1, length * 4) ||
+            !device.download(dchunkOut, gpuChunks)) {
+            println("kernel-cuda: reverseChunks: ${device.error}")
+            return 1
+        }
+        var i = 0
+        while (i < total && floatAt(gpuChunks, i) == floatAt(cpuChunks, i)) i = i + 1
+        if (i < total) launchWhy = "$launchWhy (chunk $length element $i: GPU bits ${f32ToBits(floatAt(gpuChunks, i))}, CPU ${f32ToBits(floatAt(cpuChunks, i))})"
+        // The chunk really is reversed: its first element is the source chunk's last.
+        if (floatAt(cpuChunks, 0) != floatAt(chunkX, length - 1)) launchWhy = "$launchWhy (chunk $length not reversed)"
+    }
+    println("launch: @launchBounds in the PTX and a wider launch refused, dynamic shared memory of 4000 and 60000 bytes on the GPU and the CPU ${launchWhy == ""}$launchWhy")
 
     // NVFP4 matvec: one subgroup per row on the GPU (8 warps per group), one thread per row on the CPU.
     val rows = 1000

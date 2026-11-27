@@ -3137,8 +3137,11 @@ A kernel, and every function it calls, may use:
 - the ids `kernelGlobalId`, `kernelLocalId`, `kernelGroupId`, `kernelGroupIdY`
   and `kernelGroupSize`;
 - the group's shared memory, `kernelSharedF32(count)` and
-  `kernelSharedU32(count)` with a constant `count`, and `kernelBarrier()`
-  (CUDA's `__shared__` and `__syncthreads`);
+  `kernelSharedU32(count)` with a constant `count`, `kernelSharedF32Dynamic()`
+  and `kernelSharedU32Dynamic()` sized by the launch
+  (`CudaKernelDevice.launch`'s `sharedBytes`, `kernelRunCpuShared` on the CPU;
+  CUDA's `extern __shared__`), and `kernelBarrier()` (CUDA's `__shared__` and
+  `__syncthreads`);
 - the subgroup, 32 lanes on CUDA and 1 on the CPU, so a kernel written for any
   size runs on both: `kernelSubgroupLane` and `kernelSubgroupSize`; and,
   called by every lane of the subgroup together (under a branch that only some
@@ -3176,7 +3179,15 @@ what and where:
 | `kernel.recursion:<name>` | a call back into a function the kernel is already in |
 | `kernel.type:<type>` | a value of a type a kernel cannot hold (a buffer in a `var`, a class) |
 | `kernel.signature:<detail>` | a kernel that returns a value, or that the program does not lower |
+| `kernel.launch-bounds:<name>` | an `@launchBounds` on a function that is not a `@kernel`, or with an argument that is not a literal in range |
 | `kernel.toolchain:cuda` | `opt` or `llc` failed to build the PTX |
+
+A `@kernel` entry may declare `@launchBounds(threads)` or
+`@launchBounds(threads, minGroups)` (CUDA's `__launch_bounds__`): the most
+threads per group (1 to 1024), and the fewest groups a multiprocessor should
+hold at once, both literals. The PTX gets `.maxntid` and `.minnctapersm`, so
+the compiler can spend registers up to that limit, and `CudaKernelDevice.launch`
+refuses a group of more threads.
 
 Differences from the CPU remain: on a GPU an integer division by zero gives 0
 (the CPU stops the program); `kernelFma` rounds once there (twice on the CPU);
