@@ -166,7 +166,7 @@ trusted fun __ablaRuntimeHostValgrindHeapChunk(address: int): void {
     if (address == 0) return
     __ablaRuntimeHostValgrindRequest(1296236546, address - 16, 16, 0)
     val header = ablaRuntimeLoadI64(address - 8)
-    if ((header & 2) != 0) __ablaRuntimeHostValgrindRequest(1296236546, address - 16, header & -4096, 0)
+    if ((header & 2) != 0) __ablaRuntimeHostValgrindRequest(1296236546, address - 16, header & __ablaRuntimeHostHeapMapMask, 0)
     else __ablaRuntimeHostValgrindRequest(1296236546, address - 8, (header & __ablaRuntimeHostHeapSizeMask) + 8, 0)
     return
 }
@@ -294,7 +294,10 @@ trusted fun __ablaRuntimePlatformMutexDestroy(address: int): void {
 //
 // Blocks have glibc's geometry. A block starts at a 16-byte aligned payload `p`, is `t` bytes long
 // (a multiple of 16, at least 32) and has a header word at p - 8: t, bit 0 "the block before this one
-// is in use", bit 1 "a mapping of its own", and (small blocks) the block's size class in bits 40-47.
+// is in use", bit 1 "a mapping of its own", bit 2 "freed" (parked on its class's list, or a kept mapping), and (small
+// blocks) the block's size class in bits 40-47. A block the heap hands out carries __ablaRuntimeHostHeapTag in bits 48-63:
+// a free of anything else (an address inside a block, or one the heap never gave) stops the program, and so does a
+// second free of a block (#1139 area 10, __ablaRuntimeHostHeapFreeing).
 // The next block's payload is p + t, so its header is the last word of this block, which is why a
 // block holds t - 8 bytes. A block that is truly free keeps two list links at p and p + 8 and its t in
 // its last word before that header (the next block's "previous size", read only when bit 0 of the next
@@ -329,6 +332,13 @@ val __ablaRuntimeHostHeapSmallMaximum: int = 131072
 val __ablaRuntimeHostHeapChunk: int = 1048576
 /// Selects the size field of the packed heap block header.
 val __ablaRuntimeHostHeapSizeMask: int = 1099511627760
+/// Selects the length of a mapping of its own from its header word (bits 12-47).
+val __ablaRuntimeHostHeapMapMask: int = 281474976706560
+/// Marks, in bits 48-63, the header of a block the native heap handed out.
+val __ablaRuntimeHostHeapTag: int = 43802
+/// The tag where it sits in a header word (0xab1a << 48), a literal: a computed global is 0 until the module initializes,
+/// and the heap allocates before that.
+val __ablaRuntimeHostHeapTagBits: int = -6117577143829397504
 /// Holds the next allocation address within the current heap span.
 var __ablaRuntimeHostHeapCursor: int = 0
 /// Holds the exclusive end of the current heap span.
@@ -483,7 +493,7 @@ trusted fun __ablaRuntimeHostHeapCacheTake(mapped: int): int {
     while (slot < 16) {
         val base = ablaRuntimeLoadI64(slots + slot * 8)
         if (base != 0) {
-            val length = ablaRuntimeLoadI64(base + 8) & -4096
+            val length = ablaRuntimeLoadI64(base + 8) & __ablaRuntimeHostHeapMapMask
             if (length >= mapped && (best < 0 || length < bestLength)) {
                 best = slot
                 bestLength = length
@@ -513,7 +523,7 @@ trusted fun __ablaRuntimeHostHeapCachePut(base: int, length: int): bool {
             if (kept == 0) {
                 empty = slot
             } else {
-                val keptLength = ablaRuntimeLoadI64(kept + 8) & -4096
+                val keptLength = ablaRuntimeLoadI64(kept + 8) & __ablaRuntimeHostHeapMapMask
                 if (smallest < 0 || keptLength < smallestLength) {
                     smallest = slot
                     smallestLength = keptLength
@@ -727,13 +737,13 @@ trusted fun __ablaRuntimeHostHeapFromBins(sizeClass: int, t: int): int {
     val whole = ablaRuntimeLoadI64(block - 8) & __ablaRuntimeHostHeapSizeMask
     val left = whole - t
     if (left >= 32) {
-        ablaRuntimeStoreI64(block - 8, t | 1 | (sizeClass << 40))
+        ablaRuntimeStoreI64(block - 8, t | 1 | (sizeClass << 40) | __ablaRuntimeHostHeapTagBits)
         val rest = block + t
         ablaRuntimeStoreI64(rest - 8, left | 1)
         ablaRuntimeStoreI64(rest + left - 16, left)
         __ablaRuntimeHostHeapBinInsert(rest, left)
     } else {
-        ablaRuntimeStoreI64(block - 8, whole | 1 | (__ablaRuntimeHostHeapClassBelow(whole) << 40))
+        ablaRuntimeStoreI64(block - 8, whole | 1 | (__ablaRuntimeHostHeapClassBelow(whole) << 40) | __ablaRuntimeHostHeapTagBits)
         val after = block + whole - 8
         ablaRuntimeStoreI64(after, ablaRuntimeLoadI64(after) | 1)
     }
@@ -922,7 +932,7 @@ trusted fun __ablaRuntimeHostHeapBump(sizeClass: int, t: int): int {
     var length = t
     // No sliver of less than the smallest block is left in the chunk.
     if (__ablaRuntimeHostHeapEnd - (block + t) < 32) length = __ablaRuntimeHostHeapEnd - block
-    ablaRuntimeStoreI64(block - 8, length | 1 | (__ablaRuntimeHostHeapClassBelow(length) << 40))
+    ablaRuntimeStoreI64(block - 8, length | 1 | (__ablaRuntimeHostHeapClassBelow(length) << 40) | __ablaRuntimeHostHeapTagBits)
     __ablaRuntimeHostHeapCursor = block + length
     ablaRuntimeStoreI64(block + length - 8, 1)
     block
@@ -938,13 +948,14 @@ trusted fun __ablaRuntimeHostHeapAllocate(size: int, zero: bool): int {
         var base = __ablaRuntimeHostHeapCacheTake(mapped)
         if (shared) __ablaRuntimeHostHeapLetGo()
         if (base != 0) {
+            ablaRuntimeStoreI64(base + 8, ablaRuntimeLoadI64(base + 8) & -5)
             // A kept mapping holds what its last user left.
             if (zero) __ablaRuntimeHostHeapZero(base + 16, size)
             return base + 16
         }
         base = __ablaRuntimeHostHeapMap(mapped)
         if (base == 0) return 0
-        ablaRuntimeStoreI64(base + 8, mapped | 2)
+        ablaRuntimeStoreI64(base + 8, mapped | 2 | __ablaRuntimeHostHeapTagBits)
         return base + 16
     }
     val sizeClass = __ablaRuntimeHostHeapClassOf(if (size + 8 < 32) 32 else size + 8)
@@ -957,8 +968,9 @@ trusted fun __ablaRuntimeHostHeapAllocate(size: int, zero: bool): int {
     var clean = false
     if (block != 0) {
         ablaRuntimeStoreI64(head, ablaRuntimeLoadI64(block))
-        __ablaRuntimeHostHeapParked = __ablaRuntimeHostHeapParked -
-            (ablaRuntimeLoadI64(block - 8) & __ablaRuntimeHostHeapSizeMask)
+        val parked = ablaRuntimeLoadI64(block - 8)
+        ablaRuntimeStoreI64(block - 8, parked & -5)
+        __ablaRuntimeHostHeapParked = __ablaRuntimeHostHeapParked - (parked & __ablaRuntimeHostHeapSizeMask)
     } else {
         block = __ablaRuntimeHostHeapFromBins(sizeClass, t)
         if (block == 0 && __ablaRuntimeHostHeapParked >= __ablaRuntimeHostHeapMergeAt()) {
@@ -980,19 +992,33 @@ trusted fun __ablaRuntimeHostHeapAllocate(size: int, zero: bool): int {
     block
 }
 
+// The header of `address`, which is being freed; a mapping of its own is marked freed (bit 2) here, a small block when it is
+// parked. Stops the program when `address` is not a block the heap handed out (no tag: inside a block, or never given) or
+// was freed already: a parked block, and one merged into the free block before it, keep their header with bit 2 set, and a
+// merged block that starts there gets a header without the tag. A free list that held a block twice would hand the same
+// memory to two owners (#1139 area 10).
+@inline
+trusted fun __ablaRuntimeHostHeapFreeing(address: int): int {
+    val header = ablaRuntimeLoadI64(address - 8)
+    if ((header >>> 48) != __ablaRuntimeHostHeapTag || (header & 4) != 0) ablaRuntimeTrap()
+    if ((header & 2) != 0) ablaRuntimeStoreI64(address - 8, header | 4)
+    header
+}
+
 // Free with the heap's lock held by the caller (a batch of frees takes it once): the body of __ablaRuntimeHostHeapFree.
 trusted fun __ablaRuntimeHostHeapFreeLocked(address: int): void {
     if (address == 0) return
     if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindHeapChunk(address)
-    val header = ablaRuntimeLoadI64(address - 8)
+    val header = __ablaRuntimeHostHeapFreeing(address)
     if ((header & 2) != 0) {
-        val length = header & -4096
+        val length = header & __ablaRuntimeHostHeapMapMask
         val kept = __ablaRuntimeHostHeapCachePut(address - 16, length)
         if (!kept) __ablaRuntimeHostHeapUnmap(address - 16, length)
         return
     }
     val sizeClass = (header >> 40) & 255
     if (sizeClass >= __ablaRuntimeHostHeapClasses) ablaRuntimeTrap()
+    ablaRuntimeStoreI64(address - 8, header | 4)
     val state = __ablaRuntimeHostHeapState()
     val head = state + sizeClass * 8
     ablaRuntimeStoreI64(address, ablaRuntimeLoadI64(head))
@@ -1013,8 +1039,9 @@ trusted fun __ablaRuntimeHostHeapFree(address: int): void {
     val shared = __ablaRuntimeHostHeapShared
     val header = ablaRuntimeLoadI64(address - 8)
     if ((header & 2) != 0) {
+        __ablaRuntimeHostHeapFreeing(address)
         // A mapping of its own: kept in the cache under the lock, unmapped outside it.
-        val length = header & -4096
+        val length = header & __ablaRuntimeHostHeapMapMask
         if (shared) __ablaRuntimeHostHeapAcquire()
         val kept = __ablaRuntimeHostHeapCachePut(address - 16, length)
         if (shared) __ablaRuntimeHostHeapLetGo()
@@ -1033,14 +1060,16 @@ trusted fun __ablaRuntimeHostHeapResize(address: int, size: int): int {
     if (address == 0) return __ablaRuntimeHostHeapAllocate(size, false)
     if (size < 0 || size > 4611686018427387871) return 0
     val header = ablaRuntimeLoadI64(address - 8)
+    // (realloc of a freed block, or of an address inside one: as a free of it, __ablaRuntimeHostHeapFreeing.)
+    if ((header >>> 48) != __ablaRuntimeHostHeapTag || (header & 4) != 0) ablaRuntimeTrap()
     if ((header & 2) != 0) {
-        val mappedBefore = header & -4096
+        val mappedBefore = header & __ablaRuntimeHostHeapMapMask
         if (size + 8 > __ablaRuntimeHostHeapSmallMaximum) {
             val mapped = (size + 16 + 4095) & -4096
             if (mapped == mappedBefore) return address
             val moved = __ablaRuntimeHostHeapRemap(address - 16, mappedBefore, mapped)
             if (moved < 0) return 0
-            ablaRuntimeStoreI64(moved + 8, mapped | 2)
+            ablaRuntimeStoreI64(moved + 8, mapped | 2 | __ablaRuntimeHostHeapTagBits)
             return moved + 16
         }
         val smaller = __ablaRuntimeHostHeapAllocate(size, false)
@@ -1126,7 +1155,7 @@ trusted fun __ablaRuntimeHostHeapTrim(): void {
     while (slot < 16) {
         val base = ablaRuntimeLoadI64(slots + slot * 8)
         if (base != 0) {
-            __ablaRuntimeHostHeapUnmap(base, ablaRuntimeLoadI64(base + 8) & -4096)
+            __ablaRuntimeHostHeapUnmap(base, ablaRuntimeLoadI64(base + 8) & __ablaRuntimeHostHeapMapMask)
             ablaRuntimeStoreI64(slots + slot * 8, 0)
         }
         slot = slot + 1
