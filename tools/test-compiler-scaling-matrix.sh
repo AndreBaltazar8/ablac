@@ -163,18 +163,23 @@ measure_min() {
         END { for (i = 1; i <= fields; i++) printf "%s%s", low[i], i < fields ? " " : "\n" }'
 }
 
-failed=0
+# Every check that fails, repeated at the end: the suite shows only the last five lines of a failed test's log, and a failure in an
+# early row used to scroll out of them behind the rows that passed (run 45976580421 showed "a growth bound or correctness check failed"
+# under three passing rows; the failing one, when codegen, was above them).
+failures=()
+fail_check() {
+    echo "compiler scaling: $1" >&2
+    failures+=("$1")
+}
 check_growth() {
     local label=$1 small=$2 large=$3 limit=$4 slack=$5
     if [[ ! $small =~ ^[0-9]+$ || ! $large =~ ^[0-9]+$ ]]; then
-        echo "compiler scaling: missing measurements for $label" >&2
-        failed=1
+        fail_check "missing measurements for $label"
         return
     fi
     printf 'compiler scaling: %-31s %s -> %s (bound %sx + %s)\n' "$label" "$small" "$large" "$limit" "$slack"
     if ((large > limit * small + slack)); then
-        echo "compiler scaling: $label exceeded its growth bound" >&2
-        failed=1
+        fail_check "$label exceeded its growth bound: $small -> $large, more than ${limit}x + $slack"
     fi
 }
 
@@ -217,14 +222,15 @@ check_growth "nested blocks 96/288 $unit" "$small" "$large" 5 "$slack"
 generate when 256 1 > "$output/duplicate.ab"
 if "$compiler" build "$output/duplicate.ab" --fast --no-cache -o "$output/duplicate" \
     >"$output/duplicate.out" 2>"$output/duplicate.err"; then
-    echo "compiler scaling: duplicate arm compiled" >&2
-    failed=1
+    fail_check "duplicate arm compiled"
 elif [[ $(grep -cxF 'error[E_SEMANTIC]: when.duplicate:integer:1' "$output/duplicate.err" || true) != 1 ]]; then
     cat "$output/duplicate.err" >&2
-    failed=1
+    fail_check "duplicate arm: not exactly one when.duplicate:integer:1 diagnostic"
 fi
 
-if ((failed)); then
-    echo "compiler scaling: a growth bound or correctness check failed" >&2
+if ((${#failures[@]} > 0)); then
+    # One line, so that every failure is within the five lines the suite shows (the EXIT trap adds the logs line after it).
+    summary=$(printf '; %s' "${failures[@]}")
+    echo "compiler scaling: ${#failures[@]} failed: ${summary:2}" >&2
     exit 1
 fi
