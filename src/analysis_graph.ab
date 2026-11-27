@@ -9,6 +9,7 @@ import "module.ab"
 import "module_paths.ab"
 import "lexer.ab"
 import "overload.ab"
+import "delegated_properties.ab"
 import "parser.ab"
 import "sema.ab"
 import "source_rewrite.ab"
@@ -974,21 +975,40 @@ fun bootstrapAnalysisScalarPlaceholder(declaration: BootstrapDeclaration): Boots
         BootstrapExpression(kind, text, declaration.expression.begin, declaration.expression.end, []))
 }
 
+/** `record` as the scalar checker is given it: only the methods a checked body may call (bootstrapAnalysisScalarMethod), their bodies
+ *  placeholders, and each field it never reads (not of a scalar or string type) an `int` without a default, in its place, so that the
+ *  field ids (by index) and offsets are the record's own. */
+fun bootstrapAnalysisScalarRecordView(record: BootstrapDeclaration): BootstrapDeclaration {
+    val methods: array<BootstrapDeclaration> = []
+    for (method in record.methods) {
+        if (bootstrapAnalysisScalarMethod(record, method)) methods.append(bootstrapAnalysisScalarPlaceholder(method))
+    }
+    val types: array<string> = []
+    val defaults: array<BootstrapExpression> = []
+    for (index in 0 until record.parameters.size) {
+        val type = record.parameterTypes[index]
+        val value = record.parameterDefaults[index]
+        if (bootstrapAnalysisScalarType(type) || type == "string") {
+            types.append(type)
+            defaults.append(value)
+        } else {
+            types.append("int")
+            defaults.append(BootstrapExpression("missing", "", value.begin, value.begin, []))
+        }
+    }
+    bootstrapDeclarationWithParameterDefaults(bootstrapDeclarationWithParameterTypes(bootstrapDeclarationWithMethods(record, methods), types),
+        defaults)
+}
+
 fun bootstrapAnalysisCheckScalarBody(document: BootstrapAnalysisGraphDocument, edit: BootstrapAnalysisScalarEdit,
-    builtins: Map<string, string> = Map(), builtinDocument: BootstrapAnalysisGraphDocument? = null): BootstrapAnalysisOccurrenceSet? {
+    builtins: Map<string, string> = Map(), builtinDocument: BootstrapAnalysisGraphDocument? = null,
+    documents: array<BootstrapAnalysisGraphDocument> = []): BootstrapAnalysisOccurrenceSet? {
     val declaration = document.parsed.declarations[edit.declaration]
     val declarations = [declaration]
     // Publish the callees' original interfaces and check only the edited body.
     for (index in edit.callees) declarations.append(bootstrapAnalysisScalarPlaceholder(document.parsed.declarations[index]))
     // The classes whose fields it reads, with only the methods it may call, their bodies placeholders (bootstrapAnalysisScalarRecord).
-    for (index in edit.classes) {
-        val record = document.parsed.declarations[index]
-        val methods: array<BootstrapDeclaration> = []
-        for (method in record.methods) {
-            if (bootstrapAnalysisScalarMethod(record, method)) methods.append(bootstrapAnalysisScalarPlaceholder(method))
-        }
-        declarations.append(bootstrapDeclarationWithMethods(record, methods))
-    }
+    for (record in edit.records) declarations.append(bootstrapAnalysisScalarRecordView(record))
     val parsed = BootstrapParseResult(declarations, [], 0, 0, [], [], "")
     val begins: array<int> = []
     val ends: array<int> = []
@@ -1002,6 +1022,10 @@ fun bootstrapAnalysisCheckScalarBody(document: BootstrapAnalysisGraphDocument, e
     // The built-in types (a written `val t: int`) are named by the built-in module's declarations, by their stable ids, as in the full
     // analysis.
     if (builtinDocument != null) bootstrapAnalysisGraphLocalAliases(builtinDocument, aliases)
+    // The documents of the classes from other modules, whose ids name their fields and methods.
+    val owners: Map<string, bool> = Map()
+    for (record in edit.records) if (record.sourceIdentity != document.document.path) owners.set(record.sourceIdentity, true)
+    for (item in documents) if (owners.has(item.document.path)) bootstrapAnalysisGraphLocalAliases(item, aliases)
     val set = bootstrapAnalysisOccurrenceSet(document.document.text, document.document.path, parsed,
         parsed.declarations, semantic, aliases, false, bootstrapAnalysisOccurrenceIndex(parsed.declarations, semantic, builtins))
     // A built-in member the checker names by its row (`builtin:string.size`) is the built-in module's declaration, by its stable id, as
@@ -1283,7 +1307,7 @@ fun BootstrapAnalysisService.graphReplayBody(previous: BootstrapAnalysisGraphQue
         else {
             var builtinDocument: BootstrapAnalysisGraphDocument? = null
             for (item in documents) if (item.document.path == bootstrapAnalysisGraphBuiltinsPath()) builtinDocument = item
-            val checked = bootstrapAnalysisCheckScalarBody(doc, scalar, builtins, builtinDocument)
+            val checked = bootstrapAnalysisCheckScalarBody(doc, scalar, builtins, builtinDocument, documents)
             if (checked == null) return bootstrapAnalysisRejectReplay("scalar body did not check")
             bootstrapAnalysisReplayScalarOccurrence(oldSet, checked, splice)
         }

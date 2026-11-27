@@ -152,9 +152,9 @@ fun bootstrapAnalysisPlainBodyChange(parsed: BootstrapParseResult, change: Boots
     false
 }
 
-// `classes`: the document's classes whose fields the body reads (bootstrapAnalysisScalarRecord), by index.
+// `records`: the project's classes whose fields the body reads (bootstrapAnalysisScalarRecord), as prepared.
 class BootstrapAnalysisScalarEdit(val splice: BootstrapAnalysisBodyInsert, val declaration: int, val callees: array<int>,
-    val classes: array<int> = [])
+    val records: array<BootstrapDeclaration> = [])
 
 fun bootstrapAnalysisScalarType(type: string): bool =
     type == "int" || type == "i64" || type == "f64" || type == "bool"
@@ -289,9 +289,11 @@ fun bootstrapAnalysisScalarRecord(declaration: BootstrapDeclaration): bool {
         val kind = declaration.parameterKinds[index]
         val type = declaration.parameterTypes[index]
         val value = declaration.parameterDefaults[index]
-        if ((kind != "val" && kind != "var") || (!bootstrapAnalysisScalarType(type) && type != "string") ||
-            (value.kind != "missing" && !bootstrapAnalysisScalarExpression(value, [], 0, false) &&
-             !(type == "string" && value.kind == "string" && value.children.size == 0))) return false
+        if (kind != "val" && kind != "var") return false
+        // A field of another type is never read; the checker is given it as an `int` without a default (bootstrapAnalysisScalarRecordView).
+        if ((bootstrapAnalysisScalarType(type) || type == "string") && value.kind != "missing" &&
+            !bootstrapAnalysisScalarExpression(value, [], 0, false) &&
+            !(type == "string" && value.kind == "string" && value.children.size == 0)) return false
         for (method in declaration.methods) if (method.name == declaration.parameters[index]) return false
     }
     true
@@ -357,25 +359,17 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
     if (parsed.errors != 0 || parsed.extensionErrors != 0) return null
     val changed = bootstrapAnalysisCommonPrefix(before, after)
     val shift = after.size - before.size
-    // The document's classes a checked body may read fields of, by name: text outside the edited body is the same before and after, so
-    // their fields are too.
+    // The project's classes a checked body may read fields of, by name, as prepared: only this document changed (the caller), and its
+    // text outside the edited body is the same before and after, so their fields are the same now. Each is the only top-level declaration
+    // of its name in the project.
     val classes: Map<string, BootstrapDeclaration> = Map()
-    val classIndex: Map<string, int> = Map()
     val classNames: Map<string, int> = Map()
-    for (item in 0 until parsed.declarations.size) {
-        val candidate = parsed.declarations[item]
+    for (candidate in project.declarations) {
+        if (candidate.extensionOwner != "") continue
         classNames.set(candidate.name, (classNames.get(candidate.name) ?? 0) + 1)
-        if (bootstrapAnalysisScalarRecord(candidate)) {
-            classes.set(candidate.name, candidate)
-            classIndex.set(candidate.name, item)
-        }
+        if (bootstrapAnalysisScalarRecord(candidate)) classes.set(candidate.name, candidate)
     }
-    for (name in classes.keys()) {
-        if ((classNames.get(name) ?? 0) != 1) {
-            classes.remove(name)
-            classIndex.remove(name)
-        }
-    }
+    for (name in classes.keys()) if ((classNames.get(name) ?? 0) != 1) classes.remove(name)
     for (index in 0 until parsed.declarations.size) {
         val declaration = parsed.declarations[index]
         val body = declaration.expression
@@ -405,8 +399,8 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
         if (!bootstrapAnalysisReplayStrings(oldLocals.keys(), locals.keys())) return null
         for (name in locals.keys()) if (candidates.has(name) || name == declaration.name) return null
         candidates.set(declaration.name, 0)
-        // The classes of its parameters: each must be the only declaration of its name in the project, the same class in the prepared
-        // program, and extended by nothing, so `p.x` names its field.
+        // The classes of its parameters: each is the only top-level declaration of its name in the project (above) and must be extended
+        // by nothing, so `p.x` names its field.
         val used: Map<string, int> = Map()
         for (type in declaration.parameterTypes) if (classes.has(type)) used.set(type, 0)
         for (name in used.keys()) if (candidates.has(name) || locals.has(name)) return null
@@ -422,22 +416,12 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
                 (candidate.name == "string" && candidate.extensionOwner == "" && candidate.kind != "fun"))) return null
             for (method in candidate.methods) if (bootstrapIsOperatorDeclaration(method)) return null
             if (used.has(candidate.extensionOwner)) return null
-            val owner = used.get(candidate.name)
-            if (candidate.extensionOwner == "" && owner != null) {
-                val record = classes.get(candidate.name) ?? candidate
-                if (owner != 0 || candidate.kind != "class" || candidate.sourceIdentity != declaration.sourceIdentity ||
-                    !bootstrapAnalysisReplayStrings(candidate.parameters, record.parameters) ||
-                    !bootstrapAnalysisReplayStrings(candidate.parameterTypes, record.parameterTypes) ||
-                    !bootstrapAnalysisReplayStrings(candidate.parameterKinds, record.parameterKinds)) return null
-                used.set(candidate.name, item + 1)
-            }
             val known = candidates.get(candidate.name)
             if (candidate.extensionOwner == "" && known != null) {
                 if (known != 0) return null
                 candidates.set(candidate.name, item + 1)
             }
         }
-        for (name in used.keys()) if ((used.get(name) ?? 0) == 0) return null
         val own = candidates.get(declaration.name) ?? 0
         if (own == 0 || !bootstrapAnalysisScalarInterfaceMatches(declaration, project.declarations[own - 1], true, classes)) return null
         // Only a same-module, call-free scalar function can be reused as a
@@ -455,8 +439,26 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
         if (callees.size + 1 != candidates.keys().size) return null
         val splice = BootstrapAnalysisBodyInsert(start, end - start, start, "", 0, 0,
             after.slice(start, end), oldEnd - start, before.slice(start, oldEnd))
-        val records: array<int> = []
-        for (name in used.keys()) records.append(classIndex.get(name) ?? 0)
+        val records: array<BootstrapDeclaration> = []
+        for (name in used.keys()) {
+            val record = classes.get(name)
+            if (record == null) return null
+            // Another module's: a private one is not this module's to name, which full typing reports.
+            if (record.sourceIdentity != declaration.sourceIdentity) {
+                if (record.isPrivate) return null
+                records.append(record)
+                continue
+            }
+            // One of this document: as parsed now, where its offsets (in its field ids) are, after the edited body.
+            var found = false
+            for (candidate in parsed.declarations) {
+                if (candidate.name != name || candidate.extensionOwner != "" || !bootstrapAnalysisScalarRecord(candidate)) continue
+                records.append(candidate)
+                found = true
+                break
+            }
+            if (!found) return null
+        }
         return BootstrapAnalysisScalarEdit(splice, index, callees, records)
     }
     null

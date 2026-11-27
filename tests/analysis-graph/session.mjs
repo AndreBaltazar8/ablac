@@ -1740,22 +1740,25 @@ async function unchangedInputs() {
 }
 
 const tests = { unchanged_inputs: unchangedInputs, compound_assignment: () => compoundAssignmentFix('graph-v1'), compound_assignment_v2: () => compoundAssignmentFix('graph-v2'), index_loop: () => indexLoopFix('graph-v1'), index_loop_v2: () => indexLoopFix('graph-v2'), logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
-async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false, strings = false, fields = false, extended = false, parens = false, loops = false) {
-    const head = locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
-        : fields ? 'fun answer(left: int, right: int, p: Point): int = ' : 'fun answer(left: int, right: int): int = ';
+async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false, strings = false, fields = false, extended = false, parens = false, loops = false, imported = false) {
+    // An imported class: declared in its own module.
+    const head = (imported ? 'import "./point.ab"\n' : '') + (locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
+        : fields ? 'fun answer(left: int, right: int, p: Point): int = ' : 'fun answer(left: int, right: int): int = ');
+    // A field of another type (`tags`) is never read, but does not keep the class from the checker.
+    const point = 'class Point(val x: int, var y: int, val label: string = "p", val tags: array<string> = []) {\n    fun total(): int = this.x + this.y\n    fun scaled(k: int): int = this.x * k\n    fun name(): string = this.label\n}\n';
     const block = (...lines) => '{\n' + lines.map(line => '    ' + line + '\n').join('') + '}';
     const initial = calls ? 'step(left) + right' : locals ? block('val t = left + right', 't') : returns ? block('if (left < 0) return right', 'left + right') : strings ? 'text.size + left' : fields ? 'p.x + left'
         : loops ? block('var s = 0', 'for (i in 0 until left) s += i', 's + right') : 'left + right';
     // A global `i`: the loop's `i` ends with the loop, so a later `i` is the global, left to full typing.
     const rest = '\nfun later(): int = 7\n' + (loops ? 'val i: int = 3\n' : '') + (calls
-        ? 'fun step(n: int): int = n + 1\nfun shift(n: int): int = n * 2\n' : '') + (fields
-        ? 'class Point(val x: int, var y: int, val label: string = "p") {\n    fun total(): int = this.x + this.y\n    fun scaled(k: int): int = this.x * k\n    fun name(): string = this.label\n}\n' : '');
-    const main = 'import "./dep.ab"\n' + (extended ? 'import "./ext.ab"\n' : '') + 'fun main: int = answer(2, 3' + (strings ? ', "abc"' : fields ? ', Point(4, 5)' : '') + ') + later()\n';
-    const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : locals ? 'checked-locals' : returns ? 'checked-returns' : strings ? 'checked-strings' : extended ? 'checked-extended' : loops ? 'checked-loops' : parens ? 'checked-parens' : fields ? 'checked-fields' : 'checked-scalar', {
+        ? 'fun step(n: int): int = n + 1\nfun shift(n: int): int = n * 2\n' : '') + (fields && !imported ? point : '');
+    const main = 'import "./dep.ab"\n' + (imported ? 'import "./point.ab"\n' : '') + (extended ? 'import "./ext.ab"\n' : '') + 'fun main: int = answer(2, 3' + (strings ? ', "abc"' : fields ? ', Point(4, 5)' : '') + ') + later()\n';
+    const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : locals ? 'checked-locals' : returns ? 'checked-returns' : strings ? 'checked-strings' : extended ? 'checked-extended' : imported ? 'checked-imported' : loops ? 'checked-loops' : parens ? 'checked-parens' : fields ? 'checked-fields' : 'checked-scalar', {
         'abla.toml': 'name = "checked-scalar"\nentry = "main.ab"\nvisibility = "imports"\n',
         'main.ab': main,
         'dep.ab': head + initial + rest,
         // An extension of the class: `p.x` is left to full typing.
+        ...(imported ? { 'point.ab': point } : {}),
         ...(extended ? { 'ext.ab': 'import "./dep.ab"\nfun Point.twice(): int = this.x * 2\n' } : {}),
     });
     const file = path.join(p, 'dep.ab');
@@ -1871,6 +1874,7 @@ tests.checked_strings = () => checkedScalarBody(false, false, false, false, true
 tests.checked_fields = () => checkedScalarBody(false, false, false, false, false, true);
 tests.checked_parens = () => checkedScalarBody(false, false, false, false, false, false, false, true);
 tests.checked_loops = () => checkedScalarBody(false, false, false, false, false, false, false, false, true);
+tests.checked_fields_imported = () => checkedScalarBody(false, false, false, false, false, true, false, false, false, true);
 tests.checked_fields_extended = () => checkedScalarBody(false, false, false, false, false, true, true);
 
 tests.checked_interface = async () => {
