@@ -72,6 +72,20 @@ rejected "$output_directory/mismatch/app/main.ab" \
     'note: `fun floor(f64): f64` differs in `./mismatch.ab`: `fun floor(int): f64`' \
     'note: `fun ceil(f64): f64` is missing from `./mismatch.ab`'
 
+# A remapped module that doesn't parse is reported by its parse error only: the locals of a body
+# that `@inline private fun` cut loose are not declarations the target must have.
+broken=$output_directory/broken
+mkdir -p "$broken/lib" "$broken/app"
+printf 'fun shown(x: int): int = hidden(x)\n@inline\nprivate fun hidden(x: int): int {\n    val doubled = x * 2\n    doubled\n}\n' > "$broken/lib/real.ab"
+printf 'fun shown(x: int): int = x\n' > "$broken/app/fake.ab"
+printf 'import "../lib/real.ab"\nfun main(): int = shown(0)\n' > "$broken/app/main.ab"
+printf 'name = "import-remap-broken"\n\n[imports]\n"../lib/real.ab" = "fake.ab"\n' > "$broken/app/abla.toml"
+rejected "$broken/app/main.ab" \
+    'error[E_PARSE_ANNOTATED_DECLARATION]: annotation must precede a declaration' \
+    'write `private` before the annotations, as in `private @inline fun`'
+! grep -F -e E_IMPORT_REMAP_MISMATCH -e '`val doubled' "$output_directory/rejected.err" > /dev/null ||
+    { echo "import-remap: a module that doesn't parse was compared"; cat "$output_directory/rejected.err"; exit 1; }
+
 # Only the root manifest remaps.
 variant nested 'name = "import-remap-test"'
 printf '[imports]\n"abla/float" = "abla/float"\n' >> "$output_directory/nested/lib/abla.toml"
