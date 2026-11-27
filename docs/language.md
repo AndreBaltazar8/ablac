@@ -3124,7 +3124,14 @@ A kernel, and every function it calls, may use:
   and `kernelSubgroupAll`; and `kernelSubgroupBarrier()` (`__syncwarp`);
 - `kernelFma`, `kernelSqrt`, `kernelRsqrt`, `kernelExp`, `kernelF16ToF32`,
   `kernelCountTrailingZeros` (64 for 0) and abla/float's bit and conversion
-  functions;
+  functions; the half-precision conversions on packed bits in ints (no f16 or
+  bf16 type): `kernelBf16ToF32`, `kernelF32ToBf16` and `kernelF32ToF16` (round
+  to nearest even), `kernelF16x2Fma` (two binary16 lanes, `__hfma2`),
+  `kernelF32ToE4m3x2(high, low)` and `kernelE4m3x2ToF16x2` (FP8 E4M3,
+  saturating like `cvt.rn.satfinite.e4m3x2.f32`; a module using them targets
+  sm_89, Ada) and `kernelRoundToInt` (`__float2int_rn`), each the GPU's
+  instruction on CUDA and an exact integer version on the CPU, the same bits on
+  both (NaN results 0x7fff);
 - `KernelU32Buffer.atomicAdd` (one indivisible add, giving the old value) and
   `kernelFence()` (CUDA's `__threadfence`), with which the last group to finish
   can combine every group's results.

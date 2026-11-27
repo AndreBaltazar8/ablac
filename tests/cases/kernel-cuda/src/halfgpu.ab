@@ -1,0 +1,45 @@
+// The half-precision conversions (half.ab) on the GPU against the CPU backend, word for word, on the whole input set: the
+// PTX cvt and fma.rn.f16x2 forms and the CPU's integer versions give the same bits (the CPU's are CUDA C's: half-cpu.ab).
+import "half.ab"
+import "abla/kernel"
+import "abla/kernel/cuda"
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+/** The words of `a` and `b` that differ (both the same size). */
+trusted fun halfDifferences(a: NativeByteBuffer, b: NativeByteBuffer): int {
+    val x = halfView(a)
+    val y = halfView(b)
+    var different = 0
+    for (i in 0 until x.size()) if (x.load(i) != y.load(i)) different = different + 1
+    different
+}
+
+/** The words that differ between the GPU's and the CPU's results (-1 when the GPU run failed, with the reason printed). */
+trusted fun halfCases(var device: CudaKernelDevice): int {
+    val inputs = halfInputs()
+    val cpu = halfResults(inputs)
+    halfRunCpu(inputs, cpu)
+    val gpu = halfResults(inputs)
+    val n = inputs.floats.capacity / 4
+    val m = inputs.triples.capacity / 12
+    val dx = device.allocate(inputs.floats.capacity)
+    val dabc = device.allocate(inputs.triples.capacity)
+    val dF32 = device.allocate(gpu.fromF32.capacity)
+    val dBits = device.allocate(gpu.fromBits.capacity)
+    val dFma = device.allocate(gpu.fma.capacity)
+    if (dx == null || dabc == null || dF32 == null || dBits == null || dFma == null) { println("half: ${device.error}"); return -1 }
+    if (!device.upload(dx, inputs.floats) || !device.upload(dabc, inputs.triples) ||
+        !device.launch("halfFromF32", (n + 255) / 256, 256, cudaKernelArguments().buffer(dx.words()).buffer(dF32.words()).integer(n)) ||
+        !device.launch("halfFromBits", HALF_PAIRS / 256, 256, cudaKernelArguments().buffer(dBits.words()).integer(HALF_PAIRS)) ||
+        !device.launch("halfFma", (m + 255) / 256, 256, cudaKernelArguments().buffer(dabc.words()).buffer(dFma.words()).integer(m)) ||
+        !device.download(dF32, gpu.fromF32) || !device.download(dBits, gpu.fromBits) || !device.download(dFma, gpu.fma)) {
+        println("half: ${device.error}")
+        return -1
+    }
+    val different = halfDifferences(cpu.fromF32, gpu.fromF32) + halfDifferences(cpu.fromBits, gpu.fromBits) +
+        halfDifferences(cpu.fma, gpu.fma)
+    println("half: bf16, f16, e4m3x2 (both ways), rounded ints and f16x2 fma on ${n + 2 * HALF_PAIRS + m} inputs, ${halfSummary(inputs, gpu)} on the GPU, words different from the CPU: $different, the same bits: ${different == 0}")
+    different
+}

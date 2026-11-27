@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # `@kernel` functions (#1233, docs/language.md#gpu-kernels):
 #   - abla-grad's NVFP4 matvec as a kernel on the CPU backend agrees with an independent f64 reference (nvfp4-cpu.ab);
+#   - the half-precision conversions (bf16, f16, FP8 E4M3, f16x2 fma, rounded ints) give CUDA C's bits on the CPU (half-cpu.ab);
 #   - a kernel outside the subset is refused when the program is built, naming the rule: a string (kernel.operation), a
 #     recursive call (kernel.recursion), a result (kernel.signature), native code (kernel.call);
 #   - on CUDA (tests/cases/kernel-cuda, the compiler's PTX through abla/kernel/cuda): vadd equals the CPU's result and the
@@ -20,6 +21,12 @@ cases=tests/cases/kernel
 "$compiler" build "$cases/nvfp4-cpu.ab" -o "$out/nvfp4-cpu" --fast --no-cache > "$out/nvfp4-cpu.log" 2>&1 ||
     fail "nvfp4-cpu did not build: $(head -4 "$out/nvfp4-cpu.log")"
 "$out/nvfp4-cpu" > "$out/nvfp4-cpu.out" 2>&1 || fail "nvfp4-cpu: $(cat "$out/nvfp4-cpu.out")"
+
+# The half-precision conversions (#1302) on the CPU backend give CUDA C's bits on the 4090 for every input of the set
+# (tools/probe-kernel-half.cu printed the hashes half-cpu.ab records).
+"$compiler" build "$cases/half-cpu.ab" -o "$out/half-cpu" --fast --no-cache > "$out/half-cpu.log" 2>&1 ||
+    fail "half-cpu did not build: $(head -4 "$out/half-cpu.log")"
+"$out/half-cpu" > "$out/half-cpu.out" 2>&1 || fail "half-cpu: $(cat "$out/half-cpu.out")"
 
 for refused in string:operation:string recursion:recursion:depth result:signature native:call:ablaLinuxSyscall; do
     IFS=: read -r name rule detail <<< "$refused"
@@ -111,9 +118,10 @@ if [[ -n $library ]]; then
             grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" &&
             grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" && grep -q "quad4: .* true" "$out/kernel-cuda.out" && grep -q "words4: .* true" "$out/kernel-cuda.out" &&
             grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" && grep -q "subgroups: .* true" "$out/kernel-cuda.out" &&
-            grep -q "launch guards: .* true" "$out/kernel-cuda.out" && grep -q "edge indices: .* true" "$out/kernel-cuda.out" ||
+            grep -q "launch guards: .* true" "$out/kernel-cuda.out" && grep -q "edge indices: .* true" "$out/kernel-cuda.out" &&
+            grep -q "half: .* the same bits: true" "$out/kernel-cuda.out" ||
             fail "kernel-cuda: $(cat "$out/kernel-cuda.out")"
-        cuda="vadd, the NVFP4 and Q8_0 matvecs (and Q8_0 on the unchecked fast path), rmsnorm (shared memory, barriers), kernelExp and the buffer edges agree on the GPU and the CPU"
+        cuda="vadd, the NVFP4 and Q8_0 matvecs (and Q8_0 on the unchecked fast path), rmsnorm (shared memory, barriers), kernelExp, the buffer edges and the half-precision conversions agree on the GPU and the CPU"
     fi
 fi
-echo "kernels: the NVFP4 matvec kernel matches its reference on the CPU; a string, recursion, a result, native code and an untrusted unchecked load are refused; the CPU backend stops an unchecked load past the end; CUDA: $cuda"
+echo "kernels: the NVFP4 matvec kernel matches its reference on the CPU; the half-precision conversions give CUDA C's bits on the CPU; a string, recursion, a result, native code and an untrusted unchecked load are refused; the CPU backend stops an unchecked load past the end; CUDA: $cuda"

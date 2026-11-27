@@ -1,0 +1,182 @@
+// abla/kernel's half-precision conversions (#1302) over a fixed input set, the one tools/probe-kernel-half.cu gives CUDA C:
+// f32 specials (zeros, infinities, NaNs with payloads, subnormals, the bf16/f16/e4m3 rounding and saturation edges), every
+// sign and exponent with mantissas at those edges, and xorshift32 patterns; every e4m3 pair; and f16x2 fma on crossed f16
+// specials and xorshift32 words. Each section hashes (FNV-1a, 32-bit, over each entry's words) to CUDA C's own results.
+import "abla/kernel"
+import "abla/float"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+/** Per f32 pattern x[i] (and x[i + 1], wrapping): its bf16, f16, rounded int and e4m3x2 (x[i] high) in out[4i] to out[4i + 3]. */
+@kernel
+fun halfFromF32(x: KernelU32Buffer, out: KernelU32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) {
+        val a = f32FromBits(u32(x.load(i)))
+        val b = f32FromBits(u32(x.load(if (i + 1 < n) i + 1 else 0)))
+        out.store(4 * i, kernelF32ToBf16(a))
+        out.store(4 * i + 1, kernelF32ToF16(a))
+        out.store(4 * i + 2, kernelRoundToInt(a))
+        out.store(4 * i + 3, kernelF32ToE4m3x2(a, b))
+    }
+}
+
+/** The f16x2 lanes of e4m3 pair i, for every pair below n; and the f32 bits of bf16 i in out[n + i]. */
+@kernel
+fun halfFromBits(out: KernelU32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) {
+        out.store(i, kernelE4m3x2ToF16x2(i))
+        out.store(n + i, int(f32ToBits(kernelBf16ToF32(i))))
+    }
+}
+
+/** kernelF16x2Fma of the words abc[3i], abc[3i + 1] and abc[3i + 2] in out[i]. */
+@kernel
+fun halfFma(abc: KernelU32Buffer, out: KernelU32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) out.store(i, kernelF16x2Fma(abc.load(3 * i), abc.load(3 * i + 1), abc.load(3 * i + 2)))
+}
+
+/** The pairs of e4m3 bytes (all of them). */
+val HALF_PAIRS = 65536
+
+/** The f32 patterns before the exponent sweep. */
+val HALF_SPECIALS: array<int> = [
+    0x00000000, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00000, 0x7f800001, 0xff800001,
+    0x7fbfffff, 0x7fffffff, 0xffffffff, 0x7fc00001, 0x00000001, 0x80000001, 0x007fffff, 0x00800000,
+    0x3f800000, 0xbf800000, 0x43e00000, 0x43e80000, 0x43f00000, 0xc3e00000, 0xc3f00000, 0x477fe000,
+    0x477ff000, 0x477fefff, 0x47800000, 0x33800000, 0x33000000, 0x33000001, 0x3b000000, 0x3a800000,
+    0x3b100000, 0x4f000000, 0xcf000000, 0x4effffff, 0xcf000001, 0x3f000000, 0x3fc00000, 0x40200000,
+    0xbf000000, 0xbfc00000, 0x7f7fffff, 0xff7fffff]
+
+/** The mantissas each sign and exponent is crossed with: the rounding bits of bf16 (16), f16 (13) and e4m3 (20) and their ties. */
+val HALF_MANTISSAS: array<int> = [
+    0x000000, 0x000001, 0x000002, 0x000003, 0x7fffff, 0x7ffffe, 0x400000, 0x3fffff, 0x000fff, 0x001000,
+    0x001001, 0x001fff, 0x002000, 0x003000, 0x007fff, 0x008000, 0x008001, 0x018000, 0x017fff, 0x010000,
+    0x7f8000, 0x7fc000, 0x080000, 0x080001, 0x07ffff, 0x180000, 0x100000, 0x17ffff, 0x280000, 0x700000,
+    0x780000, 0x77ffff, 0x600000, 0x680000]
+
+/** f16 specials for the fma: zeros, subnormal ends, smallest normal, +-1, 0.5, the largest, infinities, NaNs, and a few odd values. */
+val HALF_F16_SPECIALS: array<int> = [0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x3c00, 0xbc00, 0x3800, 0x7bff,
+    0xfbff, 0x7c00, 0xfc00, 0x7e00, 0x7c01, 0xfe01, 0x7fff, 0x0003, 0x3555, 0x5bff, 0x1400]
+
+/** The xorshift32 words after each section's fixed inputs. */
+val HALF_RANDOM = 262144
+
+/** Marsaglia's xorshift32, from 2463534242, as the CUDA C reference steps it. */
+class HalfRandom(var state: int)
+
+/** The next xorshift32 word. */
+fun HalfRandom.next(): int {
+    this.state = this.state ^ ((this.state << 13) & 0xffffffff)
+    this.state = this.state ^ (this.state >> 17)
+    this.state = this.state ^ ((this.state << 5) & 0xffffffff)
+    this.state
+}
+
+/** A buffer of `count` u32 words. */
+trusted fun halfWords(count: int): NativeByteBuffer = nativeByteBuffer(count * 4)
+
+/** The kernel view of a word buffer. */
+trusted fun halfView(buffer: NativeByteBuffer): KernelU32Buffer =
+    KernelU32Buffer(nativePointerAddress(buffer.address), buffer.capacity / 4)
+
+/** The f32 input patterns, then the f16x2 fma triples (3 words each), drawing from one generator in that order. */
+class HalfInputs(val floats: NativeByteBuffer, val triples: NativeByteBuffer)
+
+/** The inputs, as tools/probe-kernel-half.cu makes them. */
+trusted fun halfInputs(): HalfInputs {
+    var random = HalfRandom(2463534242)
+    val floatCount = HALF_SPECIALS.size + 2 * 256 * HALF_MANTISSAS.size + HALF_RANDOM
+    val floats = halfWords(floatCount)
+    val f = halfView(floats)
+    var k = 0
+    for (pattern in HALF_SPECIALS) { f.store(k, pattern); k = k + 1 }
+    for (sign in 0 until 2) for (exponent in 0 until 256) for (mantissa in HALF_MANTISSAS) {
+        f.store(k, (sign << 31) | (exponent << 23) | mantissa)
+        k = k + 1
+    }
+    for (r in 0 until HALF_RANDOM) { f.store(k, random.next()); k = k + 1 }
+    val s = HALF_F16_SPECIALS
+    val crossed = s.size * s.size * s.size
+    val triples = halfWords(3 * (crossed + HALF_RANDOM))
+    val t = halfView(triples)
+    k = 0
+    for (i in 0 until s.size) for (j in 0 until s.size) for (l in 0 until s.size) {
+        t.store(k, s[i] | (s[j] << 16))
+        t.store(k + 1, s[j] | (s[l] << 16))
+        t.store(k + 2, s[l] | (s[i] << 16))
+        k = k + 3
+    }
+    for (r in 0 until 3 * HALF_RANDOM) { t.store(k, random.next()); k = k + 1 }
+    HalfInputs(move(floats), move(triples))
+}
+
+/** FNV-1a (32-bit) of `hash` and the four little-endian bytes of `word`. */
+fun halfHash(hash: int, word: int): int {
+    var h = hash
+    for (k in 0 until 4) h = ((h ^ ((word >> (8 * k)) & 255)) * 16777619) & 0xffffffff
+    h
+}
+
+/** `value` as `digits` lowercase hex digits. */
+fun halfHex(value: int, digits: int): string {
+    var text = ""
+    for (k in 0 until digits) {
+        val digit = (value >> (4 * (digits - 1 - k))) & 15
+        text = "$text${"0123456789abcdef".slice(digit, digit + 1)}"
+    }
+    text
+}
+
+/** The results of the three kernels for `inputs`: 4 words per f32, 2 * HALF_PAIRS for the pairs and bf16s, 1 per triple. */
+class HalfResults(val fromF32: NativeByteBuffer, val fromBits: NativeByteBuffer, val fma: NativeByteBuffer)
+
+/** Fresh result buffers for `inputs`. */
+trusted fun halfResults(inputs: HalfInputs): HalfResults =
+    HalfResults(halfWords(4 * (inputs.floats.capacity / 4)), halfWords(2 * HALF_PAIRS), halfWords(inputs.triples.capacity / 12))
+
+/** The three kernels on the CPU backend. */
+trusted fun halfRunCpu(inputs: HalfInputs, results: HalfResults): void {
+    val n = inputs.floats.capacity / 4
+    val m = inputs.triples.capacity / 12
+    val x = halfView(inputs.floats)
+    val abc = halfView(inputs.triples)
+    val a = halfView(results.fromF32)
+    val b = halfView(results.fromBits)
+    val c = halfView(results.fma)
+    kernelRunCpu((n + 255) / 256, 256) { halfFromF32(x, a, n) }
+    kernelRunCpu(HALF_PAIRS / 256, 256) { halfFromBits(b, HALF_PAIRS) }
+    kernelRunCpu((m + 255) / 256, 256) { halfFma(abc, c, m) }
+}
+
+/**
+ * The section hashes of `results`, "f <count> <hash> e <count> <hash> h <count> <hash>", each entry's words as the CUDA C
+ * reference prints them: f: x, bf16, f16, rounded int, e4m3x2; e: pair, f16x2; h: a, b, c, fma. Also checks that bf16 i
+ * read back gives its own bits, false in `bf16Exact` otherwise.
+ */
+trusted fun halfSummary(inputs: HalfInputs, results: HalfResults): string {
+    val x = halfView(inputs.floats)
+    val abc = halfView(inputs.triples)
+    val a = halfView(results.fromF32)
+    val b = halfView(results.fromBits)
+    val c = halfView(results.fma)
+    var f = 2166136261
+    for (i in 0 until x.size()) {
+        f = halfHash(f, x.load(i))
+        for (k in 0 until 4) f = halfHash(f, a.load(4 * i + k))
+    }
+    var e = 2166136261
+    var bf16Exact = true
+    for (i in 0 until HALF_PAIRS) {
+        e = halfHash(halfHash(e, i), b.load(i))
+        if (b.load(HALF_PAIRS + i) != i << 16) bf16Exact = false
+    }
+    var h = 2166136261
+    for (i in 0 until c.size()) {
+        for (k in 0 until 3) h = halfHash(h, abc.load(3 * i + k))
+        h = halfHash(h, c.load(i))
+    }
+    "f ${x.size()} ${halfHex(f, 8)} e $HALF_PAIRS ${halfHex(e, 8)} h ${c.size()} ${halfHex(h, 8)} bf16 exact $bf16Exact"
+}

@@ -699,6 +699,86 @@ fun bootstrapKernelShuffleMode(name: string): string {
     ""
 }
 
+/** `bits` (an LLVM value of type `from`, i16 or i32) widened to the i64 of an Abla int, the result of `instruction`. */
+fun bootstrapKernelSetBits(
+    var state: BootstrapKernelFunctionState,
+    instruction: BootstrapInstruction,
+    bits: string,
+    from: string
+): void {
+    val result = bootstrapKernelFresh(state)
+    bootstrapKernelLine(state, "$result = zext $from $bits to i64")
+    bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, "i64", ""))
+}
+
+/**
+ * abla/kernel's half-precision conversions on packed bits (#1302), each the GPU's own instruction: cvt.rn.bf16.f32,
+ * cvt.rn.f16.f32, fma.rn.f16x2, cvt.rn.satfinite.e4m3x2.f32, cvt.rn.f16x2.e4m3x2 and cvt.rni.s32.f32 (the e4m3 two need
+ * sm_89, which bootstrapKernelCompilePtx then targets). False when `instruction` calls none of them.
+ */
+fun bootstrapKernelHalfBuiltin(
+    var emitter: BootstrapKernelEmitter,
+    var state: BootstrapKernelFunctionState,
+    instruction: BootstrapInstruction
+): bool {
+    val name = instruction.text
+    if (name != "kernelBf16ToF32" && name != "kernelF32ToBf16" && name != "kernelF32ToF16" && name != "kernelF16x2Fma" &&
+        name != "kernelF32ToE4m3x2" && name != "kernelE4m3x2ToF16x2" && name != "kernelRoundToInt") return false
+    val arity = if (name == "kernelF16x2Fma") 3 else if (name == "kernelF32ToE4m3x2") 2 else 1
+    if (instruction.operands.size < arity) return false
+    val floats = name == "kernelF32ToBf16" || name == "kernelF32ToF16" || name == "kernelF32ToE4m3x2" || name == "kernelRoundToInt"
+    val width = if (floats) "f32" else if (name == "kernelE4m3x2ToF16x2") "u16" else "u32"
+    var operands: array<string> = []
+    for (index in 0 until arity) {
+        val operand = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[index]), width)
+        if (operand == "") return true
+        operands.append(operand)
+    }
+    val value = bootstrapKernelFresh(state)
+    if (name == "kernelBf16ToF32") {
+        val shifted = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$shifted = shl i32 ${operands[0]}, 16")
+        bootstrapKernelLine(state, "$value = bitcast i32 $shifted to float")
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(value, "f32", ""))
+    } else if (name == "kernelF32ToBf16" || name == "kernelF32ToF16") {
+        val half = if (name == "kernelF32ToBf16") "bfloat" else "half"
+        val narrow = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$narrow = fptrunc float ${operands[0]} to $half")
+        bootstrapKernelLine(state, "$value = bitcast $half $narrow to i16")
+        bootstrapKernelSetBits(state, instruction, value, "i16")
+    } else if (name == "kernelF16x2Fma") {
+        bootstrapKernelDeclare(emitter, "declare <2 x half> @llvm.fma.v2f16(<2 x half>, <2 x half>, <2 x half>)")
+        var lanes: array<string> = []
+        for (operand in operands) {
+            val lane = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$lane = bitcast i32 $operand to <2 x half>")
+            lanes.append(lane)
+        }
+        val fused = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$fused = call <2 x half> @llvm.fma.v2f16(<2 x half> ${lanes[0]}, <2 x half> ${lanes[1]}, <2 x half> ${lanes[2]})")
+        bootstrapKernelLine(state, "$value = bitcast <2 x half> $fused to i32")
+        bootstrapKernelSetBits(state, instruction, value, "i32")
+    } else if (name == "kernelF32ToE4m3x2") {
+        // The first operand lands in the high byte, as PTX's cvt.rn.satfinite.e4m3x2.f32 d, a, b.
+        bootstrapKernelDeclare(emitter, "declare i16 @llvm.nvvm.ff.to.e4m3x2.rn(float, float)")
+        bootstrapKernelLine(state, "$value = call i16 @llvm.nvvm.ff.to.e4m3x2.rn(float ${operands[0]}, float ${operands[1]})")
+        bootstrapKernelSetBits(state, instruction, value, "i16")
+    } else if (name == "kernelE4m3x2ToF16x2") {
+        bootstrapKernelDeclare(emitter, "declare <2 x half> @llvm.nvvm.e4m3x2.to.f16x2.rn(i16)")
+        val pair = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$pair = call <2 x half> @llvm.nvvm.e4m3x2.to.f16x2.rn(i16 ${operands[0]})")
+        bootstrapKernelLine(state, "$value = bitcast <2 x half> $pair to i32")
+        bootstrapKernelSetBits(state, instruction, value, "i32")
+    } else {
+        bootstrapKernelDeclare(emitter, "declare i32 @llvm.nvvm.f2i.rn(float)")
+        bootstrapKernelLine(state, "$value = call i32 @llvm.nvvm.f2i.rn(float ${operands[0]})")
+        val result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = sext i32 $value to i64")
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(result, "i64", ""))
+    }
+    true
+}
+
 /** A call to abla/kernel's ids, subgroup operations and fma, which each backend answers itself; false when `name` is
  *  none of them. */
 fun bootstrapKernelBuiltin(
@@ -1028,6 +1108,8 @@ fun bootstrapKernelBuiltin(
         result = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$result = fpext half $half to float")
         type = "f32"
+    } else if (bootstrapKernelHalfBuiltin(emitter, state, instruction)) {
+        return true
     } else if (name == "extension_KernelF32Buffer_size" || name == "extension_KernelU32Buffer_size" ||
         name == "extension_KernelU16Buffer_size" || name == "extension_KernelU8Buffer_size") {
         if (instruction.operands.size < 1) return false
@@ -1454,11 +1536,17 @@ fun bootstrapKernelCompilePtx(module: string, var failure: array<string>): strin
     var ptx = ""
     if (!source.writeText(module)) failure.append("cannot write ${source.text}")
     else {
-        val architecture = "sm_80"
+        // FP8 conversions (kernelF32ToE4m3x2, kernelE4m3x2ToF16x2) exist from Ada (sm_89, PTX 8.1 in LLVM's NVPTX): a module
+        // using them targets that, and an Ampere GPU refuses to load it.
+        val fp8 = module.contains("@llvm.nvvm.ff.to.e4m3x2.rn") || module.contains("@llvm.nvvm.e4m3x2.to.f16x2.rn")
+        val architecture = if (fp8) "sm_89" else "sm_80"
         val opt = linuxCommand(bootstrapKernelTool("opt")).argument("-O3").argument(source.text).argument("-o")
             .argument(optimized.text).errors(log.text).run()
-        val llc = if (opt != 0) opt else linuxCommand(bootstrapKernelTool("llc")).argument("-O3")
-            .argument("-mcpu=$architecture").argument(optimized.text).argument("-o").argument(output.text).errors(log.text).run()
+        val llc = if (opt != 0) opt
+            else if (fp8) linuxCommand(bootstrapKernelTool("llc")).argument("-O3").argument("-mcpu=$architecture").argument("-mattr=+ptx81")
+                .argument(optimized.text).argument("-o").argument(output.text).errors(log.text).run()
+            else linuxCommand(bootstrapKernelTool("llc")).argument("-O3").argument("-mcpu=$architecture")
+                .argument(optimized.text).argument("-o").argument(output.text).errors(log.text).run()
         if (opt != 0 || llc != 0) {
             val reason = log.readText()
             failure.append("${if (opt != 0) "opt" else "llc"} exited ${if (opt != 0) opt else llc}: ${reason.slice(0, if (reason.size > 2000) 2000 else reason.size)} (module kept in ${source.text})")

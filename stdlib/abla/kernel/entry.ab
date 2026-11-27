@@ -401,6 +401,137 @@ fun kernelF16ToF32(bits: int): f32 {
     if (sign == 1) -magnitude else magnitude
 }
 
+// Half precision on packed bits (#1302): no f16 or bf16 type, the values travel as ints. On CUDA each is the GPU's own
+// conversion (cvt, fma.rn.f16x2); on the CPU the integer versions below give the same bits, NaN included: every NaN a
+// conversion or the fma makes is the canonical 0x7fff, sign dropped, as the GPU's.
+
+/** `bits` shifted right by `shift` (1 or more), rounded to nearest, ties to even. */
+private fun kernelCpuShiftRound(bits: int, shift: int): int {
+    val result = bits >> shift
+    val remainder = bits & ((1 << shift) - 1)
+    val half = 1 << (shift - 1)
+    if (remainder > half || (remainder == half && (result & 1) == 1)) result + 1 else result
+}
+
+/**
+ * The magnitude (2^fractionBits + fraction) * 2^(exponent - fractionBits) rounded to nearest even in a binary format with
+ * `mantissa` stored bits and exponent bias `bias`, subnormals included: its encoding, the exponent field above the mantissa
+ * bits, unbounded (the caller overflows or saturates it).
+ */
+private fun kernelCpuRoundBinary(exponent: int, fraction: int, fractionBits: int, mantissa: int, bias: int): int {
+    val biased = exponent + bias
+    val significand = (1 << fractionBits) | fraction
+    if (biased >= 1) return ((biased - 1) << mantissa) + kernelCpuShiftRound(significand, fractionBits - mantissa)
+    val shift = fractionBits - mantissa + 1 - biased
+    if (shift > fractionBits + 1) 0 else kernelCpuShiftRound(significand, shift)
+}
+
+/** The f32 value of the bfloat16 bits in the low 16 bits of `bits` (exact: the f32's top half). */
+fun kernelBf16ToF32(bits: int): f32 = f32FromBits(u32((bits & 0xffff) << 16))
+
+/** The bfloat16 bits of `value` rounded to nearest even (CUDA C's `__float2bfloat16_rn`): subnormals kept, NaN 0x7fff. */
+fun kernelF32ToBf16(value: f32): int {
+    val bits = int(f32ToBits(value))
+    if ((bits & 0x7fffffff) > 0x7f800000) return 0x7fff
+    (bits + 0x7fff + ((bits >> 16) & 1)) >> 16
+}
+
+/** The IEEE binary16 bits of `value` rounded to nearest even (CUDA C's `__float2half_rn`): past 65504 infinity, NaN 0x7fff. */
+fun kernelF32ToF16(value: f32): int {
+    val bits = int(f32ToBits(value))
+    val sign = (bits >> 16) & 0x8000
+    val exponent = (bits >> 23) & 255
+    val fraction = bits & 0x7fffff
+    if (exponent == 255) return if (fraction != 0) 0x7fff else sign | 0x7c00
+    if (exponent == 0) return sign
+    val magnitude = kernelCpuRoundBinary(exponent - 127, fraction, 23, 10, 15)
+    sign | (if (magnitude > 0x7c00) 0x7c00 else magnitude)
+}
+
+/** The IEEE binary16 bits of the f64 `value` rounded to nearest even, NaN 0x7fff (one rounding, for kernelF16x2Fma). */
+private fun kernelCpuF64ToF16(value: f64): int {
+    val bits = f64ToBits(value)
+    val sign = if (bits < 0) 0x8000 else 0
+    val exponent = (bits >> 52) & 0x7ff
+    val fraction = bits & 0xfffffffffffff
+    if (exponent == 0x7ff) return if (fraction != 0) 0x7fff else sign | 0x7c00
+    if (exponent == 0) return sign
+    val magnitude = kernelCpuRoundBinary(exponent - 1023, fraction, 52, 10, 15)
+    sign | (if (magnitude > 0x7c00) 0x7c00 else magnitude)
+}
+
+/**
+ * a * b + c on two binary16 lanes packed in the low 32 bits of each operand (lane 0 in the low half), each rounded once to
+ * nearest even: CUDA C's `__hfma2`, `fma.rn.f16x2`. The CPU computes each lane in f64, where the product is exact and the
+ * sum's one rounding cannot change the binary16 result.
+ */
+fun kernelF16x2Fma(a: int, b: int, c: int): int {
+    var result = 0
+    for (lane in 0 until 2) {
+        val x = ablaConvertF32ToF64(kernelF16ToF32((a >> (16 * lane)) & 0xffff))
+        val y = ablaConvertF32ToF64(kernelF16ToF32((b >> (16 * lane)) & 0xffff))
+        val z = ablaConvertF32ToF64(kernelF16ToF32((c >> (16 * lane)) & 0xffff))
+        result = result | (kernelCpuF64ToF16(x * y + z) << (16 * lane))
+    }
+    result
+}
+
+/** The FP8 E4M3 byte of `value` rounded to nearest even and saturated: past 448 (infinity too) +-448 (0x7e), NaN 0x7f. */
+private fun kernelCpuF32ToE4m3(value: f32): int {
+    val bits = int(f32ToBits(value))
+    val sign = (bits >> 24) & 0x80
+    val exponent = (bits >> 23) & 255
+    val fraction = bits & 0x7fffff
+    if (exponent == 255 && fraction != 0) return 0x7f
+    if (exponent == 255 || exponent > 127 + 8) return sign | 0x7e
+    if (exponent == 0) return sign
+    val magnitude = kernelCpuRoundBinary(exponent - 127, fraction, 23, 3, 7)
+    sign | (if (magnitude > 0x7e) 0x7e else magnitude)
+}
+
+/**
+ * Two FP8 E4M3 bytes in 16 bits, `high`'s in the high byte (PTX's `cvt.rn.satfinite.e4m3x2.f32 d, high, low`, CUDA C's
+ * `__nv_cvt_float2_to_fp8x2(make_float2(low, high), __NV_SATFINITE, __NV_E4M3)`): each rounded to nearest even, past 448
+ * saturated to +-448, NaN 0x7f.
+ */
+fun kernelF32ToE4m3x2(high: f32, low: f32): int = (kernelCpuF32ToE4m3(high) << 8) | kernelCpuF32ToE4m3(low)
+
+/** The binary16 bits of the FP8 E4M3 byte `byte` (exact; NaN 0x7fff). */
+private fun kernelCpuE4m3ToF16(byte: int): int {
+    val sign = (byte & 0x80) << 8
+    val exponent = (byte >> 3) & 15
+    val mantissa = byte & 7
+    if (exponent == 15 && mantissa == 7) return 0x7fff
+    if (exponent > 0) return sign | ((exponent + 8) << 10) | (mantissa << 7)
+    if (mantissa == 0) return sign
+    val top = if (mantissa >= 4) 2 else if (mantissa >= 2) 1 else 0
+    sign | ((top + 6) << 10) | ((mantissa - (1 << top)) << (10 - top))
+}
+
+/**
+ * The two FP8 E4M3 bytes in the low 16 bits of `pair` as two binary16 lanes in 32 bits, the low byte's in the low half
+ * (PTX's `cvt.rn.f16x2.e4m3x2`, CUDA C's `__nv_cvt_fp8x2_to_halfraw2`): exact, NaN 0x7fff. kernelF16ToF32 reads each lane.
+ */
+fun kernelE4m3x2ToF16x2(pair: int): int = kernelCpuE4m3ToF16(pair & 0xff) | (kernelCpuE4m3ToF16((pair >> 8) & 0xff) << 16)
+
+/**
+ * `value` rounded to the nearest int, ties to even, saturated to the 32-bit range, NaN 0 (CUDA C's `__float2int_rn`,
+ * `cvt.rni.s32.f32`).
+ */
+fun kernelRoundToInt(value: f32): int {
+    val bits = int(f32ToBits(value))
+    val negative = (bits & 0x80000000) != 0
+    val exponent = (bits >> 23) & 255
+    val fraction = bits & 0x7fffff
+    if (exponent == 255 && fraction != 0) return 0
+    if (exponent < 126) return 0
+    if (exponent >= 127 + 31) return if (negative) -2147483648 else 2147483647
+    val significand = fraction | 0x800000
+    val magnitude = if (exponent >= 127 + 23) significand << (exponent - 127 - 23)
+        else kernelCpuShiftRound(significand, 127 + 23 - exponent)
+    if (negative) -magnitude else magnitude
+}
+
 /** x * y + z: one rounding on a GPU; on the CPU the product is exact in f64 and the sum is rounded twice (to f64, then f32). */
 fun kernelFma(x: f32, y: f32, z: f32): f32 =
     ablaConvertF64ToF32(ablaConvertF32ToF64(x) * ablaConvertF32ToF64(y) + ablaConvertF32ToF64(z))
