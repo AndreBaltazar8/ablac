@@ -167,9 +167,67 @@ fun http2Paths(): void {
     return
 }
 
+// The server owns framing: a program's Content-Length that is not its body's size, two of them, or a Transfer-Encoding on a whole body would
+// end the response early on the wire, so whatever followed is read as a next response. Each is refused as an unsendable header is.
+fun framingPaths(): void {
+    val smuggled = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nEVIL!"
+    val get = httpParseRequest("GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+    val head = httpParseRequest("HEAD / HTTP/1.1\r\nHost: a\r\n\r\n")
+    val cases = [
+        HttpResponse(200, [HttpHeader("Content-Length", "0"), HttpHeader("Connection", "keep-alive")], smuggled),
+        HttpResponse(200, [HttpHeader("content-length", "4")], "a body"),
+        HttpResponse(200, [HttpHeader("Content-Length", " 6")], "a body"),
+        HttpResponse(200, [HttpHeader("Content-Length", "6"), HttpHeader("content-length", "6")], "a body"),
+        HttpResponse(200, [HttpHeader("Transfer-Encoding", "chunked"), HttpHeader("Connection", "keep-alive")], "0\r\n\r\n$smuggled"),
+        HttpResponse(200, [HttpHeader("transfer-encoding", "identity")], "x")
+    ]
+    var index = 0
+    for (response in cases) {
+        expect(httpResponseFramingError(response) != "", "framing case $index is refused")
+        expect(response.render() == refusedBytes, "framing case $index: render sends the plain 500")
+        val event = httpEventResponse(get, response, true, 1073741824)
+        expect(event.startsWith("HTTP/1.1 500 Internal Server Error\r\n") && !event.contains("EVIL"), "framing case $index: the event encoder sends the plain 500")
+        var s = ready()
+        s.feed(frame(1, 5, 1, block([hf(":method", "GET"), hf(":scheme", "https"), hf(":path", "/"), hf(":authority", "example.com")])), 0)
+        for (request in s.takeRequests()) s.respond(request.stream, response.status, response.headers, response.body)
+        expect(responseFields(frames(s.takeOutput())).startsWith(":status=500;"), "framing case $index: h2 respond sends a plain 500")
+        index = index + 1
+    }
+    // Framing the server would write itself is kept: a Content-Length equal to the body, and a HEAD's, 204's or 304's describing a body not sent.
+    val exact = HttpResponse(200, [HttpHeader("Content-Length", "6")], "a body")
+    expect(exact.render() == "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\na body", "an exact Content-Length is kept")
+    val described = HttpResponse(200, [HttpHeader("Content-Length", "1234")], "")
+    expect(described.renderHead() == "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\nConnection: close\r\n\r\n", "a HEAD's Content-Length describes the body not sent")
+    expect(httpEventResponse(head, described, true, 1073741824).contains("Content-Length: 1234\r\n"), "the event encoder keeps a HEAD's Content-Length")
+    expect(HttpResponse(304, [HttpHeader("Content-Length", "1234")], "").render().startsWith("HTTP/1.1 304"), "a 304 keeps its Content-Length")
+    // httpChunkedResponse frames its body itself: a caller's Content-Length or Transfer-Encoding beside it is refused.
+    expect(httpChunkedResponse(["a"], 200, [HttpHeader("Content-Length", "0")]) == refusedBytes, "httpChunkedResponse refuses a Content-Length")
+    expect(httpChunkedResponse(["a"], 200, [HttpHeader("Transfer-Encoding", "chunked")]) == refusedBytes, "httpChunkedResponse refuses a Transfer-Encoding")
+    expect(httpChunkedResponse(["a"]).contains("Transfer-Encoding: chunked\r\n"), "httpChunkedResponse frames its body")
+    // Trailers: an unsendable one leaves the trailers out, and the body still ends.
+    expect(httpChunkEnd([HttpHeader("X-Checksum", "1\r\n\r\nHTTP/1.1 200 OK\r\n\r\nEVIL!")]) == "0\r\n\r\n", "a trailer with CR/LF is left out")
+    expect(httpChunkEnd([HttpHeader("X Bad:", "v")]) == "0\r\n\r\n", "a trailer whose name is not a token is left out")
+    expect(httpChunkEnd([HttpHeader("X-Checksum", "1")]) == "0\r\nX-Checksum: 1\r\n\r\n", "a good trailer is written")
+    // A streaming h2 response: a Content-Length that is not the stated length, or a Transfer-Encoding, is refused.
+    for (headers in [[HttpHeader("content-length", "3")], [HttpHeader("transfer-encoding", "chunked")]]) {
+        var t = ready()
+        t.feed(get("/events"), 0)
+        t.takeEvents()
+        t.respondStream(1, 200, headers, 10)
+        expect(responseFields(frames(t.takeOutput())).startsWith(":status=500;"), "h2 respondStream refuses its framing headers")
+    }
+    var kept = ready()
+    kept.feed(get("/events"), 0)
+    kept.takeEvents()
+    kept.respondStream(1, 200, [HttpHeader("content-length", "10")], 10)
+    expect(responseFields(frames(kept.takeOutput())).startsWith(":status=200;"), "h2 respondStream keeps a Content-Length equal to its length")
+    return
+}
+
 fun main: int {
     renderPaths()
     http2Paths()
+    framingPaths()
     if (failures == 0) println("response splitting ok")
     if (failures == 0) 0 else 1
 }

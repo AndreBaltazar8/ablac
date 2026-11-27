@@ -859,7 +859,15 @@ compresses a response when the client accepts gzip, and
 ## HTTP upgrade behavior
 
 HTTP responses now preserve explicit `Connection` and `Content-Length`
-headers. Status `101` emits neither a forced body length nor
+headers. The server frames the body, so a `Content-Length` must be the body's
+size (a HEAD response's, and a 1xx, 204 or 304's, describe a body that is not
+sent); one that is not, two of them, or a `Transfer-Encoding` on a whole body
+refuse the response as an unsendable header does (`httpResponseFramingError`):
+a plain 500 goes out instead, with one line on standard error. Otherwise the
+bytes after the stated end would be read as the next response.
+`httpChunkedResponse` frames its own body and refuses a caller's
+`Content-Length` or `Transfer-Encoding`; `httpChunkEnd` leaves out trailers
+that cannot be sent as they are. Status `101` emits neither a forced body length nor
 `Connection: close`, allowing the TCP stream to transfer into the WebSocket
 lifecycle. Ordinary HTTP responses retain their previous close-delimited
 behavior.

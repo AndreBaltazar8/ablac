@@ -134,6 +134,17 @@ private fun H2Server.fieldsSendable(fields: array<HttpHeader>, instead: string):
     false
 }
 
+/** Whether `response`'s framing headers can be sent with its body (httpResponseFramingError; `head` for a HEAD request), logged as fieldsSendable is. */
+private fun H2Server.framingSendable(response: HttpResponse, head: bool): bool {
+    val error = httpResponseFramingError(response, head)
+    if (error == "") return true
+    if (!this.refusalLogged) {
+        this.refusalLogged = true
+        httpResponseRefusalLog(error, "a 500 went out instead")
+    }
+    false
+}
+
 /** The request bytes this connection holds for streams whose handler has not run: the decoded header bytes of the open streams and the body bytes buffered for them. */
 fun H2Server.heldBytes(): int {
     var total = this.bufferedBytes
@@ -235,6 +246,24 @@ fun H2Server.respondStream(stream: int, status: int, headers: array<HttpHeader>,
     if (!this.fieldsSendable(headers, "a 500 went out instead")) return this.respondStream(stream, 500, [], 0)
     val at = this.indexOf(stream)
     if (at < 0 || !this.streams[at].streaming || this.streams[at].responding || status < 200 || status > 599 || this.overflow) return false
+    // The server frames the body: a transfer-encoding, two content-lengths, or one that is not the stated `length` refuse the response.
+    var lengths = 0
+    var framing = ""
+    for (h in headers) {
+        if (httpAsciiEqualInsensitive(h.name, "Transfer-Encoding")) framing = "the response has a Transfer-Encoding"
+        else if (httpAsciiEqualInsensitive(h.name, "Content-Length")) {
+            lengths = lengths + 1
+            if (lengths > 1) framing = "the response has more than one Content-Length"
+            else if (!this.streams[at].head && status != 204 && status != 304 && (length < 0 || h.value != "$length")) framing = "the response's Content-Length is not its body's size"
+        }
+    }
+    if (framing != "") {
+        if (!this.refusalLogged) {
+            this.refusalLogged = true
+            httpResponseRefusalLog(framing, "a 500 went out instead")
+        }
+        return this.respondStream(stream, 500, [], 0)
+    }
     val fields: array<HpackField> = [HpackField(":status", "${status}", false)]
     var hasLength = false
     for (h in headers) {
@@ -444,6 +473,8 @@ fun H2Server.respond(stream: int, status: int, headers: array<HttpHeader>, body:
     if (!this.fieldsSendable(headers, "a 500 went out instead")) return this.respond(stream, 500, [], "")
     val at = this.indexOf(stream)
     if (at < 0 || this.streams[at].responding || status < 200 || status > 599 || this.overflow) return false
+    // The server frames the body: a content-length that is not its size, two of them, or a transfer-encoding refuse the response.
+    if (!this.framingSendable(HttpResponse(status, headers, body), this.streams[at].head)) return this.respond(stream, 500, [], "")
     // Answered before the request ended (413, an early answer): the rest of the request is dropped and never reaches a handler.
     if (!this.streams[at].requestDone) {
         this.streams[at].abandoned = true

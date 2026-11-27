@@ -95,8 +95,14 @@ private fun httpHex(value: int): string {
 fun httpChunkEncode(payload: string): string =
     "${httpHex(payload.size)}\r\n$payload\r\n"
 
-/// Renders the terminating zero-length chunk and optional trailer fields.
+/// Renders the terminating zero-length chunk and optional trailer fields. Trailers that cannot be sent as they are (httpResponseFieldsError: a name
+/// that is not a token, a CR, LF or NUL in a value) are left out, all of them, with one line on standard error: the body still ends where it should.
 fun httpChunkEnd(trailers: array<HttpHeader> = []): string {
+    val refused = httpResponseFieldsError(trailers)
+    if (refused != "") {
+        httpResponseRefusalLog(refused, "the chunked body ended without its trailers")
+        return "0\r\n\r\n"
+    }
     var output = "0\r\n"
     var index = 0
     while (index < trailers.size) {
@@ -185,16 +191,19 @@ fun httpChunkedResponse(
     // Headers that cannot be sent as they are (httpResponseFieldsError): httpResponseRefused(), a plain 500, in place of the whole response.
     if (httpResponseFieldsError(headers) != "") return httpResponseRefused().render()
     var output = "HTTP/1.1 $status ${httpStatusReason(status)}\r\n"
-    var hasTransfer = false
     var index = 0
     while (index < headers.size) {
-        if (httpAsciiEqualInsensitive(
-            headers[index].name, "Transfer-Encoding"
-        )) hasTransfer = true
+        // The function frames the body (chunked): a Content-Length or Transfer-Encoding of the caller's beside it would let a client or proxy
+        // read the chunks as something else, so it refuses the response as it refuses an unsendable header.
+        if (httpAsciiEqualInsensitive(headers[index].name, "Transfer-Encoding") ||
+            httpAsciiEqualInsensitive(headers[index].name, "Content-Length")) {
+            httpResponseRefusalLog("a chunked response was given its own ${headers[index].name}")
+            return httpResponseRefused().render()
+        }
         output = "$output${headers[index].name}: ${headers[index].value}\r\n"
         index = index + 1
     }
-    if (!hasTransfer) output = "${output}Transfer-Encoding: chunked\r\n"
+    output = "${output}Transfer-Encoding: chunked\r\n"
     output = "${output}Connection: keep-alive\r\n\r\n"
     index = 0
     while (index < chunks.size) {

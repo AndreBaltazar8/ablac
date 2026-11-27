@@ -429,9 +429,34 @@ private fun httpResponseFieldsErrorText(headers: array<HttpHeader>): string {
 /** The response the servers send in place of one whose headers `httpResponseFieldsError` refuses: a plain 500, none of the application's headers or body. */
 fun httpResponseRefused(): HttpResponse = HttpResponse(500, [], "")
 
-/** `response` when its headers can be sent as they are, else `httpResponseRefused()` (fail closed: nothing of the refused response is written). */
-fun httpResponseSendable(response: HttpResponse): HttpResponse =
-    if (httpResponseFieldsError(response.headers) == "") response else httpResponseRefused()
+/** Why `response`'s own framing headers cannot be sent with its body, or "": the server frames a response, so a Content-Length must be the
+ *  body's size (a HEAD response's, and a 1xx, 204 or 304's, describe a body that is not sent, and are not compared), at most one is given,
+ *  and a Transfer-Encoding is never sent with a whole body. Otherwise the bytes after the stated end would reach the client, or a proxy
+ *  on a kept-alive connection, as the next response. */
+fun httpResponseFramingError(response: HttpResponse, head: bool = false): string {
+    var lengths = 0
+    var transfers = 0
+    for (header in response.headers) {
+        if (httpAsciiEqualInsensitive(header.name, "Content-Length")) {
+            lengths = lengths + 1
+            val unsent = head || (response.status >= 100 && response.status < 200) || response.status == 204 || response.status == 304
+            if (!unsent && header.value != "${response.body.size}") return "the response's Content-Length is not its body's size"
+        } else if (httpAsciiEqualInsensitive(header.name, "Transfer-Encoding")) transfers = transfers + 1
+    }
+    if (lengths > 1) return "the response has more than one Content-Length"
+    if (transfers > 0) return "the response has a Transfer-Encoding, and its body is sent whole"
+    ""
+}
+
+/** httpResponseFieldsError, then httpResponseFramingError: why `response` cannot be sent as it is, or "". */
+fun httpResponseError(response: HttpResponse, head: bool = false): string {
+    val fields = httpResponseFieldsError(response.headers)
+    if (fields != "") fields else httpResponseFramingError(response, head)
+}
+
+/** `response` when it can be sent as it is (httpResponseError), else `httpResponseRefused()` (fail closed: nothing of the refused response is written). */
+fun httpResponseSendable(response: HttpResponse, head: bool = false): HttpResponse =
+    if (httpResponseError(response, head) == "") response else httpResponseRefused()
 
 /** One line on standard error for a refused response (`error` from httpResponseFieldsError; the value itself is not printed). The servers write it once
  *  per connection. */
@@ -475,7 +500,7 @@ fun HttpResponse.render(): string {
 }
 
 // Returns the HTTP/1.1 status and headers followed by a blank line. Content-Length still describes the underlying body.
-fun HttpResponse.renderHead(): string = "${httpResponseSendable(this).renderHeaders()}\r\n"
+fun HttpResponse.renderHead(): string = "${httpResponseSendable(this, true).renderHeaders()}\r\n"
 
 // Serializes an HTTP/1.1 request and body. Uses `authority` for Host when absent and fills missing Content-Length and Connection headers.
 // Returns "" for a request whose parts cannot be sent as they are (httpClientRequestError): nothing of it is written.
@@ -1979,7 +2004,7 @@ private fun httpServeConnection(router: HttpRouter, connection: TcpConnection, o
     val request = httpRequestOriginForm(httpRequestWithPeer(httpParseRequest(read.request), connection.descriptor))
     val response = router.dispatch(request)
     // One connection, one response: a refused one is logged here, and render() sends httpResponseRefused() for it.
-    val refusal = httpResponseFieldsError(response.headers)
+    val refusal = httpResponseError(response, request.method == "HEAD")
     if (refusal != "") httpResponseRefusalLog(refusal)
     var rendered = response.render()
     if (request.method == "HEAD") rendered = response.renderHead()
