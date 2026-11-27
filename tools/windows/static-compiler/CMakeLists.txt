@@ -50,7 +50,10 @@ if(ABLA_CRT_INVENTORY)
       /entry:wmainCRTStartup /subsystem:console "/machine:${ABLA_WINDOWS_MACHINE}" /brepro /stack:134217728
       "/def:${ABLA_IMPORT_DIR}/exports.def" ${ARGN})
   endfunction()
-  abla_crt_probe(ablac-crt-map "/lldmap:${CMAKE_BINARY_DIR}/crt-inventory/ablac.map" /verbose)
+  # /lldmap gives each input section's bytes but names a member without its archive; the MSVC-style /map names
+  # archive:member for each public symbol. CMake's vs_link_exe drops a successful link's /verbose output.
+  abla_crt_probe(ablac-crt-map "/lldmap:${CMAKE_BINARY_DIR}/crt-inventory/ablac.map"
+    "/map:${CMAKE_BINARY_DIR}/crt-inventory/ablac.msvc.map" /verbose)
   abla_crt_probe(ablac-crt-no-ucrt /nodefaultlib:libucrt.lib /errorlimit:0)
   abla_crt_probe(ablac-crt-no-ucrt-cmt /nodefaultlib:libucrt.lib /nodefaultlib:libcmt.lib /errorlimit:0)
   abla_crt_probe(ablac-crt-no-vcruntime /nodefaultlib:libvcruntime.lib /errorlimit:0)
