@@ -218,6 +218,17 @@ fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameter
         val read = "${expression.children[0].text}.${expression.text}"
         for (member in members) if (member == read) return true
     }
+    // A call of its scalar method with scalar arguments: `p.m(a)`, listed as `p.m(1` (bootstrapAnalysisScalarMethod).
+    if (kind == "member.call" && expression.children.size >= 1 && expression.children[0].kind == "identifier") {
+        val call = "${expression.children[0].text}.${expression.text}(${expression.children.size - 1}"
+        var known = false
+        for (member in members) if (member == call) known = true
+        if (!known) return false
+        for (index in 1 until expression.children.size) {
+            if (!bootstrapAnalysisScalarExpression(expression.children[index], parameters, depth + 1, calls, strings, members)) return false
+        }
+        return true
+    }
     if (kind == "member" && expression.text == "size" && expression.children.size == 1) return bootstrapAnalysisStringName(expression.children[0], strings)
     if (kind == "index" && expression.children.size == 2) {
         return bootstrapAnalysisStringName(expression.children[0], strings) &&
@@ -254,6 +265,9 @@ fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration, calls: bo
             for (field in 0 until record.parameters.size) {
                 if (bootstrapAnalysisScalarType(record.parameterTypes[field])) members.append("$name.${record.parameters[field]}")
             }
+            for (method in record.methods) {
+                if (bootstrapAnalysisScalarMethod(record, method)) members.append("$name.${method.name}(${method.parameters.size}")
+            }
         } else return false
     }
     for (kind in declaration.parameterKinds) if (kind != "parameter") return false
@@ -261,9 +275,26 @@ fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration, calls: bo
     bootstrapAnalysisScalarExpression(declaration.expression, scalars, 0, calls, strings, members)
 }
 
+/** Whether `method` of `record` is one a checked body may call: a function of written scalar parameter and result types without
+ *  defaults, type parameters or annotations, the only method of its name. The checker is given its interface with a placeholder body
+ *  (bootstrapAnalysisCheckScalarBody), as for a called function of the module. */
+fun bootstrapAnalysisScalarMethod(record: BootstrapDeclaration, method: BootstrapDeclaration): bool {
+    if (method.kind != "fun" || !bootstrapAnalysisScalarType(method.resultType) || method.typeParameters.size != 0 ||
+        method.annotations.size != 0 || method.isTrusted || method.isResource || method.isNoEscape ||
+        method.externalLibrary != "" || method.generatedNamespace != "" || method.name.startsWith("__abla_") ||
+        bootstrapIsOperatorDeclaration(method)) return false
+    for (type in method.parameterTypes) if (!bootstrapAnalysisScalarType(type)) return false
+    for (kind in method.parameterKinds) if (kind != "parameter") return false
+    for (value in method.parameterDefaults) if (value.kind != "missing") return false
+    var named = 0
+    for (other in record.methods) if (other.name == method.name) named = named + 1
+    named == 1
+}
+
 /** Whether `declaration` is a class whose fields a checked body may read: no type parameters, conformances, annotations or ownership;
  *  every constructor parameter a `val` or `var` field of scalar or string type, defaulted at most by a constant; no method named
- *  like a field. The checker is given it without its methods (bootstrapAnalysisCheckScalarBody). */
+ *  like a field. The checker is given it with only the methods a body may call (bootstrapAnalysisScalarMethod), their bodies placeholders
+ *  (bootstrapAnalysisCheckScalarBody). */
 fun bootstrapAnalysisScalarRecord(declaration: BootstrapDeclaration): bool {
     if (declaration.kind != "class" || declaration.typeParameters.size != 0 || declaration.conformances.size != 0 ||
         declaration.annotations.size != 0 || declaration.isTrusted || declaration.isResource || declaration.isNoEscape ||

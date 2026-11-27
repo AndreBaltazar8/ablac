@@ -1747,7 +1747,7 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
     const initial = calls ? 'step(left) + right' : locals ? block('val t = left + right', 't') : returns ? block('if (left < 0) return right', 'left + right') : strings ? 'text.size + left' : fields ? 'p.x + left' : 'left + right';
     const rest = '\nfun later(): int = 7\n' + (calls
         ? 'fun step(n: int): int = n + 1\nfun shift(n: int): int = n * 2\n' : '') + (fields
-        ? 'class Point(val x: int, var y: int, val label: string = "p") {\n    fun total(): int = this.x + this.y\n}\n' : '');
+        ? 'class Point(val x: int, var y: int, val label: string = "p") {\n    fun total(): int = this.x + this.y\n    fun scaled(k: int): int = this.x * k\n    fun name(): string = this.label\n}\n' : '');
     const main = 'import "./dep.ab"\n' + (extended ? 'import "./ext.ab"\n' : '') + 'fun main: int = answer(2, 3' + (strings ? ', "abc"' : fields ? ', Point(4, 5)' : '') + ') + later()\n';
     const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : locals ? 'checked-locals' : returns ? 'checked-returns' : strings ? 'checked-strings' : extended ? 'checked-extended' : parens ? 'checked-parens' : fields ? 'checked-fields' : 'checked-scalar', {
         'abla.toml': 'name = "checked-scalar"\nentry = "main.ab"\nvisibility = "imports"\n',
@@ -1835,8 +1835,10 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         if (locals) await edit(block('val t = left', 'val u = t + 1', 'u'), hits);
         // Back to one local: the symbols change again, so full typing.
         if (locals) await edit(block('val t: int = left', 't'), hits);
-        // A method call: full typing.
-        if (fields) await edit('p.total() + left', hits);
+        // Calls of its scalar methods: rechecked alone. A method of another result type: full typing.
+        if (fields) await edit('p.total() + p.scaled(left + 1) * right', extended ? hits : ++hits);
+        if (fields) await edit('p.scaled(right) - p.x', extended ? hits : ++hits);
+        if (fields) await edit('p.name().size + left', hits);
         await edit(calls ? 'step(true)' : operators ? 'left / true' : locals ? block('val t: bool = left', '1') : returns ? block('if (left) return 1', '0') : strings ? 'text[true]' : fields ? 'p.label + 1' : 'true', hits);
         await edit(initial, hits);
         await edit(calls ? 'missing(left)' : locals ? block('val left = 1', 'left') : returns ? block('if (left < 1) return missing', 'left') : fields ? 'p.z + left' : 'left + missing', hits);
