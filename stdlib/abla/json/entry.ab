@@ -2678,26 +2678,36 @@ private fun jsonTapeStringText(document: JsonDocument, index: int): string {
     jsonNodeText(document.source, document.limits, tape, index)
 }
 
+// The most bytes emit and jsonStringify write (2^61): a total past it is refused, as a value whose nodes are shared (an array holding the same
+// array twice, 62 levels deep) would otherwise sum past 2^63 and wrap to a small size the writer then overruns. Every size added to a
+// total is at most 2^62 (a string's most), and the total before it at most this, so no sum wraps before it is checked.
+private val jsonEncodedMaximum = 2305843009213693952
+
+// The bytes jsonTapeEncodeAt writes for the node at `index`, or -1 when it can't be written. The tape is an ordinary array a program can
+// change, so this follows exactly what the writer follows (each scalar's span, each array's elements and each object's members by their
+// next indexes, not the counts), and refuses a span outside the source: the writer then never writes more than this sized.
 private fun jsonTapeEncodedSize(edits: JsonEdits, index: int): int {
     val document = edits.document
     val tape = document.tape
     val kind = tape[index] & 15
-    if (kind == 0) return 4
-    if (kind == 3) return if ((tape[index] & jsonTapeFlag) != 0) 4 else 5
-    if (kind == 2) return tape[index + 2] - tape[index + 1]
+    if (kind == 0 || kind == 2 || kind == 3) {
+        val begin = tape[index + 1]
+        val end = tape[index + 2]
+        return if (begin < 0 || end < begin || end > document.source.size) -1 else end - begin
+    }
     if (kind == 1) return jsonStringEncodedSize(jsonTapeStringText(document, index))
+    // (Sizes and totals are bounded as jsonEncodedMaximum says, so each sum is checked before it could wrap.)
     if (kind == 4) {
-        val count = tape[index] >> 8
-        var total = if (count > 0) 1 + count else 2
+        var total = 1
         val end = tape[index + 3]
         var child = index + 4
         while (child < end) {
             val size = jsonTapeEncodedSize(edits, child)
-            if (size < 0) return -1
-            total = total + size
+            total = total + size + 1
+            if (size < 0 || total > jsonEncodedMaximum) return -1
             child = tape[child + 3]
         }
-        return total
+        return if (total == 1) 2 else total
     }
     if (jsonEmitListed(edits, index)) {
         val members = jsonEmitMembersOf(edits, index)
@@ -2710,23 +2720,29 @@ private fun jsonTapeEncodedSize(edits: JsonEdits, index: int): int {
                 members.tapeValues[at])
                 else jsonEncodedSize(members.jsonValues[at])
             if (keySize < 0 || size < 0) return -1
-            total = total + keySize + size
+            total = total + keySize
+            if (total > jsonEncodedMaximum) return -1
+            total = total + size
+            if (total > jsonEncodedMaximum) return -1
             at = at + 1
         }
         return total
     }
-    val count = tape[index] >> 8
-    var total = if (count > 0) 1 + count * 2 else 2
+    // An opening brace, then per member its key, a colon, its value and a comma or the closing brace.
+    var total = 1
     val end = tape[index + 3]
     var member = index + 4
     while (member < end) {
         val keySize = jsonStringEncodedSize(jsonTapeStringText(document, member))
         val size = jsonTapeEncodedSize(edits, member + 4)
         if (keySize < 0 || size < 0) return -1
-        total = total + keySize + size
+        total = total + keySize + 2
+        if (total > jsonEncodedMaximum) return -1
+        total = total + size
+        if (total > jsonEncodedMaximum) return -1
         member = tape[member + 7]
     }
-    total
+    if (total == 1) 2 else total
 }
 
 // Returns the document with edits serialized into a buffer sized from the expected output length, which the caller must supply correctly.
@@ -4490,6 +4506,7 @@ private fun jsonEncodedSize(value: Json): int {
             val size = jsonEncodedSize(element)
             if (size < 0) return -1
             total = total + size
+            if (total > jsonEncodedMaximum) return -1
         }
         return total
     }
@@ -4504,7 +4521,10 @@ private fun jsonEncodedSize(value: Json): int {
             if (keySize < 0) return -1
             val size = jsonEncodedSize(values[index])
             if (size < 0) return -1
-            total = total + keySize + size
+            total = total + keySize
+            if (total > jsonEncodedMaximum) return -1
+            total = total + size
+            if (total > jsonEncodedMaximum) return -1
             index = index + 1
         }
         return total
