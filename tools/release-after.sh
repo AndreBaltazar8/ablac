@@ -7,8 +7,11 @@
 #   2. <tag>'s convergence lineage (it gates the next release): a LINEAGES entry in tools/test-bootstrap-convergence.mjs
 #      (route A: <tag>'s pinned Linux seed, route B: the release before it, historical: <tag>'s commit) and <tag> as the first
 #      option and the default of the lineage input of .github/workflows/bootstrap-convergence.yml. Only those lines change;
-#   3. with --times FILE, tools/test-times.tsv: the results.tsv of a whole suite run (the order the gate starts tests in).
-# With --commit each step is committed on its own (the pin; the lineage; the times). Without it nothing is committed and the
+#   3. with --times FILE, tools/test-times.tsv: the results.tsv of a whole suite run (the order the gate starts tests in);
+#   4. with --release-times DIR, tools/test-times-release.tsv (the release-mode shard split of the static suite): the shards'
+#      results.tsv files of <tag>'s release run, merged. DIR is what `gh run download <run> -p 'static-suite-logs-*' -D DIR`
+#      writes (static-suite-logs-N/suite/results.tsv); every shard must have passed every command, each command once.
+# With --commit each step is committed on its own (the pin; the lineage; the times; the release times). Without it nothing is committed and the
 # diff stat is printed. Nothing is written when a check fails (no pinned <tag>, the lineage exists already, no commit for <tag>).
 # Needs bash, awk, git and what release-pin.sh needs.
 #
@@ -16,7 +19,8 @@
 #   --historical SHA   the commit <tag> was made from (default: what the tag <tag> names in the checkout)
 #   --previous TAG     the release before <tag> (default: the highest lineage below <tag>); route B's seed is that lineage's route A
 #   --times FILE       a results.tsv of a whole suite run to become tools/test-times.tsv
-#   --commit           commit each step
+#   --release-times DIR  the release run's static-suite shard logs to become tools/test-times-release.tsv
+#   --commit          commit each step
 #   --skip-pin         the pin is already done (release-pin.sh was run, or committed): start at the lineage
 #   --repo, --dir, --no-binaries, --root   as release-pin.sh (--root also names the checkout to edit)
 set -uo pipefail
@@ -32,6 +36,7 @@ root=$(cd -- "$here/.." && pwd)
 historical=
 previous=
 times=
+release_times=
 commit=0
 skip_pin=0
 pin_args=()
@@ -41,6 +46,7 @@ while (($#)); do
         --historical) historical=${2:?}; shift 2 ;;
         --previous) previous=${2:?}; shift 2 ;;
         --times) times=${2:?}; shift 2 ;;
+        --release-times) release_times=${2:?}; shift 2 ;;
         --commit) commit=1; shift ;;
         --skip-pin) skip_pin=1; shift ;;
         --repo | --dir) pin_args+=("$1" "${2:?}"); shift 2 ;;
@@ -60,6 +66,24 @@ workflow=$root/.github/workflows/bootstrap-convergence.yml
 bootstrap=$root/tools/bootstrap-compiler.sh
 [[ -f $lineages && -f $workflow && -f $bootstrap ]] || fail "$root is not an ablac checkout"
 [[ $times == "" || -f $times ]] || fail "no times file $times"
+# The release times are merged and checked now, so a bad directory writes nothing.
+release_rows=
+if [[ -n $release_times ]]; then
+    [[ -d $release_times ]] || fail "no release times directory $release_times"
+    shopt -s nullglob
+    shard_results=("$release_times"/static-suite-logs-*/suite/results.tsv)
+    shopt -u nullglob
+    ((${#shard_results[@]} >= 2)) || fail "$release_times has ${#shard_results[@]} static-suite shard results (static-suite-logs-N/suite/results.tsv)"
+    release_rows=$(mktemp "${TMPDIR:-/tmp}/release-after-times.XXXXXX")
+    trap 'rm -f -- "$release_rows"' EXIT
+    sort -n -k1,1 "${shard_results[@]}" > "$release_rows"
+    bad=$(awk -F'\t' '!(NF == 5 && $1 ~ /^[0-9]+$/ && $2 == "0" && $3 ~ /^[0-9.]+$/) { n++ } END { print n + 0 }' "$release_rows")
+    ((bad == 0)) || fail "$release_times: $bad rows are not a passed command's times (every shard must have passed)"
+    twice=$(cut -f1 "$release_rows" | uniq -d | head -n 1)
+    [[ -z $twice ]] || fail "$release_times: command $twice is in two shards"
+    count=$(wc -l < "$release_rows")
+    ((count >= 100)) || fail "$release_times has $count rows (the static suite has hundreds)"
+fi
 
 # The checks that need nothing written: the lineage is new, route B's release, the historical commit.
 grep -q "^    '$tag': {" "$lineages" && fail "$lineages has a lineage $tag already"
@@ -105,7 +129,7 @@ git_commit "Pin the bootstrap compiler to verified Abla $tag artifacts" tools/bo
 entry=$(printf "    '%s': {\n        historical: '%s',\n        seeds: {\n            a: ['%s', '%s'],\n            b: ['%s', '%s'],\n        },\n    },\n" \
     "$tag" "$historical" "$tag" "$seed" "$previous" "$previous_seed")
 temporary=$(mktemp)
-trap 'rm -f -- "$temporary" "$temporary.yml"' EXIT
+trap 'rm -f -- "$temporary" "$temporary.yml" ${release_rows:+"$release_rows"}' EXIT
 entry=$entry awk '
     /^export const LINEAGES = \{/ { inside = 1 }
     inside && /^\};/ { printf "%s\n", ENVIRON["entry"]; inside = 0; done = 1 }
@@ -126,6 +150,11 @@ if [[ -n $times ]]; then
     ((rows >= 100)) || fail "$times has $rows usable rows (a results.tsv of a whole run has hundreds)"
     cp "$times" "$root/tools/test-times.tsv"
     git_commit "tools/test-times.tsv: the times of a whole run at the $tag cut" tools/test-times.tsv
+fi
+# 4. the release-mode times
+if [[ -n $release_rows ]]; then
+    cp "$release_rows" "$root/tools/test-times-release.tsv"
+    git_commit "tools/test-times-release.tsv: the $tag release run's static-suite times" tools/test-times-release.tsv
 fi
 ((commit)) || git -C "$root" diff --stat
 echo "release-after: $tag pinned; lineage $tag added (A $tag ${seed:0:12}, B $previous ${previous_seed:0:12}, historical ${historical:0:12})"

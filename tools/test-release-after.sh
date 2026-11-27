@@ -93,6 +93,23 @@ refuse "--skip-pin on an unpinned checkout" "$root2" "$root2/tools/release-after
 refuse "a doctored .sha256" "$root2" env -i PATH="$PATH" bash -c "cp -r '$release' '$work/bad' && printf '0%s\n' \"\$(cut -c2- '$work/bad/ablac-x86_64-linux.sha256')\" > '$work/bad/ablac-x86_64-linux.sha256' && '$root2/tools/release-after.sh' v8.8.8 --dir '$work/bad' --root '$root2'"
 refuse "a bad tag" "$root2" "$root2/tools/release-after.sh" 8.8.8 --dir "$release" --root "$root2"
 refuse "a times file with no rows" "$root2" "$root2/tools/release-after.sh" v8.8.8 --times /dev/null --dir "$release" --root "$root2"
+# The release run's static-suite shards, as `gh run download -p 'static-suite-logs-*'` writes them: two of 60 commands each.
+shard_logs() { # directory
+    local n
+    for n in $(seq 120); do
+        mkdir -p "$1/static-suite-logs-$(( (n - 1) % 2 + 1 ))/suite"
+        printf '%s\t0\t%s.5\ttools/test-fake-%s.sh\t1.2\n' "$n" "$n" "$n" >> "$1/static-suite-logs-$(( (n - 1) % 2 + 1 ))/suite/results.tsv"
+    done
+}
+shard_logs "$work/failed-shard"
+sed -i '1s/\t0\t/\t1\t/' "$work/failed-shard/static-suite-logs-2/suite/results.tsv"
+refuse "release times with a failed command" "$root2" "$root2/tools/release-after.sh" v8.8.8 --release-times "$work/failed-shard" --dir "$release" --root "$root2"
+shard_logs "$work/twice"
+head -n 1 "$work/twice/static-suite-logs-1/suite/results.tsv" >> "$work/twice/static-suite-logs-2/suite/results.tsv"
+refuse "release times with a command in two shards" "$root2" "$root2/tools/release-after.sh" v8.8.8 --release-times "$work/twice" --dir "$release" --root "$root2"
+shard_logs "$work/one-shard"
+rm -r -- "$work/one-shard/static-suite-logs-2"
+refuse "release times from one shard" "$root2" "$root2/tools/release-after.sh" v8.8.8 --release-times "$work/one-shard" --dir "$release" --root "$root2"
 # A workflow of another shape is refused before anything is written.
 root3=$work/root3
 make_root "$root3"
@@ -107,12 +124,17 @@ rows=$work/times.tsv
 for n in $(seq 120); do printf '%s\t0\t1.5\ttools/test-fake-%s.sh\t1.2\n' "$n" "$n"; done > "$rows"
 # A CI runner has no git identity, and --commit commits: give it one for this copy only.
 GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
-"$root4/tools/release-after.sh" v8.8.8 --dir "$release" --root "$root4" --times "$rows" --commit > "$work/out.txt" 2>&1 || { cat "$work/out.txt" >&2; fail "release-after --commit refused a good release"; }
-[[ $(git -C "$root4" rev-list --count HEAD) -eq 4 ]] || fail "--commit did not make three commits"
+shard_logs "$work/release-logs"
+"$root4/tools/release-after.sh" v8.8.8 --dir "$release" --root "$root4" --times "$rows" --release-times "$work/release-logs" --commit > "$work/out.txt" 2>&1 || { cat "$work/out.txt" >&2; fail "release-after --commit refused a good release"; }
+[[ $(git -C "$root4" rev-list --count HEAD) -eq 5 ]] || fail "--commit did not make four commits"
 [[ -z $(git -C "$root4" status --porcelain) ]] || fail "--commit left changes"
-[[ $(git -C "$root4" show --stat --format= HEAD~2 | grep -c '|') -eq 3 ]] || fail "the pin commit holds other files than the pin's"
-[[ $(git -C "$root4" show --stat --format= HEAD~1 | grep -c '|') -eq 2 ]] || fail "the lineage commit holds other files than the lineage's"
-[[ $(git -C "$root4" show --stat --format= HEAD | grep -c '|') -eq 1 ]] || fail "the times commit holds other files"
+[[ $(git -C "$root4" show --stat --format= HEAD~3 | grep -c '|') -eq 3 ]] || fail "the pin commit holds other files than the pin's"
+[[ $(git -C "$root4" show --stat --format= HEAD~2 | grep -c '|') -eq 2 ]] || fail "the lineage commit holds other files than the lineage's"
+[[ $(git -C "$root4" show --stat --format= HEAD~1 | grep -c '|') -eq 1 ]] || fail "the times commit holds other files"
+[[ $(git -C "$root4" show --stat --format= HEAD | grep -c '|') -eq 1 ]] || fail "the release times commit holds other files"
 cmp -s "$rows" "$root4/tools/test-times.tsv" || fail "the times file was not copied"
-[[ $(git -C "$root4" log -1 --format=%s HEAD~2) == 'Pin the bootstrap compiler to verified Abla v8.8.8 artifacts' ]] || fail "the pin commit message"
-echo "release after: the pin, the lineage and the workflow's lineage input change and nothing else, the workflow parses, the convergence unit test passes; ten refusals leave the files alone; --commit makes the three commits"
+# The release times: both shards' rows, merged in command order.
+sort -n -k1,1 "$work"/release-logs/static-suite-logs-*/suite/results.tsv | cmp -s - "$root4/tools/test-times-release.tsv" || fail "the release times are not the shards' rows in order"
+[[ $(cut -f1 "$root4/tools/test-times-release.tsv" | head -n 3 | tr '\n' ' ') == '1 2 3 ' ]] || fail "the release times are not in command order"
+[[ $(git -C "$root4" log -1 --format=%s HEAD~3) == 'Pin the bootstrap compiler to verified Abla v8.8.8 artifacts' ]] || fail "the pin commit message"
+echo "release after: the pin, the lineage and the workflow's lineage input change and nothing else, the workflow parses, the convergence unit test passes; thirteen refusals leave the files alone; --commit makes the four commits (the release times merged from the static-suite shards)"
