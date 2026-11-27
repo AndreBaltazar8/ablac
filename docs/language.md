@@ -1425,6 +1425,46 @@ fun main {
 // -3
 ```
 
+An arm can name several classes (`is A, is B -> ...`). There the subject
+keeps the interface's type, since it may be either class, so the arm calls
+what the interface declares. With a nullable subject such an arm also sees
+it as not null, wherever it stands (decision #166). An arm that shares its
+body with `null` (`is A, null -> ...`) is not narrowed:
+
+```abla
+import "abla/io"
+
+sealed interface Shape {
+    fun name(): string
+}
+
+class Circle(val radius: int) : Shape {
+    fun name(): string = "circle"
+}
+class Square(val side: int) : Shape {
+    fun name(): string = "square"
+}
+class Dot(val x: int) : Shape {
+    fun name(): string = "dot"
+}
+
+fun label(shape: Shape?): string = when (shape) {
+    is Circle, is Square -> "a ${shape.name()}"   // Shape, not null
+    is Dot -> "a dot at ${shape.x}"               // Dot
+    null -> "nothing"
+}
+
+fun main {
+    println(label(Square(2)))
+    println(label(Dot(4)))
+    println(label(null))
+}
+// output:
+// a square
+// a dot at 4
+// nothing
+```
+
 `is` arms on a resource interface's value see it as its class without
 moving it. An `is` naming a type that isn't a class conforming to the
 subject's interface (or an interface extending it) is `when.is-type`.
@@ -3162,10 +3202,22 @@ field of a class whose raw constructor is restricted (`closed` of a buffer or a
 cell, `error` of a `CudaKernelDevice`) can be read anywhere, but written only
 from trusted code (decision #161): its own functions rely on what it holds, so
 `buffer.closed = false` in an ordinary function is
-`native.trust:NativeByteBuffer.closed`. In v0.2.72 a restricted use is a warning (`warning[E_SEMANTIC]: native.trust:...`,
-"from 0.2.73"); from v0.2.73 it is an error. The full list is `tools/unsafe-trusted-only.tsv`; each of those
-declarations carries the standard library's own `@__abla_trusted_only` marker,
-which a program cannot use (`annotation.reserved`).
+`native.trust:NativeByteBuffer.closed`. The standard library's other classes
+that own raw memory or a native handle are sealed the same way (decision #165):
+`ByteBuffer`, `AesKey`, `AesGcmKey`, `RsaPrivateKey`, `Keccak`,
+`LlvmOrcSession` and `LlvmOrcGeneration` are made by their factories
+(`byteBuffer()`, `aesGcmKeyOwner(...)` and each module's functions) and changed
+by their own methods; constructing one or writing its fields from an ordinary
+function is `native.trust:<Class>` or `native.trust:<Class>.<field>`. The
+string wipes `cryptoWipeString` and `tlsWipe` are trusted-only too, because
+they zero whatever string they get, a shared or immutable one included: a
+module wipes the strings it made through a private trusted wrapper. In v0.2.72 a restricted use is a warning (`warning[E_SEMANTIC]: native.trust:...`,
+"from 0.2.73"); from v0.2.73 it is an error. The list for `abla/unsafe` is
+`tools/unsafe-trusted-only.tsv`. Every restricted declaration, there and in the
+other modules (`abla/bytes`, the crypto modules, `abla/kernel`,
+`abla/sys/linux`, `abla/llvm/orc`, `abla/tls/pure/keysched`), carries the standard
+library's own `@__abla_trusted_only` marker, which a program cannot use
+(`annotation.reserved`).
 
 ```abla fragment
 import "abla/unsafe/memory"
