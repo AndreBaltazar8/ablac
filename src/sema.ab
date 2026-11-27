@@ -6717,66 +6717,140 @@ fun bootstrapRegionNamesHave(names: array<string>, name: string): bool {
 
 // Whether every result of the function body `body` is an object the body makes (see BootstrapAnalyzer.regionExpressionIsFresh):
 // its last expression and every `return`'s value, not those of the lambdas inside it. A `val` local counts when it is made from
-// one; a `var` local, a parameter, a field, an index, a module value or a method's result does not.
-fun bootstrapRegionBodyResultsFresh(var analyzer: BootstrapAnalyzer, body: BootstrapExpression): bool {
+// one; a `var` local, a parameter, a field, an index, a module value or a method's result does not. `values` are the
+// parameters of a value type (a scalar or a string), which a constructor of the body may be made of.
+fun bootstrapRegionBodyResultsFresh(var analyzer: BootstrapAnalyzer, body: BootstrapExpression, values: array<string>): bool {
     val fresh: array<string> = []
     val stale: array<string> = []
-    bootstrapRegionCollectFreshLocals(analyzer, body, fresh, stale)
-    if (!bootstrapRegionReturnsFresh(analyzer, body, fresh, stale)) return false
+    bootstrapRegionCollectFreshLocals(analyzer, body, fresh, stale, values)
+    if (!bootstrapRegionReturnsFresh(analyzer, body, fresh, stale, values)) return false
     val last = if (body.kind == "block") (if (body.children.size > 0) body.children[body.children.size - 1] else body) else body
     last.kind == "return" || last.kind == "local.val" || last.kind == "local.var" ||
         last.kind == "while" || last.kind == "for" || last.kind == "assign" || last.kind == "member.assign" ||
-        bootstrapRegionValueFresh(analyzer, last, fresh, stale)
+        bootstrapRegionValueFresh(analyzer, last, fresh, stale, values)
 }
 
 /** The body's `val` locals made from a fresh object (in `fresh`), and its other locals (in `stale`), in source order. */
 fun bootstrapRegionCollectFreshLocals(var analyzer: BootstrapAnalyzer, expression: BootstrapExpression,
-    var fresh: array<string>, var stale: array<string>): void {
+    var fresh: array<string>, var stale: array<string>, values: array<string>): void {
     if (expression.kind == "lambda" || expression.kind == "lambda.move") return
     if (expression.kind == "local.val" && expression.children.size > 0 &&
-        bootstrapRegionValueFresh(analyzer, expression.children[0], fresh, stale)) fresh.append(expression.text)
+        bootstrapRegionValueFresh(analyzer, expression.children[0], fresh, stale, values)) fresh.append(expression.text)
     else if (expression.kind == "local.val" || expression.kind == "local.var") stale.append(expression.text)
-    for (child in expression.children) bootstrapRegionCollectFreshLocals(analyzer, child, fresh, stale)
+    for (child in expression.children) bootstrapRegionCollectFreshLocals(analyzer, child, fresh, stale, values)
     return
 }
 
 /** Whether every `return` in `expression` (outside its lambdas) returns a fresh object or nothing. */
 fun bootstrapRegionReturnsFresh(var analyzer: BootstrapAnalyzer, expression: BootstrapExpression,
-    fresh: array<string>, stale: array<string>): bool {
+    fresh: array<string>, stale: array<string>, values: array<string>): bool {
     if (expression.kind == "lambda" || expression.kind == "lambda.move") return true
     if (expression.kind == "return" && expression.children.size > 0 && expression.children[0].kind != "missing" &&
-        !bootstrapRegionValueFresh(analyzer, expression.children[0], fresh, stale)) return false
+        !bootstrapRegionValueFresh(analyzer, expression.children[0], fresh, stale, values)) return false
     for (child in expression.children) {
-        if (!bootstrapRegionReturnsFresh(analyzer, child, fresh, stale)) return false
+        if (!bootstrapRegionReturnsFresh(analyzer, child, fresh, stale, values)) return false
     }
     true
 }
 
-/** Whether `expression`, in a function body whose fresh `val` locals are `fresh` (none of them in `stale`), is an object made there. */
+/** Whether `expression`, in a function body whose fresh `val` locals are `fresh` (none of them in `stale`) and whose value-typed
+ *  parameters are `values`, is an object made there, and made only of such objects and of values. */
 fun bootstrapRegionValueFresh(var analyzer: BootstrapAnalyzer, expression: BootstrapExpression,
-    fresh: array<string>, stale: array<string>): bool {
+    fresh: array<string>, stale: array<string>, values: array<string>): bool {
     val kind = expression.kind
     if (kind == "identifier") return bootstrapRegionNamesHave(fresh, expression.text) && !bootstrapRegionNamesHave(stale, expression.text)
-    if (kind == "string" || kind == "string.template" || kind == "array" || kind == "lambda" ||
+    if (kind == "string" || kind == "string.template" || kind == "lambda" ||
         kind == "lambda.move" || kind == "task" || kind == "thread" || kind == "generator") return true
+    if (kind == "array") return bootstrapRegionArgumentsFresh(analyzer, expression, fresh, stale, values)
     if (kind == "call") {
         if (expression.text == "move" && expression.children.size == 1) {
-            return bootstrapRegionValueFresh(analyzer, expression.children[0], fresh, stale)
+            return bootstrapRegionValueFresh(analyzer, expression.children[0], fresh, stale, values)
         }
         if (expression.text == "Shared" || expression.text == "Mutex" || expression.text == "Cell" ||
-            expression.text == "Map" || analyzer.findKind(expression.text) == "class") return true
+            expression.text == "Map" || analyzer.findKind(expression.text) == "class") {
+            return bootstrapRegionArgumentsFresh(analyzer, expression, fresh, stale, values) &&
+                bootstrapRegionDefaultsFresh(analyzer, expression)
+        }
         if (bootstrapRegionNamesHave(fresh, expression.text) || bootstrapRegionNamesHave(stale, expression.text)) return false
         return analyzer.regionFunctionResultIsFresh(expression.text)
     }
     if (kind == "if" && expression.children.size >= 3) {
         return expression.children[2].kind != "missing" &&
-            bootstrapRegionValueFresh(analyzer, expression.children[1], fresh, stale) &&
-            bootstrapRegionValueFresh(analyzer, expression.children[2], fresh, stale)
+            bootstrapRegionValueFresh(analyzer, expression.children[1], fresh, stale, values) &&
+            bootstrapRegionValueFresh(analyzer, expression.children[2], fresh, stale, values)
     }
     if (kind == "block" && expression.children.size > 0) {
-        return bootstrapRegionValueFresh(analyzer, expression.children[expression.children.size - 1], fresh, stale)
+        return bootstrapRegionValueFresh(analyzer, expression.children[expression.children.size - 1], fresh, stale, values)
     }
     false
+}
+
+/** Whether every argument of the constructor call or array literal `expression` in such a body is fresh there
+ *  (bootstrapRegionValueFresh) or a value: a literal scalar, or a parameter in `values` that no local shadows. */
+fun bootstrapRegionArgumentsFresh(var analyzer: BootstrapAnalyzer, expression: BootstrapExpression,
+    fresh: array<string>, stale: array<string>, values: array<string>): bool {
+    for (argument in expression.children) {
+        val value = bootstrapRegionArgumentValue(argument)
+        val scalar = value.kind == "integer" || value.kind == "float" || value.kind == "true" || value.kind == "false" ||
+            value.kind == "null" || (value.kind == "identifier" && bootstrapRegionNamesHave(values, value.text) &&
+            !bootstrapRegionNamesHave(fresh, value.text) && !bootstrapRegionNamesHave(stale, value.text))
+        if (!scalar && !bootstrapRegionValueFresh(analyzer, value, fresh, stale, values)) return false
+    }
+    true
+}
+
+/** A call argument's value: a named argument's (`log = outer`), or the argument itself. */
+fun bootstrapRegionArgumentValue(argument: BootstrapExpression): BootstrapExpression =
+    if ((argument.kind == "named.argument" || argument.kind == "named.borrow") && argument.children.size == 1) argument.children[0]
+    else argument
+
+/** Whether a value of `type` can be kept in an object of the region without that being a store into another object: a scalar
+ *  or a string. */
+fun bootstrapRegionTypeIsValue(type: string): bool {
+    val normalized = bootstrapNormalizeType(type)
+    bootstrapRegionResultIsIndependent(normalized) || normalized == "string" || normalized == "nullable:string"
+}
+
+/** The parameters of `declaration` whose type is a value (bootstrapRegionTypeIsValue). */
+fun bootstrapRegionValueParameters(declaration: BootstrapDeclaration): array<string> {
+    val names: array<string> = []
+    var index = 0
+    while (index < declaration.parameters.size && index < declaration.parameterTypes.size) {
+        if (bootstrapRegionTypeIsValue(declaration.parameterTypes[index])) names.append(declaration.parameters[index])
+        index = index + 1
+    }
+    names
+}
+
+/** Whether the defaults a constructor call `expression` leaves to its class (an omitted parameter, a field's initializer, a
+ *  delegated property's `by`) are fresh or values too: `class Keeper(val log: array<string> = moduleLog)` makes
+ *  `Keeper()` hold the module's array. Shared, Mutex, Cell and Map have none. */
+fun bootstrapRegionDefaultsFresh(var analyzer: BootstrapAnalyzer, expression: BootstrapExpression): bool {
+    val index = analyzer.typeDeclarations.find(expression.text)
+    if (index < 0) return true
+    val declaration = analyzer.declarations[index]
+    if (declaration.kind != "class" || declaration.name != expression.text) return true
+    var positional = 0
+    val named: array<string> = []
+    for (argument in expression.children) {
+        if (argument.kind == "named.argument") named.append(argument.text) else positional = positional + 1
+    }
+    var parameter = positional
+    while (parameter < declaration.parameters.size) {
+        if (!bootstrapRegionNamesHave(named, declaration.parameters[parameter])) {
+            var fallback = if (parameter < declaration.parameterDefaults.size) declaration.parameterDefaults[parameter]
+                else BootstrapExpression("missing", "", 0, 0, [])
+            if ((fallback.kind == "delegate.initializer" || fallback.kind == "delegate.field") && fallback.children.size > 0) {
+                fallback = fallback.children[0]
+            }
+            val scalar = fallback.kind == "missing" || fallback.kind == "integer" || fallback.kind == "float" ||
+                fallback.kind == "true" || fallback.kind == "false" || fallback.kind == "null" ||
+                (parameter < declaration.parameterTypes.size && bootstrapRegionTypeIsValue(declaration.parameterTypes[parameter]))
+            if (!scalar && !bootstrapRegionValueFresh(analyzer, fallback, [], [], [])) return false
+        }
+        parameter = parameter + 1
+    }
+    true
 }
 
 // A literal number or boolean, or one negated: what an untyped module value's
@@ -9457,14 +9531,19 @@ class BootstrapAnalyzer(
             }
             return false
         }
-        if (kind == "string" || kind == "string.template" || kind == "array" || kind == "lambda" ||
+        if (kind == "string" || kind == "string.template" || kind == "lambda" ||
             kind == "lambda.move" || kind == "task" || kind == "thread" || kind == "generator") return true
+        // An array literal, and a constructor's object, are the region's own only with what they are made of: `Keeper(outer)`
+        // is a new object whose field is the outer array, so a store into it is a store into `outer`.
+        if (kind == "array") return this.regionArgumentsAreFresh(expression)
         if (kind == "call") {
             if (expression.text == "move" && expression.children.size == 1) {
                 return this.regionExpressionIsFresh(expression.children[0])
             }
             if (expression.text == "Shared" || expression.text == "Mutex" || expression.text == "Cell" ||
-                expression.text == "Map" || this.findKind(expression.text) == "class") return true
+                expression.text == "Map" || this.findKind(expression.text) == "class") {
+                return this.regionArgumentsAreFresh(expression) && bootstrapRegionDefaultsFresh(this, expression)
+            }
             if (this.visibleLocalIndex(expression.text) >= 0) return false
             return this.regionFunctionResultIsFresh(expression.text)
         }
@@ -9480,6 +9559,17 @@ class BootstrapAnalyzer(
         false
     }
 
+    /** Whether every argument of the constructor call or array literal `expression` leaves what it makes the region's own:
+     *  fresh itself, or a value (a scalar or a string: nothing is stored into one). */
+    fun regionArgumentsAreFresh(expression: BootstrapExpression): bool {
+        for (argument in expression.children) {
+            val value = bootstrapRegionArgumentValue(argument)
+            if (!this.regionExpressionIsFresh(value) &&
+                !bootstrapRegionTypeIsValue(this.infer(value))) return false
+        }
+        true
+    }
+
     /** Whether every top-level function named `name` returns only objects it makes (bootstrapRegionBodyResultsFresh); a
      *  function still being decided (a cycle) counts as one, as only what it returns besides itself can say otherwise. */
     fun regionFunctionResultIsFresh(name: string): bool {
@@ -9492,7 +9582,10 @@ class BootstrapAnalyzer(
             if (declaration.name == name && declaration.extensionOwner == "" &&
                 (declaration.kind == "fun" || declaration.kind == "extern" || declaration.kind == "compile.fun")) {
                 found = true
-                if (declaration.kind == "extern" || !bootstrapRegionBodyResultsFresh(this, declaration.expression)) fresh = false
+                if (declaration.kind == "extern" ||
+                    !bootstrapRegionBodyResultsFresh(this, declaration.expression, bootstrapRegionValueParameters(declaration))) {
+                    fresh = false
+                }
             }
         }
         val answer = found && fresh
