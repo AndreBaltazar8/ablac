@@ -3,8 +3,9 @@
 // (graph-v2: initialize, analyze, document/open, document/change, analyze, shutdown), and checks that
 //   - no canary file appeared (every hostile site tries to create one: compile-time code, a provider, a subparser, a native library, a git config command);
 //   - the `git` and `curl` shims on the service's PATH were never run by anything the workspace names;
-//   - the workspace holds the same files afterwards (nothing written into it), nothing appeared where a symlink in it points, and the
-//     package cache, ABLA_CACHE_DIR and the service's TMPDIR (its private scratch directory, removed when it ends) stayed empty;
+//   - the workspace holds the same files afterwards (nothing written into it), nothing appeared where a symlink in it points, the
+//     package cache is as the case's setup left it (empty without one), and ABLA_CACHE_DIR and the service's TMPDIR (its private
+//     scratch directory, removed when it ends) stayed empty;
 //   - the service answered (initialize and analyze) inside the time and memory bound, or refused with a protocol error, and shut down.
 // Usage: node hostile.mjs COMPILER [CASE ...]
 import { spawn } from 'node:child_process';
@@ -80,8 +81,10 @@ add('prepared-copy-with-hostile-git-config', (dir, canary) => ({
     const found = spawnSync('find', [env.ABLA_PACKAGE_CACHE, '-path', '*/source/.git/config'], { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean);
     for (const f of [...copies, ...found]) if (fs.existsSync(f)) fs.appendFileSync(f, hostile);
     for (const f of [...copies, ...found]) if (!fs.existsSync(f)) console.log('note: no ' + f);
-    for (const f of fs.readdirSync(env.ABLA_PACKAGE_CACHE)) void f;
-    env.SNAPSHOT_CACHE = '1';
+    // A build hashes a prepared copy with no fingerprint record and writes one into the package cache (cache/verified); the editor
+    // must not. The copy must be over two seconds old, or nothing fingerprints it and a write could not happen.
+    fs.rmSync(path.join(env.ABLA_PACKAGE_CACHE, 'verified'), { recursive: true, force: true });
+    spawnSync('sleep', ['3']);
 } });
 add('native-library', (dir, canary) => ({
     'abla.toml': toml(['name = "evil"', 'entry = "main.ab"', 'nativeLibraries = ["evil"]', `compileCapabilities = ${ALL}`]),
@@ -275,6 +278,7 @@ for (const c of cases) {
         c.setup(dir, canary, env, run);
     }
     const before = tree(dir);
+    const cacheBefore = tree(cache);
     if (CONTROL) {
         const built = spawnSync(compiler, c.name === 'import-provider' ? ['package', 'update', '--project', dir] : ['build', '--project', dir, '-o', path.join(dir, 'out-bin'), '--fast', '--no-cache'], { env, cwd: dir, encoding: 'utf8', timeout: 120000 });
         const created = fs.readdirSync(path.dirname(dir)).some((f) => f.startsWith(path.basename(canary)));
@@ -290,7 +294,10 @@ for (const c of cases) {
     const ran = fs.existsSync(shimLog) ? fs.readFileSync(shimLog, 'utf8').trim().split('\n').filter((l) => l.includes(base)) : [];
     if (ran.length) problems.push(`shim tools ran: ${ran.slice(0, 3).join(' | ')}`);
     if (c.workspace === undefined && tree(dir) !== before) problems.push('the workspace changed');
-    if (!c.setup && fs.readdirSync(cache).length) problems.push(`the package cache holds ${fs.readdirSync(cache).join(',')}`);
+    if (tree(cache) !== cacheBefore) {
+        const was = new Set(cacheBefore.split('\n'));
+        problems.push(`the package cache changed: ${tree(cache).split('\n').filter((l) => !was.has(l)).slice(0, 3).join(' | ')}`);
+    }
     if (fs.existsSync(env.ABLA_CACHE_DIR) && fs.readdirSync(env.ABLA_CACHE_DIR).length) problems.push('ABLA_CACHE_DIR was written');
     if (c.outside && fs.readdirSync(`${dir}-outside`).length) problems.push(`written through the build/ symlink: ${fs.readdirSync(`${dir}-outside`).join(',')}`);
     if (fs.readdirSync(env.TMPDIR).length) problems.push(`the service left ${fs.readdirSync(env.TMPDIR).join(',')} in its TMPDIR`);
