@@ -88,9 +88,17 @@ grep -q 'help: .NativeByteBuffer.'"'"'s own functions change its fields' "$out/f
 build "$root/stdlib" sealed-memory
 [[ $status != 0 ]] || fail "sealed-memory built"
 for what in ByteBuffer.stage ByteBuffer.staged AesKey AesGcmKey RsaPrivateKey Keccak Keccak.closed LlvmOrcSession.closed \
-    LlvmOrcGeneration.closed cryptoWipeString tlsWipe TlsIdentityKeys; do
+    LlvmOrcGeneration.closed cryptoWipeString tlsWipe TlsIdentityKeys Sha256Stream Sha256Stream.pending TlsStoredTicket TlsTicketState; do
     grep "error\[E_SEMANTIC\]: native.trust:$what\($\|@\|:\)" "$out/sealed-memory.log" > /dev/null ||
         fail "sealed-memory: $what is not refused: $(head -4 "$out/sealed-memory.log")"
+done
+# The TLS machines' key material is private to their modules (decision #165): code outside can neither read nor set it, so it cannot
+# give a machine a string of its own to wipe.
+build "$root/stdlib" machine-secrets
+[[ $status != 0 ]] || fail "machine-secrets built"
+for what in TlsClient.handshakeSecret TlsClient.keyPairs TlsClient.masterSecret TlsServer.master TlsServer.v12Pair TlsServer.ticketMaster; do
+    grep "error\[E_SEMANTIC\]: name.private:$what:" "$out/machine-secrets.log" > /dev/null ||
+        fail "machine-secrets: $what is not private: $(head -4 "$out/machine-secrets.log")"
 done
 for accepted in trusted-call open trusted-syscall trusted-field caller-strings; do
     build "$root/stdlib" "$accepted"

@@ -102,11 +102,6 @@ class TlsServer(
     var writeEncrypted: bool,
     var read: TlsRecordProtection,
     var write: TlsRecordProtection,
-    var handshakeSecret: string,
-    var clientHandshakeSecret: string,
-    var serverHandshakeSecret: string,
-    var clientApplicationSecret: string,
-    var serverApplicationSecret: string,
     var clientChain: array<string>,
     var negotiatedAlpn: string,
     var serverName: string,
@@ -114,15 +109,12 @@ class TlsServer(
     var peerClosed: bool,
     var sentClose: bool,
     var clientAuthenticated: bool,
-    /** TLS 1.2: set when the ClientHello chose it; the suite, protections, keys, the server's ECDHE pair, the master secret. */
+    /** TLS 1.2: set when the ClientHello chose it; the suite and protections (its keys, ECDHE pair and master secret: v12Keys, v12Pair, master). */
     var v12: bool,
     var v12Suite: int,
     var v12Read: Tls12Protection,
     var v12Write: Tls12Protection,
-    var v12Keys: Tls12Keys,
-    var v12Pair: TlsKeyPair,
     var serverRandom: string,
-    var master: string,
     /** Records in a row that carried nothing (empty application data, ChangeCipherSpec), KeyUpdates in a row, and a
      *  KeyUpdate the peer asked for that is still to be answered (once per batch of input). */
     var emptyRun: int = 0,
@@ -133,10 +125,8 @@ class TlsServer(
     /** The key exchange group that was negotiated (0 until the ServerHello is processed): the group of the key share, or of the
      *  TLS 1.2 ServerKeyExchange. */
     var negotiatedGroup: int = 0,
-    /** Whether this handshake resumed a session (a ticket was accepted: no certificate was sent), and the master secret kept until the client's Finished to make
-     *  the resumption master secret and the tickets (a buffer of its own; "" when no tickets are sent). */
+    /** Whether this handshake resumed a session (a ticket was accepted: no certificate was sent). */
     var didResume: bool = false,
-    var ticketMaster: string = "",
     /** The first ClientHello offered a PSK (after a HelloRetryRequest the second must too), and the client allowed tickets (psk_key_exchange_modes lists psk_dhe_ke). */
     var firstOfferedPsk: bool = false,
     var firstPskUsable: bool = false,
@@ -152,15 +142,37 @@ class TlsServer(
     var earlySkipped: int = 0
 )
 
+// The key material the server clears (wipeSecrets): the record protections, the handshake and application secrets, TLS 1.2's key block,
+// ECDHE pair and master secret, and the master secret kept until the client's Finished to make the resumption master secret and the
+// tickets ("" when no tickets are sent). Private to this module, so only the server's own functions set them, to strings it made or
+// copied: code outside cannot hand it a string of its own to clear (decision #165). Tests read them through the tlsServer*ForTest getters.
+// The key and IV of the record protections it made (setKeys), which it wipes when it replaces or drops one: not `read.key`, so a
+// protection code outside put in their place has nothing of its own cleared.
+private var TlsServer.readKey: string = ""
+private var TlsServer.readIv: string = ""
+private var TlsServer.writeKey: string = ""
+private var TlsServer.writeIv: string = ""
+private var TlsServer.handshakeSecret: string = ""
+private var TlsServer.clientHandshakeSecret: string = ""
+private var TlsServer.serverHandshakeSecret: string = ""
+private var TlsServer.clientApplicationSecret: string = ""
+private var TlsServer.serverApplicationSecret: string = ""
+private var TlsServer.v12Keys: Tls12Keys = Tls12Keys("", "", "", "")
+private var TlsServer.v12Pair: TlsKeyPair = TlsKeyPair(0, "", "")
+private var TlsServer.master: string = ""
+private var TlsServer.ticketMaster: string = ""
+
 private fun tlsServerEmptyProtection(): TlsRecordProtection = tlsRecordProtection(TLS_AEAD_AES_128_GCM, "", "")
 
 /** A TLS 1.3 server connection waiting for its ClientHello. */
-fun tlsServerNew(config: TlsServerConfig): TlsServer =
-    TlsServer(config, TLS_SERVER_WAIT_CLIENT_HELLO, "", "", TlsHandshakeBuffer([], 0), "", "", tlsTranscript(), HKDF_SHA256, 0, 16,
-        TLS_AEAD_AES_128_GCM, "", "", false, 0, 0, false, false, tlsServerEmptyProtection(),
-        tlsServerEmptyProtection(), "", "", "", "", "", [], "", "", false, false, false, false, false, 0,
-        tls12Protection(tls12Placeholder(), "", ""), tls12Protection(tls12Placeholder(), "", ""), Tls12Keys("", "", "", ""),
-        TlsKeyPair(0, "", ""), "", "")
+fun tlsServerNew(config: TlsServerConfig): TlsServer {
+    val server = TlsServer(config, TLS_SERVER_WAIT_CLIENT_HELLO, "", "", TlsHandshakeBuffer([], 0), "", "", tlsTranscript(), HKDF_SHA256, 0, 16,
+        TLS_AEAD_AES_128_GCM, "", "", false, 0, 0, false, false, tlsServerEmptyProtection(), tlsServerEmptyProtection(), [], "", "", false, false, false, false, false, 0,
+        tls12Protection(tls12Placeholder(), "", ""), tls12Protection(tls12Placeholder(), "", ""), "")
+    server.v12Keys = Tls12Keys("", "", "", "")
+    server.v12Pair = TlsKeyPair(0, "", "")
+    server
+}
 
 /** `config` that offers the application protocols `alpn` (in the server's order, for example ["h2", "http/1.1"]); a client that offers protocols and none of them is refused
  *  with no_application_protocol, one that offers none is still accepted (see docs/tls.md). The chosen one is `TlsServer.alpn()`. */
@@ -352,11 +364,11 @@ private fun TlsServer.wipeSecrets(): void {
     tlsServerWipeOwned(this.serverHandshakeSecret)
     tlsServerWipeOwned(this.clientApplicationSecret)
     tlsServerWipeOwned(this.serverApplicationSecret)
-    tlsServerWipeOwned(this.read.key)
-    tlsServerWipeOwned(this.read.iv)
+    tlsServerWipeOwned(this.readKey)
+    tlsServerWipeOwned(this.readIv)
     tlsRecordProtectionRelease(this.read)
-    tlsServerWipeOwned(this.write.key)
-    tlsServerWipeOwned(this.write.iv)
+    tlsServerWipeOwned(this.writeKey)
+    tlsServerWipeOwned(this.writeIv)
     tlsRecordProtectionRelease(this.write)
     tlsServerWipeOwned(this.v12Pair.privateKey)
     tlsServerWipeOwned(this.master)
@@ -371,21 +383,26 @@ private fun TlsServer.wipeSecrets(): void {
 private fun TlsServer.setKeys(secret: string, forWrite: bool): void {
     // The protection this replaces is done with.
     if (forWrite) {
-        tlsServerWipeOwned(this.write.key)
-        tlsServerWipeOwned(this.write.iv)
+        tlsServerWipeOwned(this.writeKey)
+        tlsServerWipeOwned(this.writeIv)
         tlsRecordProtectionRelease(this.write)
     } else {
-        tlsServerWipeOwned(this.read.key)
-        tlsServerWipeOwned(this.read.iv)
+        tlsServerWipeOwned(this.readKey)
+        tlsServerWipeOwned(this.readIv)
         tlsRecordProtectionRelease(this.read)
     }
-    val protection = tlsRecordProtection(this.aead, tlsTrafficKey(this.hash, secret, this.keyLength),
-        tlsTrafficIv(this.hash, secret))
+    val key = tlsTrafficKey(this.hash, secret, this.keyLength)
+    val iv = tlsTrafficIv(this.hash, secret)
+    val protection = tlsRecordProtection(this.aead, key, iv)
     if (forWrite) {
         this.write = move(protection)
+        this.writeKey = key
+        this.writeIv = iv
         this.writeEncrypted = true
     } else {
         this.read = move(protection)
+        this.readKey = key
+        this.readIv = iv
         this.readEncrypted = true
     }
     return

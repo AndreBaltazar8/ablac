@@ -29,10 +29,22 @@ done
 # The programs, built up front, four at once: they read nothing at compile time, and built one before each use they
 # were most of this test's wall time (11 release builds of about 10 s, 2026-11-15).
 programs=(interop dropnotify binding-interop api identity mtls tls12prf server sni wipe serve unix bulk)
+# server.ab and wipe.ab drive the machines from outside (a KeyUpdate flood, a sequence number near its limit) and check what
+# their key material holds, which is private to abla/tls/pure/client and server (decision #165): they build against a copy of
+# the library whose machines' private extension fields are open, made here.
+rm -rf "$out/stdlib-open"
+cp -r stdlib "$out/stdlib-open"
+sed -i -e "s/^private var TlsClient\./var TlsClient./" "$out/stdlib-open/abla/tls/pure/client/entry.ab"
+sed -i -e "s/^private var TlsServer\./var TlsServer./" "$out/stdlib-open/abla/tls/pure/server/entry.ab"
+grep -q "^var TlsClient\.masterSecret" "$out/stdlib-open/abla/tls/pure/client/entry.ab" &&
+    grep -q "^var TlsServer\.master:" "$out/stdlib-open/abla/tls/pure/server/entry.ab" ||
+    { echo "tls-pure interop: the open library copy has no open machine fields" >&2; exit 1; }
 pids=()
 for program in "${programs[@]}"; do
     while (( $(jobs -rp | wc -l) >= 4 )); do sleep 0.2; done
-    "$compiler" build "tests/cases/tls-pure/$program.ab" -o "$out/$program" --no-cache > "$out/$program.build.log" 2>&1 &
+    library=()
+    [[ $program == server || $program == wipe ]] && library=(env "ABLA_STDLIB=$root/$out/stdlib-open")
+    "${library[@]}" "$compiler" build "tests/cases/tls-pure/$program.ab" -o "$out/$program" --no-cache > "$out/$program.build.log" 2>&1 &
     pids+=("$!")
 done
 for index in "${!programs[@]}"; do
