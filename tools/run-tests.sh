@@ -261,6 +261,7 @@ if [[ $suite_cpus =~ ^[1-9][0-9]*$ ]] && ((jobs > suite_cpus)); then
     for n in ${parallel[@]+"${parallel[@]}"} ${serial[@]+"${serial[@]}"}; do
         case ${commands[n-1]} in
             *tools/test-playground-build.sh*) slots=3 ;;
+            *tools/test-image-identity.sh*) slots=3 ;;   # three compiler-sized builds at once
             *tools/test-analysis-gc-stress.sh*) slots=2 ;;
             *) continue ;;
         esac

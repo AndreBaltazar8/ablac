@@ -3,7 +3,7 @@
 # in every process (10 MB, 97 MB for the static compiler: 30 and 80 ms of each build that touches a cache), but by the linker's content hash, the ELF
 # GNU build-id that a program linking LLVM gets from -Wl,--build-id=sha1 (the Mach-O LC_UUID on a Mac). This builds a program that links LLVM and prints
 # its identity, and checks that (1) the id it reads is the build-id readelf shows, (2) the id follows the content (an image with one more string has another),
-# (3) two different images have different ids and the same program built twice has the same one, (4) an image without the note
+# (3) different images have different ids (the variant of (2)) and the same program built twice has the same one, (4) an image without the note
 # falls back to the whole-image hash (non-empty size, the file's own size), and (5) both paths give a working build.
 # Usage: tools/test-image-identity.sh [compiler]
 set -euo pipefail
@@ -32,23 +32,27 @@ build_image() {
         return "$status"
     fi
 }
-build_image one tests/cases/image-identity/main.ab "$out/one"
-build_image again tests/cases/image-identity/main.ab "$out/again"
-build_image other tests/cases/modules/native-function-address.ab "$out/other"
+# The three builds are independent, and each is compiler-sized (the program imports the compiler's own modules): they run at once
+# (tools/run-tests.sh reserves three of the suite's slots for this test). Run one after the other they were 1,420 s of release
+# run 45983722873's static suite, its longest command.
+mkdir -p "$out/variant"
+sed 's|println(bootstrapRunningImageLinkerId())|println(bootstrapRunningImageLinkerId())\n    println("variant")|' tests/cases/image-identity/main.ab > "$out/variant/main.ab"
+build_image one tests/cases/image-identity/main.ab "$out/one" & one_build=$!
+build_image again tests/cases/image-identity/main.ab "$out/again" & again_build=$!
+build_image variant "$out/variant/main.ab" "$out/variant/prog" & variant_build=$!
+failed=0
+for build in "$one_build" "$again_build" "$variant_build"; do wait "$build" || failed=1; done
+((failed == 0)) || exit 1
 note=$(readelf -nW "$out/one" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
 [[ -n $note ]] || { echo 'image identity: a program that links LLVM has no GNU build-id' >&2; exit 1; }
 # (1) the program reads that id from its own image
 "$out/one" > "$out/one.out"
 [[ $(sed -n 1p "$out/one.out") == "elf-$note-$(stat -c %s "$out/one")-"* ]] || { echo "image identity: read [$(sed -n 1p "$out/one.out")], readelf says [$note], size $(stat -c %s "$out/one")" >&2; exit 1; }
-# (2) the id follows the bytes: the same program with one more string in it is another image with another id
-mkdir -p "$out/variant"
-sed 's|println(bootstrapRunningImageLinkerId())|println(bootstrapRunningImageLinkerId())\n    println("variant")|' tests/cases/image-identity/main.ab > "$out/variant/main.ab"
-build_image variant "$out/variant/main.ab" "$out/variant/prog"
+# (2) the id follows the bytes: the same program with one more string in it is another image with another id. That is also (3)'s
+# "different images, different ids", with the smallest difference (a second, unrelated program added a fourth build for no more).
 variant=$(readelf -nW "$out/variant/prog" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
 [[ -n $variant && $variant != "$note" ]] || { echo 'image identity: an image that differs by a string has the same build-id' >&2; exit 1; }
-# (3) different programs, different ids; the same program twice, the same one
-other=$(readelf -nW "$out/other" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p')
-[[ -n $other && $other != "$note" ]] || { echo 'image identity: two different images share a build-id' >&2; exit 1; }
+# (3) the same program twice, the same id
 [[ $(readelf -nW "$out/again" | sed -n 's/.*Build ID: *\([0-9a-f]*\).*/\1/p') == "$note" ]] ||
     { echo 'image identity: the same program linked twice has two build-ids (not reproducible)' >&2; exit 1; }
 # (4) without the note: the whole-image hash, over the file's own size
