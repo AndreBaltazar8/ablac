@@ -120,6 +120,7 @@ test-serial: ablac
 	tools/test-libc-parse.sh $(COMPILER)
 	tools/test-stack-canary.sh $(COMPILER)
 	tools/test-libc-format.sh $(COMPILER)
+	tools/test-libc-strftime.sh $(COMPILER)
 	tools/test-f64-boundary.sh $(COMPILER)
 	tools/test-image-identity.sh $(COMPILER)
 	tools/test-libcall-coverage.sh
