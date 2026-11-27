@@ -6699,6 +6699,77 @@ fun bootstrapRegionModuleValues(
     values
 }
 
+/** Whether `names` has `name`. */
+fun bootstrapRegionNamesHave(names: array<string>, name: string): bool {
+    for (candidate in names) if (candidate == name) return true
+    false
+}
+
+
+// Whether every result of the function body `body` is an object the body makes (see BootstrapAnalyzer.regionExpressionIsFresh):
+// its last expression and every `return`'s value, not those of the lambdas inside it. A `val` local counts when it is made from
+// one; a `var` local, a parameter, a field, an index, a module value or a method's result does not.
+fun bootstrapRegionBodyResultsFresh(var analyzer: BootstrapAnalyzer, body: BootstrapExpression): bool {
+    val fresh: array<string> = []
+    val stale: array<string> = []
+    bootstrapRegionCollectFreshLocals(analyzer, body, fresh, stale)
+    if (!bootstrapRegionReturnsFresh(analyzer, body, fresh, stale)) return false
+    val last = if (body.kind == "block") (if (body.children.size > 0) body.children[body.children.size - 1] else body) else body
+    last.kind == "return" || last.kind == "local.val" || last.kind == "local.var" ||
+        last.kind == "while" || last.kind == "for" || last.kind == "assign" || last.kind == "member.assign" ||
+        bootstrapRegionValueFresh(analyzer, last, fresh, stale)
+}
+
+/** The body's `val` locals made from a fresh object (in `fresh`), and its other locals (in `stale`), in source order. */
+fun bootstrapRegionCollectFreshLocals(var analyzer: BootstrapAnalyzer, expression: BootstrapExpression,
+    var fresh: array<string>, var stale: array<string>): void {
+    if (expression.kind == "lambda" || expression.kind == "lambda.move") return
+    if (expression.kind == "local.val" && expression.children.size > 0 &&
+        bootstrapRegionValueFresh(analyzer, expression.children[0], fresh, stale)) fresh.append(expression.text)
+    else if (expression.kind == "local.val" || expression.kind == "local.var") stale.append(expression.text)
+    for (child in expression.children) bootstrapRegionCollectFreshLocals(analyzer, child, fresh, stale)
+    return
+}
+
+/** Whether every `return` in `expression` (outside its lambdas) returns a fresh object or nothing. */
+fun bootstrapRegionReturnsFresh(var analyzer: BootstrapAnalyzer, expression: BootstrapExpression,
+    fresh: array<string>, stale: array<string>): bool {
+    if (expression.kind == "lambda" || expression.kind == "lambda.move") return true
+    if (expression.kind == "return" && expression.children.size > 0 && expression.children[0].kind != "missing" &&
+        !bootstrapRegionValueFresh(analyzer, expression.children[0], fresh, stale)) return false
+    for (child in expression.children) {
+        if (!bootstrapRegionReturnsFresh(analyzer, child, fresh, stale)) return false
+    }
+    true
+}
+
+/** Whether `expression`, in a function body whose fresh `val` locals are `fresh` (none of them in `stale`), is an object made there. */
+fun bootstrapRegionValueFresh(var analyzer: BootstrapAnalyzer, expression: BootstrapExpression,
+    fresh: array<string>, stale: array<string>): bool {
+    val kind = expression.kind
+    if (kind == "identifier") return bootstrapRegionNamesHave(fresh, expression.text) && !bootstrapRegionNamesHave(stale, expression.text)
+    if (kind == "string" || kind == "string.template" || kind == "array" || kind == "lambda" ||
+        kind == "lambda.move" || kind == "task" || kind == "thread" || kind == "generator") return true
+    if (kind == "call") {
+        if (expression.text == "move" && expression.children.size == 1) {
+            return bootstrapRegionValueFresh(analyzer, expression.children[0], fresh, stale)
+        }
+        if (expression.text == "Shared" || expression.text == "Mutex" || expression.text == "Cell" ||
+            expression.text == "Map" || analyzer.findKind(expression.text) == "class") return true
+        if (bootstrapRegionNamesHave(fresh, expression.text) || bootstrapRegionNamesHave(stale, expression.text)) return false
+        return analyzer.regionFunctionResultIsFresh(expression.text)
+    }
+    if (kind == "if" && expression.children.size >= 3) {
+        return expression.children[2].kind != "missing" &&
+            bootstrapRegionValueFresh(analyzer, expression.children[1], fresh, stale) &&
+            bootstrapRegionValueFresh(analyzer, expression.children[2], fresh, stale)
+    }
+    if (kind == "block" && expression.children.size > 0) {
+        return bootstrapRegionValueFresh(analyzer, expression.children[expression.children.size - 1], fresh, stale)
+    }
+    false
+}
+
 // A literal number or boolean, or one negated: what an untyped module value's
 // initializer must be for the value to hold no heap memory (the summary runs
 // before inference).
@@ -8063,7 +8134,9 @@ class BootstrapAnalyzer(
     var methodTargets: BootstrapResolvedMethodTargets = bootstrapResolvedMethodTargets(),
     // The built-in member each member call of the current analysis names (`builtin:array.append`), by the call's place (`begin:end`):
     // sema picks the branch for a built-in from the receiver's type, which is not known afterwards (see bootstrapBuiltinMemberKey).
-    val builtinMembers: Map<string, string> = Map()
+    val builtinMembers: Map<string, string> = Map(),
+    // Whether a function's every result is an object it makes (regionFunctionResultIsFresh): 1 yes, 2 no, 0 while it is decided.
+    val regionFreshResults: Map<string, int> = Map()
 ) {
     /** Whether `type` is a class conforming to Transactional (a TVar, or a
      *  library's transactional delegate): reads and writes through it are
@@ -9328,6 +9401,73 @@ class BootstrapAnalyzer(
     fun markRegionOwned(name: string, scope: int): void {
         this.regionOwnedNames.append(name)
         this.regionOwnedScopes.append(scope)
+    }
+
+    // regionExpressionIsOwned answers "may this be region memory?": what a store out of the region must not keep. A store
+    // into a receiver or an argument its callee keeps things in is allowed only when that object is surely the region's (it is
+    // freed with what it keeps), which a call's result is not by its type alone: `m.get(k)` or a getter returns an object that
+    // outlives the region. regionExpressionIsFresh answers that: a constructor, a literal, a lambda, a task, a thread or a
+    // generator, a `val` local made from one, and a call of a function whose every result is one.
+
+    /** Marks the `val` local `name` as made in the region from such an object (a "fresh:" entry beside the owned names). */
+    fun markRegionFresh(name: string, scope: int): void = this.markRegionOwned("fresh:$name", scope)
+
+    /** Whether `expression` is surely an object allocated in the current region. */
+    fun regionExpressionIsFresh(expression: BootstrapExpression): bool {
+        if (this.regionDepth == 0) return false
+        val kind = expression.kind
+        if (kind == "identifier") {
+            // The mark must be the visible local's own (an inner `val` of the same name may hold something else).
+            val scope = this.visibleLocalScope(expression.text)
+            if (scope < 0) return false
+            var index = 0
+            while (index < this.regionOwnedNames.size && index < this.regionOwnedScopes.size) {
+                if (this.regionOwnedNames[index] == "fresh:${expression.text}" && this.regionOwnedScopes[index] == scope) return true
+                index = index + 1
+            }
+            return false
+        }
+        if (kind == "string" || kind == "string.template" || kind == "array" || kind == "lambda" ||
+            kind == "lambda.move" || kind == "task" || kind == "thread" || kind == "generator") return true
+        if (kind == "call") {
+            if (expression.text == "move" && expression.children.size == 1) {
+                return this.regionExpressionIsFresh(expression.children[0])
+            }
+            if (expression.text == "Shared" || expression.text == "Mutex" || expression.text == "Cell" ||
+                expression.text == "Map" || this.findKind(expression.text) == "class") return true
+            if (this.visibleLocalIndex(expression.text) >= 0) return false
+            return this.regionFunctionResultIsFresh(expression.text)
+        }
+        if (kind == "if" && expression.children.size >= 3) {
+            return expression.children[2].kind != "missing" &&
+                this.regionExpressionIsFresh(expression.children[1]) &&
+                this.regionExpressionIsFresh(expression.children[2])
+        }
+        if (kind == "block" && expression.children.size > 0) {
+            return this.regionExpressionIsFresh(expression.children[expression.children.size - 1])
+        }
+        if (kind == "compile" && expression.children.size > 0) return this.regionExpressionIsFresh(expression.children[0])
+        false
+    }
+
+    /** Whether every top-level function named `name` returns only objects it makes (bootstrapRegionBodyResultsFresh); a
+     *  function still being decided (a cycle) counts as one, as only what it returns besides itself can say otherwise. */
+    fun regionFunctionResultIsFresh(name: string): bool {
+        val known = this.regionFreshResults.get(name)
+        if (known != null) return known != 2
+        this.regionFreshResults.set(name, 0)
+        var found = false
+        var fresh = true
+        for (declaration in this.declarations) {
+            if (declaration.name == name && declaration.extensionOwner == "" &&
+                (declaration.kind == "fun" || declaration.kind == "extern" || declaration.kind == "compile.fun")) {
+                found = true
+                if (declaration.kind == "extern" || !bootstrapRegionBodyResultsFresh(this, declaration.expression)) fresh = false
+            }
+        }
+        val answer = found && fresh
+        this.regionFreshResults.set(name, if (answer) 1 else 2)
+        answer
     }
 
     fun regionExpressionIsPromotion(
@@ -15303,7 +15443,7 @@ fun bootstrapInferCall(
                 analyzer.regionCalls,
                 expression.text,
                 retainedParameter
-            ) && !analyzer.regionExpressionIsOwned(
+            ) && !analyzer.regionExpressionIsFresh(
                 expression.children[retainedParameter]
             )) {
                 analyzer.fail(
@@ -15937,7 +16077,7 @@ fun bootstrapInferMemberCall(
             expression.text
         ) || (analyzer.regionCalls.retainingReceivers.contains("ext:$receiver.${expression.text}") &&
             !bootstrapStandardLibraryModuleSource(analyzer.currentSourceIdentity))) &&
-        !analyzer.regionExpressionIsOwned(expression.children[0])) {
+        !analyzer.regionExpressionIsFresh(expression.children[0])) {
         analyzer.fail(
             "region.receiver-retention:${receiver}.${expression.text}"
         )
@@ -15956,7 +16096,7 @@ fun bootstrapInferMemberCall(
                 analyzer.regionCalls,
                 methodName,
                 retainedParameter - 1
-            ) && !analyzer.regionExpressionIsOwned(
+            ) && !analyzer.regionExpressionIsFresh(
                 expression.children[retainedParameter]
             )) {
                 analyzer.fail(
@@ -17264,6 +17404,10 @@ fun bootstrapInferLocal(
         if (analyzer.regionDepth > 0 && hasInitializer &&
             analyzer.regionExpressionIsOwned(expression.children[0])) {
             analyzer.markRegionOwned(expression.text, analyzer.currentScope)
+        }
+        if (analyzer.regionDepth > 0 && hasInitializer && kind == "val" &&
+            analyzer.regionExpressionIsFresh(expression.children[0])) {
+            analyzer.markRegionFresh(expression.text, analyzer.currentScope)
         }
         result = "void"
     }
