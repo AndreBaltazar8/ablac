@@ -36,6 +36,10 @@ guarded curl --version > /dev/null || fail "curl --version did not run the real 
 # A test's own fake in front of the guard wins (the release tests' fakes keep working).
 mkdir "$work/fake"; printf '#!/bin/sh\necho fake gh\n' > "$work/fake/gh"; chmod +x "$work/fake/gh"
 [[ $(PATH="$work/fake:$guard:$PATH" gh run view 1) == 'fake gh' ]] || fail "a test's own fake gh lost to the guard"
+# Two copies of the guard on PATH (a test's private tree under the suite's guard) still reach the real curl.
+mkdir -p "$work/copy/tools/lib"; cp -R "$guard" "$work/copy/tools/lib/"
+status=0; out=$(PATH="$work/copy/tools/lib/net-guard:$guard:$PATH" timeout 20 curl -s "file://$work/file.txt") || status=$?
+[[ $status == 0 && $out == 'local bytes' ]] || fail "two copies of the guard did not reach the real curl (exit $status; 124: they exec'd each other)"
 echo 'net guard: file:// and loopback pass to the real curl; remote URLs, wget and gh are refused and logged'
 
 # 2. The real runner, in a private tree.
@@ -55,10 +59,13 @@ gh release list || true
 curl -s file://$work/file.txt
 tools/test-allowed-net.sh
 EOF
+# The private runner runs under this tree's guard, as this test does in the suite: the two copies of the guard must not take
+# each other for the real curl (they exec'd each other for ever), and the allowed test must lose both.
 status=0
-(cd "$work/tree" && RUN_TESTS_COMMANDS=$work/commands.txt JOBS=2 RUN_TESTS_MIN_FREE=0 RUN_TESTS_OUTPUT=$work/out \
-    RUN_TESTS_FILTER= RUN_TESTS_EXCLUDE= RUN_TESTS_SHARD= RUN_TESTS_HISTORY=$work/none tools/run-tests.sh build/ablac) > "$work/runner.log" 2>&1 || status=$?
-[[ $status == 1 ]] || { cat "$work/runner.log" >&2; fail "the runner exited $status, not 1"; }
+(cd "$work/tree" && PATH="$guard:$PATH" ABLA_NET_GUARD_LOG=$work/outer.log RUN_TESTS_COMMANDS=$work/commands.txt JOBS=2 \
+    RUN_TESTS_MIN_FREE=0 RUN_TESTS_OUTPUT=$work/out RUN_TESTS_FILTER= RUN_TESTS_EXCLUDE= RUN_TESTS_SHARD= \
+    RUN_TESTS_HISTORY=$work/none timeout 120 tools/run-tests.sh build/ablac) > "$work/runner.log" 2>&1 || status=$?
+[[ $status == 1 ]] || { cat "$work/runner.log" >&2; fail "the runner exited $status, not 1 (124: the guards looped)"; }
 result() { awk -F'\t' -v c="$1" '$4 == c { print $2 }' "$work/out/results.tsv"; }
 [[ $(result 'curl -s https://example.invalid/ || true') == 97 ]] || fail "a swallowed remote curl did not fail its command with 97: $(cat "$work/out/results.tsv")"
 [[ $(result 'gh release list || true') == 97 ]] || fail "a swallowed gh did not fail its command with 97"

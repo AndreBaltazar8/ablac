@@ -293,12 +293,20 @@ start() { # n
         fi
         # The network guard: gh, curl and wget refuse anything beyond file:// and the loopback host
         # (tools/lib/net-guard/curl), unless tools/test-network-allowed.txt names the command's script.
-        guard_path=$project_root/tools/lib/net-guard:$PATH
+        # A guard already on PATH (this runner run by a test under another runner) is taken off first, so only this
+        # runner's guard and list decide.
+        unguarded_path=
+        IFS=: read -r -a path_entries <<<"$PATH"
+        for entry in "${path_entries[@]}"; do
+            [[ $entry == */tools/lib/net-guard || $entry == */tools/lib/net-guard/ ]] ||
+                unguarded_path=${unguarded_path:+$unguarded_path:}$entry
+        done
+        guard_path=$project_root/tools/lib/net-guard:$unguarded_path
         network_log=$output/$n.network
         : >"$network_log"
         if [[ $command =~ (tools/test-[[:alnum:]-]+\.sh) ]] &&
             awk '!/^#/ { print $1 }' "$project_root/tools/test-network-allowed.txt" | grep -xF "${BASH_REMATCH[1]}" >/dev/null; then
-            guard_path=$PATH
+            guard_path=$unguarded_path
         fi
         # perl runs the command and reports the user and system seconds of the
         # command and everything it ran (`times` of the waited children).
