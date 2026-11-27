@@ -27,6 +27,19 @@ trusted fun bytes(hex: string): int {
     address
 }
 
+// The 32-bit units of `hex` (8 digits each) at a new wchar_t string with its terminator.
+trusted fun units(hex: string): int {
+    val count = hex.size / 8
+    val address = ablaUnsafePointerAddress(ablaUnsafeAllocate(4 * count + 4))
+    for (i in 0 until count) {
+        var unit = 0
+        for (j in 0 until 8) unit = unit * 16 + hexValue(hex[8 * i + j])
+        ablaRuntimeStoreI32(address + 4 * i, unit)
+    }
+    ablaRuntimeStoreI32(address + 4 * count, 0)
+    address
+}
+
 fun hexByte(b: int): string {
     val digits = "0123456789abcdef"
     digits.slice(b >> 4, (b >> 4) + 1) + digits.slice(b & 15, (b & 15) + 1)
@@ -35,11 +48,22 @@ fun hexByte(b: int): string {
 trusted fun run(size: int, formatHex: string, args: string): string {
     val format = bytes(formatHex)
     val tokens = args.split(" ")
-    val area = ablaUnsafePointerAddress(ablaUnsafeAllocate(8 * 16))
+    // 16-aligned (a long double's slot is), with room for twelve arguments of 16 bytes and the alignment.
+    val area = (ablaUnsafePointerAddress(ablaUnsafeAllocate(8 * 64)) + 15) & -16
     var count = 0
     for (token in tokens) {
         if (token.size == 0) continue
-        val value = if (token[0] == 105) number(token.slice(2, token.size)) else if (token[0] == 110) 0 else bytes(token.slice(2, token.size))
+        if (token[0] == 120) {
+            // x:<32 hex digits>: a long double's 16 bytes, at the next 16-aligned slot as the System V ABI places one.
+            if (count % 2 == 1) count = count + 1
+            val bytesAt = bytes(token.slice(2, token.size))
+            ablaRuntimeStoreI64(area + 8 * count, ablaRuntimeLoadI64(bytesAt))
+            ablaRuntimeStoreI64(area + 8 * count + 8, ablaRuntimeLoadI64(bytesAt + 8))
+            count = count + 2
+            continue
+        }
+        val value = if (token[0] == 105) number(token.slice(2, token.size)) else if (token[0] == 110) 0
+            else if (token[0] == 119) units(token.slice(2, token.size)) else bytes(token.slice(2, token.size))
         ablaRuntimeStoreI64(area + 8 * count, value)
         count = count + 1
     }
@@ -49,7 +73,9 @@ trusted fun run(size: int, formatHex: string, args: string): string {
     ablaRuntimeStoreI32(list + 4, 176)
     ablaRuntimeStoreI64(list + 8, area)
     ablaRuntimeStoreI64(list + 16, 0)
-    val buffer = if (size > 0) ablaUnsafePointerAddress(ablaUnsafeAllocate(size + 1)) else 0
+    // A size of -1 is SIZE_MAX (sprintf's): the buffer is the host side's 16 KiB, more than any case makes.
+    val buffer = if (size < 0) ablaUnsafePointerAddress(ablaUnsafeAllocate(16384))
+        else if (size > 0) ablaUnsafePointerAddress(ablaUnsafeAllocate(size + 1)) else 0
     val result = libcVsnprintf(buffer, size, format, list)
     var out = "$result\t"
     if (buffer != 0) {

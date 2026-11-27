@@ -1,13 +1,18 @@
 // printf for the statically linked compiler's C library (#806 step C, the printf family): vsnprintf over the System V x86-64 va_list, and the
 // variadic entry points (snprintf, sprintf, __printf_chk, __snprintf_chk) as assembly that builds the va_list and calls it (src/toolchain.ab,
-// bootstrapStaticLibcData). Conversions: %d %i %u %x %X %o %c %s %p %% with flags - + space # 0, a width and a precision (also *), the
-// length modifiers hh h l ll z j t. Floating-point conversions (%f %F %e %E %g %G %a %A) are exact and correctly rounded as glibc's (floatfmt.ab).
+// bootstrapStaticLibcData). Conversions: %d %i %u %x %X %o %b %B %c %s %p %% and %lc %ls (C locale: ASCII only, EILSEQ past it) with flags
+// - + space # 0 (' and I change nothing in the C locale), a width and a precision (also *), the length modifiers hh h l ll z j t L and C23's wN.
+// Floating-point conversions (%f %F %e %E %g %G %a %A) are exact and correctly rounded as glibc's (floatfmt.ab); a long double is formatted as
+// the nearest double. As glibc: a format that ends inside a conversion, and a width, precision or count past INT_MAX, are -1 (EINVAL, EOVERFLOW);
+// an unknown conversion is written as it came. Not supported: numbered arguments (%1$d, refused with EINVAL rather than read out of order), %n
+// (written as text: no write primitive), %m.
 import "abla/runtime/scalar"
 import "abla/float"
 import "abla/bytes"
 import "abla/simd/target"
 import "abla/unsafe/memory/raw"
 import "./string.ab"
+import "./errno.ab"
 import "./stdio.ab"
 import "./floatfmt.ab"
 
@@ -64,21 +69,128 @@ trusted fun libcVaDouble(list: int): f64 {
     f64FromBits(ablaRuntimeLoadI64(area))
 }
 
-// The output: a buffer of `size` bytes (one is kept for the NUL) and the count that would have been written.
-class LibcOut(val buffer: int, val size: int, var count: int)
+// A long double argument (%Lf and the other floating conversions with L), as the nearest double: x86-64's is the x87 80-bit format, which
+// always comes from the overflow area (16 bytes, 16-aligned); AArch64's and RV64's are IEEE binary128, from a vector register's 16-byte slot or
+// the stack (16-aligned) on AArch64, from an aligned pair of 8-byte slots on RV64. It is read whole, so the arguments after it are where they
+// should be; its value is rounded to a double, so digits past a double's precision differ from glibc's.
+trusted fun libcVaLongDouble(list: int): f64 {
+    if (simdTargetArch() == SIMD_ARCH_OTHER) {
+        val cursor = (ablaRuntimeLoadI64(list) + 15) & -16
+        ablaRuntimeStoreI64(list, cursor + 16)
+        return libcQuadToF64(ablaRuntimeLoadI64(cursor), ablaRuntimeLoadI64(cursor + 8))
+    }
+    if (simdTargetArch() == SIMD_ARCH_AARCH64) {
+        val offset = ablaRuntimeLoadI32(list + 28)
+        if (offset < 0) {
+            ablaRuntimeStoreI32(list + 28, offset + 16)
+            val slot = ablaRuntimeLoadI64(list + 16) + offset
+            return libcQuadToF64(ablaRuntimeLoadI64(slot), ablaRuntimeLoadI64(slot + 8))
+        }
+        val stack = (ablaRuntimeLoadI64(list) + 15) & -16
+        ablaRuntimeStoreI64(list, stack + 16)
+        return libcQuadToF64(ablaRuntimeLoadI64(stack), ablaRuntimeLoadI64(stack + 8))
+    }
+    val area = (ablaRuntimeLoadI64(list + 8) + 15) & -16
+    ablaRuntimeStoreI64(list + 8, area + 16)
+    libcX87ToF64(ablaRuntimeLoadI64(area), ablaRuntimeLoadI32(area + 8) & 65535)
+}
+
+// The double nearest (ties to even) to significand * 2^(exponent - 63), the significand's leading bit at bit 63 and `sticky` set when nonzero
+// bits were cut below it: overflow is an infinity, a value below half the smallest subnormal a zero.
+fun libcRoundToF64(negative: bool, significand: u64, exponent: int, sticky: bool): f64 {
+    val sign = if (negative) -9223372036854775808 else 0
+    if (exponent > 1023) return f64FromBits(sign | 9218868437227405312)
+    // The bits kept: 53 for a normal double, fewer for a subnormal one (down to the weight 2^-1074).
+    val shift = if (exponent >= -1022) 11 else -1011 - exponent
+    if (shift > 64) return f64FromBits(sign)
+    var kept = u64(0)
+    var roundUp = false
+    if (shift == 64) roundUp = significand > u64(9223372036854775808) || (significand == u64(9223372036854775808) && sticky)
+    else {
+        kept = significand >> u64(shift)
+        val remainder = significand - (kept << u64(shift))
+        val half = u64(1) << u64(shift - 1)
+        roundUp = remainder > half || (remainder == half && (sticky || (kept & u64(1)) == u64(1)))
+    }
+    if (roundUp) kept = kept + u64(1)
+    if (exponent < -1022) return f64FromBits(sign | int(kept))
+    // A carry out of the 53 bits moves the value to the next binade.
+    var biased = exponent + 1023
+    if (kept == u64(9007199254740992)) {
+        kept = u64(4503599627370496)
+        biased = biased + 1
+    }
+    if (biased >= 2047) return f64FromBits(sign | 9218868437227405312)
+    f64FromBits(sign | (biased << 52) | (int(kept) - 4503599627370496))
+}
+
+// An x87 extended value (64-bit significand with its integer bit, then the sign and the 15-bit exponent) as the nearest double.
+fun libcX87ToF64(significand: int, signExponent: int): f64 {
+    val negative = (signExponent & 32768) != 0
+    val biased = signExponent & 32767
+    val sign = if (negative) -9223372036854775808 else 0
+    if (biased == 32767) return f64FromBits(sign | (if ((significand << 1) == 0) 9218868437227405312 else 9221120237041090560))
+    // The integer bit clear (a denormal, or an unnormal the x87 no longer makes): far below a double's range, or not a number.
+    if (significand >= 0) {
+        if (biased == 0 || significand == 0) return f64FromBits(sign)
+        return f64FromBits(sign | 9221120237041090560)
+    }
+    libcRoundToF64(negative, u64(significand), biased - 16383, false)
+}
+
+// An IEEE binary128 value (its low and high words) as the nearest double.
+fun libcQuadToF64(low: int, high: int): f64 {
+    val negative = high < 0
+    val biased = (high >>> 48) & 32767
+    val sign = if (negative) -9223372036854775808 else 0
+    val fractionHigh = high & 281474976710655
+    if (biased == 32767) return f64FromBits(sign | (if (fractionHigh == 0 && low == 0) 9218868437227405312 else 9221120237041090560))
+    // A binary128 subnormal is below 2^-16382: zero as a double.
+    if (biased == 0) return f64FromBits(sign)
+    // 1.fraction (113 bits): the top 64 of them, and whether any of the 49 below are set.
+    val top = u64(-9223372036854775808) | (u64(fractionHigh) << u64(15)) | (u64(low) >> u64(49))
+    libcRoundToF64(negative, top, biased - 16383, (low & 562949953421311) != 0)
+}
+
+// The output: a buffer of `size` bytes and the count of bytes the format makes. For snprintf (`descriptor` -1) one byte is kept for the NUL and
+// what does not fit is only counted; a size_t of 2^63 or more (sprintf passes SIZE_MAX) is no limit. For printf and fprintf (`descriptor` the
+// stream's) the buffer is written out each time it fills, so no length is cut. `error` is the errno of a format glibc refuses (EINVAL 22 for a
+// format that ends inside a conversion, EOVERFLOW 75 for a width, precision or count past INT_MAX, EILSEQ 84 for a wide character the C locale cannot
+// write): the formatting stops there and the call returns -1.
+class LibcOut(val buffer: int, val size: int, var count: int, var error: int, val descriptor: int, var used: int)
+
+trusted fun LibcOut.flush(): void {
+    libcWriteAll(this.descriptor, this.buffer, this.used)
+    this.used = 0
+    return
+}
 
 trusted fun LibcOut.put(byte: int): void {
-    if (this.count + 1 < this.size) ablaRuntimeStoreU8(this.buffer + this.count, byte)
+    if (this.descriptor >= 0) {
+        if (this.used == this.size) this.flush()
+        ablaRuntimeStoreU8(this.buffer + this.used, byte)
+        this.used = this.used + 1
+    } else if (this.count + 1 < this.size) ablaRuntimeStoreU8(this.buffer + this.count, byte)
     this.count = this.count + 1
     return
 }
 
 trusted fun LibcOut.padding(count: int, byte: int): void {
     var done = 0
-    while (done < count) {
-        this.put(byte)
+    if (this.descriptor >= 0) {
+        while (done < count) {
+            this.put(byte)
+            done = done + 1
+        }
+        return
+    }
+    while (done < count && this.count + 1 < this.size) {
+        ablaRuntimeStoreU8(this.buffer + this.count, byte)
+        this.count = this.count + 1
         done = done + 1
     }
+    // What does not fit is only counted.
+    if (done < count) this.count = this.count + (count - done)
     return
 }
 
@@ -117,6 +229,30 @@ fun libcUnsignedQuotient(value: int, divisor: int): int {
 
 fun libcUnsignedRemainder(value: int, divisor: int): int = value - libcUnsignedQuotient(value, divisor) * divisor
 
+// INT_MAX: the largest width, precision and count a C int result can carry.
+val libcIntMax = 2147483647
+
+// The decimal width or precision at `start`: a value past INT_MAX is -1 (EOVERFLOW), with no int wrap however many digits follow.
+trusted fun libcFormatNumber(format: int, start: int): int {
+    var at = start
+    var value = 0
+    while (ablaRuntimeLoadU8(format + at) >= 48 && ablaRuntimeLoadU8(format + at) <= 57) {
+        if (value >= 0) {
+            value = value * 10 + ablaRuntimeLoadU8(format + at) - 48
+            if (value > libcIntMax) value = -1
+        }
+        at = at + 1
+    }
+    value
+}
+
+// The offset after the decimal digits at `start`.
+trusted fun libcFormatDigitsEnd(format: int, start: int): int {
+    var at = start
+    while (ablaRuntimeLoadU8(format + at) >= 48 && ablaRuntimeLoadU8(format + at) <= 57) at = at + 1
+    at
+}
+
 trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
     var at = 0
     while (true) {
@@ -140,6 +276,8 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
             else if (f == 32) space = true
             else if (f == 35) alternate = true
             else if (f == 48) zero = true
+            // ' (thousands grouping) and I (the locale's digits) change nothing in the C locale.
+            else if (f == 39 || f == 73) flags = true
             else flags = false
             if (flags) at = at + 1
         }
@@ -147,15 +285,23 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
         if (ablaRuntimeLoadU8(format + at) == 42) {
             width = libcVaInt(list) & 4294967295
             if (width >= 2147483648) {
+                // A negative width is the - flag and its magnitude (INT_MIN's is past INT_MAX).
                 width = 4294967296 - width
                 left = true
             }
             at = at + 1
         } else {
-            while (ablaRuntimeLoadU8(format + at) >= 48 && ablaRuntimeLoadU8(format + at) <= 57) {
-                width = width * 10 + ablaRuntimeLoadU8(format + at) - 48
-                at = at + 1
+            width = libcFormatNumber(format, at)
+            at = libcFormatDigitsEnd(format, at)
+            // %1$d: the numbered arguments are not supported; refused rather than read in the wrong order.
+            if (ablaRuntimeLoadU8(format + at) == 36) {
+                out.error = 22
+                return
             }
+        }
+        if (width < 0 || width > libcIntMax) {
+            out.error = 75
+            return
         }
         var precision = -1
         if (ablaRuntimeLoadU8(format + at) == 46) {
@@ -166,24 +312,52 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
                 if (precision >= 2147483648) precision = -1
                 at = at + 1
             } else {
-                while (ablaRuntimeLoadU8(format + at) >= 48 && ablaRuntimeLoadU8(format + at) <= 57) {
-                    precision = precision * 10 + ablaRuntimeLoadU8(format + at) - 48
-                    at = at + 1
+                precision = libcFormatNumber(format, at)
+                at = libcFormatDigitsEnd(format, at)
+                if (precision < 0) {
+                    out.error = 75
+                    return
                 }
             }
         }
-        // Length: l ll z j t take the whole word; none, h, hh the low 32, 16, 8 bits.
+        // Length: l ll z j t take the whole word; none, h, hh the low 32, 16, 8 bits; L is a long double for the floating conversions.
         var size = 4
+        var long = false
+        var longDouble = false
         var scanning = true
         while (scanning) {
             val m = ablaRuntimeLoadU8(format + at)
-            if (m == 108 || m == 122 || m == 106 || m == 116 || m == 76 || m == 113) size = 8
-            else if (m == 104) size = if (size == 2) 1 else 2
-            else scanning = false
+            if (m == 108 || m == 122 || m == 106 || m == 116 || m == 76 || m == 113) {
+                size = 8
+                if (m == 108) long = true
+                if (m == 76) longDouble = true
+            } else if (m == 104) size = if (size == 2) 1 else 2
+            else if (m == 119) {
+                // C23's wN and wfN: an integer of exactly N bits (8, 16, 32 or 64); any other N glibc refuses.
+                var next = at + 1
+                if (ablaRuntimeLoadU8(format + next) == 102) next = next + 1
+                val bits = libcFormatNumber(format, next)
+                at = libcFormatDigitsEnd(format, next) - 1
+                if (bits == 8) size = 1
+                else if (bits == 16) size = 2
+                else if (bits == 32) size = 4
+                else if (bits == 64) size = 8
+                else {
+                    out.error = 22
+                    return
+                }
+            } else scanning = false
             if (scanning) at = at + 1
         }
         val conversion = ablaRuntimeLoadU8(format + at)
+        // The format ends inside the conversion ("%", "%-5", "%l"): glibc refuses it, and nothing past the terminator is read.
+        if (conversion == 0) {
+            out.error = 22
+            return
+        }
         at = at + 1
+        val integer = conversion == 100 || conversion == 105 || conversion == 117 || conversion == 120 || conversion == 88 ||
+            conversion == 111 || conversion == 112 || conversion == 98 || conversion == 66
         var body = ""
         var sign = ""
         var numeric = false
@@ -211,33 +385,65 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
                 sign = if (plus) "+" else if (space) " " else ""
                 body = libcDigits(value, 10, false)
             }
-        } else if (conversion == 117 || conversion == 120 || conversion == 88 || conversion == 111) {
+        } else if (conversion == 117 || conversion == 120 || conversion == 88 || conversion == 111 || conversion == 98 || conversion == 66) {
+            // %b and %B are C23's binary (glibc 2.35 on): they take an argument, so reading none would put every later one out of place.
             var value = libcVaInt(list)
             if (size == 4) value = value & 4294967295
             else if (size == 2) value = value & 65535
             else if (size == 1) value = value & 255
             numeric = true
-            val base = if (conversion == 117) 10 else if (conversion == 111) 8 else 16
+            val base = if (conversion == 117) 10 else if (conversion == 111) 8 else if (conversion == 98 || conversion == 66) 2 else 16
             body = libcDigits(value, base, conversion == 88)
             if (alternate && value != 0) {
                 if (conversion == 120) sign = "0x"
                 else if (conversion == 88) sign = "0X"
+                else if (conversion == 98) sign = "0b"
+                else if (conversion == 66) sign = "0B"
                 else if (conversion == 111) body = "0" + body
             }
         } else if (conversion == 112) {
+            // %p is glibc's %#lx (its + and space flags too) and "(nil)" for NULL, which takes no precision or zeros.
             val value = libcVaInt(list)
-            body = if (value == 0) "(nil)" else "0x" + libcDigits(value, 16, false)
-        } else if (conversion == 99) {
-            body = ""
+            if (value == 0) {
+                body = "(nil)"
+                precision = -1
+            } else {
+                numeric = true
+                sign = (if (plus) "+" else if (space) " " else "") + "0x"
+                body = libcDigits(value, 16, false)
+            }
+        } else if (conversion == 99 || conversion == 67) {
+            val value = libcVaInt(list) & 4294967295
+            if ((long || conversion == 67) && value > 127) {
+                // %lc: a wint_t, one byte in the C locale; a character past 127 has none (EILSEQ).
+                out.error = 84
+                return
+            }
+            val byte = value & 255
             out.padding(if (left) 0 else width - 1, 32)
-            out.put(libcVaInt(list) & 255)
+            out.put(byte)
             out.padding(if (left) width - 1 else 0, 32)
             continue
-        } else if (conversion == 115) {
+        } else if (conversion == 115 || conversion == 83) {
             val text = libcVaInt(list)
             // A NULL string is "(null)" as glibc writes it, which a precision under its 6 bytes leaves out altogether rather than cutting.
             if (text == 0) body = if (precision >= 0 && precision < 6) "" else "(null)"
-            else {
+            else if (long || conversion == 83) {
+                // %ls: wchar_t units (4 bytes) to the terminator or the precision's bytes; one byte each in the C locale, EILSEQ past 127.
+                var copy = ""
+                var i = 0
+                while (precision < 0 || i < precision) {
+                    val unit = ablaRuntimeLoadI32(text + i * 4) & 4294967295
+                    if (unit == 0) break
+                    if (unit > 127) {
+                        out.error = 84
+                        return
+                    }
+                    copy = copy + utf8ByteText(unit)
+                    i = i + 1
+                }
+                body = copy
+            } else {
                 var length = 0
                 while ((precision < 0 || length < precision) && ablaRuntimeLoadU8(text + length) != 0) length = length + 1
                 var copy = ""
@@ -251,7 +457,7 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
             precision = -1
         } else if (conversion == 102 || conversion == 70 || conversion == 101 || conversion == 69 || conversion == 103 || conversion == 71 ||
             conversion == 97 || conversion == 65) {
-            val value = libcVaDouble(list)
+            val value = if (longDouble) libcVaLongDouble(list) else libcVaDouble(list)
             body = libcFloat(value, conversion, precision, alternate)
             if (body.size > 0 && body[0] == 45) {
                 sign = "-"
@@ -264,35 +470,37 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
                 body = body.slice(2, body.size)
             }
         } else {
-            // An unknown conversion is written as it came.
+            // Not a conversion this formatter knows (%y, %m, %n): written as it came, no argument read, as glibc writes the ones it does not
+            // know. %n in particular writes nothing anywhere.
             out.put(37)
             out.put(conversion)
             continue
         }
         // C: a zero converted with a precision of 0 has no digits at all (%.0d of 0 writes nothing but its padding); the # flag of %o keeps one 0.
-        if (precision == 0 && body == "0" && (conversion == 100 || conversion == 105 || conversion == 117 || conversion == 120 ||
-            conversion == 88 || conversion == 111)) body = if (conversion == 111 && alternate) "0" else ""
-        if (numeric && precision >= 0 && body.size < precision && (conversion == 100 || conversion == 105 || conversion == 117 ||
-            conversion == 120 || conversion == 88 || conversion == 111)) {
-            var padded = body
-            while (padded.size < precision) padded = "0" + padded
-            body = padded
-        }
-        val total = sign.size + body.size
+        if (precision == 0 && body == "0" && integer && conversion != 112) body = if (conversion == 111 && alternate) "0" else ""
+        // The precision's leading zeros, counted rather than built (a precision may be up to INT_MAX).
+        val zeros = if (numeric && integer && precision > body.size) precision - body.size else 0
+        val total = sign.size + zeros + body.size
         val fill = if (width > total) width - total else 0
         if (left) {
             out.putText(sign)
+            out.padding(zeros, 48)
             out.putText(body)
             out.padding(fill, 32)
-        } else if (zero && numeric && !(precision >= 0 && (conversion == 100 || conversion == 105 || conversion == 117 || conversion == 120 ||
-            conversion == 88 || conversion == 111))) {
+        } else if (zero && numeric && !(precision >= 0 && integer)) {
             out.putText(sign)
             out.padding(fill, 48)
             out.putText(body)
         } else {
             out.padding(fill, 32)
             out.putText(sign)
+            out.padding(zeros, 48)
             out.putText(body)
+        }
+        // A count past INT_MAX cannot be returned (glibc: EOVERFLOW).
+        if (out.count > libcIntMax) {
+            out.error = 75
+            return
         }
     }
     return
@@ -301,43 +509,59 @@ trusted fun libcFormat(var out: LibcOut, format: int, list: int): void {
 // One byte as a one-byte string (the C strings here are bytes, not UTF-8 text).
 fun utf8ByteText(byte: int): string = byteEncode(byte)
 
-@export("vsnprintf")
-trusted fun libcVsnprintf(buffer: int, size: int, format: int, list: int): int {
-    val out = LibcOut(buffer, size, 0)
+// The format over `list`: RV64's va_list is the cursor itself, passed by value, so the conversions advance a local copy of it.
+trusted fun libcFormatList(var out: LibcOut, format: int, list: int): void {
     if (simdTargetArch() == SIMD_ARCH_OTHER) {
         val cursor = nativeStackAllocate(8)
         ablaRuntimeStoreI64(cursor, list)
         libcFormat(out, format, cursor)
     } else libcFormat(out, format, list)
-    if (size > 0) {
-        val end = if (out.count < size - 1) out.count else size - 1
+    // Plain text after the last conversion can take the count past INT_MAX too.
+    if (out.error == 0 && out.count > libcIntMax) out.error = 75
+    return
+}
+
+@export("vsnprintf")
+trusted fun libcVsnprintf(buffer: int, size: int, format: int, list: int): int {
+    // size is a size_t: 2^63 and more (sprintf's SIZE_MAX) are negative here and mean no limit, not no room.
+    val room = if (size < 0) 9223372036854775807 else size
+    val out = LibcOut(buffer, room, 0, 0, -1, 0)
+    libcFormatList(out, format, list)
+    if (room > 0) {
+        val end = if (out.count < room - 1) out.count else room - 1
         ablaRuntimeStoreU8(buffer + end, 0)
+    }
+    if (out.error != 0) {
+        libcSetErrno(out.error)
+        return -1
     }
     out.count
 }
 
-// printf to stdout from the assembly shim __printf_chk: the text goes to descriptor 1 in one write.
-@export("abla_libc_vprintf")
-trusted fun libcVprintf(format: int, list: int): int {
+// printf and fprintf: the text goes to the descriptor through a 4096-byte buffer written out each time it fills (it used to be cut at 4095 bytes).
+trusted fun libcVprintfTo(descriptor: int, format: int, list: int): int {
     val buffer = __ablaRuntimeHostHeapAllocate(4096, false)
-    val count = libcVsnprintf(buffer, 4096, format, list)
-    libcWriteAll(1, buffer, if (count < 4095) count else 4095)
+    val out = LibcOut(buffer, 4096, 0, 0, descriptor, 0)
+    libcFormatList(out, format, list)
+    out.flush()
     __ablaRuntimeHostHeapFree(buffer)
-    count
+    if (out.error != 0) {
+        libcSetErrno(out.error)
+        return -1
+    }
+    out.count
 }
 
-// vprintf (the plain name), vfprintf and the fortified forms: the text goes to the stream's descriptor (first word of its FILE) in one write.
+// printf to stdout from the assembly shim __printf_chk.
+@export("abla_libc_vprintf")
+trusted fun libcVprintf(format: int, list: int): int = libcVprintfTo(1, format, list)
+
+// vprintf (the plain name), vfprintf and the fortified forms: the text goes to the stream's descriptor (first word of its FILE).
 @export("vprintf")
 trusted fun libcVprintfPlain(format: int, list: int): int = libcVprintf(format, list)
 
 @export("abla_libc_vfprintf")
-trusted fun libcVfprintf(file: int, format: int, list: int): int {
-    val buffer = __ablaRuntimeHostHeapAllocate(4096, false)
-    val count = libcVsnprintf(buffer, 4096, format, list)
-    libcWriteAll(ablaRuntimeLoadI64(file), buffer, if (count < 4095) count else 4095)
-    __ablaRuntimeHostHeapFree(buffer)
-    count
-}
+trusted fun libcVfprintf(file: int, format: int, list: int): int = libcVprintfTo(ablaRuntimeLoadI64(file), format, list)
 
 @export("vfprintf")
 trusted fun libcVfprintfPlain(file: int, format: int, list: int): int = libcVfprintf(file, format, list)
