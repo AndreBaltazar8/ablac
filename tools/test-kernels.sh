@@ -80,6 +80,15 @@ status=0
     grep -q "loadUnchecked: index 8 outside a buffer of 8" "$out/unchecked-cpu.out" &&
     ! grep -q "past the end ran" "$out/unchecked-cpu.out" ||
     fail "unchecked-cpu: the CPU backend did not stop past the end (exit $status): $(cat "$out/unchecked-cpu.out")"
+# An index near 2^63 stops each one-load form with its panic, not a fault at a wrapped address (64's review).
+"$compiler" build "$cases/aligned-wrap.ab" -o "$out/aligned-wrap" --fast --no-cache > "$out/aligned-wrap.log" 2>&1 ||
+    fail "aligned-wrap did not build: $(head -4 "$out/aligned-wrap.log")"
+for load in load4Aligned loadU32x4Aligned-words loadU16Aligned loadU32Aligned loadU32x4Aligned; do
+    status=0
+    "$out/aligned-wrap" "$load" > "$out/aligned-wrap-$load.out" 2>&1 || status=$?
+    [[ $status == 101 ]] && grep -q "${load%-words}: index 922337203685477580[0-9] outside a buffer" "$out/aligned-wrap-$load.out" ||
+        fail "aligned-wrap $load: no panic for an index near 2^63 (exit $status): $(head -3 "$out/aligned-wrap-$load.out")"
+done
 
 cuda="skipped (no libcuda.so on this machine)"
 library=""
