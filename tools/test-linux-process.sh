@@ -18,9 +18,10 @@ if has_project_c_platform_symbol "$program"; then
     echo 'raw Linux process linked a project C platform symbol' >&2
     exit 1
 fi
-# A native x86-64 Linux host maps a vDSO: the program must have found its clock_gettime there (elsewhere it may fall back).
+# A native x86-64 or AArch64 Linux host maps a vDSO: the program must have found its clock_gettime there (elsewhere, as
+# under qemu-user, it may fall back). The AArch64 native fixed-point workflow runs the same program with expect-vdso.
 expect=()
-[[ $(uname -s)/$(uname -m) == Linux/x86_64 ]] && expect=(expect-vdso)
+[[ $(uname -s)/$(uname -m) == Linux/x86_64 || $(uname -s)/$(uname -m) == Linux/aarch64 ]] && expect=(expect-vdso)
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=15 \
     "$project_root/tools/run-limited.sh" "$program" "${expect[@]}"
