@@ -2,7 +2,8 @@
 # build-static-compiler.ps1 -CrtInventory has configured the build directory with the inventory targets. Links
 # ablac-crt-map (a /lldmap map with each input section's bytes, an MSVC-style /map that names archive:member for each
 # public symbol, and lld's /verbose log when the build shows it) and the four leave-one-out links (no libucrt, no libucrt
-# and libcmt, no libvcruntime, no libcpmt), which are expected to fail and list every symbol the archive left out had
+# and libcmt, no libvcruntime, no libcpmt) plus the B candidate (no libucrt or libcmt, libvcruntime named; decision #163),
+# which are expected to fail and list every symbol the archive left out had
 # provided. Writes <build>/crt-inventory/: the maps, the logs, members.tsv, symbols.tsv, bytes.tsv,
 # undefined-<probe>.txt and summary.md. Never fails because a probe does not link, and exits 0.
 param(
@@ -87,7 +88,7 @@ $bytes.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "$($_.
     Out-File -Encoding utf8 (Join-Path $out 'bytes.tsv')
 
 # 2. The leave-one-out links: "undefined symbol: <name>" for each name the archive left out had provided.
-$probes = 'ablac-crt-no-ucrt', 'ablac-crt-no-ucrt-cmt', 'ablac-crt-no-vcruntime', 'ablac-crt-no-cpmt'
+$probes = 'ablac-crt-no-ucrt', 'ablac-crt-no-ucrt-cmt', 'ablac-crt-no-vcruntime', 'ablac-crt-no-cpmt', 'ablac-crt-candidate'
 $undefined = @{}
 foreach ($probe in $probes) {
     $log = Join-Path $out "$probe.log"
@@ -116,7 +117,7 @@ foreach ($archive in $archives) {
     $summary += "| $archive$mark | $memberCount | $symbolCount | $([long]$bytes[$archive]) |"
 }
 $summary += @('', '| Link without | Undefined symbols |', '| --- | ---: |')
-foreach ($probe in $probes) { $summary += "| $($probe -replace '^ablac-crt-no-', '') | $($undefined[$probe].Count) |" }
+foreach ($probe in $probes) { $summary += "| $($probe -replace '^ablac-crt-(no-)?', '') | $($undefined[$probe].Count) |" }
 $summary += @('', 'Public symbols by archive and member: symbols.tsv. Members /verbose reported loading, and for which symbol:',
     'members.tsv (empty when the build hid the link output). Bytes per archive: bytes.tsv.',
     'Each undefined-<probe>.txt lists what that archive provided.')

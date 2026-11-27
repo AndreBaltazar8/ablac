@@ -58,4 +58,9 @@ if(ABLA_CRT_INVENTORY)
   abla_crt_probe(ablac-crt-no-ucrt-cmt /nodefaultlib:libucrt.lib /nodefaultlib:libcmt.lib /errorlimit:0)
   abla_crt_probe(ablac-crt-no-vcruntime /nodefaultlib:libvcruntime.lib /errorlimit:0)
   abla_crt_probe(ablac-crt-no-cpmt /nodefaultlib:libcpmt.lib /errorlimit:0)
+  # Decision #163 (B): the candidate link, without the C library and its start-up, with VCRuntime named because libcmt's
+  # objects are what bring its default-library directive. Each step of the plan lowers its undefined count; at 0 the
+  # shipped link can switch.
+  abla_crt_probe(ablac-crt-candidate /nodefaultlib:libucrt.lib /nodefaultlib:libcmt.lib /defaultlib:libvcruntime.lib
+    /errorlimit:0)
 endif()
