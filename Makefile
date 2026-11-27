@@ -198,6 +198,7 @@ test-serial: ablac
 	tools/test-unsafe-static-memory.sh $(COMPILER)
 	tools/test-kernels.sh $(COMPILER)
 	tools/test-unsafe-trusted-only.sh $(COMPILER)
+	tools/test-native-memory-bounds.sh $(COMPILER)
 	tools/test-native-cstring-lifetime.sh $(COMPILER)
 	tools/test-nominal-scalars.sh $(COMPILER)
 	tools/test-tracked-language-fixes.sh $(COMPILER)
