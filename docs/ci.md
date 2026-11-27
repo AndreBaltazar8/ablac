@@ -12,7 +12,7 @@ repository permissions.
 | Job ID | Runner and scope |
 |---|---|
 | `linux` | Ubuntu 24.04, six shards of `make test`, each building the checksum-pinned bootstrap and then rebuilding the compiler with its own backend; job name `Linux suite (shard ${{ matrix.shard }}/6)` |
-| `macos` | Native Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) compiler/host checks, a `host` and a `live` lane on each; matrix names `macOS host tests (Apple Silicon)`, `macOS host and compiler fixed point`, `macOS host and compiler fixed point (Intel)` and `macOS live compiler tests (Intel)` |
+| `macos` | Native Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) compiler/host checks, each lane building stage 1 and stage 2: on each architecture a host lane and a live lane (`macOS host tests (Apple Silicon)`, `macOS host and compiler fixed point`; `macOS host and compiler fixed point (Intel)`, `macOS live compiler tests (Intel)`), and on Intel a third, `macOS system checks (Intel)`, with the stage-1 BSD calls, the compile-time thread checks, the analyze session and the libSystem import guard (on Apple Silicon these ride the host and live lanes; the matrix flags `bsd`, `ct_threads`, `analyze_session`, `import_guard` place them) |
 | `windows-cross`, `windows-run` | Ubuntu cross-builds the Windows x86-64 programs; `windows-latest` runs them (freestanding, hosted, the standard-library programs of `tests/cases/windows/programs.txt`, crash reports) and compares their output with Linux |
 | `windows-arm64-cross`, `windows-arm64-run` | The same for Windows ARM64, run on `windows-11-arm` |
 | `libc-free-aarch64` | Ubuntu cross-builds the module corpus for AArch64 and guards libc-free links and the explicit exceptions |
@@ -30,7 +30,9 @@ Android library exports under qemu with bionic. That is not a device/UI test.
 Every Mac entry builds stage 1 and stage 2. The `host` lanes exercise
 `test-macos-host.sh`, foreign-thread entry, collection, stack guards and
 emulated TLS; the `live` lanes live run, watch mode, test-watch and REPL
-sessions; one lane per architecture checks the libSystem import guard. Only the
+sessions; one lane per architecture checks the libSystem import guard. On
+Intel, emulated TLS, the import guard, the stage-1 BSD calls, the compile-time
+thread checks and the analyze session run in the third, `checks` lane. Only the
 Apple Silicon `live` lane runs the compiler fixed-point/native child and iOS
 Simulator steps in push CI. These are selected host gates, not the Linux
 suite. The REPL's util-linux PTY/editor check skips on

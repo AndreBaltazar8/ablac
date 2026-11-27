@@ -611,12 +611,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # import_guard: the lane that checks the libSystem import guard. On Intel the host lane was the longest Mac job (1,555 and
-          # 1,655 s in runs 45897364434 and 45892064909, the guard 218 and 195 s of it) and the live lane ended 6 to 8 minutes earlier.
-          - {runner: macos-15, name: macOS host tests (Apple Silicon), tests: host, logs: arm64-host, import_guard: true}
-          - {runner: macos-15, name: macOS host and compiler fixed point, tests: live, logs: arm64, import_guard: false}
-          - {runner: macos-15-intel, name: macOS host and compiler fixed point (Intel), tests: host, logs: x86_64, import_guard: false}
-          - {runner: macos-15-intel, name: macOS live compiler tests (Intel), tests: live, logs: x86_64-live, import_guard: true}
+          # tests: the host steps (host) or the live ones (live); Intel's third lane (checks) runs only the steps its flags name.
+          # The flags place the steps every lane could run: the stage-1 BSD calls (bsd), the compile-time stop and emulated-TLS
+          # threads (ct_threads), the analyze --stdio session (analyze_session) and the libSystem import guard (import_guard).
+          # Intel's two lanes, each building stage 1 and stage 2 (11 to 14 min there), took 21 to 34 min in master runs
+          # 46044469735, 46057162825 and 46064363554, the longest Mac jobs and as long as the slowest Linux shard: the third lane
+          # takes about 12 min of their tests (BSD calls 2, threads 2.5, analyze session 2.5, import guard 4.5), leaving each
+          # Intel lane its stage builds and 9 to 12 min of tests.
+          - {runner: macos-15, name: macOS host tests (Apple Silicon), tests: host, logs: arm64-host, import_guard: true, bsd: true, ct_threads: true, analyze_session: false}
+          - {runner: macos-15, name: macOS host and compiler fixed point, tests: live, logs: arm64, import_guard: false, bsd: false, ct_threads: false, analyze_session: true}
+          - {runner: macos-15-intel, name: macOS host and compiler fixed point (Intel), tests: host, logs: x86_64, import_guard: false, bsd: false, ct_threads: false, analyze_session: false}
+          - {runner: macos-15-intel, name: macOS live compiler tests (Intel), tests: live, logs: x86_64-live, import_guard: false, bsd: false, ct_threads: false, analyze_session: false}
+          - {runner: macos-15-intel, name: macOS system checks (Intel), tests: checks, logs: x86_64-checks, import_guard: true, bsd: true, ct_threads: true, analyze_session: true}
     runs-on: ${{ matrix.runner }}
     # Intel took 28 min on 89e3a628 and passed 35 on 576a47ef (stage builds and host paths are slower there).
     # The last five green runs took 32 to 38 min (59f5309c 32, a1950bc6 38, 428aff92 35, 681f64fe 33, 5a01101e 36),
@@ -652,7 +658,7 @@ jobs:
             build/ci/bootstrap-ablac build/ci/ablac-stage1 \
             2>&1 | tee build/ci-logs/macos-stage1.log
       - name: Exercise the calls made by BSD system call, one by one (stage 1)
-        if: ${{ matrix.tests != 'live' }}
+        if: ${{ matrix.bsd }}
         run: |
           mkdir -p build/ci-logs
           tools/test-darwin-syscalls.sh build/ci/ablac-stage1 \
@@ -680,14 +686,14 @@ jobs:
           echo "stage 2 build exit status: $status"
           exit $status
       - name: Exercise the native macOS host paths
-        if: ${{ matrix.tests != 'live' }}
+        if: ${{ matrix.tests == 'host' }}
         run: |
           tools/test-macos-host.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-host.log
       # A crash's stack with file:line (atos): a -g program's from its debug map, a --backtrace one's (stripped of it)
       # from the <output>.dSYM its build wrote.
       - name: ablac symbolize (a -g program, and a --backtrace one's .dSYM)
-        if: ${{ always() && matrix.tests != 'live' }}
+        if: ${{ always() && matrix.tests == 'host' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-symbolize.sh build/ci/ablac-stage2 \
@@ -695,38 +701,38 @@ jobs:
       # What only ever ran on Linux (#811), each a step of its own that runs whatever failed before it, so one failure
       # does not hide the other answers.
       - name: A dylib entered from threads it did not start (export enter/leave thunks, @hostImport)
-        if: ${{ always() && matrix.tests != 'live' }}
+        if: ${{ always() && matrix.tests == 'host' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-foreign-threads.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-foreign-threads.log
       - name: "Threads stopped for a collection (stop-the-world: safe points, blocking system calls, a held thread)"
-        if: ${{ always() && matrix.tests != 'live' }}
+        if: ${{ always() && matrix.tests == 'host' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-gc-threads.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-gc-threads.log
       - name: A thread's stack overflow on its own signal stack (Darwin sigaltstack, the stack guard)
-        if: ${{ always() && matrix.tests != 'live' }}
+        if: ${{ always() && matrix.tests == 'host' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-runtime-checks.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-runtime-checks.log
       - name: A stop and a stack overflow on a thread a compile-time site starts
-        if: ${{ always() && matrix.tests != 'live' }}
+        if: ${{ always() && matrix.ct_threads }}
         run: |
           mkdir -p build/ci-logs
           tools/test-ct-stop-threads.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-ct-stop-threads.log
       - name: The compiler's emulated TLS for ablac run (100,000 JIT-compiled threads)
-        if: ${{ always() && matrix.tests != 'live' }}
+        if: ${{ always() && matrix.ct_threads }}
         run: |
           mkdir -p build/ci-logs
           tools/test-emutls.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-emutls.log
       # Live mode (`ablac run`, live by default on a Mac too, and `--watch`): both Macs passed it in run 44558971183.
       - name: A live run redefines its functions (ablac run, live by default; liveReload, the refusals)
-        if: ${{ always() && matrix.tests != 'host' }}
+        if: ${{ always() && matrix.tests == 'live' }}
         # The reload 20 times more: arm64 trapped in a new lambda's call until the registry forward passed its output
         # as sret (runs 44586994389 to 44654107874).
         env:
@@ -736,28 +742,28 @@ jobs:
           tools/test-live-jit.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-live-jit.log
       - name: A --watch run reloads on a save, keeps running after a broken one, restarts after a refused one
-        if: ${{ always() && matrix.tests != 'host' }}
+        if: ${{ always() && matrix.tests == 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-live-watch.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-live-watch.log
       # `ablac test --watch` on a Mac: both Macs passed it in run 44856754457 (92d97ad8), so it blocks.
       - name: A test --watch run runs again when a file it reads changes, and not for another file
-        if: ${{ always() && matrix.tests != 'host' }}
+        if: ${{ always() && matrix.tests == 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-test-watch.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-test-watch.log
       # `ablac repl` is a live run on a Mac too: both Macs passed it in run 44837861069, so it blocks.
       - name: A REPL session keeps its state from line to line, contains a panic and refuses a change it cannot take
-        if: ${{ always() && matrix.tests != 'host' }}
+        if: ${{ always() && matrix.tests == 'live' }}
         run: |
           mkdir -p build/ci-logs
           tools/test-repl.sh build/ci/ablac-stage2 \
             2>&1 | tee build/ci-logs/macos-repl.log
       # lldb reads a development build's variables (2026-11-21, new): informative until both Macs have passed it.
       - name: A debugger reads a development build's parameters, locals and their Abla types (lldb)
-        if: ${{ always() && matrix.tests != 'host' }}
+        if: ${{ always() && matrix.tests == 'live' }}
         continue-on-error: true
         run: |
           mkdir -p build/ci-logs
@@ -768,7 +774,7 @@ jobs:
       # refactor-session), repeated ten rounds (needs only bash, sed and the compiler; tools/test-analysis-service.sh runs it after its protocol
       # cases on Linux). Blocking on both Macs.
       - name: A long analyze --stdio session (abla-lsp's refactor requests) answers every request and exits 0
-        if: ${{ always() && matrix.tests != 'host' }}
+        if: ${{ always() && matrix.analyze_session }}
         run: |
           mkdir -p build/ci-logs
           tools/test-analysis-refactor-session.sh build/ci/ablac-stage2 10 \
