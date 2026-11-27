@@ -47,7 +47,7 @@ the definitions and evidence together when promoting a tier.
 ## Linux x86-64
 
 In [CI](../.github/workflows/ci.yml), job `linux`, named **Linux suite (shard
-${{ matrix.shard }}/4)**, runs `make test` split into four shards after rebuilding
+${{ matrix.shard }}/6)**, runs `make test` split into six shards after rebuilding
 the compiler with its own backend. This includes the x86-64 module-program
 libc-free guard. Job `static-compiler`, named **Static compiler (no loader, no
 libc)**, builds the static compiler, checks no loader/no needed library, builds

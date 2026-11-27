@@ -27,7 +27,7 @@ whole=$(RUN_TESTS_SHARD='' list whole)
 [[ -n $whole ]] || { echo "test-shards: the suite lists no command" >&2; exit 1; }
 # release-4: the release's static suite, four shards in release mode (RUN_TESTS_FULL=1), split by tools/test-times-release.tsv
 # over tools/test-times.tsv.
-for run in 2 3 4 release-4; do
+for run in 2 3 4 6 release-4; do
     count=${run#release-}
     tables=$root/tools/test-times.tsv
     if [[ $run == release-* ]]; then export RUN_TESTS_FULL=1; tables+=" $root/tools/test-times-release.tsv"; else unset RUN_TESTS_FULL; fi

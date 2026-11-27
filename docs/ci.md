@@ -11,7 +11,7 @@ repository permissions.
 
 | Job ID | Runner and scope |
 |---|---|
-| `linux` | Ubuntu 24.04, four shards of `make test`, each building the checksum-pinned bootstrap and then rebuilding the compiler with its own backend; job name `Linux suite (shard ${{ matrix.shard }}/4)` |
+| `linux` | Ubuntu 24.04, six shards of `make test`, each building the checksum-pinned bootstrap and then rebuilding the compiler with its own backend; job name `Linux suite (shard ${{ matrix.shard }}/6)` |
 | `macos` | Native Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) compiler/host checks, a `host` and a `live` lane on each; matrix names `macOS host tests (Apple Silicon)`, `macOS host and compiler fixed point`, `macOS host and compiler fixed point (Intel)` and `macOS live compiler tests (Intel)` |
 | `windows-cross`, `windows-run` | Ubuntu cross-builds the Windows x86-64 programs; `windows-latest` runs them (freestanding, hosted, the standard-library programs of `tests/cases/windows/programs.txt`, crash reports) and compares their output with Linux |
 | `windows-arm64-cross`, `windows-arm64-run` | The same for Windows ARM64, run on `windows-11-arm` |
