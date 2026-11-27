@@ -231,6 +231,19 @@ fun bootstrapKernelBufferType(type: string): string {
     ""
 }
 
+/** The buffers of a `KernelBuffers<B, N>` type (#1299; the class KernelBuffersN<B> for N, its IR name
+ *  "KernelBuffers<N>__abla_generic_<B>"): N and the kernel value type of B ("buffer.f32", ...), or 0 and "" for another type. */
+class BootstrapKernelBuffers(val count: int, val buffer: string)
+
+fun bootstrapKernelBuffersOf(type: string): BootstrapKernelBuffers {
+    val marker = "__abla_generic_"
+    if (!type.startsWith("KernelBuffers") || type.size < 30 || type.indexOf(marker) != 14) return BootstrapKernelBuffers(0, "")
+    val digit = type[13]
+    if (digit < 49 || digit > 56) return BootstrapKernelBuffers(0, "")
+    val buffer = bootstrapKernelBufferType(type.slice(14 + marker.size, type.size))
+    if (buffer == "") BootstrapKernelBuffers(0, "") else BootstrapKernelBuffers(digit - 48, buffer)
+}
+
 /** `name` with every character outside [A-Za-z0-9_] replaced by '_', as PTX symbols need. */
 fun bootstrapKernelSymbol(name: string): string {
     var result = ""
@@ -819,6 +832,46 @@ fun bootstrapKernelArrayAccess(var emitter: BootstrapKernelEmitter, var state: B
     bootstrapKernelBufferAccess(emitter, state, instruction, store)
 }
 
+/** KernelBuffers<B, N>.get(index) (#1299): buffer `index` of the group, its (address, count) pair %<group>.<index>; a literal
+ *  index outside 0..N-1 is kernel.buffers-index, and any other index a choice among the N (folded once the index is
+ *  constant, as an `@unroll` loop variable becomes), an index outside giving an empty buffer. */
+fun bootstrapKernelBuffersGet(var emitter: BootstrapKernelEmitter, var state: BootstrapKernelFunctionState,
+    instruction: BootstrapInstruction): void {
+    if (instruction.operands.size < 2) { bootstrapKernelFail(emitter, state.name, "operation", instruction.text); return }
+    val group = bootstrapKernelGet(state, instruction.operands[0])
+    if (!group.type.startsWith("group:")) { bootstrapKernelFail(emitter, state.name, "type", group.type); return }
+    val buffer = group.type.slice(6, group.type.size)
+    val count = bootstrapKernelBoundValue(group.count)
+    val index = bootstrapKernelGet(state, instruction.operands[1])
+    if (bootstrapKernelIsDigits(index.operand)) {
+        val k = bootstrapKernelBoundValue(index.operand)
+        if (k >= count) {
+            bootstrapKernelFail(emitter, state.name, "buffers-index", "$k",
+                "a KernelBuffers<_, $count> holds buffers 0 to ${count - 1}")
+            return
+        }
+        bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("${group.operand}.$k", buffer, "${group.operand}.$k.count"))
+        return
+    }
+    val wide = bootstrapKernelConvert(emitter, state, index, "i64")
+    if (wide == "") return
+    var address = "null"
+    var size = "0"
+    var k = count - 1
+    while (k >= 0) {
+        val chosen = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$chosen = icmp eq i64 $wide, $k")
+        val nextAddress = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$nextAddress = select i1 $chosen, ptr ${group.operand}.$k, ptr $address")
+        val nextSize = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$nextSize = select i1 $chosen, i64 ${group.operand}.$k.count, i64 $size")
+        address = nextAddress
+        size = nextSize
+        k = k - 1
+    }
+    bootstrapKernelSet(state, instruction.result, BootstrapKernelValue(address, buffer, size))
+}
+
 /** The loop headers of the function being lowered that `@unroll` marks (#1296), and their llvm.loop metadata ids. */
 var bootstrapKernelUnrollHeaders: array<int> = []
 var bootstrapKernelUnrollNodes: array<int> = []
@@ -1054,6 +1107,9 @@ fun bootstrapKernelBuiltin(
     } else if (name.startsWith("extension_KernelArray__abla_generic_") &&
         (name.indexOf("_get") > 35 || name.indexOf("_set") > 35)) {
         bootstrapKernelArrayAccess(emitter, state, instruction, name.indexOf("_set") > 35)
+        return true
+    } else if (name.startsWith("extension_KernelBuffers") && name.indexOf("__abla_generic_") == 24 && name.indexOf("_get") > 39) {
+        bootstrapKernelBuffersGet(emitter, state, instruction)
         return true
     } else if (name == "kernelSharedF32Dynamic" || name == "kernelSharedU32Dynamic") {
         // The group's dynamic shared memory (#1303, CUDA's `extern __shared__`): one external addrspace(3) array, its size
@@ -1552,8 +1608,19 @@ fun bootstrapKernelCall(var emitter: BootstrapKernelEmitter, var state: Bootstra
         val argument = if (position < instruction.operands.size) bootstrapKernelGet(state, instruction.operands[position])
             else BootstrapKernelValue("", "none", "")
         val buffer = bootstrapKernelBufferType(parameterType)
+        val group = bootstrapKernelBuffersOf(parameterType)
         var text = ""
-        if (buffer != "") {
+        if (group.count > 0) {
+            // A KernelBuffers group: its N (address, count) pairs.
+            if (argument.type != "group:${group.buffer}" || argument.count != "${group.count}") {
+                bootstrapKernelFail(emitter, state.name, "type", "${argument.type} for KernelBuffers of ${group.count}")
+                return
+            }
+            for (k in 0 until group.count) {
+                val part = "ptr ${argument.operand}.$k, i64 ${argument.operand}.$k.count"
+                text = if (text == "") part else "$text, $part"
+            }
+        } else if (buffer != "") {
             if (argument.type != buffer) { bootstrapKernelFail(emitter, state.name, "type", "${argument.type} for $buffer"); return }
             text = "ptr ${argument.operand}, i64 ${argument.count}"
         } else {
@@ -1613,14 +1680,16 @@ fun bootstrapKernelInstruction(var emitter: BootstrapKernelEmitter, var state: B
         val type = state.parameterTypes[index]
         val symbol = bootstrapKernelSymbol(instruction.text)
         val buffer = bootstrapKernelBufferType(type)
-        if (buffer != "") bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("%p.$symbol", buffer, "%p.$symbol.count"))
+        val group = bootstrapKernelBuffersOf(type)
+        if (group.count > 0) bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("%p.$symbol", "group:${group.buffer}", "${group.count}"))
+        else if (buffer != "") bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("%p.$symbol", buffer, "%p.$symbol.count"))
         else bootstrapKernelSet(state, instruction.result, BootstrapKernelValue("%p.$symbol", type, ""))
     } else if (op == "local.declare" || op == "local.assign" || op == "local.set") {
         val index = bootstrapKernelLocal(state, instruction.text)
         if (index < 0 || !bootstrapKernelLocalScalar(state, index)) {
             val value = bootstrapKernelGet(state, instruction.left)
-            if (value.type.startsWith("buffer.")) {
-                // A buffer in a local is an alias, bound once: a `var` re-bound to another buffer would need the value
+            if (value.type.startsWith("buffer.") || value.type.startsWith("group:")) {
+                // A buffer (or a KernelBuffers group) in a local is an alias, bound once: a `var` re-bound to another buffer would need the value
                 // the control flow picks, which the kernel lowering does not track.
                 if (op != "local.declare" || bootstrapKernelHas(state.bufferNames, instruction.text)) {
                     bootstrapKernelFail(emitter, state.name, "type", "a var holding a buffer")
@@ -1745,8 +1814,16 @@ fun bootstrapKernelEmitFunction(var emitter: BootstrapKernelEmitter, functionInd
         val type = parameterTypes[index]
         val symbol = bootstrapKernelSymbol(function.parameters[index])
         val buffer = bootstrapKernelBufferType(type)
+        val group = bootstrapKernelBuffersOf(type)
         var text = ""
-        if (buffer != "" && entry) {
+        if (group.count > 0) {
+            // N buffers: N (address, count) parameters, %p.<name>.<k>, as N single ones are.
+            for (k in 0 until group.count) {
+                val part = if (entry) "ptr addrspace(1) %p.$symbol.$k.global, i64 %p.$symbol.$k.count" else "ptr %p.$symbol.$k, i64 %p.$symbol.$k.count"
+                text = if (text == "") part else "$text, $part"
+                if (entry) state.allocas = "${state.allocas}  %p.$symbol.$k = addrspacecast ptr addrspace(1) %p.$symbol.$k.global to ptr\n"
+            }
+        } else if (buffer != "" && entry) {
             // A kernel receives global memory; inside, every buffer is a generic pointer (global or shared).
             text = "ptr addrspace(1) %p.$symbol.global, i64 %p.$symbol.count"
             state.allocas = "${state.allocas}  %p.$symbol = addrspacecast ptr addrspace(1) %p.$symbol.global to ptr\n"
@@ -1961,9 +2038,11 @@ fun bootstrapKernelSignature(program: BootstrapIrProgram, name: string): string 
     val function = program.functions[index]
     for (position in 0 until function.parameters.size) {
         val type = if (position < function.parameterTypes.size) function.parameterTypes[position] else "unknown"
-        val buffer = bootstrapKernelBufferType(type)
+        val group = bootstrapKernelBuffersOf(type)
+        val buffer = if (group.count > 0) group.buffer else bootstrapKernelBufferType(type)
         val llvm = bootstrapKernelLlvmType(type)
-        kinds = kinds + (if (buffer == "buffer.f32") "f" else if (buffer == "buffer.u32") "w" else if (buffer == "buffer.u16") "h"
+        val times = if (group.count > 0) group.count else 1
+        for (copy in 0 until times) kinds = kinds + (if (buffer == "buffer.f32") "f" else if (buffer == "buffer.u32") "w" else if (buffer == "buffer.u16") "h"
             else if (buffer == "buffer.u8") "r" else if (llvm == "i64") "i" else if (llvm == "float") "x" else "?")
     }
     kinds

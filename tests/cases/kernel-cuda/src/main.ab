@@ -15,6 +15,7 @@ import "subgroups.ab"
 import "arrays.ab"
 import "launch.ab"
 import "intrinsics.ab"
+import "streams.ab"
 import "groups.ab"
 import "q8fast.ab"
 import "guards.ab"
@@ -514,6 +515,65 @@ trusted fun main: int {
         kernelBytePerm(0x33221100, 0x77665544, 0x0123) == 0x00112233
     for (k in 0 until intrinsicResults[0].size) if (intrinsicResults[1][k] != intrinsicResults[0][k]) intrinsicsRight = false
     println("intrinsics: $intrinsicThreads dp4a, prmt and float atomic adds, GPU equal to CPU $intrinsicsRight")
+
+    // streams (#1299's buffer arrays): scaleStreams over 2 of 3 streams (the third output keeps its fill) and pickStream with a
+    // runtime index, GPU equal to CPU.
+    val streamN = 3000
+    val streamInputs: array<NativeByteBuffer> = []
+    for (s in 0 until 3) streamInputs.append(floats(streamN) { i -> f32FromInt((i * (s + 3)) % 97) * f32(0.5) })
+    val streamResults: array<array<int>> = []
+    for (gpu in [false, true]) {
+        val outputs: array<NativeByteBuffer> = []
+        for (s in 0 until 3) outputs.append(floats(streamN) { i -> f32(-1.0) })
+        val picked = floats(streamN) { i -> f32(0.0) }
+        if (!gpu) {
+            val xs: array<KernelF32Buffer> = []
+            val ys: array<KernelF32Buffer> = []
+            for (s in 0 until 3) {
+                xs.append(KernelF32Buffer(nativePointerAddress(streamInputs[s].address), streamN))
+                ys.append(KernelF32Buffer(nativePointerAddress(outputs[s].address), streamN))
+            }
+            val xGroup = KernelBuffers<KernelF32Buffer, 3>(xs)
+            val yGroup = KernelBuffers<KernelF32Buffer, 3>(ys)
+            val pickedBuffer = KernelF32Buffer(nativePointerAddress(picked.address), streamN)
+            kernelRunCpu((streamN + 255) / 256, 256) { scaleStreams(xGroup, yGroup, 2, streamN) }
+            kernelRunCpu((streamN + 255) / 256, 256) { pickStream(xGroup, pickedBuffer, streamN) }
+        } else {
+            val dxs: array<CudaKernelMemory> = []
+            val dys: array<CudaKernelMemory> = []
+            for (s in 0 until 3) {
+                val dx = device.allocate(streamN * 4)
+                val dy = device.allocate(streamN * 4)
+                if (dx == null || dy == null || !device.upload(dx, streamInputs[s]) || !device.upload(dy, outputs[s])) {
+                    println("kernel-cuda: streams: ${device.error}")
+                    return 1
+                }
+                dxs.append(move(dx))
+                dys.append(move(dy))
+            }
+            val dpicked = device.allocate(streamN * 4)
+            if (dpicked == null) { println("kernel-cuda: ${device.error}"); return 1 }
+            if (!device.launch("scaleStreams", (streamN + 255) / 256, 256, cudaKernelArguments()
+                    .buffers([dxs[0].floats(), dxs[1].floats(), dxs[2].floats()])
+                    .buffers([dys[0].floats(), dys[1].floats(), dys[2].floats()]).integer(2).integer(streamN)) ||
+                !device.launch("pickStream", (streamN + 255) / 256, 256, cudaKernelArguments()
+                    .buffers([dxs[0].floats(), dxs[1].floats(), dxs[2].floats()]).buffer(dpicked.floats()).integer(streamN)) ||
+                !device.download(dpicked, picked)) {
+                println("kernel-cuda: streams: ${device.error}")
+                return 1
+            }
+            for (s in 0 until 3) {
+                if (!device.download(dys[s], outputs[s])) { println("kernel-cuda: streams: ${device.error}"); return 1 }
+            }
+        }
+        val words: array<int> = []
+        for (s in 0 until 3) for (i in 0 until streamN) words.append(int(f32ToBits(floatAt(outputs[s], i))))
+        for (i in 0 until streamN) words.append(int(f32ToBits(floatAt(picked, i))))
+        streamResults.append(words)
+    }
+    var streamsRight = streamResults[0][2 * streamN] == int(f32ToBits(f32(-1.0))) && streamResults[0][1] != int(f32ToBits(f32(-1.0)))
+    for (k in 0 until streamResults[0].size) if (streamResults[1][k] != streamResults[0][k]) streamsRight = false
+    println("streams: KernelBuffers of 3 under @unroll and by a runtime index, GPU equal to CPU $streamsRight")
 
     // NVFP4 matvec: one subgroup per row on the GPU (8 warps per group), one thread per row on the CPU.
     val rows = 1000

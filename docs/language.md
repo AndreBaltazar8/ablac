@@ -3093,6 +3093,15 @@ memory's, and a trusted function that owns host memory and keeps it alive
 builds one for the CPU (the raw constructors are trusted-only,
 [#1226](#trusted-native-implementations)).
 
+A kernel taking several buffers of one kind (a batch of streams) takes them as
+one parameter, `KernelBuffers<B, N>` (B a buffer type, N a literal from 1 to 8,
+else `E_PARSE_KERNEL_BUFFERS_COUNT`): the GPU gets N (address, count) pairs with
+no table to load, `get(index)` picks one (free when the index is a literal, an
+`@unroll` loop variable or a const parameter; otherwise a choice among the N),
+and a literal index outside 0..N-1 is `kernel.buffers-index`. The host passes
+them with `CudaKernelArguments.buffers([b0, b1, ...])`, exactly N, and the CPU
+backend takes `KernelBuffers<B, N>(arrayOfN)`.
+
 A thread's own small array is a `KernelArray<T>(count)` of `f32`, `int` or
 `u32`, all 0 at first, read with `get(index)` and written with `set(index,
 value)` (CUDA's `float acc[4]`). On a GPU it lives in registers, so its count

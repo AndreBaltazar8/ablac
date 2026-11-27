@@ -79,6 +79,7 @@ only its parse errors.
 | `E_PARSE_RESOURCE_DECLARATION` | `resource` before something other than `class` |
 | `E_PARSE_ANNOTATION`, `E_PARSE_ANNOTATED_DECLARATION` | a duplicate annotation, or one not followed by a declaration |
 | `E_PARSE_UNROLL_COUNT`, `E_PARSE_UNROLL_TARGET` | an `@unroll(n)` count that is not a whole number from 1 to 9999, or `@unroll` not followed by a loop |
+| `E_PARSE_KERNEL_BUFFERS_COUNT` | a `KernelBuffers<B, N>` whose N is not a literal from 1 to 8 |
 | `E_PARSE_DEFER_BODY`, `E_PARSE_REGION_BODY`, `E_PARSE_SUSPENDING_BODY` | `defer`, `region`, `generator`, `task` or `thread` without a block |
 | `E_PARSE_DECLARATION_BLOCK_*` | a malformed [declaration block](compile-time.md#declaration-blocks) |
 | `E_PARSE_*_PROGRESS` | the parser couldn't continue at that point; see the previous error |
