@@ -1,8 +1,8 @@
 # Windows compiler without the C runtime: options
 
-Status: proposal for André's decision, 2026-11-26, no code (todo #1046 follow-up; decision #104.1 left it as "a later,
-separate todo"). Inventory by ablac-15 (agents-memory `abla/ablac-windows-crt-inventory.md`), note by ablac-a5. Written
-against master 648cf072a (v0.2.78).
+Status: André chose B (decision #163); the plan is at the end. First written as a proposal (todo #1046 follow-up;
+decision #104.1 left it as "a later, separate todo"). Inventory by ablac-15 (agents-memory
+`abla/ablac-windows-crt-inventory.md`), note by ablac-a5. Written against master 648cf072a (v0.2.78).
 
 ## What is true today
 
@@ -113,6 +113,118 @@ Whatever is chosen keeps the current production packages and Windows seed until 
    libc-free (B)? Or should no Microsoft runtime code be in the compiler at all (C, which raises the same question for
    Linux's libstdc++)?
 2. **May the measurement step run now?** It is a CI-only link with map artifacts; nothing ships differently.
+
+## Decision and plan: B
+
+André chose B (decision #163): Abla's own C library, with Microsoft's C++ library (libcpmt) and low-level helpers
+(libvcruntime) kept, as Linux keeps libstdc++ and libgcc.
+
+### What the inventory measured
+
+From the `crt_inventory` runs 45983657838 (x64) and 45983661891 (arm64):
+
+- **Bytes in the image.** UCRT 268 KB (x64) / 235 KB (arm64); libcpmt 59 / 32 KB; libvcruntime 25 / 15 KB; libcmt
+  9 / 9 KB. The compiler image is 84 / 74 MB.
+- **Linking without UCRT.** That leaves 157 (x64) / 153 (arm64) undefined symbols. ARM64 needs none that x64 does
+  not.
+- **The 157 by kind.**
+
+  | Kind | Symbols |
+  | --- | ---: |
+  | math | 34 |
+  | start-up and exit | 26 |
+  | strings and number parsing | 25 |
+  | file descriptors | 14 |
+  | process | 13 |
+  | locale | 11 |
+  | heap | 10 |
+  | printf/stdio | 9 |
+  | date-format tables | 8 |
+  | time | 5 |
+  | threads | 2 |
+
+  All are public UCRT exports. None is a `__acrt_*` internal except the public `__acrt_iob_func`.
+- **Linking without UCRT and libcmt.** That also drops libcmt's start-up objects. Those include its default-library
+  directive for libvcruntime, so the probe also loses VCRuntime's names. The candidate link names `libvcruntime.lib`
+  explicitly.
+
+### Where the code goes
+
+- **Windows C library.** A new `src/static_libc/windows/` exports the UCRT names that src/orc_windows_main.ab needs.
+  It reuses the Linux modules' implementations, which make Linux system calls. On a Windows target those already go to
+  the runtime's translation (stdlib/abla/runtime/platform/windows/entry.ab, `__ablaRuntimeWindowsSyscall`). That
+  translation already has the descriptor table over handles, files, time, environment, threads and the VirtualAlloc
+  heap.
+- **ABI differences.** The Windows layer differs from Linux only where the Windows ABI does:
+  - `long` is 32 bits (LLP64), so the `strtol`/`atol` family and `_lseek` need their own widths;
+  - `long double` is `double`;
+  - `va_list` is a plain pointer on x64 and ARM64 Windows;
+  - errno is `_errno()`.
+
+### Steps, in order
+
+Each step lowers the undefined count of one candidate link. That link uses the same inputs as `ablac.exe` with
+`/nodefaultlib:libucrt.lib /nodefaultlib:libcmt.lib /defaultlib:libvcruntime.lib`. Add it to the inventory as
+`ablac-crt-candidate`. Each step's evidence is a `crt_inventory` run on both architectures, with the candidate's count
+and its undefined list. The shipped `ablac.exe` keeps `/MT` until step 7.
+
+1. **Candidate link and start-up.** Our own entry replaces `wmainCRTStartup`:
+   - it runs the C and C++ initializers between our own `.CRT$XIA`/`.CRT$XIZ` and `.CRT$XCA`/`.CRT$XCZ` markers
+     (LLVM's static `cl::opt`s and registries are there), then `abla_windows_start`;
+   - `exit` runs the `atexit`/`_onexit` table in reverse;
+   - it supplies the thread-safe static guards (`_Init_thread_header`/`_footer`/`_epoch`, over a SRW lock and
+     WaitOnAddress), the `/GS` cookie and its initialisation, `_tls_used` (the runtime already writes loader TLS for
+     programs), the 26 start-up names and the onexit tables.
+
+   **Check:** the candidate starts, and `ablac --version` runs natively on both runners.
+2. **Heap and process** (10 + 13):
+   - `malloc`/`calloc`/`realloc`/`free`/`_aligned_*`/`_strdup`/`_wcsdup` on the runtime heap, and `_heapwalk` as
+     "no more entries";
+   - `exit`/`_exit`/`abort`/`signal`/`getenv`/`rand`/`rand_s`/`_errno`/`_invoke_watson`/`_set_abort_behavior`/
+     `_set_error_mode`/`terminate`. `abort` and `_invoke_watson` end the process with the panic status.
+3. **Descriptors and stdio** (14 + 9):
+   - `_open_osfhandle`, `_get_osfhandle`, `_read`/`_write`/`_close`/`_lseek(i64)`, `_setmode` and `_chsize_s` over
+     the runtime's descriptor table (LLVM's `raw_fd_ostream` writes through these);
+   - `__acrt_iob_func` returns three FILE records;
+   - `fflush`/`fputc`/`fputs`/`putchar`;
+   - `__stdio_common_vfprintf`/`vsprintf`/`vsprintf_s`/`vsscanf`, on static_libc's formatter (format.ab,
+     floatfmt.ab) with a Windows `va_list` reader. The formatter must take an argument-reader parameter instead of
+     SysV's `va_list`.
+4. **Strings, parsing and math** (25 + 34):
+   - the static_libc functions with Windows widths;
+   - `_dclass`/`_ldclass`/`_fpclass`/`_dsign` and `feclearexcept`/`fetestexcept` over MXCSR (x64) and FPSR (ARM64).
+5. **Time and threads** (5 + 2):
+   - `_time64`, `_gmtime64_s`, `_localtime64(_s)` (UTC, as the Linux static compiler does) and `strftime`;
+   - `_beginthreadex`/`_endthreadex` over the runtime's thread start, so each thread gets its TLS and interrupt word.
+6. **The C locale** (11 + 8). Stand-ins that describe the C locale only:
+   - `___lc_codepage_func` returns 0;
+   - `___lc_collate_cp_func` returns 0;
+   - `___lc_locale_name_func` returns six null names;
+   - `___mb_cur_max_func` returns 1;
+   - `__pctype_func` returns the 256-entry C ctype table;
+   - `__strncnt` is `strnlen`;
+   - `_lock_locales`/`_unlock_locales` do nothing;
+   - `setlocale` answers "C" and refuses others;
+   - `localeconv` returns the C `lconv`;
+   - `_configthreadlocale` returns the old mode;
+   - `_Getdays`/`_Getmonths`/`_Gettnames` and their `_W_` forms return the C names in a block that only our
+     `_Strftime`/`_Wcsftime` read.
+
+   **Check:** the candidate's undefined count is 0 on both architectures.
+7. **Switch.** The shipped link drops libucrt and libcmt. Today's packages and Windows seed stay until all of these
+   pass:
+   - native x64 and ARM64 start-up, release and `--fast` builds with only System32 on `PATH`;
+   - the import and archive provenance checks;
+   - the native compile-time probes;
+   - stage 2 == stage 3 for COFF and PE;
+   - cold hello, JSON and self-build measured against the `/MT` compiler on the same runners, with PE and zip sizes no
+     worse.
+
+### Not changed
+
+- `libcpmt` and `libvcruntime` stay. `memcpy`/`memset`/`memchr`/`strchr`/`strstr`/`strrchr`/`wcschr`, exception
+  handlers, `_purecall` and `type_info` come from VCRuntime, as on Linux they come from libgcc.
+- Programs that ablac builds for Windows are unaffected: they already link no C runtime.
 
 ## Related gap (not part of this decision)
 
