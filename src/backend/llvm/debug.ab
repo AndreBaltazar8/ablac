@@ -2230,6 +2230,39 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
         LLVMPositionBuilderAtEnd(backend.builder, reported)
         bootstrapLlvmDebugWrite(backend, "fatal signal: a bad memory access at ", "abla.fault.access")
         bootstrapLlvmWriteHexCompact(backend, address)
+        if (!mac) {
+            // On Linux, the faulting instruction and the program's load address (__ehdr_start), as a debug build's
+            // stack ends, which `ablac symbolize <program>` reads: a single crash names its function. An instruction
+            // past the program's end (_end) is a shared library's (libLLVM's, in the compiler), which it can't name.
+            // The interrupted pc as below: gregs[REG_RIP] at 168 on x86-64, sigcontext.pc at 440 on AArch64, 176 on
+            // RV64.
+            val pcAt = if (riscv) 176 else if (bootstrapTextContains(backend.targetTriple, "aarch64")) 440 else 168
+            val pc = LLVMBuildLoad2(backend.builder, i64, bootstrapLlvmByteAt(backend, machine, 512, pcAt), "fault.pc")
+            var start = LLVMGetNamedGlobal(backend.module, "__ehdr_start")
+            if (pointerIsNull(start)) start = LLVMAddGlobal(backend.module, backend.i8Type, "__ehdr_start")
+            var end = LLVMGetNamedGlobal(backend.module, "_end")
+            if (pointerIsNull(end)) end = LLVMAddGlobal(backend.module, backend.i8Type, "_end")
+            val base = LLVMBuildPtrToInt(backend.builder, start, i64, "")
+            // ULT (36): pc - base < _end - base.
+            val inside = LLVMBuildICmp(backend.builder, 36, LLVMBuildSub(backend.builder, pc, base, ""),
+                LLVMBuildSub(backend.builder, LLVMBuildPtrToInt(backend.builder, end, i64, ""), base, ""), "")
+            val own = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.pc.program")
+            val library = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.pc.library")
+            val write = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.pc.write")
+            LLVMBuildCondBr(backend.builder, inside, own, library)
+            LLVMPositionBuilderAtEnd(backend.builder, own)
+            bootstrapLlvmDebugWrite(backend, "the faulting instruction (ablac symbolize <program> names it):\n",
+                "abla.fault.pc")
+            LLVMBuildBr(backend.builder, write)
+            LLVMPositionBuilderAtEnd(backend.builder, library)
+            bootstrapLlvmDebugWrite(backend, "the faulting instruction, outside the program (a shared library's):\n",
+                "abla.fault.pc.library")
+            LLVMBuildBr(backend.builder, write)
+            LLVMPositionBuilderAtEnd(backend.builder, write)
+            bootstrapLlvmWriteHexCompact(backend, pc)
+            bootstrapLlvmDebugWrite(backend, "load address ", "abla.fault.load")
+            bootstrapLlvmWriteHexCompact(backend, base)
+        }
         LLVMBuildBr(backend.builder, quiet)
         LLVMPositionBuilderAtEnd(backend.builder, quiet)
     }

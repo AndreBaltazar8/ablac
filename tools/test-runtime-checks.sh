@@ -170,6 +170,28 @@ for flags in "" "-g" "--backtrace"; do
         grep -qx 'fatal signal: a bad memory access at 0x0000000000000010' "$out/stack-store.err" ||
             fail "a bad store in a release build: $(head -3 "$out/stack-store.err")"
         ! grep -q 'bad memory access' "$out/stack-segv.err" || fail "a sent SIGSEGV named an address"
+        # On Linux it names the faulting instruction and the load address, which `ablac symbolize` turns into the
+        # function: one crash with no core (run-limited.sh allows none) says where it was.
+        # (bad-store.ab's function keeps its name in a release build, as a symbol table names it.)
+        if [[ $(uname -s) == Linux ]]; then
+            "$compiler" build "$cases/bad-store.ab" -o "$out/bad-store"
+            set +e
+            "$out/bad-store" > /dev/null 2> "$out/bad-store.err"
+            bad_store_status=$?
+            set -e
+            [[ $bad_store_status -eq 139 ]] || fail "bad-store exited $bad_store_status"
+            grep -qx 'fatal signal: a bad memory access at 0x0000000000000010' "$out/bad-store.err" &&
+                grep -qx 'the faulting instruction (ablac symbolize <program> names it):' "$out/bad-store.err" &&
+                grep -qx '0x[0-9a-f]\{16\}' "$out/bad-store.err" &&
+                grep -qx 'load address 0x[0-9a-f]\{16\}' "$out/bad-store.err" ||
+                fail "a bad store in a release build named no instruction: $(head -5 "$out/bad-store.err")"
+            if command -v llvm-symbolizer > /dev/null 2>&1; then
+                "$compiler" symbolize "$out/bad-store" "$out/bad-store.err" > "$out/bad-store.symbolized" ||
+                    fail "symbolize failed on a bad store's report: $(cat "$out/bad-store.err")"
+                grep -q '^#0 abla_test_bad_store ' "$out/bad-store.symbolized" ||
+                    fail "a bad store's instruction is not in badStore: $(cat "$out/bad-store.err" "$out/bad-store.symbolized")"
+            fi
+        fi
     else
         # Its fault report names the address too, then prints the stack; a sent SIGSEGV's says what it may be.
         grep -qx 'fatal signal: a bad memory access at 0x0000000000000010' "$out/stack-store.err" ||

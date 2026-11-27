@@ -69,7 +69,17 @@ What a debug build contains:
   `panic: <message>` (exit status 101) without the stack, and a bad memory
   access (a SIGSEGV or SIGBUS the kernel raised) as
   `fatal signal: a bad memory access at 0x0000000000000010` before the process
-  ends by the signal.
+  ends by the signal. On Linux the faulting instruction and the program's
+  load address follow, so `ablac symbolize <program> <that text>` names the
+  function from one crash, with no core needed. An instruction outside the
+  program is a shared library's, and the report says so:
+
+  ```text
+  fatal signal: a bad memory access at 0x0000000000000010
+  the faulting instruction (ablac symbolize <program> names it):
+  0x000055d1c3a4f1e7
+  load address 0x000055d1c3a00000
+  ```
 
 ## Native: lldb, atos, crash reports
 
