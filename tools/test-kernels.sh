@@ -42,6 +42,13 @@ for name in CudaKernelDevice CudaKernelMemory; do
         fail "refused-cuda-forge: no native.trust error naming $name: $(head -3 "$out/refused-cuda-forge.log")"
 done
 
+# The CPU backend's launch state (shared-memory slot addresses) is private to abla/kernel.
+status=0
+"$compiler" build "$cases/refused-cpu-state.ab" -o "$out/refused-cpu-state" --fast --no-cache > "$out/refused-cpu-state.log" 2>&1 || status=$?
+[[ $status != 0 ]] || fail "refused-cpu-state built"
+grep -q "error\[E_SEMANTIC\]: name\.private:kernelCpuState" "$out/refused-cpu-state.log" ||
+    fail "refused-cpu-state: no name.private error naming kernelCpuState: $(head -3 "$out/refused-cpu-state.log")"
+
 # A shared-memory count that wraps when multiplied by the element size stops the CPU backend (it gave a 4-byte buffer claiming 2^62 + 1 elements).
 "$compiler" build "$cases/shared-count.ab" -o "$out/shared-count" --fast --no-cache > "$out/shared-count.log" 2>&1 ||
     fail "shared-count did not build: $(head -4 "$out/shared-count.log")"

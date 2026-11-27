@@ -7,6 +7,7 @@ import "abla/kernel"
 import "abla/kernel/cuda"
 import "abla/io"
 import "abla/text"
+import "abla/unsafe/memory"
 
 /** A buffer of `memory` after the memory is dropped (the buffer value outlives it; a launch must not). */
 trusted fun staleBuffer(var device: CudaKernelDevice): KernelF32Buffer {
@@ -127,8 +128,53 @@ trusted fun closedCase(): bool {
     right
 }
 
-/** The number of guard cases that gave the wrong answer; prints each. */
-trusted fun guardCases(): int {
+/** Memory of `first` (a device made before another) belongs to `first`'s context: a later device being closed frees none of it. Every
+ *  call makes its device's context current, else the driver allocates in the context made last, and closing that one freed memory
+ *  `first` still counted as live (the next allocation could get its address: an upload to one device's memory landed in another's). */
+trusted fun contextCase(var first: CudaKernelDevice): bool {
+    var later = cudaKernelDevice()
+    val memory = first.allocate(4096)
+    val pattern = nativeByteBuffer(64)
+    for (index in 0 until 64) pattern.store(index, 90 + index)
+    val uploaded = memory != null && first.upload(memory, pattern)
+    later.close()
+    var back = nativeByteBuffer(64)
+    var right = uploaded && memory != null && first.download(memory, back)
+    if (right) for (index in 0 until 64) if (back.load(index) != 90 + index) right = false
+    if (!right) println("guards: memory of the first device did not survive closing a later one: ${first.error}")
+    first.error = ""
+    right
+}
+
+/** A host buffer that is closed (its bytes freed) is neither uploaded from nor downloaded into. */
+trusted fun closedHostCase(var device: CudaKernelDevice): bool {
+    val memory = device.allocate(4096)
+    if (memory == null) {
+        println("guards: ${device.error}")
+        return false
+    }
+    var host = nativeByteBuffer(4096)
+    host.close()
+    val right = !device.download(memory, host) && !device.upload(memory, host)
+    if (!right) println("guards: a closed host buffer was copied to or from the device")
+    right
+}
+
+/** A device record of a context with another module (a closed device whose context handle the driver gave to a later one) is not
+ *  ready, and close leaves the real device open. */
+trusted fun recordCase(var device: CudaKernelDevice): bool {
+    var stale = CudaKernelDevice(device.context, device.module + 64, "")
+    val right = !stale.ready() && stale.allocate(16) == null
+    stale.close()
+    if (!right || !device.ready()) {
+        println("guards: a record of another module passed for the device (or closing it closed the device)")
+        return false
+    }
+    true
+}
+
+/** The number of guard cases that gave the wrong answer; prints each. `device` is main's, left open. */
+trusted fun guardCases(var device: CudaKernelDevice): int {
     var wrong = 0
     if (!fewCase()) wrong += 1
     if (!forgedCase()) wrong += 1
@@ -136,5 +182,8 @@ trusted fun guardCases(): int {
     if (!staleCase()) wrong += 1
     if (!longCase()) wrong += 1
     if (!closedCase()) wrong += 1
+    if (!contextCase(device)) wrong += 1
+    if (!closedHostCase(device)) wrong += 1
+    if (!recordCase(device)) wrong += 1
     wrong
 }

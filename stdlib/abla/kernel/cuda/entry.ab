@@ -13,6 +13,8 @@ private trusted noescape extern:"c" fun cuDeviceGet(device: i64*, ordinal: i32):
 private trusted noescape extern:"c" fun cuCtxCreate_v2(context: i64*, flags: u32, device: i32): i32
 private trusted noescape extern:"c" fun cuCtxDestroy_v2(context: i64*): i32
 private trusted noescape extern:"c" fun cuCtxSynchronize(): i32
+private trusted noescape extern:"c" fun cuCtxPushCurrent_v2(context: i64*): i32
+private trusted noescape extern:"c" fun cuCtxPopCurrent_v2(context: i64*): i32
 private trusted noescape extern:"c" fun cuMemAlloc_v2(address: i64*, bytes: u64): i32
 private trusted noescape extern:"c" fun cuMemFree_v2(address: u64): i32
 private trusted noescape extern:"c" fun cuMemcpyHtoD_v2(destination: u64, source: i64*, bytes: u64): i32
@@ -26,7 +28,8 @@ private trusted noescape extern:"c" fun cuLaunchKernel(
     stream: i64*, params: i64*, extra: i64*
 ): i32
 
-// What this module has made and not yet released, which no other code can write: the contexts (one entry each) and the device
+// What this module has made and not yet released, which no other code can write: the contexts (a context and its module each: the
+// driver may give a closed context's handle to a later one, and a device record of the closed one must not pass for it) and the device
 // allocations (a context, an address and a size each). A device or memory value is only a record of these, and a record
 // that code could build or change by hand is not believed: every driver call and every launch checks it against these lists
 // (an address a program made up, a context closed already, a buffer whose memory was dropped).
@@ -42,9 +45,26 @@ class CudaKernelDevice(val context: int, val module: int, var error: string)
 resource class CudaKernelMemory(val device: CudaKernelDevice, val address: int, val bytes: int) {
     /** Frees the device memory (cuMemFree) and forgets it: a buffer made from it no longer launches. */
     trusted fun drop(): void {
-        if (cudaForgetMemory(this.device.context, this.address, this.bytes)) cuMemFree_v2(u64(this.address))
+        if (cudaForgetMemory(this.device.context, this.address, this.bytes) && cudaEnter(this.device.context)) {
+            cuMemFree_v2(u64(this.address))
+            cudaLeave()
+        }
         return
     }
+}
+
+// Every driver call runs with its device's context made current on this thread (pushed before, popped after): the driver allocates in,
+// loads into and launches on the current context, which is otherwise the one made last, so memory of one device would be made in (and
+// freed with) another's context.
+
+/** Makes `context` current on this thread; false when the driver refused. */
+private trusted fun cudaEnter(context: int): bool = cuCtxPushCurrent_v2(nativePointerFromAddress(context)) == i32(0)
+
+/** Restores the context that was current before cudaEnter. */
+private trusted fun cudaLeave(): void {
+    val previous = nativePointerCell(nativeNullPointer())
+    cuCtxPopCurrent_v2(previous.address)
+    return
 }
 
 /** Removes the allocation (`context`, `address`, `bytes`) from the live list; false when it is not there (made by hand, freed already, or its context closed). */
@@ -125,41 +145,60 @@ trusted fun cudaKernelDevice(ordinal: int = 0): CudaKernelDevice {
         cuCtxDestroy_v2(context.load())
         return failed
     }
+    // cuCtxCreate made the context current; it is current again only inside each call on the device (cudaEnter).
+    cudaLeave()
     val made = CudaKernelDevice(nativePointerAddress(context.load()), nativePointerAddress(module.load()), "")
     cudaOpenContexts.append(made.context)
+    cudaOpenContexts.append(made.module)
     made
 }
 
-/** Whether the device is usable: no error, and its context was made by cudaKernelDevice and is not closed. */
-fun CudaKernelDevice.ready(): bool {
-    if (this.error != "" || this.context == 0) return false
-    for (open in cudaOpenContexts) if (open == this.context) return true
+/** Whether `context` with `module` is a device cudaKernelDevice made and close has not closed. */
+private fun cudaDeviceOpen(context: int, module: int): bool {
+    if (context == 0) return false
+    var index = 0
+    while (index + 1 < cudaOpenContexts.size) {
+        if (cudaOpenContexts[index] == context && cudaOpenContexts[index + 1] == module) return true
+        index += 2
+    }
     false
 }
 
+/** Whether the device is usable: no error, and its context was made by cudaKernelDevice and is not closed. */
+fun CudaKernelDevice.ready(): bool = this.error == "" && cudaDeviceOpen(this.context, this.module)
+
 /** `bytes` bytes of device memory, or null (the reason in `error`). */
 trusted fun CudaKernelDevice.allocate(bytes: int): CudaKernelMemory? {
-    if (!this.ready()) return null
+    if (!this.ready() || bytes <= 0 || !cudaKernelOk(this, cuCtxPushCurrent_v2(nativePointerFromAddress(this.context)), "cuCtxPushCurrent")) return null
     val address = nativeI64Cell(0)
-    if (bytes <= 0 || !cudaKernelOk(this, cuMemAlloc_v2(address.address, u64(bytes)), "cuMemAlloc")) return null
+    val allocated = cudaKernelOk(this, cuMemAlloc_v2(address.address, u64(bytes)), "cuMemAlloc")
+    cudaLeave()
+    if (!allocated) return null
     cudaLiveMemory.append(this.context)
     cudaLiveMemory.append(address.load())
     cudaLiveMemory.append(bytes)
     CudaKernelMemory(this, address.load(), bytes)
 }
 
-/** Copies all of `data` (at most the memory's size) to the start of `memory`. */
+/** Copies all of `data` (at most the memory's size) to the start of `memory`; false for a closed `data`. */
 trusted fun CudaKernelDevice.upload(memory: CudaKernelMemory, data: NativeByteBuffer): bool {
-    if (!this.ready() || !cudaMemoryHolds(this.context, memory.address, memory.bytes)) return false
+    if (data.closed || !this.ready() || !cudaMemoryHolds(this.context, memory.address, memory.bytes)) return false
+    if (!cudaKernelOk(this, cuCtxPushCurrent_v2(nativePointerFromAddress(this.context)), "cuCtxPushCurrent")) return false
     val bytes = if (data.capacity < memory.bytes) data.capacity else memory.bytes
-    cudaKernelOk(this, cuMemcpyHtoD_v2(u64(memory.address), data.address, u64(bytes)), "cuMemcpyHtoD")
+    val copied = cudaKernelOk(this, cuMemcpyHtoD_v2(u64(memory.address), data.address, u64(bytes)), "cuMemcpyHtoD")
+    cudaLeave()
+    copied
 }
 
-/** Copies the start of `memory` into all of `data` (at most the memory's size); waits for the launches before it. */
+/** Copies the start of `memory` into all of `data` (at most the memory's size); waits for the launches before it. False for a closed
+ *  `data` (its bytes are freed). */
 trusted fun CudaKernelDevice.download(memory: CudaKernelMemory, var data: NativeByteBuffer): bool {
-    if (!this.ready() || !cudaMemoryHolds(this.context, memory.address, memory.bytes)) return false
+    if (data.closed || !this.ready() || !cudaMemoryHolds(this.context, memory.address, memory.bytes)) return false
+    if (!cudaKernelOk(this, cuCtxPushCurrent_v2(nativePointerFromAddress(this.context)), "cuCtxPushCurrent")) return false
     val bytes = if (data.capacity < memory.bytes) data.capacity else memory.bytes
-    cudaKernelOk(this, cuMemcpyDtoH_v2(data.address, u64(memory.address), u64(bytes)), "cuMemcpyDtoH")
+    val copied = cudaKernelOk(this, cuMemcpyDtoH_v2(data.address, u64(memory.address), u64(bytes)), "cuMemcpyDtoH")
+    cudaLeave()
+    copied
 }
 
 /** The parameters of one launch, in the kernel's order: a buffer is its address and its element count, an int is 64 bits,
@@ -265,9 +304,13 @@ trusted fun CudaKernelDevice.launch(name: string, groups: int, groupSize: int, a
         this.error = problem
         return false
     }
+    if (!cudaKernelOk(this, cuCtxPushCurrent_v2(nativePointerFromAddress(this.context)), "cuCtxPushCurrent")) return false
     val function = nativePointerCell(nativeNullPointer())
     if (!cudaKernelOk(this, cuModuleGetFunction(function.address, nativePointerFromAddress(this.module), name),
-        "cuModuleGetFunction($name)")) return false
+        "cuModuleGetFunction($name)")) {
+        cudaLeave()
+        return false
+    }
     // The driver reads the parameter bytes during cuLaunchKernel.
     val count = arguments.words.size
     val values = nativeByteBuffer(if (count == 0) 8 else count * 8)
@@ -280,6 +323,7 @@ trusted fun CudaKernelDevice.launch(name: string, groups: int, groupSize: int, a
     val launched = cudaKernelOk(this, cuLaunchKernel(function.load(), u32(groups), u32(groupsY), 1, u32(groupSize), 1, 1, 0,
         nativeNullPointer(), pointers.address, nativeNullPointer()), "cuLaunchKernel($name)") &&
         cudaKernelOk(this, cuCtxSynchronize(), "cuCtxSynchronize")
+    cudaLeave()
     values.close()
     pointers.close()
     launched
@@ -288,9 +332,7 @@ trusted fun CudaKernelDevice.launch(name: string, groups: int, groupSize: int, a
 /** Unloads the kernels and destroys the context, also when a call failed on it (a refused launch leaves `error` set, and its
  *  context still holds driver resources such as BAR1 space). */
 trusted fun CudaKernelDevice.close(): void {
-    var isOpen = false
-    if (this.context != 0) for (context in cudaOpenContexts) if (context == this.context) isOpen = true
-    if (!isOpen) return
+    if (!cudaDeviceOpen(this.context, this.module)) return
     // The context goes first from the open list, so a second close, or a launch or allocation on this device, finds it closed; its
     // allocations go with it (the driver frees them with the context).
     var kept: array<int> = []
@@ -306,10 +348,20 @@ trusted fun CudaKernelDevice.close(): void {
     while (cudaLiveMemory.size > 0) cudaLiveMemory.removeLast()
     for (word in kept) cudaLiveMemory.append(word)
     var open: array<int> = []
-    for (context in cudaOpenContexts) if (context != this.context) open.append(context)
+    index = 0
+    while (index + 1 < cudaOpenContexts.size) {
+        if (cudaOpenContexts[index] != this.context) {
+            open.append(cudaOpenContexts[index])
+            open.append(cudaOpenContexts[index + 1])
+        }
+        index += 2
+    }
     while (cudaOpenContexts.size > 0) cudaOpenContexts.removeLast()
-    for (context in open) cudaOpenContexts.append(context)
-    if (this.module != 0) cuModuleUnload(nativePointerFromAddress(this.module))
+    for (word in open) cudaOpenContexts.append(word)
+    if (this.module != 0 && cudaEnter(this.context)) {
+        cuModuleUnload(nativePointerFromAddress(this.module))
+        cudaLeave()
+    }
     cuCtxDestroy_v2(nativePointerFromAddress(this.context))
     this.error = "the device is closed"
     return
