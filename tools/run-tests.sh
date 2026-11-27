@@ -291,9 +291,18 @@ start() { # n
             grep -qx "${BASH_REMATCH[1]}" "$project_root/tools/test-fast-builds.txt"; then
             fast_builds=1
         fi
+        # The network guard: gh, curl and wget refuse anything beyond file:// and the loopback host
+        # (tools/lib/net-guard/curl), unless tools/test-network-allowed.txt names the command's script.
+        guard_path=$project_root/tools/lib/net-guard:$PATH
+        network_log=$output/$n.network
+        : >"$network_log"
+        if [[ $command =~ (tools/test-[[:alnum:]-]+\.sh) ]] &&
+            awk '!/^#/ { print $1 }' "$project_root/tools/test-network-allowed.txt" | grep -xF "${BASH_REMATCH[1]}" >/dev/null; then
+            guard_path=$PATH
+        fi
         # perl runs the command and reports the user and system seconds of the
         # command and everything it ran (`times` of the waited children).
-        ABLA_TEST_FAST_BUILDS=$fast_builds perl -e '
+        PATH=$guard_path ABLA_NET_GUARD_LOG=$network_log ABLA_TEST_FAST_BUILDS=$fast_builds perl -e '
             my $status = system("bash", "-c", $ARGV[0]);
             my @t = times;
             open(my $f, ">", $ARGV[1]) or exit 1;
@@ -301,6 +310,12 @@ start() { # n
             exit($status == -1 ? 127 : ($status & 127) ? 128 + ($status & 127) : $status >> 8);
         ' "$command" "$output/$n.cpu" >"$output/$n.log" 2>&1 </dev/null
         status=$?
+        # A refused network call fails the command (exit 97) even when the test swallowed the error.
+        if [[ -s $network_log ]]; then
+            { echo "run-tests: this command reached for the network (refused; tools/lib/net-guard/curl):"; cat "$network_log"; } >>"$output/$n.log"
+            status=97
+        fi
+        rm -f "$network_log"
         end=$(seconds_now)
         cpu=$(cat "$output/$n.cpu" 2>/dev/null || echo 0)
         rm -f "$output/$n.cpu"
