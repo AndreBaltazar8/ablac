@@ -4,8 +4,9 @@
 # (libc-math-functions, libc-iconv, libc-spawn, libc-wcsftime exit 42; libc-stack-chk-fail ends by SIGABRT after writing its message to
 # standard error; libc-fortify exits 42 for fortified calls that fit and aborts the same way for each that does not; libc-qsort exits 42 when
 # comparators that are not consistent leave the memory around the array alone; libc-memalign exits 42 when a wrapping request is ENOMEM; libc-realpath
-# exits 42 when a result past PATH_MAX is ENAMETOOLONG and the bytes after the buffer are untouched). Linux only. The same code is what the static
-# compiler links (tools/test-static-compiler.sh).
+# exits 42 when a result past PATH_MAX is ENAMETOOLONG and the bytes after the buffer are untouched; libc-format-aarch64, AArch64 only, exits 42
+# when vsnprintf reads an AAPCS64 va_list's register and stack arguments in order). Linux only. The same code is what the static compiler links
+# (tools/test-static-compiler.sh).
 # Usage: tools/test-libc-functions.sh [compiler]
 set -euo pipefail
 export LC_ALL=C
@@ -20,12 +21,12 @@ out=build/libc-functions
 rm -rf "$out"
 mkdir -p "$out"
 # string.ab, and what imports it (format.ab, stdio.ab, fortify.ab), cannot be in an ordinary program: their exported C symbols clash with the
-# runtime's. The qsort and fortify programs are built against copies of the library without the @export lines.
+# runtime's. The qsort, fortify and format-aarch64 programs are built against copies of the library without the @export lines.
 mkdir -p "$out/libc"
 for file in src/static_libc/*.ab; do sed '/^@export/d' "$file" > "$out/libc/${file##*/}"; done
 source_of() {
     case $1 in
-        qsort|fortify) sed 's|"\.\./\.\./\.\./src/static_libc/|"./libc/|' "tests/cases/libc-$1/main.ab" > "$out/$1-main.ab"; echo "$out/$1-main.ab" ;;
+        qsort|fortify|format-aarch64) sed 's|"\.\./\.\./\.\./src/static_libc/|"./libc/|' "tests/cases/libc-$1/main.ab" > "$out/$1-main.ab"; echo "$out/$1-main.ab" ;;
         *) echo "tests/cases/libc-$1/main.ab" ;;
     esac
 }
@@ -70,11 +71,11 @@ echo 'libc functions: the fortified memcpy, memset, vsnprintf and realpath refus
 # The same modules for AArch64 Linux (#806 step C, the static compiler's second target): the programs that do not run another program are
 # built with --target aarch64-linux and run under qemu-aarch64 (posix_spawn's test starts the host's /bin/sh, which the guest cannot).
 if aarch64_runner_available; then
-    for name in math-functions correct-rounding iconv wcsftime qsort memalign stack-chk-fail; do
+    for name in math-functions correct-rounding iconv wcsftime qsort memalign format-aarch64 stack-chk-fail; do
         "$compiler" build "$(source_of "$name")" -o "$out/$name.aarch64" --target aarch64-linux --no-cache > "$out/$name.aarch64.build.log" 2>&1 ||
             { echo "libc functions: libc-$name did not build for aarch64-linux" >&2; tail -20 "$out/$name.aarch64.build.log" >&2; exit 1; }
     done
-    for name in math-functions correct-rounding iconv wcsftime qsort memalign; do
+    for name in math-functions correct-rounding iconv wcsftime qsort memalign format-aarch64; do
         code=0
         aarch64_run -- "$out/$name.aarch64" > "$out/$name.aarch64.out" 2>&1 < /dev/null || code=$?
         [[ $code == 42 ]] || { echo "libc functions: libc-$name exited $code on AArch64" >&2; cat "$out/$name.aarch64.out" >&2; exit 1; }
