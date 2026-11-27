@@ -1849,6 +1849,10 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
                 : (i % 2 ? 'right + ' + n : 'left * ' + n + ' + right');
             await edit(expression, extended ? hits : ++hits);
         }
+        // String values: a literal, compared with a string field, a string parameter or a local of written type `string`.
+        if (fields) await edit('(if (p.label == "p") p.x else p.y) + left', extended ? hits : ++hits);
+        if (strings) await edit('if (text == "abc") left else right', ++hits);
+        if (locals) await edit(block('val t: string = "ab"', 'if (t != "ab") left else right'), ++hits);
         // Another local: the document's symbols change, so full typing.
         if (locals) await edit(block('val t = left', 'val u = t + 1', 'u'), hits);
         // Back to one local: the symbols change again, so full typing.
