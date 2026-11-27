@@ -4,11 +4,11 @@
 import "abla/runtime/scalar"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
+import "abla/unsafe/native"
 import "./string.ab"
 
+// The published cells (libcCtypeCells), 0 until the first call.
 var libcCtypeClass: int = 0
-var libcCtypeLower: int = 0
-var libcCtypeUpper: int = 0
 
 // glibc's little-endian mask bits.
 trusted fun libcCtypeMask(c: int): int {
@@ -31,9 +31,16 @@ trusted fun libcCtypeMask(c: int): int {
     mask
 }
 
-// A cell holding the table pointer (the functions return the address of a pointer).
-trusted fun libcCtypeBuild(): void {
-    if (libcCtypeClass != 0) return
+// The three cells (class, lower, upper: each the pointer to its table's element 0) that the functions return the addresses of, built once on
+// first use. Threads of the compiler may get here first at the same time: each builds whole tables and publishes its cells with one store after
+// a fence, and a reader fences after it loads the published pointer, so no thread reads a cell (or a table) before it is written, on AArch64
+// either. A thread that loses the race leaves its copy unused. (The cells used to be three globals stored one by one, read without a fence.)
+trusted fun libcCtypeCells(): int {
+    val published = libcCtypeClass
+    if (published != 0) {
+        ablaUnsafeAtomicFence()
+        return published
+    }
     val classes = __ablaRuntimeHostHeapAllocate(384 * 2 + 16, true)
     val lower = __ablaRuntimeHostHeapAllocate(384 * 4 + 16, true)
     val upper = __ablaRuntimeHostHeapAllocate(384 * 4 + 16, true)
@@ -53,34 +60,23 @@ trusted fun libcCtypeBuild(): void {
         ablaRuntimeStoreI32(upper + index * 4, raised)
         index = index + 1
     }
-    // Three cells (class, lower, upper), each the pointer to element 0.
     val cells = __ablaRuntimeHostHeapAllocate(32, true)
     ablaRuntimeStoreI64(cells, classes + 256)
     ablaRuntimeStoreI64(cells + 8, lower + 512)
     ablaRuntimeStoreI64(cells + 16, upper + 512)
-    libcCtypeUpper = cells + 16
-    libcCtypeLower = cells + 8
+    ablaUnsafeAtomicFence()
     libcCtypeClass = cells
-    return
+    cells
 }
 
 @export("__ctype_b_loc")
-trusted fun libcCtypeBLoc(): int {
-    libcCtypeBuild()
-    libcCtypeClass
-}
+trusted fun libcCtypeBLoc(): int = libcCtypeCells()
 
 @export("__ctype_tolower_loc")
-trusted fun libcCtypeLowerLoc(): int {
-    libcCtypeBuild()
-    libcCtypeLower
-}
+trusted fun libcCtypeLowerLoc(): int = libcCtypeCells() + 8
 
 @export("__ctype_toupper_loc")
-trusted fun libcCtypeUpperLoc(): int {
-    libcCtypeBuild()
-    libcCtypeUpper
-}
+trusted fun libcCtypeUpperLoc(): int = libcCtypeCells() + 16
 
 // The C locale's multibyte character is one byte.
 @export("__ctype_get_mb_cur_max")
