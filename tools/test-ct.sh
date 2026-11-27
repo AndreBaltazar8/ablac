@@ -719,7 +719,7 @@ frame_view_read() {
 # The real entry points, run: the 16 KiB below the stack pointer is zeroed, each public AES (every key size, and a
 # 64 KiB input) and RSA private entry (2048, 3072 and 4096 bits) is called from a helper that returns, and the region
 # must still be zero beneath the entry's own frame. A worker that outgrows its wipe (ctScrubStack2048 in abla/crypto/aes,
-# ctScrubStack4096 in abla/crypto/rsa) fails this; the fixtures' static depth check can't reach the allocator and runtime
+# ctScrubStack8192 in abla/crypto/rsa) fails this; the fixtures' static depth check can't reach the allocator and runtime
 # frames these workers use. Three plain runs and one with a collection at every safe point (ABLA_GC_STRESS=1), the
 # deterministic worst case, since a collection in the middle of an entry makes it deeper. Controls: a byte left in the
 # red zone is found, and gone after ctScrubStack1024.
