@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The runtime's own heap (x86-64 and AArch64 Linux, macOS; the static libc's malloc and free) stops the program on a free it
 # cannot honour (#1139 area 10): a second free of a small block (its class's list would hand it out twice), a second free of a
-# mapping of its own (kept for reuse twice), and a free of an address inside a block. Each must die by the heap's trap
+# mapping of its own (kept for reuse twice), a free of an address inside a block, and a second ablaUnsafeFree (the tracked layer
+# over the heap, checked against its registry slot before it changes). Each must die by the heap's trap
 # (SIGILL); the control, 100k mixed allocations and frees, must pass with __ablaRuntimeHostHeapVerify clean. Release and --fast
 # builds (the --fast one links the compiler's prebuilt host runtime).
 set -euo pipefail
@@ -24,10 +25,10 @@ for kind in release fast; do
     status=0
     timeout 60 "$out/heap-$kind" control > /dev/null 2>&1 || status=$?
     [[ $status == 0 ]] || fail "$kind control: status $status (50 + n: __ablaRuntimeHostHeapVerify found problem n)"
-    for mode in double large interior; do
+    for mode in double large interior unsafe; do
         status=0
         timeout 60 "$out/heap-$kind" "$mode" > /dev/null 2>&1 || status=$?
-        [[ $status == 132 ]] || fail "$kind $mode: status $status, not the heap's trap (132): 30/35 mean the block was handed out twice, 41 the free was accepted"
+        [[ $status == 132 ]] || fail "$kind $mode: status $status, not the heap's trap (132): 30/35/60 mean the block was handed out twice, 41/61 the free was accepted"
     done
 done
 echo "host heap misuse: double frees and interior frees stop the program; the control passes"
