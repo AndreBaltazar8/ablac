@@ -63,4 +63,59 @@ if(ABLA_CRT_INVENTORY)
   # shipped link can switch.
   abla_crt_probe(ablac-crt-candidate /nodefaultlib:libucrt.lib /nodefaultlib:libcmt.lib /defaultlib:libvcruntime.lib
     /errorlimit:0)
+  # Step 1: libcmt's start-up and C++ support of our own (crt-free-start.cpp: no stack cookie checks, no default library).
+  target_sources(ablac-crt-candidate PRIVATE crt-free-start.cpp)
+  set_source_files_properties(crt-free-start.cpp PROPERTIES COMPILE_OPTIONS "/GS-;/Zl")
+  # The /GS exception handlers (__GSHandlerCheck and its _SEH/_EH/_EH4 forms, which check a frame's cookie when an
+  # exception is dispatched through it) and ARM64's __security_push_cookie/__security_pop_cookie stay Microsoft's own:
+  # their members are taken out of libcmt.lib (on LIB, as the link finds it) and linked as objects, as the /MT link
+  # links them today.
+  # LIB is ;-separated on every host, as CMake lists are (PATHS ENV would split it on : off Windows).
+  find_file(ABLA_LIBCMT libcmt.lib PATHS $ENV{LIB} NO_DEFAULT_PATH NO_CACHE)
+  if(NOT ABLA_LIBCMT)
+    message(FATAL_ERROR "libcmt.lib is not on LIB; the candidate link takes its /GS handler members")
+  endif()
+  # llvm-ar (beside clang-cl, or on PATH): llvm-lib lists members but has no /extract.
+  get_filename_component(abla_compiler_directory "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  find_program(ABLA_LLVM_AR llvm-ar HINTS "${abla_compiler_directory}" NO_CACHE REQUIRED)
+  execute_process(COMMAND "${ABLA_LLVM_AR}" t "${ABLA_LIBCMT}" OUTPUT_VARIABLE libcmt_members
+    RESULT_VARIABLE libcmt_status)
+  if(NOT libcmt_status EQUAL 0)
+    message(FATAL_ERROR "${ABLA_LLVM_AR} could not list ${ABLA_LIBCMT}")
+  endif()
+  string(REPLACE "\n" ";" libcmt_members "${libcmt_members}")
+  set(libcmt_directory "${CMAKE_BINARY_DIR}/libcmt-members")
+  set(libcmt_folder amd64)
+  if(ABLA_WINDOWS_MACHINE STREQUAL "arm64")
+    set(libcmt_folder arm64)
+  endif()
+  file(REMOVE_RECURSE "${libcmt_directory}")
+  set(libcmt_objects)
+  foreach(member IN LISTS libcmt_members)
+    string(STRIP "${member}" member)
+    # Only the machine's own folder: ARM64's libcmt also holds arm64ec and amd64 builds of these members.
+    if(member MATCHES "[\\\\/]${libcmt_folder}[\\\\/](gshandler[a-z0-9_]*|secpushpop)\\.obj$")
+      # Each member alone in a directory: the file llvm-ar writes is named after the member, which is a Windows path
+      # (its last part on Windows, all of it elsewhere).
+      set(name "${CMAKE_MATCH_1}")
+      set(scratch "${libcmt_directory}/${name}")
+      file(MAKE_DIRECTORY "${scratch}")
+      execute_process(COMMAND "${ABLA_LLVM_AR}" x "${ABLA_LIBCMT}" "${member}" WORKING_DIRECTORY "${scratch}"
+        RESULT_VARIABLE extract_status)
+      file(GLOB extracted LIST_DIRECTORIES false "${scratch}/*")
+      list(LENGTH extracted extracted_count)
+      if(NOT extract_status EQUAL 0 OR NOT extracted_count EQUAL 1)
+        message(FATAL_ERROR "${ABLA_LLVM_AR} could not extract ${member} from ${ABLA_LIBCMT}")
+      endif()
+      set(object "${libcmt_directory}/${name}.obj")
+      file(RENAME "${extracted}" "${object}")
+      list(APPEND libcmt_objects "${object}")
+    endif()
+  endforeach()
+  if(NOT libcmt_objects)
+    message(FATAL_ERROR "${ABLA_LIBCMT} has no gshandler members")
+  endif()
+  message(STATUS "Candidate link: libcmt members ${libcmt_objects}")
+  set_source_files_properties(${libcmt_objects} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  target_sources(ablac-crt-candidate PRIVATE ${libcmt_objects})
 endif()

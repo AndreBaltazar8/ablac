@@ -218,7 +218,67 @@ and its undefined list. The shipped `ablac.exe` keeps `/MT` until step 7.
    - the native compile-time probes;
    - stage 2 == stage 3 for COFF and PE;
    - cold hello, JSON and self-build measured against the `/MT` compiler on the same runners, with PE and zip sizes no
-     worse.
+     worse;
+   - no security check weaker than the `/MT` build's. The frame-cookie check of the `__GSHandlerCheck` handlers
+     must end the process natively, on x64 and ARM64, when a frame with a corrupted cookie is dispatched through.
+
+### Linking locally (decision #164)
+
+The candidate link also runs on Linux, so steps are iterated there and CI only confirms them. It uses:
+
+- **CRT and SDK.** Fetched with xwin 0.6.7 (nixpkgs `xwin`, source tag 0.6.7) with `--accept-license`, from the Visual
+  Studio 17 release-channel manifest:
+  - build 17.14.37906.3, product 17.14.45;
+  - `manifest_17.json` sha256 44a3e7dc44486c945abdc1fae97e7e22de4d05e80f03b00e9302ba4b72c3e0e3;
+  - package manifest `pkg_manifest_da49c304…`;
+  - CRT 14.44.17.14, the same toolset as the runners' MSVC 19.44;
+  - SDK 10.0.22621.
+
+  They are cached in `~/.cache/xwin` and are never committed, shipped or uploaded.
+- **The rest.** The pinned Windows LLVM SDKs (nix/llvm-windows-*-static-pin.json, sha256 checked), the CI's
+  `windows-compiler-coff` artifact, CMake with clang-cl and lld-link 23.1.3.
+
+**Checked against CI.** The local `ablac-crt-no-ucrt` link of run 45983657838's (x64) and 45983661891's (arm64)
+objects leaves exactly CI's 157 / 153 undefined names.
+
+### Progress
+
+- **Step 0.** The candidate leaves 155 undefined names on x64 (locally).
+  - 128 of them are C-library names: the 157 minus 29 that only libcmt's own start-up needed.
+  - The other 27 are what libcmt supplied:
+    - the entry;
+    - `operator new`/`delete`;
+    - the `/GS` cookie and handlers;
+    - the thread-safe static guards;
+    - `_load_config_used` (which the delay-load helper reads);
+    - the Control Flow Guard pointers;
+    - `__isa_enabled`;
+    - `_alloca_probe`;
+    - `atexit`;
+    - `type_info`'s vftable;
+    - `__tlregdtor`;
+    - `_IsNonwritableInCurrentImage`.
+
+  ARM64 also needs libcmt's out-of-line `_Interlocked*` functions, `__security_push_cookie`/`__security_pop_cookie`
+  and `__GSHandlerCheck_EH` (FH3).
+- **Step 1.** Two sources supply those:
+  - **Microsoft's own members.** The `/GS` exception handlers (`__GSHandlerCheck` and its `_SEH`/`_EH`/`_EH4` forms)
+    and ARM64's `__security_push_cookie`/`__security_pop_cookie` are libcmt.lib's members. CMakeLists.txt takes
+    them out of libcmt.lib with llvm-ar (only the machine's own folder) and links them as objects. That is Microsoft's
+    code under the same terms as today's `/MT` link, as with VCRuntime.
+  - **Ours.** The rest is in tools/windows/static-compiler/crt-free-start.cpp, in C++ built with `/GS- /Zl`, written
+    from the documented interfaces (winnt.h, the `/GS` and `_Interlocked` documentation on learn.microsoft.com, the
+    MSVC thread-safe-statics ABI).
+
+  These are compiler support and start-up (the counterpart of crt1.o and libgcc on Linux), not C library. The
+  candidate then leaves 130 (x64) and 126 (arm64) undefined names, all C-library ones from the list above. The
+  C-library functions are written in Abla (steps 2 to 6).
+
+  Two behaviours stay the same as under `/MT` today:
+  - `atexit` records functions and nothing runs them. The runtime ends the process with ExitProcess, which never ran
+    the C runtime's exit table.
+  - `thread_local` destructors are not run (`__tlregdtor` records nothing). lld's ELF reader's thread-locals hold
+    only memory.
 
 ### Not changed
 
