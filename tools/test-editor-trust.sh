@@ -17,4 +17,5 @@ mkdir -p build
 control=$(EDITOR_TRUST_CONTROL=1 node tools/fuzz/editor-trust/hostile.mjs "$compiler" ct-expression import-provider)
 created=$(printf '%s\n' "$control" | grep -c 'canary CREATED' || true)
 [ "$created" = 2 ] || { printf 'editor trust: a hostile site does not act in a build, so the editor check proves nothing for it:\n%s\n' "$control" >&2; exit 1; }
-node tools/fuzz/editor-trust/hostile.mjs "$compiler" combined prepared-copy-with-hostile-git-config initialize-without-mode workspace-is-root-link
+node tools/fuzz/editor-trust/hostile.mjs "$compiler" combined prepared-copy-with-hostile-git-config initialize-without-mode workspace-is-root-link stdlib-literals \
+    stdlib-literals-build-link

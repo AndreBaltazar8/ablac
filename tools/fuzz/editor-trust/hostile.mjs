@@ -3,7 +3,8 @@
 // (graph-v2: initialize, analyze, document/open, document/change, analyze, shutdown), and checks that
 //   - no canary file appeared (every hostile site tries to create one: compile-time code, a provider, a subparser, a native library, a git config command);
 //   - the `git` and `curl` shims on the service's PATH were never run by anything the workspace names;
-//   - the workspace holds the same files afterwards (nothing written into it) and the package cache and ABLA_CACHE_DIR stayed empty;
+//   - the workspace holds the same files afterwards (nothing written into it), nothing appeared where a symlink in it points, and the
+//     package cache, ABLA_CACHE_DIR and the service's TMPDIR (its private scratch directory, removed when it ends) stayed empty;
 //   - the service answered (initialize and analyze) inside the time and memory bound, or refused with a protocol error, and shut down.
 // Usage: node hostile.mjs COMPILER [CASE ...]
 import { spawn } from 'node:child_process';
@@ -171,6 +172,15 @@ add('import-outside-root', () => ({
     'main.ab': `import "/etc/passwd"\nimport "../../../../../etc/hostname"\nfun main: int = 0\n`,
 }), { bound: 'respond' });
 add('workspace-is-root-link', () => ({}), { workspace: '/', bound: 'respond' });
+// The standard library's literal handlers do run in the editor, and the evaluator keeps state between their steps: that must go in the
+// service's own directory, not the workspace's build/ (#1139 area 8), nor where a symlinked build/ points.
+const literals = () => ({
+    'abla.toml': toml(['name = "evil"', 'entry = "main.ab"']),
+    'main.ab': 'import "abla/regex"\nimport "abla/json"\nfun main: int {\n    val r = $regex("(?<x>a+)b")\n    val p = $regex("ab+")\n' +
+        '    val j = $json { "a": [1, 2], "b": "c" }\n    0\n}\n',
+});
+add('stdlib-literals', literals);
+add('stdlib-literals-build-link', (dir) => ({ ...literals(), '@link:build': `${dir}-outside` }), { outside: true });
 
 function write(dir, files) {
     for (const [name, contents] of Object.entries(files)) {
@@ -257,6 +267,9 @@ for (const c of cases) {
     fs.mkdirSync(cache);
     const env = { PATH: `${shim}:${process.env.PATH}`, HOME: path.join(base, `home-${c.name}`), ABLA_PACKAGE_CACHE: cache, ABLA_CACHE_DIR: path.join(base, `abla-cache-${c.name}`), ABLA_SYSROOT: process.env.ABLA_SYSROOT ?? '', ABLA_STDLIB: process.env.ABLA_STDLIB ?? '', ABLA_DEBUG: '0' };
     fs.mkdirSync(env.HOME);
+    env.TMPDIR = path.join(base, `tmp-${c.name}`);
+    fs.mkdirSync(env.TMPDIR);
+    if (c.outside) fs.mkdirSync(`${dir}-outside`);
     if (c.setup) {
         const run = (args) => spawnSync(compiler, args, { env: { ...env, PATH: process.env.PATH }, cwd: dir, encoding: 'utf8', timeout: 120000 });
         c.setup(dir, canary, env, run);
@@ -279,6 +292,8 @@ for (const c of cases) {
     if (c.workspace === undefined && tree(dir) !== before) problems.push('the workspace changed');
     if (!c.setup && fs.readdirSync(cache).length) problems.push(`the package cache holds ${fs.readdirSync(cache).join(',')}`);
     if (fs.existsSync(env.ABLA_CACHE_DIR) && fs.readdirSync(env.ABLA_CACHE_DIR).length) problems.push('ABLA_CACHE_DIR was written');
+    if (c.outside && fs.readdirSync(`${dir}-outside`).length) problems.push(`written through the build/ symlink: ${fs.readdirSync(`${dir}-outside`).join(',')}`);
+    if (fs.readdirSync(env.TMPDIR).length) problems.push(`the service left ${fs.readdirSync(env.TMPDIR).join(',')} in its TMPDIR`);
     if (summary.steps.some((s) => s.endsWith('timeout'))) problems.push('no answer in time');
     if (summary.killed) problems.push('had to be killed');
     if (c.minPending !== undefined && (summary.pending ?? 0) < c.minPending) problems.push(`only ${summary.pending ?? 0} blocked compile-time sites reported (the workspace has more): the analysis stopped early`);

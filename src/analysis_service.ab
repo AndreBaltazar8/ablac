@@ -21,6 +21,7 @@ import "lexer.ab"
 import "gc_stress_scope.ab"
 import "analysis_budget.ab"
 import "abla/integer"
+import "eval.ab"
 
 val ABLA_ANALYSIS_PROTOCOL_VERSION: int = 1
 val ABLA_ANALYSIS_MAX_DOCUMENTS: int = 20000
@@ -1740,9 +1741,32 @@ fun bootstrapAnalysisSampleMemory(label: string): void {
     return
 }
 
+/** A new directory only this user can read, from `mktemp -d` (under TMPDIR, else /tmp): "" when it can't be made. */
+fun bootstrapAnalysisScratchDirectory(): string {
+    val made = linuxCommand("mktemp").argument("-d").argument("-t").argument("abla-analysis.XXXXXXXX").capture()
+    var path = made.output
+    if (path.endsWith("\n")) path = path.slice(0, path.size - 1)
+    if (made.status != 0 || !path.startsWith("/")) "" else path
+}
+
 fun bootstrapAnalysisService(): int {
     // The editor's collections stop the service while it answers: four threads mark and sweep (ABLA_GC_WORKERS overrides).
     runtimeMemorySetGcWorkers(4)
+    // What the evaluator keeps between steps (the standard library's literal handlers run in the editor too) goes in
+    // a private directory of the service's, removed when it ends: never into the workspace's build/ (#1139 area 8).
+    val scratch = bootstrapAnalysisScratchDirectory()
+    if (scratch == "") {
+        linuxWriteStandardError("error: the analysis service cannot make its scratch directory (mktemp -d)\n")
+        return 1
+    }
+    bootstrapProcessScratchBase = scratch
+    val status = bootstrapAnalysisServiceLoop()
+    Path(scratch).removeTree()
+    status
+}
+
+/** Answers requests from standard input until it ends; the status the service exits with. */
+fun bootstrapAnalysisServiceLoop(): int {
     val service = BootstrapAnalysisService([], [], 1, false, true)
     val configured = linuxEnvironment("ABLA_ANALYSIS_BUDGET_MS").value.parseInt() ?? 0
     val budget = if (configured > 0 && configured <= 600000) configured else 60000
