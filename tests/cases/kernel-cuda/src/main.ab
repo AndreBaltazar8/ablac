@@ -9,6 +9,7 @@ import "rmsnorm.ab"
 import "q8.ab"
 import "exp.ab"
 import "pick4.ab"
+import "quad.ab"
 import "groups.ab"
 import "q8fast.ab"
 import "guards.ab"
@@ -105,6 +106,35 @@ trusted fun main: int {
     var pickEqual = floatAt(cpuPick, 1) != floatAt(cpuPick, 0)
     for (i in 0 until quads) if (floatAt(gpuPick, i) != floatAt(cpuPick, i)) pickEqual = false
     println("pick4: $quads quads chosen by an if, GPU equal to CPU $pickEqual")
+
+    // quad4: f32x4 values the kernel builds (#1298), as parameters, results and a var set in both branches. Small
+    // integers and halves, so every sum is exact on both backends.
+    val quadCount = 4096
+    val qx = floats(quadCount * 4 + 4) { i -> f32FromInt((i * 7) % 13 - 6) * f32(0.5) }
+    val qw = floats(quadCount * 4) { i -> f32FromInt(i % 5 - 2) }
+    val cpuQuad = floats(quadCount) { i -> f32(0.0) }
+    val cpuQx = KernelF32Buffer(nativePointerAddress(qx.address), quadCount * 4 + 4)
+    val cpuQw = KernelF32Buffer(nativePointerAddress(qw.address), quadCount * 4)
+    val cpuQo = KernelF32Buffer(nativePointerAddress(cpuQuad.address), quadCount)
+    kernelRunCpu((quadCount + 255) / 256, 256) { quad4(cpuQx, cpuQw, cpuQo, quadCount) }
+    val dquadX = device.allocate((quadCount * 4 + 4) * 4)
+    val dquadW = device.allocate(quadCount * 4 * 4)
+    val dquadOut = device.allocate(quadCount * 4)
+    if (dquadX == null || dquadW == null || dquadOut == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val gpuQuad = floats(quadCount) { i -> f32(0.0) }
+    if (!device.upload(dquadX, qx) || !device.upload(dquadW, qw) ||
+        !device.launch("quad4", (quadCount + 255) / 256, 256, cudaKernelArguments().buffer(dquadX.floats())
+            .buffer(dquadW.floats()).buffer(dquadOut.floats()).integer(quadCount)) || !device.download(dquadOut, gpuQuad)) {
+        println("kernel-cuda: quad4: ${device.error}")
+        return 1
+    }
+    var quadEqual = true
+    var quadNonzero = 0
+    for (i in 0 until quadCount) {
+        if (int(f32ToBits(floatAt(gpuQuad, i))) != int(f32ToBits(floatAt(cpuQuad, i)))) quadEqual = false
+        if (floatAt(cpuQuad, i) != f32(0.0)) quadNonzero = quadNonzero + 1
+    }
+    println("quad4: $quadCount built f32x4 dots, GPU bits equal to CPU ${quadEqual && quadNonzero > quadCount / 2}")
 
     // Atomics: countThreads over vadd's 100000 threads, and sumGroups (the last group adds the partials), twice each.
     val words = nativeByteBuffer(4 * 400)

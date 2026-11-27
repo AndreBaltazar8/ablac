@@ -1,0 +1,29 @@
+// f32x4 values a kernel builds itself (#1298): f32x4(a, b, c, d), as a parameter and a result of the functions it calls,
+// and a `var` set in both branches of an `if`, as abla-grad's NVFP4 matvec reads four floats where load4 cannot (an
+// unaligned offset). The inputs are small integers and halves, so every product and sum is exact and the GPU's fma and the
+// CPU's two roundings give the same bits; each lane has its own weight, so lanes out of order change the result.
+import "abla/kernel"
+import "abla/simd"
+
+/** `a` with each lane times `scale`, built lane by lane. */
+fun quadScaled(a: f32x4, scale: f32): f32x4 = f32x4(a.get(0) * scale, a.get(1) * scale, a.get(2) * scale, a.get(3) * scale)
+
+/** sum + the dot product of `w` and `v`. */
+fun quadDot(sum: f32, w: f32x4, v: f32x4): f32 =
+    kernelFma(w.get(3), v.get(3), kernelFma(w.get(2), v.get(2), kernelFma(w.get(1), v.get(1), kernelFma(w.get(0), v.get(0), sum))))
+
+/** out[i] = x[4i + 1 ..] (unaligned: read one by one, or load4 where aligned) dotted with w's quad i, halved, plus the
+ *  same four read by an `if` that picks a built vector for odd i. */
+@kernel
+fun quad4(x: KernelF32Buffer, w: KernelF32Buffer, out: KernelF32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) {
+        val base = i * 4 + 1
+        var v = f32x4(f32(0.0), f32(0.0), f32(0.0), f32(0.0))
+        if (x.isAligned(base, 16)) v = x.load4(base)
+        else v = f32x4(x.load(base), x.load(base + 1), x.load(base + 2), x.load(base + 3))
+        val u = if (i % 2 == 0) x.load4(base) else f32x4(x.load(base + 3), x.load(base + 2), x.load(base + 1), x.load(base))
+        val weights = quadScaled(w.load4(i * 4), f32(0.5))
+        out.store(i, quadDot(quadDot(f32(0.0), weights, v), f32x4(f32(1.0), f32(2.0), f32(4.0), f32(8.0)), u))
+    }
+}

@@ -3008,7 +3008,9 @@ only through its buffers: `KernelF32Buffer`, `KernelU32Buffer`,
 any alignment for packed data such as GGML blocks). A buffer is an address and
 an element count: an index outside it loads 0 and stores nothing, on every
 backend. `KernelF32Buffer.load4(i)` reads four elements as an `f32x4`, one
-16-byte load on a GPU when they are inside the buffer and aligned. Ordinary
+16-byte load on a GPU when they are inside the buffer and aligned; a kernel also
+makes its own with `f32x4(a, b, c, d)`, and passes and returns them as any
+value. Ordinary
 code does not make a buffer from an address: abla/kernel/cuda's
 `CudaKernelMemory.floats()`, `words()`, `halves()` and `raw()` give the device memory's, and a
 trusted function that owns host memory and keeps it alive builds one for the CPU
