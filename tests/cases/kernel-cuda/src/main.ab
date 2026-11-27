@@ -11,6 +11,7 @@ import "exp.ab"
 import "pick4.ab"
 import "quad.ab"
 import "words.ab"
+import "subgroups.ab"
 import "groups.ab"
 import "q8fast.ab"
 import "guards.ab"
@@ -284,6 +285,66 @@ trusted fun main: int {
         if (highWords.load(i) != (partnerLane + 1) * 2 || lowWords.load(i) != partnerLane) shuffleRight = false
     }
     println("shuffle: $shuffleThreads lanes, the subgroup maximum with ties to the lowest lane and 64-bit partners on the GPU $shuffleRight")
+
+    // subgroupOps (#1300): shuffles by lane, up and down, votes, the subgroup barrier and the ballot argmax, against each
+    // subgroup's expected values; kernelCountTrailingZeros on the CPU too.
+    val opsThreads = 1024
+    val opsX = floats(opsThreads) { i -> subgroupInput(i) }
+    val opsIds = nativeByteBuffer(opsThreads * 4)
+    for (i in 0 until opsThreads) storeWord(opsIds, i * 4, subgroupId(i))
+    val dox = device.allocate(opsThreads * 4)
+    val doids = device.allocate(opsThreads * 4)
+    val doout = device.allocate(opsThreads * 16)
+    val dowords = device.allocate(opsThreads * 32)
+    if (dox == null || doids == null || doout == null || dowords == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    val opsOut = nativeByteBuffer(opsThreads * 16)
+    val opsWords = nativeByteBuffer(opsThreads * 32)
+    if (!device.upload(dox, opsX) || !device.upload(doids, opsIds) || !device.launch("subgroupOps", opsThreads / 256, 256,
+        cudaKernelArguments().buffer(dox.floats()).buffer(doids.words()).buffer(doout.floats()).buffer(dowords.words())) ||
+        !device.download(doout, opsOut) || !device.download(dowords, opsWords)) {
+        println("kernel-cuda: subgroupOps: ${device.error}")
+        return 1
+    }
+    val outFloats = KernelF32Buffer(nativePointerAddress(opsOut.address), opsThreads * 4)
+    val outWords = KernelU32Buffer(nativePointerAddress(opsWords.address), opsThreads * 8)
+    var opsRight = kernelCountTrailingZeros(0) == 64 && kernelCountTrailingZeros(8) == 3 &&
+        kernelCountTrailingZeros(1 << 40) == 40 && kernelCountTrailingZeros(-4) == 2
+    var anyFalse = 0
+    var allFalse = 0
+    for (i in 0 until opsThreads) {
+        val lane = i % 32
+        val base = i - lane
+        val upFrom = if (lane >= 3) i - 3 else i
+        val downFrom = if (lane + 2 < 32) i + 2 else i
+        if (outFloats.load(i * 4) != subgroupInput(base) || outFloats.load(i * 4 + 1) != subgroupInput(base + (lane + 5) % 32) ||
+            outFloats.load(i * 4 + 2) != subgroupInput(upFrom) || outFloats.load(i * 4 + 3) != subgroupInput(downFrom)) opsRight = false
+        val below = if (lane >= 1) i - 1 else i
+        if (outWords.load(i * 8) != (subgroupId(below) ^ 0x5a5a5a5a) || outWords.load(i * 8 + 1) != subgroupId(below) ||
+            outWords.load(i * 8 + 2) != subgroupId(base + 31)) opsRight = false
+        var ballot = 0
+        var anyBig = false
+        var allSmall = true
+        var top = subgroupInput(base)
+        var winner = 0
+        for (l in 0 until 32) {
+            val value = subgroupInput(base + l)
+            if (value > f32(0.0)) ballot = ballot | (1 << l)
+            if (value > f32(8.0)) anyBig = true
+            if (!(value < f32(100.0))) allSmall = false
+            if (value > top) {
+                top = value
+                winner = l
+            }
+        }
+        if (!anyBig) anyFalse = anyFalse + 1
+        if (!allSmall) allFalse = allFalse + 1
+        if (outWords.load(i * 8 + 3) != ballot || outWords.load(i * 8 + 4) != (if (anyBig) 1 else 0) ||
+            outWords.load(i * 8 + 5) != (if (allSmall) 1 else 0) || outWords.load(i * 8 + 6) != winner ||
+            outWords.load(i * 8 + 7) != subgroupId(base + winner)) opsRight = false
+    }
+    // Both answers of each vote occur.
+    if (anyFalse == 0 || anyFalse == opsThreads || allFalse == 0 || allFalse == opsThreads) opsRight = false
+    println("subgroups: $opsThreads lanes, shuffles by lane, up and down, ballot, any, all, the barrier and the ballot argmax on the GPU $opsRight")
 
     // NVFP4 matvec: one subgroup per row on the GPU (8 warps per group), one thread per row on the CPU.
     val rows = 1000

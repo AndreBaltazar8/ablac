@@ -3038,7 +3038,7 @@ recursive); the buffers, also in `val` locals; `kernelGlobalId`, `kernelLocalId`
 so a kernel written for any size runs on both); the group's shared memory,
 `kernelSharedF32(count)` and `kernelSharedU32(count)` with a constant `count`,
 and `kernelBarrier()` (CUDA's `__shared__` and `__syncthreads`); `kernelFma`,
-`kernelSqrt`, `kernelRsqrt`, `kernelExp` and `kernelF16ToF32`; `kernelSubgroupShuffleXor` and `kernelSubgroupShuffleXorInt` (a lane's value from lane xor distance, CUDA's `__shfl_xor_sync`); `KernelU32Buffer.atomicAdd` (one indivisible add, giving the old value) and `kernelFence()` (CUDA's `__threadfence`), with which the last group to finish can combine every group's results; and abla/float's bit and conversion
+`kernelSqrt`, `kernelRsqrt`, `kernelExp` and `kernelF16ToF32`; `kernelSubgroupShuffleXor` and `kernelSubgroupShuffleXorInt` (a lane's value from lane xor distance, CUDA's `__shfl_xor_sync`), `kernelSubgroupShuffle`, `kernelSubgroupShuffleUp` and `kernelSubgroupShuffleDown` with their `Int` forms (`__shfl_sync`, `__shfl_up_sync`, `__shfl_down_sync`; `kernelSubgroupShuffle(v, 0)` broadcasts lane 0's), the votes `kernelSubgroupBallot` (a mask from 0 to 2^32 - 1), `kernelSubgroupAny` and `kernelSubgroupAll`, `kernelSubgroupBarrier()` (`__syncwarp`) and `kernelCountTrailingZeros` (64 for 0), every lane of the subgroup calling them together; `KernelU32Buffer.atomicAdd` (one indivisible add, giving the old value) and `kernelFence()` (CUDA's `__threadfence`), with which the last group to finish can combine every group's results; and abla/float's bit and conversion
 functions. Anything else (a string, an array, a class value, a closure, an
 allocation, I/O, a native call) is refused when the program is built, naming
 what and where:

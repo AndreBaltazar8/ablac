@@ -1,0 +1,53 @@
+// Subgroup shuffles by lane, up and down, votes and the subgroup barrier (#1300), each lane writing what it got; the GPU's
+// answers are checked against each subgroup's expected values (a CPU subgroup is one thread). Also abla-grad's argmax
+// (dspark_step): the lowest lane holding the maximum, by kernelCountTrailingZeros of a ballot, and that lane's id.
+import "abla/kernel"
+import "abla/float"
+
+/** Thread i writes four floats at out[4i] (lane 0's x, lane (l + 5) % 32's, the lane 3 below's, the lane 2 above's) and
+ *  eight words at words[8i] (the 64-bit id one lane below as two words, lane 31's id, the ballot of x > 0, any x > 8,
+ *  all x < 100, the argmax lane and its id). Every thread runs every operation: all lanes take part. */
+@kernel
+fun subgroupOps(x: KernelF32Buffer, ids: KernelU32Buffer, out: KernelF32Buffer, words: KernelU32Buffer) {
+    val i = kernelGlobalId()
+    val lane = kernelSubgroupLane()
+    val v = x.load(i)
+    val id = ids.load(i)
+    val first = kernelSubgroupShuffle(v, 0)
+    val rotated = kernelSubgroupShuffle(v, (lane + 5) % 32)
+    val up = kernelSubgroupShuffleUp(v, 3)
+    val down = kernelSubgroupShuffleDown(v, 2)
+    val wideBelow = kernelSubgroupShuffleUpInt(id * 4294967296 + (id ^ 0x5a5a5a5a), 1)
+    val last = kernelSubgroupShuffleInt(id, 31)
+    val ballot = kernelSubgroupBallot(v > f32(0.0))
+    val anyBig = kernelSubgroupAny(v > f32(8.0))
+    val allSmall = kernelSubgroupAll(v < f32(100.0))
+    val top = kernelSubgroupMax(v)
+    val winner = kernelCountTrailingZeros(kernelSubgroupBallot(v == top))
+    val winnerId = kernelSubgroupShuffleInt(id, winner)
+    kernelSubgroupBarrier()
+    out.store(i * 4, first)
+    out.store(i * 4 + 1, rotated)
+    out.store(i * 4 + 2, up)
+    out.store(i * 4 + 3, down)
+    words.store(i * 8, wideBelow & 0xffffffff)
+    words.store(i * 8 + 1, wideBelow >>> 32)
+    words.store(i * 8 + 2, last)
+    words.store(i * 8 + 3, ballot)
+    words.store(i * 8 + 4, if (anyBig) 1 else 0)
+    words.store(i * 8 + 5, if (allSmall) 1 else 0)
+    words.store(i * 8 + 6, winner)
+    words.store(i * 8 + 7, winnerId)
+}
+
+/** subgroupOps' x[i]: halves from -3 to 3 (the maximum tied in most subgroups), 10 more where i % 97 == 3 and 200 more
+ *  where i % 211 == 7, so each vote has both answers across subgroups. */
+fun subgroupInput(i: int): f32 {
+    var value = f32FromInt((i * 7) % 13 - 6) * f32(0.5)
+    if (i % 97 == 3) value = value + f32(10.0)
+    if (i % 211 == 7) value = value + f32(200.0)
+    value
+}
+
+/** subgroupOps' ids[i]: distinct, below 2^20. */
+fun subgroupId(i: int): int = (i * 7919 + 13) % 1000003
