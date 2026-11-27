@@ -15,6 +15,10 @@ done
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 fail() { echo "release-check windows: $1" >&2; exit 1; }
+# No network (tools/lib/test-offline.sh): the windows-fixpoint check's `gh run view 1` gets the recorded empty answer (run 1 has no
+# Release jobs), and a call that reaches further fails the test. The convergence comparison below is this test's own.
+. "$root/tools/lib/test-offline.sh"
+offline_setup "$work"
 cd "$root"
 "$compiler" build tools/pe-info/main.ab -o "$work/pe-info" --fast --no-cache > "$work/pe-info.log" 2>&1 || { cat "$work/pe-info.log" >&2; fail "pe-info did not build"; }
 "$compiler" build tools/windows/implib.ab -o "$work/implib" --fast --no-cache > "$work/implib.log" 2>&1 || { cat "$work/implib.log" >&2; fail "implib did not build"; }
@@ -37,7 +41,7 @@ printf 'toolchain' > "$work/base/abla-toolchain-x86_64-linux.tar.gz"
 (cd "$work/base" && for name in ablac-x86_64-linux abla-toolchain-x86_64-linux.tar.gz; do sha256sum "$name" > "$name.sha256"; done; ls | sort) > "$work/expected"
 printf '{"passed":false}\n' > "$work/convergence.json"
 run() { # artifacts-dir out-dir -> the output lines
-    "$root/tools/release-check.sh" v9.9.9 1 "$work/stage2" --artifacts "$1" --assets-from "$work/expected" --out "$2" \
+    PATH="$offline:$PATH" "$root/tools/release-check.sh" v9.9.9 1 "$work/stage2" --artifacts "$1" --assets-from "$work/expected" --out "$2" \
         --source-ref 0000000000000000000000000000000000000000 --lineage v9.9.8 \
         --convergence-comparison "$work/convergence.json" 2>&1 || true
 }
@@ -94,4 +98,5 @@ cp "$work/good.exe" "$work/arm64-tree/abla-toolchain-aarch64-windows/bin/ablac.e
 (cd "$work/arm64-tree" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | zip -q -X "$work/arm64-wrong-machine.zip" -@)
 add_zip "$work/arm64-wrong-machine.zip" ablac-windows-arm64.zip
 judge arm64-wrong-machine FAIL 'expected console PE for aarch64' windows-arm64
+offline_check
 echo "release-check windows: the windows check passes the packaged toolchain and fails a missing compiler, missing import lists, a stray entry, a non-PE compiler, a C runtime import and a missing version string"
