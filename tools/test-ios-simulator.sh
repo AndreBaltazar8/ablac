@@ -78,24 +78,64 @@ xcrun --sdk iphonesimulator clang \
 codesign --force --sign - "$directory/ios-caller"
 codesign --force --sign - "$directory/ios-baseline"
 codesign --force --sign - "$directory/ios-deadline-negative"
-xcrun simctl list devices available --json > "$directory/simulators.json"
-node - "$directory/simulators.json" "$directory/ios-caller" "$directory/ios-baseline" "$directory/ios-deadline-negative" <<'SIM'
+xcrun simctl list runtimes available --json > "$directory/runtimes.json"
+node - "$directory/runtimes.json" "$directory/ios-caller" "$directory/ios-baseline" "$directory/ios-deadline-negative" <<'SIM'
 const assert = require("assert");
 const { spawnSync } = require("child_process");
 const fs = require("fs"), path = require("path");
-const [simulators, caller, baseline, negative] = process.argv.slice(2);
-const allDevices = JSON.parse(fs.readFileSync(simulators, "utf8")).devices;
-const devices = Object.entries(allDevices).filter(([runtime]) => runtime.includes(".iOS-"))
-  .flatMap(([, group]) => group.filter((device) => device.isAvailable));
-assert.ok(devices.length, "No available iOS Simulator runtime; this gate does not download one");
-const rank = (device) => (device.state !== "Booted" ? 1 : 0);
-devices.sort((a, b) => rank(a) - rank(b) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) || (a.udid < b.udid ? -1 : a.udid > b.udid ? 1 : 0));
-const device = devices[0];
-const udid = device.udid;
-const bootedHere = device.state !== "Booted";
-console.log("iOS Simulator:", device.name, udid);
+const [runtimesFile, caller, baseline, negative] = process.argv.slice(2);
+// A device of our own on the newest iOS runtime, created, booted and deleted here: a stock device the runner image left
+// in an unknown state sat in bootstatus for 240 s twice on 2026-11-27 (runs 46017227075, 46057162825).
+const runtimes = JSON.parse(fs.readFileSync(runtimesFile, "utf8")).runtimes
+  .filter((runtime) => runtime.isAvailable && (runtime.platform === "iOS" || runtime.identifier.includes(".iOS-")));
+assert.ok(runtimes.length, "No available iOS Simulator runtime; this gate does not download one");
+const versionKey = (runtime) => runtime.version.split(".").map(Number);
+runtimes.sort((a, b) => { const x = versionKey(a), y = versionKey(b); for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (y[i] || 0) - (x[i] || 0); return 0; });
+const runtime = runtimes[0];
+const types = (runtime.supportedDeviceTypes || []);
+const type = types.find((t) => t.productFamily === "iPhone") || types[0];
+assert.ok(type, "iOS Simulator runtime " + runtime.identifier + " lists no device type");
 const simctl = (args, options) => spawnSync("xcrun", ["simctl", ...args], { encoding: "utf8", ...options });
-const checked = (result, what) => { assert.strictEqual(result.status, 0, what + ": " + (result.status === null ? result.signal : result.status) + " " + (result.stderr || "")); return result; };
+const outcome = (result) => (result.status === null ? (result.signal || (result.error && result.error.code) || "no status") : String(result.status));
+const checked = (result, what) => { assert.strictEqual(result.status, 0, what + ": " + outcome(result) + " " + (result.stderr || "")); return result; };
+const created = checked(simctl(["create", "abla-ios-test-" + process.pid, type.identifier, runtime.identifier], { timeout: 120000 }), "create");
+const udid = created.stdout.trim();
+assert.match(udid, /^[0-9A-F-]{36}$/, "simctl create printed " + JSON.stringify(created.stdout));
+console.log("iOS Simulator:", type.name, runtime.name, udid);
+// BEGIN simulatorBoot (also exercised without a Simulator by tools/test-ios-simulator-control.sh)
+// Boots the device and waits until it is ready, within bounds: at most two boots, each waited for by bootstatus for at
+// most readyTimeout. A failed boot or wait prints simctl's output and the device's state, shuts the device down and
+// boots once more; a second failure throws.
+function simulatorBoot(simctl, udid, report, bootTimeout = 120000, readyTimeout = 420000) {
+  const outcome = (result) => (result.status === null ? (result.signal || (result.error && result.error.code) || "no status") : String(result.status));
+  const tail = (result) => ((result.stdout || "") + (result.stderr || "")).trim().split("\n").slice(-8).join("\n");
+  const state = () => {
+    const list = simctl(["list", "devices", "--json"], { timeout: 60000 });
+    try {
+      const device = Object.values(JSON.parse(list.stdout).devices).flat().find((d) => d.udid === udid);
+      return device ? device.state : "not listed";
+    } catch (error) { return "unknown (simctl list: " + outcome(list) + ")"; }
+  };
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const boot = simctl(["boot", udid], { timeout: bootTimeout });
+    // simctl refuses to boot a device that is already booted; bootstatus then decides.
+    const booted = boot.status === 0 || /current state: Booted/.test(boot.stderr || "");
+    if (booted) {
+      const ready = simctl(["bootstatus", udid], { timeout: readyTimeout });
+      if (ready.status === 0) { report("iOS Simulator: booted (attempt " + attempt + ")"); return; }
+      report("iOS Simulator: bootstatus " + outcome(ready) + " (attempt " + attempt + "):\n" + tail(ready));
+    } else {
+      report("iOS Simulator: boot " + outcome(boot) + " (attempt " + attempt + "):\n" + tail(boot));
+    }
+    report("iOS Simulator: device state " + state());
+    if (attempt === 1) {
+      report("iOS Simulator: shutting the device down and booting it once more");
+      simctl(["shutdown", udid], { timeout: bootTimeout });
+    }
+  }
+  throw new Error("iOS Simulator: the device did not boot after two attempts (simctl's output and state are above)");
+}
+// END simulatorBoot
 // BEGIN simulatorDeadlineControl (also exercised without a Simulator by the fixture test)
 function simulatorDeadlineControl(spawn, waitForReady, report) {
   const marker = "ios-deadline-control: waiting for SIGALRM";
@@ -109,8 +149,7 @@ function simulatorDeadlineControl(spawn, waitForReady, report) {
 }
 // END simulatorDeadlineControl
 try {
-  if (bootedHere) checked(simctl(["boot", udid], { timeout: 60000 }), "boot");
-  checked(simctl(["bootstatus", udid, "-b"], { timeout: 240000, stdio: "inherit" }), "bootstatus");
+  simulatorBoot(simctl, udid, (message) => console.log(message));
   // A C-only process separates launch-service readiness from Abla startup.
   console.log("iOS Simulator: launch pure C baseline");
   // A C process that does nothing can still time out while the Simulator's launch services finish starting ("Waiting on
@@ -147,6 +186,7 @@ try {
     assert.ok(result.stdout.includes("Abla C export returned 42"));
   }
 } finally {
-  if (bootedHere) simctl(["shutdown", udid], { timeout: 60000 });
+  simctl(["shutdown", udid], { timeout: 60000 });
+  simctl(["delete", udid], { timeout: 60000 });
 }
 SIM
