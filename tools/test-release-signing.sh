@@ -71,7 +71,15 @@ fresh; ghost 0000000000000000000000000000000000000000000000000000000000000000 SH
 refuses 'a missing SHA256SUMS.tmp with another hash' "$work/rel"
 fresh; ghost e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 other.tmp
 refuses 'a missing file with the hash of nothing' "$work/rel"
-echo 'a listed file missing from the directory refused (the v0.2.73 line tolerated)'
+# v0.2.67's two lines as published: release-check's empty marker and a partial temporary list.
+fresh; ghost e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 .release-check
+ghost ab186c87ae549a4a732441f983e56f70b09770bc0260ef83db103d1914e7e9dd SHA256SUMS.tmp
+accepts "$work/rel"
+fresh; ghost 0000000000000000000000000000000000000000000000000000000000000000 .release-check
+refuses 'a missing .release-check with another hash' "$work/rel"
+fresh; ghost ab186c87ae549a4a732441f983e56f70b09770bc0260ef83db103d1914e7e9dd other.tmp
+refuses "a missing file with v0.2.67's list hash under another name" "$work/rel"
+echo 'a listed file missing from the directory refused (the v0.2.67-v0.2.73 scratch lines tolerated)'
 
 # The real signer: sign-release.sh signs a directory and verifies it against the repository's public key, so with
 # a key that is not the project's it must refuse (the guard against shipping with the wrong secret).

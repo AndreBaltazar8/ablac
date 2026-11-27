@@ -19,7 +19,7 @@ shift
 fail() { printf 'verify-release: REFUSED: %s\n' "$*" >&2; exit 1; }
 
 [[ -f $key ]] || fail "no public key at $key"
-[[ -f $dir/SHA256SUMS ]] || fail "no SHA256SUMS in $dir"
+[[ -f $dir/SHA256SUMS ]] || fail "no SHA256SUMS in $dir (download it and SHA256SUMS.sig with the assets; a draft has neither until its publish job signs it, and releases before $(cat "$here/first-signed-release" 2>/dev/null || echo the first signed one) are not signed)"
 [[ -f $dir/SHA256SUMS.sig ]] || fail "no SHA256SUMS.sig in $dir"
 command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen is needed to verify the signature"
 
@@ -57,11 +57,16 @@ else
         case $name in SHA256SUMS | SHA256SUMS.sig) continue ;; esac
         check "$name"; count=$((count + 1))
     done < <(find "$dir" -type f | LC_ALL=C sort)
-    # A listed file that is not in DIR is a refusal too, except the one line v0.2.73 signed by mistake: its own empty
-    # temporary list (sha256 of nothing, SHA256SUMS.tmp), which no release since carries.
+    # A listed file that is not in DIR is a refusal too, except the scratch files v0.2.67 to v0.2.73 signed by mistake and
+    # never published, each only with the hash that release signed: their own temporary list SHA256SUMS.tmp (empty in
+    # v0.2.68-v0.2.73; in v0.2.67 a partial list, ab186c87...) and release-check's empty marker .release-check (v0.2.67).
+    # No release since carries them.
+    empty=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     while read -r want name; do
         [[ -f $dir/$name ]] && continue
-        [[ $name == SHA256SUMS.tmp && $want == e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]] && continue
+        [[ $name == SHA256SUMS.tmp && $want == "$empty" ]] && continue
+        [[ $name == SHA256SUMS.tmp && $want == ab186c87ae549a4a732441f983e56f70b09770bc0260ef83db103d1914e7e9dd ]] && continue
+        [[ $name == .release-check && $want == "$empty" ]] && continue
         fail "$name is listed in the signed SHA256SUMS but missing from $dir"
     done < "$listed"
 fi
