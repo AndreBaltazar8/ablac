@@ -451,6 +451,7 @@ test-serial: ablac
 	tools/test-self-hosted.sh $(COMPILER)
 	tools/test-inferred-results.sh $(COMPILER)
 	tools/test-when-null.sh $(COMPILER)
+	tools/test-when-is-group.sh $(COMPILER)
 	tools/test-init-order.sh $(COMPILER)
 	tools/test-runtime-internal.sh $(COMPILER)
 	tools/test-transform-targets.sh $(COMPILER)

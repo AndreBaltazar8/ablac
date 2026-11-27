@@ -682,7 +682,9 @@ fun main {
 - Using a nullable value as non-null is an error that names the type, such
   as `member:nullable:Node.value` or `arithmetic.type@..:nullable:i64:i64`.
 - In a `when` whose subject is a nullable `val` or parameter, the arms after
-  a `null ->` arm see the non-null type.
+  a `null ->` arm see the non-null type. An `is T ->` arm sees it as `T`
+  wherever it stands, and an arm shared by `is` patterns only
+  (`is A, is B -> ...`) sees the non-null type.
 - `a?.b` and `a ?? b` handle a nullable value in one expression; see
   [null-safe operators](#null-safe-operators).
 
