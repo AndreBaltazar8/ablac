@@ -1740,22 +1740,22 @@ async function unchangedInputs() {
 }
 
 const tests = { unchanged_inputs: unchangedInputs, compound_assignment: () => compoundAssignmentFix('graph-v1'), compound_assignment_v2: () => compoundAssignmentFix('graph-v2'), index_loop: () => indexLoopFix('graph-v1'), index_loop_v2: () => indexLoopFix('graph-v2'), logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
-async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false, strings = false, fields = false, extended = false, parens = false, loops = false, imported = false, globals = false) {
+async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false, strings = false, fields = false, extended = false, parens = false, loops = false, imported = false, globals = false, arrays = false) {
     // An imported class: declared in its own module.
-    const head = (imported ? 'import "./point.ab"\n' : '') + (locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
+    const head = (imported ? 'import "./point.ab"\n' : '') + (arrays ? 'fun answer(left: int, right: int, xs: array<int>): int ' : locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
         : fields ? 'fun answer(left: int, right: int, p: Point): int = ' : 'fun answer(left: int, right: int): int = ');
     // A field of another type (`tags`) is never read, but does not keep the class from the checker.
     const point = 'class Point(val x: int, var y: int, val label: string = "p", val tags: array<string> = []) {\n    fun total(): int = this.x + this.y\n    fun scaled(k: int): int = this.x * k\n    fun name(): string = this.label\n}\n';
     const block = (...lines) => '{\n' + lines.map(line => '    ' + line + '\n').join('') + '}';
     const initial = calls ? 'step(left) + right' : locals ? block('val t = left + right', 't') : returns ? block('if (left < 0) return right', 'left + right') : strings ? 'text.size + left' : fields ? 'p.x + left'
-        : globals ? 'LIMIT + left' : loops ? block('var s = 0', 'for (i in 0 until left) s += i', 's + right') : 'left + right';
+        : globals ? 'LIMIT + left' : arrays ? block('var s = xs.size', 'for (x in xs) s += x', 's + left') : loops ? block('var s = 0', 'for (i in 0 until left) s += i', 's + right') : 'left + right';
     // A global `i`: the loop's `i` ends with the loop, so a later `i` is the global, left to full typing.
     const rest = '\nfun later(): int = 7\n' + (loops ? 'val i: int = 3\n' : '')
         // Global values after the function: their offsets move with each edit. `NAMES` is not a scalar.
         + (globals ? 'val LIMIT: int = 40\nval scale = 3\nvar counter: int = 0\nval NAMES: array<string> = []\n' : '') + (calls
         ? 'fun step(n: int): int = n + 1\nfun shift(n: int): int = n * 2\n' : '') + (fields && !imported ? point : '');
-    const main = 'import "./dep.ab"\n' + (imported ? 'import "./point.ab"\n' : '') + (extended ? 'import "./ext.ab"\n' : '') + 'fun main: int = answer(2, 3' + (strings ? ', "abc"' : fields ? ', Point(4, 5)' : '') + ') + later()\n';
-    const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : locals ? 'checked-locals' : returns ? 'checked-returns' : strings ? 'checked-strings' : extended ? 'checked-extended' : imported ? 'checked-imported' : globals ? 'checked-globals' : loops ? 'checked-loops' : parens ? 'checked-parens' : fields ? 'checked-fields' : 'checked-scalar', {
+    const main = 'import "./dep.ab"\n' + (imported ? 'import "./point.ab"\n' : '') + (extended ? 'import "./ext.ab"\n' : '') + 'fun main: int = answer(2, 3' + (arrays ? ', [1, 2, 3]' : strings ? ', "abc"' : fields ? ', Point(4, 5)' : '') + ') + later()\n';
+    const p = fixture(calls ? 'checked-calls' : operators ? 'checked-operators' : locals ? 'checked-locals' : returns ? 'checked-returns' : strings ? 'checked-strings' : extended ? 'checked-extended' : imported ? 'checked-imported' : globals ? 'checked-globals' : arrays ? 'checked-arrays' : loops ? 'checked-loops' : parens ? 'checked-parens' : fields ? 'checked-fields' : 'checked-scalar', {
         'abla.toml': 'name = "checked-scalar"\nentry = "main.ab"\nvisibility = "imports"\n',
         'main.ab': main,
         'dep.ab': head + initial + rest,
@@ -1835,6 +1835,10 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
                 // Bodies that end in a closing parenthesis, which the parsed expression ends before.
                 : parens
                 ? (i % 2 ? '(left + ' + n + ')' : 'left * (right - ' + n + ')')
+                // An array parameter's size, elements and iteration.
+                : arrays
+                ? (i % 2 ? block('var s = 0', 'for (x in xs) s += x * ' + n, 'return s + xs[left % xs.size]')
+                    : block('var s = right', 'for (x in xs) if (x > ' + n + ') s += 1', 's'))
                 : globals
                 ? (i % 2 ? 'LIMIT * ' + n + ' + right' : 'left * scale + counter + ' + n)
                 // Mutable locals, assignments, loops and their control.
@@ -1855,6 +1859,10 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         if (fields) await edit('p.name().size + left', hits);
         // A global that is not a scalar: full typing. (A local that shadows a global: checked_loops, its global `i`.)
         if (globals) await edit('NAMES.size + left', hits);
+        // A call of an array's method: full typing (and again from there), then rechecked alone.
+        if (arrays) await edit(block('var s = 0', 'for (x in xs) s += x', 'xs.indexOf(s) + s'), hits);
+        if (arrays) await edit(block('var s = 0', 'for (x in xs) s += x', 's - xs[0]'), hits);
+        if (arrays) await edit(block('var s = 0', 'for (x in xs) s += x', 's - xs[1]'), ++hits);
         // From a body that was not checked alone: full typing; then rechecked alone.
         if (globals) await edit('LIMIT - scale * counter', hits);
         if (globals) await edit('LIMIT - scale * counter + 1', ++hits);
@@ -1865,11 +1873,11 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         if (loops) await edit(block('var s = 0', 'for (i in later() until left) s += i', 's'), hits);
         // Back to the first loop: rechecked alone.
         if (loops) await edit(block('var s = 1', 'for (i in 0 until right) s *= 2', 's'), ++hits);
-        await edit(calls ? 'step(true)' : operators ? 'left / true' : loops ? block('var s = 0', 'for (i in 0 until left) s += true', 's') : globals ? 'LIMIT + true' : locals ? block('val t: bool = left', '1') : returns ? block('if (left) return 1', '0') : strings ? 'text[true]' : fields ? 'p.label + 1' : 'true', hits);
+        await edit(calls ? 'step(true)' : operators ? 'left / true' : loops ? block('var s = 0', 'for (i in 0 until left) s += true', 's') : globals ? 'LIMIT + true' : arrays ? block('var s = 0', 'for (x in xs) s += true', 's') : locals ? block('val t: bool = left', '1') : returns ? block('if (left) return 1', '0') : strings ? 'text[true]' : fields ? 'p.label + 1' : 'true', hits);
         await edit(initial, hits);
-        await edit(calls ? 'missing(left)' : loops ? block('var s = 0', 'for (i in 0 until left) s += missing', 's') : locals ? block('val left = 1', 'left') : returns ? block('if (left < 1) return missing', 'left') : fields ? 'p.z + left' : 'left + missing', hits);
-        await edit(calls ? 'step(right)' : locals || returns || loops ? block('right') : 'right', hits);
-        await edit(calls ? 'shift(left)' : locals || returns || loops ? block('return left') : 'left', extended ? hits : ++hits);
+        await edit(calls ? 'missing(left)' : arrays ? block('var s = 0', 'for (x in xs) s += missing', 's') : loops ? block('var s = 0', 'for (i in 0 until left) s += missing', 's') : locals ? block('val left = 1', 'left') : returns ? block('if (left < 1) return missing', 'left') : fields ? 'p.z + left' : 'left + missing', hits);
+        await edit(calls ? 'step(right)' : locals || returns || loops || arrays ? block('right') : 'right', hits);
+        await edit(calls ? 'shift(left)' : locals || returns || loops || arrays ? block('return left') : 'left', extended ? hits : ++hits);
     } finally {
         await Promise.all(sessions.map(s => s.close()));
     }
@@ -1884,6 +1892,7 @@ tests.checked_strings = () => checkedScalarBody(false, false, false, false, true
 tests.checked_fields = () => checkedScalarBody(false, false, false, false, false, true);
 tests.checked_parens = () => checkedScalarBody(false, false, false, false, false, false, false, true);
 tests.checked_loops = () => checkedScalarBody(false, false, false, false, false, false, false, false, true);
+tests.checked_arrays = () => checkedScalarBody(false, false, false, false, false, false, false, false, false, false, false, true);
 tests.checked_globals = () => checkedScalarBody(false, false, false, false, false, false, false, false, false, false, true);
 tests.checked_fields_imported = () => checkedScalarBody(false, false, false, false, false, true, false, false, false, true);
 tests.checked_fields_extended = () => checkedScalarBody(false, false, false, false, false, true, true);

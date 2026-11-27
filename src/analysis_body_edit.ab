@@ -162,7 +162,7 @@ fun bootstrapAnalysisScalarType(type: string): bool =
 
 // No global reads. Direct calls, when admitted, still need a separate proof
 // for their complete lookup bucket and the callee's checking interface.
-// `strings` are the names of string parameters: read only through `.size` and a byte index. `members` are the scalar fields of class
+// `strings` are the names of string and scalar-array parameters: read only through `.size`, an index and a `for`. `members` are the scalar fields of class
 // parameters, as `p.x`, and the global values it may read, as `global:name`.
 fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameters: array<string>, depth: int, calls: bool,
     strings: array<string> = [], members: array<string> = []): bool {
@@ -244,7 +244,8 @@ fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration, calls: bo
         val name = declaration.parameters[index]
         val record = classes.get(type)
         if (bootstrapAnalysisScalarType(type)) scalars.append(name)
-        else if (type == "string") strings.append(name)
+        // A string or an array of scalars: read through its size, an index and a `for`.
+        else if (type == "string" || bootstrapAnalysisScalarArray(type)) strings.append(name)
         else if (record != null) {
             // The parameter's own name, so that no local shadows it.
             members.append("$name.")
@@ -449,10 +450,11 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
         for (item in 0 until project.declarations.size) {
             val candidate = project.declarations[item]
             if (bootstrapIsOperatorDeclaration(candidate)) return null
-            // What `s.size` and `s[i]` could also name: a `size` extension of string, or a type of that name (an indexing operator is an
-            // operator declaration, refused above). A function named `string`, or another type's member of that name, changes neither.
-            if (readsStrings && ((candidate.extensionOwner == "string" && candidate.name == "size") ||
-                (candidate.name == "string" && candidate.extensionOwner == "" && candidate.kind != "fun"))) return null
+            // What `s.size` and `s[i]` could also name: a `size` extension of string or an array, or a type of either name (an indexing
+            // operator is an operator declaration, refused above). A function so named, or another type's member, changes neither.
+            if (readsStrings && (((candidate.extensionOwner == "string" || candidate.extensionOwner.startsWith("array")) &&
+                candidate.name == "size") || ((candidate.name == "string" || candidate.name == "array") &&
+                candidate.extensionOwner == "" && candidate.kind != "fun"))) return null
             for (method in candidate.methods) if (bootstrapIsOperatorDeclaration(method)) return null
             if (used.has(candidate.extensionOwner)) return null
             val known = candidates.get(candidate.name)
@@ -688,7 +690,8 @@ fun bootstrapAnalysisScalarLocalNames(expression: BootstrapExpression, var names
  *  - an assignment (or compound assignment) of a `var` in scope;
  *  - `return` of a scalar expression;
  *  - `if` with statement branches, the else optional;
- *  - an unlabeled `while`, `do … while` or `for` over `a until b` or `a..b`, with a new name, and a statement body;
+ *  - an unlabeled `while`, `do … while` or `for` over `a until b`, `a..b` or a string or scalar-array parameter, with a new name,
+ *    and a statement body;
  *  - an unlabeled `break` or `continue`;
  *  - a block of these.
  *  A nested body's declarations end with it. */
@@ -728,13 +731,15 @@ fun bootstrapAnalysisScalarStatement(statement: BootstrapExpression, var scope: 
         return bootstrapAnalysisScalarBody(statement.children[0], scope, depth + 1, calls, strings, members) &&
             bootstrapAnalysisScalarExpression(statement.children[1], scope, depth + 1, calls, strings, members)
     }
-    // A range is built in: its bounds must be `i64`, whatever the project declares (bootstrapInferRange).
+    // A range is built in: its bounds must be `i64`, whatever the project declares (bootstrapInferRange). So is iterating a string (its
+    // bytes) or an array (bootstrapInferFor).
     if (kind == "for" && statement.children.size == 2 && bootstrapForLabelAt(statement.text) < 0) {
         val source = statement.children[0]
-        if ((source.kind != "range.until" && source.kind != "range.closed") || source.children.size != 2 ||
-            !bootstrapAnalysisScalarNewName(statement.text, scope, strings, members) ||
-            !bootstrapAnalysisScalarExpression(source.children[0], scope, depth + 1, calls, strings, members) ||
-            !bootstrapAnalysisScalarExpression(source.children[1], scope, depth + 1, calls, strings, members)) return false
+        val range = (source.kind == "range.until" || source.kind == "range.closed") && source.children.size == 2 &&
+            bootstrapAnalysisScalarExpression(source.children[0], scope, depth + 1, calls, strings, members) &&
+            bootstrapAnalysisScalarExpression(source.children[1], scope, depth + 1, calls, strings, members)
+        if ((!range && !bootstrapAnalysisStringName(source, strings)) ||
+            !bootstrapAnalysisScalarNewName(statement.text, scope, strings, members)) return false
         val inner: array<string> = []
         for (name in scope) inner.append(name)
         inner.append(statement.text)
@@ -774,14 +779,18 @@ fun bootstrapAnalysisScalarReturn(statement: BootstrapExpression, scope: array<s
         bootstrapAnalysisScalarExpression(statement.children[0], scope, depth + 1, calls, strings, members)
 }
 
-/** Whether `expression` is the name of a string parameter. */
+/** Whether `type` is an array of a scalar type. */
+fun bootstrapAnalysisScalarArray(type: string): bool =
+    type == "array<int>" || type == "array<i64>" || type == "array<f64>" || type == "array<bool>"
+
+/** Whether `expression` is the name of a string or scalar-array parameter. */
 fun bootstrapAnalysisStringName(expression: BootstrapExpression, strings: array<string>): bool {
     if (expression.kind != "identifier") return false
     for (name in strings) if (name == expression.text) return true
     false
 }
 
-/** Whether `expression` reads a member or an index (here, a string parameter's size or bytes). */
+/** Whether `expression` reads a member or an index (here, a string or array parameter's size or elements). */
 fun bootstrapAnalysisReadsString(expression: BootstrapExpression): bool {
     if (expression.kind == "member" || expression.kind == "index") return true
     for (child in expression.children) if (bootstrapAnalysisReadsString(child)) return true
