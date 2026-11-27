@@ -382,6 +382,7 @@ test-serial: ablac
 	tools/test-region-member-names.sh $(COMPILER)
 	tools/test-null-default-leave.sh $(COMPILER)
 	tools/test-exhaustive-when.sh $(COMPILER)
+	tools/test-sealed-when.sh $(COMPILER)
 	tools/test-loop-control.sh $(COMPILER)
 	tools/test-labeled-loops.sh $(COMPILER)
 	tools/test-nullable-refinement.sh $(COMPILER)
