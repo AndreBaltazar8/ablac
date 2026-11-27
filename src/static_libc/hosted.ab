@@ -5,6 +5,8 @@
 // compiler's own module may declare the same C name as an import. A shared object of the program's own (nativeLibraries) cannot be loaded.
 import "abla/runtime/scalar"
 import "abla/sys/linux"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/native"
 import "./errno.ab"
 import "./fs.ab"
 import "./string.ab"
@@ -35,50 +37,83 @@ trusted fun libcCondInit(condition: int, attributes: int): int {
     0
 }
 
-// Thread-specific data: 128 keys, a table of 256 thread slots (the thread id modulo 256, as errno does) made on first use.
-var libcActiveKeys: int = 0
-var libcSpecificTable: int = 0
+// Thread-specific data: 128 keys. Each key has a word that is 0 while it is free and its generation (odd, counting up) while it is in use, in
+// static storage (no first-use race); a key is claimed by a compare-and-swap of its word. Each thread's values are a table of its own (the
+// generation and the value for each key, 16 bytes a key) behind a thread-local cell, made the first time the thread sets one: a value counts only
+// while its generation is the key's, so deleting a key (its word cleared) and creating it again forgets every thread's value without visiting
+// the threads. (The values used to live in one table of 256 rows found by the thread id modulo 256, which gave threads whose ids differed by
+// a multiple of 256 each other's values.) Destructors are not run.
+trusted fun libcKeyWords(): int = nativeStaticAllocate(128 * 4)
 
-trusted fun libcSpecificSlot(key: int): int {
-    if (libcSpecificTable == 0) libcSpecificTable = __ablaRuntimeHostHeapAllocate(256 * 128 * 8, true)
-    libcSpecificTable + ((linuxSyscall0(186) & 255) * 128 + key) * 8
+// The last generation given out, for all keys (31 bits: about a billion creations before one repeats).
+trusted fun libcKeyGenerationCell(): int = nativeStaticAllocate(4)
+
+trusted fun libcThreadValuesCell(): int = nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00")
+
+// The generation of `key` while it is in use, 0 for a free key or one out of range.
+trusted fun libcKeyGeneration(key: int): int {
+    if (key < 0 || key >= 128) return 0
+    val word = ablaRuntimeLoadI32(libcKeyWords() + key * 4) & 4294967295
+    ablaUnsafeAtomicFence()
+    word
 }
 
 @export("abla_libc_pthread_key_create")
 trusted fun libcKeyCreate(key: int, destructor: int): int {
-    if (libcActiveKeys == 0) libcActiveKeys = __ablaRuntimeHostHeapAllocate(128, true)
     var slot = 0
-    while (slot < 128 && ablaRuntimeLoadU8(libcActiveKeys + slot) != 0) slot = slot + 1
-    if (slot == 128) return 11
-    ablaRuntimeStoreU8(libcActiveKeys + slot, 1)
-    ablaRuntimeStoreI32(key, slot)
-    0
+    while (slot < 128) {
+        if ((ablaRuntimeLoadI32(libcKeyWords() + slot * 4) & 4294967295) == 0) {
+            // A new generation, odd so it is never 0 and never one a deleted key's values carry.
+            var generation = 0
+            var claimed = false
+            while (!claimed) {
+                val last = ablaRuntimeLoadI32(libcKeyGenerationCell()) & 4294967295
+                generation = ((last + 2) | 1) & 2147483647
+                claimed = i64(ablaUnsafeAtomicCompareExchangeU32(libcKeyGenerationCell(), u32(last), u32(generation))) == last
+            }
+            if (i64(ablaUnsafeAtomicCompareExchangeU32(libcKeyWords() + slot * 4, u32(0), u32(generation))) == 0) {
+                ablaRuntimeStoreI32(key, slot)
+                return 0
+            }
+        }
+        slot = slot + 1
+    }
+    11
 }
 
 @export("abla_libc_pthread_key_delete")
 trusted fun libcKeyDelete(key: int): int {
     val slot = libcInt(key)
-    if (slot < 0 || slot >= 128 || libcActiveKeys == 0 ||
-        ablaRuntimeLoadU8(libcActiveKeys + slot) == 0) return 22
-    if (libcSpecificTable != 0) {
-        var threadSlot = 0
-        while (threadSlot < 256) {
-            ablaRuntimeStoreI64(libcSpecificTable + (threadSlot * 128 + slot) * 8, 0)
-            threadSlot = threadSlot + 1
-        }
-    }
-    ablaRuntimeStoreU8(libcActiveKeys + slot, 0)
+    val generation = libcKeyGeneration(slot)
+    if (generation == 0) return 22
+    ablaUnsafeAtomicCompareExchangeU32(libcKeyWords() + slot * 4, u32(generation), u32(0))
     0
 }
 
 @export("abla_libc_pthread_setspecific")
 trusted fun libcSetspecific(key: int, value: int): int {
-    ablaRuntimeStoreI64(libcSpecificSlot(key & 127), value)
+    val slot = libcInt(key)
+    val generation = libcKeyGeneration(slot)
+    if (generation == 0) return 22
+    var values = ablaRuntimeLoadI64(libcThreadValuesCell())
+    if (values == 0) {
+        values = __ablaRuntimeHostHeapAllocate(128 * 16, true)
+        if (values == 0) return 12
+        ablaRuntimeStoreI64(libcThreadValuesCell(), values)
+    }
+    ablaRuntimeStoreI64(values + slot * 16, generation)
+    ablaRuntimeStoreI64(values + slot * 16 + 8, value)
     0
 }
 
 @export("abla_libc_pthread_getspecific")
-trusted fun libcGetspecific(key: int): int = ablaRuntimeLoadI64(libcSpecificSlot(key & 127))
+trusted fun libcGetspecific(key: int): int {
+    val slot = libcInt(key)
+    val generation = libcKeyGeneration(slot)
+    val values = ablaRuntimeLoadI64(libcThreadValuesCell())
+    if (generation == 0 || values == 0 || ablaRuntimeLoadI64(values + slot * 16) != generation) return 0
+    ablaRuntimeLoadI64(values + slot * 16 + 8)
+}
 
 @export("abla_libc_setitimer")
 trusted fun libcSetitimer(which: int, value: int, previous: int): int = libcResult(linuxSyscall3(38, libcInt(which), value, previous))

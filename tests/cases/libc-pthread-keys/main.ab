@@ -1,0 +1,62 @@
+// pthread keys of the statically linked compiler's C library (src/static_libc/hosted.ab, #1139 area 14): a value is the setting thread's own.
+// The main thread sets one, then threads are started one at a time until one has a thread id equal to the main thread's modulo 256 (the old
+// table's row), which must see no value and whose own leaves the main thread's alone. A deleted key forgets its values, also when its slot is
+// created again. Built by tools/test-libc-functions.sh against a copy of the library without its @export lines. Exits 42.
+import "abla/io"
+import "abla/runtime/scalar"
+import "abla/sys/linux"
+import "abla/unsafe/memory/raw"
+import "../../../src/static_libc/hosted.ab"
+
+// The key, in static storage (a thread cannot capture an int).
+trusted fun keyCell(): int = nativeStaticAllocate(8)
+
+trusted fun key(): int = ablaRuntimeLoadI32(keyCell()) & 4294967295
+
+// The thread's work: its id, whether it saw a value, then it sets its own. Returns id * 2 + (1 if it saw one).
+trusted fun probe(): int {
+    val saw = libcGetspecific(key()) != 0
+    libcSetspecific(key(), 2222)
+    linuxSyscall0(186) * 2 + (if (saw) 1 else 0)
+}
+
+trusted fun main: int {
+    if (libcKeyCreate(keyCell(), 0) != 0) {
+        println("libc-pthread-keys: pthread_key_create failed")
+        return 1
+    }
+    val mainId = linuxSyscall0(186)
+    libcSetspecific(key(), 1111)
+    var tries = 0
+    var collided = false
+    while (!collided && tries < 4096) {
+        val worker = thread { probe() }
+        val result = await worker
+        val id = result / 2
+        if (result % 2 != 0) {
+            println("libc-pthread-keys: thread $id saw a value it never set (main $mainId)")
+            return 1
+        }
+        collided = id != mainId && id % 256 == mainId % 256
+        tries += 1
+    }
+    val after = libcGetspecific(key())
+    if (after != 1111) {
+        println("libc-pthread-keys: the main thread's value is $after after another thread set its own (main $mainId, $tries threads)")
+        return 1
+    }
+    if (!collided) println("libc-pthread-keys: no thread id equal to the main thread's modulo 256 in $tries threads (the check still ran)")
+    // Deleted, then created again (the same slot): no value until one is set.
+    val slot = key()
+    if (libcKeyDelete(slot) != 0 || libcGetspecific(slot) != 0) {
+        println("libc-pthread-keys: a deleted key still has a value")
+        return 1
+    }
+    if (libcKeyCreate(keyCell(), 0) != 0 || key() != slot || libcGetspecific(key()) != 0) {
+        println("libc-pthread-keys: a key created again in slot $slot (now ${key()}) has the old value")
+        return 1
+    }
+    libcSetspecific(key(), 5)
+    if (libcGetspecific(key()) != 5) return 1
+    42
+}
