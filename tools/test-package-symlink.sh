@@ -3,6 +3,7 @@
 # `-> ../../file` would read a file of the developer's machine as source. The fetch keeps the link (the checkout is the
 # tree that was locked) but the build refuses to read through it, naming it; a link that stays inside the package
 # (`alias.ab -> real.ab`) works. Links are judged by where they really lead: a chain of links that each stay inside by their text is refused too.
+# Nor may it import a file outside its copy by an absolute or ../ path, link or not; its own files work.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -58,9 +59,27 @@ status=$(run out-chain)
 [ "$status" != 99 ] || fail 'the import went through a chain of in-package links out of the package (it read the file outside)'
 grep -q "alias.ab (a symbolic link out of its package)" "$test_root/run-out-chain.log" || fail "no diagnostic naming the link (chain)" "$test_root/run-out-chain.log"
 
+# No link needed: a dependency's module importing a file outside its copy by an absolute or a ../ path. The
+# file outside defines real(), so reading it would build and run 99. Its own files by a path that stays inside still work.
+for case in "absolute|$test_root/outside-real.ab" "up|../../../../../outside-real.ab" "dot|sub/../../../../../../outside-real.ab"; do
+    IFS='|' read -r name target <<< "$case"
+    new_dep real.ab alias.ab
+    printf 'import "%s"\nfun depValue(): int = real()\n' "$target" > "$dep/dep.ab"
+    commit
+    update "plain-$name" || fail "update failed (plain $name)" "$test_root/plain-$name.log"
+    [ "$(run "plain-$name")" != 99 ] || fail "a dependency's import \"$target\" read a file outside its package"
+    grep -q "outside-real.ab (an import out of its package)" "$test_root/run-plain-$name.log" ||
+        fail "no diagnostic naming the import (plain $name)" "$test_root/run-plain-$name.log"
+done
+new_dep real.ab alias.ab
+printf 'import "sub/../real.ab"\nfun depValue(): int = real()\n' > "$dep/dep.ab"
+commit
+update plain-inside || fail 'update failed (plain inside)' "$test_root/plain-inside.log"
+[ "$(run plain-inside)" = 7 ] || fail "a dependency's own file by a path that stays inside was refused" "$test_root/run-plain-inside.log"
+
 new_dep real.ab alias.ab
 commit
 update inside || fail 'a link inside the package was refused' "$test_root/inside.log"
 [ "$(run inside)" = 7 ] || fail 'the package with an inner link does not build' "$test_root/run-inside.log"
 
-echo "package symlink: an import through a link leaving a fetched package, also by a chain of links, is refused naming it; a link inside the package works"
+echo "package symlink: an import leaving a fetched package, through a link, a chain of links, an absolute or a ../ path, is refused naming it; a link or a path inside the package works"
