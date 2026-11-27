@@ -1,0 +1,100 @@
+// dense_local_check (#1139 area 7): the LLVM backend's dense-word path for local int arrays (bootstrapLlvmDenseLocalIntegers).
+// A local `var a: array<int> = []` whose only uses are int appends, element reads and writes and `.size` keeps its elements as
+// raw 8-byte words, read and written through one unsigned bounds check (bootstrapLlvmDenseArrayElement); a counted
+// `while (i < end) { b[i] = a[i]; i = i + 1 }` over two such locals becomes one memmove (array.copy.dense, also with `a[i + 1]`).
+// A check makes two of them, appends one at a time and in loops, writes and reads elements at computed in-range indices, takes
+// sizes and runs both copy shapes, folding every value read into a running hash. The generator keeps the same arrays itself, so
+// the expected hash and sizes are an oracle. Indices outside the arrays are the panic campaign's (dense index, dense store).
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+
+/** The hash step the check and the generator share: wraps like the check's `int` (Abla's own arithmetic in both). */
+fun fuzzDenseMix(hash: int, value: int): int = (hash * 31 + value) % 1000003
+
+fun FuzzGen.denseLocalCheck(index: int): FuzzCheck {
+    val lines: array<string> = ["fun dnMix$index(hash: int, value: int): int = (hash * 31 + value) % 1000003",
+        "fun c$index(): string {", "    var a: array<int> = []", "    var b: array<int> = []",
+        "    var t = 0"]
+    // the generator's copies of a and b
+    val ma: array<int> = []
+    val mb: array<int> = []
+    var t = 0
+    var loops = 0
+    for (step in 0 until this.r.range(6, 16)) {
+        val onA = this.r.chance(0.6)
+        val name = if (onA) "a" else "b"
+        val model = if (onA) ma else mb
+        val kind = this.r.range(0, 7)
+        if (kind == 0 || model.size == 0) {
+            val value = this.r.range(-1000, 1000)
+            lines.append("    $name.append($value)")
+            model.append(value)
+        } else if (kind == 1) {
+            val count = this.r.range(1, 120)
+            val mul = this.r.range(-9, 9)
+            val add = this.r.range(-50, 50)
+            loops = loops + 1
+            if (this.r.chance(0.5)) {
+                lines.append("    for (i in 0 until $count) $name.append(i * $mul + $add)")
+            } else {
+                lines.append("    var w$loops = 0")
+                lines.append("    while (w$loops < $count) {")
+                lines.append("        $name.append(w$loops * $mul + $add)")
+                lines.append("        w$loops = w$loops + 1")
+                lines.append("    }")
+            }
+            for (i in 0 until count) model.append(i * mul + add)
+        } else if (kind == 2) {
+            val at = this.r.range(0, model.size - 1)
+            val value = this.r.range(-100000, 100000)
+            if (this.r.chance(0.5)) {
+                lines.append("    $name[$at] = $value")
+            } else {
+                lines.append("    $name[$name.size - ${model.size - at}] = $value")
+            }
+            model[at] = value
+        } else if (kind == 3) {
+            val at = this.r.range(0, model.size - 1)
+            lines.append("    t = dnMix$index(t, $name[$at])")
+            t = fuzzDenseMix(t, model[at])
+        } else if (kind == 4) {
+            lines.append("    t = dnMix$index(t, $name.size)")
+            t = fuzzDenseMix(t, model.size)
+        } else if (kind == 5) {
+            lines.append("    for (i in 0 until $name.size) t = dnMix$index(t, $name[i])")
+            for (v in model) t = fuzzDenseMix(t, v)
+        } else {
+            // a counted copy loop (array.copy.dense) from one local into the other (or itself, shifted left by one)
+            val self = this.r.chance(0.3)
+            val target = if (self) name else (if (onA) "b" else "a")
+            val targetModel = if (self) model else (if (onA) mb else ma)
+            val advance = self || this.r.chance(0.4)
+            val sourceLimit = if (advance) model.size - 1 else model.size
+            val limit = if (targetModel.size < sourceLimit) targetModel.size else sourceLimit
+            if (limit >= 1) {
+                val end = this.r.range(1, limit)
+                val begin = this.r.range(0, end)
+                loops = loops + 1
+                lines.append("    var k$loops = $begin")
+                lines.append("    val e$loops = $end")
+                lines.append("    while (k$loops < e$loops) {")
+                lines.append("        $target[k$loops] = $name[k$loops${if (advance) " + 1" else ""}]")
+                lines.append("        k$loops = k$loops + 1")
+                lines.append("    }")
+                for (i in begin until end) targetModel[i] = model[if (advance) i + 1 else i]
+            }
+        }
+    }
+    for (v in ma) t = fuzzDenseMix(t, v)
+    for (v in mb) t = fuzzDenseMix(t, v)
+    for (line in [
+        "    for (i in 0 until a.size) t = dnMix$index(t, a[i])",
+        "    for (i in 0 until b.size) t = dnMix$index(t, b[i])",
+        "    val actual = \"\$t:\${a.size}:\${b.size}\"",
+        "    val dnExpected = \"$t:${ma.size}:${mb.size}\"",
+        "    if (dnExpected != actual) return \"FUZZ_ORACLE_FAILURE:\" + actual",
+        "    actual",
+        "}"]) lines.append(line)
+    FuzzCheck(lines, "c$index()", "str", index)
+}
