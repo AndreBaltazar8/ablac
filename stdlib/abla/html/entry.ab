@@ -45,6 +45,27 @@ fun ablaHtmlUrlAttribute(name: string): bool = when (name) {
 /// Whether a lowercase attribute name is an event handler (on...), whose value runs as script.
 fun ablaHtmlEventAttribute(name: string): bool = name.size > 2 && name[0] == 111 && name[1] == 110
 
+/// Whether a lowercase attribute name takes script, or a document that runs it: an event handler, or an iframe's srcdoc (a whole HTML
+/// document, parsed after the attribute is decoded, so escaping does not make it safe).
+fun ablaHtmlScriptAttribute(name: string): bool = ablaHtmlEventAttribute(name) || name == "srcdoc"
+
+/// Whether a lowercase attribute of a lowercase SVG animation element (animate, set, animateMotion, animateTransform) sets the animated
+/// attribute's value: values (a ;-list), to, from and by. Its target can be an href, so each item is held to the URL policy.
+fun ablaHtmlAnimationValue(tag: string, name: string): bool =
+    (tag == "animate" || tag == "set" || tag == "animatemotion" || tag == "animatetransform") &&
+    (name == "values" || name == "to" || name == "from" || name == "by")
+
+/// `value`, a ;-separated list, with each item as ablaHtmlSafeUrl writes it.
+fun ablaHtmlSafeUrlList(value: string): string {
+    var result = ""
+    var first = true
+    for (item in value.split(";")) {
+        result = if (first) ablaHtmlSafeUrl(item) else "$result;${ablaHtmlSafeUrl(item)}"
+        first = false
+    }
+    result
+}
+
 /// The value written in place of a URL whose scheme runs script or carries a document.
 val ablaHtmlUnsafeUrl = "about:invalid#abla-unsafe-url"
 
@@ -174,6 +195,7 @@ private compile fun ablaHtmlParseElement(cursor: ParserCursor, depth: int, insid
                 parserRawSkipWhitespace(cursor)
                 val value = if (parserRawConsume(cursor, "{")) {
                     if (ablaHtmlEventAttribute(key)) return ablaHtmlReject(cursor, "an Abla expression cannot fill the event handler attribute $name: its value runs as script (for a handler the program wrote, put ablaHtmlTrustedAttribute(\"$name\", code) in an attribute group)")
+                    if (ablaHtmlScriptAttribute(key)) return ablaHtmlReject(cursor, "an Abla expression cannot fill the attribute $name: its value is a document whose scripts run (for one the program wrote, put ablaHtmlTrustedAttribute(\"$name\", markup) in an attribute group)")
                     syntaxCall("ablaHtmlAttribute", [attrName, ablaHtmlReadHole(cursor)])
                 } else {
                     val quote = if (parserRawConsume(cursor, "\"")) "\"" else if (parserRawConsume(cursor, "'")) "'" else ""
@@ -280,18 +302,21 @@ private fun ablaHtmlWriteEscaped(var output: ByteBuffer, value: string, preserve
     return
 }
 
-private fun ablaHtmlWriteAttribute(var output: ByteBuffer, attribute: HtmlAttribute): void {
+private fun ablaHtmlWriteAttribute(var output: ByteBuffer, attribute: HtmlAttribute, tag: string): void {
     if (!ablaHtmlNameValid(attribute.name, true)) return
-    // A value from Abla (a hole, or ablaHtmlAttribute) is held to the policy; authored and trusted ones are not. An event handler from Abla
-    // is left out (a hole in one does not compile); a URL whose scheme runs script or carries a document is replaced.
+    // A value from Abla (a hole, or ablaHtmlAttribute) is held to the policy; authored and trusted ones are not. An event handler or a
+    // srcdoc from Abla is left out (a hole in one does not compile); a URL whose scheme runs script or carries a document is replaced,
+    // as is each such item of an SVG animation's values, to, from or by (which set the animated attribute, an href among them).
     val dynamic = attribute.sourceQuote == "" && !attribute.skipsPolicy
     val key = attribute.name.lowercase()
-    if (dynamic && attribute.value != null && ablaHtmlEventAttribute(key)) return
+    if (dynamic && attribute.value != null && ablaHtmlScriptAttribute(key)) return
     output.appendText(" ")
     output.appendText(attribute.name)
     val written = attribute.value
     if (written == null) return
-    val value = if (dynamic && ablaHtmlUrlAttribute(key)) ablaHtmlSafeUrl(written) else written
+    val value = if (dynamic && ablaHtmlUrlAttribute(key)) ablaHtmlSafeUrl(written)
+        else if (dynamic && ablaHtmlAnimationValue(tag, key)) ablaHtmlSafeUrlList(written)
+        else written
     val quote = if (attribute.sourceQuote == "'") "'" else "\""
     val preserve = attribute.sourceQuote == "'" || attribute.sourceQuote == "\""
     output.appendText("=")
@@ -310,7 +335,7 @@ private fun ablaHtmlWriteNode(var output: ByteBuffer, node: Html, insideForeign:
         val foreign = insideForeign || lower == "svg" || lower == "math"
         output.appendText("<")
         output.appendText(node.tag)
-        for (attribute in node.attributes) ablaHtmlWriteAttribute(output, attribute)
+        for (attribute in node.attributes) ablaHtmlWriteAttribute(output, attribute, lower)
         if (foreign && node.selfClosing && node.children.size == 0) output.appendText("/>")
         else {
             output.appendText(">")

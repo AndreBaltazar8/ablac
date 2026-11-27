@@ -113,15 +113,27 @@ fun main {
 // <a href="/search?q=1">Search</a>
 ```
 
-An event handler (`on...`) runs its value as script, so a hole that fills one
-is a compile error, and an `ablaHtmlAttribute` named `on...` is left out when
-rendered.
+The same check applies to each `;`-separated item of `values`, `to`, `from` and
+`by` on an SVG `animate`, `set`, `animateMotion` or `animateTransform`, since
+these set the animated attribute, which can be an `href`.
+
+An event handler (`on...`) runs its value as script, and an iframe's `srcdoc`
+is a whole document whose scripts run (escaping does not change that), so a
+hole that fills one is a compile error, and an `ablaHtmlAttribute` with either
+name is left out when rendered.
 
 ```abla error
 import "abla/html"
 
 fun invalid(code: string): Html = $html <button onclick={code}>Go</button>
 // error: an Abla expression cannot fill the event handler attribute onclick
+```
+
+```abla error
+import "abla/html"
+
+fun invalid(page: string): Html = $html <iframe srcdoc={page}></iframe>
+// error: an Abla expression cannot fill the attribute srcdoc
 ```
 
 Authored (quoted) attribute values are not checked. For a value the program
