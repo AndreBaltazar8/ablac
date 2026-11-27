@@ -144,18 +144,28 @@ if [[ -n ${RUN_TESTS_SHARD:-} ]]; then
     ((shard_index <= shard_count)) || { echo "RUN_TESTS_SHARD: shard $shard_index of $shard_count" >&2; exit 2; }
     history=$project_root/tools/test-times.tsv
 fi
+# A release-mode run (RUN_TESTS_FULL=1: the release's static suite, gate-release) splits by tools/test-times-release.tsv where it
+# knows a command: release-mode builds cost differently, and a test such as test-image-identity.sh is long only there (1,420 s
+# in release run 45983722873, where the fast-mode table's split put it on test-self-hosted.sh's shard).
+shard_release_times=
+if [[ -n ${RUN_TESTS_FULL:-} && -s $project_root/tools/test-times-release.tsv ]]; then shard_release_times=$project_root/tools/test-times-release.tsv; fi
 shard_filter() { # "n<TAB>command<TAB>group" lines in, the lines of this shard out
     if ((shard_count == 1)); then cat; return; fi
-    awk -F'\t' -v history="$project_root/tools/test-times.tsv" -v idx="$shard_index" -v count="$shard_count" '
+    awk -F'\t' -v history="$project_root/tools/test-times.tsv" -v release="$shard_release_times" -v idx="$shard_index" -v count="$shard_count" '
         function key(command) { gsub(/[^ ;]*ablac[^ ;]*/, "COMPILER", command); return command }
-        BEGIN {
-            while ((getline line < history) > 0) {
+        function read_times(file,    line, field, k) {
+            while ((getline line < file) > 0) {
                 split(line, field, "\t")
                 if (field[3] ~ /^[0-9.]+$/) {
                     k = key(field[4]); wall[k] = field[3] + 0
                     cost[k] = (field[5] + 0 > 0 ? field[5] + 0 : wall[k])
                 }
             }
+            close(file)
+        }
+        BEGIN {
+            read_times(history)
+            if (release != "") read_times(release)
         }
         {
             lines++; number[lines] = $1; text[lines] = $0
