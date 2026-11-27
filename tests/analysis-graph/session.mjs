@@ -855,7 +855,7 @@ async function stableIds() {
         'fun scale(value: string): string = value',
         'fun total(items: array<int>): int {',
         '    var sum = 0',
-        '    for (item in items) sum = sum + item',
+        '    for (item in items) sum += item',
         '    val add = { a: int -> a + sum }',
         '    return add(1)',
         '}',
@@ -1426,6 +1426,7 @@ fun main: int {
             ['W_NULLABLE_EARLY_EXIT', 'val value = input ?? return 0'],
             ['W_NULLABLE_EARLY_EXIT', 'val value = input ?? return'],
             ['W_NULLABLE_EARLY_EXIT', 'val value = input ?? continue'],
+            ['W_COMPOUND_ASSIGNMENT', 'count +='],
             ['W_NULLABLE_EARLY_EXIT', 'val value = next() ?? return 0'],
             ['W_ARRAY_MAPPED', 'val output: array<int> = input.mapped { value -> (value + 2) * 3 }'],
             ['W_ARRAY_MAPPED', 'val output: array<string> = input.mapped { word -> "hello $word" }'],
@@ -1529,6 +1530,163 @@ fun main: int {
     }
 }
 
+// Apply every first fix of the given codes, check the edited text analyzes cleanly with none left, and that both programs exit 0.
+async function applyHintFixes(session, project, entry, source, codes, label) {
+    const snapshot = await session.analyze();
+    assert.equal(snapshot.complete, true);
+    const diagnostics = doc(snapshot, entry).diagnostics.filter((d) => codes.includes(d.code));
+    assert.ok(diagnostics.every((d) => d.severity === 'warning'), JSON.stringify(diagnostics));
+    const edits = diagnostics.map((d) => d.fixes[0].edits[0]);
+    let edited = Buffer.from(source);
+    for (const { range, newText } of [...edits].sort((a, b) => b.range.start - a.range.start)) {
+        edited = Buffer.concat([edited.subarray(0, range.start), Buffer.from(newText), edited.subarray(range.end)]);
+    }
+    await session.rpc('document/open', { uri: uri(entry), version: 1, text: edited.toString() });
+    const after = await session.analyze();
+    noErrors(after);
+    assert.ok(!doc(after, entry).diagnostics.some((d) => codes.includes(d.code)), JSON.stringify(doc(after, entry).diagnostics));
+    const output = path.join(project, 'program');
+    for (const text of [source, edited.toString()]) {
+        fs.writeFileSync(entry, text);
+        const built = spawnSync(compiler, ['build', entry, '-o', output, '--no-cache'], { encoding: 'utf8' });
+        assert.equal(built.status, 0, built.stderr);
+        assert.equal(spawnSync(output, []).status, 0, `${label} edit changed behavior`);
+    }
+    return { diagnostics, edited: edited.toString() };
+}
+
+// `x = x op e` for an ordinary mutable local becomes `x op= e` (the same tree). Globals, fields, a left-nested operand
+// (`x - a - b` is `(x - a) - b`), a parenthesized read, a comment and an existing compound are left alone; a shadowing local is its own.
+async function compoundAssignmentFix(mode) {
+    const source = `var total = 0
+class Box(var count: int)
+fun Box.bump(): void {
+    this.count = this.count + 1
+    count = count + 1
+}
+fun main: int {
+    var n = 1
+    n = n + 2
+    n = n - 1
+    n = n * 3
+    n=n+1
+    n = n / 2
+    n = n % 4
+    var s = "a"
+    s = s + "b"
+    var m = 10
+    m = m - 2 - 3
+    m = (m) + 1
+    m = m /* keep */ + 1
+    m += 1
+    if (true) {
+        var m = 0
+        m = m + 1
+        if (m != 1) return 3
+    }
+    total = total + 1
+    val box = Box(0)
+    box.bump()
+    if (n != 3 || s != "ab" || m != 8 || total != 1 || box.count != 2) 1 else 0
+}
+`;
+    const project = fixture(`compound-assignment-${mode}`, { 'main.ab': source });
+    const entry = path.join(project, 'main.ab');
+    const session = await start(project, { mode });
+    try {
+        const { diagnostics } = await applyHintFixes(session, project, entry, source, ['W_COMPOUND_ASSIGNMENT'], 'compound assignment');
+        assert.deepEqual(diagnostics.map((d) => d.fixes[0].edits[0].newText),
+            ['n +=', 'n -=', 'n *=', 'n += ', 'n /=', 'n %=', 's +=', 'm +=']);
+    } finally {
+        await session.close();
+    }
+}
+
+// An index loop whose index has no other use becomes `for (x in xs)`. Bodies that grow or shrink the array keep their behavior
+// (both forms read the size once). A used index, a reassigned or field source, a class element, a typed binding and a label
+// are left alone.
+async function indexLoopFix(mode) {
+    const source = `import "abla/array"
+class Item(val v: int)
+fun sum(xs: array<int>): int {
+    var total = 0
+    for (i in 0 until xs.size) {
+        val x = xs[i]
+        total += x
+    }
+    total
+}
+fun codes(text: string): int {
+    var total = 0
+    for (k in 0 until text.size) {
+        val c = text[k]
+        total += c
+    }
+    total
+}
+fun grow(): int {
+    val a = [1, 2, 3]
+    var n = 0
+    for (i in 0 until a.size) {
+        val x = a[i]
+        if (a.size < 6) a.append(x * 10)
+        n += 1
+    }
+    n + a.size
+}
+fun used(xs: array<int>): int {
+    var total = 0
+    for (i in 0 until xs.size) {
+        val x = xs[i]
+        total += x * i
+    }
+    total
+}
+fun reassigned(): int {
+    var xs = [1, 2]
+    var total = 0
+    for (i in 0 until xs.size) {
+        val x = xs[i]
+        total += x
+        xs = [5, 6]
+    }
+    total
+}
+fun objects(xs: array<Item>): int {
+    var total = 0
+    for (i in 0 until xs.size) {
+        val x = xs[i]
+        total += x.v
+    }
+    total
+}
+fun typed(xs: array<int>): int {
+    var total = 0
+    for (i in 0 until xs.size) {
+        val x: int = xs[i]
+        total += x
+    }
+    total
+}
+fun main: int {
+    if (sum([1, 2, 3]) != 6 || codes("ab") != 195 || grow() != 9) return 1
+    if (used([1, 2]) != 2 || reassigned() != 7 || objects([Item(4)]) != 4 || typed([2]) != 2) return 2
+    0
+}
+`;
+    const project = fixture(`index-loop-${mode}`, { 'main.ab': source });
+    const entry = path.join(project, 'main.ab');
+    const session = await start(project, { mode });
+    try {
+        const { diagnostics, edited } = await applyHintFixes(session, project, entry, source, ['W_INDEX_LOOP'], 'index loop');
+        assert.deepEqual(diagnostics.map((d) => d.fixes[0].edits[0].newText),
+            ['for (x in xs) {', 'for (c in text) {', 'for (x in a) {']);
+        assert.ok(edited.includes('for (x in xs) {\n        total += x\n'), edited);
+    } finally {
+        await session.close();
+    }
+}
+
 // A repeated analyze of an unchanged revision is answered from the held answer without reloading the project (#1132), and every change
 // a reload would see without an overlay still gives a new revision: a file edited on disk (same size), a file that appears and changes
 // where an import resolves (a prepared package beside the vendored one), and the manifest.
@@ -1581,7 +1739,7 @@ async function unchangedInputs() {
     await s.close();
 }
 
-const tests = { unchanged_inputs: unchangedInputs, logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+const tests = { unchanged_inputs: unchangedInputs, compound_assignment: () => compoundAssignmentFix('graph-v1'), compound_assignment_v2: () => compoundAssignmentFix('graph-v2'), index_loop: () => indexLoopFix('graph-v1'), index_loop_v2: () => indexLoopFix('graph-v2'), logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false, strings = false, fields = false, extended = false, parens = false) {
     const head = locals || returns ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
         : fields ? 'fun answer(left: int, right: int, p: Point): int = ' : 'fun answer(left: int, right: int): int = ';

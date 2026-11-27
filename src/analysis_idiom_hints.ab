@@ -124,13 +124,21 @@ private fun idiomMappedEdit(source: string, local: BootstrapExpression, loop: Bo
     "${head}${input.text}.mapped { ${loop.text} -> $argument }"
 }
 
+private fun idiomArithmeticOperator(kind: string): bool =
+    kind == "+" || kind == "-" || kind == "*" || kind == "/" || kind == "%"
+
+// `x op= e` parses to the same tree as `x = x op e` (parseExpressionBody), so
+// the edit changes only spelling. A top-level operator whose left operand is
+// the name itself has every tighter or parenthesized operand on its right:
+// `x = x - a - b` is `(x - a) - b` and is left alone.
 // The resolved local identity distinguishes ordinary locals from globals,
 // delegated bindings and similarly named shadowing declarations.
-private fun idiomLogicalAssignment(source: string, path: string,
+private fun idiomUpdateAssignment(source: string, path: string,
     expression: BootstrapExpression, occurrences: BootstrapAnalysisOccurrenceSet,
     locals: Map<string, bool>, var diagnostics: array<BootstrapFrontendDiagnostic>): void {
     val rhs = expression.children[0]
-    if ((rhs.kind != "&&" && rhs.kind != "||") || rhs.text != rhs.kind || rhs.children.size != 2) return
+    val logical = rhs.kind == "&&" || rhs.kind == "||"
+    if ((!logical && !idiomArithmeticOperator(rhs.kind)) || rhs.text != rhs.kind || rhs.children.size != 2) return
     val read = rhs.children[0]
     if (read.kind != "identifier" || read.text != expression.text) return
     val begin = expression.begin
@@ -140,30 +148,36 @@ private fun idiomLogicalAssignment(source: string, path: string,
         source.slice(nameEnd, read.begin).trim() != "=") return
     val written = idiomOccurrenceAt(occurrences, begin, nameEnd)
     val repeated = idiomOccurrenceAt(occurrences, read.begin, read.end)
-    if (written < 0 || repeated < 0 || occurrences.types[written] != "bool" ||
+    if (written < 0 || repeated < 0 || (logical && occurrences.types[written] != "bool") ||
+        occurrences.types[written] == "" ||
         occurrences.ids[written] != occurrences.ids[repeated] ||
         locals.get(occurrences.ids[written]) == null) return
     var operator = read.end
     while (operator < source.size &&
         (source[operator] == 32 || source[operator] == 9)) operator = operator + 1
-    val end = operator + 2
+    val end = operator + rhs.kind.size
     if (end > source.size || source.slice(operator, end) != rhs.kind) return
-    val title = "Use the ${rhs.kind}= Boolean assignment"
-    val text = "${expression.text} ${rhs.kind}="
-    diagnostics.append(BootstrapFrontendDiagnostic("W_LOGICAL_ASSIGNMENT", title, path, begin, end,
+    // `x = x+1` becomes `x += 1`, not `x +=1`.
+    val spaced = end < source.size && source[end] != 32 && source[end] != 9 &&
+        source[end] != 10 && source[end] != 13
+    val gap = if (spaced) " " else ""
+    val text = "${expression.text} ${rhs.kind}=$gap"
+    val code = if (logical) "W_LOGICAL_ASSIGNMENT" else "W_COMPOUND_ASSIGNMENT"
+    val title = if (logical) "Use the ${rhs.kind}= Boolean assignment" else "Use ${rhs.kind}="
+    diagnostics.append(BootstrapFrontendDiagnostic(code, title, path, begin, end,
         fixes = [BootstrapFrontendFix(title, "replace", begin, end, text)], severity = "warning"))
 }
 
 private fun idiomAppend(source: string, expression: BootstrapExpression,
     occurrences: BootstrapAnalysisOccurrenceSet, nullable: bool, mapped: bool,
-    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string, logical: bool, var locals: Map<string, bool>): void {
-    if (logical) {
+    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string, updates: bool, var locals: Map<string, bool>): void {
+    if (updates) {
         if (expression.kind == "local.var" && expression.children[0].kind != "delegate.initializer") {
             val begin = expression.children[1].begin
             val declaration = idiomOccurrenceAt(occurrences, begin, begin + expression.text.size)
             if (declaration >= 0) locals.set(occurrences.ids[declaration], true)
         } else if (expression.kind == "assign") {
-            idiomLogicalAssignment(source, path, expression, occurrences, locals, diagnostics)
+            idiomUpdateAssignment(source, path, expression, occurrences, locals, diagnostics)
         }
     }
     if ((nullable || mapped) && expression.kind == "block") {
@@ -192,17 +206,107 @@ private fun idiomAppend(source: string, expression: BootstrapExpression,
             }
         }
     }
-    for (child in expression.children) idiomAppend(source, child, occurrences, nullable, mapped, diagnostics, path, logical, locals)
+    for (child in expression.children) idiomAppend(source, child, occurrences, nullable, mapped, diagnostics, path, updates, locals)
+}
+
+private fun idiomMentions(expression: BootstrapExpression, name: string): bool {
+    if (expression.kind == "identifier" && expression.text == name) return true
+    // A nested loop or lambda that rebinds the name is still counted: the
+    // hint is skipped rather than proving the shadowing.
+    for (child in expression.children) if (idiomMentions(child, name)) return true
+    false
+}
+
+// How often `name` is declared as a local, or assigned (`assign` names
+// its target; a compound assignment is an `assign` too).
+private fun idiomBindings(expression: BootstrapExpression, name: string): int {
+    var count = 0
+    if ((expression.kind == "local.val" || expression.kind == "local.var" || expression.kind == "assign" ||
+        expression.kind == "lambda.parameter" || expression.kind == "for") &&
+        bootstrapForName(expression) == name) count = 1
+    for (child in expression.children) count = count + idiomBindings(child, name)
+    count
+}
+
+private fun idiomPlainElement(type: string): bool =
+    idiomScalar(type) || type == "f64" || type == "f32" || type == "i32" || type == "u32" ||
+        type == "u64" || type == "i16" || type == "u16" || type == "i8" || type == "u8"
+
+// `for (i in 0 until xs.size) { val x = xs[i] ... }` with no other use of
+// `i` becomes `for (x in xs) { ... }`. Both forms read the size once and
+// each element when its iteration starts, bounds-checked, so a body that
+// grows or shrinks xs behaves the same. xs must be a parameter or a single
+// `val` that nothing reassigns, holding a string or plain scalars.
+private fun idiomIndexLoopEdit(source: string, loop: BootstrapExpression,
+    declaration: BootstrapDeclaration, occurrences: BootstrapAnalysisOccurrenceSet): string {
+    if (loop.children.size != 2 || bootstrapLoopLabel(loop) != "") return ""
+    val range = loop.children[0]
+    val body = loop.children[1]
+    if (range.kind != "range.until" || range.children.size != 2 || body.kind != "block" ||
+        body.children.size < 2) return ""
+    val start = range.children[0]
+    val size = range.children[1]
+    if (start.kind != "integer" || start.text != "0" || size.kind != "member" || size.text != "size" ||
+        size.children.size != 1 || size.children[0].kind != "identifier") return ""
+    val items = size.children[0]
+    val binding = body.children[0]
+    if (binding.kind != "local.val" || binding.children.size != 2 ||
+        binding.children[1].text != "inferred") return ""
+    val read = binding.children[0]
+    if (read.kind != "index" || read.children.size != 2 || read.children[0].kind != "identifier" ||
+        read.children[0].text != items.text || read.children[1].kind != "identifier" ||
+        read.children[1].text != loop.text || binding.text == items.text) return ""
+    for (index in 1 until body.children.size) if (idiomMentions(body.children[index], loop.text)) return ""
+    val type = idiomTypeAt(occurrences, items)
+    if (type != "string" && (!bootstrapIsArrayType(type) || !idiomPlainElement(bootstrapArrayElementType(type)))) return ""
+    var parameter = false
+    for (index in 0 until declaration.parameters.size) {
+        if (declaration.parameters[index] == items.text) parameter = declaration.parameterKinds[index] == "parameter"
+    }
+    val bindings = idiomBindings(declaration.expression, items.text)
+    if (if (parameter) bindings != 0 else bindings != 1) return ""
+    if (!parameter) {
+        // The single binding has to be a `val`, not a `var` or an assignment.
+        if (!idiomDeclaresVal(declaration.expression, items.text)) return ""
+    }
+    // The block opens with `{`, then only whitespace before the binding.
+    if (body.begin < 0 || body.begin >= source.size || source[body.begin] != 123 ||
+        source.slice(body.begin + 1, binding.begin).trim() != "" ||
+        idiomHasComment(source.slice(loop.begin, binding.end))) return ""
+    "for (${binding.text} in ${items.text}) {"
+}
+
+private fun idiomDeclaresVal(expression: BootstrapExpression, name: string): bool {
+    if (expression.kind == "local.val" && expression.text == name) return true
+    for (child in expression.children) if (idiomDeclaresVal(child, name)) return true
+    false
+}
+
+private fun idiomIndexLoops(source: string, expression: BootstrapExpression, declaration: BootstrapDeclaration,
+    occurrences: BootstrapAnalysisOccurrenceSet, var diagnostics: array<BootstrapFrontendDiagnostic>, path: string): void {
+    if (expression.kind == "for" && expression.begin >= 0 && expression.end <= source.size &&
+        expression.children.size == 2 && expression.children[1].children.size > 0) {
+        val replacement = idiomIndexLoopEdit(source, expression, declaration, occurrences)
+        if (replacement != "") {
+            val end = expression.children[1].children[0].end
+            val title = "Iterate over the values directly"
+            diagnostics.append(BootstrapFrontendDiagnostic("W_INDEX_LOOP", title, path, expression.begin, end,
+                fixes = [BootstrapFrontendFix(title, "replace", expression.begin, end, replacement)],
+                severity = "warning"))
+        }
+    }
+    for (child in expression.children) idiomIndexLoops(source, child, declaration, occurrences, diagnostics, path)
 }
 
 private fun idiomDeclaration(source: string, declaration: BootstrapDeclaration,
     occurrences: BootstrapAnalysisOccurrenceSet, nullable: bool, mapped: bool,
-    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string, logical: bool, var locals: Map<string, bool>): void {
+    var diagnostics: array<BootstrapFrontendDiagnostic>, path: string, updates: bool, var locals: Map<string, bool>): void {
     // A resolved occurrence in an instantiated generic body does not prove
     // that the edit is valid for every substitution.
     if (declaration.typeParameters.size != 0 || declaration.sourceIdentity != path) return
-    idiomAppend(source, declaration.expression, occurrences, nullable, mapped, diagnostics, path, logical, locals)
-    for (method in declaration.methods) idiomDeclaration(source, method, occurrences, nullable, mapped, diagnostics, path, logical, locals)
+    idiomAppend(source, declaration.expression, occurrences, nullable, mapped, diagnostics, path, updates, locals)
+    if (updates) idiomIndexLoops(source, declaration.expression, declaration, occurrences, diagnostics, path)
+    for (method in declaration.methods) idiomDeclaration(source, method, occurrences, nullable, mapped, diagnostics, path, updates, locals)
 }
 
 /** The standard extension is the only possible target of the introduced
@@ -236,11 +340,12 @@ fun bootstrapAnalysisIdiomHints(source: string, path: string, parsed: BootstrapP
             if (edge.source == "abla/array" && edge.alias == "" && !edge.provider && !edge.contractOnly) mapped = true
         }
     }
-    val logical = source.contains("=") && (source.contains("&&") || source.contains("||"))
-    if (!nullable && !mapped && !logical) return
+    // Boolean and arithmetic updates: `x = x && e`, `x = x + e`, ...
+    val updates = source.contains("=")
+    if (!nullable && !mapped && !updates) return
     for (diagnostic in diagnostics) if (diagnostic.severity == "error") return
     val locals: Map<string, bool> = Map()
     for (declaration in parsed.declarations) {
-        idiomDeclaration(source, declaration, occurrences, nullable, mapped, diagnostics, path, logical, locals)
+        idiomDeclaration(source, declaration, occurrences, nullable, mapped, diagnostics, path, updates, locals)
     }
 }

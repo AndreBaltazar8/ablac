@@ -569,6 +569,8 @@ quick fix. They leave comments and code with uncertain types or effects alone.
 | `W_NULLABLE_EARLY_EXIT` | Combine an inferred nullable scalar binding and the immediately following null guard with `?? return` or `?? continue`. The null branch must only exit, with at most a literal return value. The initializer still runs once. |
 | `W_ARRAY_MAPPED` | Replace a fresh array and the immediately following single-append loop with [`array.mapped`](stdlib/arrays.md). The hint covers simple scalar transforms with no calls or captures when the standard extension is already imported and resolves unambiguously. |
 | `W_LOGICAL_ASSIGNMENT` | Replace `x = x && expr` or `x = x \|\| expr` with the corresponding Boolean assignment for an ordinary mutable local. |
+| `W_COMPOUND_ASSIGNMENT` | Replace `x = x + expr` (or `-`, `*`, `/`, `%`) with `x += expr` for an ordinary mutable local. The two spellings parse to the same tree. A left operand that is itself an operation (`x = x - a - b`), a parenthesized read and a comment inside the update are left alone. |
+| `W_INDEX_LOOP` | Replace `for (i in 0 until xs.size) { val x = xs[i] … }` with `for (x in xs) { … }` when the index has no other use. `xs` must be a parameter or a single `val` that nothing reassigns, holding a string or an array of plain scalars. Both loops read the size once and each element when its iteration starts. |
 
 ## Builds
 
