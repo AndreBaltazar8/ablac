@@ -21,16 +21,21 @@ defaults:
 
 jobs:
   shard:
-    name: Static suite (shard ${{ matrix.shard }}/2)
+    name: Static suite (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # Four shards: in v0.2.78's release run (45898824396) each of two took 36 minutes on an ordinary runner (8,048 CPU seconds
+    # of the release-mode suite on four CPUs), the critical path of the release. The split is tools/test-times.tsv's, which
+    # tools/test-shards.sh checks for 2, 3 and 4 shards.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
+    # No ABLA_TEST_JOBS: under the suite the tests that run builds of their own at once (test-self-hosted.sh,
+    # test-aarch64-linux.sh, test-libc-free-programs.sh) take their suite default of 2 workers. At 1, test-self-hosted.sh
+    # alone took 1,974 s of shard 2's 3,327 in that run, and the seven commands that wait for it started after it.
     env:
       JOBS: '8'
-      ABLA_TEST_JOBS: '1'
       ABLA_NATIVE_JOBS: '1'
       ABLA_CODEGEN_JOBS: '1'
       ABLA_RELEASE_SELFHOST_BUILD_SECONDS: '1800'
@@ -89,7 +94,7 @@ jobs:
             out=build/ci-static-suite
             RUN_TESTS_LIST=1 RUN_TESTS_OUTPUT="$out/selection" tools/run-tests.sh build/ablac | sort -n > "$out/expected.ids"
             test -s "$out/expected.ids"
-            RUN_TESTS_SHARD="$SHARD/2" RUN_TESTS_OUTPUT="$out/suite" tools/run-tests.sh build/ablac
+            RUN_TESTS_SHARD="$SHARD/4" RUN_TESTS_OUTPUT="$out/suite" tools/run-tests.sh build/ablac
             sha256sum < build/ablac.bin | cut -d " " -f1 > "$out/payload.hash"
             cut -d " " -f1 "$out/tested-compiler.sha256" > "$out/expected.hash"
             cmp "$out/payload.hash" "$out/expected.hash"
@@ -113,18 +118,23 @@ jobs:
         with:
           pattern: static-suite-logs-*
           path: shards
-      - name: Check that both shards covered the same artifact and the full recipe
+      - name: Check that every shard covered the same artifact and together the full recipe
         run: |
+          shards=4
           first=shards/static-suite-logs-1
-          second=shards/static-suite-logs-2
-          cmp "$first/static-suite-source.sha" "$second/static-suite-source.sha"
-          cmp "$first/tested-compiler.sha256" "$second/tested-compiler.sha256"
-          cmp "$first/expected.ids" "$second/expected.ids"
-          cmp "$first/suite/commands.txt" "$second/suite/commands.txt"
-          for shard in "$first" "$second"; do
+          results=()
+          for ((index = 1; index <= shards; index++)); do
+            shard=shards/static-suite-logs-$index
+            cmp "$first/static-suite-source.sha" "$shard/static-suite-source.sha"
+            cmp "$first/tested-compiler.sha256" "$shard/tested-compiler.sha256"
+            cmp "$first/expected.ids" "$shard/expected.ids"
+            cmp "$first/suite/commands.txt" "$shard/suite/commands.txt"
             test -s "$shard/suite/results.tsv"
             awk -F '\t' 'NF < 4 || $2 != "0" { bad=1 } END { exit bad }' "$shard/suite/results.tsv"
+            results+=("$shard/suite/results.tsv")
           done
-          cut -f1 "$first/suite/results.tsv" "$second/suite/results.tsv" | sort -n > actual.ids
+          # No artifact beyond the shards the matrix ran (a stale count would leave a shard unchecked).
+          test "$(find shards -mindepth 1 -maxdepth 1 -name 'static-suite-logs-*' | wc -l)" -eq "$shards"
+          cut -f1 "${results[@]}" | sort -n > actual.ids
           cmp "$first/expected.ids" actual.ids
           printf '%s commands passed with compiler %s\n' "$(wc -l < actual.ids)" "$(cat "$first/tested-compiler.sha256")" >> "$GITHUB_STEP_SUMMARY"

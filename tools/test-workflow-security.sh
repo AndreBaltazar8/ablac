@@ -11,13 +11,13 @@
 #      value is data, never shell code);
 #   8. no actions/cache, no `cache:` key of a setup action and no self-hosted runner (nothing a pull request could
 #      poison for a release to consume).
-#   9. release.yml: the `compiler` and `publish` jobs refuse `source_ref` (a branch or commit built to test the workflow) with
+#   9. release.yml's `publish` job and release-compiler.yml's `compiler` job (release.yml calls it per platform) refuse `source_ref` (a branch or commit built to test the workflow) with
 #      `publish_release` on, as their first step: a published release is built from its tag only;
 #   3b. in release.yml only the bridge job (a draft release is visible to a push token only; it checks nothing out) and the publish job
 #      hold a write permission: the build jobs run the scripts of the tree they check out (the tag, or source_ref when testing);
-#  11. release.yml downloads its artifacts without merge-multiple (a file name two artifacts share would be overwritten silently);
+#  11. release.yml and release-compiler.yml download their artifacts without merge-multiple (a file name two artifacts share would be overwritten silently);
 #  10. a Nix installer is fetched and checked against a pinned sha256 (the local action .github/actions/install-nix) in the
-#      workflows that build release assets (release.yml, static-suite.yml, windows-x64-toolchain.yml, windows-arm64-toolchain.yml),
+#      workflows that build release assets (release.yml, release-compiler.yml, static-suite.yml, windows-x64-toolchain.yml, windows-arm64-toolchain.yml),
 #      never by cachix/install-nix-action alone.
 # tools/test-workflow-security.sh [workflow-directory]
 # tools/test-workflow-security.sh --controls   each rule is shown to fail on a workflow that breaks it
@@ -87,6 +87,13 @@ if [[ ${1:-} == --controls ]]; then
 ' | sed 's/run: test -z "$SOURCE_REF"/run: true/' > "$work/w/release.yml"
     if "$0" "$work/w" > "$work/out" 2>&1; then echo "workflow security control 'source_ref': accepted" >&2; exit 1; fi
     grep -q 'do not refuse source_ref' "$work/out" || { cat "$work/out" >&2; echo "workflow security control 'source_ref': wrong refusal" >&2; exit 1; }
+    # The compiler job lives in release-compiler.yml (called once per platform): the same rule there.
+    rm -rf "$work/w"; mkdir "$work/w"
+    printf 'name: r\non:\n  workflow_call:\npermissions:\n  contents: read\njobs:\n  compiler:\n    runs-on: ubuntu-24.04\n    steps:\n      - env:\n          SOURCE_REF: ${{ inputs.source_ref }}\n        run: true\n      - uses: actions/checkout@%s\n        with:\n          persist-credentials: false\n' "$pin" > "$work/w/release-compiler.yml"
+    if "$0" "$work/w" > "$work/out" 2>&1; then echo "workflow security control 'release-compiler source_ref': accepted" >&2; exit 1; fi
+    grep -q 'release-compiler.yml: job(s) compiler *do not refuse source_ref' "$work/out" || { cat "$work/out" >&2; echo "workflow security control 'release-compiler source_ref': wrong refusal" >&2; exit 1; }
+    sed -i 's/run: true/run: test -z "$SOURCE_REF"/' "$work/w/release-compiler.yml"
+    "$0" "$work/w" > "$work/out" 2>&1 || { cat "$work/out" >&2; echo "workflow security: a release-compiler.yml that refuses source_ref is refused" >&2; exit 1; }
     release_route() {
         local name=$1 windows=$2 arm64=$3 ancestor=$4 route syntax literal
         local operators='^[[:space:]()&|=!]+$'
@@ -118,6 +125,16 @@ if [[ ${1:-} == --controls ]]; then
         echo 'workflow control: a skipped bridge suppressed the static suite for a full release' >&2
         exit 1
     fi
+    for job in compiler-linux compiler-macos; do
+        if ! release_route "$job" with with skipped; then
+            echo "workflow control: a skipped bridge suppressed $job for a full release" >&2
+            exit 1
+        fi
+        if release_route "$job" only with success; then
+            echo "workflow control: windows=only selected $job" >&2
+            exit 1
+        fi
+    done
     echo 'workflow controls: security rules and release routing passed'
     exit 0
 fi
@@ -189,7 +206,8 @@ for file in "${files[@]}"; do
         [[ -z $unguarded ]] || fail "$name: job(s) $unguarded read secrets.ABLA_RELEASE_SIGNING_KEY without environment: release"
     fi
     # 9. a published release is built from its tag, never from source_ref (the build jobs run the checked-out tree's scripts)
-    if [[ $name == release.yml ]]; then
+    # (release-compiler.yml is release.yml's compiler job, called once per platform.)
+    if [[ $name == release.yml || $name == release-compiler.yml ]]; then
         unchecked=$(awk '
             /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job = $1; sub(/:$/, "", job); seen[job] = 1; next }
             /test -z "\$SOURCE_REF"|-n "\$SOURCE_REF"/ { checked[job] = 1 }
@@ -198,12 +216,12 @@ for file in "${files[@]}"; do
         [[ -z $unchecked ]] || fail "$name: job(s) $unchecked do not refuse source_ref with publish_release on"
     fi
     # 11. no merge-multiple in release.yml
-    if [[ $name == release.yml ]] && grep -n -E '^[[:space:]]+merge-multiple:' "$file" > /dev/null; then
+    if [[ $name == release.yml || $name == release-compiler.yml ]] && grep -n -E '^[[:space:]]+merge-multiple:' "$file" > /dev/null; then
         fail "$name: merge-multiple hides a file name that two artifacts share"
     fi
     # 10. the workflows that build release assets install Nix through the hash-pinned local action
     case $name in
-        release.yml|static-suite.yml|windows-x64-toolchain.yml|windows-arm64-toolchain.yml)
+        release.yml|release-compiler.yml|static-suite.yml|windows-x64-toolchain.yml|windows-arm64-toolchain.yml)
             if grep -n 'uses:[[:space:]]*cachix/install-nix-action' "$file" > /dev/null; then
                 fail "$name: cachix/install-nix-action used directly; use ./.github/actions/install-nix (the Nix installer is hash-pinned there)"
             fi ;;

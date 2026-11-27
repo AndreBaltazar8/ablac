@@ -69,8 +69,10 @@ do not count as callers.
 
 ## Releases and logs
 
-Release's `compiler` job builds and packages Linux x86-64, macOS arm64 and
-macOS Intel compilers. The Linux entry also prepares static x86-64 and AArch64
+Release's `compiler` job ([release-compiler.yml](../.github/workflows/release-compiler.yml),
+called as `compiler-linux` and as the two-runner `compiler-macos`) builds and packages Linux x86-64, macOS arm64 and
+macOS Intel compilers. The static suite (four shards, release mode) needs only `compiler-linux`;
+publishing needs all of them. The Linux entry also prepares static x86-64 and AArch64
 artifacts; current source promotes static x86-64 to the default raw compiler
 name starting with v0.2.65. Source workflow entries are not proof that an older
 release published the corresponding files. Packaged-toolchain smoke,

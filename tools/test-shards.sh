@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The suite's shards (tools/run-tests.sh with RUN_TESTS_SHARD=i/n, what the CI matrix of the Linux job runs): for 2 and 3 shards, every command of
+# The suite's shards (tools/run-tests.sh with RUN_TESTS_SHARD=i/n, what the CI matrix of the Linux job and the release's static suite run): for 2, 3 and 4 shards, every command of
 # the recipe is in exactly one shard (the union of the shards is the whole suite, no command twice, none dropped), test-self-hosted.sh is in the
 # same shard as the commands that wait for it, a command that tools/test-times.tsv does not know is still placed, and the shards' cost (by that
 # table) is balanced: the longest within 12% of the shortest. Usage: tools/test-shards.sh [compiler]
@@ -25,7 +25,7 @@ list() { RUN_TESTS_LIST=1 RUN_TESTS_OUTPUT="$work/$1" "$root/tools/run-tests.sh"
 export RUN_TESTS_SHARD=
 whole=$(RUN_TESTS_SHARD='' list whole)
 [[ -n $whole ]] || { echo "test-shards: the suite lists no command" >&2; exit 1; }
-for count in 2 3; do
+for count in 2 3 4; do
     : > "$work/union.$count"
     for ((shard = 1; shard <= count; shard++)); do
         RUN_TESTS_SHARD=$shard/$count list "s$shard-$count" > "$work/shard.$shard.$count"
