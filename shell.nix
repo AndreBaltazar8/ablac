@@ -26,6 +26,10 @@ let
   clang = if xtensa && prebuiltUsable then llvm.clang.override { cc = prebuilt.clangUnwrapped; } else llvm.clang;
   xtensaCohort = import ./nix/xtensa-cohort.nix { inherit pkgs llvmTools; };
   androidInputs = import ./nix/android-tests.nix { inherit pkgs; };
+  # tools/test-aarch64-linux-library.sh: a glibc process for AArch64 (its runtime files only, from the binary cache) that
+  # loads an aarch64-linux Abla library under qemu-aarch64 (#811). Only on an x86-64 Linux host.
+  aarch64Glibc = if pkgs.stdenv.hostPlatform.system == "x86_64-linux"
+    then (import pkgs.path { system = "aarch64-linux"; }).glibc else null;
 in
 pkgs.mkShell {
   packages = with pkgs; [
@@ -72,6 +76,9 @@ pkgs.mkShell {
       export ABLA_ANDROID_NDK="${androidInputs}/ndk"
       export ABLA_BIONIC_ROOT="${androidInputs}/bionic"
       export ABLA_REQUIRE_ANDROID_TESTS=1
+    ''}
+    ${pkgs.lib.optionalString (aarch64Glibc != null) ''
+      export ABLA_AARCH64_GLIBC="${aarch64Glibc}/lib"
     ''}
     # A host build's opt and llc (src/toolchain.ab), whatever else is first on PATH.
     export ABLA_LLVM_TOOLS="${llvmTools}/bin"

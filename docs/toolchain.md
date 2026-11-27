@@ -122,6 +122,12 @@ option for it: the program decides. `ablac build --verbose` prints a note
 naming why a build linked libc. macOS executables link libSystem (below), and libraries
 and objects are unchanged.
 
+An `aarch64-linux` shared or static library carries its own system calls, heap, memory and jump
+routines, as an arm64 Android library does. It names no library (no `DT_NEEDED`) and leaves only
+`pthread_create` and `pthread_join` undefined. Those two come from the C library of the process that
+loads it, and only when the library starts a thread. `tools/test-aarch64-linux-library.sh` checks this,
+and it loads the library from a glibc process under `qemu-aarch64`.
+
 `abla/tls/pure` provides TLS without libc or OpenSSL. The standard HTTPS
 client in `abla/http/tls` uses it. A libc-free Linux executable links directly with LLD,
 without a clang driver or C development files. A static compiler built with

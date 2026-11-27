@@ -660,6 +660,7 @@ test-serial: ablac
 	tools/test-android-link.sh $(COMPILER)
 	tools/test-android-seccomp.sh $(COMPILER)
 	tools/test-android-run.sh $(COMPILER)
+	tools/test-aarch64-linux-library.sh $(COMPILER)
 	tools/test-foreign-threads.sh $(COMPILER)
 	tools/test-valgrind.sh $(COMPILER)
 	tools/test-gc-threads.sh $(COMPILER)
