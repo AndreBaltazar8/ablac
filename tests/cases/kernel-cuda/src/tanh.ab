@@ -1,0 +1,132 @@
+// kernelTanh (CUDA C's tanhf on the GPU, an f64 tanh rounded to f32 on the CPU): a sweep of -12..12 in steps of 1/4096,
+// 64 values each side of the two switch-over points of tanhf's approximation (|x| = 0.6, where the polynomial gives way to
+// 1 - 2 / (e^2|x| + 1), and |x| = 9.0109, from where it is 1), denormals of both signs, +-0, the infinities and NaN. The GPU
+// is within 2 ulp of the CPU, gives +-0 and denormals back unchanged, +-1 for the infinities and past 9.0109, and NaN for NaN.
+import "abla/kernel"
+import "abla/kernel/cuda"
+import "abla/float"
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+/** y[i] = tanh(x[i]) for every thread i below n. */
+@kernel
+fun tanhAll(x: KernelF32Buffer, y: KernelF32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) y.store(i, kernelTanh(x.load(i)))
+}
+
+/** y[i] = 1 / (1 + e^-x[i]) for every thread i below n. */
+@kernel
+fun sigmoidAll(x: KernelF32Buffer, y: KernelF32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i < n) y.store(i, kernelSigmoid(x.load(i)))
+}
+
+/** The bit pattern of `value` in an order that follows the floats' (negatives below positives, -0 next to +0). */
+fun tanhOrdered(value: f32): int {
+    val bits = int(f32ToBits(value))
+    if (bits >= 2147483648) -(bits - 2147483648) else bits
+}
+
+/** The test's inputs: the sweep, the switch-over neighbourhoods and denormals of both signs, then the specials. */
+fun tanhInputs(): array<f32> {
+    val inputs: array<f32> = []
+    for (i in -12 * 4096 until 12 * 4096 + 1) inputs.append(f32FromInt(i) / f32(4096.0))
+    for (edge in [1058642330, 1091579060]) {
+        for (k in -64 until 65) {
+            inputs.append(f32FromBits(u32(edge + k)))
+            inputs.append(f32FromBits(u32(edge + k + 2147483648)))
+        }
+    }
+    for (bits in [1, 2, 3, 1000, 4194304, 8388607]) {
+        inputs.append(f32FromBits(u32(bits)))
+        inputs.append(f32FromBits(u32(bits + 2147483648)))
+    }
+    for (bits in [0, 2147483648, 2139095040, 4286578688, 2143289344, 4290772992]) inputs.append(f32FromBits(u32(bits)))
+    inputs
+}
+
+/** Whether kernelTanh on the GPU agrees with the CPU backend as the file's comment says, printing the worst distance. */
+trusted fun tanhCases(var device: CudaKernelDevice): bool {
+    val inputs = tanhInputs()
+    val n = inputs.size
+    val x = nativeByteBuffer(n * 4)
+    for (i in 0 until n) {
+        val bits = int(f32ToBits(inputs[i]))
+        for (b in 0 until 4) x.store(i * 4 + b, (bits >> (b * 8)) & 255)
+    }
+    val cpu = nativeByteBuffer(n * 4)
+    val gpu = nativeByteBuffer(n * 4)
+    val xBuffer = KernelF32Buffer(nativePointerAddress(x.address), n)
+    val cpuBuffer = KernelF32Buffer(nativePointerAddress(cpu.address), n)
+    kernelRunCpu((n + 255) / 256, 256) { tanhAll(xBuffer, cpuBuffer, n) }
+    val dx = device.allocate(n * 4)
+    val dy = device.allocate(n * 4)
+    if (dx == null || dy == null) { println("tanh: ${device.error}"); return false }
+    if (!device.upload(dx, x) || !device.launch("tanhAll", (n + 255) / 256, 256,
+        cudaKernelArguments().buffer(dx.floats()).buffer(dy.floats()).integer(n)) || !device.download(dy, gpu)) {
+        println("tanh: ${device.error}")
+        return false
+    }
+    val gpuBuffer = KernelF32Buffer(nativePointerAddress(gpu.address), n)
+    var worst = 0
+    var exact = true
+    for (i in 0 until n) {
+        val input = inputs[i]
+        val got = gpuBuffer.load(i)
+        val want = cpuBuffer.load(i)
+        val inputBits = int(f32ToBits(input))
+        val magnitude = inputBits & 2147483647
+        if (magnitude > 2139095040) {
+            if ((int(f32ToBits(got)) & 2147483647) <= 2139095040) exact = false
+            continue
+        }
+        // +-0 and denormals come back unchanged; +-infinity and |x| >= 9.0109 give exactly +-1.
+        if (magnitude < 8388608 && f32ToBits(got) != f32ToBits(input)) exact = false
+        if (magnitude >= 1091579060 && f32ToBits(got) != f32ToBits(if (inputBits >= 2147483648) f32(-1.0) else f32(1.0))) exact = false
+        val distance = tanhOrdered(got) - tanhOrdered(want)
+        val absolute = if (distance < 0) -distance else distance
+        if (absolute > worst) worst = absolute
+    }
+    println("kernelTanh: $n values, GPU within $worst ulp of the CPU (at most 2), +-0, denormals, +-1 and NaN exact: ${worst <= 2 && exact}")
+    worst <= 2 && exact && sigmoidCases(device)
+}
+
+/** kernelSigmoid from -80 to 30 in steps of 1/1024 (above about -88.7, where CUDA's expf of -x stays finite) within 3 ulp of
+ *  the CPU, and 0 at -infinity, 1 at infinity and NaN for NaN, exactly. */
+trusted fun sigmoidCases(var device: CudaKernelDevice): bool {
+    val sweep = 110 * 1024 + 1
+    val n = sweep + 3
+    val x = nativeByteBuffer(n * 4)
+    for (i in 0 until n) {
+        val value = if (i < sweep) f32FromInt(i - 80 * 1024) / f32(1024.0)
+            else f32FromBits(u32(if (i == sweep) 4286578688 else if (i == sweep + 1) 2139095040 else 2143289344))
+        val bits = int(f32ToBits(value))
+        for (b in 0 until 4) x.store(i * 4 + b, (bits >> (b * 8)) & 255)
+    }
+    val cpu = nativeByteBuffer(n * 4)
+    val gpu = nativeByteBuffer(n * 4)
+    val xBuffer = KernelF32Buffer(nativePointerAddress(x.address), n)
+    val cpuBuffer = KernelF32Buffer(nativePointerAddress(cpu.address), n)
+    kernelRunCpu((n + 255) / 256, 256) { sigmoidAll(xBuffer, cpuBuffer, n) }
+    val dx = device.allocate(n * 4)
+    val dy = device.allocate(n * 4)
+    if (dx == null || dy == null) { println("sigmoid: ${device.error}"); return false }
+    if (!device.upload(dx, x) || !device.launch("sigmoidAll", (n + 255) / 256, 256,
+        cudaKernelArguments().buffer(dx.floats()).buffer(dy.floats()).integer(n)) || !device.download(dy, gpu)) {
+        println("sigmoid: ${device.error}")
+        return false
+    }
+    val gpuBuffer = KernelF32Buffer(nativePointerAddress(gpu.address), n)
+    var worst = 0
+    for (i in 0 until sweep) {
+        val distance = int(f32ToBits(gpuBuffer.load(i))) - int(f32ToBits(cpuBuffer.load(i)))
+        val absolute = if (distance < 0) -distance else distance
+        if (absolute > worst) worst = absolute
+    }
+    val ends = f32ToBits(gpuBuffer.load(sweep)) == u32(0) && f32ToBits(gpuBuffer.load(sweep + 1)) == f32ToBits(f32(1.0)) &&
+        (int(f32ToBits(gpuBuffer.load(sweep + 2))) & 2147483647) > 2139095040
+    println("kernelSigmoid: $n values, GPU within $worst ulp of the CPU (at most 3), 0, 1 and NaN at the ends: ${worst <= 3 && ends}")
+    worst <= 3 && ends
+}

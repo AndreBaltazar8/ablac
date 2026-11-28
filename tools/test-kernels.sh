@@ -116,12 +116,12 @@ if [[ -n $library ]]; then
         grep -q "GPU equal to CPU true" "$out/kernel-cuda.out" && grep -q "within 1e-5 of CPU true" "$out/kernel-cuda.out" &&
             grep -q "on the GPU and the CPU true" "$out/kernel-cuda.out" &&
             grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" &&
-            grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" && grep -q "quad4: .* true" "$out/kernel-cuda.out" && grep -q "words4: .* true" "$out/kernel-cuda.out" &&
+            grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "kernelTanh: .*: true" "$out/kernel-cuda.out" && grep -q "kernelSigmoid: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" && grep -q "quad4: .* true" "$out/kernel-cuda.out" && grep -q "words4: .* true" "$out/kernel-cuda.out" &&
             grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" && grep -q "subgroups: .* true" "$out/kernel-cuda.out" &&
             grep -q "launch guards: .* true" "$out/kernel-cuda.out" && grep -q "edge indices: .* true" "$out/kernel-cuda.out" &&
             grep -q "half: .* the same bits: true" "$out/kernel-cuda.out" ||
             fail "kernel-cuda: $(cat "$out/kernel-cuda.out")"
-        cuda="vadd, the NVFP4 and Q8_0 matvecs (and Q8_0 on the unchecked fast path), rmsnorm (shared memory, barriers), kernelExp, the buffer edges and the half-precision conversions agree on the GPU and the CPU"
+        cuda="vadd, the NVFP4 and Q8_0 matvecs (and Q8_0 on the unchecked fast path), rmsnorm (shared memory, barriers), kernelExp, kernelTanh, kernelSigmoid, the buffer edges and the half-precision conversions agree on the GPU and the CPU"
     fi
 fi
 echo "kernels: the NVFP4 matvec kernel matches its reference on the CPU; the half-precision conversions give CUDA C's bits on the CPU; a string, recursion, a result, native code and an untrusted unchecked load are refused; the CPU backend stops an unchecked load past the end; CUDA: $cuda"

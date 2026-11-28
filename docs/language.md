@@ -3122,7 +3122,7 @@ A kernel, and every function it calls, may use:
   `__shfl_down_sync`; `kernelSubgroupShuffle(v, 0)` broadcasts lane 0's); the
   votes `kernelSubgroupBallot` (a mask from 0 to 2^32 - 1), `kernelSubgroupAny`
   and `kernelSubgroupAll`; and `kernelSubgroupBarrier()` (`__syncwarp`);
-- `kernelFma`, `kernelSqrt`, `kernelRsqrt`, `kernelExp`, `kernelF16ToF32`,
+- `kernelFma`, `kernelSqrt`, `kernelRsqrt`, `kernelExp`, `kernelTanh`, `kernelSigmoid`, `kernelF16ToF32`,
   `kernelCountTrailingZeros` (64 for 0) and abla/float's bit and conversion
   functions; the half-precision conversions on packed bits in ints (no f16 or
   bf16 type): `kernelBf16ToF32`, `kernelF32ToBf16` and `kernelF32ToF16` (round
@@ -3151,7 +3151,7 @@ what and where:
 
 Differences from the CPU remain: on a GPU an integer division by zero gives 0
 (the CPU stops the program); `kernelFma` rounds once there (twice on the CPU);
-`kernelRsqrt` and `kernelExp` compute what CUDA C's `rsqrtf` and `expf` do
+`kernelRsqrt`, `kernelExp`, `kernelTanh` and `kernelSigmoid` compute what CUDA C's `rsqrtf`, `expf`, `tanhf` and `1.0f / (1.0f + expf(-x))` do
 there (within 2 ulp; on the CPU through f64); and the CPU runs a group's threads one after
 another, so `kernelBarrier` works there only in groups of one thread (a larger
 group stops the program). A kernel must not depend on the first three; one

@@ -1048,7 +1048,7 @@ fun bootstrapKernelBuiltin(
         result = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$result = call float @llvm.nvvm.rsqrt.approx.f(float $operand)")
         type = "f32"
-    } else if (name == "kernelExp") {
+    } else if (name == "kernelExp" || name == "kernelSigmoid") {
         if (instruction.operands.size < 1) return false
         val a = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[0]), "f32")
         if (a == "") return true
@@ -1056,10 +1056,18 @@ fun bootstrapKernelBuiltin(
         // bits: j = saturate(a * log2(e) / 252 + 0.5) * 252 rounded down onto 1.5 * 2^23 + 1 (the integer part of
         // a * log2(e) + 127 in j's low bits), f = a * log2(e) - (j - 1.5 * 2^23 - 127) in two fma steps (log2(e) split in
         // two), and the result 2^f (ex2.approx) times 2^(j's low bits - 127), made by shifting j's bits into the exponent.
+        // kernelSigmoid is CUDA C's 1.0f / (1.0f + expf(-x)) as NVRTC 12.9 compiles it (checked against its PTX for
+        // compute_89, abla-grad's option): the same steps on -x, with the last multiply fused into the add of 1
+        // (fma.rn(2^f, 2^j, 1), which CUDA's default contraction makes), then 1 over that rounded once (rcp.rn).
         bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.fma.rn.f(float, float, float)")
         bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.fma.rm.f(float, float, float)")
         bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.saturate.f(float)")
         bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.ex2.approx.ftz.f32(float)")
+        var input = a
+        if (name == "kernelSigmoid") {
+            input = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$input = fneg float $a")
+        }
         val log2e = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$log2e = bitcast i32 1069066811 to float")
         val log2eLow = bootstrapKernelFresh(state)
@@ -1069,7 +1077,7 @@ fun bootstrapKernelBuiltin(
         val step = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$step = fdiv float $log2e, 252.0")
         val scaled = bootstrapKernelFresh(state)
-        bootstrapKernelLine(state, "$scaled = call float @llvm.nvvm.fma.rn.f(float $a, float $step, float 0.5)")
+        bootstrapKernelLine(state, "$scaled = call float @llvm.nvvm.fma.rn.f(float $input, float $step, float 0.5)")
         val clamped = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$clamped = call float @llvm.nvvm.saturate.f(float $scaled)")
         val lowBias = bootstrapKernelFresh(state)
@@ -1085,9 +1093,9 @@ fun bootstrapKernelBuiltin(
         val negated = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$negated = fsub float -0.0, $whole")
         val high = bootstrapKernelFresh(state)
-        bootstrapKernelLine(state, "$high = call float @llvm.nvvm.fma.rn.f(float $a, float $log2e, float $negated)")
+        bootstrapKernelLine(state, "$high = call float @llvm.nvvm.fma.rn.f(float $input, float $log2e, float $negated)")
         val fraction = bootstrapKernelFresh(state)
-        bootstrapKernelLine(state, "$fraction = call float @llvm.nvvm.fma.rn.f(float $a, float $log2eLow, float $high)")
+        bootstrapKernelLine(state, "$fraction = call float @llvm.nvvm.fma.rn.f(float $input, float $log2eLow, float $high)")
         val bits = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$bits = bitcast float $j to i32")
         val exponent = bootstrapKernelFresh(state)
@@ -1097,7 +1105,75 @@ fun bootstrapKernelBuiltin(
         val power = bootstrapKernelFresh(state)
         bootstrapKernelLine(state, "$power = call float @llvm.nvvm.ex2.approx.ftz.f32(float $fraction)")
         result = bootstrapKernelFresh(state)
-        bootstrapKernelLine(state, "$result = fmul float $power, $scale")
+        if (name == "kernelExp") bootstrapKernelLine(state, "$result = fmul float $power, $scale")
+        else {
+            val denominator = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$denominator = call float @llvm.nvvm.fma.rn.f(float $power, float $scale, float 1.0)")
+            bootstrapKernelLine(state, "$result = fdiv float 1.0, $denominator")
+        }
+        type = "f32"
+    } else if (name == "kernelTanh") {
+        if (instruction.operands.size < 1) return false
+        val a = bootstrapKernelConvert(emitter, state, bootstrapKernelGet(state, instruction.operands[0]), "f32")
+        if (a == "") return true
+        // CUDA C's tanhf without fast-math (libdevice's __nv_tanhf) step for step, so a ported kernel keeps its bits;
+        // checked against the PTX NVRTC 12.9 (CUDA 12.9.86) makes of tanhf with abla-grad's one option,
+        // --gpu-architecture=compute_89. From |a| >= 0.6: 1 - 2 / (2^(|a| * 2 log2(e)) + 1) with ex2.approx.ftz and
+        // rcp.approx.ftz, 1 from |a| >= 9.0109 (0x41102cb4), then a's sign; below: a + a * a^2 * p(a^2), an odd
+        // polynomial of four fma.rn steps (its constants are the PTX's, as bits).
+        bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.fma.rn.f(float, float, float)")
+        bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.ex2.approx.ftz.f32(float)")
+        bootstrapKernelDeclare(emitter, "declare float @llvm.nvvm.rcp.approx.ftz.f(float)")
+        bootstrapKernelDeclare(emitter, "declare float @llvm.fabs.f32(float)")
+        val magnitude = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$magnitude = call float @llvm.fabs.f32(float $a)")
+        val twiceLog2e = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$twiceLog2e = bitcast i32 1077455419 to float")
+        val scaled = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$scaled = fmul float $magnitude, $twiceLog2e")
+        val power = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$power = call float @llvm.nvvm.ex2.approx.ftz.f32(float $scaled)")
+        val denominator = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$denominator = fadd float $power, 1.0")
+        val reciprocal = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$reciprocal = call float @llvm.nvvm.rcp.approx.ftz.f(float $denominator)")
+        val large = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$large = call float @llvm.nvvm.fma.rn.f(float $reciprocal, float -2.0, float 1.0)")
+        val saturateAt = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$saturateAt = bitcast i32 1091579060 to float")
+        val saturated = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$saturated = fcmp oge float $magnitude, $saturateAt")
+        val unsigned = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$unsigned = select i1 $saturated, float 1.0, float $large")
+        val unsignedBits = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$unsignedBits = bitcast float $unsigned to i32")
+        val inputBits = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$inputBits = bitcast float $a to i32")
+        val sign = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$sign = and i32 $inputBits, -2147483648")
+        val signedBits = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$signedBits = or i32 $sign, $unsignedBits")
+        val signed = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$signed = bitcast i32 $signedBits to float")
+        val square = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$square = fmul float $a, $a")
+        var polynomial = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$polynomial = bitcast i32 1015083138 to float")
+        for (bits in [-1118421842, 1040734529, -1096111635, 0]) {
+            val coefficient = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$coefficient = bitcast i32 $bits to float")
+            val next = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$next = call float @llvm.nvvm.fma.rn.f(float $polynomial, float $square, float $coefficient)")
+            polynomial = next
+        }
+        val small = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$small = call float @llvm.nvvm.fma.rn.f(float $polynomial, float $a, float $a)")
+        val switchAt = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$switchAt = bitcast i32 1058642330 to float")
+        val wide = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$wide = fcmp oge float $magnitude, $switchAt")
+        result = bootstrapKernelFresh(state)
+        bootstrapKernelLine(state, "$result = select i1 $wide, float $signed, float $small")
         type = "f32"
     } else if (name == "kernelF16ToF32") {
         if (instruction.operands.size < 1) return false
