@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
+# The compiler's self-rebuild: <compiler> builds src/orc_main.ab again, the result carries its runtime code, emits the
+# same IR for its own source as <compiler> did, and builds a native child that runs.
+#
+#   tools/test-pure-self-rebuild.sh [<compiler>] [<built>]
+#
+# <built> is that rebuild when the caller has already made it and checked its IR, as tools/gate.sh does: stage 2 of
+# tools/bootstrap-stages.sh, built by stage 1, whose bitcode stage 2 emits again byte for byte. Then the build and the
+# IR comparison are not repeated (they were a third full compiler build in each gate), and the rest is checked on it.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
+built=${2:-}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 entry="$project_root/src/orc_main.ab"
-output="$project_root/build/ablac-pure-self"
+output=${built:-$project_root/build/ablac-pure-self}
 reference_ir="$project_root/build/ablac-pure-self.reference.ll"
 self_ir="$project_root/build/ablac-pure-self.fixed.ll"
 probe="$project_root/build/ablac-pure-self-probe"
@@ -14,9 +23,11 @@ compiler_ir="${compiler}.ll"
 if [[ $compiler == *.bin ]]; then compiler_ir="${compiler%.bin}.ll"; fi
 
 # Build through the same LLVM-native path used for every Abla program.
-ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
-    "$project_root/tools/build-self-hosted-release.sh" \
-    "$compiler" "$output" "$entry" || exit 1
+if [[ -z $built ]]; then
+    ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
+        "$project_root/tools/build-self-hosted-release.sh" \
+        "$compiler" "$output" "$entry" || exit 1
+fi
 
 [[ -s $output ]] || exit 1
 # Runtime code is emitted from Abla source into the compiler module itself.
@@ -52,7 +63,9 @@ fi
 # directly instead of redundantly emitting the complete compiler graph twice.
 # Installed/bootstrap compilers may not retain their module, so keep one
 # bounded generation-one emission as a fallback.
-if [[ -s $compiler_ir && -s $output.ll ]]; then
+if [[ -n $built ]]; then
+    : # the caller compared the bitcode
+elif [[ -s $compiler_ir && -s $output.ll ]]; then
     cp -- "$compiler_ir" "$reference_ir" || exit 1
     cp -- "$output.ll" "$self_ir" || exit 1
 else
@@ -66,7 +79,7 @@ else
         "$project_root/tools/run-limited.sh" \
         "$output" --emit-llvm "$entry" > "$self_ir" || exit 1
 fi
-cmp "$reference_ir" "$self_ir" || exit 1
+[[ -n $built ]] || cmp "$reference_ir" "$self_ir" || exit 1
 
 if [[ $(uname -s) == Darwin ]]; then
     if [[ -x /opt/homebrew/bin/brew ]]; then

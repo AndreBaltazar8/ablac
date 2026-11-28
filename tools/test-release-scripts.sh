@@ -444,12 +444,16 @@ grep -q ' JOBS=8 taskset -c 16-23 tools/run-tests.sh' <<<"$out" || fail "the sui
 grep -q 'RUN_TESTS_FULL' <<<"$out" && fail "the regular gate runs the full suite"
 grep -q 'reproducible-elsewhere' <<<"$out" && fail "the regular gate checks reproducibility"
 grep -q 'make self-rebuild' <<<"$out" || fail "make self-rebuild is missing"
-grep -q 'taskset -c 8-11' <<<"$out" && fail "slot 3's gate touches slot 2's cores"
+grep -q 'taskset -c 8-15' <<<"$out" && fail "slot 3's gate touches slot 2's cores"
 # A tree with bootstrap-stages.sh: the quick stage 3, no separate stage builds.
 out=$("$gate" "$new_tree" 4 --dry-run 2>&1) || fail "gate --dry-run failed on a tree with bootstrap-stages.sh"
 grep -q 'taskset -c 24-31 tools/bootstrap-stages.sh build/gate/seed.bin build/gate$' <<<"$out" || { echo "$out" >&2; fail "the quick stages are not used (or --full is given) by the regular gate"; }
 grep -q 'build-self-hosted-release.sh' <<<"$out" && fail "a tree with bootstrap-stages.sh also builds the stages one by one"
 grep -q ' JOBS=8 taskset -c 24-31 tools/run-tests.sh' <<<"$out" || fail "slot 4 is not 8 jobs on 24-31"
+# Its self-rebuild checks stage 2, which stage 1 built, instead of building the compiler a third time.
+grep -q 'taskset -c 24-31 tools/test-pure-self-rebuild.sh build/gate/stage1 build/gate/stage2$' <<<"$out" ||
+    fail "the self-rebuild does not check the stage 2 that bootstrap-stages built"
+grep -q 'make self-rebuild' <<<"$out" && fail "a tree with bootstrap-stages.sh rebuilds the compiler a third time"
 out5=$("$gate" "$new_tree" 5 --dry-run 2>&1)
 grep -q ' JOBS=8 taskset -c 20-27 tools/run-tests.sh' <<<"$out5" || fail "slot 5 is not 8 jobs on 20-27"
 # The release gate: --full stages, the full suite, reproducibility; gate-release.sh is gate.sh --release.
@@ -457,13 +461,15 @@ out=$("$release_gate" "$new_tree" 1 --dry-run 2>&1) || fail "gate-release --dry-
 grep -q 'tools/bootstrap-stages.sh build/gate/seed.bin build/gate --full' <<<"$out" || fail "the release gate does not build stage 3 whole"
 grep -q 'RUN_TESTS_FULL=1 JOBS=8 taskset -c 0-7 tools/run-tests.sh' <<<"$out" || fail "the release gate's suite is not the full one"
 grep -q 'test-reproducible-elsewhere.sh --self build/ablac.bin' <<<"$out" || fail "the reproducibility check is missing"
+grep -q 'tools/test-pure-self-rebuild.sh build/gate/stage2 build/gate/stage3$' <<<"$out" ||
+    fail "the release gate's self-rebuild does not check the whole stage 3"
 [[ $("$release_gate" "$old_tree" 2 --dry-run 2>&1) == "$("$gate" "$old_tree" 2 --release --dry-run 2>&1)" ]] || fail "gate-release.sh is not gate.sh --release"
 # The slot table.
 out=$("$gate" "$old_tree" 2 --dry-run 2>&1)
-grep -q ' JOBS=6 taskset -c 8-11,14-15 ' <<<"$out" || fail "slot 2 is not 6 jobs on 8-11,14-15"
+grep -q ' JOBS=8 taskset -c 8-15 ' <<<"$out" || fail "slot 2 is not 8 jobs on 8-15"
 out=$(GATE_CPUS=0-1 GATE_JOBS=2 "$gate" "$old_tree" 1 --dry-run 2>&1)
 grep -q ' JOBS=2 taskset -c 0-1 ' <<<"$out" || fail "GATE_CPUS and GATE_JOBS are not honoured"
-for expected in '1: 0-7' '2: 8-11,14-15' '3: 16-23' '4: 24-31' 'efficiency cores' 'performance cores'; do
+for expected in '1: 0-7' '2: 8-15' '3: 16-23' '4: 24-31' 'efficiency cores' 'performance cores'; do
     grep -q -- "$expected" "$gate" || fail "the slot table in gate.sh lost '$expected'"
 done
 # Nothing is written by a dry run, and the refusals.

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The gate for one worktree: stage 1 from the bootstrap compiler the tree pins (tools/bootstrap-compiler.sh: the pinned release,
 # checksum-verified, kept as build/gate/seed.bin), stage 2 == stage 3 (tools/bootstrap-stages.sh when the tree has it: stage 3 is only
-# the compiler run, compared by bitcode; else three builds and a cmp), `make self-rebuild`, then the suite. Two chunks (the stage
+# the compiler run, compared by bitcode; else three builds and a cmp), the self-rebuild's checks (tools/test-pure-self-rebuild.sh
+# on the stage that bootstrap-stages built and compared, not a further build; `make self-rebuild` in an older tree), then the
+# suite. Two chunks (the stage
 # builds and the self-rebuild; the suite) each queue for the shared full-test slot and then the build slot (fair-flock), so no
 # slot is held for more than one chunk. The progress is in <worktree>/build/gate/gate.log: the line `stage2 == stage3`, the
 # suite's `N passed, M failed in Xs`, and last `exit=<status>`. Run it through systemd-run (never nohup: it ignores SIGHUP and
@@ -10,8 +12,8 @@
 #   tools/gate.sh <worktree> [slot] [--release] [--dry-run]
 #
 # The slot (default 2) picks the cores and jobs (all gates used to share cores 0-7):
-#   1: 0-7 (8 jobs)   2: 8-11,14-15 (6 jobs; cpus 12 and 13 are offline)   3: 16-23   4: 24-31   5: 20-27 (overlaps 3 and 4)
-# Core types (ablac-4e's measurements): cpus 0-15 are the performance cores (12 and 13 offline), cpus 16-31 the efficiency cores.
+#   1: 0-7 (8 jobs)   2: 8-15 (8 jobs)   3: 16-23   4: 24-31   5: 20-27 (overlaps 3 and 4)
+# Core types (ablac-4e's measurements): cpus 0-15 are the performance cores, cpus 16-31 the efficiency cores.
 # Slots 1 and 2 are P-cores; slots 3, 4 and 5 are E-cores, about 1.5x slower per test (37 s against 25 s for the same job), so a
 # timing-sensitive test sees slower cores there.
 # GATE_CPUS and GATE_JOBS override them; FAIR_FLOCK names the fair-flock script (default: novakind/tools/fair-flock beside the
@@ -42,7 +44,7 @@ n=${args[1]:-2}
 tree=$(cd "$tree" && pwd)
 case $n in
     1) cpus=0-7 jobs=8 ;;
-    2) cpus=8-11,14-15 jobs=6 ;;
+    2) cpus=8-15 jobs=8 ;;
     3) cpus=16-23 jobs=8 ;;
     4) cpus=24-31 jobs=8 ;;
     5) cpus=20-27 jobs=8 ;;
@@ -109,11 +111,20 @@ build() { echo "time taskset -c $cpus tools/build-self-hosted-release.sh $1 $2 s
 seed_step='tools/bootstrap-compiler.sh build/gate/seed.bin'   # (a no-op when the seed there is the pinned one)
 if [[ -x $tree/tools/bootstrap-stages.sh ]]; then
     stages="time taskset -c $cpus tools/bootstrap-stages.sh build/gate/seed.bin build/gate$( ((release)) && echo ' --full')"
+    # The self-rebuild is the last whole stage, built by the one before it, whose bitcode bootstrap-stages compared.
+    if ((release)); then
+        rebuilt='build/gate/stage2 build/gate/stage3'
+    else
+        rebuilt='build/gate/stage1 build/gate/stage2'
+    fi
+    self_rebuild="make ablac
+        time taskset -c $cpus tools/test-pure-self-rebuild.sh $rebuilt"
 else
     stages="$(build build/gate/seed.bin build/gate/stage1)
         $(build build/gate/stage1 build/gate/stage2)
         $(build build/gate/stage2 build/gate/stage3)
         cmp build/gate/stage2 build/gate/stage3 && echo 'stage2 == stage3'"
+    self_rebuild='make self-rebuild'
 fi
 if ((release)); then
     suite_env='RUN_TESTS_FULL=1 '
@@ -124,7 +135,7 @@ fi
 step builds "$seed_step
         $stages
         cp build/gate/stage2 build/ablac.bin
-        make self-rebuild" &&
+        $self_rebuild" &&
     step suite "rm -f build/test-logs/*.log 2>/dev/null || true; ${suite_env}JOBS=$jobs taskset -c $cpus tools/run-tests.sh" &&
     if ((release)); then
         step repro "time taskset -c $cpus tools/test-reproducible-elsewhere.sh --self build/ablac.bin
