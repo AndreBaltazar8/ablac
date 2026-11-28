@@ -624,14 +624,19 @@ fun RsaPublicKey.verifyPkcs1Sha1Legacy(message: string, signature: string): bool
 
 // --- Encryption ---------------------------------------------------------------------------------
 
-// Returns the requested number of MGF1 mask bytes using a digest function that produces a nonempty result.
+// Returns the requested number of MGF1 mask bytes, or "" when the digest function returns an empty block or blocks of
+// different sizes (the hash is the caller's: an empty one would never fill the mask). Callers check the mask's size.
 fun rsaMgf1(seed: string, size: int, hash: (string) -> string): string {
     var out = ""
     var counter = 0
+    var block = -1
     while (out.size < size) {
         val c =
             "${rsaByte(counter >> 24)}${rsaByte(counter >> 16)}${rsaByte(counter >> 8)}${rsaByte(counter)}"
-        out = out + hash(seed + c)
+        val digest = hash(seed + c)
+        if (digest.size == 0 || (block >= 0 && digest.size != block)) return ""
+        block = digest.size
+        out = out + digest
         counter = counter + 1
     }
     out.slice(0, size)
@@ -653,8 +658,11 @@ fun rsaEncryptOaep(key: RsaPublicKey, plaintext: string, hash: (string) -> strin
     if (seed == "") return cryptoFailed(RSA_NO_RANDOM)
     val block = label + "\x00".repeat(size - plaintext.size - 2 * hashSize - 2) + "\x01" +
         plaintext
-    val maskedBlock = binaryXor(block, rsaMgf1(seed, block.size, hash))
-    val maskedSeed = binaryXor(seed, rsaMgf1(maskedBlock, hashSize, hash))
+    val blockMask = rsaMgf1(seed, block.size, hash)
+    val maskedBlock = binaryXor(block, blockMask)
+    val seedMask = rsaMgf1(maskedBlock, hashSize, hash)
+    if (blockMask.size != block.size || seedMask.size != hashSize) return cryptoFailed("the hash size is not the hash's output size")
+    val maskedSeed = binaryXor(seed, seedMask)
     val encrypted = rsaPublicOperation(key, "\x00" + maskedSeed + maskedBlock)
     if (encrypted ==
         "") cryptoFailed("the input is too long for this key") else CryptoResult(encrypted, true,
@@ -733,6 +741,8 @@ trusted fun rsaDecryptOaep(key: RsaPrivateKey, ciphertext: string, hash: (string
     val maskedBlock = encoded.slice(1 + hashSize, encoded.size)
     val seed = binaryXor(maskedSeed, rsaMgf1(maskedBlock, hashSize, hash))
     val block = binaryXor(maskedBlock, rsaMgf1(seed, maskedBlock.size, hash))
+    // The masks are the caller's hash's: one that came back short would make the block shorter than the label check reads.
+    if (seed.size != hashSize || block.size != maskedBlock.size) return cryptoFailed("the hash size is not the hash's output size")
     val delimiter = rsaOaepDelimiter(ablaUnsafeStringAddress(block), block.size,
         ablaUnsafeStringAddress(expected), hashSize, u8(encoded[0])).declassify()
     if (delimiter == u32(0)) return cryptoFailed(RSA_DECRYPT_FAILED)
