@@ -55,7 +55,7 @@ func server(port, certFile, keyFile string, hold bool, clientCA string) {
 		fmt.Fprintln(os.Stderr, "peer:", err)
 		os.Exit(2)
 	}
-	fmt.Println("listening", port)
+	fmt.Println("listening", listener.Addr().(*net.TCPAddr).Port)
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
