@@ -49,7 +49,7 @@ for run in 2 3 4 6 release-4; do
     shard_of_self=
     for ((shard = 1; shard <= count; shard++)); do grep -qx "$self" "$work/shard.$shard.$run" && shard_of_self=$shard; done
     [[ -n $shard_of_self ]] || { echo "test-shards: test-self-hosted.sh is in no shard" >&2; exit 1; }
-    for waiting in test-borrow-lifetimes test-floating-point test-nominal-scalars test-unsafe-stack-memory test-local-shadowing test-eval-steps test-borrow-duplicates; do
+    for waiting in test-unsafe-stack-memory test-borrow-duplicates; do
         number=$(grep -n "tools/$waiting.sh" "$work/whole/commands.txt" | head -n 1 | cut -d: -f1)
         [[ -n $number ]] || continue
         grep -qx "$number" "$work/shard.$shard_of_self.$run" || { echo "test-shards: $waiting is not in test-self-hosted.sh's shard" >&2; exit 1; }

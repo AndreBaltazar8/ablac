@@ -87,10 +87,7 @@ fi
 # reruns these suite scripts in the same build directories.
 serial_reason() { # command
     case $1 in
-        *tools/test-borrow-lifetimes.sh* | *tools/test-floating-point.sh* | \
-        *tools/test-nominal-scalars.sh* | *tools/test-unsafe-stack-memory.sh* | \
-        *tools/test-local-shadowing.sh* | *tools/test-eval-steps.sh* | \
-        *tools/test-borrow-duplicates.sh*)
+        *tools/test-unsafe-stack-memory.sh* | *tools/test-borrow-duplicates.sh*)
             echo "test-self-hosted.sh reruns it in the same build directory" ;;
     esac
 }
