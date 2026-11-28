@@ -34,7 +34,7 @@ if [[ ${ABLA_STATIC_TARGET:-} == riscv64-linux && -z ${ABLA_STATIC_LLD_LIB:-} ]]
     exit 2
 fi
 # In-process lld (#92, runtime/abla_lld_shim.cpp, the one C++ source): with ABLA_STATIC_LLD_LIB (a directory with liblldELF.a, liblldWasm.a, liblldCOFF.a, liblldCommon.a),
-# ABLA_STATIC_LLD_INCLUDE (lld's headers) and ABLA_STATIC_LLVM_INCLUDE (LLVM's) the compiler carries lld and runs its links in its own process (x86-64 only for now);
+# ABLA_STATIC_LLD_INCLUDE (lld's headers) and ABLA_STATIC_LLVM_INCLUDE (LLVM's) the compiler carries lld and runs its links in its own process (x86-64, AArch64 and riscv64-linux, which requires it);
 # without them it carries a stub and runs the external ld.lld/wasm-ld as before. tools/static-llvm-env.sh prints all of them.
 shim_object=
 if [[ -n ${ABLA_STATIC_LLD_LIB:-} ]]; then
