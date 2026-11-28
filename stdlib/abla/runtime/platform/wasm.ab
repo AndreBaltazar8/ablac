@@ -1055,6 +1055,7 @@ trusted fun __ablaRuntimePlatformFree(address: int): void {
         if (size != 0) {
             val owner = ablaRuntimeLoadI64(header + 24)
             if (owner >= 0 && owner < 48) {
+                if (owner == 12) __ablaRuntimeWasmMarkerCount = __ablaRuntimeWasmMarkerCount - 1
                 __ablaRuntimeWasmUnlink(header)
                 __ablaRuntimeWasmMallocFree(header)
                 __ablaRuntimeWasmAllocationCount =
@@ -1077,8 +1078,41 @@ trusted fun __ablaRuntimePlatformMemoryCheckpoint(): int {
     var marker = __ablaRuntimeWasmAllocationTail
     if (marker == 0 || ablaRuntimeLoadI64(marker + 24) != 12) {
         marker = __ablaRuntimeWasmTrackedAllocate(8, 12) - 32
+        __ablaRuntimeWasmMarkerCount = __ablaRuntimeWasmMarkerCount + 1
     }
     marker
+}
+
+/// The live checkpoint markers (a reset that frees one counts it out).
+var __ablaRuntimeWasmMarkerCount: int = 0
+
+/// Moves tracked `payload` (the latest allocation) to before every marker younger than tracked `owner`: a rope's flat
+/// copy made after a checkpoint the rope is older than was freed by that checkpoint's reset while the rope still
+/// pointed at it (see the host runtime's __ablaRuntimeHostPlaceBeforeMarkers). The walk back from the tail stops at the
+/// owner or past the oldest live marker, so it is no longer than a reset of that marker.
+trusted fun __ablaRuntimeWasmPlaceBeforeMarkers(payload: int, owner: int): void {
+    val header = payload - 32
+    val ownerHeader = owner - 32
+    val ownerLayout = ablaRuntimeLoadI64(ownerHeader + 24)
+    if (ownerLayout < 0 || ownerLayout >= 48 || ownerLayout == 12) return
+    var node = ablaRuntimeLoadI64(header)
+    var seen = 0
+    var earliest = 0
+    while (node != 0 && node != ownerHeader && seen < __ablaRuntimeWasmMarkerCount) {
+        if (ablaRuntimeLoadI64(node + 24) == 12) {
+            earliest = node
+            seen = seen + 1
+        }
+        node = ablaRuntimeLoadI64(node)
+    }
+    if (earliest == 0) return
+    __ablaRuntimeWasmUnlink(header)
+    val previous = ablaRuntimeLoadI64(earliest)
+    ablaRuntimeStoreI64(header, previous)
+    ablaRuntimeStoreI64(header + 8, earliest)
+    ablaRuntimeStoreI64(earliest, header)
+    if (previous == 0) __ablaRuntimeWasmAllocationHead = header
+    else ablaRuntimeStoreI64(previous + 8, header)
 }
 
 /// Releases tracked allocations made after the checkpoint.
@@ -1756,10 +1790,12 @@ trusted fun __ablaRuntimePlatformMemoryFreeze(value: any): any = value
 // region (a global's rope flattened first inside a request's region would otherwise keep a copy the region frees).
 trusted fun __ablaRuntimePlatformAllocateOwned(requested: int, layout: int, owner: int): int {
     val region = __ablaRuntimeWasmRegion
-    if (region == 0 || ablaRuntimeLoadI64(owner - 8) == region) return __ablaRuntimePlatformAllocateLayout(requested, layout)
-    __ablaRuntimeWasmRegion = 0
+    if (region != 0 && ablaRuntimeLoadI64(owner - 8) == region) return __ablaRuntimePlatformAllocateLayout(requested, layout)
+    if (region != 0) __ablaRuntimeWasmRegion = 0
     val result = __ablaRuntimePlatformAllocateLayout(requested, layout)
-    __ablaRuntimeWasmRegion = region
+    if (region != 0) __ablaRuntimeWasmRegion = region
+    // Nor inside a checkpoint younger than its owner.
+    if (__ablaRuntimeWasmMarkerCount > 0) __ablaRuntimeWasmPlaceBeforeMarkers(result, owner)
     result
 }
 

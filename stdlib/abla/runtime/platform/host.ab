@@ -2864,6 +2864,7 @@ trusted fun __ablaRuntimeHostFreeUnlocked(address: int): void {
                 if (slot >= __ablaRuntimeHostRegistrySlots ||
                     (ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8) & -16) != address) ablaRuntimeTrap()
                 if (state == 10) ablaRuntimeAtomicFetchAddI64(__ablaRuntimeHostNativePressure(), size)
+                if (state == 12) __ablaRuntimeHostMarkerRemove(address)
                 val entry = __ablaRuntimeHostUnregister(slot)
                 val width = __ablaRuntimeHostEntryWidth(entry)
                 if (__ablaRuntimeHostValgrind()) __ablaRuntimeHostValgrindFreed(address)
@@ -2892,9 +2893,93 @@ trusted fun __ablaRuntimePlatformMemoryCheckpoint(): int {
     var marker = __ablaRuntimeHostRegistryLast()
     if (marker == 0 || (ablaRuntimeLoadI64(marker - 8) & 63) != 12) {
         marker = __ablaRuntimeHostTrackedAllocate(8, 12)
+        __ablaRuntimeHostMarkerAdd(marker)
     }
     __ablaRuntimeHostHeapUnlock(mutex)
     marker
+}
+
+// The live checkpoint markers, by address, oldest first (outside the tracked heap): the order of their registry slots,
+// which a collection's compaction keeps and __ablaRuntimeHostPlaceBeforeMarkers only rotates. A marker leaves the list
+// when a reset frees it.
+var __ablaRuntimeHostMarkers: int = 0
+var __ablaRuntimeHostMarkerCount: int = 0
+var __ablaRuntimeHostMarkerCapacity: int = 0
+
+/// Adds a new marker (the latest allocation) to the end of the marker list, under the heap lock.
+trusted fun __ablaRuntimeHostMarkerAdd(marker: int): void {
+    if (__ablaRuntimeHostMarkerCount == __ablaRuntimeHostMarkerCapacity) {
+        val capacity = if (__ablaRuntimeHostMarkerCapacity == 0) 16 else __ablaRuntimeHostMarkerCapacity * 2
+        val grown = ablaRuntimePointerAddress(__ablaRuntimeHostCalloc(capacity, 8))
+        if (grown == 0) __ablaRuntimeHostOutOfMemory()
+        if (__ablaRuntimeHostMarkers != 0) {
+            ablaUnsafeCopyMemory(grown, __ablaRuntimeHostMarkers, __ablaRuntimeHostMarkerCount * 8)
+            __ablaRuntimeHostFree(ablaRuntimePointerFromAddress(__ablaRuntimeHostMarkers))
+        }
+        __ablaRuntimeHostMarkers = grown
+        __ablaRuntimeHostMarkerCapacity = capacity
+    }
+    ablaRuntimeStoreI64(__ablaRuntimeHostMarkers + __ablaRuntimeHostMarkerCount * 8, marker)
+    __ablaRuntimeHostMarkerCount = __ablaRuntimeHostMarkerCount + 1
+}
+
+/// Removes a freed marker from the marker list, under the heap lock.
+trusted fun __ablaRuntimeHostMarkerRemove(marker: int): void {
+    var index = 0
+    var found = false
+    while (index < __ablaRuntimeHostMarkerCount) {
+        val at = __ablaRuntimeHostMarkers + index * 8
+        if (found) ablaRuntimeStoreI64(at - 8, ablaRuntimeLoadI64(at))
+        else if (ablaRuntimeLoadI64(at) == marker) found = true
+        index = index + 1
+    }
+    if (found) __ablaRuntimeHostMarkerCount = __ablaRuntimeHostMarkerCount - 1
+}
+
+/// Moves tracked `payload` (just allocated) to before every marker younger than tracked `owner`; takes the heap lock.
+/// A rope's flat copy (__ablaRuntimeStringDataSlow) is made the first time the rope's bytes are read and stands for the
+/// rope from then on. Made after a checkpoint the rope is older than, a reset of that checkpoint freed it while the rope
+/// still pointed at it. The copy takes the slot of the earliest such marker, each of those markers the next one's,
+/// and the last the copy's: the markers keep their order, and what lay between them is now before them, so a reset
+/// leaves it to the collector. The copy is allocated under one hold of the heap lock and moved under another: a reset on
+/// another thread in between could free it first. Resets are trusted code's, and the compiler's are on one thread.
+trusted fun __ablaRuntimeHostPlaceBeforeMarkers(payload: int, owner: int): void {
+    val mutex = __ablaRuntimeHostHeapLock()
+    if (__ablaRuntimeHostMarkerCount > 0) __ablaRuntimeHostMarkersRotate(payload, owner)
+    __ablaRuntimeHostHeapUnlock(mutex)
+}
+
+/// The rotation of __ablaRuntimeHostPlaceBeforeMarkers, under the heap lock.
+trusted fun __ablaRuntimeHostMarkersRotate(payload: int, owner: int): void {
+    val ownerWord = ablaRuntimeLoadI64(owner - 8)
+    val ownerState = ownerWord & 63
+    if (ownerState >= 16 || ownerState == 12) return
+    val ownerSlot = ownerWord >>> 6
+    var slot = ablaRuntimeLoadI64(payload - 8) >>> 6
+    var moving = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
+    val copySlot = slot
+    var index = 0
+    while (index < __ablaRuntimeHostMarkerCount) {
+        val marker = ablaRuntimeLoadI64(__ablaRuntimeHostMarkers + index * 8)
+        val markerSlot = ablaRuntimeLoadI64(marker - 8) >>> 6
+        if (markerSlot > ownerSlot && markerSlot < copySlot) {
+            val at = __ablaRuntimeHostRegistry + markerSlot * 8
+            val displaced = ablaRuntimeLoadI64(at)
+            __ablaRuntimeHostSetSlot(moving, markerSlot)
+            ablaRuntimeStoreI64(at, moving)
+            moving = displaced
+        }
+        index = index + 1
+    }
+    __ablaRuntimeHostSetSlot(moving, copySlot)
+    ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + copySlot * 8, moving)
+}
+
+/// Stores `slot` in the header of the registry entry `entry`, keeping its state.
+@inline
+trusted fun __ablaRuntimeHostSetSlot(entry: int, slot: int): void {
+    val payload = entry & -16
+    ablaRuntimeStoreI64(payload - 8, (slot << 6) | (ablaRuntimeLoadI64(payload - 8) & 63))
 }
 
 /// Releases tracked allocations made after the checkpoint.
@@ -5798,10 +5883,14 @@ trusted fun __ablaRuntimePlatformMemoryFreeze(value: any): any {
 // region (a global's rope flattened first inside a request's region would otherwise keep a copy the region frees).
 trusted fun __ablaRuntimePlatformAllocateOwned(requested: int, layout: int, owner: int): int {
     val region = __ablaRuntimeHostRegionLoad()
-    if (region == 0 || ((ablaRuntimeLoadI64(owner - 8) & 63) == 63 && ablaRuntimeLoadI64(owner - 24) == region)) return __ablaRuntimePlatformAllocateLayout(requested, layout)
-    __ablaRuntimeHostRegionStore(0)
+    if (region != 0 && (ablaRuntimeLoadI64(owner - 8) & 63) == 63 && ablaRuntimeLoadI64(owner - 24) == region) {
+        return __ablaRuntimePlatformAllocateLayout(requested, layout)
+    }
+    if (region != 0) __ablaRuntimeHostRegionStore(0)
     val result = __ablaRuntimePlatformAllocateLayout(requested, layout)
-    __ablaRuntimeHostRegionStore(region)
+    if (region != 0) __ablaRuntimeHostRegionStore(region)
+    // Nor inside a checkpoint younger than its owner (see __ablaRuntimeHostPlaceBeforeMarkers).
+    if ((ablaRuntimeLoadI64(result - 8) & 63) < 16) __ablaRuntimeHostPlaceBeforeMarkers(result, owner)
     result
 }
 

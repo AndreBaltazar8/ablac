@@ -381,6 +381,7 @@ test-serial: ablac
 	tools/test-region-stores.sh $(COMPILER)
 	tools/test-memory-promote.sh $(COMPILER)
 	tools/test-rope-region.sh $(COMPILER)
+	tools/test-rope-checkpoint.sh $(COMPILER)
 	tools/test-region-extension-names.sh $(COMPILER)
 	tools/test-region-member-names.sh $(COMPILER)
 	tools/test-null-default-leave.sh $(COMPILER)
