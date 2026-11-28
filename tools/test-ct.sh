@@ -777,6 +777,28 @@ real_entries_margin() {
 # frames these workers use. Three plain runs and one with a collection at every safe point (ABLA_GC_STRESS=1), the
 # deterministic worst case, since a collection in the middle of an entry makes it deeper. Controls: a byte left in the
 # red zone is found, and gone after ctScrubStack1024.
+# ctScrubStack8192 with about 6 KiB of stack left (tests/cases/ct/scrub-near-limit.ab, in a thread whose stack the soft
+# limit sizes: 256 KiB here): the wipe stops at the guard page under the stack instead of faulting on it, and still zeroes
+# what lies between. On x86-64 natively and, when a runner is there, on AArch64 (sp read with its own template).
+scrub_near_limit_run() { # arch
+    local name=scrub-near-limit-$1 source=$cases/scrub-near-limit.ab target=() runner=()
+    if [[ $1 == aarch64 ]]; then
+        aarch64_runner_available || { echo "ok   aarch64 scrub near the stack limit: skipped (no AArch64 runner)"; return 0; }
+        source=$out/scrub-near-limit-aarch64.ab
+        sed -e 's/stackPointer("movq %rsp, $0", "=r")/stackPointer("mov $0, sp", "=r")/' "$cases/scrub-near-limit.ab" > "$source"
+        grep 'stackPointer("mov $0, sp"' "$source" > /dev/null || { echo "ct: the AArch64 template was not put in" >&2; exit 1; }
+        target=(--target aarch64-linux)
+        runner=(aarch64_run --timeout 120 --)
+    fi
+    "$compiler" build "$source" "${target[@]}" -o "$out/$name" --no-cache --stdlib-internals
+    local status=0
+    (ulimit -S -s 256 && "${runner[@]}" "$out/$name") > "$out/$name.log" 2>&1 || status=$?
+    [[ $status == 0 ]] || {
+        cat "$out/$name.log" >&2; echo "ct: ctScrubStack8192 near the stack limit on $1 ended with $status" >&2; exit 1
+    }
+    echo "ok   $1 scrub near the stack limit: $(tail -1 "$out/$name.log")"
+}
+
 real_entries_run() {
     "$compiler" build "$cases/residue-run.ab" -o "$out/residue-run" --no-cache --stdlib-internals
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$out/keys-3072.pem" 2> /dev/null
@@ -1027,6 +1049,7 @@ frame_address_read
 frame_view_read
 residue_read
 real_entries_run
+scrub_near_limit_run x86_64
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
 clmul_read "$out/x86.o" x86_64
@@ -1066,6 +1089,7 @@ llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
 aarch64_run --cpu max -- "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
 read_target aarch64 "$out/aarch64.o"
+scrub_near_limit_run aarch64
 owner_wipe_read aarch64 "$out/aarch64.o"
 # The allocation probe as an AArch64 object (built by the driver above): the same out-of-line check as x86-64.
 $check --expect-allocator aarch64 "$out/aarch64-alloc-probe.o" probe_bignum_allocate: probe_aes_expand: > "$out/alloc-probe-aarch64.log" 2>&1 || {

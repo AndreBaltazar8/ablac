@@ -1089,7 +1089,33 @@ fun bootstrapLlvmEmitCtScrubStack(backend: BootstrapLlvmBackend, name: string): 
     if (bytes == 0) return false
     var assembly = ""
     var constraints = ""
-    if (arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
+    // A wipe longer than a page, on Linux, goes down one page at a time and stops at a page it can't write: a thread whose
+    // work fit in its stack may have less than the wipe's size left under it, and the page under its stack is a guard (a
+    // fault) or another mapping (a thread's control page, a store that is not ours). Each page below the one sp is in is
+    // first given to getcpu, which writes 4 bytes there or returns -EFAULT without a fault (it grows the main thread's
+    // stack as a store would). What the stop leaves unwiped was never stack, so the work that ran there never wrote it.
+    // The wipes of a page or less keep their one-loop shape, which the residue checks read (tools/ct/check).
+    val linux = bootstrapTextContains(backend.targetTriple, "linux")
+    if (bytes > 4096 && linux && arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
+        // r9 the next byte above what is left to wipe, r8 the lowest byte to wipe, r10 the page sp is in; each round
+        // takes rdi down to the page under r9 (or r8), probes it unless it is r10's, and zeroes [rdi, r9).
+        val chunk = "leaq -1(%r9), %rdi\nandq \$\$-4096, %rdi\ncmpq %r8, %rdi\ncmovbq %r8, %rdi\n"
+        assembly =
+            "movq %rsp, %r9\nleaq -$bytes(%rsp), %r8\nmovq %rsp, %r10\nandq \$\$-4096, %r10\n1:\n" + chunk +
+            "cmpq %r10, %rdi\njae 2f\nxorl %esi, %esi\nxorl %edx, %edx\nmovl \$\$309, %eax\nsyscall\n" +
+            "testq %rax, %rax\njnz 3f\n" + chunk +
+            "2:\nmovq %r9, %rcx\nsubq %rdi, %rcx\nshrq \$\$3, %rcx\nmovq %rdi, %r9\nxorl %eax, %eax\nrep stosq\n" +
+            "cmpq %r8, %r9\nja 1b\n3:"
+        constraints = "~{rdi},~{rsi},~{rdx},~{rcx},~{rax},~{r8},~{r9},~{r10},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"
+    } else if (bytes > 4096 && linux && arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
+        // The same with x9 (above what is left), x10 (lowest), x11 (sp's page) and x12 (this round's page); getcpu is 168.
+        val chunk = "sub x12, x9, #1\nand x12, x12, #0xfffffffffffff000\ncmp x12, x10\ncsel x12, x10, x12, lo\n"
+        assembly =
+            "mov x9, sp\nsub x10, sp, #${bytes / 4096}, lsl #12\nmov x11, sp\nand x11, x11, #0xfffffffffffff000\n1:\n" +
+            chunk + "cmp x12, x11\nb.hs 2f\nmov x0, x12\nmov x1, xzr\nmov x2, xzr\nmov x8, #168\nsvc #0\ncbnz x0, 3f\n" +
+            "2:\nmov x13, x12\n4:\nstp xzr, xzr, [x13], #16\ncmp x13, x9\nb.ne 4b\nmov x9, x12\ncmp x9, x10\nb.hi 1b\n3:"
+        constraints = "~{x0},~{x1},~{x2},~{x8},~{x9},~{x10},~{x11},~{x12},~{x13},~{memory},~{cc}"
+    } else if (arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
         assembly =
             "leaq -$bytes(%rsp), %rdi\nmovl \$\$${bytes / 8}, %ecx\nxorl %eax, %eax\nrep stosq"
         constraints = "~{rdi},~{rcx},~{rax},~{memory},~{dirflag},~{fpsr},~{flags}"
