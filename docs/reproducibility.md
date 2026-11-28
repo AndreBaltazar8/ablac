@@ -28,7 +28,8 @@ The claim, stated so that it can be checked and so that its limits are visible. 
 - **macOS, beyond v0.2.47.** The v0.2.47 rebuild is one recorded comparison with recorded tools. A newer release, SDK, Xcode or
   LLVM has no such run, and the executable of a Mac build carries paths, a UUID and an ad-hoc signature that
   depend on the machine.
-- **Windows.** No reproducibility check exists.
+- **Windows.** A Release run with `windows` set to `with` or `fixpoint` compares two native self-builds of the Windows
+  compiler (`windows-fixpoint`); a rebuild of a published zip elsewhere is not checked.
 - **The toolchain archives.** The dynamic Linux archive and the macOS archives take packages from `apt` and Homebrew
   at build time (docs/ci-security.md), which are not pinned by hash. The static Linux archive does not; its content is
   covered only through the static compiler's fixpoint and its size and dependency checks, not by a rebuild of the archive.

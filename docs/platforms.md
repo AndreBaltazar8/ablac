@@ -5,8 +5,8 @@ promise or a fresh green CI run. Read each row's scope: executing a compiler
 under qemu, running a library on Simulator, and testing a physical device are
 different evidence. Optional/manual jobs count only when actually run.
 
-The published asset baseline is [v0.2.64](https://github.com/AndreBaltazar8/ablac/releases/tag/v0.2.64),
-whose asset names are saved in [the release snapshot](readiness-data/release-assets-v0.2.64.json).
+The published asset baseline is [v0.2.79](https://github.com/AndreBaltazar8/ablac/releases/tag/v0.2.79),
+whose asset names are saved in [the release snapshot](readiness-data/release-assets-v0.2.79.json).
 The workflows on master can prepare artifacts that this release did not ship.
 Checksums accompany the published compiler and toolchain assets.
 
@@ -25,20 +25,20 @@ Checksums accompany the published compiler and toolchain assets.
 ## Matrix
 
 <!-- readiness-platforms:start -->
-| Platform | Tier | Compiler host evidence | Program target evidence | Published v0.2.64 assets |
+| Platform | Tier | Compiler host evidence | Program target evidence | Published v0.2.79 assets |
 |---|---|---|---|---|
-| Linux x86-64 | T1 | Native suite, dynamic self-build and static compiler fixpoint | Native executables; default libc-free link with explicit dependency exceptions | `ablac-x86_64-linux`, `ablac-static-x86_64-linux`, `abla-toolchain-x86_64-linux.tar.gz` |
-| Linux AArch64 | T2 | Cross-built static compiler exercised under qemu in CI; native self-build and smoke on manual dispatch | Static programs cross-built and selected programs executed under qemu | None; AArch64 static compiler not a v0.2.64 asset |
+| Linux x86-64 | T1 | Native suite, dynamic self-build and static compiler fixpoint | Native executables; default libc-free link with explicit dependency exceptions | `ablac-x86_64-linux` (static), `ablac-dynamic-x86_64-linux`, `abla-toolchain-x86_64-linux.tar.gz`, `abla-toolchain-dynamic-x86_64-linux.tar.gz` |
+| Linux AArch64 | T2 | Cross-built static compiler exercised under qemu in CI; native self-build and smoke on manual dispatch | Static programs cross-built and selected programs executed under qemu | `ablac-static-aarch64-linux` (since v0.2.65) |
 | macOS arm64 | T2 | Native compiler, selected host checks and self-rebuild | Native Mach-O; selected runtime paths, iOS Simulator integration | `ablac-arm64-macos`, `abla-toolchain-arm64-macos.tar.gz` |
 | macOS Intel | T2 | Native compiler and selected host checks; release self-rebuild | Native Mach-O; selected runtime paths | `ablac-x86_64-macos`, `abla-toolchain-x86_64-macos.tar.gz` |
 | Android arm64 | T2 | No Android-hosted compiler gate | Shared libraries checked against NDK; exports executed by bionic under qemu | None for Android |
 | iOS arm64 and Simulator | T2 Simulator / T3 device | No iOS-hosted compiler gate | Device archive/XCFramework checks; selected exported calls run on arm64 Simulator | None for iOS |
-| WebAssembly hosted | T2 | No Wasm-hosted compiler gate | Release/development modules execute with the `abla_host` ABI under Node | No standalone Wasm compiler asset; build support in host toolchains |
+| WebAssembly hosted | T2 | No Wasm-hosted compiler gate | Release/development modules execute with the `abla_host` ABI under Node | `abla-playground-0.2.79.tar.gz` (the compiler front end as Wasm, [playground.md](playground.md)); no standalone Wasm compiler |
 | WebAssembly hostless | T2 | No Wasm-hosted compiler gate | Import-free runtime fixtures and differential programs execute under Node | No standalone Wasm compiler asset; build support in host toolchains |
 | Xtensa / ESP32 | T3 | No compiler hosted on the microcontroller | Object/assembly checks and optional companion integration; no required board run | No ablac ESP32 binary; separately versioned LLVM companion |
 | Linux RISC-V 64 | T2 | Static compiler (pinned patched LLVM/lld) executed under qemu in CI: release and fast hello, in-process object emission; self-build fixed point under qemu on manual dispatch | Static LP64D programs; every module program that links static runs under qemu and matches x86-64 (335 of 336) | None; the RV64 compiler is not a release asset |
-| Windows x86-64 | T2 | Packaged compiler smoke on `windows-latest` nightly and on dispatch; native fixed point required when the zip ships | Cross-built on Linux; the freestanding exit-status program, the hosted crash program with its symbolized backtrace, and selected hosted programs run natively on `windows-latest` in CI | None in v0.2.64; `abla-toolchain-x86_64-windows.zip` shipped in v0.2.68 |
-| Windows ARM64 | T2 | Packaged compiler smoke and native fixed point on `windows-11-arm` required when the zip ships | Hosted programs cross-built on Linux and run natively on `windows-11-arm` in CI | None in v0.2.64. `ablac-windows-arm64.zip` starts with v0.2.69. |
+| Windows x86-64 | T2 | Packaged compiler smoke on `windows-latest` nightly and on dispatch; native fixed point required when the zip ships | Cross-built on Linux; the freestanding exit-status program, the hosted crash program with its symbolized backtrace, and selected hosted programs run natively on `windows-latest` in CI | `abla-toolchain-x86_64-windows.zip` (since v0.2.68) |
+| Windows ARM64 | T2 | Packaged compiler smoke and native fixed point on `windows-11-arm` required when the zip ships | Hosted programs cross-built on Linux and run natively on `windows-11-arm` in CI | `ablac-windows-arm64.zip` (since v0.2.69) |
 <!-- readiness-platforms:end -->
 
 `tools/readiness.sh` reads this marked table directly. Update
@@ -66,9 +66,8 @@ program links no libc. Programs that explicitly bring C libraries still need
 those libraries. Static compile-time library emulation has documented numeric
 limits; inspect [the remaining math differences](../TODO.md#known-upstream-llvm-miscompiles).
 The LLVM 23.1.x fdiv issue below also applies wherever an unpatched LLVM is used.
-The source release workflow now promotes the static binary to the default asset
-and retains a dynamic binary under a new name; that future naming is not the
-v0.2.64 asset inventory above.
+From v0.2.65 the static binary is the default asset, `ablac-x86_64-linux`, and
+the dynamic one ships beside it as `ablac-dynamic-x86_64-linux`.
 
 ## Linux AArch64
 
@@ -85,7 +84,7 @@ exceptions are recorded separately. See
 
 The current [Release](../.github/workflows/release.yml) `compiler` Linux entry
 has **Build and check the static compiler for AArch64 Linux**, producing
-`ablac-static-aarch64-linux`. It is absent from the v0.2.64 published snapshot.
+`ablac-static-aarch64-linux`, published from v0.2.65.
 The artifact check runs under qemu on an x86-64 builder; it skips the compiler
 self-build fixpoint unless explicitly requested. There is no native AArch64
 full-suite job. `--target aarch64-linux` is a built-in target in
@@ -195,24 +194,26 @@ release (there is no `ablac-riscv64-linux` asset and no `setup-abla` support), a
 ## macOS arm64 and Intel
 
 [CI](../.github/workflows/ci.yml) job `macos`, named **${{ matrix.name }}**,
-contains **macOS host and compiler fixed point** on `macos-15` (`full: true`)
-and **macOS host and compiler fixed point (Intel)** on `macos-15-intel`
-(`full: false`). Both run **Exercise the native macOS host paths**, foreign
-thread entry, stop-the-world GC, stack guards, emulated TLS, live reload,
-watch mode, REPL sessions, and the libSystem import guard. Only the arm64
-`full` entry runs **Check the compiler fixed point and native child** and
-**Link iOS slices and exercise an exported C call on Simulator**. These are
-selected tests; `full: true` here does not mean the Linux full suite.
+has four entries, a `host` and a `live` lane on each of `macos-15` and
+`macos-15-intel`: **macOS host tests (Apple Silicon)**, **macOS host and
+compiler fixed point**, **macOS host and compiler fixed point (Intel)** and
+**macOS live compiler tests (Intel)**. The host lanes run the native host
+paths (foreign thread entry, stop-the-world GC, stack guards, emulated TLS),
+the live lanes live reload, watch mode and REPL sessions, and one lane per
+architecture the libSystem import guard. The Apple Silicon live lane also runs
+the compiler fixed point and native child and **Link iOS slices and exercise
+an exported C call on Simulator**. These are selected tests, not the Linux full
+suite.
 
 [Release](../.github/workflows/release.yml) job `compiler` has `macos-15` /
 `ablac-arm64-macos` and `macos-15-intel` / `ablac-x86_64-macos` entries, native
 self-build and host checks, and **Exercise the packaged toolchain**.
 
-Known gaps: Homebrew LLVM 23.1.x is affected by the **fdiv miscompile**:
-`0.0 / (0.0 * x)` can become zero instead of NaN in optimized code, without
-fast-math flags. The minimized case and affected modes are in
-[TODO](../TODO.md#known-upstream-llvm-miscompiles); a patch file in the repository
-does not prove the installed Homebrew LLVM has it. REPL session behavior is
+Known gaps: CI and release jobs install the pinned, patched LLVM
+(`tools/install-macos-llvm.sh`), but a local build on Homebrew LLVM 23.1.x is
+affected by the **fdiv miscompile**: `0.0 / (0.0 * x)` can become zero instead
+of NaN in optimized code, without fast-math flags. The minimized case and
+affected modes are in [TODO](../TODO.md#known-upstream-llvm-miscompiles). REPL session behavior is
 tested, but interactive editor/PTY behavior has no Mac CI gate here. SDK and
 libSystem dependencies remain; macOS is not a static Linux-style executable
 environment. See [the runtime boundary](toolchain.md).
@@ -305,7 +306,7 @@ and runs [test-windows-link.sh](../tools/test-windows-link.sh). Job
 crash program's access-violation report, its backtrace symbolized to file and
 line, the seven hosted programs in `tests/cases/windows/hosted` (hello,
 arguments, environment, files, processes, loopback sockets, threads; `--fast`
-and release) and the 81 standard-library programs listed in
+and release) and the 86 standard-library programs listed in
 [programs.txt](../tests/cases/windows/programs.txt) (collections, text, date,
 files, `homePath` (`USERPROFILE` where there is no `HOME`), process metrics (the runtime's system call 4008: working set, commit charge, the descriptor table's entries, the creation time; `tests/cases/windows/process-metrics.ab` is the module test without its `ulimit -n` shell), process exit, loopback HTTP and WebSocket, threads, ...). The Linux job
 leaves each image with the output and exit status the same program has built

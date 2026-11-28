@@ -199,8 +199,9 @@ implementation and work unchanged in hosted and JIT execution. `abla/fs` and
 atomic files, directory enumeration/watch identities, arguments, sleep, and
 command/child lifecycle. `abla/process/time` exposes millisecond/nanosecond
 monotonic values, checked nanosecond sleep, and an affine `MonotonicClock` that
-reuses its three kernel buffers in hot loops. Linux lowers these operations to
-`clock_gettime` and `nanosleep` syscalls without libc.
+reuses its three kernel buffers in hot loops. On Linux a clock read goes
+through the vDSO's `clock_gettime` on x86-64 and AArch64 (the system call where
+there is no vDSO) and a sleep is the `nanosleep` system call, without libc.
 
 `BufferedTextWriter` batches text behind an ordinary `(string) -> bool` sink.
 Its stdout/stderr constructors stay in `abla/io`; the file adapter is a

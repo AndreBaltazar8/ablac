@@ -56,7 +56,7 @@ handoff applies to a v0.2.20 compiler only; newer bootstraps build directly.
 The release workflow still rebuilds stage 2 and verifies the fixed point.
 
 A Linux release is reproducible byte for byte. From the tag, in any directory,
-with `gh release download <tag> -p ablac-dynamic-x86_64-linux` as `published` (from v0.2.66 on the
+with `gh release download <tag> -p ablac-dynamic-x86_64-linux` as `published` (from v0.2.65 on the
 `ablac-x86_64-linux` asset is the statically linked compiler, which the release checks by its fixpoint:
 tools/test-static-artifact.sh; it is the bootstrap seed, and the dynamic asset ships beside it as an opt-in: it is the only compiler with compile-time `dlopen` and the stage 2 cmp proof):
 
@@ -166,8 +166,8 @@ pin:
 A newer pair is chosen with `--lineage` (and the workflow's `lineage` input); `LINEAGES` in
 `tools/test-bootstrap-convergence.mjs` lists them. `v0.2.51`: route A starts from the checksum-pinned v0.2.51
 and route B from v0.2.50, rebuilding the v0.2.51 sources (`1758d94e64b0e7f31f22107f8556fd63dc4351c6`) twice; the
-The same shape for `v0.2.52` and `v0.2.53` (the latter: A the v0.2.53 pin, B v0.2.52, sources `b9ed669ce148440cef09650dde9db4085358f0cd`). The
-default stays the v0.2.45 pair above. Adding a lineage is adding its two seed checksums and the bridge commit.
+The same shape for `v0.2.52` and `v0.2.53` (the latter: A the v0.2.53 pin, B v0.2.52, sources `b9ed669ce148440cef09650dde9db4085358f0cd`). Later
+releases have pairs of the same shape, and the workflow's `lineage` input defaults to the latest release's. Adding a lineage is adding its two seed checksums and the bridge commit.
 
 **Release gate.** A release is not published until this gate is green on its source commit.
 `tools/release-convergence.sh run vX --source-ref <the commit vX is made from>` dispatches the workflow with
@@ -257,13 +257,13 @@ C implementations remain for iOS and older bootstrap compilers. It contains no A
 allocation, evaluator, or compiler implementation.
 
 LLVM and the platform linkers remain native toolchain dependencies. Libc-free
-Linux program links use LLD directly without clang; the x86-64 static compiler
-can embed LLD through `runtime/abla_lld_shim.cpp` when its archives and headers
+Linux program links use LLD directly without clang; the static compiler
+(x86-64, AArch64 and RISC-V 64) can embed LLD through `runtime/abla_lld_shim.cpp` when its archives and headers
 are configured. The dynamic toolchain and other targets retain their own
 native build-tool requirements.
 Linux pins them through Nix, with [a prebuilt LLVM for Xtensa](llvm-xtensa.md);
-macOS uses Homebrew LLVM and the system
-Mach-O linker. Removing those hosted dependencies is a separate freestanding goal described in
+macOS CI and releases use the pinned, patched LLVM of
+`tools/llvm-macos-pins.sh` and the system Mach-O linker. Removing those hosted dependencies is a separate freestanding goal described in
 [full-self-hosting.md](full-self-hosting.md).
 
 ## Word-zero intrinsic transition

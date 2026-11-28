@@ -45,7 +45,8 @@ collection.
 
 The dynamic backend loads libLLVM; the static Linux compiler embeds LLVM and
 its own C-library compatibility routines. With its LLD archives configured,
-the x86-64 static compiler also links in process through a small C++ bridge.
+the static compiler (x86-64, AArch64 and RISC-V 64) also links in process
+through a small C++ bridge.
 Libc-free program links use LLD directly without clang. These checks eliminate
 some dynamic dependencies, not LLVM itself. See the exact
 [native dependency boundaries](full-self-hosting.md).

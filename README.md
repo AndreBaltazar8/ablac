@@ -77,8 +77,8 @@ steps:
   - run: ablac build app.ab -o build/app
 ```
 
-The action supports Linux x86-64, both Apple Silicon and Intel macOS, and (from the release that ships
-`abla-toolchain-x86_64-windows.zip`) Windows x86-64 runners, where the toolchain is one `ablac.exe` with
+The action supports Linux x86-64, both Apple Silicon and Intel macOS, and Windows x86-64 (from v0.2.68) and
+ARM64 (from v0.2.69) runners, where the toolchain is one `ablac.exe` with
 `llvm-objcopy.exe` beside it and needs no Visual Studio or SDK. Pin it
 to a full commit SHA when an immutable action reference is required.
 
@@ -131,7 +131,7 @@ The macOS host supports Intel and Apple Silicon. `make` downloads the pinned
 bootstrap compiler, rebuilds the current Abla sources as a native Mach-O
 executable for LLVM's detected host triple, and uses Homebrew LLVM for native
 object emission and ORC execution. Each host uses its native compiler artifact
-published with `v0.2.16`; no Intel translation is involved on Apple Silicon.
+of the release `tools/bootstrap-compiler.sh` pins; no Intel translation is involved on Apple Silicon.
 `build/ablac` puts the tools of the LLVM `build/ablac.bin` links first on PATH
 (`ABLA_LLVM` and `ABLA_LLD` name other prefixes), and the rebuilds run through it.
 Run `tools/test-macos-host.sh build/ablac` for the focused native host gate.

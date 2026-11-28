@@ -12,8 +12,11 @@ repository permissions.
 | Job ID | Runner and scope |
 |---|---|
 | `linux` | Ubuntu 24.04, four shards of `make test`, each building the checksum-pinned bootstrap and then rebuilding the compiler with its own backend; job name `Linux suite (shard ${{ matrix.shard }}/4)` |
-| `macos` | Native Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) compiler/host checks; matrix names `macOS host and compiler fixed point` and `macOS host and compiler fixed point (Intel)` |
+| `macos` | Native Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) compiler/host checks, a `host` and a `live` lane on each; matrix names `macOS host tests (Apple Silicon)`, `macOS host and compiler fixed point`, `macOS host and compiler fixed point (Intel)` and `macOS live compiler tests (Intel)` |
+| `windows-cross`, `windows-run` | Ubuntu cross-builds the Windows x86-64 programs; `windows-latest` runs them (freestanding, hosted, the standard-library programs of `tests/cases/windows/programs.txt`, crash reports) and compares their output with Linux |
+| `windows-arm64-cross`, `windows-arm64-run` | The same for Windows ARM64, run on `windows-11-arm` |
 | `libc-free-aarch64` | Ubuntu cross-builds the module corpus for AArch64 and guards libc-free links and the explicit exceptions |
+| `libc-free-riscv64` | The same for RISC-V 64, in three parts |
 | `static-compiler` | Ubuntu builds the x86-64 static compiler; checks no loader/no needed library, a child compile/run and the static compiler fixpoint |
 | `static-compiler-aarch64` | Ubuntu cross-builds the static AArch64 compiler on three runners (`STATIC_AARCH64_PART`), each building a third of the module corpus with it under qemu; part 1 also runs its compiler/program/JIT/compile-time checks; no native AArch64 full suite |
 
@@ -24,12 +27,13 @@ not multiply without limit. The suite-parent stack stays at 8 MiB. Android
 NDK and bionic image downloads are checksum-pinned; the suite then executes
 Android library exports under qemu with bionic. That is not a device/UI test.
 
-Both Mac entries build stage 1 and stage 2, exercise `test-macos-host.sh`, and
-check foreign-thread entry, collection, stack guards, emulated TLS, live run,
-watch mode, test-watch, REPL sessions and the libSystem import guard. Only
-Apple Silicon (`matrix.full`) runs the additional compiler fixed-point/native
-child and iOS Simulator steps in push CI. The Intel entry is a selected host
-gate, not the Linux suite. The REPL's util-linux PTY/editor check skips on
+Every Mac entry builds stage 1 and stage 2. The `host` lanes exercise
+`test-macos-host.sh`, foreign-thread entry, collection, stack guards and
+emulated TLS; the `live` lanes live run, watch mode, test-watch and REPL
+sessions; one lane per architecture checks the libSystem import guard. Only the
+Apple Silicon `live` lane runs the compiler fixed-point/native child and iOS
+Simulator steps in push CI. These are selected host gates, not the Linux
+suite. The REPL's util-linux PTY/editor check skips on
 macOS; session coverage alone does not verify interactive editing there.
 
 The configured timeouts are 90 minutes for Linux and Mac jobs, 60 for the

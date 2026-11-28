@@ -1,8 +1,9 @@
 # LLVM native backend
 
 LLVM is the current production-quality native backend and will remain an
-optional hosted accelerator. Because libLLVM is implemented in C++ and loads
-libc, it cannot prove the final freestanding self-host goal. The required
+optional hosted accelerator. Because LLVM is implemented in C++ and needs a C
+library (the static compiler links it on Abla's own), it cannot prove the final
+freestanding self-host goal. The required
 baseline Abla machine-code/ELF backend is planned in
 [full-self-hosting.md](full-self-hosting.md).
 

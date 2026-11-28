@@ -45,7 +45,7 @@ RSA keys under 2048 bits for PSS verification.
   PKCS#12 key derivation of OpenSSL 1.x, Windows, macOS and Java 8, with a SHA-1 or SHA-256 MAC (read only; our writers use
   PBES2). A MAC is required, and RC4, single DES, SHA-224/384/512 and PBMAC1 MACs are refused:
   [PKCS#12 client certificates](pkcs12-client-certificates.md).
-- Speed: an RSA-2048 signature (a server with an RSA certificate, or a client certificate) takes about 8 ms in a release
+- Speed: an RSA-2048 signature (a server with an RSA certificate, or a client certificate) takes about 3 ms in a release
   build and about 300 ms in a `--fast` build; ECDSA and Ed25519 are far cheaper. Parsing a system bundle of 145
   certificates takes about 6 ms in a release build and 90 ms in a `--fast` build.
 - Server side: one certificate by default; several are chosen by server name and signature algorithms (below).

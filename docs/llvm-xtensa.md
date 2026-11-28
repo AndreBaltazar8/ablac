@@ -48,8 +48,8 @@ explicitly requests a new companion.
 change, a local shell builds from source, so the patches being worked on are the
 ones in use, and a CI shell stops with an error rather than build for an hour.
 
-macOS doesn't use `shell.nix`: its jobs use ordinary Homebrew LLVM, without the private Xtensa patches.
-The packaged Linux toolchain likewise uses stock LLVM. The Nix-built library
+macOS doesn't use `shell.nix`: its jobs use the pinned, patched LLVM of `tools/llvm-macos-pins.sh`, without the
+private Xtensa patches. The packaged Linux toolchain likewise uses the patched LLVM without the Xtensa backend. The Nix-built library
 requires newer glibc interfaces, including GLIBC_2.44; changing its RPATH is not
 enough to use it on Ubuntu 22.04. See the measured
 [portability study](design/xtensa-release-feasibility.md).

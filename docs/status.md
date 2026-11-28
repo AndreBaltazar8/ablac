@@ -20,7 +20,8 @@ require libc; hosted facilities are optional capabilities.
   classes and methods with interface bounds and type-argument inference.
   See [language.md](language.md#interfaces) and its [generics section](language.md#generics).
 - The hosted compiler and ordinary Abla programs build and run natively on
-  x86-64 Linux plus Intel and Apple Silicon macOS; the macOS gate covers
+  x86-64 Linux, Intel and Apple Silicon macOS, and Windows x86-64 and ARM64;
+  releases also ship a static AArch64 Linux compiler. The macOS gate covers
   Mach-O emission, ORC, console, filesystem, and child-process behavior.
 - The final-native conformance manifest is `tests/abla-tests.json`, one part of
   the larger shell-command suite. Focused gates cover default libc-free Linux
@@ -50,13 +51,15 @@ require libc; hosted facilities are optional capabilities.
   in [performance.md](performance.md) with its revision and measurements.
 - Networking now includes affine IPv4/IPv6 TCP and UDP, bounded DNS A/AAAA,
   structured timeout/EOF/error results, raw epoll, hosted epoll/kqueue,
-  certificate-verified TLS/HTTPS/WSS transports, and secure random on Linux and
-  macOS. The bounded event HTTP/WebSocket managers support persistent requests,
+  certificate-verified TLS/HTTPS/WSS transports, and secure random on Linux,
+  macOS and Windows. The bounded event HTTP/WebSocket managers support persistent requests,
   chunked bodies, gzip, SSE framing, partial writes, and output backpressure;
   JSON/RPC routing remains transport-neutral.
 - Portable process timing now exposes monotonic millisecond/nanosecond values,
   checked nanosecond sleep, and an affine reusable clock whose hot read/sleep
-  path issues raw Linux syscalls without allocating or linking libc.
+  path reads the clock through the vDSO on x86-64 and AArch64 Linux (the
+  system call where there is none) and sleeps by system call, without
+  allocating or linking libc.
 - Application-sized ELF modules place generated functions in independent text
   sections, allowing the existing linker garbage collection to discard unused
   imported APIs. The transformation is bounded so large compiler modules keep

@@ -40,9 +40,9 @@ checks the rules below on every workflow (`--controls` shows each rule refusing 
 - The local action `.github/actions/install-nix` and the `release.yml` of a tag come from the tag's own tree when a job checks it out: a tag made before
   they existed (before v0.2.69) cannot be released again with this workflow (the job cannot find the action). Re-releasing an old tag uses the
   workflow files of that tag's time, or a new tag.
-- Real cuts dispatch the Release workflow with `publish_release` off, and `source_ref` when the tag is not yet pushed, and publish from the
-  maintainer's machine (docs/bootstrap.md, "Signed releases"). The refusal of `source_ref` with `publish_release` on applies to
-  the workflow's own publish path, which that flow does not use.
+- Real cuts are published by the workflow's `publish` job once the `release` environment's reviewer approves it; the local flow
+  (`publish_release` off, then `gh release create` from the maintainer's machine, docs/bootstrap.md, "Signed releases") is the
+  fallback. `source_ref` is refused with `publish_release` on, so the publish path builds the pushed tag.
 - The `bridge` job and its `bridge-assets` hand-off to the compiler jobs run only when a Release is dispatched with `bridge_release`, and no draft bridge
   release exists to rehearse them with: that path is fixed but unverified until the next bridge is needed. The publish job's flatten step is
   `tools/release-flatten-artifacts.sh`, tested on fixture directories by `tools/test-release-scripts.sh` (a shared file name is refused).

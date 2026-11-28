@@ -137,7 +137,8 @@ and it loads the library from a glibc process under `qemu-aarch64`.
 client in `abla/http/tls` uses it. A libc-free Linux executable links directly with LLD,
 without a clang driver or C development files. A static compiler built with
 `ABLA_STATIC_LLD_LIB` and its header paths embeds LLD through
-`runtime/abla_lld_shim.cpp` on x86-64; otherwise it uses the external linker.
+`runtime/abla_lld_shim.cpp` (x86-64 and AArch64; RISC-V 64 requires it);
+otherwise it uses the external linker.
 LLVM remains a dependency even when its archives and LLD are inside one static
 executable. See [the self-hosting boundary](full-self-hosting.md).
 
