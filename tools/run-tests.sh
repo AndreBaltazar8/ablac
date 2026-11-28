@@ -313,8 +313,9 @@ start() { # n
         PATH=$guard_path ABLA_NET_GUARD_LOG=$network_log ABLA_TEST_FAST_BUILDS=$fast_builds perl -e '
             my $status = system("bash", "-c", $ARGV[0]);
             my @t = times;
-            open(my $f, ">", $ARGV[1]) or exit 1;
-            printf $f "%.1f\n", $t[2] + $t[3];
+            # The CPU seconds are bookkeeping: a file that cannot be written says why and leaves the command its status.
+            if (open(my $f, ">", $ARGV[1])) { printf $f "%.1f\n", $t[2] + $t[3]; close($f); }
+            else { print STDERR "run-tests: cannot record the CPU seconds in $ARGV[1]: $!\n"; }
             exit($status == -1 ? 127 : ($status & 127) ? 128 + ($status & 127) : $status >> 8);
         ' "$command" "$output/$n.cpu" >"$output/$n.log" 2>&1 </dev/null
         status=$?
