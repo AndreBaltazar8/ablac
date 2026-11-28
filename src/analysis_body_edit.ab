@@ -209,7 +209,10 @@ fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameter
     // declaration and no extension in the project (bootstrapAnalysisScalarChange).
     if (kind == "member" && expression.children.size == 1) {
         val read = bootstrapAnalysisMemberPath(expression)
-        if (read != "") for (member in members) if (member == read) return true
+        var known = false
+        if (read != "") for (member in members) if (member == read) known = true
+        // An element's field: its index must be admissible too.
+        if (known) return !read.contains("[]") || bootstrapAnalysisScalarIndexes(expression, parameters, depth + 1, calls, strings, members)
     }
     // A call of its scalar method with scalar arguments: `p.m(a)`, listed as `p.m(1` (bootstrapAnalysisScalarMethod).
     if (kind == "member.call" && expression.children.size >= 1 && expression.children[0].kind == "identifier") {
@@ -253,6 +256,13 @@ fun bootstrapAnalysisScalarFunction(declaration: BootstrapDeclaration, calls: bo
         if (bootstrapAnalysisScalarType(type)) scalars.append(name)
         // A string or an array of scalars: read through its size, an index and a `for`.
         else if (type == "string" || bootstrapAnalysisScalarArray(type)) strings.append(name)
+        // An array of a class: read through its size, an element's fields (`ds[i].x`, listed as `ds[].x`) and a `for`, whose variable
+        // reads the same fields (bootstrapAnalysisScalarStatement).
+        else if (bootstrapAnalysisRecordArray(type, classes) != "") {
+            strings.append(name)
+            val element = classes.get(bootstrapAnalysisRecordArray(type, classes))
+            if (element != null) bootstrapAnalysisScalarFields("$name[]", element, classes, members, 1)
+        }
         else if (record != null) {
             // The parameter's own name, so that no local shadows it.
             members.append("$name.")
@@ -489,7 +499,11 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
         // The classes of its parameters: each is the only top-level declaration of its name in the project (above) and must be extended
         // by nothing, so `p.x` names its field.
         val used: Map<string, int> = Map()
-        for (type in declaration.parameterTypes) if (classes.has(type)) used.set(type, 0)
+        for (type in declaration.parameterTypes) {
+            if (classes.has(type)) used.set(type, 0)
+            val element = bootstrapAnalysisRecordArray(type, classes)
+            if (element != "") used.set(element, 0)
+        }
         // A constructor call of a plain class (bootstrapAnalysisScalarPlainRecord): the class, not a function, is what the name is.
         for (name in candidates.keys()) {
             val record = classes.get(name)
@@ -825,7 +839,22 @@ fun bootstrapAnalysisScalarStatement(statement: BootstrapExpression, var scope: 
         val inner: array<string> = []
         for (name in scope) inner.append(name)
         inner.append(statement.text)
-        return bootstrapAnalysisScalarBody(statement.children[1], inner, depth + 1, calls, strings, members)
+        // Over an array of a class: the variable reads an element's fields (`ds[].x` as `d.x`), in the body only.
+        val elements: array<string> = []
+        for (member in members) elements.append(member)
+        if (source.kind == "identifier") {
+            val prefix = "${source.text}[]."
+            // The element as a value too, when the array is of a class.
+            for (member in members) if (member.startsWith(prefix)) {
+                elements.append("${statement.text}.")
+                break
+            }
+            for (member in members) {
+                if (member.startsWith(prefix)) elements.append("${statement.text}.${member.slice(prefix.size, member.size)}")
+                if (member.startsWith("seq:$prefix")) elements.append("seq:${statement.text}.${member.slice(prefix.size + 4, member.size)}")
+            }
+        }
+        return bootstrapAnalysisScalarBody(statement.children[1], inner, depth + 1, calls, strings, elements)
     }
     if (kind == "break" || kind == "continue") return statement.text == "" && statement.children.size == 0
     if (kind == "block") return bootstrapAnalysisScalarBody(statement, scope, depth + 1, calls, strings, members)
@@ -876,12 +905,32 @@ fun bootstrapAnalysisSequence(expression: BootstrapExpression, strings: array<st
     false
 }
 
-/** `p.x` or `p.f.x` as that text, or "" for any other expression. */
+/** The class of the elements of `type`, an array of one of `classes`, or "". */
+fun bootstrapAnalysisRecordArray(type: string, classes: Map<string, BootstrapDeclaration>): string {
+    if (!type.startsWith("array<") || !type.endsWith(">")) return ""
+    val element = type.slice(6, type.size - 1)
+    if (classes.has(element)) element else ""
+}
+
+/** `p.x`, `p.f.x` or `ds[i].x` (as `ds[].x`) as that text, or "" for any other expression. */
 fun bootstrapAnalysisMemberPath(expression: BootstrapExpression): string {
     if (expression.kind == "identifier") return expression.text
+    if (expression.kind == "index" && expression.children.size == 2 && expression.children[0].kind == "identifier") {
+        return "${expression.children[0].text}[]"
+    }
     if (expression.kind != "member" || expression.children.size != 1) return ""
     val receiver = bootstrapAnalysisMemberPath(expression.children[0])
     if (receiver == "") "" else "$receiver.${expression.text}"
+}
+
+/** Whether the indexes in the member chain `expression` (`ds[i].x`) are admissible expressions. */
+fun bootstrapAnalysisScalarIndexes(expression: BootstrapExpression, parameters: array<string>, depth: int, calls: bool,
+    strings: array<string>, members: array<string>): bool {
+    if (expression.kind == "index") return bootstrapAnalysisScalarExpression(expression.children[1], parameters, depth + 1, calls, strings, members)
+    if (expression.kind == "member" && expression.children.size == 1) {
+        return bootstrapAnalysisScalarIndexes(expression.children[0], parameters, depth + 1, calls, strings, members)
+    }
+    true
 }
 
 /** Lists the fields of `record` a checked body may read through `prefix`: scalar and string ones as `prefix.x`, string and scalar-array
