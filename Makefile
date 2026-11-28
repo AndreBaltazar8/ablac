@@ -629,6 +629,7 @@ test-serial: ablac
 	tools/test-gc-default.sh $(COMPILER)
 	tools/test-fork-stop.sh $(COMPILER)
 	tools/test-frozen.sh $(COMPILER)
+	tools/test-shipped-root.sh $(COMPILER)
 	tools/test-gc-spin.sh $(COMPILER)
 	tools/test-gc-native-pressure.sh $(COMPILER)
 	tools/test-gc-root-plan.sh $(COMPILER)

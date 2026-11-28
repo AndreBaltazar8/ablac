@@ -9,7 +9,11 @@ runtime sources from its toolchain root, independently of the caller's working
 directory. Installed or custom layouts may override that root with
 `ABLA_SYSROOT`; `ABLA_STDLIB` remains available as a narrower standard-library
 override. Project inputs, outputs, and caches continue to use project or
-invocation-relative paths.
+invocation-relative paths. What the toolchain ships, links or runs itself (`runtime/`, the prebuilt fast runtimes in
+`fast-runtime-v1`, the release collector in `release-collector-v1`, the standard library's discovery records) comes only
+from `ABLA_SYSROOT`, the toolchain beside the compiler's own binary, or the directory holding a configured `ABLA_STDLIB`,
+never from the working directory: their records are digests anyone can compute. A compiler run with none of these builds
+those objects itself.
 
 The Linux x86-64 compiler and toolchain are statically linked. The standalone
 `ablac-x86_64-linux` release asset (from v0.2.65) is the static compiler: src/orc_main_static.ab on LLVM's
@@ -397,7 +401,9 @@ or in the directory `--cache-dir <dir>` (on `build`, `test` and `run`) or
 outlives it: a build in a fresh copy of a project, made from the copy's root,
 finds the entries an earlier copy's builds left (entries are keyed by content
 and by paths as the build names them, so projects and copies can share one
-directory). A hit requires an exact
+directory). A cache directory is trusted as its owner's: an entry is checked against records of its files (sizes,
+inodes, change times), not against who wrote them, so anyone who can write the directory can publish objects your
+builds link. Keep it yours, as the package cache. A hit requires an exact
 comparison of the complete bundled source after matching its length, two
 independent deterministic fingerprints, target/LLVM ABI version, and
 optimization profile. Cache manifests are published only after successful
