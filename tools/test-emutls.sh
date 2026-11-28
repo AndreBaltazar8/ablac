@@ -105,7 +105,7 @@ fi
 cat > "$out/mach/with.ab" <<'AB'
 import "abla/runtime/emutls"
 @export("__emutls_get_address")
-fun ablaEmutlsGetAddress(control: int): int = emutlsGetAddress(control)
+trusted fun ablaEmutlsGetAddress(control: int): int = emutlsGetAddress(control)
 fun main: int = 0
 AB
 cat > "$out/mach/without.ab" <<'AB'
