@@ -26,14 +26,19 @@
 FROM ubuntu:24.04 AS toolchain
 ARG LLVM_VERSION=23
 ENV DEBIAN_FRONTEND=noninteractive
+# LLVM from apt.llvm.org, whose signing key must have the pinned fingerprint (no downloaded script runs as root).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg lsb-release wget software-properties-common \
+        ca-certificates curl gnupg \
         make git patch libssl-dev libffi-dev libedit-dev zlib1g-dev \
-    && wget -q https://apt.llvm.org/llvm.sh \
-    && bash llvm.sh ${LLVM_VERSION} \
-    && apt-get install -y --no-install-recommends \
-        lld-${LLVM_VERSION} llvm-${LLVM_VERSION}-dev libllvm${LLVM_VERSION} \
-    && rm -rf /var/lib/apt/lists/* llvm.sh
+    && curl -fsSL --retry 5 https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm.asc \
+    && test "$(gpg --show-keys --with-colons /tmp/llvm.asc | awk -F: '$1 == "fpr" { print $10; exit }')" = \
+        6084F3CF814B57C1CF12EFD515CF4D18AF4F7421 \
+    && gpg --dearmor -o /usr/share/keyrings/apt.llvm.org.gpg /tmp/llvm.asc \
+    && echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-${LLVM_VERSION} main" \
+        > /etc/apt/sources.list.d/llvm.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        clang-${LLVM_VERSION} lld-${LLVM_VERSION} llvm-${LLVM_VERSION} llvm-${LLVM_VERSION}-dev libllvm${LLVM_VERSION} \
+    && rm -rf /var/lib/apt/lists/* /tmp/llvm.asc
 ENV PATH=/usr/lib/llvm-${LLVM_VERSION}/bin:$PATH
 
 FROM toolchain AS compiler
