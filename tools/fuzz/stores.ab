@@ -1,12 +1,14 @@
 // The integer-store campaign: an `int` stored where a narrower integer is wanted (a local's initialiser or assignment, a
 // field, an array element, an `append`, an array literal, a function's result) must be refused at compile time unless it
 // is a literal that fits, and a store that is accepted must keep the exact value (docs/language.md, Integers). Never a value
-// that differs silently: 300 printed from an `i8`, or 44. One program per type, site and value class, each built native
-// `--fast`, native release and for hostless Wasm; every mode must agree, and each must either refuse the program or print
-// the stored value unchanged.
+// that differs silently: 300 printed from an `i8`, or 44. One program per type and value class with every site, built
+// native `--fast`, native release and for hostless Wasm; every mode must agree, and each must either refuse the store
+// (a diagnostic at the site) or print the stored value unchanged. A site the merged program leaves unsettled gets a
+// program of its own, which reports the fault.
 import "abla/io"
 import "abla/text"
 import "abla/fs"
+import "abla/integer"
 import "./prng.ab"
 import "./modes.ab"
 import "./verdict.ab"
@@ -42,19 +44,96 @@ fun fuzzStoreValue(var r: Prng, type: string, over: bool): int {
     low - r.range(2, 70000)
 }
 
+/** The statements of one site: store `expression` into `type` and print `<label>=<stored value>`. */
+fun fuzzStoreBody(type: string, site: string, expression: string, label: string): string {
+    if (site == "local-init") return "    val x: $type = $expression\n    println(\"$label=\${x}\")\n"
+    if (site == "local-assign") return "    var x: $type = 0\n    x = $expression\n    println(\"$label=\${x}\")\n"
+    if (site == "field-assign") return "    val b = StoreBox(0)\n    b.f = $expression\n    println(\"$label=\${b.f}\")\n"
+    if (site == "element-assign") return "    val a: array<$type> = [0, 0]\n    a[1] = $expression\n    println(\"$label=\${a[1]}\")\n"
+    if (site == "element-append") return "    val a: array<$type> = []\n    a.append($expression)\n    println(\"$label=\${a[0]}\")\n"
+    if (site == "array-literal") return "    val a: array<$type> = [$expression, 0]\n    println(\"$label=\${a[0]}\")\n"
+    "    println(\"$label=\${stored()}\")\n"
+}
+
+/** The declarations every store program starts with (7 lines and a blank; line 7 is `stored`, the result site). */
+fun fuzzStorePrelude(type: string, result: string): string =
+    "import \"abla/io\"\n\nclass StoreBox(var f: $type)\n\nfun id(value: int): int = value\n\nfun stored(): $type = $result\n\n"
+
 /** The program for one site: stores `expression` into `type` and prints `s=<stored value>`. */
-fun fuzzStoreProgram(type: string, site: string, expression: string): string {
-    var body = ""
-    if (site == "local-init") body = "    val x: $type = $expression\n    println(\"s=\${x}\")\n"
-    else if (site == "local-assign") body = "    var x: $type = 0\n    x = $expression\n    println(\"s=\${x}\")\n"
-    else if (site == "field-assign") body = "    val b = StoreBox(0)\n    b.f = $expression\n    println(\"s=\${b.f}\")\n"
-    else if (site == "element-assign") body = "    val a: array<$type> = [0, 0]\n    a[1] = $expression\n    println(\"s=\${a[1]}\")\n"
-    else if (site == "element-append") body = "    val a: array<$type> = []\n    a.append($expression)\n    println(\"s=\${a[0]}\")\n"
-    else if (site == "array-literal") body = "    val a: array<$type> = [$expression, 0]\n    println(\"s=\${a[0]}\")\n"
-    else body = "    println(\"s=\${stored()}\")\n"
-    "import \"abla/io\"\n\nclass StoreBox(var f: $type)\n\nfun id(value: int): int = value\n\n" +
-        "fun stored(): $type = ${if (site == "result") expression else "0"}\n\n" +
-        "@export(\"run\")\nfun run(): int {\n$body    0\n}\n\nfun main: int = run()\n"
+fun fuzzStoreProgram(type: string, site: string, expression: string): string =
+    fuzzStorePrelude(type, if (site == "result") expression else "0") +
+        "@export(\"run\")\nfun run(): int {\n${fuzzStoreBody(type, site, expression, "s")}    0\n}\n\nfun main: int = run()\n"
+
+/** Every site of a class in one program, site k in a function of its own printing `s<k>=<stored value>`; `first` and
+ *  `last` are the lines of site k's store (the result site's is `stored`, line 7). */
+class FuzzStoreMerged(val text: string, val first: array<int>, val last: array<int>)
+
+fun fuzzStoreMergedProgram(type: string, expressions: array<string>): FuzzStoreMerged {
+    var result = "0"
+    for (index in 0 until FUZZ_STORE_SITES.size) {
+        if (FUZZ_STORE_SITES[index] == "result") result = expressions[index]
+    }
+    var text = fuzzStorePrelude(type, result)
+    var line = 9
+    val first: array<int> = []
+    val last: array<int> = []
+    var calls = ""
+    for (index in 0 until FUZZ_STORE_SITES.size) {
+        val body = fuzzStoreBody(type, FUZZ_STORE_SITES[index], expressions[index], "s$index")
+        val lines = body.split("\n").size - 1
+        text = text + "fun site$index: void {\n$body}\n"
+        if (FUZZ_STORE_SITES[index] == "result") {
+            first.append(7)
+            last.append(7)
+        } else {
+            first.append(line)
+            last.append(line + lines + 1)
+        }
+        line = line + lines + 2
+        calls = calls + "    site$index()\n"
+    }
+    FuzzStoreMerged(text + "\n@export(\"run\")\nfun run(): int {\n$calls    0\n}\n\nfun main: int = run()\n", first, last)
+}
+
+/** The build errors `result`'s mode wrote under `directory` (modesOf's files: a Wasm module's are its driver's). */
+fun fuzzStoreErrors(directory: string, result: FuzzResult): string {
+    val stem = if (result.mode == "wasm" || result.mode == "wasm-dev") "w" else result.mode
+    fuzzReadText("$directory/$stem.build.err")
+}
+
+/** Whether `errors` has a diagnostic located in program.ab between lines `first` and `last`. */
+fun fuzzStoreRefusedAt(errors: string, first: int, last: int): bool {
+    for (line in errors.split("\n")) {
+        val at = line.indexOf("program.ab:")
+        if (line.trim().startsWith("-->") && at >= 0) {
+            val rest = line.slice(at + 11, line.size)
+            val colon = rest.indexOf(":")
+            val number = (if (colon >= 0) rest.slice(0, colon) else rest).parseInt() ?? 0
+            if (number >= first && number <= last) return true
+        }
+    }
+    false
+}
+
+/** One site's faults from its own program's results (the verdict the merged program could not give). */
+fun fuzzStoreSiteFaults(type: string, name: string, value: int, results: array<FuzzResult>, mustBuild: bool,
+    mayKeep: bool): array<string> {
+    val faults: array<string> = []
+    // one verdict per mode: refused, or built and printed; modes must agree on which, and on the output
+    var refused = 0
+    var built = 0
+    for (result in results) {
+        if (result.built) built = built + 1 else refused = refused + 1
+    }
+    if (refused > 0 && built > 0) {
+        faults.append("$type $name (value $value): ${refused} modes refuse the store, ${built} build it: " +
+            textJoin(fuzzDifferingModes(results), ", "))
+    }
+    for (result in results) {
+        val fault = fuzzStoreFault(result, value, mustBuild, mayKeep)
+        if (fault != "") faults.append("$type $name (value $value): $fault")
+    }
+    faults
 }
 
 /** What a mode's result means for the class: "" when it is allowed (refused, or the exact value), else the fault. */
@@ -82,41 +161,54 @@ fun fuzzRunStores(runner: FuzzRunner, seed: int, keep: bool): string {
     for (cls in FUZZ_STORE_CLASSES) {
         val over = cls.endsWith("over")
         val viaInt = cls.startsWith("int")
-        val names: array<string> = []
+        val mustBuild = cls == "literal-fits"
+        val mayKeep = !over
         val values: array<int> = []
+        val expressions: array<string> = []
         for (site in FUZZ_STORE_SITES) {
             val value = fuzzStoreValue(r, type, over)
-            val literal = "$value"
-            val expression = if (viaInt) "id($value)" else literal
-            val name = "$cls-$site"
-            val relative = "$directory/$name"
-            Path("${runner.root}/$relative").createDirectories()
-            Path("${runner.root}/$relative/program.ab").writeText(fuzzStoreProgram(type, site, expression))
-            names.append(name)
             values.append(value)
+            expressions.append(if (viaInt) "id($value)" else "$value")
         }
-        val perSite: array<array<FuzzResult>> = []
-        for (index in 0 until names.size) {
-            val relative = "$directory/${names[index]}"
-            perSite.append(runner.modesOf(relative, "$relative/program.ab", "", true))
+        // The class's sites in one program, built every way: every mode building it and printing each value exactly
+        // (where the class may keep it), or every mode refusing it with a diagnostic at each site, settles all of them.
+        // A site that it does not settle (a mode builds where another refuses, an output differs, a refusal names no
+        // diagnostic at the site) is built in a program of its own as before, which gives the fault.
+        val merged = fuzzStoreMergedProgram(type, expressions)
+        val together = "$directory/$cls"
+        Path("${runner.root}/$together").createDirectories()
+        Path("${runner.root}/$together/program.ab").writeText(merged.text)
+        val results = runner.modesOf(together, "$together/program.ab", "", true)
+        var built = 0
+        for (result in results) {
+            if (result.built) built = built + 1
         }
-        for (index in 0 until names.size) {
-            val results = perSite[index]
-            val mustBuild = cls == "literal-fits"
-            val mayKeep = !over
-            // one verdict per mode: refused, or built and printed; modes must agree on which, and on the output
-            var refused = 0
-            var built = 0
+        var expected = ""
+        for (index in 0 until values.size) expected = expected + "s$index=${values[index]}\n"
+        val settled: array<bool> = []
+        for (index in 0 until values.size) {
+            var right = results.size > 0 && (built == results.size || built == 0)
             for (result in results) {
-                if (result.built) built = built + 1 else refused = refused + 1
+                if (result.built) {
+                    if (!mayKeep || result.status != 0 || result.output != expected) right = false
+                } else if (mustBuild ||
+                    !fuzzStoreRefusedAt(fuzzStoreErrors("${runner.root}/$together", result), merged.first[index], merged.last[index])) {
+                    right = false
+                }
             }
-            if (refused > 0 && built > 0) {
-                faults.append("$type ${names[index]} (value ${values[index]}): ${refused} modes refuse the store, ${built} build it: " +
-                    textJoin(fuzzDifferingModes(results), ", "))
-            }
-            for (result in results) {
-                val fault = fuzzStoreFault(result, values[index], mustBuild, mayKeep)
-                if (fault != "") faults.append("$type ${names[index]} (value ${values[index]}): $fault")
+            settled.append(right)
+        }
+        for (index in 0 until values.size) {
+            if (!settled[index]) {
+                val site = FUZZ_STORE_SITES[index]
+                val name = "$cls-$site"
+                val relative = "$directory/$name"
+                Path("${runner.root}/$relative").createDirectories()
+                Path("${runner.root}/$relative/program.ab").writeText(fuzzStoreProgram(type, site, expressions[index]))
+                for (fault in fuzzStoreSiteFaults(type, name, values[index], runner.modesOf(relative, "$relative/program.ab", "", true),
+                    mustBuild, mayKeep)) {
+                    faults.append(fault)
+                }
             }
         }
     }
