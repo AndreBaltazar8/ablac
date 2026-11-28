@@ -1690,6 +1690,50 @@ fun main: int {
 // A repeated analyze of an unchanged revision is answered from the held answer without reloading the project (#1132), and every change
 // a reload would see without an overlay still gives a new revision: a file edited on disk (same size), a file that appears and changes
 // where an import resolves (a prepared package beside the vendored one), and the manifest.
+// An open document the entry does not import: editing it changes the revision but not the answer, which the service holds
+// (graphHeldOutsideEdits) instead of analysing the project again; an edit to a module of the graph, or an import that
+// brings the document in, is analysed.
+async function outsideEdits(mode) {
+    const name = `outside-edits-${mode}`;
+    fs.rmSync(path.join(root, name), { recursive: true, force: true });
+    const p = fixture(name, {
+        'main.ab': 'import "dep.ab"\nfun main: int = answer()\n',
+        'dep.ab': 'fun answer: int = 42\n',
+        'other.ab': 'fun other: int = 1\n',
+    });
+    const log = 'outside.stderr';
+    const s = await start(p, { mode, log, env: { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TRACE: '1' } });
+    const held = () => (fs.readFileSync(path.join(p, log), 'utf8').match(/edits outside the graph: held answer/g) ?? []).length;
+    const other = uri(path.join(p, 'other.ab'));
+    const dep = uri(path.join(p, 'dep.ab'));
+    const texts = (result) => result.documents.map((d) => [d.uri, d.text]).sort();
+    await s.rpc('document/open', { uri: other, version: 1, text: 'fun other: int = 1\n' });
+    const a = await s.analyze();
+    noErrors(a);
+    assert.ok(!a.documents.some((d) => d.uri === other));
+    await s.rpc('document/change', { uri: other, version: 2, text: 'fun other: int = 2\n' });
+    await s.rpc('document/change', { uri: other, version: 3, text: 'fun other: int = 3\n' });
+    const b = await s.analyze();
+    assert.equal(held(), 1, 'an edit outside the graph was analysed again');
+    assert.notEqual(b.revision, a.revision);
+    assert.deepEqual(texts(b), texts(a));
+    // The held answer is the current revision's: a query names it.
+    const hover = await s.rpc('query/hover', { uri: uri(path.join(p, 'main.ab')), offset: Buffer.byteLength('import "dep.ab"\nfun main: int = '), revision: b.revision });
+    assert.equal(hover.error, undefined, JSON.stringify(hover.error));
+    // An edit to a module of the graph is analysed.
+    await s.rpc('document/open', { uri: dep, version: 1, text: 'fun answer: int = 43\n' });
+    const c = await s.analyze();
+    assert.equal(held(), 1);
+    assert.equal(c.documents.find((d) => d.uri === dep).text, 'fun answer: int = 43\n');
+    // So is the edit that imports the open document: it joins the graph with its open text.
+    await s.rpc('document/change', { uri: other, version: 4, text: 'fun other: int = 4\n' });
+    fs.writeFileSync(path.join(p, 'main.ab'), 'import "dep.ab"\nimport "other.ab"\nfun main: int = answer() + other()\n');
+    const d = await s.analyze();
+    assert.equal(held(), 1, 'a changed module on disk was answered from the held answer');
+    assert.equal(d.documents.find((x) => x.uri === other)?.text, 'fun other: int = 4\n');
+    await s.close();
+}
+
 async function unchangedInputs() {
     const rev = '1'.repeat(40);
     const digest = '2'.repeat(40);
@@ -1739,7 +1783,7 @@ async function unchangedInputs() {
     await s.close();
 }
 
-const tests = { unchanged_inputs: unchangedInputs, compound_assignment: () => compoundAssignmentFix('graph-v1'), compound_assignment_v2: () => compoundAssignmentFix('graph-v2'), index_loop: () => indexLoopFix('graph-v1'), index_loop_v2: () => indexLoopFix('graph-v2'), logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+const tests = { unchanged_inputs: unchangedInputs, outside_edits: () => outsideEdits('graph-v1'), outside_edits_v2: () => outsideEdits('graph-v2'), compound_assignment: () => compoundAssignmentFix('graph-v1'), compound_assignment_v2: () => compoundAssignmentFix('graph-v2'), index_loop: () => indexLoopFix('graph-v1'), index_loop_v2: () => indexLoopFix('graph-v2'), logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false, strings = false, fields = false, extended = false, parens = false, loops = false, imported = false, globals = false, arrays = false, importedCalls = false, constructors = false, records = false) {
     // An imported class: declared in its own module. Imported functions: of two modules of the project and the standard library.
     const head = (imported ? 'import "./point.ab"\n' : '') + (importedCalls ? 'import "./lib.ab"\nimport "./other.ab"\nimport "abla/bits"\n' : '') + (constructors ? 'import "./box.ab"\n' : '') + (records ? 'fun answer(left: int, right: int, ps: array<Pair>): int ' : arrays ? 'fun answer(left: int, right: int, xs: array<int>, names: array<string>): int ' : locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '

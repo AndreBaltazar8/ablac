@@ -1410,6 +1410,8 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
             return held.snapshot
         }
     }
+    val outside = if (reuseTyping) this.graphHeldOutsideEdits(entry) else null
+    if (outside != null) return outside
     bootstrapSourceRewrites = []
     if (this.graphJsonConstruction) {
         bootstrapJsonConstructionReset()
@@ -1929,6 +1931,51 @@ fun bootstrapAnalysisGraphProjection(snapshot: Json, fields: Json): Json {
 /** Whether a reload of `entry` would read what the load behind the held answer read (graphLoadKey): the same entry, the manifests and
  *  compile-time inputs as they were, and a module graph that, resolved again, lists the same modules and reads none anew
  *  (bootstrapFrontendHostGraphUnchanged). Overlays are covered by the revision: a document change is a new one. */
+/** The held answer under the current revision, when every revision since it was an edit to an open document that is not
+ *  one of its modules (a file the entry does not import, open in the editor) and a load would read what it read: such an
+ *  edit changed nothing the answer says, and analysing it again cost a whole analysis (1.2 s on abla-one) for that. */
+fun BootstrapAnalysisService.graphHeldOutsideEdits(entry: string): Json? {
+    val held = this.graphQueryIndex ?? return null
+    val key = this.graphLoadKey ?? return null
+    if (this.graphIndexRevision < 0 || held.revision != this.graphIndexRevision ||
+        this.overlayEditsFrom != this.graphIndexRevision ||
+        this.revision != this.graphIndexRevision + this.overlayEdits.size) return null
+    val modules: Map<string, bool> = Map()
+    for (path in key.paths) modules.set(bootstrapAnalysisGraphPath(path), true)
+    for (path in this.overlayEdits) {
+        if (modules.has(bootstrapAnalysisGraphPath(path))) return null
+    }
+    if (!this.graphUnchangedSinceLoad(entry)) return null
+    val restamped = bootstrapAnalysisGraphRestamped(held.snapshot, this.revision)
+    val previous = "${held.revision}"
+    this.graphQueryIndex = BootstrapAnalysisGraphQueryIndex(this.revision, restamped, held.documents, held.symbols,
+        held.occurrences)
+    this.graphIndexRevision = this.revision
+    if (this.graphStableIds) {
+        for (generation in this.graphGenerations) {
+            if (generation.revision == previous) {
+                this.graphRememberGeneration(BootstrapAnalysisGraphGeneration("${this.revision}", generation.fingerprints,
+                    generation.uris))
+                break
+            }
+        }
+    }
+    if (linuxEnvironment("ABLA_ANALYSIS_INCREMENTAL_TRACE").value == "1") {
+        linuxPrintStandardError("abla-analysis-typing edits outside the graph: held answer\n")
+    }
+    restamped
+}
+
+fun bootstrapAnalysisGraphRestamped(snapshot: Json, revision: int): Json {
+    val keys: array<string> = []
+    val values: array<Json> = []
+    for (index in 0 until snapshot.keys.size) {
+        keys.append(snapshot.keys[index])
+        values.append(if (snapshot.keys[index] == "revision") jsonString("${revision}") else snapshot.values[index])
+    }
+    jsonObject(keys, values)
+}
+
 fun BootstrapAnalysisService.graphUnchangedSinceLoad(entry: string): bool {
     val key = this.graphLoadKey ?? return false
     if (key.entry != entry || key.compilePaths.size != key.compileContents.size) return false
