@@ -173,6 +173,8 @@ fun bootstrapAnalysisScalarExpression(expression: BootstrapExpression, parameter
         for (name in parameters) if (name == expression.text) return true
         // A string or scalar-array parameter as a value: compared, or passed to a function of the module.
         for (name in strings) if (name == expression.text) return true
+        // A class parameter as a value: passed to a function, listed as `p.`.
+        for (member in members) if (member == "${expression.text}.") return true
         // A global value of the document (bootstrapAnalysisScalarGlobal), listed as `global:name`.
         for (member in members) if (member == "global:${expression.text}") return true
         return false
@@ -318,7 +320,8 @@ fun bootstrapAnalysisScalarRecord(declaration: BootstrapDeclaration): bool {
 }
 
 /** Whether `declaration`, a function of another module, is one a checked body may call: a public plain function of scalar, string or
- *  scalar-array parameters without defaults and a scalar result. */
+ *  scalar-array parameters without defaults and a scalar result. (With a class parameter, the checker leaves its call's occurrence
+ *  untyped, which the splice refuses.) */
 fun bootstrapAnalysisScalarSignature(declaration: BootstrapDeclaration): bool {
     if (declaration.kind != "fun" || !bootstrapAnalysisScalarType(declaration.resultType) || declaration.isPrivate ||
         declaration.isTrusted || declaration.isResource || declaration.isNoEscape || declaration.annotations.size != 0 ||
@@ -331,6 +334,20 @@ fun bootstrapAnalysisScalarSignature(declaration: BootstrapDeclaration): bool {
         if (declaration.parameterKinds[index] != "parameter" || declaration.parameterDefaults[index].kind != "missing" ||
             (!bootstrapAnalysisScalarType(type) && type != "string" && !bootstrapAnalysisScalarArray(type))) return false
     }
+    true
+}
+
+/** Whether `record` (bootstrapAnalysisScalarRecord) is one a checked body may construct: each of its fields of a scalar or string type, so
+ *  that the checker is given it as it is (bootstrapAnalysisScalarRecordView). */
+fun bootstrapAnalysisScalarPlainRecord(record: BootstrapDeclaration): bool {
+    for (type in record.parameterTypes) if (!bootstrapAnalysisScalarType(type) && type != "string") return false
+    true
+}
+
+/** Whether every call of `name` in `expression` passes `count` arguments. */
+fun bootstrapAnalysisScalarCallArity(expression: BootstrapExpression, name: string, count: int): bool {
+    if (expression.kind == "call" && expression.text == name && expression.children.size != count) return false
+    for (child in expression.children) if (!bootstrapAnalysisScalarCallArity(child, name, count)) return false
     true
 }
 
@@ -477,6 +494,15 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
         // by nothing, so `p.x` names its field.
         val used: Map<string, int> = Map()
         for (type in declaration.parameterTypes) if (classes.has(type)) used.set(type, 0)
+        // A constructor call of a plain class (bootstrapAnalysisScalarPlainRecord): the class, not a function, is what the name is.
+        for (name in candidates.keys()) {
+            val record = classes.get(name)
+            if (record == null) continue
+            // Every field passed: the full pipeline fills in defaulted arguments before typing, the checker does not.
+            if (!bootstrapAnalysisScalarPlainRecord(record) || !bootstrapAnalysisScalarCallArity(body, name, record.parameters.size)) return null
+            used.set(name, 0)
+            candidates.remove(name)
+        }
         for (name in used.keys()) if (candidates.has(name) || locals.has(name)) return null
         // Require exactly one global candidate for each spelling and no
         // operator selection. A generic or alias owner could name a scalar.
@@ -511,10 +537,11 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
             if (item == index || !candidates.has(callee.name)) continue
             val target = candidates.get(callee.name) ?? 0
             if (target == 0 || callee.sourceIdentity != declaration.sourceIdentity ||
-                !bootstrapAnalysisScalarFunction(callee) ||
-                !bootstrapAnalysisScalarInterfaceMatches(callee, project.declarations[target - 1], false)) return null
+                !bootstrapAnalysisScalarFunction(callee, false, classes) ||
+                !bootstrapAnalysisScalarInterfaceMatches(callee, project.declarations[target - 1], false, classes)) return null
             callees.append(item)
             local.set(callee.name, 0)
+            for (type in callee.parameterTypes) if (classes.has(type)) used.set(type, 0)
         }
         // A function of another module: one of a module this document imports directly (no alias, not only its contract), so the name
         // resolves as in full typing and its import is used by name (the syntax use facts, compared by the caller). Its interface, as
@@ -531,6 +558,9 @@ fun bootstrapAnalysisScalarChange(before: string, after: string,
             if (!(imports?.has(callee.sourceIdentity) ?? false)) return null
             external.append(callee)
         }
+        // The classes the module's callees take: extended by nothing either, and named by no local.
+        for (name in used.keys()) if (locals.has(name)) return null
+        for (candidate in project.declarations) if (used.has(candidate.extensionOwner)) return null
         val splice = BootstrapAnalysisBodyInsert(start, end - start, start, "", 0, 0,
             after.slice(start, end), oldEnd - start, before.slice(start, oldEnd))
         val records: array<BootstrapDeclaration> = []
