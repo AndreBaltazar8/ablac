@@ -3111,16 +3111,17 @@ A kernel, and every function it calls, may use:
   `kernelSharedU32(count)` with a constant `count`, and `kernelBarrier()`
   (CUDA's `__shared__` and `__syncthreads`);
 - the subgroup, 32 lanes on CUDA and 1 on the CPU, so a kernel written for any
-  size runs on both: `kernelSubgroupLane` and `kernelSubgroupSize`, and, with
-  every lane of the subgroup calling them together, `kernelSubgroupSum` and
-  `kernelSubgroupMax`; the shuffles `kernelSubgroupShuffleXor` (a lane's value
-  from lane xor distance, `__shfl_xor_sync`), `kernelSubgroupShuffle`,
-  `kernelSubgroupShuffleUp` and `kernelSubgroupShuffleDown`, each with an `Int`
-  form such as `kernelSubgroupShuffleXorInt` (`__shfl_sync`, `__shfl_up_sync`,
-  `__shfl_down_sync`;
-  `kernelSubgroupShuffle(v, 0)` broadcasts lane 0's); the votes
-  `kernelSubgroupBallot` (a mask from 0 to 2^32 - 1), `kernelSubgroupAny` and
-  `kernelSubgroupAll`; and `kernelSubgroupBarrier()` (`__syncwarp`);
+  size runs on both: `kernelSubgroupLane` and `kernelSubgroupSize`; and,
+  called by every lane of the subgroup together (under a branch that only some
+  lanes take, they are undefined on CUDA, as `kernelBarrier()` is for a group):
+  `kernelSubgroupSum` and `kernelSubgroupMax`; the shuffles
+  `kernelSubgroupShuffleXor` (a lane's value from lane xor distance,
+  `__shfl_xor_sync`), `kernelSubgroupShuffle`, `kernelSubgroupShuffleUp` and
+  `kernelSubgroupShuffleDown`, each with an `Int` form such as
+  `kernelSubgroupShuffleXorInt` (`__shfl_sync`, `__shfl_up_sync`,
+  `__shfl_down_sync`; `kernelSubgroupShuffle(v, 0)` broadcasts lane 0's); the
+  votes `kernelSubgroupBallot` (a mask from 0 to 2^32 - 1), `kernelSubgroupAny`
+  and `kernelSubgroupAll`; and `kernelSubgroupBarrier()` (`__syncwarp`);
 - `kernelFma`, `kernelSqrt`, `kernelRsqrt`, `kernelExp`, `kernelF16ToF32`,
   `kernelCountTrailingZeros` (64 for 0) and abla/float's bit and conversion
   functions;
