@@ -2262,6 +2262,16 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
             bootstrapLlvmWriteHexCompact(backend, pc)
             bootstrapLlvmDebugWrite(backend, "load address ", "abla.fault.load")
             bootstrapLlvmWriteHexCompact(backend, base)
+            if (bootstrapLlvmStackGuardKernel(backend)) {
+                // A library's instruction: which library, and where in it (one crash is then enough to symbolize).
+                val named = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.pc.library.name")
+                val reportedPc = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.pc.reported")
+                LLVMBuildCondBr(backend.builder, inside, reportedPc, named)
+                LLVMPositionBuilderAtEnd(backend.builder, named)
+                bootstrapLlvmFaultLibraryReport(backend, pc)
+                LLVMBuildBr(backend.builder, reportedPc)
+                LLVMPositionBuilderAtEnd(backend.builder, reportedPc)
+            }
         }
         LLVMBuildBr(backend.builder, quiet)
         LLVMPositionBuilderAtEnd(backend.builder, quiet)
@@ -2356,6 +2366,149 @@ fun bootstrapLlvmByteElement(backend: BootstrapLlvmBackend, bytes: i64*, index: 
     val element = LLVMBuildGEP2(backend.builder, backend.i8Type, bytes, indices.pointer(), 1, "")
     indices.drop()
     element
+}
+
+// A hexadecimal number in /proc/self/maps from byte `cursor` (an i64 alloca) of `buffer`'s first `total` (a value):
+// its value, `cursor` left at the first byte that is not a lowercase hex digit.
+fun bootstrapLlvmFaultMapsHex(backend: BootstrapLlvmBackend, buffer: i64*, total: i64*, cursor: i64*): i64* {
+    val i64 = backend.i64Type
+    val builder = backend.builder
+    val function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+    val value = LLVMBuildAlloca(builder, i64, "maps.hex")
+    LLVMBuildStore(builder, LLVMConstInt(i64, 0, 0), value)
+    val loop = LLVMAppendBasicBlockInContext(backend.context, function, "maps.hex.loop")
+    val read = LLVMAppendBasicBlockInContext(backend.context, function, "maps.hex.read")
+    val digit = LLVMAppendBasicBlockInContext(backend.context, function, "maps.hex.digit")
+    val done = LLVMAppendBasicBlockInContext(backend.context, function, "maps.hex.done")
+    LLVMBuildBr(builder, loop)
+    LLVMPositionBuilderAtEnd(builder, loop)
+    val at = LLVMBuildLoad2(builder, i64, cursor, "")
+    // ULT (36).
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 36, at, total, ""), read, done)
+    LLVMPositionBuilderAtEnd(builder, read)
+    val byte = LLVMBuildZExt(builder, LLVMBuildLoad2(builder, backend.i8Type, bootstrapLlvmByteElement(backend, buffer, at), ""),
+        i64, "")
+    // '0' to '9' (48 to 57) are 0 to 9, 'a' to 'f' (97 to 102) 10 to 15; ULT (36) on the offsets.
+    val decimal = LLVMBuildSub(builder, byte, LLVMConstInt(i64, 48, 0), "")
+    val letter = LLVMBuildSub(builder, byte, LLVMConstInt(i64, 97, 0), "")
+    val isDecimal = LLVMBuildICmp(builder, 36, decimal, LLVMConstInt(i64, 10, 0), "")
+    val isLetter = LLVMBuildICmp(builder, 36, letter, LLVMConstInt(i64, 6, 0), "")
+    LLVMBuildCondBr(builder, LLVMBuildOr(builder, isDecimal, isLetter, ""), digit, done)
+    LLVMPositionBuilderAtEnd(builder, digit)
+    val nibble = LLVMBuildSelect(builder, isDecimal, decimal, LLVMBuildAdd(builder, letter, LLVMConstInt(i64, 10, 0), ""), "")
+    LLVMBuildStore(builder, LLVMBuildOr(builder, LLVMBuildShl(builder, LLVMBuildLoad2(builder, i64, value, ""),
+        LLVMConstInt(i64, 4, 0), ""), nibble, ""), value)
+    LLVMBuildStore(builder, LLVMBuildAdd(builder, at, LLVMConstInt(i64, 1, 0), ""), cursor)
+    LLVMBuildBr(builder, loop)
+    LLVMPositionBuilderAtEnd(builder, done)
+    LLVMBuildLoad2(builder, i64, value, "")
+}
+
+// For a fault outside the program on Linux (a shared library's instruction: libLLVM's, in the compiler): the line
+// "<library> + 0x<offset>", the offset from where the library is loaded (the start of its mapping at file offset 0),
+// which `llvm-symbolizer --obj=<library> 0x<offset>` names. Read from /proc/self/maps with openat, read and close only,
+// into a static buffer of 64 KiB (no allocation in a signal handler); nothing when the instruction is in no mapping it read.
+fun bootstrapLlvmFaultLibraryReport(backend: BootstrapLlvmBackend, pc: i64*): void {
+    val i64 = backend.i64Type
+    val builder = backend.builder
+    val function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+    val capacity = 65536
+    val buffer = bootstrapLlvmStackGuardGlobal(backend, "abla.fault.maps", LLVMArrayType2(backend.i8Type, capacity))
+    val path = bootstrapLlvmGlobalStringPointer(backend, "/proc/self/maps", "abla.fault.maps.path")
+    val zero = LLVMConstInt(i64, 0, 0)
+    val one = LLVMConstInt(i64, 1, 0)
+    // openat(AT_FDCWD, path, O_RDONLY).
+    val descriptor = bootstrapLlvmLinuxX64Syscall(backend, 257, [LLVMConstInt(i64, -100, 1), path, zero, zero])
+    val total = LLVMBuildAlloca(builder, i64, "maps.total")
+    LLVMBuildStore(builder, zero, total)
+    val readLoop = LLVMAppendBasicBlockInContext(backend.context, function, "maps.read")
+    val readMore = LLVMAppendBasicBlockInContext(backend.context, function, "maps.read.more")
+    val readEnd = LLVMAppendBasicBlockInContext(backend.context, function, "maps.read.end")
+    val finished = LLVMAppendBasicBlockInContext(backend.context, function, "maps.finished")
+    // SLT (40): a failed open (a negative errno) reports nothing.
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 40, descriptor, zero, ""), finished, readLoop)
+    LLVMPositionBuilderAtEnd(builder, readLoop)
+    val have = LLVMBuildLoad2(builder, i64, total, "")
+    val got = bootstrapLlvmLinuxX64Syscall(backend, 0, [descriptor, bootstrapLlvmByteElement(backend, buffer, have),
+        LLVMBuildSub(builder, LLVMConstInt(i64, capacity, 0), have, "")])
+    // SGT (38): more bytes; then while the buffer has room (ULT 36).
+    val now = LLVMBuildAdd(builder, have, got, "")
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 38, got, zero, ""), readMore, readEnd)
+    LLVMPositionBuilderAtEnd(builder, readMore)
+    LLVMBuildStore(builder, now, total)
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 36, now, LLVMConstInt(i64, capacity, 0), ""), readLoop, readEnd)
+    LLVMPositionBuilderAtEnd(builder, readEnd)
+    bootstrapLlvmLinuxX64Syscall(backend, 3, [descriptor])
+    val size = LLVMBuildLoad2(builder, i64, total, "maps.size")
+    // Each line: start-end perms offset device inode [path]. The library's base is the start of the latest mapping at
+    // file offset 0 (the maps are in address order, a library's first mapping first).
+    val cursor = LLVMBuildAlloca(builder, i64, "maps.cursor")
+    val base = LLVMBuildAlloca(builder, i64, "maps.base")
+    val pathAt = LLVMBuildAlloca(builder, i64, "maps.path")
+    LLVMBuildStore(builder, zero, cursor)
+    LLVMBuildStore(builder, zero, base)
+    val line = LLVMAppendBasicBlockInContext(backend.context, function, "maps.line")
+    val fields = LLVMAppendBasicBlockInContext(backend.context, function, "maps.fields")
+    val scan = LLVMAppendBasicBlockInContext(backend.context, function, "maps.scan")
+    val scanByte = LLVMAppendBasicBlockInContext(backend.context, function, "maps.scan.byte")
+    val scanNext = LLVMAppendBasicBlockInContext(backend.context, function, "maps.scan.next")
+    val lineEnd = LLVMAppendBasicBlockInContext(backend.context, function, "maps.line.end")
+    val setBase = LLVMAppendBasicBlockInContext(backend.context, function, "maps.base.set")
+    val check = LLVMAppendBasicBlockInContext(backend.context, function, "maps.check")
+    val found = LLVMAppendBasicBlockInContext(backend.context, function, "maps.found")
+    val next = LLVMAppendBasicBlockInContext(backend.context, function, "maps.next")
+    LLVMBuildBr(builder, line)
+    LLVMPositionBuilderAtEnd(builder, line)
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 36, LLVMBuildLoad2(builder, i64, cursor, ""), size, ""), fields, finished)
+    LLVMPositionBuilderAtEnd(builder, fields)
+    val start = bootstrapLlvmFaultMapsHex(backend, buffer, size, cursor)
+    // Past '-'.
+    LLVMBuildStore(builder, LLVMBuildAdd(builder, LLVMBuildLoad2(builder, i64, cursor, ""), one, ""), cursor)
+    val end = bootstrapLlvmFaultMapsHex(backend, buffer, size, cursor)
+    // Past " rwxp " (the permissions are always four letters).
+    LLVMBuildStore(builder, LLVMBuildAdd(builder, LLVMBuildLoad2(builder, i64, cursor, ""), LLVMConstInt(i64, 6, 0), ""), cursor)
+    val offset = bootstrapLlvmFaultMapsHex(backend, buffer, size, cursor)
+    // The path: from the line's first '/' (no earlier field has one) to its newline.
+    LLVMBuildStore(builder, LLVMConstInt(i64, -1, 1), pathAt)
+    LLVMBuildBr(builder, scan)
+    LLVMPositionBuilderAtEnd(builder, scan)
+    val at = LLVMBuildLoad2(builder, i64, cursor, "")
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 36, at, size, ""), scanByte, lineEnd)
+    LLVMPositionBuilderAtEnd(builder, scanByte)
+    val byte = LLVMBuildLoad2(builder, backend.i8Type, bootstrapLlvmByteElement(backend, buffer, at), "")
+    // EQ (32): a newline (10) ends the line.
+    LLVMBuildCondBr(builder, LLVMBuildICmp(builder, 32, byte, LLVMConstInt(backend.i8Type, 10, 0), ""), lineEnd, scanNext)
+    LLVMPositionBuilderAtEnd(builder, scanNext)
+    // The first '/' (47) of the line: SLT (40) -1 says none yet.
+    val first = LLVMBuildAnd(builder, LLVMBuildICmp(builder, 32, byte, LLVMConstInt(backend.i8Type, 47, 0), ""),
+        LLVMBuildICmp(builder, 40, LLVMBuildLoad2(builder, i64, pathAt, ""), zero, ""), "")
+    LLVMBuildStore(builder, LLVMBuildSelect(builder, first, at, LLVMBuildLoad2(builder, i64, pathAt, ""), ""), pathAt)
+    LLVMBuildStore(builder, LLVMBuildAdd(builder, at, one, ""), cursor)
+    LLVMBuildBr(builder, scan)
+    LLVMPositionBuilderAtEnd(builder, lineEnd)
+    val newline = LLVMBuildLoad2(builder, i64, cursor, "maps.newline")
+    val pathStart = LLVMBuildLoad2(builder, i64, pathAt, "")
+    // SGE (39): a file's mapping.
+    val file = LLVMBuildICmp(builder, 39, pathStart, zero, "")
+    LLVMBuildCondBr(builder, LLVMBuildAnd(builder, file, LLVMBuildICmp(builder, 32, offset, zero, ""), ""), setBase, check)
+    LLVMPositionBuilderAtEnd(builder, setBase)
+    LLVMBuildStore(builder, start, base)
+    LLVMBuildBr(builder, check)
+    LLVMPositionBuilderAtEnd(builder, check)
+    // start <= pc < end (UGE 35, ULT 36), in a file.
+    val inside = LLVMBuildAnd(builder, LLVMBuildICmp(builder, 35, pc, start, ""), LLVMBuildICmp(builder, 36, pc, end, ""), "")
+    LLVMBuildCondBr(builder, LLVMBuildAnd(builder, inside, file, ""), found, next)
+    LLVMPositionBuilderAtEnd(builder, next)
+    LLVMBuildStore(builder, LLVMBuildAdd(builder, newline, one, ""), cursor)
+    LLVMBuildBr(builder, line)
+    LLVMPositionBuilderAtEnd(builder, found)
+    bootstrapLlvmRuntimeWrite(backend, 2, bootstrapLlvmByteElement(backend, buffer, pathStart),
+        LLVMBuildSub(builder, newline, pathStart, ""))
+    bootstrapLlvmDebugWrite(backend, " + ", "abla.fault.library.plus")
+    bootstrapLlvmWriteHexCompact(backend, LLVMBuildSub(builder, pc, LLVMBuildLoad2(builder, i64, base, ""), ""))
+    LLVMBuildBr(builder, finished)
+    LLVMPositionBuilderAtEnd(builder, finished)
+    return
 }
 
 // bootstrapLlvmDebugWriteHex as a loop over a digit table, for code every release build carries (the fault

@@ -191,6 +191,23 @@ for flags in "" "-g" "--backtrace"; do
                 grep -q '^#0 abla_test_bad_store ' "$out/bad-store.symbolized" ||
                     fail "a bad store's instruction is not in badStore: $(cat "$out/bad-store.err" "$out/bad-store.symbolized")"
             fi
+            # An instruction outside the program (a shared library's, as libLLVM's in the compiler) is named by its
+            # file and its offset from where the file is loaded, read from /proc/self/maps: library-fault.ab maps a
+            # file with a bad load at byte 32 and calls it.
+            if [[ $(uname -m) == x86_64 ]]; then
+                "$compiler" build "$cases/library-fault.ab" -o "$out/library-fault"
+                set +e
+                code_file="$(cd "$out" && pwd -P)/library-fault.code"
+                "$out/library-fault" "$code_file" > "$out/library-fault.out" 2> "$out/library-fault.err"
+                library_status=$?
+                set -e
+                [[ $library_status -eq 139 ]] ||
+                    fail "library-fault exited $library_status: $(cat "$out/library-fault.out" "$out/library-fault.err")"
+                grep -qx 'fatal signal: a bad memory access at 0x0000000000000010' "$out/library-fault.err" &&
+                    grep -qx 'the faulting instruction, outside the program (a shared library'"'"'s):' "$out/library-fault.err" &&
+                    grep -qxF "$code_file + 0x0000000000000020" "$out/library-fault.err" ||
+                    fail "a fault in a mapped file did not name it: $(cat "$out/library-fault.err")"
+            fi
         fi
     else
         # Its fault report names the address too, then prints the stack; a sent SIGSEGV's says what it may be.

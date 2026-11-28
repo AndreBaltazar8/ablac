@@ -71,14 +71,26 @@ What a debug build contains:
   `fatal signal: a bad memory access at 0x0000000000000010` before the process
   ends by the signal. On Linux the faulting instruction and the program's
   load address follow, so `ablac symbolize <program> <that text>` names the
-  function from one crash, with no core needed. An instruction outside the
-  program is a shared library's, and the report says so:
+  function from one crash, with no core needed:
 
   ```text
   fatal signal: a bad memory access at 0x0000000000000010
   the faulting instruction (ablac symbolize <program> names it):
   0x000055d1c3a4f1e7
   load address 0x000055d1c3a00000
+  ```
+
+  An instruction outside the program is a shared library's (libLLVM's, in the
+  compiler). The report says so and names the library and the offset from
+  where it is loaded, read from `/proc/self/maps`, for
+  `llvm-symbolizer --obj=<library> <offset>`:
+
+  ```text
+  fatal signal: a bad memory access at 0x000000000000000c
+  the faulting instruction, outside the program (a shared library's):
+  0x00007f56745b4020
+  load address 0x0000558ecde96000
+  /nix/store/...-llvm-23/lib/libLLVM.so.23 + 0x0000000004a1c020
   ```
 
 ## Native: lldb, atos, crash reports
