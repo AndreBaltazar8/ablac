@@ -716,6 +716,60 @@ frame_view_read() {
     echo "ok   x86_64 frame views: a boxed value's tag read as public through its slot's address, the twelve ways a secret could hide found"
 }
 
+# How close each real entry's work comes to the edge of its wipe. The same program against a copy of the library whose
+# wipes of one size do nothing, once for each of 2048, 4096 and 8192 (ctScrubStack1024, the program's own control, still
+# wipes): an entry's row is read from the run without its own wipe, where the deepest byte it leaves is how deep its
+# work went past what the wipes it calls itself clear (a PKCS#12 entry's RSA import wipes 8192 below its own frame),
+# measured below the helper's stack pointer, so the margin is a lower bound. Margin = the entry's wipe (AES 2048, RSA and
+# key generation 8192, the PBE entries 4096 and cryptoPassword 2048) minus that depth. Every row is in
+# $out/residue-margin.txt; fewer than CT_MARGIN_FLOOR bytes (default 256) fails, so a worker that grows towards its wipe
+# is found before it leaves a byte. (The RSA DER import was 40 bytes from its 4096 wipe when a guard in
+# rsaPrivateFromNumbers pushed it past.)
+real_entries_margin() {
+    local open=$out/stdlib-nowipe floor=${CT_MARGIN_FLOOR:-256} size scrub
+    rm -rf "$open"
+    cp -r stdlib "$open"
+    scrub=$open/abla/ct/scrub/entry.ab
+    for size in 2048 4096 8192; do
+        cp stdlib/abla/ct/scrub/entry.ab "$scrub"
+        sed -i -e "/^@inline fun ctScrubStack$size(): void {/,/^}/{/ctScrubBounded$size() else ctScrubBelow$size()/d}" "$scrub"
+        [[ $(grep -c "ctScrubBelow$size()$" "$scrub") == 0 ]] &&
+            grep "ctScrubBounded1024() else ctScrubBelow1024()" "$scrub" > /dev/null ||
+            { echo "ct: the library copy without the $size wipe did not take (abla/ct/scrub changed shape)" >&2; exit 1; }
+        ABLA_STDLIB="$project_root/$open" "$compiler" build "$cases/residue-run.ab" -o "$out/residue-nowipe-$size" \
+            --no-cache --stdlib-internals
+        # The run fails (the entries of that size leave their work); its verbose rows are what is read.
+        "$out/residue-nowipe-$size" v "$@" > "$out/residue-nowipe-$size.log" 2>&1 || true
+    done
+    awk -v floor="$floor" '
+        function row(name, wipe, depth) {
+            if (FILENAME !~ ("-" wipe "\\.log$")) return
+            margin = wipe - depth
+            printf "%-60s wipe %5d  depth %5d  margin %5d\n", name, wipe, depth, margin
+            if (count == 0 || margin < least) { least = margin; leastName = name }
+            count++
+        }
+        /^aes [0-9]+ [0-9]+ [0-9]+: [0-9]+$/ { row($1 " " $2 " " $3 " " $4, 2048, $5); next }
+        /^rsa .* [0-9]+: [0-9]+$/ { row($0, 8192, $NF); next }
+        /^generate: [0-9]+$/ { row("generate", 8192, $2); next }
+        /^pbe password [0-9]+: [0-9]+$/ { row($0, 2048, $NF); next }
+        /^pbe [^t].* [0-9]+: [0-9]+$/ { row($0, 4096, $NF); next }
+        END {
+            if (count == 0) { print "no rows"; exit 2 }
+            printf "smallest margin: %d bytes (%s), floor %d\n", least, leastName, floor
+            if (least < floor) exit 1
+        }' "$out"/residue-nowipe-{2048,4096,8192}.log > "$out/residue-margin.txt" || {
+        cat "$out/residue-margin.txt" >&2
+        echo "ct: a real entry's work comes within CT_MARGIN_FLOOR bytes of its wipe (or no rows were read)" >&2; exit 1
+    }
+    # The rows must have been measured: an entry whose work left nothing would read as depth 0 against every wipe.
+    awk '$0 ~ /depth +0 / { zero++ } END { exit zero > 0 }' "$out/residue-margin.txt" || {
+        cat "$out/residue-margin.txt" >&2; echo "ct: a row of the no-wipe run left nothing (the copy still wipes?)" >&2; exit 1
+    }
+    rm -rf "$open"
+    echo "ok   x86_64 real entry margins: $(tail -1 "$out/residue-margin.txt")"
+}
+
 # The real entry points, run: the 16 KiB below the stack pointer is zeroed, each public AES (every key size, and a
 # 64 KiB input) and RSA private entry (2048, 3072 and 4096 bits) is called from a helper that returns, and the region
 # must still be zero beneath the entry's own frame. A worker that outgrows its wipe (ctScrubStack2048 in abla/crypto/aes,
@@ -755,6 +809,7 @@ real_entries_run() {
         ABLA_GC_STRESS=1 "$out/residue-run" v "${files[@]}" >&2
         echo "ct: a real entry point left bytes below itself with a collection at every safe point" >&2; exit 1
     }
+    real_entries_margin "${files[@]}"
     rm -f "$out"/keys-*.pem "$out"/keys-*.p8 "$out"/keys-*.p12
     echo "ok   x86_64 real entry points: AES at 128, 192 and 256 bits with a 64 KiB input, RSA at 2048, 3072 and 4096, key generation, the password entries of PBE over PKCS#8 and PKCS#12: nothing below their own frame in 16 KiB, three runs and one under GC stress"
 }
