@@ -3176,6 +3176,11 @@ A kernel, and every function it calls, may use:
 - `kernelDp4a(a, b, c)` (the dot product of four signed bytes plus `c`, CUDA's
   `__dp4a`) and `kernelBytePerm(a, b, selector)` (four of eight bytes,
   `__byte_perm`);
+- the tensor-core products `kernelMmaF16(a, b, c)` and `kernelMmaBf16` (m16n8k16,
+  f32 sums) and `kernelMmaS8` (m16n8k32, 32-bit int sums as `u32x4` words), PTX
+  `mma.sync` with every lane of the subgroup calling them together, each holding
+  its `u32x4` A, `u32x2` B and C fragments in the PTX ISA's layout (their doc
+  comments give it); GPU only: on the CPU backend they stop the program;
 - `KernelU32Buffer.atomicAdd` and `KernelF32Buffer.atomicAdd` (one indivisible
   add, giving the old value) and `kernelFence()` (CUDA's `__threadfence`), with
   which the last group to finish can combine every group's results.

@@ -1175,6 +1175,52 @@ fun bootstrapKernelBuiltin(
             bootstrapKernelLine(state, "$raw = call i32 asm \"prmt.b32 \$0, \$1, \$2, \$3;\", \"=r,r,r,r\"(i32 ${operands[0]}, i32 ${operands[1]}, i32 $selector)")
             bootstrapKernelLine(state, "$result = zext i32 $raw to i64")
         }
+    } else if (name == "kernelMmaF16" || name == "kernelMmaBf16" || name == "kernelMmaS8") {
+        // One tensor-core matrix product of the subgroup (#1304, André's #182 A): mma.sync.aligned, each lane holding its
+        // fragments in the PTX layout (sm_80). f16 and bf16 are m16n8k16 with f32 sums, s8 is m16n8k32 with s32 sums.
+        if (instruction.operands.size < 3) return false
+        val integer = name == "kernelMmaS8"
+        val sums = if (integer) "u32x4" else "f32x4"
+        val wanted = ["u32x4", "u32x2", sums]
+        val words: array<string> = []
+        val accumulators: array<string> = []
+        for (position in 0 until 3) {
+            val vector = bootstrapKernelGet(state, instruction.operands[position])
+            if (vector.type != wanted[position]) {
+                bootstrapKernelFail(emitter, state.name, "type", vector.type, "$name takes (u32x4, u32x2, $sums)")
+                return true
+            }
+            val lanes = if (position == 1) 2 else 4
+            val laneType = if (position == 2 && !integer) "float" else "i32"
+            for (k in 0 until lanes) {
+                val element = bootstrapKernelFresh(state)
+                bootstrapKernelLine(state, "$element = extractelement ${bootstrapKernelLlvmType(vector.type)} ${vector.operand}, i64 $k")
+                if (position == 2) accumulators.append("$laneType $element") else words.append("i32 $element")
+            }
+        }
+        val shape = if (name == "kernelMmaF16") "m16n8k16.row.col.f32.f16.f16.f32"
+            else if (name == "kernelMmaBf16") "m16n8k16.row.col.f32.bf16.bf16.f32" else "m16n8k32.row.col.s32.s8.s8.s32"
+        val register = if (integer) "r" else "f"
+        val lane = if (integer) "i32" else "float"
+        var arguments = ""
+        for (word in words) arguments = if (arguments == "") word else "$arguments, $word"
+        for (sum in accumulators) arguments = "$arguments, $sum"
+        val raw = bootstrapKernelFresh(state)
+        // convergent, as clang marks CUDA's inline asm: every lane of the subgroup takes part, so no branch may split them.
+        bootstrapKernelLine(state, "$raw = call { $lane, $lane, $lane, $lane } asm sideeffect \"mma.sync.aligned.$shape " +
+            "{\$0, \$1, \$2, \$3}, {\$4, \$5, \$6, \$7}, {\$8, \$9}, {\$10, \$11, \$12, \$13};\", " +
+            "\"=$register,=$register,=$register,=$register,r,r,r,r,r,r,$register,$register,$register,$register\"" +
+            "($arguments) convergent")
+        type = sums
+        var vector = "undef"
+        for (k in 0 until 4) {
+            val element = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$element = extractvalue { $lane, $lane, $lane, $lane } $raw, $k")
+            val next = bootstrapKernelFresh(state)
+            bootstrapKernelLine(state, "$next = insertelement ${bootstrapKernelLlvmType(sums)} $vector, $lane $element, i64 $k")
+            vector = next
+        }
+        result = vector
     } else if (name == "extension_KernelF32Buffer_atomicAdd") {
         // One indivisible float add (CUDA's atomicAdd on a float: red/atom.add.f32, relaxed), checked as a load is.
         if (instruction.operands.size < 3) return false

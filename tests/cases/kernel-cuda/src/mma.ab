@@ -1,0 +1,131 @@
+// Tensor cores (#1304, André's #182 A): one subgroup's mma.sync per kernel, each lane loading its A, B and C fragments
+// (4, 2 and 4 words at lane * 4, lane * 2 and lane * 4) and storing its D fragment at lane * 4. main.ab builds the
+// fragments from whole matrices by the PTX layout and checks D against the product it computes on the host.
+import "abla/kernel"
+import "abla/simd"
+import "abla/kernel/cuda"
+import "abla/float"
+import "abla/unsafe/memory"
+
+/** D = A B + C, f16 in, f32 sums (m16n8k16). */
+@kernel
+fun mmaF16(a: KernelU32Buffer, b: KernelU32Buffer, c: KernelF32Buffer, d: KernelF32Buffer) {
+    val lane = kernelLocalId()
+    val sums = kernelMmaF16(a.loadU32x4(lane * 4), b.loadU32x2(lane * 2), c.load4(lane * 4))
+    for (k in 0 until 4) d.store(lane * 4 + k, sums.get(k))
+}
+
+/** D = A B + C, bf16 in, f32 sums (m16n8k16). */
+@kernel
+fun mmaBf16(a: KernelU32Buffer, b: KernelU32Buffer, c: KernelF32Buffer, d: KernelF32Buffer) {
+    val lane = kernelLocalId()
+    val sums = kernelMmaBf16(a.loadU32x4(lane * 4), b.loadU32x2(lane * 2), c.load4(lane * 4))
+    for (k in 0 until 4) d.store(lane * 4 + k, sums.get(k))
+}
+
+/** D = A B + C, signed bytes in, 32-bit int sums (m16n8k32). */
+@kernel
+fun mmaS8(a: KernelU32Buffer, b: KernelU32Buffer, c: KernelU32Buffer, d: KernelU32Buffer) {
+    val lane = kernelLocalId()
+    d.storeU32x4(lane * 4, kernelMmaS8(a.loadU32x4(lane * 4), b.loadU32x2(lane * 2), c.loadU32x4(lane * 4)))
+}
+
+/** The f16 (or with `brain` the bf16) bits of `value`, a half-integer from -8 to 8 (exact in both). */
+fun mmaHalfBits(value: f32, brain: bool): int {
+    val bits = int(f32ToBits(value))
+    if (brain) return bits >> 16
+    if ((bits & 2147483647) == 0) return (bits >> 16) & 32768
+    ((bits >> 16) & 32768) | ((((bits >> 23) & 255) - 112) << 10) | ((bits >> 13) & 1023)
+}
+
+/** Stores the low 32 bits of `value` little endian at word `index` of `buffer`. */
+fun mmaStoreWord(var buffer: NativeByteBuffer, index: int, value: int): void {
+    for (k in 0 until 4) buffer.store(index * 4 + k, (value >> (k * 8)) & 255)
+}
+
+/** Word `index` of `buffer`, 0 to 2^32 - 1. */
+trusted fun mmaWordAt(buffer: NativeByteBuffer, index: int): int {
+    var word = 0
+    for (k in 0 until 4) word = word | (buffer.load(index * 4 + k) << (k * 8))
+    word
+}
+
+/** kind 0 (mmaF16), 1 (mmaBf16) and 2 (mmaS8) on the GPU, one subgroup, against D = A B + C computed here: "" when every
+ *  lane's D fragment is right (and the D's are not all zero), else what went wrong. A, B and C are small integers (halves
+ *  and quarters for the floats), so every sum is exact in any order. */
+trusted fun mmaCheck(var device: CudaKernelDevice): string {
+    for (kind in 0 until 3) {
+        val integer = kind == 2
+        val depth = if (integer) 32 else 16
+        val aValues: array<int> = []
+        for (i in 0 until 16 * depth) aValues.append(if (integer) (i * 37 + 11) % 256 - 128 else (i * 7) % 9 - 4)
+        val bValues: array<int> = []
+        for (i in 0 until depth * 8) bValues.append(if (integer) (i * 53 + 5) % 256 - 128 else (i * 5) % 7 - 3)
+        val cValues: array<int> = []
+        for (i in 0 until 128) cValues.append(if (integer) (i * 7919) % 20001 - 10000 else i % 13 - 6)
+        // The floats are A = a / 2, B = b / 2 and C = c / 4, so D = (sum of a b + c) / 4.
+        val aWords = nativeByteBuffer(32 * 16)
+        val bWords = nativeByteBuffer(32 * 8)
+        val cWords = nativeByteBuffer(32 * 16)
+        val expected: array<int> = []
+        for (i in 0 until 128) expected.append(0)
+        for (lane in 0 until 32) {
+            val g = lane / 4
+            val t = lane % 4
+            for (r in 0 until 4) {
+                val row = g + (r % 2) * 8
+                var word = 0
+                if (integer) {
+                    for (k in 0 until 4) word = word | ((aValues[row * depth + 4 * t + (r / 2) * 16 + k] & 255) << (8 * k))
+                } else {
+                    for (k in 0 until 2) {
+                        word = word | (mmaHalfBits(f32FromInt(aValues[row * depth + 2 * t + (r / 2) * 8 + k]) * f32(0.5), kind == 1) << (16 * k))
+                    }
+                }
+                mmaStoreWord(aWords, lane * 4 + r, word)
+            }
+            for (r in 0 until 2) {
+                var word = 0
+                if (integer) {
+                    for (k in 0 until 4) word = word | ((bValues[(4 * t + r * 16 + k) * 8 + g] & 255) << (8 * k))
+                } else {
+                    for (k in 0 until 2) word = word | (mmaHalfBits(f32FromInt(bValues[(2 * t + r * 8 + k) * 8 + g]) * f32(0.5), kind == 1) << (16 * k))
+                }
+                mmaStoreWord(bWords, lane * 2 + r, word)
+            }
+            for (r in 0 until 4) {
+                val row = g + (r / 2) * 8
+                val column = 2 * t + r % 2
+                var sum = cValues[row * 8 + column]
+                for (k in 0 until depth) sum = sum + aValues[row * depth + k] * bValues[k * 8 + column]
+                if (integer) {
+                    mmaStoreWord(cWords, lane * 4 + r, cValues[row * 8 + column] & 4294967295)
+                    expected[lane * 4 + r] = sum & 4294967295
+                } else {
+                    mmaStoreWord(cWords, lane * 4 + r, int(f32ToBits(f32FromInt(cValues[row * 8 + column]) * f32(0.25))))
+                    expected[lane * 4 + r] = int(f32ToBits(f32FromInt(sum) * f32(0.25)))
+                }
+            }
+        }
+        val name = if (kind == 0) "mmaF16" else if (kind == 1) "mmaBf16" else "mmaS8"
+        val da = device.allocate(32 * 16)
+        val db = device.allocate(32 * 8)
+        val dc = device.allocate(32 * 16)
+        val dd = device.allocate(32 * 16)
+        if (da == null || db == null || dc == null || dd == null) return "$name: ${device.error}"
+        val arguments = cudaKernelArguments().buffer(da.words()).buffer(db.words())
+        val launched = if (integer) arguments.buffer(dc.words()).buffer(dd.words()) else arguments.buffer(dc.floats()).buffer(dd.floats())
+        val out = nativeByteBuffer(32 * 16)
+        if (!device.upload(da, aWords) || !device.upload(db, bWords) || !device.upload(dc, cWords) ||
+            !device.launch(name, 1, 32, launched) || !device.download(dd, out)) {
+            return "$name: ${device.error}"
+        }
+        var nonzero = 0
+        for (i in 0 until 128) {
+            if (mmaWordAt(out, i) != expected[i]) return "$name: word $i is ${mmaWordAt(out, i)}, not ${expected[i]}"
+            if (expected[i] != 0) nonzero = nonzero + 1
+        }
+        if (nonzero < 64) return "$name: only $nonzero nonzero words"
+    }
+    ""
+}

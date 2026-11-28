@@ -22,6 +22,13 @@ cases=tests/cases/kernel
     fail "nvfp4-cpu did not build: $(head -4 "$out/nvfp4-cpu.log")"
 "$out/nvfp4-cpu" > "$out/nvfp4-cpu.out" 2>&1 || fail "nvfp4-cpu: $(cat "$out/nvfp4-cpu.out")"
 
+# Tensor cores on the CPU backend (#1304): kernelMmaF16 stops the program and says it needs a GPU subgroup.
+"$compiler" build "$cases/mma-cpu.ab" -o "$out/mma-cpu" --fast --no-cache > "$out/mma-cpu.log" 2>&1 ||
+    fail "mma-cpu did not build: $(head -4 "$out/mma-cpu.log")"
+if "$out/mma-cpu" > "$out/mma-cpu.out" 2>&1 || ! grep -q "kernelMmaF16 needs a GPU subgroup of 32 lanes" "$out/mma-cpu.out"; then
+    fail "mma-cpu: $(cat "$out/mma-cpu.out")"
+fi
+
 # The half-precision conversions (#1302) on the CPU backend give CUDA C's bits on the 4090 for every input of the set
 # (tools/probe-kernel-half.cu printed the hashes half-cpu.ab records).
 "$compiler" build "$cases/half-cpu.ab" -o "$out/half-cpu" --fast --no-cache > "$out/half-cpu.log" 2>&1 ||
@@ -122,7 +129,7 @@ if [[ -n $library ]]; then
             grep -q "on the GPU and the CPU true" "$out/kernel-cuda.out" &&
             grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" &&
             grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "kernelTanh: .*: true" "$out/kernel-cuda.out" && grep -q "kernelSigmoid: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" && grep -q "quad4: .* true" "$out/kernel-cuda.out" && grep -q "words4: .* true" "$out/kernel-cuda.out" && grep -q "pairs2: .* true" "$out/kernel-cuda.out" &&
-            grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" && grep -q "subgroups: .* true" "$out/kernel-cuda.out" && grep -q "arrays: .* true, in registers true" "$out/kernel-cuda.out" && grep -q "launch: .* true" "$out/kernel-cuda.out" && grep -q "intrinsics: .* true" "$out/kernel-cuda.out" && grep -q "streams: .* true" "$out/kernel-cuda.out" &&
+            grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" && grep -q "subgroups: .* true" "$out/kernel-cuda.out" && grep -q "arrays: .* true, in registers true" "$out/kernel-cuda.out" && grep -q "launch: .* true" "$out/kernel-cuda.out" && grep -q "intrinsics: .* true" "$out/kernel-cuda.out" && grep -q "streams: .* true" "$out/kernel-cuda.out" && grep -q "mma: .* true $" "$out/kernel-cuda.out" &&
             grep -q "launch guards: .* true" "$out/kernel-cuda.out" && grep -q "edge indices: .* true" "$out/kernel-cuda.out" &&
             grep -q "half: .* the same bits: true" "$out/kernel-cuda.out" ||
             fail "kernel-cuda: $(cat "$out/kernel-cuda.out")"
