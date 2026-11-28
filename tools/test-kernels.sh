@@ -97,6 +97,11 @@ for load in load4Aligned loadU32x4Aligned-words loadU16Aligned loadU32Aligned lo
         fail "aligned-wrap $load: no panic for an index near 2^63 (exit $status): $(head -3 "$out/aligned-wrap-$load.out")"
 done
 
+# The CUDA program as an object on every machine (no libcuda needed): its PTX, a long text that more than one function
+# holds, must survive the backend's per-function memory reset (#1306: the root plan read it after the reset had freed it).
+"$compiler" build --project tests/cases/kernel-cuda --emit object -o "$out/kernel-cuda.o" --fast --no-cache \
+    > "$out/kernel-cuda-object.log" 2>&1 || fail "kernel-cuda did not build as an object: $(tail -4 "$out/kernel-cuda-object.log")"
+
 cuda="skipped (no libcuda.so on this machine)"
 library=""
 for directory in /run/opengl-driver/lib /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib; do
