@@ -31,14 +31,9 @@ done
 programs=(interop dropnotify binding-interop api identity mtls tls12prf server sni wipe serve unix bulk)
 # server.ab and wipe.ab drive the machines from outside (a KeyUpdate flood, a sequence number near its limit) and check what
 # their key material holds, which is private to abla/tls/pure/client and server (decision #165): they build against a copy of
-# the library whose machines' private extension fields are open, made here.
-rm -rf "$out/stdlib-open"
-cp -r stdlib "$out/stdlib-open"
-sed -i -e "s/^private var TlsClient\./var TlsClient./" "$out/stdlib-open/abla/tls/pure/client/entry.ab"
-sed -i -e "s/^private var TlsServer\./var TlsServer./" "$out/stdlib-open/abla/tls/pure/server/entry.ab"
-grep -q "^var TlsClient\.masterSecret" "$out/stdlib-open/abla/tls/pure/client/entry.ab" &&
-    grep -q "^var TlsServer\.master:" "$out/stdlib-open/abla/tls/pure/server/entry.ab" ||
-    { echo "tls-pure interop: the open library copy has no open machine fields" >&2; exit 1; }
+# the library whose machines' private extension fields are open (tools/lib/tls-open-stdlib.sh).
+. "$root/tools/lib/tls-open-stdlib.sh"
+tls_open_stdlib "$root" "$out"
 pids=()
 for program in "${programs[@]}"; do
     while (( $(jobs -rp | wc -l) >= 4 )); do sleep 0.2; done

@@ -17,7 +17,11 @@ if ! command -v openssl > /dev/null || ! openssl genpkey -algorithm EC -pkeyopt 
     exit 0
 fi
 openssl req -x509 -new -key "$out/key.pem" -out "$out/cert.pem" -subj /CN=localhost -addext 'subjectAltName=DNS:localhost' -days 2 2> /dev/null
-"$compiler" build tests/cases/tls-pure/handles.ab -o "$out/handles" --fast --no-cache
+# handles.ab checks that detach clears the server's traffic secret, which is private to abla/tls/pure/server: it builds
+# against a copy of the library with the machines' fields open (tools/lib/tls-open-stdlib.sh).
+. "$root/tools/lib/tls-open-stdlib.sh"
+tls_open_stdlib "$root" "$out"
+ABLA_STDLIB="$root/$out/stdlib-open" "$compiler" build tests/cases/tls-pure/handles.ab -o "$out/handles" --fast --no-cache
 pids=()
 trap 'for p in "${pids[@]:-}"; do [[ -z $p ]] || kill "$p" 2> /dev/null || true; done' EXIT
 

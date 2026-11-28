@@ -14,7 +14,10 @@ out=build/tls-chains
 rm -rf "$out"
 mkdir -p "$out"
 command -v openssl > /dev/null || { echo 'tls-chains: no openssl; skipped'; exit 0; }
-"$compiler" build tests/cases/tls-pure/handles.ab -o "$out/handles" --fast --no-cache
+# handles.ab reads a server's private traffic secret (its detach check): built against the open library copy.
+. "$root/tools/lib/tls-open-stdlib.sh"
+tls_open_stdlib "$root" "$out"
+ABLA_STDLIB="$root/$out/stdlib-open" "$compiler" build tests/cases/tls-pure/handles.ab -o "$out/handles" --fast --no-cache
 
 make_chain() { # kind: rsa | ec
     local kind=$1 key_args
