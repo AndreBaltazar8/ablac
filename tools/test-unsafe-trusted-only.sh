@@ -15,7 +15,8 @@
 #   - a write of a field of a marked class (reopening a closed buffer) from code that is not trusted is
 #     `native.trust:<class>.<field>` (decision #161 A; a warning in the warn phase), and the same write in a trusted function and a
 #     read of the field from ordinary code are accepted;
-#   - the marker on a program's own declaration is annotation.reserved.
+#   - the marker on a program's own declaration is annotation.reserved;
+#   - abla/memory's raw memoryCheckpoint and memoryReset are refused outside trusted code, with the region { } help.
 set -euo pipefail
 compiler=${1:-build/ablac}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
@@ -71,12 +72,13 @@ done
 # Phase "error" (the standard library as it is: every marker is at "error").
 for refused in plain-call:nativePointerAddress constructor:NativeByteBuffer reference:nativePointerAddress \
     compile-time:nativePointerAddress plain-syscall:linuxSyscall1 field-write:NativeByteBuffer.closed \
-    field-extension:NativeByteBuffer.closed; do
+    field-extension:NativeByteBuffer.closed memory-reset:memoryReset memory-reset:memoryCheckpoint; do
     IFS=: read -r name what <<< "$refused"
     build "$root/stdlib" "$name"
     [[ $status != 0 ]] || fail "$name built with the marker at error"
     grep -q "native.trust:$what" "$out/$name.log" || fail "$name: no native.trust:$what: $(head -4 "$out/$name.log")"
 done
+grep -q 'help: .*scope allocations with region { }' "$out/memory-reset.log" || fail "memory-reset: no region help: $(head -5 "$out/memory-reset.log")"
 grep -q 'help: allocate one with nativeByteBuffer(capacity)' "$out/constructor.log" || fail "constructor: no factory help: $(head -5 "$out/constructor.log")"
 grep -q 'help: wrap the call in a trusted function' "$out/plain-call.log" || fail "plain-call: no help: $(head -5 "$out/plain-call.log")"
 grep -q 'help: call the abla/sys wrapper' "$out/plain-syscall.log" || fail "plain-syscall: no help: $(head -5 "$out/plain-syscall.log")"

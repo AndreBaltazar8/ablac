@@ -313,7 +313,8 @@ retaining foreign calls, and direct or transitive mutation of outer receivers
 and heap parameters. Affine resources are destroyed before the generation is
 reset. The raw numeric checkpoint functions (`memoryCheckpoint`,
 `memoryReset` in `abla/memory`) cannot encode those lifetime facts, so they
-are for runtime and compiler internals, not for application code. The REPL uses the checked form after unloading each JIT
+are for runtime and compiler internals, not for application code: both are trusted-only (a call from code that is not
+trusted is `native.trust:memoryReset`), and a scoped allocation in a program is a `region { }`. The REPL uses the checked form after unloading each JIT
 generation; HTTP handlers can adopt it once their response promotion and
 long-lived-state policy is explicit.
 

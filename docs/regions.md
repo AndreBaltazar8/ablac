@@ -157,7 +157,8 @@ The runtime can reclaim a whole allocation generation in constant time, but
 a raw numeric checkpoint is not a safe lifetime model:
 `memoryReset(checkpoint)` can invalidate an array, object, string or closure
 while an ordinary binding still refers to it. The raw primitive therefore
-remains an internal mechanism, and source code uses the checked lexical form.
+remains an internal mechanism, trusted-only (`memoryCheckpoint` and `memoryReset` are refused outside trusted code,
+`native.trust`), and source code uses the checked lexical form.
 
 ## Surface
 
