@@ -1089,32 +1089,61 @@ fun bootstrapLlvmEmitCtScrubStack(backend: BootstrapLlvmBackend, name: string): 
     if (bytes == 0) return false
     var assembly = ""
     var constraints = ""
-    // A wipe longer than a page, on Linux, goes down one page at a time and stops at a page it can't write: a thread whose
-    // work fit in its stack may have less than the wipe's size left under it, and the page under its stack is a guard (a
-    // fault) or another mapping (a thread's control page, a store that is not ours). Each page below the one sp is in is
-    // first given to getcpu, which writes 4 bytes there or returns -EFAULT without a fault (it grows the main thread's
-    // stack as a store would). What the stop leaves unwiped was never stack, so the work that ran there never wrote it.
-    // The wipes of a page or less keep their one-loop shape, which the residue checks read (tools/ct/check).
+    // A wipe longer than a page goes no lower than the end of the stack: a thread whose work fit in its stack may have less
+    // than the wipe's size left under it, and the page under its stack is a guard (a fault) or another mapping (a thread's
+    // control page, a store that is not ours). What the stop leaves unwiped was never stack, so the work that ran there
+    // never wrote it. The wipes of a page or less keep their one-loop shape, which the residue checks read (tools/ct/check);
+    // every guard page is at least 4 KiB, so they reach no further than it. The sizes above a page are whole pages (8192),
+    // which AArch64's sub takes as an immediate shifted by 12.
+    // - Linux and macOS go down one page at a time, and each page below the one sp is in is first given to a system call
+    //   that writes there or fails with EFAULT without a fault: getcpu (4 bytes; it grows the main thread's stack as a store
+    //   would) on Linux, getrlimit (16 bytes) on macOS. A sandbox that refuses that call (a seccomp filter's errno) stops
+    //   the wipe at the page sp is in: nothing outside the stack is written, and less of it is wiped.
+    // - Windows commits a thread's stack as it grows, and TEB.StackLimit (gs:0x10 on x86-64, [x18, #0x10] on ARM64) is its
+    //   lowest committed byte, above the guard page: the wipe stops there (a store under the guard page faults). A stack
+    //   pointer under StackLimit is not on the thread's stack, and that wipe keeps its full size.
     val linux = bootstrapTextContains(backend.targetTriple, "linux")
-    if (bytes > 4096 && linux && arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
+    val macOS = bootstrapLlvmDarwinSyscallTarget(backend)
+    val windows = bootstrapLlvmTargetIsWindows(backend.targetTriple)
+    if (bytes > 4096 && (linux || macOS) && arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
         // r9 the next byte above what is left to wipe, r8 the lowest byte to wipe, r10 the page sp is in; each round
-        // takes rdi down to the page under r9 (or r8), probes it unless it is r10's, and zeroes [rdi, r9).
+        // takes rdi down to the page under r9 (or r8), probes it unless it is r10's, and zeroes [rdi, r9). getcpu is 309;
+        // macOS's getrlimit (194, in the BSD class) fails with the carry flag set.
         val chunk = "leaq -1(%r9), %rdi\nandq \$\$-4096, %rdi\ncmpq %r8, %rdi\ncmovbq %r8, %rdi\n"
+        val probe =
+            if (macOS) "movq %rdi, %rsi\nmovl \$\$3, %edi\nmovl \$\$0x20000c2, %eax\nsyscall\njc 3f\n"
+            else "xorl %esi, %esi\nxorl %edx, %edx\nmovl \$\$309, %eax\nsyscall\ntestq %rax, %rax\njnz 3f\n"
         assembly =
             "movq %rsp, %r9\nleaq -$bytes(%rsp), %r8\nmovq %rsp, %r10\nandq \$\$-4096, %r10\n1:\n" + chunk +
-            "cmpq %r10, %rdi\njae 2f\nxorl %esi, %esi\nxorl %edx, %edx\nmovl \$\$309, %eax\nsyscall\n" +
-            "testq %rax, %rax\njnz 3f\n" + chunk +
+            "cmpq %r10, %rdi\njae 2f\n" + probe + chunk +
             "2:\nmovq %r9, %rcx\nsubq %rdi, %rcx\nshrq \$\$3, %rcx\nmovq %rdi, %r9\nxorl %eax, %eax\nrep stosq\n" +
             "cmpq %r8, %r9\nja 1b\n3:"
         constraints = "~{rdi},~{rsi},~{rdx},~{rcx},~{rax},~{r8},~{r9},~{r10},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}"
-    } else if (bytes > 4096 && linux && arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
-        // The same with x9 (above what is left), x10 (lowest), x11 (sp's page) and x12 (this round's page); getcpu is 168.
+    } else if (bytes > 4096 && (linux || macOS) && arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
+        // The same with x9 (above what is left), x10 (lowest), x11 (sp's page) and x12 (this round's page): getcpu is
+        // 168; macOS's getrlimit is 194 in x16 (svc #0x80), with the carry flag set when it fails. macOS pages are 16 KiB
+        // there, so a page is probed four times; its mappings and guards are whole pages.
         val chunk = "sub x12, x9, #1\nand x12, x12, #0xfffffffffffff000\ncmp x12, x10\ncsel x12, x10, x12, lo\n"
+        val probe =
+            if (macOS) "mov x0, #3\nmov x1, x12\nmov x16, #194\nsvc #0x80\nb.cs 3f\n"
+            else "mov x0, x12\nmov x1, xzr\nmov x2, xzr\nmov x8, #168\nsvc #0\ncbnz x0, 3f\n"
         assembly =
             "mov x9, sp\nsub x10, sp, #${bytes / 4096}, lsl #12\nmov x11, sp\nand x11, x11, #0xfffffffffffff000\n1:\n" +
-            chunk + "cmp x12, x11\nb.hs 2f\nmov x0, x12\nmov x1, xzr\nmov x2, xzr\nmov x8, #168\nsvc #0\ncbnz x0, 3f\n" +
+            chunk + "cmp x12, x11\nb.hs 2f\n" + probe +
             "2:\nmov x13, x12\n4:\nstp xzr, xzr, [x13], #16\ncmp x13, x9\nb.ne 4b\nmov x9, x12\ncmp x9, x10\nb.hi 1b\n3:"
-        constraints = "~{x0},~{x1},~{x2},~{x8},~{x9},~{x10},~{x11},~{x12},~{x13},~{memory},~{cc}"
+        constraints = "~{x0},~{x1},~{x2},~{x8},~{x9},~{x10},~{x11},~{x12},~{x13},~{x16},~{memory},~{cc}"
+    } else if (bytes > 4096 && windows && arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
+        // rdi = sp - bytes, raised to StackLimit (rax) when that is at or under sp.
+        assembly =
+            "leaq -$bytes(%rsp), %rdi\nmovq %gs:16, %rax\ncmpq %rsp, %rax\nja 1f\ncmpq %rax, %rdi\ncmovbq %rax, %rdi\n1:\n" +
+            "movq %rsp, %rcx\nsubq %rdi, %rcx\nshrq \$\$3, %rcx\nxorl %eax, %eax\nrep stosq"
+        constraints = "~{rdi},~{rcx},~{rax},~{memory},~{dirflag},~{fpsr},~{flags}"
+    } else if (bytes > 4096 && windows && arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
+        // x9 = sp - bytes, raised to StackLimit (x10) when that is at or under sp (x11); then zeroed up to sp.
+        assembly =
+            "sub x9, sp, #${bytes / 4096}, lsl #12\nldr x10, [x18, #16]\nmov x11, sp\ncmp x10, x11\nb.hi 1f\n" +
+            "cmp x9, x10\ncsel x9, x10, x9, lo\n1:\ncmp x9, x11\nb.hs 3f\n2:\nstp xzr, xzr, [x9], #16\ncmp x9, x11\nb.ne 2b\n3:"
+        constraints = "~{x9},~{x10},~{x11},~{memory},~{cc}"
     } else if (arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
         assembly =
             "leaq -$bytes(%rsp), %rdi\nmovl \$\$${bytes / 8}, %ecx\nxorl %eax, %eax\nrep stosq"

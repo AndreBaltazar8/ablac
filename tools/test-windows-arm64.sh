@@ -53,8 +53,9 @@ build_pe stm stm/basic
 build_pe stack-probe windows/arm64/stack-probe
 build_pe crash windows/crash/crash --backtrace
 # The compile-time guard's Windows half (fault-guard, watchdog, preempt: docs/design/windows-jit.md §4, §5), run with the
-# argument "arm64" so they write ARM64 code into executable memory.
-for name in fault-guard watchdog preempt; do
+# argument "arm64" so they write ARM64 code into executable memory; with them scrub-near-limit (ctScrubStack8192 with
+# less than a page committed under it), which reads StackLimit with ARM64 code there.
+for name in fault-guard watchdog preempt scrub-near-limit; do
     build_pe "$name" "windows/$name" --fast
 done
 grep -q 'Symbol: RtlVirtualUnwind' "$out/crash.pe" || fail 'backtrace omitted the Windows unwinder'

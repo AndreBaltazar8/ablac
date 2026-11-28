@@ -1,0 +1,99 @@
+// ctScrubStack8192 on Windows called with less than a page of stack under it: the wipe must stop at the thread's
+// StackLimit (TEB + 0x10, the lowest committed byte, above the guard page), not write under it, and must still zero what
+// lies between there and itself. Windows commits a thread's stack as it grows and moves StackLimit down with it, so a
+// thread that has just gone deeper than ever before has less than a page committed under it, and a store a page under
+// that faults; Wine commits as the stack grows too but leaves StackLimit a page above the end of the stack, so there the
+// recursion goes down to the end. The thread goes down by recursion until less than `room` bytes are left above
+// StackLimit, fills them with a marker, wipes, and checks that they are zero. Exit 0 if so; 1 or 2 for a setup that went
+// wrong, 3 for a marker left; a fault (the wipe wrote under StackLimit's guard) ends it with a stack overflow or an
+// access violation. StackLimit is read by code in executable memory, as fault-guard.ab runs code: x64's
+// mov rax, gs:[0x10]; ret, or ARM64's ldr x0, [x18, #16]; ret with the argument "arm64". callNativeMain returns a 32-bit
+// result, sign-extended, so a second copy at +32 shifts the high half down first. Built for
+// x86_64-windows (tools/test-ct.sh runs it under Wine; the windows-run job on Windows) and
+// aarch64-windows (tools/test-windows-arm64.sh; the windows-arm64-run job).
+import "abla/ct/scrub"
+import "abla/io"
+import "abla/sys/linux/process"
+import "abla/runtime/platform/windows"
+import "abla/unsafe/memory/raw"
+
+/** The Abla Windows routine (src/backend/llvm/windows.ab): the caller's stack pointer. */
+trusted noescape extern:"c" fun abla_windows_stack_pointer(): int
+trusted noescape extern:"c" fun FlushInstructionCache(process: int, address: int, size: int): int
+
+val room = 3072
+
+
+// StackLimit, from the code at `code`: the low half there, the high half at +32.
+@noinline trusted fun limit(code: int): int = callNativeMain(code + 32) * 4294967296 + (callNativeMain(code) & 4294967295)
+
+@noinline trusted fun fill(from: int, to: int): void {
+    var at = from
+    while (at < to) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(at), 165)
+        at = at + 1
+    }
+    return
+}
+
+// Whether [from, to) is all zero.
+@noinline trusted fun zero(from: int, to: int): bool {
+    var at = from
+    while (at < to) {
+        if (ablaUnsafeLoadU8(nativePointerFromAddress(at)) != 0) return false
+        at = at + 1
+    }
+    true
+}
+
+@noinline fun wipe(): void {
+    ctScrubStack8192()
+    return
+}
+
+// Recurse until less than `room` bytes are left above StackLimit, then mark them and wipe: 0 if they are zero after,
+// 2 if the recursion overshot, 3 if a marker byte is left. The marker stops 512 bytes under the stack pointer, clear of
+// the frames of fill, wipe and the scrub's own call.
+@noinline trusted fun descend(code: int): int {
+    val here = abla_windows_stack_pointer()
+    val low = limit(code)
+    if (here - low > room) {
+        // Not a tail call: the frame stays, and `here` is read after it.
+        val status = descend(code)
+        return if (here == 0) -1 else status
+    }
+    if (here - low < 1536) return 2
+    fill(low, here - 512)
+    wipe()
+    if (zero(low, here - 512)) 0 else 3
+}
+
+// In the thread: the code that reads StackLimit, in executable memory (ARM64 when the argument is "arm64"), then the descent.
+trusted fun worker(): int {
+    val arm64 = linuxArgument(0) == "arm64"
+    val code = VirtualAlloc(0, 4096, 12288, 64)
+    if (code == 0) return 1
+    val low = if (arm64) [64, 10, 64, 249, 192, 3, 95, 214] else [101, 72, 139, 4, 37, 16, 0, 0, 0, 195]
+    val high = if (arm64) [64, 10, 64, 249, 0, 252, 96, 211, 192, 3, 95, 214] else [101, 72, 139, 4, 37, 16, 0, 0, 0, 72, 193, 232, 32, 195]
+    var at = 0
+    while (at < low.size) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(code + at), low[at])
+        at += 1
+    }
+    at = 0
+    while (at < high.size) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(code + 32 + at), high[at])
+        at += 1
+    }
+    FlushInstructionCache(GetCurrentProcess(), code, 64)
+    val status = descend(code)
+    if (status == 0) println("scrub near the limit: wiped down to StackLimit with ${room} bytes or less left")
+    status
+}
+
+fun main: int {
+    val running = thread { worker() }
+    val status = await running
+    if (status != 0) println("scrub near the limit: check $status")
+    status
+}

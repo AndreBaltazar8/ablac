@@ -799,6 +799,22 @@ scrub_near_limit_run() { # arch
     echo "ok   $1 scrub near the stack limit: $(tail -1 "$out/$name.log")"
 }
 
+# The same on Windows (tests/cases/windows/scrub-near-limit.ab), under Wine when it is there: the wipe stops at the
+# thread's StackLimit. Wine leaves StackLimit a page above the end of the stack, so the recursion goes down to that end;
+# on Windows (the windows-run and windows-arm64-run jobs) StackLimit follows the stack down as it is committed.
+scrub_near_limit_windows_run() {
+    local name=scrub-near-limit-windows status=0
+    command -v lld-link > /dev/null || { echo "ok   windows scrub near the stack limit: skipped (no lld-link)"; return 0; }
+    "$compiler" build tests/cases/windows/scrub-near-limit.ab --target x86_64-windows -o "$out/$name.exe" --fast \
+        --no-cache > "$out/$name.build.log" 2>&1 || { cat "$out/$name.build.log" >&2; echo "ct: $name did not build" >&2; exit 1; }
+    timeout 300 tools/windows/wine-run.sh "$out/$name.exe" > "$out/$name.log" 2>&1 || status=$?
+    [[ $status == 125 ]] && { echo "ok   windows scrub near the stack limit: skipped (Wine is not installed)"; return 0; }
+    [[ $status == 0 ]] && grep -qx 'scrub near the limit: wiped down to StackLimit with 3072 bytes or less left' <(tr -d '\r' < "$out/$name.log") || {
+        cat "$out/$name.log" >&2; echo "ct: ctScrubStack8192 near the stack limit under Wine ended with $status" >&2; exit 1
+    }
+    echo "ok   windows scrub near the stack limit: $(tr -d '\r' < "$out/$name.log" | tail -1)"
+}
+
 real_entries_run() {
     "$compiler" build "$cases/residue-run.ab" -o "$out/residue-run" --no-cache --stdlib-internals
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$out/keys-3072.pem" 2> /dev/null
@@ -1050,6 +1066,7 @@ frame_view_read
 residue_read
 real_entries_run
 scrub_near_limit_run x86_64
+scrub_near_limit_windows_run
 orchestration_read "$out/x86.o"
 worker_read "$out/x86.o"
 clmul_read "$out/x86.o" x86_64

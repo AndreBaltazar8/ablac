@@ -136,6 +136,26 @@ if [[ $(uname -s) == Darwin ]]; then
     fi
 fi
 
+# macOS: ctScrubStack8192 in a pthread with about 6 KiB of stack left (tests/cases/ct/scrub-near-limit-macos.ab) stops
+# at the end of the stack instead of writing into the guard page under it, and still zeroes what lies between. On Apple
+# Silicon the stack pointer is read with its own template. (Linux runs the same check in tools/test-ct.sh.)
+if [[ $(uname -s) == Darwin ]]; then
+    scrub_source="$project_root/tests/cases/ct/scrub-near-limit-macos.ab"
+    if [[ $(uname -m) == arm64 ]]; then
+        sed -e 's/stackPointer("movq %rsp, $0", "=r")/stackPointer("mov $0, sp", "=r")/' "$scrub_source" > "$out/scrub-near-limit-macos.ab"
+        grep 'stackPointer("mov $0, sp"' "$out/scrub-near-limit-macos.ab" > /dev/null || fail "the Apple Silicon template was not put in"
+        scrub_source="$out/scrub-near-limit-macos.ab"
+    fi
+    "$compiler" build "$scrub_source" -o "$out/scrub-near-limit"
+    set +e
+    "$out/scrub-near-limit" > "$out/scrub-near-limit.out" 2>&1
+    scrub_status=$?
+    set -e
+    [[ $scrub_status -eq 0 ]] || fail "ctScrubStack8192 near the stack limit exited $scrub_status: $(head -3 "$out/scrub-near-limit.out")"
+    grep -qx 'scrub near the limit: wiped down to the stack'"'"'s end with 6144 bytes or less left' "$out/scrub-near-limit.out" ||
+        fail "ctScrubStack8192 near the stack limit: $(head -3 "$out/scrub-near-limit.out")"
+fi
+
 # A stack overflow panics; another SIGSEGV still ends the process by the signal.
 for flags in "" "-g" "--backtrace"; do
     "$compiler" build "$cases/stack.ab" -o "$out/stack" $flags

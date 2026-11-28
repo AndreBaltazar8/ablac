@@ -95,13 +95,15 @@ if ((Invoke-Program 'crash' 101 @('thread-panic')).Err -notmatch '(?m)^0x[0-9a-f
 # The compile-time guard's Windows half (docs/design/windows-jit.md §4, §5), with ARM64 code in executable memory: two bad
 # accesses and two stack overflows sent back to their guard (the second overflow only if the first one's guard page was put
 # back), a time limit that stops a spinning thread and interrupts waits, and another thread's CONTEXT redirect and
-# CancelSynchronousIo. A missed stop would wait out 30 s sleeps, or for ever: a minute each.
+# CancelSynchronousIo. A missed stop would wait out 30 s sleeps, or for ever: a minute each. With them, ctScrubStack8192 with
+# less than a page of the stack committed under it (scrub-near-limit): the wipe stops at StackLimit.
 $guard = @{
     'fault-guard' = "armed 0, JIT fault back with 4, signal 11, address 16`nown fault back with 4, address 24`noverflow back with 4, signal 11`nsecond overflow back with 4, signal 11`n"
     'watchdog' = "armed 0`nspin back with 3`nruntime sleep -4`ndeferred sleep -4, asked true`ninterpreted read -4`ndisarmed sleep 0`n"
     'preempt' = "spinning`nback with 3, watchdog 1`ninterrupted pipe read -4`ncancelled true`n"
+    'scrub-near-limit' = "scrub near the limit: wiped down to StackLimit with 3072 bytes or less left`n"
 }
-foreach ($name in 'fault-guard', 'watchdog', 'preempt') {
+foreach ($name in 'fault-guard', 'watchdog', 'preempt', 'scrub-near-limit') {
     $out = (Invoke-Program $name 0 @('arm64') 60).Out
     if ($out -cne $guard[$name]) { throw "$name output differed: $out" }
 }

@@ -1,0 +1,79 @@
+// ctScrubStack8192 on macOS called with less than 8 KiB of stack left under it: scrub-near-limit.ab's check, in a pthread
+// (512 KiB, a guard page under it: 4 KiB on Intel, 16 KiB on Apple Silicon) whose lowest address is pthread_get_stackaddr_np
+// less pthread_get_stacksize_np. Exit 0 if the space between the end of the stack and the wipe is zero after it; 1 or 2
+// for a setup that went wrong, 3 for a marker left; a fault (the wipe wrote into the guard) ends it with
+// "panic: stack overflow". The stack pointer is read by inline assembly; tools/test-runtime-checks.sh replaces the
+// template on Apple Silicon.
+import "abla/ct/scrub"
+import "abla/io"
+import "abla/unsafe/memory/raw"
+
+trusted noescape extern:"inline-assembly" fun stackPointer(template: string, constraints: string): int
+trusted noescape extern:"c" fun pthread_self(): int
+trusted noescape extern:"c" fun pthread_get_stackaddr_np(thread: int): int
+trusted noescape extern:"c" fun pthread_get_stacksize_np(thread: int): int
+
+trusted fun sp(): int = stackPointer("movq %rsp, $0", "=r")
+
+// The calling thread's lowest stack address.
+trusted fun stackLow(): int {
+    val self = pthread_self()
+    pthread_get_stackaddr_np(self) - pthread_get_stacksize_np(self)
+}
+
+val room = 6144
+
+@noinline trusted fun fill(from: int, to: int): void {
+    var at = from
+    while (at < to) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(at), 165)
+        at = at + 1
+    }
+    return
+}
+
+// Whether [from, to) is all zero.
+@noinline trusted fun zero(from: int, to: int): bool {
+    var at = from
+    while (at < to) {
+        if (ablaUnsafeLoadU8(nativePointerFromAddress(at)) != 0) return false
+        at = at + 1
+    }
+    true
+}
+
+@noinline fun wipe(): void {
+    ctScrubStack8192()
+    return
+}
+
+// Recurse until less than `room` bytes are left above `low`, then mark that space and wipe it: 0 if it is zero after,
+// 2 if the recursion overshot, 3 if a marker byte is left. The marker stops 512 bytes under sp, clear of the frames of
+// fill, wipe and the scrub's own call.
+@noinline fun descend(low: int): int {
+    val here = sp()
+    if (here - low > room) {
+        // Not a tail call: the frame stays, and `here` is read after it.
+        val status = descend(low)
+        return if (here == 0) -1 else status
+    }
+    if (here - low < 4608) return 2
+    fill(low, here - 512)
+    wipe()
+    if (zero(low, here - 512)) 0 else 3
+}
+
+fun worker(): int {
+    val low = stackLow()
+    if (low <= 0 || low >= sp()) return 1
+    val status = descend(low)
+    if (status == 0) println("scrub near the limit: wiped down to the stack's end with ${room} bytes or less left")
+    status
+}
+
+fun main: int {
+    val running = thread { worker() }
+    val status = await running
+    if (status != 0) println("scrub near the limit: check $status")
+    status
+}
