@@ -26,11 +26,29 @@ static StringRef sourceName(const Function &function) {
     return qualified == StringRef::npos ? name : name.drop_front(qualified);
 }
 
+// host.ab's cold paths go in the region too: the stop-the-world and trim machinery, fork, resize, out of memory,
+// the configuration reads and recovery, none of them on an allocation's fast path. Kept out: the pressure checks and
+// what an allocation calls (WriteHeader, HeapConsolidate, HeapMerge), which must stay inlinable in the program (moving
+// those cost binary-trees 2%). Cold hello −5% and cold JSON −1% in instructions; programs within noise.
+static bool coldHost(StringRef name) {
+    static constexpr const char *prefixes[] = {
+        "Stw", "FinishAdaptiveGc", "Frozen", "HeapTrim", "TrimAfter", "TrimWorthwhile", "Fork", "HeapResize",
+        "OutOfMemory", "GcGrowthConfigured", "GcWorkersConfigured", "GcWorkersForcedConfigured", "GcStressConfigured",
+        "GcTraceConfigured", "GcPoisonConfigured", "Getenv", "Registry", "HexDigit", "Exit",
+        "DirectoryContains", "HeapRemap", "HeapGiveBack", "HeapDiscard", "HeapUnmap",
+        "HeapTrackMapping", "Recover", "RecoveryAddress",
+    };
+    for (const char *prefix : prefixes)
+        if (name.starts_with(prefix)) return true;
+    return false;
+}
+
 static bool movable(StringRef name) {
     if (name == "__ablaRuntimePlatformMemoryCollect")
         return true;
     if (!name.consume_front("__ablaRuntimeHost"))
         return false;
+    if (coldHost(name) && !name.contains("Pressure")) return true;
     return name.starts_with("Background") || name.starts_with("Collection") ||
            name.starts_with("Mark") || name.starts_with("TraceMarked") ||
            name.starts_with("TraceParallel") || name.starts_with("Sweep") ||
