@@ -70,6 +70,25 @@ for name in CudaKernelDevice CudaKernelMemory; do
         fail "refused-cuda-forge: no native.trust error naming $name: $(head -3 "$out/refused-cuda-forge.log")"
 done
 
+# Device memory is a device address (#1139 area 13): CudaKernelMemory's views have no host load or store and are no KernelF32Buffer for
+# the CPU backend, and a buffer's or view's address is for trusted code only. All refused when the program is built (no GPU needed).
+for refused in device-host-load:CudaKernelF32View device-cpu-run:CudaKernelF32View; do
+    IFS=: read -r name type <<< "$refused"
+    status=0
+    "$compiler" build "$cases/refused-$name.ab" -o "$out/refused-$name" --fast --no-cache > "$out/refused-$name.log" 2>&1 || status=$?
+    [[ $status != 0 ]] || fail "refused-$name built"
+    grep "error\[E_SEMANTIC\]:.*$type" "$out/refused-$name.log" > /dev/null ||
+        fail "refused-$name: no error naming $type: $(head -3 "$out/refused-$name.log")"
+done
+status=0
+"$compiler" build "$cases/refused-buffer-address.ab" -o "$out/refused-buffer-address" --fast --no-cache > "$out/refused-buffer-address.log" 2>&1 ||
+    status=$?
+[[ $status != 0 ]] || fail "refused-buffer-address built"
+for name in CudaKernelF32View KernelF32Buffer; do
+    grep "error\[E_SEMANTIC\]: native\.trust:$name\.address" "$out/refused-buffer-address.log" > /dev/null ||
+        fail "refused-buffer-address: no native.trust error for $name.address: $(head -3 "$out/refused-buffer-address.log")"
+done
+
 # The CPU backend's launch state (shared-memory slot addresses) is private to abla/kernel.
 status=0
 "$compiler" build "$cases/refused-cpu-state.ab" -o "$out/refused-cpu-state" --fast --no-cache > "$out/refused-cpu-state.log" 2>&1 || status=$?

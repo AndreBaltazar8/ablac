@@ -10216,6 +10216,34 @@ class BootstrapAnalyzer(
         if (spec != "") this.reportTrustedOnly("$owner.$name", spec, begin, end)
     }
 
+    /** A read or write of field `field` of `owner`, where the class `owner` names it in `@__abla_trusted_fields("a, b")` (the
+     *  standard library's own annotation: a field that is an address, which code that is not trusted may not see), from code
+     *  that is neither trusted nor in the class's own module: `native.trust:<owner>.<field>`. */
+    fun checkTrustedField(owner: string, field: string, begin: int, end: int): void {
+        if (this.trustedDepth > 0) return
+        val generic = owner.indexOf("<")
+        val type = if (generic > 0) owner.slice(0, generic) else owner
+        val index = this.typeDeclarations.find(type)
+        if (index < 0) return
+        val declaration = this.declarations[index]
+        if (declaration.name != type || declaration.kind != "class") return
+        if (bootstrapGenericSourceFile(declaration.sourceIdentity) == bootstrapGenericSourceFile(this.currentSourceIdentity)) return
+        var annotation = 0
+        while (annotation < declaration.annotations.size && annotation < declaration.annotationArguments.size) {
+            if (declaration.annotations[annotation] == "__abla_trusted_fields" &&
+                declaration.annotationArguments[annotation].kind == "string") {
+                for (name in declaration.annotationArguments[annotation].text.split(",")) {
+                    if (name.trim() == field) {
+                        this.reportTrustedOnly("$type.$field", "error: `$type.$field` is an address; read it only in a trusted function",
+                            begin, end)
+                        return
+                    }
+                }
+            }
+            annotation = annotation + 1
+        }
+    }
+
     /** A write of field `field` of `owner` from code that is not trusted, where `owner` is a class marked `@__abla_trusted_only`
      *  (#1226, decision #161 A): `native.trust:<owner>.<field>`, or its warning in the class's "warn" phase. */
     fun checkTrustedOnlyField(owner: string, field: string, begin: int, end: int): void {
@@ -14196,7 +14224,8 @@ class BootstrapAnalyzer(
             }
             // The standard library's own annotation (runtime-valued classes).
             for (annotation in declaration.annotations) {
-                if ((annotation == "__abla_runtime_value" || annotation == "__abla_trusted_only") &&
+                if ((annotation == "__abla_runtime_value" || annotation == "__abla_trusted_only" ||
+                     annotation == "__abla_trusted_fields") &&
                     !bootstrapStandardLibraryModuleSource(bootstrapGenericSourceFile(declaration
                         .sourceIdentity))) {
                     this.failAtOffset("annotation.reserved:$annotation", declaration.begin)
@@ -16160,6 +16189,8 @@ fun bootstrapInferMember(
             if (near != "") analyzer.diagnostics =
                 "${analyzer.diagnostics}help: `${bootstrapShownType(receiver)}` has no field `${expression.text}`; did you mean `$near`?\n"
         }
+        // A field that is an address (`@__abla_trusted_fields`): only trusted code, or the class's own module, reads it.
+        if (result != "unknown") analyzer.checkTrustedField(receiver, expression.text, expression.begin, expression.end)
         // (A property without a getter, reported with it, stays a field read.)
         if (analyzer.delegatedField(receiver, expression.text) != "" && result != "unknown") {
             analyzer.recordDelegatedRewrite(expression, "read")
