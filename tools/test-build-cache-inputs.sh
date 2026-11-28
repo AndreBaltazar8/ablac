@@ -279,8 +279,14 @@ SH
         cmp "$directory/warm.bin" "$output"
         if [[ -n $sidecar ]]; then cmp "$directory/warm$sidecar" "$output$sidecar"; fi
     fi
-    cmp "$directory/warm.stdout" "$directory/clean.stdout"
-    cmp "$directory/warm.stderr" "$directory/clean.stderr"
+    # The two outputs, line by line when they differ: cmp alone named only the first differing line.
+    local stream
+    for stream in stdout stderr; do
+        diff -u --label "warm $stream" --label "clean $stream" "$directory/warm.$stream" "$directory/clean.$stream" >&2 || {
+            printf 'cache inputs: %s: the warm and clean builds printed different %s\n' "$name" "$stream" >&2
+            return 1
+        }
+    done
     printf 'cache inputs: %s matches the clean build\n' "$name"
 }
 
