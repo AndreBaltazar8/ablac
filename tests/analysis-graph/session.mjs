@@ -1938,8 +1938,10 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         if (fields) await edit('p.tags.size + left', hits);
         // A global that is not a scalar: full typing. (A local that shadows a global: checked_loops, its global `i`.)
         if (globals) await edit('NAMES.size + left', hits);
-        // Another module's function that takes a class: full typing.
+        // Another module's function that takes a class of its module: the first use of box.ab changes the import uses, so full typing;
+        // the next edit keeps it used and is rechecked alone.
         if (constructors) await edit('volume(Box(left, 1), right) + area(q)', hits);
+        if (constructors) await edit('volume(Box(right, left), 2) - area(q)', ++hits);
         // A constructor call that leaves a defaulted field out: full typing. Passing every field again: rechecked alone (only the new
         // body is given to the checker).
         if (constructors) await edit('area(Pair(left, right)) + left', hits);
