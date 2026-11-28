@@ -11,8 +11,11 @@
 #
 #   tools/gate.sh <worktree> [slot] [--release] [--dry-run]
 #
-# The slot (default 2) picks the cores and jobs (all gates used to share cores 0-7):
-#   1: 0-7 (8 jobs)   2: 8-15 (8 jobs)   3: 16-23   4: 24-31   5: 20-27 (overlaps 3 and 4)
+# The slot (default 2) picks the cores (all gates used to share cores 0-7):
+#   1: 0-7   2: 8-15   3: 16-23   4: 24-31   5: 20-27 (overlaps 3 and 4)
+# The suite runs one job more than the slot has cores: some tests wait (on their servers, child processes, timeouts) for a
+# good part of their wall time, and the extra job keeps the cores busy meanwhile (a 6-core gate spent 167 s of its 2331 s
+# suite with cores idle that way).
 # Core types (ablac-4e's measurements): cpus 0-15 are the performance cores, cpus 16-31 the efficiency cores.
 # Slots 1 and 2 are P-cores; slots 3, 4 and 5 are E-cores, about 1.5x slower per test (37 s against 25 s for the same job), so a
 # timing-sensitive test sees slower cores there.
@@ -43,15 +46,22 @@ n=${args[1]:-2}
 [[ $n =~ ^[0-9]+$ ]] || { echo "gate: the slot must be a number, got $n" >&2; exit 2; }
 tree=$(cd "$tree" && pwd)
 case $n in
-    1) cpus=0-7 jobs=8 ;;
-    2) cpus=8-15 jobs=8 ;;
-    3) cpus=16-23 jobs=8 ;;
-    4) cpus=24-31 jobs=8 ;;
-    5) cpus=20-27 jobs=8 ;;
-    *) cpus=0-7 jobs=8 ;;
+    1) cpus=0-7 ;;
+    2) cpus=8-15 ;;
+    3) cpus=16-23 ;;
+    4) cpus=24-31 ;;
+    5) cpus=20-27 ;;
+    *) cpus=0-7 ;;
 esac
 cpus=${GATE_CPUS:-$cpus}
-jobs=${GATE_JOBS:-$jobs}
+# The cores in a cpuset list (0-7,14-15 is 10), and one job more.
+cores=0
+IFS=, read -r -a ranges <<< "$cpus"
+for range in "${ranges[@]}"; do
+    [[ $range =~ ^([0-9]+)(-([0-9]+))?$ ]] || { echo "gate: cannot read the cpuset $cpus" >&2; exit 2; }
+    cores=$((cores + ${BASH_REMATCH[3]:-${BASH_REMATCH[1]}} - ${BASH_REMATCH[1]} + 1))
+done
+jobs=${GATE_JOBS:-$((cores + 1))}
 common=$(git -C "$tree" rev-parse --path-format=absolute --git-common-dir 2> /dev/null || echo "$tree/.git")   # <projects>/ablac/.git
 slot=${FAIR_FLOCK:-$(dirname -- "$(dirname -- "$common")")/novakind/tools/fair-flock}
 [[ -x $slot || $dry == 1 ]] || { echo "gate: no fair-flock at $slot (set FAIR_FLOCK)" >&2; exit 2; }
