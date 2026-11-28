@@ -3071,21 +3071,24 @@ A `@kernel` function is a GPU kernel written in ordinary Abla (#1233,
 [design/gpu-kernels.md](design/gpu-kernels.md)). It runs once per thread of a
 launch, finds its thread with abla/kernel's ids, and reads and writes memory
 only through its buffers: `KernelF32Buffer`, `KernelU32Buffer`,
-`KernelU16Buffer` and `KernelU8Buffer` (bytes, with `loadU16`, `loadU32` and
-`loadU32x4` at any alignment for packed data such as GGML blocks, and `loadS8`
-for a signed byte). `KernelU32Buffer.loadU32x4(i)` and `storeU32x4(i, v)` move
-four words as a `u32x4`, one 16-byte access on a GPU when they are inside the
-buffer and aligned. A buffer is an address and
-an element count: an index outside it loads 0 and stores nothing, on every
-backend. `KernelF32Buffer.load4(i)` reads four elements as an `f32x4`, one
-16-byte load on a GPU when they are inside the buffer and aligned; a kernel also
-makes its own with `f32x4(a, b, c, d)`, and passes and returns them as any
-value. Ordinary
-code does not make a buffer from an address: abla/kernel/cuda's
-`CudaKernelMemory.floats()`, `words()`, `halves()` and `raw()` give the device memory's, and a
-trusted function that owns host memory and keeps it alive builds one for the CPU
-(the raw constructors are trusted-only, [#1226](#trusted-native-implementations)).
-The same function runs:
+`KernelU16Buffer` and `KernelU8Buffer`. A buffer is an address and an element
+count: an index outside it loads 0 and stores nothing, on every backend.
+Besides one element at a time:
+
+- `KernelF32Buffer.load4(i)` reads four elements as an `f32x4`, and
+  `KernelU32Buffer.loadU32x4(i)` and `storeU32x4(i, v)` move four words as a
+  `u32x4`, each one 16-byte access on a GPU when the four are inside the buffer
+  and aligned;
+- `KernelU8Buffer` reads packed data such as GGML blocks at any alignment with
+  `loadU16`, `loadU32` and `loadU32x4`, and a signed byte with `loadS8`.
+
+A kernel also makes its own vectors with `f32x4(a, b, c, d)` and
+`u32x4(a, b, c, d)`, and passes and returns them as any value. Ordinary code
+does not make a buffer from an address: abla/kernel/cuda's
+`CudaKernelMemory.floats()`, `words()`, `halves()` and `raw()` give the device
+memory's, and a trusted function that owns host memory and keeps it alive
+builds one for the CPU (the raw constructors are trusted-only,
+[#1226](#trusted-native-implementations)). The same function runs:
 
 - on the CPU through `kernelRunCpu(groups, groupSize) { kernel(...) }`, which
   runs each thread in turn on the calling thread (a subgroup there is one
@@ -3096,17 +3099,36 @@ The same function runs:
   CUDA toolkit is needed; the build needs LLVM's `opt` and `llc`, as cross
   targets do).
 
-A kernel, and every function it calls, may use: `bool`, the integer types,
-`f32` and `f64` scalars; arithmetic, comparison and bit operators;
-`if`/`when`, loops and `return`; calls to other such functions (not
-recursive); the buffers, also in `val` locals; `kernelGlobalId`, `kernelLocalId`, `kernelGroupId`, `kernelGroupIdY`,
-`kernelGroupSize`; `kernelSubgroupLane`, `kernelSubgroupSize`,
-`kernelSubgroupSum` and `kernelSubgroupMax` (32 lanes on CUDA, 1 on the CPU,
-so a kernel written for any size runs on both); the group's shared memory,
-`kernelSharedF32(count)` and `kernelSharedU32(count)` with a constant `count`,
-and `kernelBarrier()` (CUDA's `__shared__` and `__syncthreads`); `kernelFma`,
-`kernelSqrt`, `kernelRsqrt`, `kernelExp` and `kernelF16ToF32`; `kernelSubgroupShuffleXor` and `kernelSubgroupShuffleXorInt` (a lane's value from lane xor distance, CUDA's `__shfl_xor_sync`), `kernelSubgroupShuffle`, `kernelSubgroupShuffleUp` and `kernelSubgroupShuffleDown` with their `Int` forms (`__shfl_sync`, `__shfl_up_sync`, `__shfl_down_sync`; `kernelSubgroupShuffle(v, 0)` broadcasts lane 0's), the votes `kernelSubgroupBallot` (a mask from 0 to 2^32 - 1), `kernelSubgroupAny` and `kernelSubgroupAll`, `kernelSubgroupBarrier()` (`__syncwarp`) and `kernelCountTrailingZeros` (64 for 0), every lane of the subgroup calling them together; `KernelU32Buffer.atomicAdd` (one indivisible add, giving the old value) and `kernelFence()` (CUDA's `__threadfence`), with which the last group to finish can combine every group's results; and abla/float's bit and conversion
-functions. Anything else (a string, an array, a class value, a closure, an
+A kernel, and every function it calls, may use:
+
+- `bool`, the integer types, `f32` and `f64` scalars and the `f32x4` and
+  `u32x4` vectors; arithmetic, comparison and bit operators; `if`/`when`, loops
+  (also with [`@unroll`](#annotations)) and `return`; calls to other such
+  functions (not recursive); the buffers, also in `val` locals;
+- the ids `kernelGlobalId`, `kernelLocalId`, `kernelGroupId`, `kernelGroupIdY`
+  and `kernelGroupSize`;
+- the group's shared memory, `kernelSharedF32(count)` and
+  `kernelSharedU32(count)` with a constant `count`, and `kernelBarrier()`
+  (CUDA's `__shared__` and `__syncthreads`);
+- the subgroup, 32 lanes on CUDA and 1 on the CPU, so a kernel written for any
+  size runs on both: `kernelSubgroupLane` and `kernelSubgroupSize`, and, with
+  every lane of the subgroup calling them together, `kernelSubgroupSum` and
+  `kernelSubgroupMax`; the shuffles `kernelSubgroupShuffleXor` (a lane's value
+  from lane xor distance, `__shfl_xor_sync`), `kernelSubgroupShuffle`,
+  `kernelSubgroupShuffleUp` and `kernelSubgroupShuffleDown`, each with an `Int`
+  form such as `kernelSubgroupShuffleXorInt` (`__shfl_sync`, `__shfl_up_sync`,
+  `__shfl_down_sync`;
+  `kernelSubgroupShuffle(v, 0)` broadcasts lane 0's); the votes
+  `kernelSubgroupBallot` (a mask from 0 to 2^32 - 1), `kernelSubgroupAny` and
+  `kernelSubgroupAll`; and `kernelSubgroupBarrier()` (`__syncwarp`);
+- `kernelFma`, `kernelSqrt`, `kernelRsqrt`, `kernelExp`, `kernelF16ToF32`,
+  `kernelCountTrailingZeros` (64 for 0) and abla/float's bit and conversion
+  functions;
+- `KernelU32Buffer.atomicAdd` (one indivisible add, giving the old value) and
+  `kernelFence()` (CUDA's `__threadfence`), with which the last group to finish
+  can combine every group's results.
+
+Anything else (a string, an array, a class value, a closure, an
 allocation, I/O, a native call) is refused when the program is built, naming
 what and where:
 
