@@ -33,6 +33,37 @@ fun main {
 // {"enabled":true}
 ```
 
+## Links and handlers in HTML
+
+`$html` escapes every value that comes from Abla. A URL attribute such as
+`href` or `src` takes a value from Abla only when it is a safe URL: a
+`javascript:`, `vbscript:` or `data:` value, however its scheme is spelled,
+becomes `about:invalid#abla-unsafe-url`. An event handler such as `onclick`
+is written in the template, never filled from Abla; pass data to it through
+a `data-` attribute. These checks need v0.2.80 or a current source build.
+See [URLs and event handlers](../subparsers.md#urls-and-event-handlers).
+
+[Runnable source](../../tests/cases/tour/html-links.ab):
+
+```abla run source=../../tests/cases/tour/html-links.ab
+import "abla/html"
+import "abla/io"
+
+fun link(target: string, label: string): Html = $html <a href={target}>{label}</a>
+
+fun main {
+    println(link("/books?id=7", "Book 7").render())
+    println(link("JavaScript:alert(1)", "Click").render())
+    val id = "7"
+    val button = $html <button data-id={id} onclick="pick(this.dataset.id)">Pick</button>
+    println(button.render())
+}
+// output:
+// <a href="/books?id=7">Book 7</a>
+// <a href="about:invalid#abla-unsafe-url">Click</a>
+// <button data-id="7" onclick="pick(this.dataset.id)">Pick</button>
+```
+
 ## Match text with named captures
 
 A `$regex("pattern")` literal checks the pattern during compilation. A named
