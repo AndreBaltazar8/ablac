@@ -1880,6 +1880,9 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         if (fields) await edit('p.inner.k * left + p.inner.tag.size', extended ? hits : ++hits);
         if (strings) await edit('if (text == "abc") left else right', ++hits);
         if (locals) await edit(block('val t: string = "ab"', 'if (t != "ab") left else right'), ++hits);
+        // `when` over values: as an expression, and as a statement.
+        if (parens) await edit('when (left % 3) {\n    0 -> right\n    1, 2 -> left * 2\n    else -> 7\n}', ++hits);
+        if (locals) await edit(block('val t = left', 'when (t) {', '    1 -> return right', '    else -> {}', '}', 't + 1'), ++hits);
         // Another local: the document's symbols change, so full typing.
         if (locals) await edit(block('val t = left', 'val u = t + 1', 'u'), hits);
         // Back to one local: the symbols change again, so full typing.
