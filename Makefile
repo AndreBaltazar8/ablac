@@ -500,6 +500,7 @@ test-serial: ablac
 	tools/test-ct-named-constructor.sh $(COMPILER)
 	tools/test-map-resources.sh $(COMPILER)
 	tools/test-resource-unconstructed-drop.sh $(COMPILER)
+	tools/test-backend-unsupported-stops.sh $(COMPILER)
 	tools/test-map-growth.sh $(COMPILER)
 	tools/test-string-equal.sh $(COMPILER)
 	tools/test-definite-assignment.sh $(COMPILER)
