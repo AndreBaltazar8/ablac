@@ -6271,6 +6271,38 @@ fun bootstrapRegionFieldIsHeap(
     field: string
 ): bool = summary.heapFields.contains("$owner\n$field")
 
+// The declared type of a place rooted at a parameter (`p`, `p.field`, `p[i]`, `p.items[0].field`): the parameter's type,
+// then each field's and element's. A step it cannot follow gives the parameter's own type, as before places were followed.
+fun bootstrapRegionParameterPlaceType(
+    place: BootstrapExpression,
+    parameterType: string,
+    summary: BootstrapRegionCallSummary
+): string {
+    val type = bootstrapRegionParameterPlaceStep(place, parameterType, summary)
+    if (type == "") parameterType else type
+}
+
+fun bootstrapRegionParameterPlaceStep(
+    place: BootstrapExpression,
+    parameterType: string,
+    summary: BootstrapRegionCallSummary
+): string {
+    if (place.kind == "identifier") return parameterType
+    if (place.kind == "delegate.project" && place.children.size == 1)
+        return bootstrapRegionParameterPlaceStep(place.children[0], parameterType, summary)
+    if (place.kind == "member" && place.children.size == 1) {
+        val base = bootstrapRegionParameterPlaceStep(place.children[0], parameterType, summary)
+        if (base == "") return ""
+        return bootstrapNormalizeType(bootstrapBorrowElementType(summary.fieldTypes.get("$base.${place.text}") ?? ""))
+    }
+    if (place.kind == "index" && place.children.size == 2) {
+        val base = bootstrapRegionParameterPlaceStep(place.children[0], parameterType, summary)
+        if (bootstrapIsArrayType(base)) return bootstrapNormalizeType(bootstrapArrayElementType(base))
+        if (bootstrapIsMapType(base)) return bootstrapNormalizeType(bootstrapMapValueType(base))
+    }
+    ""
+}
+
 fun bootstrapRegionExpressionRetainsParameters(
     expression: BootstrapExpression,
     declarationName: string,
@@ -6284,10 +6316,13 @@ fun bootstrapRegionExpressionRetainsParameters(
     if (expression.kind == "member.assign") {
         val root = bootstrapPlaceRootName(expression.children[0])
         val parameter = bootstrapRegionParameterIndex(parameters, root)
+        // The owner is that of the place stored into: `p.items[0].name = v` stores into an element's field, not p's.
         if (parameter >= 0 && parameter < parameterTypes.size &&
             bootstrapRegionFieldIsHeap(
                 summary,
-                bootstrapNormalizeType(parameterTypes[parameter]),
+                bootstrapRegionParameterPlaceType(
+                    expression.children[0], bootstrapNormalizeType(parameterTypes[parameter]), summary
+                ),
                 expression.text
             )) {
             changed = bootstrapRegionMarkRetainingParameter(
@@ -6301,7 +6336,9 @@ fun bootstrapRegionExpressionRetainsParameters(
         val root = bootstrapPlaceRootName(expression.children[0])
         val parameter = bootstrapRegionParameterIndex(parameters, root)
         if (parameter >= 0 && parameter < parameterTypes.size) {
-            val type = bootstrapNormalizeType(parameterTypes[parameter])
+            val type = bootstrapRegionParameterPlaceType(
+                expression.children[0], bootstrapNormalizeType(parameterTypes[parameter]), summary
+            )
             if (bootstrapIsArrayType(type) &&
                 !bootstrapRegionResultIsIndependent(
                     bootstrapArrayElementType(type)
@@ -6349,8 +6386,11 @@ fun bootstrapRegionExpressionRetainsParameters(
         var receiverType = "unknown"
         if (receiverParameter >= 0 &&
             receiverParameter < parameterTypes.size) {
-            receiverType = bootstrapNormalizeType(
-                parameterTypes[receiverParameter]
+            // The receiver's own type: `p.keeper.keep(v)` and `p[0].keep(v)` call Keeper.keep, not a method of p's type.
+            receiverType = bootstrapRegionParameterPlaceType(
+                expression.children[0],
+                bootstrapNormalizeType(parameterTypes[receiverParameter]),
+                summary
             )
             if ((expression.text == "append" &&
                  bootstrapIsArrayType(receiverType) &&
