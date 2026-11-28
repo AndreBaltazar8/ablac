@@ -16,6 +16,7 @@ import "kernel.ab"
 import "abla/sys/linux/process"
 import "abla/sys/linux"
 import "abla/runtime/memory"
+import "abla/memory"
 import "core.ab"
 import "debug.ab"
 import "coverage.ab"
@@ -41,6 +42,12 @@ import "../../staged_parser.ab"
 import "../../ct_eval.ab"
 import "abla/text"
 
+// The runtime's checkpoints and release are trusted-only outside the standard library (#191): an emission resets only what it
+// allocated itself, and nothing it made outlives the reset.
+private trusted fun bootstrapLlvmMemoryCheckpoint(): int = runtimeMemoryCheckpoint()
+private trusted fun bootstrapLlvmMemoryReset(checkpoint: int): void = runtimeMemoryReset(checkpoint)
+private trusted fun bootstrapLlvmMemoryRelease(): void = runtimeMemoryRelease()
+
 fun bootstrapLlvmTraceMemory(label: string): void {
     val configured = linuxEnvironment("ABLA_COMPILER_MEMORY_TRACE")
     if (configured.found && configured.value != "") {
@@ -53,11 +60,11 @@ fun bootstrapLlvmTraceMemory(label: string): void {
              label.startsWith("functions.end:") ||
              label.startsWith("verification.end:") ||
              label == "render.end")) {
-            runtimeMemoryCollect()
-            linuxWriteStandardError("abla-retained-memory $label ${runtimeMemoryLiveBytes()}\n")
+            memoryCollect()
+            linuxWriteStandardError("abla-retained-memory $label ${memoryLiveBytes()}\n")
         }
         linuxWriteStandardError(
-            "abla-llvm-memory $label ${runtimeMemoryLiveBytes()}\n"
+            "abla-llvm-memory $label ${memoryLiveBytes()}\n"
         )
     }
 }
@@ -469,7 +476,7 @@ trusted fun bootstrapEmitLlvmProgramPrepared(
     // The frontend's work is done: the runtime heap's free memory goes back to the system before LLVM builds the
     // module, whose allocations come from the C library's malloc (once the runtime's blocks and malloc's were one
     // pool, and LLVM reused what the frontend freed).
-    runtimeMemoryRelease()
+    bootstrapLlvmMemoryRelease()
     LLVMSetTarget(
         backend.module,
         nativePointerFromAddress(nativeCStringAddress(
@@ -734,7 +741,7 @@ trusted fun bootstrapEmitLlvmProgramPrepared(
     index = 0
     while (index < program.functions.size) {
         if (emittedFunctions[index]) {
-            val emissionCheckpoint = runtimeMemoryCheckpoint()
+            val emissionCheckpoint = bootstrapLlvmMemoryCheckpoint()
             val functionErrors = bootstrapLlvmEmitFunction(
                 backend, program, program.functions[index], index,
                 functionIndex, identities, nativeIndex, globalIndex,
@@ -749,7 +756,7 @@ trusted fun bootstrapEmitLlvmProgramPrepared(
             )
             bootstrapLlvmDebugClear(debug, backend)
             errors = errors + functionErrors
-            runtimeMemoryReset(emissionCheckpoint)
+            bootstrapLlvmMemoryReset(emissionCheckpoint)
         }
         index = index + 1
     }

@@ -32,6 +32,7 @@ import "abla/llvm/orc"
 import "abla/llvm/aot"
 import "abla/unsafe/memory"
 import "abla/runtime/memory"
+import "abla/memory"
 import "parser.ab"
 import "module_paths.ab"
 import "eval.ab"
@@ -49,6 +50,12 @@ import "ct_reproducible.ab"
 import "package.ab"
 import "native_argv.ab"
 
+// The runtime's checkpoints and release are trusted-only outside the standard library (#191): a partition resets only what it
+// allocated itself, and nothing it made outlives the reset.
+private trusted fun bootstrapToolchainMemoryCheckpoint(): int = runtimeMemoryCheckpoint()
+private trusted fun bootstrapToolchainMemoryReset(checkpoint: int): void = runtimeMemoryReset(checkpoint)
+private trusted fun bootstrapToolchainMemoryRelease(): void = runtimeMemoryRelease()
+
 // glibc's; Darwin's comes from the runtime's compatibility adapter, which maps it to
 // malloc_zone_pressure_relief.
 noescape extern:"c" fun malloc_trim(pad: int): int
@@ -56,8 +63,8 @@ noescape extern:"c" fun malloc_trim(pad: int): int
 // Collects the heap, then hands the pages the runtime's heap and malloc keep free back to the system: in a large
 // build the allocator otherwise holds hundreds of MB of freed blocks while opt, llc or the linker run beside this process.
 fun bootstrapCollectAndRelease(): void {
-    runtimeMemoryCollect()
-    runtimeMemoryRelease()
+    memoryCollect()
+    bootstrapToolchainMemoryRelease()
     malloc_trim(0)
     return
 }
@@ -4155,7 +4162,7 @@ fun bootstrapEmitPartitionedObject(
                 // partition and can otherwise accumulate across every bucket
                 // in a large native build.
                 partBuckets.append(bucket)
-                val partitionCheckpoint = runtimeMemoryCheckpoint()
+                val partitionCheckpoint = bootstrapToolchainMemoryCheckpoint()
                 status = bootstrapExtractLlvmFunctions(
                     preparedPath,
                     partLlvm,
@@ -4205,7 +4212,7 @@ fun bootstrapEmitPartitionedObject(
                         if (copyStatus != 0) Path(temporary).remove()
                     }
                 }
-                runtimeMemoryReset(partitionCheckpoint)
+                bootstrapToolchainMemoryReset(partitionCheckpoint)
             }
             bucket = bucket + 1
         }
@@ -5878,7 +5885,7 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
             // module) while opt and llc, larger still, run beside this process. Below
             // 256 MB that's little against LLVM's own peak, and the collection is 3% of a
             // small program's build.
-            if (status == 0 && runtimeMemoryLiveBytes() >= 268435456) {
+            if (status == 0 && memoryLiveBytes() >= 268435456) {
                 bootstrapCollectAndRelease()
                 bootstrapLlvmTraceMemory("emit.collected")
             }
