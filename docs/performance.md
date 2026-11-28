@@ -1,24 +1,102 @@
-# Compiler performance contract
+# Performance
 
-Correctness and full self-hosted conformance come first. Once the pure-Abla
-compiler accepts the complete language surface, optimization proceeds against
-reproducible measurements rather than ad-hoc timings.
+How to get fast builds and fast programs, and how to measure them. Every number
+here is dated and names the version it was measured on; the measurement pages
+in [measurements/](measurements/) hold the tables and their method. The dated
+sections after [Measurement log](#measurement-log) record how the compiler and
+runtime got where they are.
 
-Run the current end-to-end rebuild benchmark with:
+## `--fast` or release
 
-```sh
-make benchmark
+`ablac build` makes a release build (LLVM's optimizing pipeline).
+`ablac build --fast` is the development profile: it runs only
+`mem2reg,simplifycfg` before code generation, so nothing is inlined. It is for
+the edit-build-test loop, not for timing or shipping a program:
+
+- It compiles less. Cold builds in a fresh cache on v0.2.78 (2026-11-27, one
+  E-core, [series](measurements/compile-series-2026-11-27.md)): the JSON program
+  took 7.8 G instructions with `--fast` against 11.4 G for release.
+- Its programs run much slower where the optimizer matters. On 2026-10-26, a loop
+  over the bytes of a 2.5 MB string ran in 2,220-2,270 ms with `--fast` and in
+  51-101 ms with `--o1` ([details](#--fast-and---o1-ir-pipelines-2026-10-26)).
+
+Measure and ship release builds. `ablac run` compiles with the `--o1` pipeline.
+
+## The build cache and the `--fast` runtime
+
+Builds keep their results in a content cache (`build/.abla-cache` under the
+working directory by default), so an unchanged program or module isn't compiled
+again. `--no-cache` skips the program cache. In CI, keep the cache directory
+between runs.
+
+A `--fast` program links a prebuilt runtime object. Up to v0.2.79, the first
+`--fast` build in each new cache compiled it, which doubled that first build
+from v0.2.67 on (`--fast` hello 2.1 G instructions on v0.2.66, 4.7 G on v0.2.67).
+From v0.2.80 the Linux toolchain ships the object for its compiler, and a fresh
+cache takes it: on 2026-11-27, `--fast` hello went from 5.59 G to 1.80 G
+instructions and the JSON program from 9.39 G to 5.48 G
+([series](measurements/compile-series-2026-11-27.md)). An edited runtime, or
+another compiler, still builds its own.
+`ABLA_FAST_RUNTIME_OBJECT=0` turns the prebuilt runtime off
+([toolchain.md](toolchain.md#build)).
+
+## Measuring
+
+Count instructions, not seconds. On a shared or busy machine wall time moves
+with the load: between v0.2.77 and v0.2.78 the cold builds took 21-29% longer
+in wall time with the same instruction counts
+([series](measurements/compile-series-2026-11-27.md)).
+
+- `perf stat -e instructions:u -- ablac build ...` counts a build's user
+  instructions; `perf stat -e instructions:u -p <pid>` counts a server's while a
+  load generator sends a fixed number of requests. On a CPU with two core types
+  (P- and E-cores), pin the process with `taskset` to one type and read that
+  type's line.
+- Compare release builds, three runs or more each, with only one thing changed.
+- Repository tools: `tools/bench-compile-speed.sh` (perf counters for cold
+  builds or a self-build), `tools/bench-compile-time.sh` (compile-time code
+  under `#` against the same code compiled), `tools/bench-languages/` (Abla
+  against other languages, [README](../tools/bench-languages/README.md)),
+  `make benchmark` (a full self-build), `tools/bench-json-stream.sh`,
+  `tools/bench-http2-client.sh` and `tools/wasm-bench`.
+- The `abla-compare` HTTP benchmark compares an Abla web server with Go, Rust
+  and Zig ones; its 2026-11-27 rerun across releases is
+  [measurements/abla-compare-2026-11-27.md](measurements/abla-compare-2026-11-27.md).
+
+## Faster programs
+
+- **Regions for per-request work.** Build what one request, one line or one file
+  needs inside a `region { ... }` and keep only a scalar answer: the region
+  frees all of it at once, without collection work
+  ([regions.md](regions.md), [below](#regions-for-transient-data)).
+
+```abla
+import "abla/io"
+import "abla/text"
+
+fun wordCount(line: string): int = region {
+    line.split(" ").size
+}
+
+fun main {
+    println("${wordCount("one two three")}")
+}
+// output:
+// 3
 ```
 
-The benchmark reports complete source-to-executable time and output size.
-For phase diagnosis, measure `ablac --emit-llvm` separately from the native
-build; the former covers parsing, semantic analysis, lowering, and LLVM text
-emission, while the latter additionally includes LLVM optimization, parallel
-object emission, and linking.
+- **Large request bodies.** The event servers buffer a request body whole, up to
+  `maximumBodyBytes` (1 MiB by default). For uploads, a streaming route
+  (`server.streamRoute`, [networking.md](networking.md)) hands the body over in
+  pieces. Since v0.2.79 a buffered body is read with one memory copy: in the
+  2026-11-27 HTTP rerun, a 16 KiB body went from 70,000 to 13,000 instructions
+  per request ([abla-compare](measurements/abla-compare-2026-11-27.md)).
+- **Clocks.** From v0.2.80, a clock read on x86-64 and AArch64 Linux goes
+  through the kernel's vDSO instead of a system call (about 12 ns against 96 ns,
+  one read on an i9-13900K P-core), so timing each request costs little. It needs
+  nothing from the program; where there is no vDSO the system call is used.
 
-Two compilers were compared with `tools/bench-compare.py` (compile instructions, stripped size,
-run cycles and instructions, on `tests/benchmarks`, under `perf`); it was removed with the repository's Python (see git history at a8e65b35), and
-the CI macOS runtime benchmark and `tools/wasm-bench` are what runs today.
+## Measurement log
 
 ## Regions for transient data
 

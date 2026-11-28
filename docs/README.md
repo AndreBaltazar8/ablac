@@ -44,7 +44,7 @@ examples. The [compact guide](guide.md) is a single-page refresher.
 | [toolchain.md](toolchain.md) | `ablac build`, `run`, `repl`, `serve`, `package`; targets and Wasm |
 | [llvm-backend.md](llvm-backend.md) | How code is emitted; `@naked`, `@section`, inline assembly |
 | [freestanding.md](freestanding.md) | Programs without libc or an operating system |
-| [performance.md](performance.md) | Compiler speed and memory budgets |
+| [performance.md](performance.md) | Fast builds and fast programs: `--fast` or release, the build cache, measuring by instructions, runtime tips; the measurement log |
 | [macos-runtime-measurements.md](macos-runtime-measurements.md) | Native Mac v0.2.45/v0.2.47 timings, RSS and binary sizes |
 | [wasm-runtime-measurements.md](wasm-runtime-measurements.md) | WebAssembly module size and Node run time of the benchmark programs, v0.2.45 to v0.2.51 |
 | [constant-time.md](constant-time.md) | What `abla/ct` promises, what `tools/test-ct.sh` reads on each target, and what it does not cover |
