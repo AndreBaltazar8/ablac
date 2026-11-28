@@ -127,7 +127,7 @@ list_cases() {
         for source in "$project_root"/tests/cases/modules/*.ab; do
             name=$(basename "$source" .ab)
             [[ $name == invalid-* ]] && continue
-            grep -qE '^fun main(\(\))?: int' "$source" || continue
+            grep -qE '^(trusted )?fun main(\(\))?: int' "$source" || continue
             [[ $negative_names == *" module/$name "* ]] && continue
             printf 'module module/%s %s\n' "$name" "$source"
         done
@@ -302,8 +302,12 @@ run_case() { # kind name source
         local base
         base=$(basename "$source" .ab)
         cp "$source" "$dir/runtime.ab"
-        sed -E 's/^fun main(\(\))?: int/fun parityMainBody(): int/' "$source" >"$dir/staged.ab"
-        printf '\nfun main: int = #parityMainBody()\n' >>"$dir/staged.ab"
+        # A trusted main (one that calls trusted-only functions, such as memoryReset) stays trusted, and so does the main
+        # that runs it at compile time.
+        sed -E 's/^(trusted )?fun main(\(\))?: int/\1fun parityMainBody(): int/' "$source" >"$dir/staged.ab"
+        local trusted=''
+        grep -qE '^trusted fun main(\(\))?: int' "$source" && trusted='trusted '
+        printf '\n%sfun main: int = #parityMainBody()\n' "$trusted" >>"$dir/staged.ab"
         rm -f "$dir/$base.ab"
     fi
     cp "$dir/staged.ab" "$dir/.staged.pristine"
