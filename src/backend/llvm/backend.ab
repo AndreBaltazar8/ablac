@@ -215,15 +215,42 @@ trusted fun bootstrapLlvmLocalizeFastRuntime(module: i64*): void {
         if (LLVMIsDeclaration(function) == 0) bootstrapLlvmFastRuntimeLinkage(function, exported)
         function = LLVMGetNextFunction(function)
     }
+    bootstrapLlvmFastRuntimeSharedGlobals = []
     var global = LLVMGetFirstGlobal(module)
     while (!pointerIsNull(global)) {
-        if (LLVMIsDeclaration(global) == 0) bootstrapLlvmFastRuntimeLinkage(global, exported)
+        if (LLVMIsDeclaration(global) == 0) {
+            val name = bootstrapLlvmDebugValueName(global)
+            // A runtime variable: the program links against this definition (bootstrapLlvmShareFastRuntimeGlobals).
+            if (name.startsWith("abla_global_") && LLVMIsGlobalConstant(global) == i32(0)) {
+                LLVMSetLinkage(global, i32(0))
+                LLVMSetVisibility(global, llvmHiddenVisibility())
+                bootstrapLlvmFastRuntimeSharedGlobals.append(name)
+            } else bootstrapLlvmFastRuntimeLinkage(global, exported)
+        }
         global = LLVMGetNextGlobal(global)
     }
     var alias = LLVMGetFirstGlobalAlias(module)
     while (!pointerIsNull(alias)) {
         bootstrapLlvmFastRuntimeLinkage(alias, exported)
         alias = LLVMGetNextGlobalAlias(alias)
+    }
+}
+
+// A program built with the prebuilt fast runtime: each runtime variable the object defines (its cache entry's list) is the
+// object's, so the program's own definition becomes a declaration of it (#1308). Two copies would each keep their own
+// state: the object's __ablaRuntimeStmRecover read a transaction state the program's transactions never wrote.
+trusted fun bootstrapLlvmShareFastRuntimeGlobals(module: i64*): void {
+    val shared: Map<string, bool> = Map()
+    for (name in bootstrapLlvmFastRuntimeObjectGlobals) shared.set(name, true)
+    var global = LLVMGetFirstGlobal(module)
+    while (!pointerIsNull(global)) {
+        if (LLVMIsDeclaration(global) == 0 && shared.has(bootstrapLlvmDebugValueName(global))) {
+            LLVMSetInitializer(global, nativeNullPointer())
+            LLVMSetLinkage(global, i32(0))
+            LLVMSetVisibility(global, llvmHiddenVisibility())
+            LLVMGlobalClearMetadata(global)
+        }
+        global = LLVMGetNextGlobal(global)
     }
 }
 
@@ -874,6 +901,8 @@ trusted fun bootstrapEmitLlvmProgramPrepared(
         }
         if (bootstrapLlvmFastRuntimeExports.size > 0) {
             bootstrapLlvmLocalizeFastRuntime(backend.module)
+        } else if (requireMain && bootstrapLlvmFastRuntimeObjectGlobals.size > 0) {
+            bootstrapLlvmShareFastRuntimeGlobals(backend.module)
         }
     }
     LLVMDisposeBuilder(backend.builder)

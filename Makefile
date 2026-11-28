@@ -761,6 +761,7 @@ test-serial: ablac
 	tools/test-builtin-names.sh $(COMPILER)
 	tools/test-sidecar.sh $(COMPILER)
 	tools/test-fast-runtime-object.sh $(COMPILER)
+	tools/test-fast-runtime-globals.sh $(COMPILER)
 	tools/test-tool-object-cache.sh $(COMPILER)
 	tools/test-native-cstring.sh $(COMPILER)
 	tools/test-frontend-scaling.sh $(COMPILER)
