@@ -12,10 +12,10 @@
 #     without the line, granted with it while abla.lock pins the package;
 #   - unpinned: a named grant for a package abla.lock doesn't lock is refused (E_PACKAGE_CAPABILITY_UNPINNED);
 #   - path-import: a module the project imports by path from outside its tree is the project's own code, granted;
-#   - path-callee: a dependency's site calling into such a module is judged by the dependency's grants: refused;
-#   - path-escape: a file only a dependency reaches (a path out of its copy) is the dependency's: refused as undeclared;
-#   - tree-dependency, tree-root: a file of the root's own tree that only a dependency imports is the dependency's (refused); one the
-#     root's code imports too, through another root module and after the dependency, is the root's (granted);
+#   - path-callee: a dependency's site calling into such a module (the root remaps the dependency's stub to it) is judged
+#     by the dependency's grants: refused;
+#   - path-escape, tree-dependency, tree-root: a dependency's import of a file out of its copy by path (elsewhere, or in the
+#     root's own tree, imported by the root too or not) is refused before any grant is judged, naming the import;
 #   - jit-reader, jit-native: with the root's environment and trusted.native in the native tier's generation, a
 #     dependency's site that reads the environment or calls C is refused in analysis, before anything runs.
 #   - process, network: process.io and network are named-only too (#112 A): declared and authorized, still refused
@@ -180,7 +180,8 @@ status=0
 
 # Such a module is the root's, but a dependency's own site that calls into it is judged by the dependency's grants:
 # the root grants filesystem.write and imports the writer, the dependency (which declares nothing) calls it at compile
-# time: refused at the dependency's site, nothing written.
+# time: refused at the dependency's site, nothing written. A dependency can't import a file out of its copy by path, so
+# it reaches the root's module the one way a root allows: the root remaps the dependency's own stub to it ([imports]).
 mkdir -p "$out/path-callee/shared"
 cat > "$out/path-callee/shared/writer.ab" <<'EOF'
 import "abla/compiler"
@@ -191,18 +192,19 @@ fun writeMark(name: string): string {
     name
 }
 EOF
-repository "$out/path-callee/quiet-dep" quiet-dep '' "import \"$out/path-callee/shared/writer.ab\"
+repository "$out/path-callee/quiet-dep" quiet-dep '' "import \"writer.ab\"
 val taken = #writeMark(\"dependency-mark.txt\")
 fun dependencyValue: string = taken"
+printf '%s\n' 'fun writeMark(name: string): string = name' > "$out/path-callee/quiet-dep/src/writer.ab"
 commit "$out/path-callee/quiet-dep" dependency
-application path-callee '"filesystem.write"' quiet-dep
+application path-callee '"filesystem.write"' quiet-dep \
+    "$(printf '[imports]\n".abla/packages/quiet-dep/source/src/writer.ab" = "../shared/writer.ab"')"
 sed -i '1i import "../../shared/writer.ab"' "$out/path-callee/application/src/main.ab"
 refused path-callee compile.effect-denied
 [[ -z $(find "$out/path-callee" -name dependency-mark.txt) ]] || fail "path-callee: the dependency's site wrote through the root's module"
 
-# A file only a dependency reaches, by a path out of its copy, is that dependency's code, never the root's: its request
-# is the dependency's, refused as undeclared. (The path is absolute: a relative one out of the copy is read against the
-# cache's copy at `package update`, another directory, and refused there when nothing is at it.)
+# A dependency's module may import by path only files of its own copy: a file out of it, here by an absolute path, is
+# never read, so its compile-time request never runs (and with it the old question of whose code it was).
 mkdir -p "$out/path-escape/elsewhere"
 cat > "$out/path-escape/elsewhere/tool.ab" <<'EOF'
 import "abla/compiler"
@@ -213,11 +215,9 @@ EOF
 repository "$out/path-escape/quiet-dep" quiet-dep '' "import \"$out/path-escape/elsewhere/tool.ab\""
 commit "$out/path-escape/quiet-dep" dependency
 application path-escape '"environment"' quiet-dep
-refused path-escape E_COMPILE_CAPABILITY_UNDECLARED
-grep -q "tool.ab' of dependency 'quiet-dep'" "$out/path-escape.log" ||
-    fail "path-escape: the escaped module wasn't counted as the dependency's: $(grep -m2 error "$out/path-escape.log")"
-# The same for a file of the root's own tree that the root doesn't import (#1139 area 1, round 5): a dependency that imports it by its absolute
-# path makes it the dependency's code, not the root's, so its `#` sites don't run with the root's grants.
+refused path-escape "elsewhere/tool.ab (an import out of its package)"
+# The same for a file of the root's own tree (#1139 area 1, round 5): out of the dependency's copy, so refused, so its `#`
+# sites never run with the root's grants.
 tree_config() { # tree_config <case>: the root's tools/config.ab, which reads the probe variable at compile time
     mkdir -p "$out/$1/application/tools"
     cat > "$out/$1/application/tools/config.ab" <<'EOF'
@@ -227,16 +227,14 @@ val configValue = #compilerEnvironment("ABLA_GRANT_PROBE")
 fun configText: string = configValue
 EOF
 }
-# tree-dependency: only the dependency imports it: refused as the dependency's, naming the file and the dependency.
+# tree-dependency: only the dependency imports it.
 repository "$out/tree-dependency/quiet-dep" quiet-dep '' "import \"$out/tree-dependency/application/tools/config.ab\""$'\n'"fun dependencyValue: string = configText()"
 commit "$out/tree-dependency/quiet-dep" dependency
 application tree-dependency '"environment"' quiet-dep
 tree_config tree-dependency
-refused tree-dependency E_COMPILE_CAPABILITY_UNDECLARED
-grep -q "config.ab' is in the project's tree, but only dependency 'quiet-dep' imports it" "$out/tree-dependency.log" ||
-    fail "tree-dependency: the module wasn't counted as the dependency's: $(grep -m2 error "$out/tree-dependency.log")"
-# tree-root: the root imports it too, after the dependency (the dependency's import is resolved first) and through another of its modules: it
-# is the root's, granted.
+refused tree-dependency "tools/config.ab (an import out of its package)"
+# tree-root: the root imports it too, through another of its modules: the root's import works, the dependency's is still
+# refused.
 repository "$out/tree-root/quiet-dep" quiet-dep '' "import \"$out/tree-root/application/tools/config.ab\""$'\n'"fun dependencyValue: string = configText()"
 commit "$out/tree-root/quiet-dep" dependency
 application tree-root '"environment"' quiet-dep
@@ -244,7 +242,7 @@ tree_config tree-root
 printf '%s\n' 'import "../tools/config.ab"' 'fun configured: string = configText()' > "$out/tree-root/application/src/settings.ab"
 printf '%s\n' 'import "abla/io"' 'import "provider.ab"' 'import dependencySource()' 'import "settings.ab"' \
     "fun main { println(\"dependency value: '\${configured()}'\") }" > "$out/tree-root/application/src/main.ab"
-granted tree-root "$ABLA_GRANT_PROBE"
+refused tree-root "tools/config.ab (an import out of its package)"
 # The native tier: the root grants itself environment and trusted.native, so the JIT's generation gets the compiler's
 # environment and the root's libraries (ct_jit.ab, bootstrapCtSetEnvironment, bootstrapCtNativeLibraries). A dependency
 # that requests nothing can't use either: its sites are refused in analysis (compile.effect-denied), before any runs,
