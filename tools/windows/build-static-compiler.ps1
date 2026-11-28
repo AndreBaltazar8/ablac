@@ -31,8 +31,10 @@ $imports = (Resolve-Path -LiteralPath $ImportDirectory).Path
 $llvm = (Resolve-Path -LiteralPath $LlvmRoot).Path
 $build = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildDirectory)
 # abla-heap: the Abla C library with malloc and free on the Windows process heap (process-heap.cpp), a measurement arm.
-$targetOptions = if ($CLibrary -eq 'abla-heap') { @('-DABLA_C_LIBRARY=abla', '-DABLA_WINDOWS_PROCESS_HEAP=ON') }
-    else { @("-DABLA_C_LIBRARY=$CLibrary") }
+# The outer @() keeps this an array: an `if` expression unrolls a one-element array to a string, and `+=` would then
+# concatenate, and splatting the string would pass its characters to cmake one by one.
+$targetOptions = @(if ($CLibrary -eq 'abla-heap') { '-DABLA_C_LIBRARY=abla', '-DABLA_WINDOWS_PROCESS_HEAP=ON' }
+    else { "-DABLA_C_LIBRARY=$CLibrary" })
 $machine = 'IMAGE_FILE_MACHINE_AMD64'
 if ($Architecture -eq 'arm64') {
     $machine = 'IMAGE_FILE_MACHINE_ARM64'
