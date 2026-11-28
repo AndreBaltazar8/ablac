@@ -1,0 +1,145 @@
+// unroll_check (#648, #1296): `@unroll(n)` and bare `@unroll` are hints, so a loop under one gives what the same loop
+// gives without it, in every mode. Each check writes one function twice, urP<i> without hints and urH<i> with them: a
+// few loops in a row (`for` over `a until b`, `while` and a labeled `do`-`while`, each counting with its own variable),
+// trip counts around the unroll count (0, 1, n - 1, n, n + 1, 16, 17, 100, an empty range and a `do` that runs once),
+// bounds that are literals (bare `@unroll` needs them) or come from the arguments, and bodies that mix, `continue` on
+// a residue, `break` at a value and run an inner `for` (with its own hint in urH). The generator runs the same loops;
+// the check compares both functions' results with its total.
+import "abla/text"
+import "./prng.ab"
+import "./gen.ab"
+
+val UR_MODULUS = 1000003
+
+fun urMix(total: int, value: int): int = ((total * 31 + value) % UR_MODULUS + UR_MODULUS) % UR_MODULUS
+
+/** A body statement. kind 0: total = mix(total, i * a + b); 1: `if (i % p == q) continue`; 2: `if (i == q) break`;
+ *  3: an inner `for (j in 0 until c)` mixing i * j + b, hinted with `hint` in urH (0 none, -1 bare, else a count). */
+class UrStmt(val kind: int, val a: int, val b: int, val p: int, val q: int, val c: int, val hint: int)
+
+/** A loop. form 0 `for`, 1 `while`, 2 labeled `do`-`while`; it counts from `low` to `high` (exclusive), where `high`
+ *  is a literal or the argument `n` plus `offset` (`dynamic`); `hint` as in UrStmt. */
+class UrLoop(val form: int, val low: int, val high: int, val dynamic: bool, val offset: int, val hint: int,
+    val body: array<UrStmt>)
+
+fun urHintText(hint: int): string = if (hint == 0) "" else if (hint < 0) "@unroll " else "@unroll($hint) "
+
+fun FuzzGen.urStmt(): UrStmt {
+    val kind = this.r.below(10)
+    val hints: array<int> = [0, -1, 1, 2, 3, 4, 8]
+    if (kind < 5) return UrStmt(0, this.r.range(-7, 9), this.r.range(-20, 50), 1, 0, 0, 0)
+    if (kind < 7) {
+        val p = this.r.range(2, 5)
+        return UrStmt(1, 0, 0, p, this.r.below(p), 0, 0)
+    }
+    if (kind < 8) return UrStmt(2, 0, 0, 1, this.r.range(0, 20), 0, 0)
+    val c = this.r.pickInt([0, 1, 2, 3, 4, 5, 8])
+    val hint = this.r.pickInt(hints)
+    // bare `@unroll` on `0 until 0` has no trips to unroll; keep it to ranges that run
+    UrStmt(3, 0, this.r.range(-9, 9), 1, 0, c, if (hint < 0 && c == 0) 2 else hint)
+}
+
+fun FuzzGen.urLoop(n: int): UrLoop {
+    val form = this.r.below(3)
+    val count = this.r.pickInt([1, 2, 3, 4, 8, 16])
+    val low = this.r.range(0, 3)
+    val trips = this.r.pickInt([0, 1, count - 1, count, count + 1, 2 * count + 1, 16, 17, 100, -3])
+    // a `while` or `do` has no constant trip count, so bare `@unroll` is refused there; a `for` takes it on literals
+    val dynamic = this.r.chance(0.5)
+    val hint = if (form == 0 && !dynamic && trips > 0 && this.r.chance(0.4)) -1 else if (this.r.chance(0.15)) 0 else count
+    val body: array<UrStmt> = []
+    for (k in 0 until this.r.range(1, 4)) body.append(this.urStmt())
+    // the bound: a literal, or n + offset with the same value
+    UrLoop(form, low, low + trips, dynamic, low + trips - n, hint, body)
+}
+
+fun urStmtText(s: UrStmt, hinted: bool, pad: string, index: int): string =
+    if (s.kind == 0) "${pad}total = urMix$index(total, i * (${s.a}) + (${s.b}))"
+    else if (s.kind == 1) "${pad}if (i % ${s.p} == ${s.q}) continue"
+    else if (s.kind == 2) "${pad}if (i == ${s.q}) break"
+    else "$pad${if (hinted) urHintText(s.hint) else ""}for (j in 0 until ${s.c}) total = urMix$index(total, i * j + (${s.b}))"
+
+/** The loops of one function, hinted or not. */
+fun urBodyText(loops: array<UrLoop>, hinted: bool, index: int): array<string> {
+    val out: array<string> = ["    var total = 1"]
+    for (k in 0 until loops.size) {
+        val loop = loops[k]
+        val high = if (loop.dynamic) "n + (${loop.offset})" else "(${loop.high})"
+        val hint = if (hinted) urHintText(loop.hint) else ""
+        if (loop.form == 0) {
+            out.append("    ${hint}for (i in ${loop.low} until $high) {")
+            for (s in loop.body) out.append(urStmtText(s, hinted, "        ", index))
+            out.append("    }")
+        } else {
+            // the counter moves first, so a `continue` cannot skip it
+            out.append("    var k$k = ${loop.low}")
+            if (loop.form == 1) out.append("    ${hint}while (k$k < $high) {") else out.append("    ${hint}l$k@ do {")
+            out.append("        val i = k$k")
+            out.append("        k$k = k$k + 1")
+            for (s in loop.body) out.append(urStmtText(s, hinted, "        ", index))
+            out.append(if (loop.form == 1) "    }" else "    } while (k$k < $high)")
+        }
+    }
+    out.append("    total")
+    out
+}
+
+/** What the loops give. */
+fun urRun(loops: array<UrLoop>): int {
+    var total = 1
+    for (loop in loops) {
+        var i = loop.low
+        var first = true
+        while (i < loop.high || (loop.form == 2 && first)) {
+            first = false
+            val at = i
+            i = i + 1
+            var stop = false
+            var skip = false
+            for (s in loop.body) {
+                if (s.kind == 0) total = urMix(total, at * s.a + s.b)
+                else if (s.kind == 1) {
+                    if (at % s.p == s.q) {
+                        skip = true
+                        break
+                    }
+                } else if (s.kind == 2) {
+                    if (at == s.q) {
+                        stop = true
+                        break
+                    }
+                } else {
+                    for (j in 0 until s.c) total = urMix(total, at * j + s.b)
+                }
+            }
+            if (stop) break
+            if (skip) continue
+        }
+    }
+    total
+}
+
+fun FuzzGen.unrollCheck(index: int): FuzzCheck {
+    val n = this.r.range(0, 30)
+    val loops: array<UrLoop> = []
+    for (k in 0 until this.r.range(1, 4)) loops.append(this.urLoop(n))
+    val lines: array<string> = [
+        "fun urMix$index(total: int, value: int): int = ((total * 31 + value) % $UR_MODULUS + $UR_MODULUS) % $UR_MODULUS"]
+    lines.append("fun urP$index(n: int): int {")
+    for (line in urBodyText(loops, false, index)) lines.append(line)
+    lines.append("}")
+    lines.append("fun urH$index(n: int): int {")
+    for (line in urBodyText(loops, true, index)) lines.append(line)
+    lines.append("}")
+    val total = urRun(loops)
+    val body: array<string> = [
+        "fun c$index(): string {",
+        "    val args = [$n, ${n + 1}]",
+        "    val actual = \"\${urP$index(args[0])};\${urH$index(args[0])}\"",
+        "    val urExpected = \"$total;$total\"",
+        "    if (urExpected != actual) return \"FUZZ_ORACLE_FAILURE:\" + actual",
+        "    actual",
+        "}"]
+    for (line in body) lines.append(line)
+    FuzzCheck(lines, "c$index()", "str", index)
+}

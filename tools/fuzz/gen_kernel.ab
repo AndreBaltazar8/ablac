@@ -1,0 +1,252 @@
+// kernel_ops_check (#648, #1298/#1300/#1301): the CPU path of the vector and subgroup operations a `@kernel` uses, called
+// from ordinary code, against a scalar reference the generator computes lane by lane. f32x4 trees (plus, minus, times,
+// min, max, a halving, `with` and `get`) over small integers and halves, so every lane is exact and its bits are the
+// same in any order of rounding; u32x4 trees (plus, minus, times, and, or, xor, andNot, shifts by 0 to 31) over any
+// 32-bit lanes, wrapping; and abla/kernel's subgroup operations, where a subgroup is one thread: the shuffles (by lane,
+// up, down, xor, f32 and Int) give the caller's value, the ballot is 1 or 0, any and all are the condition, the sum and
+// max are the value, kernelFma of exact values is exact, and kernelCountTrailingZeros counts (64 for 0); and a `@kernel`
+// launched by kernelRunCpu over a CPU buffer (kernelSharedU32), whose threads store what their ids and those operations
+// give, with a store and a load past the end (nothing, and 0). A lane is shown
+// as its bits (an f32 plus 0.0, so -0 shows as 0), each result joined in order; the check compares the text.
+import "abla/text"
+import "abla/float"
+import "./prng.ab"
+import "./gen.ab"
+
+val KO_MASK = 4294967295
+
+/** An f32x4 tree. kind: "leaf" (lanes), "plus", "minus", "times", "min", "max", "half" (times 0.5 each), "with"
+ *  (lane k set to value v). */
+class KoF(val kind: string, val lanes: array<f32>, val kids: array<KoF>, val k: int, val v: f32)
+
+/** A u32x4 tree. kind: "leaf" (lanes), "plus", "minus", "times", "and", "or", "xor", "andNot", "shl", "shr" (by k). */
+class KoU(val kind: string, val lanes: array<int>, val kids: array<KoU>, val k: int)
+
+fun FuzzGen.koSmall(): f32 = f32FromInt(this.r.range(-8, 8)) * (if (this.r.chance(0.3)) f32(0.5) else f32(1.0))
+
+fun f32Text(value: f32): string {
+    val whole = f32ToInt(value)
+    if (f32FromInt(whole) == value) return "f32(${whole}.0)"
+    // a half
+    "f32(${f32ToF64(value)})"
+}
+
+fun FuzzGen.koF(depth: int): KoF {
+    val kind = if (depth <= 0) 0 else this.r.below(8)
+    if (kind == 0 || kind == 7) {
+        val lanes: array<f32> = []
+        for (lane in 0 until 4) lanes.append(this.koSmall())
+        return KoF("leaf", lanes, [], 0, f32(0.0))
+    }
+    if (kind == 6) return KoF(this.r.pick(["half", "with"]), [], [this.koF(depth - 1)], this.r.below(4), this.koSmall())
+    // times grows the lanes fastest: keep one side a leaf
+    val name = ["plus", "minus", "times", "min", "max", "plus"][kind - 1]
+    val right = if (name == "times") this.koF(0) else this.koF(depth - 1)
+    KoF(name, [], [this.koF(depth - 1), right], 0, f32(0.0))
+}
+
+fun koFText(node: KoF): string = when (node.kind) {
+    "leaf" -> "f32x4(${f32Text(node.lanes[0])}, ${f32Text(node.lanes[1])}, ${f32Text(node.lanes[2])}, ${f32Text(node.lanes[3])})"
+    "plus" -> "(${koFText(node.kids[0])} + ${koFText(node.kids[1])})"
+    "minus" -> "(${koFText(node.kids[0])} - ${koFText(node.kids[1])})"
+    "times" -> "(${koFText(node.kids[0])} * ${koFText(node.kids[1])})"
+    "min" -> "${koFText(node.kids[0])}.min(${koFText(node.kids[1])})"
+    "max" -> "${koFText(node.kids[0])}.max(${koFText(node.kids[1])})"
+    "half" -> "(${koFText(node.kids[0])} * f32x4(f32(0.5), f32(0.5), f32(0.5), f32(0.5)))"
+    else -> "${koFText(node.kids[0])}.with(${node.k}, ${f32Text(node.v)})"
+}
+
+fun koFRun(node: KoF): array<f32> {
+    if (node.kind == "leaf") {
+        val copy: array<f32> = []
+        for (value in node.lanes) copy.append(value)
+        return copy
+    }
+    val a = koFRun(node.kids[0])
+    val out: array<f32> = []
+    if (node.kind == "half") {
+        for (lane in 0 until 4) out.append(a[lane] * f32(0.5))
+        return out
+    }
+    if (node.kind == "with") {
+        for (lane in 0 until 4) out.append(if (lane == node.k) node.v else a[lane])
+        return out
+    }
+    val b = koFRun(node.kids[1])
+    for (lane in 0 until 4) {
+        val x = a[lane]
+        val y = b[lane]
+        out.append(when (node.kind) {
+            "plus" -> x + y
+            "minus" -> x - y
+            "times" -> x * y
+            "min" -> if (x < y) x else y
+            else -> if (x > y) x else y
+        })
+    }
+    out
+}
+
+fun FuzzGen.koLane(): int = when (this.r.below(5)) {
+    0 -> this.r.pickInt([0, 1, 2, 2147483647, 2147483648, KO_MASK, KO_MASK - 1])
+    1 -> 1 << this.r.below(32)
+    else -> this.r.bits(32)
+}
+
+fun FuzzGen.koU(depth: int): KoU {
+    val kind = if (depth <= 0) 0 else this.r.below(10)
+    if (kind == 0) {
+        val lanes: array<int> = []
+        for (lane in 0 until 4) lanes.append(this.koLane())
+        return KoU("leaf", lanes, [], 0)
+    }
+    if (kind >= 8) return KoU(if (kind == 8) "shl" else "shr", [], [this.koU(depth - 1)], this.r.below(32))
+    KoU(["plus", "minus", "times", "and", "or", "xor", "andNot"][kind - 1], [], [this.koU(depth - 1), this.koU(depth - 1)], 0)
+}
+
+fun koUText(node: KoU): string = when (node.kind) {
+    "leaf" -> "u32x4(u32(${node.lanes[0]}), u32(${node.lanes[1]}), u32(${node.lanes[2]}), u32(${node.lanes[3]}))"
+    "plus" -> "(${koUText(node.kids[0])} + ${koUText(node.kids[1])})"
+    "minus" -> "(${koUText(node.kids[0])} - ${koUText(node.kids[1])})"
+    "times" -> "(${koUText(node.kids[0])} * ${koUText(node.kids[1])})"
+    "and" -> "(${koUText(node.kids[0])} & ${koUText(node.kids[1])})"
+    "or" -> "(${koUText(node.kids[0])} | ${koUText(node.kids[1])})"
+    "xor" -> "(${koUText(node.kids[0])} ^ ${koUText(node.kids[1])})"
+    "andNot" -> "${koUText(node.kids[0])}.andNot(${koUText(node.kids[1])})"
+    "shl" -> "(${koUText(node.kids[0])} << ${node.k})"
+    else -> "(${koUText(node.kids[0])} >> ${node.k})"
+}
+
+/** a * b mod 2^32 without a 64-bit overflow. */
+fun koTimes(a: int, b: int): int = ((a & 65535) * b + (((a >>> 16) * b) & 65535) * 65536) & KO_MASK
+
+fun koURun(node: KoU): array<int> {
+    if (node.kind == "leaf") {
+        val copy: array<int> = []
+        for (value in node.lanes) copy.append(value)
+        return copy
+    }
+    val a = koURun(node.kids[0])
+    val out: array<int> = []
+    if (node.kind == "shl" || node.kind == "shr") {
+        for (lane in 0 until 4) out.append(if (node.kind == "shl") ((a[lane] & (KO_MASK >>> node.k)) << node.k) else a[lane] >>> node.k)
+        return out
+    }
+    val b = koURun(node.kids[1])
+    for (lane in 0 until 4) {
+        val x = a[lane]
+        val y = b[lane]
+        out.append(when (node.kind) {
+            "plus" -> (x + y) & KO_MASK
+            "minus" -> (x - y + KO_MASK + 1) & KO_MASK
+            "times" -> koTimes(x, y)
+            "and" -> x & y
+            "or" -> x | y
+            "xor" -> x ^ y
+            else -> x & (KO_MASK ^ y)
+        })
+    }
+    out
+}
+
+fun koBits(value: f32): int = int(f32ToBits(value + f32(0.0)))
+
+fun koCtz(value: int): int {
+    if (value == 0) return 64
+    var count = 0
+    var rest = value
+    while ((rest & 1) == 0) {
+        rest = rest >>> 1
+        count = count + 1
+    }
+    count
+}
+
+fun FuzzGen.kernelOpsCheck(index: int): FuzzCheck {
+    val lines: array<string> = []
+    val body: array<string> = ["fun c$index(): string {", "    val out: array<string> = []"]
+    val expected: array<string> = []
+    for (t in 0 until this.r.range(2, 5)) {
+        val form = this.r.below(5)
+        if (form == 0) {
+            // an f32x4 tree, every lane's bits
+            val node = this.koF(this.r.range(1, 3))
+            body.append("    val f$t = ${koFText(node)}")
+            body.append("    for (lane in 0 until 4) out.append(\"\${f32ToBits(f$t.get(lane) + f32(0.0))}\")")
+            for (value in koFRun(node)) expected.append("${koBits(value)}")
+        } else if (form == 1) {
+            val node = this.koU(this.r.range(1, 3))
+            body.append("    val u$t = ${koUText(node)}")
+            body.append("    for (lane in 0 until 4) out.append(\"\${u$t.get(lane)}\")")
+            for (value in koURun(node)) expected.append("$value")
+        } else if (form == 2) {
+            // subgroup operations on one lane of an f32x4, and kernelFma of exact values
+            val node = this.koF(1)
+            val lane = this.r.below(4)
+            val values = koFRun(node)
+            val x = values[lane]
+            val op = this.r.pick(["kernelSubgroupShuffle(VAL, LANE)", "kernelSubgroupShuffleUp(VAL, LANE)",
+                "kernelSubgroupShuffleDown(VAL, LANE)", "kernelSubgroupShuffleXor(VAL, LANE)", "kernelSubgroupSum(VAL)",
+                "kernelSubgroupMax(VAL)", "kernelFma(VAL, VAL, VAL)"]).replace("LANE", "${this.r.range(0, 31)}")
+            body.append("    val s$t = ${koFText(node)}.get($lane)")
+            body.append("    out.append(\"\${f32ToBits(${op.replace("VAL", "s$t")} + f32(0.0))}\")")
+            val result = if (op.startsWith("kernelFma")) x * x + x else x
+            expected.append("${koBits(result)}")
+        } else if (form == 3) {
+            // integer subgroup operations, votes and trailing zeros
+            val value = if (this.r.chance(0.2)) 0 else if (this.r.chance(0.3)) (1 << this.r.below(63)) else this.r.next()
+            val shift = this.r.range(0, 31)
+            val choice = this.r.below(5)
+            val call = when (choice) {
+                0 -> "kernelSubgroupShuffleInt(${fuzzIntConst(value, "int")}, $shift)"
+                1 -> "kernelSubgroupShuffleUpInt(${fuzzIntConst(value, "int")}, $shift)"
+                2 -> "kernelSubgroupShuffleDownInt(${fuzzIntConst(value, "int")}, $shift)"
+                3 -> "kernelSubgroupShuffleXorInt(${fuzzIntConst(value, "int")}, $shift)"
+                else -> "kernelCountTrailingZeros(${fuzzIntConst(value, "int")})"
+            }
+            val limit = this.r.range(-5, 5)
+            body.append("    val n$t = $call")
+            body.append("    out.append(\"\$n$t,\${kernelSubgroupBallot(n$t > $limit)},\${kernelSubgroupAny(n$t > $limit)},\${kernelSubgroupAll(n$t <= $limit)}\")")
+            val result = if (choice == 4) koCtz(value) else value
+            expected.append("$result,${if (result > limit) 1 else 0},${result > limit},${result <= limit}")
+        } else {
+            // a `@kernel` launched by kernelRunCpu over a CPU buffer: each thread stores what its ids and the subgroup
+            // operations give; one store past the end does nothing, and a load past the end gives 0
+            val n = this.r.range(1, 40)
+            val size = this.r.pickInt([1, 2, 3, 4, 8, 32])
+            val groups = (n + size - 1) / size + this.r.below(2)
+            val a = this.r.range(0, 50)
+            val b = this.r.range(0, 1000)
+            val d = this.r.range(0, 31)
+            val c = this.r.range(0, 9)
+            val m = this.r.range(1, 4)
+            val residue = this.r.below(m)
+            val e = this.r.range(0, 3)
+            lines.append("@kernel")
+            lines.append("fun koK${index}x$t(out: KernelU32Buffer, n: int) {")
+            lines.append("    val i = kernelGlobalId()")
+            lines.append("    if (i < n) {")
+            lines.append("        out.store(i, i * $a + $b + kernelSubgroupShuffleXorInt(i, $d) * $c + kernelSubgroupBallot(i % $m == $residue) * 1000 +")
+            lines.append("            kernelCountTrailingZeros(i + $e) * 7 + kernelLocalId() * 100000 + kernelGroupId() * 10000000)")
+            lines.append("        if (i == 0) out.store(n, 99)")
+            lines.append("    }")
+            lines.append("}")
+            body.append("    val buf$t = kernelSharedU32($n)")
+            body.append("    for (k in 0 until $n) buf$t.store(k, 0)")
+            body.append("    kernelRunCpu($groups, $size) { koK${index}x$t(buf$t, $n) }")
+            body.append("    for (k in 0 until ${n + 1}) out.append(\"\${buf$t.load(k)}\")")
+            for (i in 0 until n) {
+                val ballot = if (i % m == residue) 1 else 0
+                expected.append("${i * a + b + i * c + ballot * 1000 + koCtz(i + e) * 7 + (i % size) * 100000 + (i / size) * 10000000}")
+            }
+            expected.append("0")
+        }
+    }
+    body.append("    val actual = textJoin(out, \";\")")
+    body.append("    val koExpected = \"${textJoin(expected, ";")}\"")
+    body.append("    if (koExpected != actual) return \"FUZZ_ORACLE_FAILURE:\" + actual")
+    body.append("    actual")
+    body.append("}")
+    for (line in body) lines.append(line)
+    FuzzCheck(lines, "c$index()", "str", index)
+}

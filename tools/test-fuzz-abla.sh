@@ -64,7 +64,7 @@ done
 if fuzz --selftest --record "$controls/fuzz.json" 2>/dev/null; then echo "fuzz: --record was accepted without a seed campaign" >&2; exit 1; fi
 echo "fuzz: the campaign record counts its seeds and modes"
 fuzz --replay
-fuzz --control-oracle default_owner_check,ownership_lifetime_check,fresh_select_check,json_check,yaml_check,gzip_check,region_member_check,logical_assign_check,static_concat_check,gc_churn_check,sealed_when_check,dense_local_check
+fuzz --control-oracle default_owner_check,ownership_lifetime_check,fresh_select_check,json_check,yaml_check,gzip_check,region_member_check,logical_assign_check,static_concat_check,gc_churn_check,sealed_when_check,dense_local_check,unroll_check,kernel_ops_check
 fuzz --hosted-tasks --seeds 100000 --checks 8
 fuzz --panics --seeds 100008 --checks 2
 tools/fuzz/test-targets.sh "$compiler"
