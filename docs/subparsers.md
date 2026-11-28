@@ -140,10 +140,12 @@ Authored (quoted) attribute values are not checked. For a value the program
 wrote or fully checked, such as a `data:` image or a handler of its own,
 `ablaHtmlTrustedAttribute(name, value)` in an attribute group skips both
 checks; its value is still escaped. It is an ordinary function, not a
-`trusted` one. The other ways past the checks are building an `HtmlAttribute`
-with its fourth argument `true`, building an `Html` value directly, and
-`ablaHtmlRaw`, which inserts markup verbatim; an audit searches for all four
-names.
+`trusted` one. The other ways past the checks are an attribute with a source
+quote (`ablaHtmlLiteralAttribute`, or an `HtmlAttribute` built with its third
+argument), building an `Html` value directly, and `ablaHtmlRaw`, which inserts
+markup verbatim; an audit searches for those names. The exemption that lets
+`ablaHtmlTrustedAttribute`'s value past covers only the exact name and value it
+was made for.
 
 ```abla
 import "abla/html"
@@ -155,6 +157,15 @@ fun main {
 }
 // output:
 // <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" onload="ready()">
+```
+
+The exemption's type is private to `abla/html`, so a program cannot make one:
+
+```abla error
+import "abla/html"
+
+fun forged(code: string): HtmlAttribute = HtmlAttribute("onclick", code, "", HtmlExemption("onclick", code))
+// error: name.private:HtmlExemption
 ```
 
 An unquoted literal attribute value is a compile error.

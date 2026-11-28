@@ -196,9 +196,11 @@ fun main {
 
 The ways past these checks are explicit:
 
-- `ablaHtmlTrustedAttribute(name, value)`, or
-  `HtmlAttribute(name, value, "", true)`, writes one attribute without
-  them;
+- `ablaHtmlTrustedAttribute(name, value)` writes one attribute without
+  them (the old `HtmlAttribute(name, value, "", true)` no longer
+  compiles: the fourth argument is an exemption only `abla/html` makes);
+- an attribute with a source quote (`ablaHtmlLiteralAttribute`) is
+  treated as authored;
 - `ablaHtmlRaw(markup)` inserts markup as it is;
 - an `Html` value can be built with its constructor.
 
