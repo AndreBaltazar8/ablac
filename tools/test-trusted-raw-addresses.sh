@@ -5,7 +5,7 @@
 # `private` when nothing outside the file calls them, and else in a file of the module that is not its entry (`// public: none`, docs/language.md: a name
 # from such a file is internal, no import makes it visible, in strict and flat modules alike).
 # This test lists every public `trusted` function (any attributes, any name, signature over several lines too) of an ENTRY file of the library (outside
-# abla/unsafe, abla/runtime and abla/sys), or of a file the entry re-exports (`export import "./byte-lanes.ab"`), with an int or a pointer parameter, and
+# abla/unsafe, abla/runtime and abla/sys), or of a file the entry re-exports by a relative path (`export import "./byte-lanes.ab"`, `export import "tree.ab"`), with an int or a pointer parameter, and
 # compares the list with tools/trusted-address-review.tsv, which classes each:
 #   a  not an address: a count, a flag, an offset the callee bounds, a descriptor, an index the host validates (the reason is in the table);
 #   t  an address (taken or returned) that only trusted code may use: the declaration is marked `@__abla_trusted_only` (decision #130 A) or is a trusted
@@ -23,11 +23,12 @@ out=build/trusted-raw-addresses
 mkdir -p "$out"
 export LC_ALL=C
 git ls-files 'stdlib/*entry.ab' | grep -vE '^stdlib/abla/(unsafe|runtime|sys)/' | sort | while IFS= read -r file; do
-    # The entry and the files it re-exports, each listed under the entry's module.
+    # The entry and the files it re-exports by a relative path (with or without "./"; a module name like "abla/x" is not a
+    # file), each listed under the entry's module.
     sources=("$file")
     while IFS= read -r exported; do
-        [[ -n $exported ]] && sources+=("$(dirname "$file")/${exported#./}")
-    done < <(sed -nE 's|^export import "(\./[^"]+)".*|\1|p' "$file")
+        [[ -n $exported && $exported != abla/* ]] && sources+=("$(dirname "$file")/${exported#./}")
+    done < <(sed -nE 's|^export import "([^"]+\.ab)".*|\1|p' "$file")
     awk -v file="$file" '
         function flush(   params, depth, i, ch, p, n, hit, k) {
             params = ""; depth = 0
@@ -44,7 +45,9 @@ git ls-files 'stdlib/*entry.ab' | grep -vE '^stdlib/abla/(unsafe|runtime|sys)/' 
             line = $0
             sub(/^(@[A-Za-z]+(\([^)]*\))? )*(inline |noinline )?trusted( noescape)?( extern:"[a-z]+")? fun /, "", line)
             name = line; sub(/\(.*/, "", name)
-            # A trusted extern is native.trust from code that is not trusted already, as a marked declaration is.
+            # A trusted extern is native.trust from code that is not trusted already, as a marked declaration is. Only the line
+            # right above the declaration counts as its mark: another annotation or a comment between the two reads as
+            # unmarked, which fails a (t) row rather than passing an unmarked one.
             marked = (previous ~ /^@__abla_trusted_only/ || $0 ~ / extern:"[a-z]+" fun /) ? "marked" : "-"
             sig = line; open = 1
             if (balanced(sig)) { flush(); open = 0 }
