@@ -6042,6 +6042,26 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
         status = 152
         failureKind = "reported"
     }
+    // An AArch64 or RISC-V 64 Linux executable has only the libc-free link (#811), so a program that brings a C library
+    // cannot link there (G3, docs/design/aarch64-linux-c-boundary.md): say which boundary, before the linker lists symbols.
+    // LLVM is the exception when ABLA_STATIC_LLVM_LIB names the target's static archives, as the static compilers link it.
+    val crossLinuxExecutable = target.hosted && artifact == "executable" && target.objectFormat == "elf" &&
+        (bootstrapLlvmTargetIsAarch64Linux(target.llvmTriple) || target.name == "riscv64-linux")
+    if (status == 0 && crossLinuxExecutable) {
+        val boundary = if (nativeLibraries.size > 0) "the manifest names nativeLibraries (${nativeLibraries.join(", ")})"
+            else if (hostImports) "it calls extern \"host\" functions"
+            else if (linkLlvm && linuxEnvironment("ABLA_STATIC_LLVM_LIB").value == "")
+                "it links LLVM, which needs a C library (the static compilers bring Abla's own, with ABLA_STATIC_LLVM_LIB)"
+            else ""
+        if (boundary != "") {
+            linuxPrintStandardError(
+                "error[E_BUILD_TARGET_CAPABILITY]: target '${target.name}' links no C library, and $outputPath brings one: $boundary\n" +
+                    "help: a program with a C boundary builds for x86-64 Linux, where it links the system's glibc\n"
+            )
+            status = 152
+            failureKind = "reported"
+        }
+    }
     // An arm64 Android library may import from bionic what a user's native input needs; the runtime imports nothing (the
     // five pthread functions it calls go through the host's table, decision #121), which tools/test-android-link.sh checks.
     if (status == 0 && !target.hosted && !rawTarget &&
@@ -6483,10 +6503,36 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
             val failures = "$publishPath.libc-free-link"
             val hostedFailures = "$publishPath.link-errors"
             val explainHosted = !libcFree && libcReason != ""
+            // An AArch64 or RISC-V 64 program's link (libc-free, from any host): its undefined C functions are named after
+            // the linker's own report (G3). The static compilers' links report as they did.
+            val crossFailures = "$publishPath.cross-link-errors"
+            val explainCross = (aarch64Linux || riscv64Linux) && !staticLlvm
             if (libcFree) link.errors(failures)
             else if (explainHosted) link.errors(hostedFailures)
+            else if (explainCross) link.errors(crossFailures)
             status = if (macTarget) link.run()
             else bootstrapRunHostLink(link, linkedObject, publishPath)
+            if (explainCross) {
+                val reported = Path(crossFailures).readText()
+                if (reported != "") linuxPrintStandardError(reported)
+                if (status != 0) {
+                    val undefined: array<string> = []
+                    for (line in reported.split("\n")) {
+                        val at = line.indexOf("undefined symbol: ")
+                        val name = if (at >= 0) line.slice(at + 18, line.size).trim() else ""
+                        if (name != "" && undefined.size < 8 &&
+                            !bootstrapTextContains("\n${undefined.join("\n")}\n", "\n$name\n")) undefined.append(name)
+                    }
+                    if (undefined.size > 0) {
+                        linuxPrintStandardError(
+                            "error[E_BUILD_TARGET_CAPABILITY]: target '${target.name}' links no C library, and $outputPath calls C functions nothing in it defines: ${undefined.join(", ")}\n" +
+                                "help: a program with a C boundary builds for x86-64 Linux, where it links the system's glibc\n"
+                        )
+                        failureKind = "reported"
+                    }
+                }
+                Path(crossFailures).remove()
+            }
             if (explainHosted) {
                 // The linker's own report stays as it was; a link that needs the C
                 // library's development files where there are none also says so.

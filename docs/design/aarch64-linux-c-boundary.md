@@ -23,20 +23,23 @@ The nine `nobuild-a64` lines of tools/libc-free-programs-allowlist.txt are three
 
 | Programs | Boundary | Needs |
 |---|---|---|
-| `bootstrap-llvm`, `conformance-ir-cache`, `lowered-ir-cache`, `native-function-address`, `stable-native-symbols`, `xtensa-interrupt-handler` | import `src/`, so LLVM in the process | AArch64 LLVM archives, no C library |
+| `bootstrap-llvm`, `conformance-ir-cache`, `lowered-ir-cache`, `native-function-address`, `stable-native-symbols`, `xtensa-interrupt-handler` | import `src/`, so LLVM in the process | libLLVM and a C library: glibc, or Abla's own (src/static_libc) with the static archives |
 | `unsafe-boundary` | `extern "c" dlsym` | a dynamic loader: glibc |
-| `import-alias-externs` | `extern "c" sin` | nothing any more |
+| `import-alias-externs` | `extern "c" sin` (libm) | a C library: glibc's libm |
 | `compile-time-recursion-deep` | none | the x86-64 compiler's own stack (not a C boundary) |
 
-- **The LLVM group does not need glibc.** The AArch64 compiler is itself an Abla program that links LLVM. It links the static
-  AArch64 LLVM archives on Abla's own C library (src/static_libc). The link already takes that route when
-  `ABLA_STATIC_LLVM_LIB` is set (`staticLlvm` in the aarch64 branch). That route has been proven only for the compiler's own
-  entry; the six programs have not been built through it yet, which is item 1 below. nix/aarch64-static-native-deps.nix provides the archives,
-  libstdc++.a, libgcc.a and libz.a from any host, as the static AArch64 job and aarch64-native-fixpoint.yml use them. The
-  allowlist's note ("libLLVM has no AArch64 build here") is true of the pinned shell's dynamic libLLVM, not of those archives.
-- **`import-alias-externs` is stale.** With 0.2.79 it builds for aarch64-linux and exits 42 under qemu-aarch64: `sin` is
-  Abla's own now (#806). Its line can go.
-- **`unsafe-boundary`** is the real case. `dlsym` needs the dynamic loader, and a static-pie program has none.
+- **The LLVM group needs a C library as well as LLVM.** The AArch64 compiler is itself an Abla program that links LLVM: the
+  static AArch64 LLVM archives (nix/aarch64-static-native-deps.nix, from any host) on Abla's own C library, which its entry
+  (src/orc_main_static.ab) imports from src/static_libc. With `ABLA_STATIC_LLVM_LIB` and `ABLA_STATIC_TARGET_LIBS` set, the
+  link takes that route (`staticLlvm`) for any program. But `bootstrap-llvm` imports no C library, so with 0.2.79 it stops
+  at the link's aliases (`--defsym: symbol not found: abla_libc_setitimer`, and more). The C library is in `src/`, not the
+  standard library, so a user's program that imports `abla/llvm` cannot bring it either. On aarch64-linux these programs
+  need what any C-boundary program needs: a C library at link time. That's glibc and libLLVM.so under A or B, or Abla's
+  C library made part of the standard library (a larger change that nothing asks for).
+- **`import-alias-externs`** calls libm's `sin` through `extern "c"`. A release build for aarch64-linux links and exits 42
+  under qemu-aarch64, but only because the optimizer folds `sin(0.0)`. The `--fast` build the test makes leaves `sin`
+  undefined. It's a real C boundary, so its line stays.
+- **`unsafe-boundary`**: `dlsym` needs the dynamic loader, and a static-pie program has none.
 
 **Who hits it outside the tests** (sibling repositories, 2026-11-28):
 - abla-graphics, abla-doom and abla-one's desktop gallery name `vulkan`, `X11`, `EGL` and `GL`.
@@ -88,20 +91,17 @@ archives.
 ### In every option
 
 These need no decision:
-1. The LLVM group builds for aarch64-linux through the static archives. The libc-free AArch64 lane sets `ABLA_STATIC_LLVM_LIB`
-   and `ABLA_STATIC_TARGET_LIBS` from nix/aarch64-static-native-deps.nix, and those six `nobuild-a64` lines go (and the RV64
-   twins if an RV64 cohort exists; there is none today).
-2. `import-alias-externs`' line goes.
-3. A link that cannot work says so. When the aarch64 link is libc-free and the program brings a C library, the build stops
-   before lld with `E_BUILD_TARGET_CAPABILITY`. The error names the boundary and what would build it: the native host under A,
-   the sysroot under B, or "x86-64 Linux only" under C.
-4. `compile-time-recursion-deep` is a separate item: the cross compiler's stack, not a C boundary.
+1. A link that cannot work says so, with `E_BUILD_TARGET_CAPABILITY` naming the boundary. The build stops before the link when
+   the manifest names `nativeLibraries`, the program calls `extern "host"` functions, or it links LLVM with no static
+   archives named. When the link leaves C functions undefined (`dlsym`), it gives one error naming them after the linker's
+   report. Under A the help line would say "build on an AArch64 Linux machine" instead of x86-64.
+2. The nine lines stay until A or B. The six LLVM programs are the compiler's own tests, which import `src/`.
+3. `compile-time-recursion-deep` is a separate item: the cross compiler's stack, not a C boundary.
 
 ## What CI needs
 
-- **For the shared items:** the libc-free-aarch64 job fetches nix/aarch64-static-native-deps.nix. It's binary-cached, and
-  about the same download the static AArch64 job already makes. The job then builds and runs the six LLVM programs under
-  QEMU, and a test checks the new diagnostic.
+- **For the shared items:** nothing new. tools/test-target-descriptors.sh checks the new diagnostics with the x86-64
+  compiler's cross builds (no QEMU run needed).
 - **For A:** one job on GitHub's `ubuntu-24.04-arm` runner, which aarch64-native-fixpoint.yml already uses. It runs the
   AArch64 compiler natively and builds:
   - `unsafe-boundary` (dlsym);
@@ -116,7 +116,8 @@ These need no decision:
 
 ## Recommendation
 
-Do the shared items now. They are small, need no decision, and remove seven of the nine lines. Then do **A**: the same rule as
+Do the shared item now: it is small and needs no decision, and the eight C-boundary programs then fail with an
+error that names their boundary instead of lld's list. Then do **A**: the same rule as
 x86-64 (libc-free unless the program brings a C library) on native AArch64 hosts, with a clear error for cross builds. That
 covers the programs people actually build on ARM Linux machines, at one branch and one native CI job. Leave B until someone
 needs to build ARM graphics binaries on x86-64. Its cost is in maintaining a sysroot of system libraries, not in the compiler.
@@ -126,8 +127,8 @@ needs to build ARM graphics binaries on x86-64. Its cost is in maintaining a sys
 > **Programs with a C boundary on aarch64-linux (G3).** Today an aarch64-linux program that links a C library (its manifest
 > names `nativeLibraries` such as vulkan, GL or cuda, or it calls C functions like `dlsym`) does not build. The build fails
 > with a raw linker error, even on an ARM Linux machine. On x86-64 Linux the same program links the system's glibc. That
-> affects abla-graphics, abla-doom, abla-one's desktop gallery and abla-grad on ARM Linux. Programs that link LLVM can be
-> fixed without glibc, and that's being done regardless.
+> affects abla-graphics, abla-doom, abla-one's desktop gallery and abla-grad on ARM Linux, and programs that link LLVM. A
+> clearer error for these builds is being added regardless.
 >
 > - **A (recommended):** on an ARM Linux machine, link glibc exactly as x86-64 does, only for programs that bring a C library.
 >   Building such a program for ARM from an x86-64 machine stays unsupported, with a clear error. One native ARM CI job.

@@ -39,6 +39,25 @@ set -e
 grep 'help: .*--target x86_64-windows-hosted' "$directory/freestanding-io.err" > /dev/null ||
     { cat "$directory/freestanding-io.err" >&2; exit 1; }
 
+# aarch64-linux links no C library (#811, G3: docs/design/aarch64-linux-c-boundary.md). A program that brings one stops with
+# E_BUILD_TARGET_CAPABILITY naming the boundary: the manifest's nativeLibraries and LLVM before the link, C functions the
+# libc-free link leaves undefined (dlsym) after it.
+c_boundary() {
+    local name=$1 expected=$2
+    shift 2
+    set +e
+    env -u ABLA_STATIC_LLVM_LIB "$compiler" build "$@" --fast --no-cache --target aarch64-linux -o "$directory/$name" \
+        >"$directory/$name.out" 2>"$directory/$name.err"
+    local status=$?
+    set -e
+    [[ $status -ne 0 ]] || { echo "target descriptors: $name built for aarch64-linux" >&2; exit 1; }
+    grep -F "error[E_BUILD_TARGET_CAPABILITY]: target 'aarch64-linux' links no C library" "$directory/$name.err" |
+        grep -F "$expected" > /dev/null || { cat "$directory/$name.err" >&2; exit 1; }
+}
+c_boundary a64-native-libraries 'the manifest names nativeLibraries (m)' --project "$project_root/tests/cases/floating-native"
+c_boundary a64-llvm 'it links LLVM' "$project_root/tests/cases/target-descriptors/llvm-import.ab"
+c_boundary a64-dlsym 'calls C functions nothing in it defines: dlsym' "$project_root/tests/cases/modules/unsafe-boundary.ab"
+
 "$compiler" build \
     "$project_root/tests/cases/target-descriptors/generic-object-build.ab" \
     --fast --no-cache -o "$directory/generic-driver"
