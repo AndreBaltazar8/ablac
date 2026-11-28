@@ -20,6 +20,7 @@ examples. The [compact guide](guide.md) is a single-page refresher.
 | [json.md](json.md) | `abla/json`, `$json` and `$jsons` |
 | [networking.md](networking.md) | Sockets, HTTP, WebSocket, TLS and JWT |
 | [migrating-from-tls-hosted.md](migrating-from-tls-hosted.md) | Replace the removed hosted TLS and crypto APIs |
+| [migrating-to-v0.2.80.md](migrating-to-v0.2.80.md) | Changes in v0.2.80 that can stop a build or change behaviour, each with the fix |
 | [diagnostics.md](diagnostics.md) | How to read compiler errors, and what each code means |
 | [debugging.md](debugging.md) | Debug builds, stack traces, panics |
 
