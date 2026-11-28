@@ -17,6 +17,7 @@ everything else.
 | Shared `is` arms are narrowed | nothing breaks | [6](#6-shared-is-arms-see-a-nullable-subject-as-not-null) |
 | abla-postgres authentication and `sslMode` | connection refused, or TLS where there was none | [7](#7-abla-postgres-password-authentication-and-sslmode) |
 | abla-one session ids leave the URL | nothing, unless you wrote your own host script or proxy | [8](#8-abla-one-session-ids-leave-the-url) |
+| `memoryCheckpoint` and `memoryReset` are trusted-only | `native.trust:` build error | [9](#9-memorycheckpoint-and-memoryreset-are-trusted-only) |
 
 ## 1. Raw-memory classes are made by their factories
 
@@ -363,3 +364,47 @@ from earlier host scripts.
 abla-one's web backends also stop a link to a `javascript:`, `vbscript:`
 or `data:` URL (it opens nothing), and leave out a style value that could
 end its rule, as `$html` does in [section 3](#3-html-checks-urls-and-event-handlers).
+
+## 9. `memoryCheckpoint` and `memoryReset` are trusted-only
+
+`memoryReset(checkpoint)` frees everything allocated since
+`memoryCheckpoint()`, whether or not other values still use it. Nothing
+checks that, so these two are now trusted-only, as the other raw-memory
+functions are: a call from code that isn't trusted is a build error.
+
+Before, this built:
+
+```abla error
+import "abla/memory"
+
+fun main {
+    val checkpoint = memoryCheckpoint()
+    // error: native.trust:memoryCheckpoint
+}
+```
+
+**Fix:** scope the allocations with `region { ... }`, which frees the same
+memory when the block ends and checks at compile time that nothing from
+inside is still reachable ([regions.md](regions.md)):
+
+```abla
+import "abla/io"
+
+fun total(count: int): int {
+    val values: array<int> = []
+    for (index in 0 until count) values.append(index)
+    var sum = 0
+    for (value in values) sum += value
+    sum
+}
+
+fun main {
+    val sum = region { total(100) }
+    println("$sum")
+}
+// output:
+// 4950
+```
+
+Code that manages this memory itself, such as an allocator, keeps the
+calls inside a `trusted fun`.
