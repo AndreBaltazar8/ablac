@@ -65,33 +65,28 @@ function(abla_libcmt_gs_objects result)
     # Only the machine's own folder: ARM64's libcmt also holds arm64ec and amd64 builds of these members.
     if(member MATCHES "[\\\\/]${libcmt_folder}[\\\\/](gshandler[a-z0-9_]*|secpushpop)\\.obj$")
       # Each member alone in a directory: the file llvm-ar writes is named after the member, which is a Windows path
-      # (its last part on Windows, all of it elsewhere). On Windows llvm-ar also matches a member by that last part, so
-      # `x` alone takes the first member of the name, which in ARM64's libcmt is the arm64ec build (lld then refuses
-      # it). Each instance of the name is tried in turn (llvm-ar's N modifier), and the one kept is the one whose COFF
-      # machine is this link's: a wrong one is never linked.
+      # (its last part on Windows, all of it elsewhere). Without P, llvm-ar on Windows matches a member by that last
+      # part only, so `x` takes the first member of the name, which in ARM64's libcmt is the arm64ec build (lld then
+      # refuses it), and how N counts the names differs between LLVM 22 and 23. P matches the whole member path, which
+      # is unique in the machine's folder. The object is kept only if its COFF machine is this link's.
       set(name "${CMAKE_MATCH_1}")
       set(scratch "${libcmt_directory}/${name}")
       set(object "${libcmt_directory}/${name}.obj")
-      set(instance 0)
       set(found FALSE)
-      while(NOT found AND instance LESS 8)
-        math(EXPR instance "${instance} + 1")
-        file(REMOVE_RECURSE "${scratch}")
-        file(MAKE_DIRECTORY "${scratch}")
-        execute_process(COMMAND "${ABLA_LLVM_AR}" xN ${instance} "${ABLA_LIBCMT}" "${member}" WORKING_DIRECTORY "${scratch}"
-          RESULT_VARIABLE extract_status OUTPUT_QUIET ERROR_QUIET)
-        file(GLOB extracted LIST_DIRECTORIES false "${scratch}/*")
-        list(LENGTH extracted extracted_count)
-        if(NOT extract_status EQUAL 0 OR NOT extracted_count EQUAL 1)
-          break()
-        endif()
+      file(REMOVE_RECURSE "${scratch}")
+      file(MAKE_DIRECTORY "${scratch}")
+      execute_process(COMMAND "${ABLA_LLVM_AR}" xP "${ABLA_LIBCMT}" "${member}" WORKING_DIRECTORY "${scratch}"
+        RESULT_VARIABLE extract_status OUTPUT_QUIET ERROR_QUIET)
+      file(GLOB extracted LIST_DIRECTORIES false "${scratch}/*")
+      list(LENGTH extracted extracted_count)
+      if(extract_status EQUAL 0 AND extracted_count EQUAL 1)
         execute_process(COMMAND "${ABLA_LLVM_READOBJ}" --file-headers "${extracted}" OUTPUT_VARIABLE headers
           RESULT_VARIABLE readobj_status)
         if(readobj_status EQUAL 0 AND headers MATCHES "Machine: ${libcmt_machine} ")
           file(RENAME "${extracted}" "${object}")
           set(found TRUE)
         endif()
-      endwhile()
+      endif()
       file(REMOVE_RECURSE "${scratch}")
       if(NOT found)
         message(FATAL_ERROR "${ABLA_LLVM_AR} gave no ${libcmt_machine} object for ${member} from ${ABLA_LIBCMT}")

@@ -6,7 +6,9 @@
 #   - self-build: src/orc_windows_main.ab compiled to its COFF object (the step that ends in the SDK link, as
 #     check-compiler-fixpoint.ps1 does), with the source tree as the sysroot.
 # Each time is the median of its rounds. The candidate fails when a median is more than -Tolerance slower than the
-# baseline's, or its ablac.exe or zip is larger. The table goes to the job summary and measure.json to -Directory.
+# baseline's, or its ablac.exe or zip more than -SizeTolerance larger (0.3%: the +0.2% that the C library's own code
+# adds in place of the UCRT pieces is accepted, see the design doc's first run). The table goes to the job summary and
+# measure.json to -Directory.
 param(
     [Parameter(Mandatory)][string]$Baseline,
     [Parameter(Mandatory)][string]$Candidate,
@@ -14,7 +16,8 @@ param(
     [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64',
     [ValidateRange(1, 50)][int]$Rounds = 5,
     [ValidateRange(1, 10)][int]$SelfRounds = 2,
-    [double]$Tolerance = 0.05
+    [double]$Tolerance = 0.05,
+    [double]$SizeTolerance = 0.003
 )
 
 $ErrorActionPreference = 'Stop'
@@ -120,7 +123,7 @@ $rows = @(
 $failures = @()
 $table = @("| $Architecture | /MT | Abla C library | change | verdict |", '|---|---:|---:|---:|---|')
 foreach ($row in $rows) {
-    $limit = if ($row.Time) { $row.Base * (1 + $Tolerance) } else { $row.Base }
+    $limit = $row.Base * (1 + $(if ($row.Time) { $Tolerance } else { $SizeTolerance }))
     $ok = $row.Cand -le $limit
     if (!$ok) { $failures += $row.Name }
     $change = if ($row.Base) { '{0:+0.0;-0.0;0.0}%' -f (100 * ($row.Cand - $row.Base) / $row.Base) } else { 'n/a' }
@@ -130,9 +133,9 @@ foreach ($row in $rows) {
 $table | Out-Host
 if ($env:GITHUB_STEP_SUMMARY) { ($table + '') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY }
 [ordered]@{
-    architecture = $Architecture; rounds = $Rounds; selfRounds = $SelfRounds; tolerance = $Tolerance
+    architecture = $Architecture; rounds = $Rounds; selfRounds = $SelfRounds; tolerance = $Tolerance; sizeTolerance = $SizeTolerance
     baseline = [ordered]@{ hello = $base.Hello; json = $base.Json; self = $base.Self; exe = $base.Exe; zip = $base.Zip }
     candidate = [ordered]@{ hello = $cand.Hello; json = $cand.Json; self = $cand.Self; exe = $cand.Exe; zip = $cand.Zip }
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $work 'measure.json')
 if ($failures.Count) { throw "The Abla C library compiler is worse than /MT in: $($failures -join ', ')" }
-Write-Host "Abla C library compiler ($Architecture): no worse than /MT in speed (tolerance $Tolerance) or size"
+Write-Host "Abla C library compiler ($Architecture): no worse than /MT in speed (tolerance $Tolerance) or size (tolerance $SizeTolerance)"
