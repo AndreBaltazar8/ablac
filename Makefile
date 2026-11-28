@@ -458,6 +458,7 @@ test-serial: ablac
 	tools/test-when-is-group.sh $(COMPILER)
 	tools/test-init-order.sh $(COMPILER)
 	tools/test-runtime-internal.sh $(COMPILER)
+	tools/test-runtime-trusted.sh $(COMPILER)
 	tools/test-transform-targets.sh $(COMPILER)
 	tools/test-extension-fields.sh $(COMPILER)
 	tools/test-extension-receivers.sh $(COMPILER)

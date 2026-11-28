@@ -2677,6 +2677,11 @@ fun bootstrapIsAssignment(expression: BootstrapExpression): bool =
     expression.kind == "assign" || expression.kind == "member.assign" ||
     expression.kind == "index.assign"
 
+// The runtime functions any program may call outside trusted code: what they return
+// exposes no memory (a function value's id is a number the program compares).
+fun bootstrapRuntimePublicFunction(name: string): bool =
+    name == "ablaRuntimeFunctionId"
+
 // The runtime's address-yielding intrinsics and field-slot accessors. What
 // they return (an object's, a field's or a value's own memory) or the alias
 // tag their access carries is sound only under the runtime's layout
@@ -2739,6 +2744,11 @@ fun bootstrapRuntimeModuleSource(sourceIdentity: string): bool {
     }
     sourceIdentity.startsWith(bootstrapRuntimeModulePrefix)
 }
+
+// A test's runtime fixture (tools/runtime-fixture.sh copies a case into abla/runtime/fixtures of its own copy of the standard
+// library, so it may use the runtime's intrinsics): the program beside it calls its functions, as the test means it to.
+fun bootstrapRuntimeFixtureSource(sourceIdentity: string): bool =
+    bootstrapRuntimeModuleSource(sourceIdentity) && sourceIdentity.startsWith("${bootstrapRuntimeModulePrefix}fixtures/")
 
 // An identifier, call or assignment by where it is: `source:begin:name`.
 // A key per identifier, call or assignment, built for every occurrence the analysis and the lowering look at (a million
@@ -10882,9 +10892,24 @@ class BootstrapAnalyzer(
     }
 
     // The `@__abla_trusted_only` spec (#1226) of the function, extern or class `name` resolves to, "" when it has none.
+    // A function or extern of the runtime's own modules (stdlib/abla/runtime/…) is trusted-only outside the standard
+    // library: it frees, resets or reads the allocator's memory as the runtime does, so ordinary code, a dependency's
+    // among it, must not reach it (#191).
     fun trustedOnlySpec(name: string): string {
         val function = this.functionIndexOf(name)
-        if (function >= 0) return bootstrapTrustedOnlySpec(this.declarations[function])
+        if (function >= 0) {
+            val spec = bootstrapTrustedOnlySpec(this.declarations[function])
+            if (spec != "") return spec
+            if (bootstrapRuntimeModuleSource(this.declarations[function].sourceIdentity) &&
+                !bootstrapRuntimeFixtureSource(this.declarations[function].sourceIdentity) &&
+                !bootstrapRuntimePublicFunction(this.declarations[function].name) &&
+                !bootstrapRuntimeInternalFunction(this.declarations[function].name) &&
+                !bootstrapStandardLibraryModuleSource(this.currentSourceIdentity) &&
+                !bootstrapRuntimeInternalCaller(this.currentSourceIdentity)) {
+                return "error: the runtime's own functions are for the standard library; use its API (abla/memory, abla/io, …), or call this from a trusted function (`trusted fun`) that keeps the runtime's invariants"
+            }
+            return ""
+        }
         val type = this.typeDeclarations.find(name)
         if (type >= 0) return bootstrapTrustedOnlySpec(this.declarations[type])
         ""
