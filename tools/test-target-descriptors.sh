@@ -25,19 +25,32 @@ set -e
 grep -q "unsupported target 'imaginary-none'" "$directory/invalid.err"
 [[ ! -e "$directory/invalid" ]] || exit 1
 
-# The standard library on the freestanding x86_64-windows, which has no runtime: the runtime's names are missing, and
+# The standard library on x86_64-windows-freestanding, which has no runtime: the runtime's names are missing, and
 # the build says why once and names the hosted target, instead of only listing them.
 set +e
 "$compiler" build "$project_root/tests/cases/target-descriptors/freestanding-io.ab" \
-    --fast --no-cache --target x86_64-windows -o "$directory/freestanding-io.obj" \
+    --fast --no-cache --target x86_64-windows-freestanding -o "$directory/freestanding-io.obj" \
     >"$directory/freestanding-io.out" 2>"$directory/freestanding-io.err"
 freestanding_status=$?
 set -e
 [[ $freestanding_status -ne 0 ]] || exit 1
-[[ $(grep -c 'target x86_64-windows is freestanding' "$directory/freestanding-io.err") -eq 1 ]] ||
+[[ $(grep -c 'target x86_64-windows-freestanding is freestanding' "$directory/freestanding-io.err") -eq 1 ]] ||
     { cat "$directory/freestanding-io.err" >&2; exit 1; }
-grep 'help: .*--target x86_64-windows-hosted' "$directory/freestanding-io.err" > /dev/null ||
+grep 'help: .*--target x86_64-windows` for the runtime' "$directory/freestanding-io.err" > /dev/null ||
     { cat "$directory/freestanding-io.err" >&2; exit 1; }
+
+# The three x86-64 Windows spellings (v0.2.80, docs/migrating-to-v0.2.80.md): x86_64-windows is the hosted target, the same
+# object as its old name x86_64-windows-hosted (an alias), and x86_64-windows-freestanding (above) has no runtime.
+for spelling in x86_64-windows x86_64-windows-hosted; do
+    mkdir -p "$directory/$spelling"
+    "$compiler" build "$project_root/tests/cases/target-descriptors/freestanding-io.ab" --fast --no-cache --target "$spelling" \
+        --emit object -o "$directory/$spelling/io.obj" > "$directory/$spelling/build.log" 2>&1 ||
+        { cat "$directory/$spelling/build.log" >&2; echo "--target $spelling is not the hosted Windows target" >&2; exit 1; }
+done
+cmp "$directory/x86_64-windows/io.obj" "$directory/x86_64-windows-hosted/io.obj" ||
+    { echo 'x86_64-windows-hosted does not build what x86_64-windows does' >&2; exit 1; }
+grep 'supported targets: .*x86_64-windows, aarch64-windows, x86_64-windows-freestanding (no runtime)' \
+    "$directory/invalid.err" > /dev/null || { cat "$directory/invalid.err" >&2; exit 1; }
 
 # aarch64-linux links no C library (#811, G3: docs/design/aarch64-linux-c-boundary.md). A program that brings one stops with
 # E_BUILD_TARGET_CAPABILITY naming the boundary: the manifest's nativeLibraries and LLVM before the link, C functions the

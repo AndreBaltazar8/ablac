@@ -75,7 +75,7 @@ external=$(mktemp -d "$root/build/windows-link-tools.XXXXXX")
 trap 'rm -rf -- "$tools" "$external"' EXIT
 ln -s "$objcopy" "$external/llvm-objcopy"
 ln -s "$lld_link" "$external/lld-link"
-for target in aarch64-windows x86_64-windows-hosted; do
+for target in aarch64-windows x86_64-windows; do
     PATH="$tools" "$compiler" build tests/cases/windows/hosted/hello.ab --target "$target" --no-cache \
         -o "$out/link-inprocess.$target.exe" > "$out/link-inprocess.$target.log" 2>&1 ||
         { cat "$out/link-inprocess.$target.log" >&2; fail "$target: the in-process link failed"; }

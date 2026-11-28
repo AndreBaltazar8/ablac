@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hosted Windows programs (W1c, docs/design/windows-target.md): the Abla runtime and standard library over kernel32 through
-# platform/windows, cross-built on Linux with `--target x86_64-windows-hosted` (--fast and release), linked by lld-link. Each program
+# platform/windows, cross-built on Linux with `--target x86_64-windows` (--fast and release), linked by lld-link. Each program
 # in tests/cases/windows/hosted must
 #   - import only what tools/windows-imports-allowlist.txt allows, and no C runtime under any name;
 #   - print what the same program prints built natively for Linux, with the same arguments, when run under Wine (skipped with a
@@ -35,7 +35,7 @@ for source in tests/cases/windows/hosted/*.ab; do
         flags=(--no-cache)
         [[ $mode == fast ]] && flags+=(--fast)
         exe=$out/$name.$mode.exe
-        "$compiler" build "$source" --target x86_64-windows-hosted -o "$exe" "${flags[@]}" > "$exe.log" 2>&1 ||
+        "$compiler" build "$source" --target x86_64-windows -o "$exe" "${flags[@]}" > "$exe.log" 2>&1 ||
             { cat "$exe.log" >&2; fail "$name ($mode) did not build for Windows"; }
         imports=$(llvm-readobj --coff-imports "$exe" | awk '/^ *Name:/ { dll = $2 } /^ *Symbol:/ { print dll, $2 }')
         ! grep -qiE 'msvcrt|ucrtbase|vcruntime|api-ms-win-crt' <<< "$imports" || fail "$name ($mode): a C runtime import: $imports"

@@ -55,11 +55,11 @@ check_executable() { # $1 = the image, $2 = what it is
 }
 ran=
 check_executable "$out/exit7.exe" "the hand-linked image"
-# The compiler's own target: --target x86_64-windows writes the import libraries from runtime/windows/imports and links.
-"$compiler" build tests/cases/windows/exit7.ab --target x86_64-windows -o "$out/product.exe" > "$out/product.log" 2>&1 ||
-    { cat "$out/product.log" >&2; fail "--target x86_64-windows did not build"; }
-"$compiler" build tests/cases/windows/exit7.ab --target x86_64-windows -o "$out/product-again.exe" > "$out/product.log" 2>&1
+# The compiler's own target: --target x86_64-windows-freestanding writes the import libraries from runtime/windows/imports and links.
+"$compiler" build tests/cases/windows/exit7.ab --target x86_64-windows-freestanding -o "$out/product.exe" > "$out/product.log" 2>&1 ||
+    { cat "$out/product.log" >&2; fail "--target x86_64-windows-freestanding did not build"; }
+"$compiler" build tests/cases/windows/exit7.ab --target x86_64-windows-freestanding -o "$out/product-again.exe" > "$out/product.log" 2>&1
 cmp "$out/product.exe" "$out/product-again.exe" || fail "the compiler's Windows executable is not reproducible"
 [[ ! -e $out/product.exe.imports ]] || fail "the import libraries were left beside the output"
 check_executable "$out/product.exe" "the compiler's image"
-echo "windows-link: COFF object, import library from names, lld-link (reproducible), PE32+ console, imports within the allowlist and no C runtime, built by --target x86_64-windows too; $ran"
+echo "windows-link: COFF object, import library from names, lld-link (reproducible), PE32+ console, imports within the allowlist and no C runtime, built by --target x86_64-windows-freestanding too; $ran"

@@ -114,7 +114,7 @@ for step in valgrind-1:flag plain:plain valgrind-2:env; do
     fi
 done
 # --valgrind is refused for a target valgrind does not run (a Windows program).
-if "$compiler" build tests/cases/valgrind/use-after-free.ab -o "$out/windows.exe" --target x86_64-windows-hosted --fast --no-cache \
+if "$compiler" build tests/cases/valgrind/use-after-free.ab -o "$out/windows.exe" --target x86_64-windows --fast --no-cache \
     --valgrind > "$out/windows.log" 2>&1; then fail "a Windows build took --valgrind"; fi
 grep -q 'E_BUILD_VALGRIND_TARGET' "$out/windows.log" || fail "the Windows refusal: $(head -3 "$out/windows.log")"
 echo "valgrind: ${#programs[@]} programs built with --valgrind report nothing under memcheck (GC stress on and off), two uses of freed memory and a planted collector write after free are reported, a plain build next to a valgrind one (--valgrind, ABLA_VALGRIND=1) makes no requests, and a Windows target is refused"

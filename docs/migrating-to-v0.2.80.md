@@ -19,6 +19,7 @@ everything else.
 | abla-one session ids leave the URL | nothing, unless you wrote your own host script or proxy | [8](#8-abla-one-session-ids-leave-the-url) |
 | `memoryCheckpoint` and `memoryReset` are trusted-only | `native.trust:` build error | [9](#9-memorycheckpoint-and-memoryreset-are-trusted-only) |
 | The runtime's own functions are for the standard library | `native.trust:` build error | [10](#10-the-runtimes-own-functions-are-for-the-standard-library) |
+| `x86_64-windows` is the hosted Windows target | runtime-name build errors for a freestanding Windows program | [11](#11-x86_64-windows-is-the-hosted-windows-target) |
 
 ## 1. Raw-memory classes are made by their factories
 
@@ -457,3 +458,23 @@ trusted-only; use `region { ... }` instead of a checkpoint
 form are for code that keeps the runtime's invariants itself, inside a
 `trusted fun`; a dependency that does this needs a grant line in your
 manifest ([packages.md](packages.md)).
+
+## 11. `x86_64-windows` is the hosted Windows target
+
+`--target x86_64-windows` used to build a freestanding program: its own
+`abla_start` entry, with no runtime and no standard library. It now
+builds a hosted program (the Abla runtime and the standard library over
+`kernel32`), as `aarch64-windows` does on ARM64 and as the Windows
+compiler does for itself. The freestanding target is now
+`x86_64-windows-freestanding`. The old hosted name,
+`x86_64-windows-hosted`, still works for a while as another name for
+`x86_64-windows`.
+
+A freestanding program built with the old name now stops with errors
+about runtime names such as `__ablaRuntimeFree`, or links against an
+entry point it does not define.
+
+**Fix:** build a freestanding program with
+`--target x86_64-windows-freestanding`. Change
+`--target x86_64-windows-hosted` to `--target x86_64-windows` in scripts
+and `abla.toml` files before the alias goes away.

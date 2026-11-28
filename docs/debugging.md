@@ -273,7 +273,7 @@ module has no name section.
 
 ### Windows
 
-A hosted Windows program (`--target x86_64-windows-hosted`) reports how it
+A hosted Windows program (`--target x86_64-windows`) reports how it
 died as a Linux one does, through a vectored exception handler its `main`
 installs. Every build says what ended it: a panic its message (status 101), a
 stack overflow `panic: stack overflow` (status 101), a bad memory access

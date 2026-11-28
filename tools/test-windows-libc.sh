@@ -30,7 +30,7 @@ command -v lld-link > /dev/null || { echo "windows-libc: skipped (lld-link is no
 ran=()
 skipped=()
 for name in scan print; do
-    "$compiler" build "$cases/$name.ab" --target x86_64-windows-hosted --fast --no-cache -o "$out/$name.exe" > "$out/$name.log" 2>&1 ||
+    "$compiler" build "$cases/$name.ab" --target x86_64-windows --fast --no-cache -o "$out/$name.exe" > "$out/$name.log" 2>&1 ||
         { cat "$out/$name.log" >&2; fail "$name.ab did not build for Windows"; }
     cp "$cases/$name-cases.txt" "$out/" 2> /dev/null || true
     status=0

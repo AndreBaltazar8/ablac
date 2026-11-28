@@ -298,7 +298,7 @@ in these workflows. See [companion installation and limits](llvm-xtensa.md).
 
 x86-64. [CI](../.github/workflows/ci.yml) job `windows-cross`, **Windows
 programs, cross-built on Linux**, builds a freestanding program
-(`x86_64-windows`) and the hosted crash program (`x86_64-windows-hosted`, the
+(`x86_64-windows-freestanding`) and the hosted crash program (`x86_64-windows`, the
 runtime and standard library over `kernel32`), with and without `--backtrace`,
 and runs [test-windows-link.sh](../tools/test-windows-link.sh). Job
 `windows-run`, **Windows programs, run on Windows**, runs the images on

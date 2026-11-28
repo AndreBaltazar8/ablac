@@ -21,7 +21,7 @@ listed=$(grep -E '^trusted fun __ablaRuntimeWindowsTranslated' "$file" | grep -o
 for tool in lld-link llvm-readobj; do
     command -v "$tool" > /dev/null || { echo "windows-syscalls: the list matches ($tested); the refusal is skipped ($tool is not installed)"; exit 0; }
 done
-"$compiler" build tests/cases/windows/refuse.ab --target x86_64-windows-hosted -o "$out/refuse.exe" --fast --no-cache > "$out/refuse.log" 2>&1 ||
+"$compiler" build tests/cases/windows/refuse.ab --target x86_64-windows -o "$out/refuse.exe" --fast --no-cache > "$out/refuse.log" 2>&1 ||
     { cat "$out/refuse.log" >&2; fail "refuse.ab did not build for Windows"; }
 status=0
 tools/windows/wine-run.sh "$out/refuse.exe" > "$out/refuse.out" 2> "$out/refuse.err" || status=$?
@@ -35,7 +35,7 @@ grep -q 'unsupported Linux system call 999' "$out/refuse.out" "$out/refuse.err" 
 # What the compiler asks before it reaches LLVM (self.ab): the stack limit is the 8 MiB the image is linked with, the descriptor
 # limit the table's 4096, the affinity mask 8 bytes with a CPU in it, and /proc/self/exe the program itself ("/" for "\"). And
 # what it links: a float `%` (the runtime's remainder: no fmod to import), malloc_trim (0) and pthread_key_create (ENOSYS).
-"$compiler" build tests/cases/windows/self.ab --target x86_64-windows-hosted -o "$out/self.exe" --fast --no-cache > "$out/self.log" 2>&1 ||
+"$compiler" build tests/cases/windows/self.ab --target x86_64-windows -o "$out/self.exe" --fast --no-cache > "$out/self.log" 2>&1 ||
     { cat "$out/self.log" >&2; fail "self.ab did not build for Windows"; }
 status=0
 tools/windows/wine-run.sh "$out/self.exe" > "$out/self.out" 2> "$out/self.err" || status=$?
@@ -54,7 +54,7 @@ expect 'cpu time true'
 expect 'signal mask 0 0'
 expect 'ids 0 0 0 0'
 # The unwind-free jump pair (jump.ab): abla_setjmp returns 0 first, abla_longjmp from twenty frames down returns 7 to it.
-"$compiler" build tests/cases/windows/jump.ab --target x86_64-windows-hosted -o "$out/jump.exe" --fast --no-cache > "$out/jump.log" 2>&1 ||
+"$compiler" build tests/cases/windows/jump.ab --target x86_64-windows -o "$out/jump.exe" --fast --no-cache > "$out/jump.log" 2>&1 ||
     { cat "$out/jump.log" >&2; fail "jump.ab did not build for Windows"; }
 status=0
 tools/windows/wine-run.sh "$out/jump.exe" > "$out/jump.out" 2> "$out/jump.err" || status=$?
@@ -62,7 +62,7 @@ tools/windows/wine-run.sh "$out/jump.exe" > "$out/jump.out" 2> "$out/jump.err" |
 [[ "$(cat "$out/jump.out")" == $'armed\njumped 7' ]] || fail "jump.exe printed: $(cat "$out/jump.out" "$out/jump.err")"
 # A fault sent back (fault-jump.ab): a vectored handler ahead of the runtime's redirects an access violation with
 # abla_windows_redirect to abla_longjmp, and the thread is back where abla_setjmp armed it with 4, not ended by the fault.
-"$compiler" build tests/cases/windows/fault-jump.ab --target x86_64-windows-hosted -o "$out/fault-jump.exe" --fast --no-cache \
+"$compiler" build tests/cases/windows/fault-jump.ab --target x86_64-windows -o "$out/fault-jump.exe" --fast --no-cache \
     > "$out/fault-jump.log" 2>&1 || { cat "$out/fault-jump.log" >&2; fail "fault-jump.ab did not build for Windows"; }
 status=0
 tools/windows/wine-run.sh "$out/fault-jump.exe" > "$out/fault-jump.out" 2> "$out/fault-jump.err" || status=$?
@@ -71,7 +71,7 @@ tools/windows/wine-run.sh "$out/fault-jump.exe" > "$out/fault-jump.out" 2> "$out
 # An interrupt word (interrupt.ab, §5): with the thread's word set, each wait returns EINTR (-4) within a slice: a 30-second
 # nanosleep, poll with nothing to wait on, poll on a socket, a futex wait and wait4 on a child sleeping 30 s; cleared, the killed
 # child is collected and a 50 ms sleep returns 0. The whole program takes seconds, not the minutes a missed interrupt would.
-"$compiler" build tests/cases/windows/interrupt.ab --target x86_64-windows-hosted -o "$out/interrupt.exe" --fast --no-cache \
+"$compiler" build tests/cases/windows/interrupt.ab --target x86_64-windows -o "$out/interrupt.exe" --fast --no-cache \
     > "$out/interrupt.log" 2>&1 || { cat "$out/interrupt.log" >&2; fail "interrupt.ab did not build for Windows"; }
 status=0
 started=$SECONDS
@@ -81,7 +81,7 @@ tools/windows/wine-run.sh "$out/interrupt.exe" > "$out/interrupt.out" 2> "$out/i
 (( SECONDS - started < 25 )) || fail "interrupt.exe took $((SECONDS - started)) s: the interrupted sleep ran its time"
 # The fault target (fault-guard.ab, call 4004, §4): an access violation in VirtualAlloc'd code and one in the program's own
 # code each go to the target with SIGSEGV's number and the address touched, which jumps back with 4.
-"$compiler" build tests/cases/windows/fault-guard.ab --target x86_64-windows-hosted -o "$out/fault-guard.exe" --fast --no-cache \
+"$compiler" build tests/cases/windows/fault-guard.ab --target x86_64-windows -o "$out/fault-guard.exe" --fast --no-cache \
     > "$out/fault-guard.log" 2>&1 || { cat "$out/fault-guard.log" >&2; fail "fault-guard.ab did not build for Windows"; }
 status=0
 timeout 60 tools/windows/wine-run.sh "$out/fault-guard.exe" > "$out/fault-guard.out" 2> "$out/fault-guard.err" || status=$?
@@ -92,7 +92,7 @@ timeout 60 tools/windows/wine-run.sh "$out/fault-guard.exe" > "$out/fault-guard.
 # whose frame grows with every call it translates (under Wine it outgrew the overflowed stack once), and that function's frame
 # (its x64 unwind codes: the allocation and the registers it pushes, with the handler inlined into it) stays within 128 bytes.
 # Built -g, so the object names the function.
-"$compiler" build tests/cases/windows/fault-guard.ab --target x86_64-windows-hosted -g -o "$out/fault-guard-named.exe" --no-cache \
+"$compiler" build tests/cases/windows/fault-guard.ab --target x86_64-windows -g -o "$out/fault-guard-named.exe" --no-cache \
     > "$out/fault-guard-named.log" 2>&1 || { cat "$out/fault-guard-named.log" >&2; fail "fault-guard.ab did not build with -g"; }
 grep -q '@windows.__ablaRuntimeWindowsGuardSyscall(i64 4005,' "$out/fault-guard-named.exe.ll" ||
     fail "the vectored handler's entry does not call __ablaRuntimeWindowsGuardSyscall"
@@ -108,7 +108,7 @@ frame=$(llvm-readobj --unwind "$out/fault-guard-named.exe.o" | awk '
 # VirtualAlloc, never out of a loaded image (a runtime sleep gets EINTR instead), interrupts a deferred stop's sleep and an
 # interpreted site's pipe read with EINTR, and does nothing once disarmed. The whole program takes seconds, not the 30-second
 # sleeps a missed stop would.
-"$compiler" build tests/cases/windows/watchdog.ab --target x86_64-windows-hosted -o "$out/watchdog.exe" --fast --no-cache \
+"$compiler" build tests/cases/windows/watchdog.ab --target x86_64-windows -o "$out/watchdog.exe" --fast --no-cache \
     > "$out/watchdog.log" 2>&1 || { cat "$out/watchdog.log" >&2; fail "watchdog.ab did not build for Windows"; }
 status=0
 started=$SECONDS
@@ -119,7 +119,7 @@ timeout 120 tools/windows/wine-run.sh "$out/watchdog.exe" > "$out/watchdog.out" 
 # The watchdog takes no lock the thread it suspended may hold (watchdog-loader.ab): armed with a 1 ms deadline while the thread
 # takes and releases the loader lock 400000 times (GetModuleHandleW by name). Where its look at the program counter took the
 # loader lock (RtlPcToFileHeader), the program never ended; it takes about a second.
-"$compiler" build tests/cases/windows/watchdog-loader.ab --target x86_64-windows-hosted -o "$out/watchdog-loader.exe" --fast \
+"$compiler" build tests/cases/windows/watchdog-loader.ab --target x86_64-windows -o "$out/watchdog-loader.exe" --fast \
     --no-cache > "$out/watchdog-loader.log" 2>&1 || { cat "$out/watchdog-loader.log" >&2; fail "watchdog-loader.ab did not build for Windows"; }
 status=0
 timeout 60 tools/windows/wine-run.sh "$out/watchdog-loader.exe" > "$out/watchdog-loader.out" 2> "$out/watchdog-loader.err" ||
@@ -128,7 +128,7 @@ timeout 60 tools/windows/wine-run.sh "$out/watchdog-loader.exe" > "$out/watchdog
 [[ "$(cat "$out/watchdog-loader.out")" == $'armed 0\nfound 400000 of 400000, asked true' ]] || fail "watchdog-loader.exe printed: $(cat "$out/watchdog-loader.out" "$out/watchdog-loader.err")"
 # The watchdog's two stops (preempt.ab, §5), each from a second thread: a thread spinning in VirtualAlloc'd code is suspended,
 # its CONTEXT redirected to a jump back with 3, and resumed; a thread reading an empty pipe gets EINTR from CancelSynchronousIo.
-"$compiler" build tests/cases/windows/preempt.ab --target x86_64-windows-hosted -o "$out/preempt.exe" --fast --no-cache \
+"$compiler" build tests/cases/windows/preempt.ab --target x86_64-windows -o "$out/preempt.exe" --fast --no-cache \
     > "$out/preempt.log" 2>&1 || { cat "$out/preempt.log" >&2; fail "preempt.ab did not build for Windows"; }
 status=0
 timeout 60 tools/windows/wine-run.sh "$out/preempt.exe" > "$out/preempt.out" 2> "$out/preempt.err" || status=$?
@@ -140,7 +140,7 @@ timeout 60 tools/windows/wine-run.sh "$out/preempt.exe" > "$out/preempt.out" 2> 
 # ends is EAGAIN. A peer's reset (SO_LINGER 0, close) makes read, readResult and a TLS session's read fail with ECONNRESET, and SO_LINGER is
 # converted between Linux's two ints and Winsock's two words (a linger time above 0 reads back). A silent peer: a TcpConnection.readResult
 # under its receive timeout waits it out and is EAGAIN with no bytes.
-"$compiler" build tests/cases/windows/socket-failure.ab --target x86_64-windows-hosted -o "$out/socket-failure.exe" --fast \
+"$compiler" build tests/cases/windows/socket-failure.ab --target x86_64-windows -o "$out/socket-failure.exe" --fast \
     --no-cache > "$out/socket-failure.log" 2>&1 || { cat "$out/socket-failure.log" >&2; fail "socket-failure.ab did not build for Windows"; }
 status=0
 timeout 60 tools/windows/wine-run.sh "$out/socket-failure.exe" > "$out/socket-failure.out" 2> "$out/socket-failure.err" || status=$?
@@ -148,7 +148,7 @@ timeout 60 tools/windows/wine-run.sh "$out/socket-failure.exe" > "$out/socket-fa
 expected=$'recvfrom dontwait -11\ntimeout set 0\ntimeout read 0: 1 s 500000 us\nread until the timeout -11, waited at least 1.4 s true\nnonblocking 0\nread -11\nrecvfrom -11\nsend 1\nread after send 1\nread at the end 0\nsend after shutdown negative true\nlinger 7 s set 0\nlinger read 0: on 1 for 7 s\nlinger set 0\nread after a reset -104\nlinger set 0\nreadResult after a reset error 104 0\nlinger set 0\nTLS read after a reset -1 0\ntimeouts set true\nreadResult from a silent peer error 11 0, waited at least 0.4 s true'
 [[ "$(cat "$out/socket-failure.out")" == "$expected" ]] || fail "socket-failure.exe printed: $(cat "$out/socket-failure.out" "$out/socket-failure.err")"
 # What a child inherits (inherit.ab): an inheritable pipe end of the parent is not in the child, which has the three streams only.
-"$compiler" build tests/cases/windows/inherit.ab --target x86_64-windows-hosted -o "$out/inherit.exe" --fast --no-cache \
+"$compiler" build tests/cases/windows/inherit.ab --target x86_64-windows -o "$out/inherit.exe" --fast --no-cache \
     > "$out/inherit.log" 2>&1 || { cat "$out/inherit.log" >&2; fail "inherit.ab did not build for Windows"; }
 status=0
 timeout 60 tools/windows/wine-run.sh "$out/inherit.exe" > "$out/inherit.out" 2> "$out/inherit.err" || status=$?

@@ -80,7 +80,7 @@ windows() {
     local output=$1
     shift
     env -i PATH="$PWD/$out/empty" HOME="$PWD/$out" ABLA_CACHE_DIR="$PWD/$out/cache-windows" "$@" \
-        "$PWD/$pkg/bin/ablac" build tests/cases/windows/exit7.ab --target x86_64-windows --no-cache \
+        "$PWD/$pkg/bin/ablac" build tests/cases/windows/exit7.ab --target x86_64-windows-freestanding --no-cache \
         -o "$out/$output.exe" > "$out/$output.log" 2>&1
 }
 windows windows || { tail -5 "$out/windows.log" >&2; fail 'Windows link on an empty PATH failed'; }

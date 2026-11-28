@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Standard-library test programs on a hosted Windows target: every program listed in tests/cases/windows/programs.txt (collections, text,
-# date, files, process exit, loopback HTTP and WebSocket, threads, ...) is built --fast with `--target x86_64-windows-hosted`, linked by
+# date, files, process exit, loopback HTTP and WebSocket, threads, ...) is built --fast with `--target x86_64-windows`, linked by
 # lld-link, and must
 #   - import only what tools/windows-imports-allowlist.txt allows, and no C runtime under any name;
 #   - exit with the status the list gives and print what the same program prints built natively for Linux, when run under Wine (skipped
@@ -13,7 +13,7 @@
 # (the windows-arm64-run job). A program that does not build is reported at the end, and the others are still built.
 set -euo pipefail
 compiler=${1:-build/ablac}
-target=${2:-x86_64-windows-hosted}
+target=${2:-x86_64-windows}
 [[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
@@ -38,10 +38,10 @@ wine_only_finish() {
         # ... but a --backtrace build of it goes to build/windows-debug, and the Windows job runs that one and prints
         # what happens to it (tools/windows/debug-programs.ps1: output, status, the symbolized stack of a crash).
         mkdir -p build/windows-debug
-        "$compiler" build "$source" --target x86_64-windows-hosted -o "build/windows-debug/$name.exe" --fast --backtrace --no-cache \
+        "$compiler" build "$source" --target x86_64-windows -o "build/windows-debug/$name.exe" --fast --backtrace --no-cache \
             > "build/windows-debug/$name.log" 2>&1 || { cat "build/windows-debug/$name.log" >&2; fail "$name did not build with --backtrace"; }
         # --fast builds name the functions of a stack; a release one also has its file:line (<name>-release.exe.debug).
-        "$compiler" build "$source" --target x86_64-windows-hosted -o "build/windows-debug/$name-release.exe" --backtrace --no-cache \
+        "$compiler" build "$source" --target x86_64-windows -o "build/windows-debug/$name-release.exe" --backtrace --no-cache \
             > "build/windows-debug/$name-release.log" 2>&1 || { cat "build/windows-debug/$name-release.log" >&2; fail "$name did not build with --backtrace for release"; }
         wineonly=$((wineonly + 1))
 }

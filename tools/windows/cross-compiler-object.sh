@@ -5,8 +5,8 @@ set -euo pipefail
 compiler=$1
 entry=$2
 out=$3
-target=${4:-x86_64-windows-hosted}
-[[ $target == x86_64-windows-hosted || $target == aarch64-windows ]] ||
+target=${4:-x86_64-windows}
+[[ $target == x86_64-windows || $target == x86_64-windows-hosted || $target == aarch64-windows ]] ||
     { echo "Unsupported Windows compiler target: $target" >&2; exit 2; }
 mkdir -p "$out"
 if [[ -e $out/ablac.exe.o || -e $out/ablac.exe.imports ]]; then

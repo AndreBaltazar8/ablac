@@ -83,6 +83,6 @@ whole() { # NAME FLAGS...: builds into $work/whole/<from>/ under one output name
 whole release
 whole backtrace --backtrace
 whole aarch64-backtrace --target aarch64-linux --backtrace
-whole windows-fast --target x86_64-windows-hosted --fast
-whole windows-debug --target x86_64-windows-hosted -g
+whole windows-fast --target x86_64-windows --fast
+whole windows-debug --target x86_64-windows -g
 echo "reproducible paths: --fast and -g builds are the same from any working directory, by a relative or absolute path, and in a copy; so is every file of release, --backtrace, AArch64 and hosted Windows builds; --path-prefix-map works"

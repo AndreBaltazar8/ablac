@@ -30,7 +30,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $work = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Directory)
 New-Item -ItemType Directory -Path $work | Out-Null
 $bundle = if ($Architecture -eq 'arm64') { 'aarch64' } else { 'x86_64' }
-$target = if ($Architecture -eq 'arm64') { 'aarch64-windows' } else { 'x86_64-windows-hosted' }
+$target = if ($Architecture -eq 'arm64') { 'aarch64-windows' } else { 'x86_64-windows' }
 
 function Unpack([string]$Label, [string]$Archive) {
     $path = (Resolve-Path -LiteralPath $Archive).Path

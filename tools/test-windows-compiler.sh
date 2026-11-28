@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The compiler itself on Windows, before its LLVM is there (step 2 of docs/design/windows-target.md; the LLVM and lld archives
-# for windows-msvc are #1137): src/orc_main.ab cross-built for x86_64-windows-hosted names nothing outside the Windows runtime's
+# for windows-msvc are #1137): src/orc_main.ab cross-built for x86_64-windows names nothing outside the Windows runtime's
 # imports but LLVM-C functions; linked against a stub LLVM (each function returns 0) and installed as the package lays it out
 # (bin/ablac.exe beside share/abla), it runs under Wine from another directory with no ABLA_SYSROOT:
 #   - its export table holds every external definition of its object (exports.def, the --export-dynamic of its JIT);
@@ -26,7 +26,7 @@ command -v llvm-nm > /dev/null || { echo "windows-compiler: skipped (llvm-nm is 
 # (tools/run-limited-compiler.sh) is its time alone, and beside the suite's other jobs it went past that (since the compiler
 # collects with background freeing and collection threads, 2ece0285c). This build has its own limit.
 ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-600} ABLA_WINDOWS_LINK_KEEP=1 \
-    "$compiler" build src/orc_main.ab --target x86_64-windows-hosted --fast -o "$out/ablac.exe" > "$out/build.log" 2>&1 || true
+    "$compiler" build src/orc_main.ab --target x86_64-windows --fast -o "$out/ablac.exe" > "$out/build.log" 2>&1 || true
 [[ -s $out/ablac.exe.o ]] || { tail -20 "$out/build.log" >&2; fail "src/orc_main.ab gave no object for Windows"; }
 
 # What the object needs beyond LLVM is what the runtime imports (runtime/windows/imports), nothing of a C library.
@@ -65,7 +65,7 @@ listed=$(grep -c '^    ' "$kept/exports.def")
 slice="$out/ct-slice"
 rm -rf "$slice"
 ABLA_CT_HOST_TRIPLE=x86_64-pc-windows-msvc ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_DUMP="$slice" \
-    "$compiler" build tests/cases/compile-eval-jit/scalars.ab --target x86_64-windows-hosted -o "$out/ct-slice.exe" --no-cache \
+    "$compiler" build tests/cases/compile-eval-jit/scalars.ab --target x86_64-windows -o "$out/ct-slice.exe" --no-cache \
     > "$out/ct-slice.log" 2>&1 || { tail -5 "$out/ct-slice.log" >&2; fail "the compile-time slice probe did not build"; }
 ls "$slice"/generation-*.optimized.ll > /dev/null 2>&1 || fail "no optimized Windows compile-time slice was written ($out/ct-slice.log)"
 { awk '/^    / { print $1 }' "$kept/exports.def"; grep -hv '^#' runtime/windows/imports/*.txt; } | sort -u > "$out/ct-slice.allowed"

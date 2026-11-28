@@ -2,7 +2,7 @@
 # Module identity by the host's path syntax (src/module_paths.ab, abla/fs/path, Path in abla/sys/linux/fs):
 #   - tests/cases/module-path-identity/main.ab checks bootstrapNormalizeModulePath by the POSIX and the Windows syntax on Linux
 #     (drives, UNC shares, `\` read as `/`, the root kept);
-#   - host.ab prints what the host's Path gives: POSIX's on Linux; built for x86_64-windows-hosted and run under Wine, Windows's
+#   - host.ab prints what the host's Path gives: POSIX's on Linux; built for x86_64-windows and run under Wine, Windows's
 #     (a drive path is absolute, joins and normal forms come back `/`-separated, a verbatim `\\?\` path as written);
 #   - compile-time code may still call Path's lexical methods with no capability (pathHostIsWindows is a provider).
 # The Wine half is skipped with a message without Wine or lld-link.
@@ -43,7 +43,7 @@ host verbatim \\?\C:\a/b
 EOF
 diff "$out/linux.expected" "$out/linux.out" > /dev/null || fail "Linux: $(diff "$out/linux.expected" "$out/linux.out")"
 command -v lld-link > /dev/null || { echo "module-path-identity: both syntaxes, compile time and the Linux host checked; Wine skipped (no lld-link)"; exit 0; }
-"$compiler" build "$cases/host.ab" --target x86_64-windows-hosted -o "$out/windows.exe" --fast --no-cache > "$out/windows.log" 2>&1 ||
+"$compiler" build "$cases/host.ab" --target x86_64-windows -o "$out/windows.exe" --fast --no-cache > "$out/windows.log" 2>&1 ||
     { cat "$out/windows.log" >&2; fail "host.ab did not build for Windows"; }
 status=0
 tools/windows/wine-run.sh "$out/windows.exe" > "$out/windows.out" 2> "$out/windows.err" || status=$?

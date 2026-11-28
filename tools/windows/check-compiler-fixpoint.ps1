@@ -27,7 +27,7 @@ New-Item -ItemType Directory -Path $work | Out-Null
 $seedRoot = Join-Path $work 'seed'
 Expand-Archive -LiteralPath $archivePath -DestinationPath $seedRoot
 $bundleArchitecture = if ($Architecture -eq 'arm64') { 'aarch64' } else { 'x86_64' }
-$target = if ($Architecture -eq 'arm64') { 'aarch64-windows' } else { 'x86_64-windows-hosted' }
+$target = if ($Architecture -eq 'arm64') { 'aarch64-windows' } else { 'x86_64-windows' }
 $machine = if ($Architecture -eq 'arm64') { 'IMAGE_FILE_MACHINE_ARM64' } else { 'IMAGE_FILE_MACHINE_AMD64' }
 $seed = Join-Path $seedRoot "abla-toolchain-$bundleArchitecture-windows/bin/ablac.exe"
 $entry = if ($CLibrary -ne 'msvc') { 'src/orc_windows_main_crtfree.ab' } else { 'src/orc_windows_main.ab' }

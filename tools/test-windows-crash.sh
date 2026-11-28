@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Crash reports of a hosted Windows program (x86_64-windows-hosted; src/backend/llvm/debug.ab, the Windows section): what
+# Crash reports of a hosted Windows program (x86_64-windows; src/backend/llvm/debug.ab, the Windows section): what
 # tests/cases/windows/crash/crash.ab prints when it dies under Wine, built release, --backtrace and --fast -g:
 #   - a panic: its message and exit status 101; a --backtrace build names the stack's frames (main among them), a --fast -g
 #     one prints them unnamed, a release build prints none;
@@ -31,7 +31,7 @@ for mode in release backtrace fast; do
     [[ $mode == backtrace ]] && flags+=(--backtrace)
     # (-g: the suite builds with ABLA_DEBUG=0, which makes a bare --fast build one without debug information.)
     [[ $mode == fast ]] && flags+=(--fast -g)
-    "$compiler" build "$source" --target x86_64-windows-hosted -o "$out/crash-$mode.exe" "${flags[@]}" > "$out/$mode.log" 2>&1 ||
+    "$compiler" build "$source" --target x86_64-windows -o "$out/crash-$mode.exe" "${flags[@]}" > "$out/$mode.log" 2>&1 ||
         { cat "$out/$mode.log" >&2; fail "crash.ab ($mode) did not build"; }
 done
 imports() { llvm-readobj --coff-imports "$1" | awk '/^ *Symbol:/ { print $2 }'; }

@@ -21,7 +21,7 @@ mkdir -p "$out"
 export ABLA_WINE_PREFIX=$out/prefix
 fail() { echo "windows-system-roots: $1" >&2; exit 1; }
 wine() { "$root/tools/windows/wine-run.sh" "$@"; }
-"$compiler" build tests/cases/windows/system-roots.ab --target x86_64-windows-hosted -o "$out/system-roots.exe" --fast --no-cache > "$out/build.log" 2>&1 ||
+"$compiler" build tests/cases/windows/system-roots.ab --target x86_64-windows -o "$out/system-roots.exe" --fast --no-cache > "$out/build.log" 2>&1 ||
     { cat "$out/build.log" >&2; fail "did not build"; }
 cd "$out"
 status=0
