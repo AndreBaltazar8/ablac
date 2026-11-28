@@ -46,6 +46,10 @@ static bool coldHost(StringRef name) {
 static bool movable(StringRef name) {
     if (name == "__ablaRuntimePlatformMemoryCollect")
         return true;
+    // The release fault report's library lookup (bootstrapLlvmFaultLibraryFunction): /proc/self/maps read and parsed
+    // in IR the backend emits, which every release build otherwise optimizes again (+2% of a cold hello).
+    if (name == "__ablaRuntimeHostFaultLibraryReport")
+        return true;
     if (!name.consume_front("__ablaRuntimeHost"))
         return false;
     if (coldHost(name) && !name.contains("Pressure")) return true;

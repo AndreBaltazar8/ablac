@@ -2274,7 +2274,8 @@ fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
                 val reportedPc = LLVMAppendBasicBlockInContext(backend.context, handler, "fault.pc.reported")
                 LLVMBuildCondBr(backend.builder, inside, reportedPc, named)
                 LLVMPositionBuilderAtEnd(backend.builder, named)
-                bootstrapLlvmFaultLibraryReport(backend, pc)
+                val report = bootstrapLlvmFaultLibraryFunction(backend)
+                bootstrapLlvmCallTyped(backend, bootstrapLlvmFunctionType(backend, backend.voidType, [i64]), report, [pc], "")
                 LLVMBuildBr(backend.builder, reportedPc)
                 LLVMPositionBuilderAtEnd(backend.builder, reportedPc)
             }
@@ -2515,6 +2516,35 @@ fun bootstrapLlvmFaultLibraryReport(backend: BootstrapLlvmBackend, pc: i64*): vo
     LLVMBuildBr(builder, finished)
     LLVMPositionBuilderAtEnd(builder, finished)
     return
+}
+
+// Set for a --fast program that links the prebuilt fast runtime, which defines abla_fault_library_report.
+var bootstrapLlvmFaultLibraryExternal = false
+
+// bootstrapLlvmFaultLibraryReport as a function of its own, `abla_fault_library_report(pc)`, which the release fault
+// handler calls, so a build does not optimize it again (it was +2% of a cold hello). In a release build the collector
+// compiles it once into the prebuilt region (runtime/abla_release_collector.h matches its abla.source); a --fast program
+// that links the prebuilt fast runtime only declares it (that object defines and exports it). Its 64 KiB buffer is
+// therefore one global, on one side: the program's in a release build (the region imports it), the object's in --fast.
+fun bootstrapLlvmFaultLibraryFunction(backend: BootstrapLlvmBackend): i64* {
+    val name = "abla_fault_library_report"
+    var function = LLVMGetNamedFunction(backend.module, name)
+    if (!pointerIsNull(function)) return function
+    val type = bootstrapLlvmFunctionType(backend, backend.voidType, [backend.i64Type])
+    function = LLVMAddFunction(backend.module, name, type)
+    if (bootstrapLlvmFaultLibraryExternal) return function
+    // The fast runtime object exports it (bootstrapLlvmLocalizeFastRuntime makes it hidden); a program keeps it internal.
+    if (bootstrapLlvmFastRuntimeExports.size == 0) LLVMSetLinkage(function, llvmInternalLinkage())
+    bootstrapLlvmAddFunctionAttribute(backend, function, "noinline")
+    bootstrapLlvmAddFunctionAttribute(backend, function, "cold")
+    bootstrapLlvmAddFunctionAttribute(backend, function, "nounwind")
+    bootstrapLlvmAddStringFunctionAttribute(backend, function, "abla.source", "__ablaRuntimeHostFaultLibraryReport")
+    val resume = LLVMGetInsertBlock(backend.builder)
+    LLVMPositionBuilderAtEnd(backend.builder, LLVMAppendBasicBlockInContext(backend.context, function, "entry"))
+    bootstrapLlvmFaultLibraryReport(backend, LLVMGetParam(function, 0))
+    LLVMBuildRetVoid(backend.builder)
+    if (!pointerIsNull(resume)) LLVMPositionBuilderAtEnd(backend.builder, resume)
+    function
 }
 
 // bootstrapLlvmDebugWriteHex as a loop over a digit table, for code every release build carries (the fault
