@@ -488,6 +488,7 @@ fun HttpAsyncClient.complete(
 // Closes the socket, unregisters it, and releases TLS state for the connection slot.
 fun HttpAsyncClient.closeConnection(slot: int): void {
     if (slot >= 0 && this.connectionStates[slot] != 0) {
+        this.connectionReadPending[slot] = false
         this.tlsFree(slot)
         val descriptor = this.connectionDescriptors[slot]
         if (descriptor >= 0) {
@@ -573,6 +574,8 @@ fun HttpAsyncClient.allocateConnection(request: int): int {
         this.connectionProtocols.append(1)
         this.connectionH2.append(h2ClientNew())
         this.connectionActivity.append(0)
+        this.connectionReadPending.append(false)
+        this.connectionReadStep.append(0)
     }
     this.connectionProtocols[slot] = 1
     this.connectionActivity[slot] = linuxMonotonicMilliseconds()
@@ -590,6 +593,7 @@ fun HttpAsyncClient.allocateConnection(request: int): int {
     this.connectionUsed[slot] = 0
     this.connectionDnsQueries[slot] = 0
     this.connectionWriteInterest[slot] = false
+    this.connectionReadPending[slot] = false
     slot
 }
 
@@ -903,10 +907,42 @@ fun HttpAsyncClient.parseResponse(slot: int, eof: bool): bool {
     true
 }
 
+// The bytes one read of a connection takes before it hands control back to step(): a server that never stops sending (a
+// stream, DATA or PING frames) can't keep step() from returning, or pile up input and replies without bound in one call.
+private val httpAsyncReadBudget = 1048576
+
+// By connection slot: a read stopped at its budget with input maybe still waiting, in the socket or a TLS record that raises no
+// readiness event; and the step that last read it. The next step reads such a slot before it waits.
+private var HttpAsyncClient.connectionReadPending: array<bool> = []
+private var HttpAsyncClient.connectionReadStep: array<int> = []
+// Whether some slot is marked, and the count of steps taken.
+private var HttpAsyncClient.readsPending: bool = false
+private var HttpAsyncClient.stepCount: int = 0
+
+/** Whether a read stopped at the client's per-read budget in the last step, so the next step reads on without waiting. */
+fun HttpAsyncClient.readBudgetPending(): bool = this.readsPending
+
+// Starts a read of `slot` in this step; returns the bytes taken so far (none).
+fun HttpAsyncClient.readBegin(slot: int): int {
+    this.connectionReadStep[slot] = this.stepCount
+    this.connectionReadPending[slot] = false
+    0
+}
+
+// Whether a read of `slot` that took `taken` bytes is at its budget; then the slot is marked for the next step.
+fun HttpAsyncClient.readSpent(slot: int, taken: int): bool {
+    if (taken < httpAsyncReadBudget) return false
+    this.connectionReadPending[slot] = true
+    this.readsPending = true
+    true
+}
+
 // Consumes ready response bytes and handles complete responses, EOF, or failed reads.
 fun HttpAsyncClient.readSlot(slot: int): void {
     var reading = true
+    var taken = this.readBegin(slot)
     while (reading && this.connectionStates[slot] != 0) {
+        if (this.readSpent(slot, taken)) return
         if (this.connectionSecure[slot]) {
             this.tlsRead(slot)
         } else httpAsyncPlainRead(this.connectionDescriptors[slot], this.reader)
@@ -915,6 +951,7 @@ fun HttpAsyncClient.readSlot(slot: int): void {
         this.reader.text = ""
         val state = this.connectionStates[slot]
         if (status > 0) {
+            taken = taken + chunk.size
             if (state == httpAsyncConnectionIdle) {
                 // Unsolicited bytes on a pooled connection: drop it.
                 this.closeConnection(slot)
@@ -1189,13 +1226,19 @@ fun HttpAsyncClient.h2Pump(slot: int): void {
 // Reads ready HTTP/2 bytes and dispatches frames until blocked or the connection closes.
 fun HttpAsyncClient.h2Read(slot: int): void {
     var reading = true
+    var taken = this.readBegin(slot)
     while (reading && this.connectionStates[slot] == httpAsyncConnectionH2) {
+        if (this.readSpent(slot, taken)) {
+            reading = false
+            continue
+        }
         if (this.connectionSecure[slot]) this.tlsRead(slot)
         else httpAsyncPlainRead(this.connectionDescriptors[slot], this.reader)
         val status = this.reader.status
         val chunk = this.reader.text
         this.reader.text = ""
         if (status > 0) {
+            taken = taken + chunk.size
             val now = linuxMonotonicMilliseconds()
             this.connectionActivity[slot] = now
             this.connectionH2[slot].feed(chunk, now)
@@ -1590,15 +1633,18 @@ fun HttpAsyncClient.streamWrite(slot: int): void {
 // Reads what the socket has (until it would block or the inbox is full) and parses it.
 fun HttpAsyncClient.streamRead(slot: int): void {
     var reading = true
+    var taken = this.readBegin(slot)
     while (reading && this.connectionStates[slot] == httpAsyncConnectionStreaming) {
         val request = this.connectionRequests[slot]
         if (request < 0 || this.streamStates[request].paused) return
+        if (this.readSpent(slot, taken)) return
         if (this.connectionSecure[slot]) this.tlsRead(slot)
         else httpAsyncPlainRead(this.connectionDescriptors[slot], this.reader)
         val status = this.reader.status
         val chunk = this.reader.text
         this.reader.text = ""
         if (status > 0) {
+            taken = taken + chunk.size
             this.connectionInputs[slot] = if (this.connectionInputs[slot] == "") chunk else "${this.connectionInputs[slot]}$chunk"
             this.streamParse(slot, false)
             this.streamTouch(request)
@@ -1978,6 +2024,11 @@ fun HttpAsyncClient.step(timeoutMilliseconds: int = 0): int {
     var timeout = timeoutMilliseconds
     if (timeout < 0) timeout = 0
     if (this.activeRequests > 0 && timeout > 50) timeout = 50
+    this.stepCount = this.stepCount + 1
+    // Input a read left at its budget is read in this step without waiting: bytes a TLS record already holds raise no event.
+    val retry = this.readsPending
+    this.readsPending = false
+    if (retry) timeout = 0
     val records = this.poller.waitCompact(256, timeout)
     var handled = 0
     var index = 0
@@ -2003,6 +2054,18 @@ fun HttpAsyncClient.step(timeoutMilliseconds: int = 0): int {
             }
         }
         index = index + 12
+    }
+    if (retry) {
+        var slot = 0
+        while (slot < this.connectionReadPending.size) {
+            if (this.connectionReadPending[slot] && this.connectionReadStep[slot] != this.stepCount &&
+                this.connectionStates[slot] != 0) {
+                this.connectionReadPending[slot] = false
+                this.socketReady(slot, true, false, false)
+                handled = handled + 1
+            }
+            slot = slot + 1
+        }
     }
     this.sweep(linuxMonotonicMilliseconds())
     this.pumpEvents()

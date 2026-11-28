@@ -548,6 +548,7 @@ test-serial: ablac
 	tools/test-http-host.sh $(COMPILER)
 	tools/test-http-native-scan.sh $(COMPILER)
 	tools/test-http-async-surplus.sh $(COMPILER)
+	tools/test-http-async-read-budget.sh $(COMPILER)
 	tools/test-http-close-delimited.sh $(COMPILER)
 	tools/test-http-interim.sh $(COMPILER)
 	tools/test-http-request-scan.sh $(COMPILER)

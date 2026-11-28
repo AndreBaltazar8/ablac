@@ -1,0 +1,79 @@
+// One read of an async HTTP connection takes at most httpAsyncReadBudget bytes before step() returns: a server that keeps the socket
+// full can't keep step() from returning or pile up input without bound in one call. What is left is read by the next step without
+// waiting for a readiness event (a TLS record's plaintext raises none). One program: a server that answers with a 6 MiB body and
+// keeps its socket full, and a client stepping with no wait. Prints "http-async read budget ok".
+import "abla/io"
+import "abla/text"
+import "abla/net"
+import "abla/http/async"
+
+val SIZE = 6291456
+
+fun main: int {
+    val listener = tcpListenAddress(ipv4Loopback(0))
+    listener.setNonblocking()
+    val port = listener.localPort()
+    val connections: array<TcpConnection> = []
+    val client = httpAsyncClient()
+    val id = client.get("http://127.0.0.1:${port}/big")
+    val piece = "x".repeat(65536)
+    val head = "HTTP/1.1 200 OK\r\nContent-Length: ${SIZE}\r\n\r\n"
+    var response = ""
+    var sent = 0
+    var asked = false
+    var pendingSteps = 0
+    var done = false
+    var loops = 0
+    while (!done && loops < 20000) {
+        var accepted = listener.accept()
+        if (accepted.descriptor >= 0) {
+            accepted.setNonblocking()
+            connections.append(move(accepted))
+        }
+        for (i in 0 until connections.size) {
+            if (connections[i].descriptor >= 0) {
+                if (!asked) {
+                    val read = connections[i].readResult(4096)
+                    if (read.hasData() && read.bytes.contains("GET ")) {
+                        asked = true
+                        response = head
+                    }
+                }
+                // Fill the socket as far as the kernel takes it.
+                var writing = asked
+                while (writing && sent < head.size + SIZE) {
+                    if (response.size == 0) response = if (head.size + SIZE - sent >= piece.size) piece else piece.slice(0, head.size + SIZE - sent)
+                    val result = connections[i].writeResult(response)
+                    if (result.written > 0) {
+                        sent = sent + result.written
+                        response = response.slice(result.written, response.size)
+                    } else writing = false
+                }
+            }
+        }
+        client.step(0)
+        if (client.readBudgetPending()) pendingSteps = pendingSteps + 1
+        for (c in client.takeCompletions()) {
+            if (c.id == id) {
+                if (c.status != 200 || c.body.size != SIZE) {
+                    println("FAIL status ${c.status} body ${c.body.size} bytes error ${c.error}")
+                    return 1
+                }
+                done = true
+            }
+        }
+        loops = loops + 1
+    }
+    for (i in 0 until connections.size) connections[i].close()
+    listener.close()
+    if (!done) {
+        println("FAIL the response was not answered")
+        return 1
+    }
+    if (pendingSteps == 0) {
+        println("FAIL no step stopped at the read budget: one step read everything the socket held")
+        return 1
+    }
+    println("http-async read budget ok")
+    0
+}
