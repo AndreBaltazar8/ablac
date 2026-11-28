@@ -469,6 +469,25 @@ out=$("$gate" "$old_tree" 2 --dry-run 2>&1)
 grep -q ' JOBS=9 taskset -c 8-15 ' <<<"$out" || fail "slot 2 is not 9 jobs on 8-15"
 out=$(GATE_CPUS=0-1 GATE_JOBS=2 "$gate" "$old_tree" 1 --dry-run 2>&1)
 grep -q ' JOBS=2 taskset -c 0-1 ' <<<"$out" || fail "GATE_CPUS and GATE_JOBS are not honoured"
+# A tree whose bootstrap-stages.sh checks in two parts: stages 1 and 2 before the suite, stage 3 beside it, the gate failing
+# if either does; the release gate keeps all three before the suite.
+split_tree=$work/tree-split
+mkdir -p "$split_tree/tools"
+printf '#!/bin/sh\nexit 0\n' >"$split_tree/tools/bootstrap-compiler.sh"
+printf '#!/bin/sh\n# --stages-1-2 | --stage-3\nexit 0\n' >"$split_tree/tools/bootstrap-stages.sh"
+chmod +x "$split_tree/tools/bootstrap-compiler.sh" "$split_tree/tools/bootstrap-stages.sh"
+out=$("$gate" "$split_tree" 3 --dry-run 2>&1)
+builds=$(sed -n '/^== builds/,/^== suite/p' <<<"$out")
+suite=$(sed -n '/^== suite/,$p' <<<"$out")
+grep -q 'bootstrap-stages.sh build/gate/seed.bin build/gate --stages-1-2$' <<<"$builds" || fail "the builds chunk does not stop at stage 2"
+grep -q -- '--stage-3' <<<"$builds" && fail "the builds chunk checks stage 3 too"
+grep -q 'bootstrap-stages.sh build/gate/seed.bin build/gate --stage-3 > build/gate/stage3.log 2>&1 &$' <<<"$suite" ||
+    fail "stage 3 is not checked beside the suite"
+grep -q 'wait \$stage3 || stage3_status=' <<<"$suite" || fail "the suite chunk does not wait for the stage-3 check"
+grep -q "the stage-3 check failed" <<<"$suite" || fail "a failed stage-3 check does not fail the gate"
+out=$("$gate" "$split_tree" 3 --release --dry-run 2>&1)
+grep -q 'bootstrap-stages.sh build/gate/seed.bin build/gate --full$' <<<"$out" || fail "the release gate does not keep the whole stage 3 first"
+grep -q -- '--stage-3\|--stages-1-2' <<<"$out" && fail "the release gate splits the stages"
 # One job more than the cores of GATE_CPUS, a list included.
 out=$(GATE_CPUS=8-11,14-15 "$gate" "$old_tree" 2 --dry-run 2>&1)
 grep -q ' JOBS=7 taskset -c 8-11,14-15 ' <<<"$out" || fail "six cores are not 7 jobs"

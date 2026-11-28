@@ -10,19 +10,35 @@
 # are compared byte for byte. Equal bitcode gives the same executable because opt and code generation are
 # deterministic, which tools/test-reproducible-build.sh checks on its own; they are 43 of a stage's 54 s.
 # --full builds stage 3 whole and compares the executables as well (the release gate's mode).
+# The check in two parts, so that tools/gate.sh can start the suite on stage 2 while stage 3 is checked beside it:
+# --stages-1-2 builds stages 1 and 2 and stops (no verdict yet), and --stage-3 then checks stage 3 against the stage 2
+# that --stages-1-2 left in <directory>, as the whole run does.
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 || ( $# -eq 3 && $3 != --full ) ]]; then
-    printf 'usage: %s <bootstrap-compiler> <directory> [--full]\n' "$0" >&2
+if [[ $# -lt 2 || $# -gt 3 || ( $# -eq 3 && $3 != --full && $3 != --stages-1-2 && $3 != --stage-3 ) ]]; then
+    printf 'usage: %s <bootstrap-compiler> <directory> [--full | --stages-1-2 | --stage-3]\n' "$0" >&2
     exit 2
 fi
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 bootstrap=$(realpath -- "$1")
 directory=$(realpath -m -- "$2")
 full=${3:-}
+part=
+if [[ $full == --stages-1-2 || $full == --stage-3 ]]; then
+    part=$full
+    full=
+fi
 cd "$project_root"
 mkdir -p -- "$directory"
-rm -f -- "$directory/stage2.bc" "$directory/stage3.bc" "$directory/stage3"
+if [[ $part == --stage-3 ]]; then
+    rm -f -- "$directory/stage3.bc" "$directory/stage3"
+    if [[ ! -x $directory/stage2 || ! -s $directory/stage2.bc ]]; then
+        echo "bootstrap-stages: --stage-3 needs the stage2 and stage2.bc that --stages-1-2 leaves in $directory" >&2
+        exit 1
+    fi
+else
+    rm -f -- "$directory/stage2.bc" "$directory/stage3.bc" "$directory/stage3"
+fi
 TIMEFORMAT='%R s'
 
 stage() { # stage <compiler> <output> [environment...]
@@ -32,8 +48,11 @@ stage() { # stage <compiler> <output> [environment...]
     time env "$@" tools/build-self-hosted-release.sh "$compiler" "$output" src/orc_main.ab
 }
 
-stage "$bootstrap" "$directory/stage1"
-stage "$directory/stage1" "$directory/stage2" ABLA_COMPILER_BITCODE="$directory/stage2.bc"
+if [[ $part != --stage-3 ]]; then
+    stage "$bootstrap" "$directory/stage1"
+    stage "$directory/stage1" "$directory/stage2" ABLA_COMPILER_BITCODE="$directory/stage2.bc"
+fi
+[[ $part == --stages-1-2 ]] && exit 0
 if [[ $full == --full ]]; then
     stage "$directory/stage2" "$directory/stage3" ABLA_COMPILER_BITCODE="$directory/stage3.bc"
 else

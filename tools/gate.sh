@@ -141,12 +141,30 @@ if ((release)); then
 else
     suite_env=
 fi
+suite="${suite_env}JOBS=$jobs taskset -c $cpus tools/run-tests.sh"
+# The regular gate checks stage 3 beside the suite, which needs only stage 2: the stage-3 run is a single thread on the
+# slot's cores (13 s of the builds chunk), so the suite starts that much sooner. Its verdict goes into the log after the
+# suite's, and either failing fails the gate. (The release gate builds stage 3 whole and its self-rebuild checks it, so
+# it keeps the three stages before the suite.)
+if ((!release)) && [[ -x $tree/tools/bootstrap-stages.sh ]] && grep -q -- '--stage-3' "$tree/tools/bootstrap-stages.sh"; then
+    stages="time taskset -c $cpus tools/bootstrap-stages.sh build/gate/seed.bin build/gate --stages-1-2"
+    suite="taskset -c $cpus tools/bootstrap-stages.sh build/gate/seed.bin build/gate --stage-3 > build/gate/stage3.log 2>&1 &
+        stage3=\$!
+        status=0
+        $suite || status=\$?
+        stage3_status=0
+        wait \$stage3 || stage3_status=\$?
+        grep -v '^warning\\|^source\\[\\|^  -->' build/gate/stage3.log || true
+        [[ \$stage3_status == 0 ]] || { echo 'gate: the stage-3 check failed (build/gate/stage3.log)'; status=1; }
+        [[ \$status == 0 ]]"
+fi
 
 step builds "$seed_step
         $stages
         cp build/gate/stage2 build/ablac.bin
         $self_rebuild" &&
-    step suite "rm -f build/test-logs/*.log 2>/dev/null || true; ${suite_env}JOBS=$jobs taskset -c $cpus tools/run-tests.sh" &&
+    step suite "rm -f build/test-logs/*.log 2>/dev/null || true
+        $suite" &&
     if ((release)); then
         step repro "time taskset -c $cpus tools/test-reproducible-elsewhere.sh --self build/ablac.bin
         sha256sum build/gate/stage2
