@@ -1178,6 +1178,12 @@ fun bootstrapDefinedTargetDescriptor(
     target.linkInputs
 )
 
+// Where a program with a C boundary builds when target (aarch64-linux or riscv64-linux, from another host) links no C library.
+fun bootstrapCBoundaryHelp(target: string): string =
+    if (target == "aarch64-linux")
+        "help: a program with a C boundary builds on an AArch64 Linux machine, or for x86-64 Linux, where it links the system's glibc\n"
+    else "help: a program with a C boundary builds for x86-64 Linux, where it links the system's glibc\n"
+
 fun bootstrapSupportedTargets(): string =
     "x86_64-linux, aarch64-linux, riscv64-linux, x86_64-macos, arm64-macos, x86_64-windows, aarch64-windows, x86_64-windows-freestanding (no runtime), wasm32-wasi"
 
@@ -6106,11 +6112,13 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
         status = 152
         failureKind = "reported"
     }
-    // An AArch64 or RISC-V 64 Linux executable has only the libc-free link (#811), so a program that brings a C library
-    // cannot link there (G3, docs/design/aarch64-linux-c-boundary.md): say which boundary, before the linker lists symbols.
-    // LLVM is the exception when ABLA_STATIC_LLVM_LIB names the target's static archives, as the static compilers link it.
+    // An AArch64 or RISC-V 64 Linux executable built anywhere but an AArch64 Linux machine has only the libc-free link (#811),
+    // so a program that brings a C library cannot link there (G3, docs/design/aarch64-linux-c-boundary.md): say which
+    // boundary, before the linker lists symbols. On an AArch64 Linux machine it links that machine's glibc, as x86-64 does
+    // (#184). LLVM is the exception when ABLA_STATIC_LLVM_LIB names the target's static archives, as the static compilers link it.
     val crossLinuxExecutable = target.hosted && artifact == "executable" && target.objectFormat == "elf" &&
-        (bootstrapLlvmTargetIsAarch64Linux(target.llvmTriple) || target.name == "riscv64-linux")
+        ((bootstrapLlvmTargetIsAarch64Linux(target.llvmTriple) && bootstrapHostTargetName() != "aarch64-linux") ||
+         target.name == "riscv64-linux")
     if (status == 0 && crossLinuxExecutable) {
         val boundary = if (nativeLibraries.size > 0) "the manifest names nativeLibraries (${nativeLibraries.join(", ")})"
             else if (hostImports) "it calls extern \"host\" functions"
@@ -6120,7 +6128,7 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
         if (boundary != "") {
             linuxPrintStandardError(
                 "error[E_BUILD_TARGET_CAPABILITY]: target '${target.name}' links no C library, and $outputPath brings one: $boundary\n" +
-                    "help: a program with a C boundary builds for x86-64 Linux, where it links the system's glibc\n"
+                    bootstrapCBoundaryHelp(target.name)
             )
             status = 152
             failureKind = "reported"
@@ -6332,10 +6340,15 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
             (bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) || aarch64Linux || riscv64Linux))
             linuxEnvironment("ABLA_STATIC_LLVM_LIB").value else ""
         val staticLlvm = staticLlvmLibrary != ""
-        var libcFree = !macTarget && bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) &&
+        // An AArch64 program built on an AArch64 Linux machine follows the x86-64 rule (#184, G3 option A): libc-free unless it
+        // brings a C library, then the machine's own glibc through the clang driver. Built anywhere else it has only the
+        // libc-free link.
+        val nativeAarch64 = aarch64Linux && bootstrapHostTargetName() == "aarch64-linux"
+        val glibcTarget = bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) || nativeAarch64
+        var libcFree = !macTarget && glibcTarget &&
         !target.libcFree && !linkOpenSsl && (!linkLlvm || staticLlvm) && !hostImports &&
         nativeLibraries.size == 0
-        var libcReason = if (macTarget || !bootstrapLlvmTargetIsX8664Linux(target.llvmTriple)) ""
+        var libcReason = if (macTarget || !glibcTarget) ""
         else if (linkOpenSsl) "it imports OpenSSL (TLS)"
         else if (linkLlvm && !staticLlvm) "it links libLLVM"
         else if (nativeLibraries.size > 0) "the manifest names nativeLibraries"
@@ -6344,11 +6357,13 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
         // The libc-free link takes nothing from the system: not its start files, not
         // libgcc (a machine without C development files has none), only the builtins
         // of the toolchain's own clang (#806).
-        val runtimeLibrary = if (libcFree) bootstrapLibcFreeRuntimeLibrary() else ""
+        val runtimeLibrary = if (libcFree && !aarch64Linux) bootstrapLibcFreeRuntimeLibrary() else ""
         var linking = true
         while (linking) {
             val link = bootstrapLinkCommand(if (macTarget) macClang else "clang")
-            if (aarch64Linux || riscv64Linux) {
+            // The AArch64 and RISC-V 64 libc-free link (on a native AArch64 host, until the program turns out to need glibc).
+            val crossLink = riscv64Linux || (aarch64Linux && (libcFree || !nativeAarch64))
+            if (crossLink) {
                 // A cross-built Linux program never links libc (#811): its own
                 // start-up (abla_start), no C library, no runtime library.
                 link.argument("--target=${target.llvmTriple}")
@@ -6556,7 +6571,7 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
             // x86-64 without SSE4.1; Darwin's libSystem already carries libm.
             // Only as needed: a program that calls none of it (float `%` is the
             // runtime's own on x86-64 Linux) does not depend on libm (#806).
-            if (!macTarget && !libcFree && !aarch64Linux && !riscv64Linux) {
+            if (!macTarget && !libcFree && !crossLink) {
                 link.argument("-Wl,--as-needed")
                 link.argument("-lm")
                 link.argument("-Wl,--no-as-needed")
@@ -6570,7 +6585,7 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
             // An AArch64 or RISC-V 64 program's link (libc-free, from any host): its undefined C functions are named after
             // the linker's own report (G3). The static compilers' links report as they did.
             val crossFailures = "$publishPath.cross-link-errors"
-            val explainCross = (aarch64Linux || riscv64Linux) && !staticLlvm
+            val explainCross = crossLink && !nativeAarch64 && !staticLlvm
             if (libcFree) link.errors(failures)
             else if (explainHosted) link.errors(hostedFailures)
             else if (explainCross) link.errors(crossFailures)
@@ -6590,7 +6605,7 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
                     if (undefined.size > 0) {
                         linuxPrintStandardError(
                             "error[E_BUILD_TARGET_CAPABILITY]: target '${target.name}' links no C library, and $outputPath calls C functions nothing in it defines: ${undefined.join(", ")}\n" +
-                                "help: a program with a C boundary builds for x86-64 Linux, where it links the system's glibc\n"
+                                bootstrapCBoundaryHelp(target.name)
                         )
                         failureKind = "reported"
                     }
@@ -6610,7 +6625,7 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
                 }
                 Path(hostedFailures).remove()
             }
-            if (status == 0 && libcFree) {
+            if (status == 0 && libcFree && !aarch64Linux) {
                 // abla_start applies R_X86_64_RELATIVE relocations only.
                 val other = bootstrapOtherRelocation(publishPath, "R_X86_64_", 8)
                 if (other != "") {
@@ -6618,7 +6633,7 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
                     status = 1
                 }
             }
-            if (status == 0 && aarch64Linux) {
+            if (status == 0 && aarch64Linux && crossLink) {
                 // abla_start applies R_AARCH64_RELATIVE relocations only.
                 val other = bootstrapOtherRelocation(publishPath, "R_AARCH64_", 1027)
                 if (other != "") {

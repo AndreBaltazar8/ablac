@@ -131,6 +131,12 @@ option for it: the program decides. `ablac build --verbose` prints a note
 naming why a build linked libc. macOS executables link libSystem (below), and libraries
 and objects are unchanged.
 
+An AArch64 program links glibc this way only when it is built on an AArch64 Linux machine, against that machine's
+glibc and libraries (with clang and their development files, as on x86-64). Built for `aarch64-linux` on any other
+host, it has only the libc-free link: a program that brings a C library stops with `E_BUILD_TARGET_CAPABILITY`
+naming the boundary ([design/aarch64-linux-c-boundary.md](design/aarch64-linux-c-boundary.md), option A).
+`tools/test-aarch64-c-boundary.sh` checks the native rule on GitHub's `ubuntu-24.04-arm` runner.
+
 An `aarch64-linux` shared or static library carries its own system calls, heap, memory and jump
 routines, as an arm64 Android library does. It names no library (no `DT_NEEDED`) and leaves only
 `pthread_create` and `pthread_join` undefined. Those two come from the C library of the process that

@@ -135,3 +135,10 @@ needs to build ARM graphics binaries on x86-64. Its cost is in maintaining a sys
 > - **B:** A, plus building them for ARM from x86-64 through a downloaded ARM system library set (nix). More CI, and each new
 >   system library must exist in that set. Graphics programs can't be run under emulation, only linked.
 > - **C:** ARM Linux stays libc-free. These programs are documented as x86-64 Linux only, with a clear error.
+
+## Decision
+
+André chose **A** (#184). On an AArch64 Linux host, a program that brings a C library links the system's glibc and those
+libraries, by the x86-64 rule; a cross build that has a C boundary keeps `E_BUILD_TARGET_CAPABILITY`. The CI job
+`aarch64-c-boundary` (ci.yml, `ubuntu-24.04-arm`) builds and runs the nine `nobuild-a64` programs with the native AArch64
+compiler (tools/test-aarch64-c-boundary.sh).
