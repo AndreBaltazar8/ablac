@@ -242,6 +242,7 @@ test-serial: ablac
 	tools/test-release-check-playground.sh
 	tools/test-wasm-panic-message.sh $(COMPILER)
 	tools/test-release-scripts.sh $(COMPILER)
+	tools/test-gate-hold.sh
 	tools/test-siblings-tool.sh
 	tools/test-release-after.sh $(COMPILER)
 	tools/test-wasm-debug-reproducible.sh $(COMPILER)

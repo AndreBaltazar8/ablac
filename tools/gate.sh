@@ -5,7 +5,8 @@
 # on the stage that bootstrap-stages built and compared, not a further build; `make self-rebuild` in an older tree), then the
 # suite. Two chunks (the stage
 # builds and the self-rebuild; the suite) each queue for the shared full-test slot and then the build slot (fair-flock), so no
-# slot is held for more than one chunk. The progress is in <worktree>/build/gate/gate.log: the line `stage2 == stage3`, the
+# slot is held for more than one chunk. A builds chunk that finds the slot's suite running (another gate's) builds inside
+# that suite's hold instead, taking no lock (tools/gate-hold.sh, hold_mark below). The progress is in <worktree>/build/gate/gate.log: the line `stage2 == stage3`, the
 # suite's `N passed, M failed in Xs`, and last `exit=<status>`. Run it through systemd-run (never nohup: it ignores SIGHUP and
 # breaks the signal-watch test).
 #
@@ -91,29 +92,59 @@ else
     fi
 fi
 
+# The suite's hold, lent to the next gate's builds (tools/gate-hold.sh). While a suite runs it holds both of the slot's
+# locks for half an hour, and the next gate on the slot would wait all of it to build its stages, a single thread on the
+# slot's cores for most of three minutes. So the suite marks its hold in this file (its process and start time, removed when
+# it ends), and a builds chunk that finds a live mark for its slot runs inside that hold instead of queueing: it takes no
+# lock of its own, so NovaKind sees the slot exactly as before (both locks held by the suite), and it is killed if the suite
+# ends first, after which it queues for both locks and builds again as before. The mark is in a directory only this user
+# can write (not the shared /tmp, where anyone could plant one that lends a hold no suite has, or block the suite's own);
+# a mark that cannot be written only means the hold is not lent.
+# One place for every gate of this user (a systemd unit has no XDG_RUNTIME_DIR unless given it, a shell does).
+hold_directory=${HOME:?}/.cache/ablac-gate
+hold_mark=${GATE_HOLD_MARK:-$hold_directory/suite.slot$n}
+if ((!dry)) && [[ -z ${GATE_HOLD_MARK:-} ]]; then
+    mkdir -p -m 700 -- "$hold_directory" 2> /dev/null || true
+fi
+
 # One chunk inside both slots, in the worktree's shell.
 step() { # name commands
-    local android_args=()
+    local android_args=() mark= status
     if [[ $1 == suite && $android_tests == true ]]; then
         android_args=(--arg androidTests true)
+    fi
+    # The suite marks its hold for the next gate's builds, and the mark goes when the suite does.
+    if [[ $1 == suite && -x $tree/tools/gate-hold.sh ]]; then
+        mark="GATE_HOLD_FILE=$(printf %q "$hold_mark")
+        tools/gate-hold.sh mark \"\$GATE_HOLD_FILE\" \$\$ || echo 'gate: the suite could not mark its hold, so it is not lent'
+        trap '[[ \$(cut -d\" \" -f1 \"\$GATE_HOLD_FILE\" 2> /dev/null) == \$\$ ]] && rm -f \"\$GATE_HOLD_FILE\"' EXIT"
     fi
     if ((dry)); then
         printf '== %s (slot %s, cpus %s, jobs %s, fair-flock %s)\n' "$1" "$n" "$cpus" "$jobs" "$slot"
         [[ ${#android_args[@]} == 0 ]] || printf 'nix-shell --arg androidTests true\n'
+        [[ -z $mark ]] || printf '%s\n' "$mark"
         printf '%s\n' "$2"
         return 0
     fi
-    "$slot" --close /tmp/novakind-full-test.slot$n \
-        "$slot" --close /tmp/novakind-build.slot$n \
-        nix-shell "$tree/shell.nix" "${android_args[@]}" --run "
+    local shell=(nix-shell "$tree/shell.nix" "${android_args[@]}" --run "
         set -e
-        echo \"granted \$(date -u +%FT%TZ): $1\"
+        echo \"granted \$(date -u +%FT%TZ): $1\${GATE_BORROWED:+ (inside the slot's running suite's hold)}\"
         cd $tree
         ulimit -Ss 8192
         TIMEFORMAT='%R s'
+        $mark
         $2
         echo \"released \$(date -u +%FT%TZ): $1\"
-      " >> "$log" 2>&1
+      ")
+    if [[ $1 == builds && -x $tree/tools/gate-hold.sh ]] && "$tree/tools/gate-hold.sh" live "$hold_mark"; then
+        status=0
+        GATE_BORROWED=1 "$tree/tools/gate-hold.sh" borrow "$hold_mark" "${shell[@]}" >> "$log" 2>&1 || status=$?
+        ((status == 75)) || return "$status"
+        echo "gate: the suite whose hold the builds were in ended first; queueing for the slot" >> "$log"
+    fi
+    "$slot" --close /tmp/novakind-full-test.slot$n \
+        "$slot" --close /tmp/novakind-build.slot$n \
+        "${shell[@]}" >> "$log" 2>&1
 }
 
 build() { echo "time taskset -c $cpus tools/build-self-hosted-release.sh $1 $2 src/orc_main.ab"; }
