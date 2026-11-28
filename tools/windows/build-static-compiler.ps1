@@ -7,7 +7,7 @@ param(
     [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64',
     # The C library ablac.exe links (docs/design/windows-crt-free-compiler.md, step 7): msvc, the static UCRT and libcmt
     # (/MT), or abla, Abla's own, which needs the object of src/orc_windows_main_crtfree.ab as -CompilerObject.
-    [ValidateSet('msvc', 'abla')][string]$CLibrary = 'msvc',
+    [ValidateSet('msvc', 'abla', 'abla-heap')][string]$CLibrary = 'msvc',
     # Also link the /GS exception-dispatch probe (tools/windows/check-gs-handler.ps1): this object, gs-probe.cpp compiled by
     # cl, linked as ablac.exe is, to abla-gs-probe.exe in the build directory.
     [string]$GsProbeObject,
@@ -30,7 +30,9 @@ $compiler = (Resolve-Path -LiteralPath $CompilerObject).Path
 $imports = (Resolve-Path -LiteralPath $ImportDirectory).Path
 $llvm = (Resolve-Path -LiteralPath $LlvmRoot).Path
 $build = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildDirectory)
-$targetOptions = @("-DABLA_C_LIBRARY=$CLibrary")
+# abla-heap: the Abla C library with malloc and free on the Windows process heap (process-heap.cpp), a measurement arm.
+$targetOptions = if ($CLibrary -eq 'abla-heap') { @('-DABLA_C_LIBRARY=abla', '-DABLA_WINDOWS_PROCESS_HEAP=ON') }
+    else { @("-DABLA_C_LIBRARY=$CLibrary") }
 $machine = 'IMAGE_FILE_MACHINE_AMD64'
 if ($Architecture -eq 'arm64') {
     $machine = 'IMAGE_FILE_MACHINE_ARM64'

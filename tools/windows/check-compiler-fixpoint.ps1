@@ -6,7 +6,7 @@ param(
     [ValidateSet('interp', 'native')][string]$Tier = 'interp',
     [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64',
     # The C library the self-builds link (build-static-compiler.ps1): abla builds src/orc_windows_main_crtfree.ab.
-    [ValidateSet('msvc', 'abla')][string]$CLibrary = 'msvc'
+    [ValidateSet('msvc', 'abla', 'abla-heap')][string]$CLibrary = 'msvc'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +30,7 @@ $bundleArchitecture = if ($Architecture -eq 'arm64') { 'aarch64' } else { 'x86_6
 $target = if ($Architecture -eq 'arm64') { 'aarch64-windows' } else { 'x86_64-windows-hosted' }
 $machine = if ($Architecture -eq 'arm64') { 'IMAGE_FILE_MACHINE_ARM64' } else { 'IMAGE_FILE_MACHINE_AMD64' }
 $seed = Join-Path $seedRoot "abla-toolchain-$bundleArchitecture-windows/bin/ablac.exe"
-$entry = if ($CLibrary -eq 'abla') { 'src/orc_windows_main_crtfree.ab' } else { 'src/orc_windows_main.ab' }
+$entry = if ($CLibrary -ne 'msvc') { 'src/orc_windows_main_crtfree.ab' } else { 'src/orc_windows_main.ab' }
 $coff = Join-Path $work 'coff'
 $link = Join-Path $work 'link'
 

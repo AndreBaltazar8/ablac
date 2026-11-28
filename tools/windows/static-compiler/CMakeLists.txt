@@ -18,6 +18,10 @@ set(ABLA_C_LIBRARY "msvc" CACHE STRING "The C library ablac links: msvc (/MT) or
 if(NOT ABLA_C_LIBRARY MATCHES "^(msvc|abla)$")
   message(FATAL_ERROR "ABLA_C_LIBRARY must be msvc or abla")
 endif()
+option(ABLA_WINDOWS_PROCESS_HEAP "With ABLA_C_LIBRARY abla: malloc and free on the process heap (process-heap.cpp), to measure" OFF)
+if(ABLA_WINDOWS_PROCESS_HEAP AND NOT ABLA_C_LIBRARY STREQUAL "abla")
+  message(FATAL_ERROR "ABLA_WINDOWS_PROCESS_HEAP needs ABLA_C_LIBRARY abla")
+endif()
 
 find_package(LLD 23.1.3 EXACT REQUIRED CONFIG PATHS "${ABLA_LLVM_ROOT}/lib/cmake/lld" NO_DEFAULT_PATH)
 
@@ -113,10 +117,16 @@ function(abla_link_abla_c_library target)
     /alternatename:malloc=abla_libc_malloc /alternatename:calloc=abla_libc_calloc /alternatename:free=abla_libc_free
     /alternatename:realloc=abla_libc_realloc /alternatename:atoi=abla_windows_atoi)
   target_sources(${target} PRIVATE crt-free-start.cpp)
+  # A measurement arm (build-static-compiler.ps1 -CLibrary abla-heap): malloc and free on the process heap, whose
+  # definitions the /alternatename defaults above then give way to.
+  if(ABLA_WINDOWS_PROCESS_HEAP)
+    target_sources(${target} PRIVATE process-heap.cpp)
+  endif()
   abla_libcmt_gs_objects(gs_objects)
   target_sources(${target} PRIVATE ${gs_objects})
 endfunction()
 set_source_files_properties(crt-free-start.cpp PROPERTIES COMPILE_OPTIONS "/GS-;/Zl")
+set_source_files_properties(process-heap.cpp PROPERTIES COMPILE_OPTIONS "/Zl")
 
 set_source_files_properties("${ABLA_COMPILER_OBJECT}" PROPERTIES EXTERNAL_OBJECT TRUE)
 # ablac.exe and the /GS probe below: the compiler object, the lld shim and an entry (crt-start.cpp's wmain, which runs
