@@ -1,0 +1,57 @@
+// Decimal f64 literals in a kernel: the GPU must read each as its value, as the CPU backend does. Before the fix the
+// kernel lowering gave every decimal f64 literal the bits 0 (it read only hexadecimal, inf and nan), so these were all
+// 0 or the other operand on the GPU, among them f32FromInt of an int past 2^53, whose last step is a multiply by 2048.0.
+import "abla/kernel"
+import "abla/kernel/cuda"
+import "abla/float"
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+val LITERAL_WORDS = 8
+
+/** Per thread i: LITERAL_WORDS f32 bit patterns, each made from i and a decimal f64 literal (exact ones, rounded ones,
+ *  tiny and huge ones, negative ones). */
+@kernel
+fun literalAll(out: KernelU32Buffer, n: int) {
+    val i = kernelGlobalId()
+    if (i >= n) return
+    val d = f64FromInt(i)
+    val at = i * 8
+    out.store(at, int(f32ToBits(f64ToF32(d * 2048.0))))
+    out.store(at + 1, int(f32ToBits(f64ToF32(d * 0.1 + 0.2))))
+    out.store(at + 2, int(f32ToBits(f64ToF32(d - 3.75))))
+    out.store(at + 3, int(f32ToBits(f64ToF32(d * 1.0e-7 + 6.02214076e23))))
+    out.store(at + 4, int(f32ToBits(f64ToF32(d * 1.0e-310 * 1.0e300))))
+    out.store(at + 5, int(f32ToBits(f64ToF32(-d / 3.0))))
+    out.store(at + 6, int(f32ToBits(f32FromInt((i + 1) << 55))))
+    out.store(at + 7, int(f32ToBits(f32FromInt(-((i + 3) << 54) - i))))
+}
+
+/** How many words of literalAll differ between the GPU and the CPU backend (or 1 when the GPU part cannot run). */
+trusted fun literalCases(var device: CudaKernelDevice): int {
+    val n = 256
+    val cpuOut = nativeByteBuffer(n * LITERAL_WORDS * 4)
+    val gpuOut = nativeByteBuffer(n * LITERAL_WORDS * 4)
+    val cpuWords = KernelU32Buffer(nativePointerAddress(cpuOut.address), n * LITERAL_WORDS)
+    kernelRunCpu(n / 64, 64) { literalAll(cpuWords, n) }
+    val dOut = device.allocate(n * LITERAL_WORDS * 4)
+    if (dOut == null) {
+        println("literals: ${device.error}")
+        return 1
+    }
+    if (!device.launch("literalAll", n / 64, 64, cudaKernelArguments().buffer(dOut.words()).integer(n)) ||
+        !device.download(dOut, gpuOut)) {
+        println("literals: ${device.error}")
+        return 1
+    }
+    val gpuWords = KernelU32Buffer(nativePointerAddress(gpuOut.address), n * LITERAL_WORDS)
+    var wrong = 0
+    for (i in 0 until n * LITERAL_WORDS) {
+        if (cpuWords.load(i) != gpuWords.load(i)) {
+            if (wrong == 0) println("literals: thread ${i / LITERAL_WORDS} word ${i % LITERAL_WORDS} is ${gpuWords.load(i)} on the GPU, ${cpuWords.load(i)} on the CPU")
+            wrong = wrong + 1
+        }
+    }
+    wrong
+}

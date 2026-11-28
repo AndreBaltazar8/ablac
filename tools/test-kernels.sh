@@ -2,6 +2,7 @@
 # `@kernel` functions (#1233, docs/language.md#gpu-kernels):
 #   - abla-grad's NVFP4 matvec as a kernel on the CPU backend agrees with an independent f64 reference (nvfp4-cpu.ab);
 #   - the half-precision conversions (bf16, f16, FP8 E4M3, f16x2 fma, rounded ints) give CUDA C's bits on the CPU (half-cpu.ab);
+#   - decimal f64 literals in a kernel keep their f64 bits in the PTX, on any host (literal-ptx.ab);
 #   - a kernel outside the subset is refused when the program is built, naming the rule: a string (kernel.operation), a
 #     recursive call (kernel.recursion), a result (kernel.signature), native code (kernel.call);
 #   - on CUDA (tests/cases/kernel-cuda, the compiler's PTX through abla/kernel/cuda): vadd equals the CPU's result and the
@@ -40,6 +41,13 @@ fi
 "$compiler" build "$cases/half-cpu.ab" -o "$out/half-cpu" --fast --no-cache > "$out/half-cpu.log" 2>&1 ||
     fail "half-cpu did not build: $(head -4 "$out/half-cpu.log")"
 "$out/half-cpu" > "$out/half-cpu.out" 2>&1 || fail "half-cpu: $(cat "$out/half-cpu.out")"
+
+# Decimal f64 literals keep their value in the PTX (literal-ptx.ab), on any host: the lowering once read every one as 0.
+"$compiler" build "$cases/literal-ptx.ab" -o "$out/literal-ptx" --fast --no-cache > "$out/literal-ptx.log" 2>&1 ||
+    fail "literal-ptx did not build: $(head -4 "$out/literal-ptx.log")"
+"$out/literal-ptx" > "$out/literal.ptx" 2> "$out/literal-ptx.err" || fail "literal-ptx: $(cat "$out/literal-ptx.err")"
+grep -q 0d40A0000000000000 "$out/literal.ptx" && grep -q 0d3FB999999999999A "$out/literal.ptx" ||
+    fail "literal-ptx: 2048.0 or 0.1 lost its value in the PTX: $(grep -E "0d[0-9A-F]{16}" "$out/literal.ptx" | head -3)"
 
 for refused in string:operation:string recursion:recursion:depth result:signature native:call:ablaLinuxSyscall launch-target:launch-bounds:helper launch-range:launch-bounds:wide array-index:array-index:index array-size:array-size:count buffers-index:buffers-index:2; do
     IFS=: read -r name rule detail <<< "$refused"
@@ -134,12 +142,12 @@ if [[ -n $library ]]; then
         grep -q "GPU equal to CPU true" "$out/kernel-cuda.out" && grep -q "within 1e-5 of CPU true" "$out/kernel-cuda.out" &&
             grep -q "on the GPU and the CPU true" "$out/kernel-cuda.out" &&
             grep -q "within 1e-5 of the CPU true" "$out/kernel-cuda.out" && grep -q "matvecQ8: .* true" "$out/kernel-cuda.out" &&
-            grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "kernelTanh: .*: true" "$out/kernel-cuda.out" && grep -q "kernelSigmoid: .*: true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" && grep -q "quad4: .* true" "$out/kernel-cuda.out" && grep -q "words4: .* true" "$out/kernel-cuda.out" && grep -q "pairs2: .* true" "$out/kernel-cuda.out" &&
+            grep -q "kernelExp: .*: true" "$out/kernel-cuda.out" && grep -q "kernelTanh: .*: true" "$out/kernel-cuda.out" && grep -q "kernelSigmoid: .*: true" "$out/kernel-cuda.out" && grep -q "decimal f64 literals: .* true" "$out/kernel-cuda.out" && grep -q "pick4: .* true" "$out/kernel-cuda.out" && grep -q "quad4: .* true" "$out/kernel-cuda.out" && grep -q "words4: .* true" "$out/kernel-cuda.out" && grep -q "pairs2: .* true" "$out/kernel-cuda.out" &&
             grep -q "matvecQ8Fast: .* true" "$out/kernel-cuda.out" && grep -q "atomics: .* true" "$out/kernel-cuda.out" && grep -q "shuffle: .* true" "$out/kernel-cuda.out" && grep -q "subgroups: .* true" "$out/kernel-cuda.out" && grep -q "arrays: .* true, in registers true" "$out/kernel-cuda.out" && grep -q "launch: .* true" "$out/kernel-cuda.out" && grep -q "intrinsics: .* true" "$out/kernel-cuda.out" && grep -q "streams: .* true" "$out/kernel-cuda.out" && grep -q "mma: .* true $" "$out/kernel-cuda.out" &&
             grep -q "launch guards: .* true" "$out/kernel-cuda.out" && grep -q "edge indices: .* true" "$out/kernel-cuda.out" &&
             grep -q "half: .* the same bits: true" "$out/kernel-cuda.out" ||
             fail "kernel-cuda: $(cat "$out/kernel-cuda.out")"
-        cuda="vadd, the NVFP4 and Q8_0 matvecs (and Q8_0 on the unchecked fast path), rmsnorm (shared memory, barriers), kernelExp, kernelTanh, kernelSigmoid, the buffer edges and the half-precision conversions agree on the GPU and the CPU"
+        cuda="vadd, the NVFP4 and Q8_0 matvecs (and Q8_0 on the unchecked fast path), rmsnorm (shared memory, barriers), kernelExp, kernelTanh, kernelSigmoid, decimal f64 literals, the buffer edges and the half-precision conversions agree on the GPU and the CPU"
     fi
 fi
 echo "kernels: the NVFP4 matvec kernel matches its reference on the CPU; the half-precision conversions give CUDA C's bits on the CPU; a string, recursion, a result, native code and an untrusted unchecked load are refused; the CPU backend stops an unchecked load past the end and keeps dynamic shared memory alive past its launch; CUDA: $cuda"
