@@ -100,6 +100,26 @@ for what in TlsClient.handshakeSecret TlsClient.keyPairs TlsClient.masterSecret 
     grep "error\[E_SEMANTIC\]: name.private:$what:" "$out/machine-secrets.log" > /dev/null ||
         fail "machine-secrets: $what is not private: $(head -4 "$out/machine-secrets.log")"
 done
+# abla/simd's byte-lane address functions and ByteBuffer.stageReserve (decision #130 A, e6 S2 and S2a): a call and a reference from code
+# that is not trusted are refused; the raw lane intrinsics, which skip .get's and .with's index check, are private to abla/simd (S3).
+build "$root/stdlib" raw-lanes
+[[ $status != 0 ]] || fail "raw-lanes built"
+for what in ByteBuffer.stageReserve u8x16.storeAddress; do
+    grep "error\[E_SEMANTIC\]: native.trust:$what\($\|@\|:\)" "$out/raw-lanes.log" > /dev/null ||
+        fail "raw-lanes: $what is not refused: $(head -4 "$out/raw-lanes.log")"
+done
+[[ $(grep -c 'error\[E_SEMANTIC\]: native.trust:u8x16LoadAddress\($\|@\|:\)' "$out/raw-lanes.log") -ge 2 ]] ||
+    fail "raw-lanes: the call and the reference to u8x16LoadAddress are not both refused: $(head -6 "$out/raw-lanes.log")"
+grep -q 'help: load from a string with u8x16Load' "$out/raw-lanes.log" || fail "raw-lanes: no help: $(head -5 "$out/raw-lanes.log")"
+build "$root/stdlib" lane-index
+[[ $status != 0 ]] || fail "lane-index built"
+for what in ablaSimd_with_u8x16 ablaSimd_get_u8x16 ablaSimd_get_u64x8 ablaSimd_with_f32x4; do
+    grep "error\[E_SEMANTIC\]: name.private:$what\($\|@\|:\)" "$out/lane-index.log" > /dev/null ||
+        fail "lane-index: $what is not private: $(head -4 "$out/lane-index.log")"
+done
+build "$root/stdlib" trusted-lanes
+[[ $status == 0 ]] || fail "trusted-lanes was refused: $(head -4 "$out/trusted-lanes.log")"
+[[ $("$out/trusted-lanes") == "lanes 104 88 7 65" ]] || fail "trusted-lanes did not print 'lanes 104 88 7 65': $("$out/trusted-lanes" 2>&1 | head -2)"
 for accepted in trusted-call open trusted-syscall trusted-field caller-strings; do
     build "$root/stdlib" "$accepted"
     [[ $status == 0 ]] || fail "$accepted was refused: $(head -4 "$out/$accepted.log")"
