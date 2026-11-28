@@ -423,6 +423,7 @@ test-serial: ablac
 	tools/test-compile-eval-directory.sh $(COMPILER)
 	tools/test-compile-native.sh $(COMPILER)
 	tools/test-compile-tls.sh $(COMPILER)
+	tools/test-compile-bridge-grants.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)
