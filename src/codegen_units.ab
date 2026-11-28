@@ -35,6 +35,7 @@ import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 import "abla/bits"
 import "abla/llvm/orc"
+import "abla/unsafe/native"
 import "backend/llvm/bindings.ab"
 import "backend/llvm/debug.ab"
 
@@ -362,10 +363,81 @@ trusted fun bootstrapCodegenPromoteValue(value: i64*, anonymous: int): int {
     next
 }
 
-/** A declaration standing for `function` (which is then deleted): its name,
+noescape extern:"c" fun LLVMGetStringAttributeKind(attribute: i64*, length: i64*): i64*
+noescape extern:"c" fun LLVMRemoveStringAttributeAtIndex(function: i64*, index: i32, key: i64*, length: i32): void
+noescape extern:"c" fun LLVMSetComdat(value: i64*, comdat: i64*): void
+
+/** The address of llvm::Function::deleteBodyImpl(bool), the work of Function::deleteBody that libLLVM exports under its
+ *  Itanium name, found once (-1 until then); 0 when this compiler can't find it (one linked statically, whose LLVM keeps
+ *  its symbols to itself, or another C++ ABI), and the strip erases as before. */
+var bootstrapCodegenDeleteBodyAddress = -1
+
+/** Drops `function`'s body where it stands, making it a declaration (in a module read lazily, a body never read stays
+ *  unread), without erasing the function: the bitcode reader keeps the functions it has not read yet in tables keyed by
+ *  their Function*, and erasing one frees memory a later function can take while the reader still holds the old key (the
+ *  suspect of GA74's rare crash in libLLVM, a null + 0xc read in a self-rebuild). false when this compiler can't. */
+trusted fun bootstrapCodegenDropBody(function: i64*): bool {
+    if (bootstrapCodegenDeleteBodyAddress < 0) {
+        // LLVM searches only the libraries it loaded: "" is the running program's own handle, whose scope is the
+        // executable and what it links (libLLVM), as ctNativeProcessSymbol loads it.
+        bootstrapCodegenDeleteBodyAddress = if (llvmLoadLibraryPermanently("") != 0) 0
+            else llvmSearchForAddressOfSymbol("_ZN4llvm8Function14deleteBodyImplEb")
+        val trace = linuxEnvironment("ABLA_CODEGEN_UNITS_TRACE")
+        if (trace.found && trace.value == "1") {
+            linuxPrintStandardError(if (bootstrapCodegenDeleteBodyAddress != 0) "codegen units: other units' bodies dropped in place\n"
+                else "codegen units: other units' functions erased\n")
+        }
+    }
+    if (bootstrapCodegenDeleteBodyAddress == 0) return false
+    // deleteBodyImpl(this, ShouldDrop = false), whose first step clears the function's materializable mark; the third
+    // argument is not read.
+    ablaUnsafeCallVoidPointer3(bootstrapCodegenDeleteBodyAddress, function, nativeNullPointer(), nativeNullPointer())
+    true
+}
+
+/** Removes `function`'s string attributes (the ones that describe a body) at every index, keeping the others. */
+trusted fun bootstrapCodegenDropStringAttributes(function: i64*): void {
+    var index = -1
+    val parameters = int(LLVMCountParams(function))
+    val length = nativeByteBuffer(8)
+    while (index <= parameters) {
+        val count = int(LLVMGetAttributeCountAtIndex(function, i32(index)))
+        if (count > 0) {
+            val attributes = nativeByteBuffer(count * 8)
+            LLVMGetAttributesAtIndex(function, i32(index), attributes.pointerAt(0))
+            var slot = 0
+            while (slot < count) {
+                val attribute = nativePointerFromAddress(attributes.loadI64(slot * 8))
+                if (LLVMIsStringAttribute(attribute) != i32(0)) {
+                    length.storeI64(0, 0)
+                    val key = LLVMGetStringAttributeKind(attribute, length.pointerAt(0))
+                    LLVMRemoveStringAttributeAtIndex(function, i32(index), key, i32(length.loadI64(0) & 4294967295))
+                }
+                slot = slot + 1
+            }
+            attributes.close()
+        }
+        index = index + 1
+    }
+    length.close()
+    return
+}
+
+/** `function` as a declaration: where it stands when this compiler can drop its body (bootstrapCodegenDropBody), else a
+ *  new declaration standing for it (and `function` is deleted). Either way its name,
  *  type, calling convention, visibility and attributes (not the string ones,
  *  which describe a body). */
 trusted fun bootstrapCodegenDeclareFunction(module: i64*, function: i64*): void {
+    if (bootstrapCodegenDropBody(function)) {
+        // As the new declaration would be: external, with no section, alignment, comdat or unnamed_addr.
+        LLVMSetLinkage(function, i32(0))
+        LLVMSetSection(function, "")
+        LLVMSetAlignment(function, i32(0))
+        LLVMSetUnnamedAddress(function, i32(0))
+        LLVMSetComdat(function, nativeNullPointer())
+        bootstrapCodegenDropStringAttributes(function)
+        return
+    }
     val name = bootstrapLlvmDebugValueName(function)
     LLVMSetValueName2(function, "", 0)
     val declaration = LLVMAddFunction(module, name, LLVMGlobalGetValueType(function))
