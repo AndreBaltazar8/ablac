@@ -64,6 +64,17 @@ manages this memory itself has to be a `trusted fun`, and a dependency
 that defines trusted code needs a grant line in your manifest
 ([packages.md](packages.md)).
 
+The pure TLS library follows the same rule for the secrets it wipes:
+
+- `TlsClient` and `TlsServer` keep their key pairs, secrets and tickets
+  private, set only by their own functions;
+- `Sha256Stream`, `TlsStoredTicket`, `TlsTicketState` and
+  `TlsIdentityKeys` are made only by the library: use `sha256Stream()`,
+  the session cache, the ticket keys and the identity loaders;
+- an identity's `wipe()`, and a key generation, clear only strings the
+  library made, so a `TlsIdentity` built by hand has nothing of yours
+  wiped.
+
 ## 2. A region stores only into its own objects
 
 Inside `region { ... }`, a region's object could be stored into an object
@@ -176,17 +187,16 @@ fun main {
 // <a href="about:invalid#abla-unsafe-url">Open</a>
 ```
 
-The ways past these checks are now explicit:
+The ways past these checks are explicit:
 
-- `ablaHtmlTrustedAttribute(name, value)` writes one attribute without
+- `ablaHtmlTrustedAttribute(name, value)`, or
+  `HtmlAttribute(name, value, "", true)`, writes one attribute without
   them;
-- `ablaHtmlRaw(markup)` inserts markup as it is.
+- `ablaHtmlRaw(markup)` inserts markup as it is;
+- an `Html` value can be built with its constructor.
 
-`HtmlAttribute(name, value, "", true)` no longer skips the checks; use
-`ablaHtmlTrustedAttribute(name, value)`. An `Html` value built with its
-constructor rather than by `$html` or `ablaHtmlRaw` is written as escaped
-text. Use either only for values your program wrote or fully checked.
-See [subparsers.md](subparsers.md).
+Use them only for values your program wrote or fully checked. See
+[subparsers.md](subparsers.md#urls-and-event-handlers).
 
 ## 4. HTTP servers refuse headers and framing they cannot send
 
@@ -252,10 +262,10 @@ import "util.ab"
 import github("owner/other-package")
 ```
 
-**Fix:** a package that reached a sibling checkout by path, which is
-common in development, should name that package as a dependency and import it by name.
-A sibling path in your own project, such as
-`import "../../abla-postgres/src/postgres.ab"`, still works.
+**Fix:** a package that needs another package's files names that package
+as a dependency and imports it by name. A sibling path in your own
+project, such as `import "../../abla-postgres/src/postgres.ab"`, still
+works.
 
 ## 6. Shared `is` arms see a nullable subject as not null
 
