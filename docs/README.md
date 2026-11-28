@@ -15,6 +15,7 @@ examples. The [compact guide](guide.md) is a single-page refresher.
 | [ownership.md](ownership.md) | Who may change a value and who cleans it up: `var`/`own` parameters, `move`, resources, borrows, `Shared`/`Mutex`, closures |
 | [concurrency.md](concurrency.md) | `defer`, generators, tasks and threads |
 | [regions.md](regions.md) | `region { ... }`: scoped allocation and its escape rules |
+| [security.md](security.md) | What Abla checks for you and what your program still must do: trusted code, regions, dependencies, compile-time grants, `$html`, HTTP, TLS, signed releases |
 | [standard-library.md](standard-library.md) | Every `abla/...` module, by task, with links to their API pages |
 | [stdlib/text.md](stdlib/text.md), [stdlib/system.md](stdlib/system.md), [stdlib/numbers.md](stdlib/numbers.md), [stdlib/security-and-dates.md](stdlib/security-and-dates.md), [stdlib/testing.md](stdlib/testing.md) | Library API pages: text, files and processes, math, hashing and dates, testing |
 | [json.md](json.md) | `abla/json`, `$json` and `$jsons` |
