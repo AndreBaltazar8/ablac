@@ -218,6 +218,8 @@ fun BootstrapAnalysisService.graphBudgetIncomplete(): Json {
         bootstrapAnalysisGraphActiveEntry = ""
         bootstrapAnalysisGraphModules = bootstrapModuleState()
         this.graphParsed = Map()
+        this.graphEncoded = Map()
+        this.graphEncodedBytes = 0
         this.graphQueryIndex = null
         this.graphIndexRevision = -1
         this.graphReplayInputs = null
@@ -823,15 +825,56 @@ fun BootstrapAnalysisService.graphWriteAnalysis(id: int, answer: Json): void {
         if (!linuxWriteStandardOutputAll("$delimiter$quoted:")) return
         if (key == "documents" && value.isArray()) {
             if (!linuxWriteStandardOutputAll("[")) return
+            val revision = answer.get("revision")
             for (item in 0 until value.values.size) {
                 if (item > 0 && !linuxWriteStandardOutputAll(",")) return
-                val document = this.graphMaterializeDocument(value.values[item])
-                if (!linuxWriteStandardOutputAll(jsonStringify(document))) return
+                val text = this.graphEncodedDocument(if (revision.isString()) revision.asString() else "", value.values[item])
+                if (!linuxWriteStandardOutputAll(text)) return
             }
             if (!linuxWriteStandardOutputAll("]")) return
         } else if (!linuxWriteStandardOutputAll(jsonStringify(value))) return
     }
     linuxPrintStandardOutput("}}\n")
+}
+
+/** What one document of an answer at `revision` encodes to. An analysis sends every module of the graph each time, the runtime's
+ *  too (a 2-line project's answer is 7.4 MB, 6.3 MB of it host.ab and runtime/self/entry.ab), and their symbols and occurrences
+ *  were encoded again for every request: 40 MB allocated and about a quarter of the request. graph-v2 keeps a fingerprint of each
+ *  document (graphGenerations: its version, the hash of its text and exported symbols, of its occurrences and of its diagnostics,
+ *  everything the encoded document is made of), so the text made for a fingerprint is kept and sent again while the fingerprint is
+ *  the same. A document of any other shape (a `fields` projection) or without a fingerprint (graph-v1) is encoded as before. The
+ *  texts kept are at most BOOTSTRAP_ANALYSIS_ENCODED_BYTES: what does not fit is encoded each time. */
+fun BootstrapAnalysisService.graphEncodedDocument(revision: string, document: Json): string {
+    if (!this.graphStableIds || revision == "" || !bootstrapAnalysisGraphWholeDocument(document)) {
+        return jsonStringify(this.graphMaterializeDocument(document))
+    }
+    val uri = document.getString("uri")
+    val fingerprint = this.graphFingerprint(revision, uri)
+    if (fingerprint == "") return jsonStringify(this.graphMaterializeDocument(document))
+    val kept = this.graphEncoded.get(uri)
+    if (kept != null && kept.fingerprint == fingerprint) return kept.text
+    val text = jsonStringify(this.graphMaterializeDocument(document))
+    val freed = if (kept != null) kept.text.size else 0
+    if (this.graphEncodedBytes - freed + text.size <= BOOTSTRAP_ANALYSIS_ENCODED_BYTES) {
+        this.graphEncoded.set(uri, BootstrapAnalysisEncodedDocument(fingerprint, text))
+        this.graphEncodedBytes = this.graphEncodedBytes - freed + text.size
+    } else if (kept != null) {
+        this.graphEncoded.remove(uri)
+        this.graphEncodedBytes = this.graphEncodedBytes - freed
+    }
+    text
+}
+
+/** The texts graphEncodedDocument keeps, in bytes: the runtime's documents of a small project, part of a large one's. */
+val BOOTSTRAP_ANALYSIS_ENCODED_BYTES = 33554432
+
+class BootstrapAnalysisEncodedDocument(val fingerprint: string, val text: string)
+
+/** Whether `document` has the fields an analysis answer's document has, in their order (and not a `fields` projection's subset). */
+fun bootstrapAnalysisGraphWholeDocument(document: Json): bool {
+    val keys = document.keys
+    keys.size == 6 && keys[0] == "uri" && keys[1] == "version" && keys[2] == "text" && keys[3] == "symbols" &&
+        keys[4] == "occurrences" && keys[5] == "diagnostics"
 }
 
 fun BootstrapAnalysisGraphQueryIndex.withDocumentation(symbol: Json): Json {
@@ -1398,6 +1441,8 @@ fun BootstrapAnalysisService.graphSnapshotRun(reuseTyping: bool = true): Json {
         bootstrapAnalysisGraphModules = bootstrapModuleState()
         bootstrapModuleFreezeSnapshots = bootstrapAnalysisFreezeEnabled()
         this.graphParsed = Map()
+        this.graphEncoded = Map()
+        this.graphEncodedBytes = 0
         if (reuseTyping) this.graphReplayInputs = null
     }
     bootstrapAnalysisGraphModules.overlays = []
