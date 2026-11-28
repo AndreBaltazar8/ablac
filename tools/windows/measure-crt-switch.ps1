@@ -17,7 +17,11 @@ param(
     [ValidateRange(1, 50)][int]$Rounds = 5,
     [ValidateRange(1, 10)][int]$SelfRounds = 3,
     [double]$Tolerance = 0.05,
-    [double]$SizeTolerance = 0.003
+    [double]$SizeTolerance = 0.003,
+    # Also one self-build of each compiler with ABLA_GC_TRACE=1, not timed into the medians: how many collections it ran,
+    # how many built the collector's page directory rather than taking the lazy lookup, their time, and the heap mapped
+    # at the last one, as information rows under the table and in measure.json.
+    [switch]$GcTrace
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,7 +43,7 @@ function Unpack([string]$Label, [string]$Archive) {
     [pscustomobject]@{
         Label = $Label; Ablac = $ablac; Zip = (Get-Item $path).Length; Exe = (Get-Item $ablac).Length
         Hello = [Collections.Generic.List[double]]::new(); Json = [Collections.Generic.List[double]]::new()
-        Self = [Collections.Generic.List[double]]::new()
+        Self = [Collections.Generic.List[double]]::new(); Gc = $null
     }
 }
 
@@ -106,6 +110,28 @@ try {
             $compiler.Self.Add($seconds)
         }
     }
+    if ($GcTrace) {
+        foreach ($compiler in $compilers) {
+            $self = Join-Path $work "$($compiler.Label)-self/ablac.exe"
+            New-Item -ItemType Directory -Force -Path (Split-Path $self) | Out-Null
+            $env:ABLA_GC_TRACE = '1'
+            try {
+                $seconds = Time-Build $compiler 'self-gc' @('build', 'src/orc_windows_main.ab', '--target', $target, '--no-cache', '-o', $self) 1 $root
+            } finally {
+                Remove-Item Env:ABLA_GC_TRACE -ErrorAction Ignore
+            }
+            Remove-Item -Recurse -Force -LiteralPath (Split-Path $self)
+            # Each collection traces "gc: directory reason <n>" (0: the lazy lookup) and "gc: live ... <ms> ms, mapped <bytes> ...".
+            $trace = Join-Path $work "$($compiler.Label)-self-gc.log"
+            $reasons = @(Select-String -LiteralPath $trace -Pattern '^gc: directory reason (\d+)' | ForEach-Object { [int]$_.Matches[0].Groups[1].Value })
+            $lives = @(Select-String -LiteralPath $trace -Pattern ' (\d+) ms, mapped (\d+)' | ForEach-Object { $_.Matches[0] })
+            $compiler.Gc = [ordered]@{
+                seconds = $seconds; collections = $reasons.Count; directory = @($reasons | Where-Object { $_ -ne 0 }).Count
+                milliseconds = [long](($lives | ForEach-Object { [long]$_.Groups[1].Value } | Measure-Object -Sum).Sum)
+                mapped = if ($lives.Count) { [long]$lives[-1].Groups[2].Value } else { [long]0 }
+            }
+        }
+    }
 } finally {
     Pop-Location
     $env:PATH = $savedPath
@@ -130,12 +156,21 @@ foreach ($row in $rows) {
     $format = if ($row.Time) { '{0:0.000}' } else { '{0:N0}' }
     $table += "| $($row.Name) | $($format -f $row.Base) | $($format -f $row.Cand) | $change | $(if ($ok) { 'ok' } else { 'WORSE' }) |"
 }
+if ($GcTrace) {
+    foreach ($row in @(@('GC collections (traced self-build)', 'collections'), @('GC page-directory builds', 'directory'),
+            @('GC time (ms)', 'milliseconds'), @('heap mapped at the last GC (bytes)', 'mapped'))) {
+        $b = $base.Gc[$row[1]]
+        $c = $cand.Gc[$row[1]]
+        $change = if ($b) { '{0:+0.0;-0.0;0.0}%' -f (100 * ($c - $b) / $b) } else { 'n/a' }
+        $table += "| $($row[0]) | $('{0:N0}' -f $b) | $('{0:N0}' -f $c) | $change | info |"
+    }
+}
 $table | Out-Host
 if ($env:GITHUB_STEP_SUMMARY) { ($table + '') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY }
 [ordered]@{
     architecture = $Architecture; rounds = $Rounds; selfRounds = $SelfRounds; tolerance = $Tolerance; sizeTolerance = $SizeTolerance
-    baseline = [ordered]@{ hello = $base.Hello; json = $base.Json; self = $base.Self; exe = $base.Exe; zip = $base.Zip }
-    candidate = [ordered]@{ hello = $cand.Hello; json = $cand.Json; self = $cand.Self; exe = $cand.Exe; zip = $cand.Zip }
+    baseline = [ordered]@{ hello = $base.Hello; json = $base.Json; self = $base.Self; exe = $base.Exe; zip = $base.Zip; gc = $base.Gc }
+    candidate = [ordered]@{ hello = $cand.Hello; json = $cand.Json; self = $cand.Self; exe = $cand.Exe; zip = $cand.Zip; gc = $cand.Gc }
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $work 'measure.json')
 if ($failures.Count) { throw "The Abla C library compiler is worse than /MT in: $($failures -join ', ')" }
 Write-Host "Abla C library compiler ($Architecture): no worse than /MT in speed (tolerance $Tolerance) or size (tolerance $SizeTolerance)"
