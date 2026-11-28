@@ -97,31 +97,40 @@ expressions=(
     '"abc".slice(0, spin()).size' 'filledArray(spin(), 7).size'
     'when (spin()) { 2 -> 42; else -> 1 }' '"x".repeat(spin()).size'
 )
-case_number=0
-for expression in "${expressions[@]}"; do
-    source="$output_directory/operand-$case_number.ab"
-    : > "$source"
-    if [[ $expression == *repeat* ]]; then echo 'import "abla/text"' >> "$source"; fi
-    sed "s@#(spin())@#($expression)@" "$project_root/tests/cases/eval-steps/operand-stop.ab" >> "$source"
-    for limit in 20 21 22 23 24 25 26 27 28 29; do
-        set +e
-        ABLA_COMPILE_EVAL=interp ABLA_EVAL_STEP_LIMIT=$limit "$compiler" --emit-llvm "$source" \
-            > "$output_directory/operand-$case_number-$limit.out" 2>&1
-        status=$?
-        set -e
-        log="$output_directory/operand-$case_number-$limit.out"
-        if [[ $status -ne 1 || $(grep -c '^error\[' "$log") -ne 1 ]] ||
-            ! grep -Fq 'error[E_EVAL_STEP_LIMIT]' "$log" ||
-            ! grep -Fq 'ABLA_COMPILE_EVAL_TRACE=1' "$log"; then
+# Every expression is a site of its own in one source (the step limit is per site), each in a function body as
+# operand-stop.ab's main is, so one build per limit stops all of them: each site reports one step-limit error and
+# nothing else, so an abandoned value one of them consumed would show as another error.
+source="$output_directory/operands.ab"
+echo 'import "abla/text"' > "$source"
+grep -v '^fun main: int = ' "$project_root/tests/cases/eval-steps/operand-stop.ab" >> "$source"
+sum=0
+for case_number in "${!expressions[@]}"; do
+    printf 'fun site%d: int = #(%s)\n' "$case_number" "${expressions[$case_number]}" >> "$source"
+    sum="$sum + site$case_number()"
+done
+echo "fun main: int = $sum" >> "$source"
+for limit in 20 21 22 23 24 25 26 27 28 29; do
+    log="$output_directory/operands-$limit.out"
+    set +e
+    ABLA_COMPILE_EVAL=interp ABLA_EVAL_STEP_LIMIT=$limit "$compiler" --emit-llvm "$source" > "$log" 2>&1
+    status=$?
+    set -e
+    if [[ $status -ne 1 || $(grep -c '^error\[' "$log") -ne ${#expressions[@]} ||
+        $(grep -c '^error\[E_EVAL_STEP_LIMIT\]: .*ABLA_COMPILE_EVAL_TRACE=1' "$log") -ne ${#expressions[@]} ]]; then
+        echo "eval-steps: the operands at $limit steps did not give exactly one step-limit error each" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+    for expression in "${expressions[@]}"; do
+        if [[ $(grep -cF "note: in \`#($expression)\` at " "$log") -ne 1 ]]; then
             echo "eval-steps: $expression at $limit steps did not give exactly one step-limit error" >&2
             cat "$log" >&2
             exit 1
         fi
     done
-    # The same expression without the cut-off is valid.
-    ABLA_COMPILE_EVAL=interp "$compiler" --emit-llvm "$source" > "$output_directory/operand-$case_number-ok.ll"
-    case_number=$((case_number + 1))
 done
+# The same expressions without the cut-off are valid.
+ABLA_COMPILE_EVAL=interp "$compiler" --emit-llvm "$source" > "$output_directory/operands-ok.ll"
 
 # Genuine faults remain diagnostics, including a different # site in the
 # same source as one stopped at its step limit.
