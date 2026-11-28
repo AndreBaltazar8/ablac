@@ -43,6 +43,25 @@ for count in 1000 2000 4000; do
     }' >"$out/$count.ab"
 done
 
+# Measurements of a ratio over its bound, after the first.
+retries=2
+
+seconds() { printf '%d.%02d' "$(($1 / 100))" "$(($1 % 100))"; }
+
+# measure <profile> <count>: builds and runs the program, sets cpu to the build's user + system CPU in hundredths of a second.
+measure() {
+    local target="$out/$1-$2"
+    if ! "$timer" -p "$compiler" build "$out/$2.ab" -o "$target" "${flags[@]}" \
+        >"$target.log" 2>"$target.time"; then
+        cat "$target.log" "$target.time" >&2
+        exit 1
+    fi
+    "$target" >"$target.stdout"
+    cmp "$out/$2.expected" "$target.stdout"
+    cpu=$(awk '/^(user|sys) / { total += $2 } END { printf "%.0f\n", total * 100 }' "$target.time")
+    printf 'native locals scaling: %s %d locals %s CPU s\n' "$1" "$2" "$(seconds "$cpu")"
+}
+
 for profile in release fast; do
     flags=(--no-cache --no-debug)
     if [[ $profile == fast ]]; then flags+=(--fast); fi
@@ -57,24 +76,29 @@ for profile in release fast; do
     fi
     cpu_by_count=()
     for count in 1000 2000 4000; do
-        target="$out/$profile-$count"
-        if ! "$timer" -p "$compiler" build "$out/$count.ab" -o "$target" "${flags[@]}" \
-            >"$target.log" 2>"$target.time"; then
-            cat "$target.log" "$target.time" >&2
-            exit 1
-        fi
-        "$target" >"$target.stdout"
-        cmp "$out/$count.expected" "$target.stdout"
-        cpu=$(awk '/^(user|sys) / { total += $2 } END { printf "%.0f\n", total * 100 }' "$target.time")
-        printf 'native locals scaling: %s %d locals %d.%02d CPU s\n' \
-            "$profile" "$count" "$((cpu / 100))" "$((cpu % 100))"
+        measure "$profile" "$count"
+        cpu_by_count[$count]=$cpu
         reference_count=$((count / span))
         reference_cpu=${cpu_by_count[$reference_count]:-0}
-        if ((reference_cpu > 0 && cpu > max_ratio * reference_cpu)); then
-            printf 'native locals scaling: %s %d locals took more than %dx the CPU of %d\n' \
-                "$profile" "$count" "$max_ratio" "$reference_count" >&2
+        # CPU time swells under load (a JOBS=6 suite once gave 2.40/4.12/22.66 s where the same compiler alone gives
+        # 1.67/3.20/9.27), and more for the longer build. A ratio over the bound is measured again, both sizes, and judged on
+        # each size's least time: load only adds time, while a quadratic pass is over the bound in every run.
+        retry=0
+        while ((reference_cpu > 0 && cpu_by_count[$count] > max_ratio * reference_cpu && retry < retries)); do
+            retry=$((retry + 1))
+            printf 'native locals scaling: %s %d locals over %dx the CPU of %d, measuring both again (%d of %d)\n' \
+                "$profile" "$count" "$max_ratio" "$reference_count" "$retry" "$retries"
+            measure "$profile" "$reference_count"
+            ((cpu >= reference_cpu)) || reference_cpu=$cpu
+            cpu_by_count[$reference_count]=$reference_cpu
+            measure "$profile" "$count"
+            ((cpu >= cpu_by_count[$count])) || cpu_by_count[$count]=$cpu
+        done
+        if ((reference_cpu > 0 && cpu_by_count[$count] > max_ratio * reference_cpu)); then
+            printf 'native locals scaling: %s %d locals took more than %dx the CPU of %d in each of %d runs (least %s s against %s s)\n' \
+                "$profile" "$count" "$max_ratio" "$reference_count" "$((retries + 1))" \
+                "$(seconds "${cpu_by_count[$count]}")" "$(seconds "$reference_cpu")" >&2
             exit 1
         fi
-        cpu_by_count[$count]=$cpu
     done
 done
