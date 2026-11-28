@@ -25,7 +25,7 @@ fail() {
 unknown_literals() {
     { grep -rn --include=*.ab -E '"(atomic|Transactional)"' "$1" || true; } |
         grep -v -E '(==|!=) *"(atomic|Transactional)"' |
-        grep -v -E 'BootstrapExpression\("atomic", "", start\.begin, body\.end, \[body\]\)' |
+        grep -v -E 'BootstrapExpression\("atomic", "", start\.begin(\(\))?, body\.end, \[body\]\)' |
         grep -v -E 'atContextualKeyword\("atomic", BOOTSTRAP_TOKEN_LBRACE\)' |
         grep -v -E 'stmNote\("atomic", ' |
         grep -v -E 'source\.contains\("(atomic|Transactional)"\)' |
