@@ -15,7 +15,7 @@ param(
     [Parameter(Mandatory)][string]$Directory,
     [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64',
     [ValidateRange(1, 50)][int]$Rounds = 5,
-    [ValidateRange(1, 10)][int]$SelfRounds = 2,
+    [ValidateRange(1, 10)][int]$SelfRounds = 3,
     [double]$Tolerance = 0.05,
     [double]$SizeTolerance = 0.003
 )
@@ -139,3 +139,6 @@ if ($env:GITHUB_STEP_SUMMARY) { ($table + '') | Add-Content -LiteralPath $env:GI
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $work 'measure.json')
 if ($failures.Count) { throw "The Abla C library compiler is worse than /MT in: $($failures -join ', ')" }
 Write-Host "Abla C library compiler ($Architecture): no worse than /MT in speed (tolerance $Tolerance) or size (tolerance $SizeTolerance)"
+# A GitHub pwsh step exits with the status of the last native command the script ran (the measured programs and
+# builds may end non-zero by design): every check above passed, so say so.
+exit 0
