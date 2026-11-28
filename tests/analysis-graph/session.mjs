@@ -1745,7 +1745,9 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
     const head = (imported ? 'import "./point.ab"\n' : '') + (importedCalls ? 'import "./lib.ab"\nimport "./other.ab"\nimport "abla/bits"\n' : '') + (constructors ? 'import "./box.ab"\n' : '') + (arrays ? 'fun answer(left: int, right: int, xs: array<int>): int ' : locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
         : fields ? 'fun answer(left: int, right: int, p: Point): int = ' : constructors ? 'fun answer(left: int, right: int, q: Pair): int = ' : 'fun answer(left: int, right: int): int = ');
     // A field of another type (`tags`) is never read, but does not keep the class from the checker.
-    const point = 'class Point(val x: int, var y: int, val label: string = "p", val tags: array<string> = [], val weights: array<int> = []) {\n    fun total(): int = this.x + this.y\n    fun scaled(k: int): int = this.x * k\n    fun name(): string = this.label\n}\n';
+    // `inner` is of another plain class, whose fields a chain `p.inner.k` reads.
+    const point = 'class Inner(val k: int, val tag: string = "i")\n' +
+        'class Point(val x: int, var y: int, val label: string = "p", val tags: array<string> = [], val weights: array<int> = [], val inner: Inner = Inner(1)) {\n    fun total(): int = this.x + this.y\n    fun scaled(k: int): int = this.x * k\n    fun name(): string = this.label\n}\n';
     const block = (...lines) => '{\n' + lines.map(line => '    ' + line + '\n').join('') + '}';
     const initial = calls ? 'step(left) + right' : locals ? block('val t = left + right', 't') : returns ? block('if (left < 0) return right', 'left + right') : strings ? 'text.size + left' : fields ? 'p.x + left'
         : globals ? 'LIMIT + left' : constructors ? 'area(q) + left' : importedCalls ? 'twice(left) + other(right) + bitAnd(left, right)' : arrays ? block('var s = xs.size', 'for (x in xs) s += x', 's + left') : loops ? block('var s = 0', 'for (i in 0 until left) s += i', 's + right') : 'left + right';
@@ -1870,6 +1872,8 @@ async function checkedScalarBody(calls = false, operators = false, locals = fals
         // Member chains on string and scalar-array fields: their size and elements. Another array field's size: full typing.
         if (fields) await edit('p.label.size + p.weights.size * left', extended ? hits : ++hits);
         if (fields) await edit('p.weights[left] + p.label[0]', extended ? hits : ++hits);
+        // Through a field of another class: its scalar and string fields.
+        if (fields) await edit('p.inner.k * left + p.inner.tag.size', extended ? hits : ++hits);
         if (strings) await edit('if (text == "abc") left else right', ++hits);
         if (locals) await edit(block('val t: string = "ab"', 'if (t != "ab") left else right'), ++hits);
         // Another local: the document's symbols change, so full typing.
