@@ -1,0 +1,97 @@
+// The Windows compiler's own C library's sscanf (src/static_libc/windows/io.ab, __stdio_common_vsscanf), over the cases in scan-cases.txt
+// in the working directory, one a line: "<options>\t<format>\t<text>[\t<room>[\t<count>]]". Options 0 is sscanf, 1 sscanf_s, whose
+// slots alternate a destination and its room (default 64); count is the text's (_snscanf; default SIZE_MAX, up to its NUL). Each of eight
+// destinations is a 64-byte zone of 0xAA: the line printed is the result, the first 24 bytes of the first four zones, and TAIL<n> when
+// n bytes past byte 24 of any zone changed (no case's text fills 24). tools/test-windows-libc.sh compares it with scan-expected.txt.
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/runtime/scalar"
+import "abla/unsafe/memory/raw"
+import "../../../../src/static_libc/windows/io.ab"
+
+// The C library's exit (process.ab) runs this table, which tools/windows/static-compiler/crt-free-start.cpp has in the compiler.
+@export("abla_crt_run_exit_table")
+fun scanExitTable(): void {
+    return
+}
+
+/** A NUL-ended copy of `text` on the host heap. */
+trusted fun scanCString(text: string): int {
+    val at = __ablaRuntimeHostHeapAllocate(text.size + 1, false)
+    var i = 0
+    while (i < text.size) {
+        ablaRuntimeStoreU8(at + i, text[i])
+        i = i + 1
+    }
+    ablaRuntimeStoreU8(at + text.size, 0)
+    at
+}
+
+/** Two lower-case hexadecimal digits of the byte `b`. */
+fun scanHex(b: int): string {
+    val digits = "0123456789abcdef"
+    digits.slice(b >> 4, (b >> 4) + 1) + digits.slice(b & 15, (b & 15) + 1)
+}
+
+/** The value of the decimal digits of `text`. */
+fun scanNumber(text: string): int {
+    var value = 0
+    for (byte in text) value = value * 10 + byte - 48
+    value
+}
+
+trusted fun main {
+    val zones = nativeStaticAllocate(8 * 64)
+    val list = nativeStaticAllocate(16 * 8)
+    for (line in Path("scan-cases.txt").readText().split("\n")) {
+        if (line.size == 0) continue
+        val fields = line.split("\t")
+        val options = if (fields[0] == "1") 1 else 0
+        val room = if (fields.size > 3) scanNumber(fields[3]) else 64
+        val count = if (fields.size > 4) scanNumber(fields[4]) else -1
+        var i = 0
+        while (i < 8 * 64) {
+            ablaRuntimeStoreU8(zones + i, 170)
+            i = i + 1
+        }
+        var slot = 0
+        var zone = 0
+        while (slot < 16) {
+            if (options == 1 && slot % 2 == 1) ablaRuntimeStoreI64(list + slot * 8, room)
+            else {
+                ablaRuntimeStoreI64(list + slot * 8, zones + (zone % 8) * 64)
+                zone = zone + 1
+            }
+            slot = slot + 1
+        }
+        val text = scanCString(if (fields.size > 2) fields[2] else "")
+        val format = scanCString(fields[1])
+        val result = windowsVsscanf(options, text, count, format, 0, list)
+        __ablaRuntimeHostHeapFree(text)
+        __ablaRuntimeHostHeapFree(format)
+        var out = "$result"
+        var z = 0
+        while (z < 4) {
+            out = out + " "
+            var b = 0
+            while (b < 24) {
+                out = out + scanHex(ablaRuntimeLoadU8(zones + z * 64 + b))
+                b = b + 1
+            }
+            z = z + 1
+        }
+        var tail = 0
+        z = 0
+        while (z < 8) {
+            var b = 24
+            while (b < 64) {
+                if (ablaRuntimeLoadU8(zones + z * 64 + b) != 170) tail = tail + 1
+                b = b + 1
+            }
+            z = z + 1
+        }
+        if (tail != 0) out = out + " TAIL$tail"
+        println(out)
+    }
+}

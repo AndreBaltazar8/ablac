@@ -37,15 +37,22 @@ extern "C" void* _aligned_malloc(size_t size, size_t alignment);
 extern "C" void _aligned_free(void* block);
 
 // --- the stack cookie ---------------------------------------------------------------------------------------------------
-// /GS (learn.microsoft.com, "/GS (Buffer Security Check)"): code reads __security_cookie, which start-up sets to a value
-// that differs per run, and calls __security_check_cookie with it at return, which ends the process when it changed. The
-// built-in default is the one the Visual Studio CRT source's gs_cookie.c gives (DEFAULT_SECURITY_COOKIE), so code that
-// reads the cookie before start-up sets it gets the value it expects.
+// /GS (learn.microsoft.com, "/GS (Buffer Security Check)"): code reads __security_cookie, a value that differs per run, and
+// calls __security_check_cookie with it at return, which ends the process when it changed. The loader seeds it (the image's
+// load configuration names it), and start-up keeps that seed; only when it is still the built-in default does start-up make
+// one. The default is the one the Visual Studio CRT source's gs_cookie.c gives (DEFAULT_SECURITY_COOKIE), so code that reads
+// the cookie before either sets it gets the value it expects. tools/test-windows-libc.sh checks the seed is kept.
 
 extern "C" UINT_PTR __security_cookie = 0x00002B992DDFA232ull;
 extern "C" UINT_PTR __security_cookie_complement = ~0x00002B992DDFA232ull;
 
 static void abla_security_init_cookie() {
+    // The loader has seeded the cookie already when the image's load configuration names it (_load_config_used below), from the
+    // system's random source: a value that is no longer the default is kept, as Microsoft's __security_init_cookie keeps it.
+    if (__security_cookie != 0x00002B992DDFA232ull) {
+        __security_cookie_complement = ~__security_cookie;
+        return;
+    }
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
     FILETIME time;
