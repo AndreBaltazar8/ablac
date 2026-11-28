@@ -199,12 +199,12 @@ The ways past these checks are explicit:
 - `ablaHtmlTrustedAttribute(name, value)` writes one attribute without
   them (the old `HtmlAttribute(name, value, "", true)` no longer
   compiles: the fourth argument is an exemption only `abla/html` makes);
-- an attribute with a source quote (`ablaHtmlLiteralAttribute`) is
-  treated as authored;
 - `ablaHtmlRaw(markup)` inserts markup as it is;
 - an `Html` value can be built with its constructor.
 
-Use them only for values your program wrote or fully checked. See
+An attribute with a source quote (`ablaHtmlLiteralAttribute`) is checked like
+any other value from Abla; only attributes written in the `$html` source are
+authored. Use these ways past only for values your program wrote or fully checked. See
 [subparsers.md](subparsers.md#urls-and-event-handlers).
 
 ## 4. HTTP servers refuse headers and framing they cannot send

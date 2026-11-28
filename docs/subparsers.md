@@ -136,14 +136,14 @@ fun invalid(page: string): Html = $html <iframe srcdoc={page}></iframe>
 // error: an Abla expression cannot fill the attribute srcdoc
 ```
 
-Authored (quoted) attribute values are not checked. For a value the program
-wrote or fully checked, such as a `data:` image or a handler of its own,
+Attribute values authored in the `$html` source are not checked. For a value
+the program wrote or fully checked, such as a `data:` image or a handler of its own,
 `ablaHtmlTrustedAttribute(name, value)` in an attribute group skips both
 checks; its value is still escaped. It is an ordinary function, not a
-`trusted` one. The other ways past the checks are an attribute with a source
-quote (`ablaHtmlLiteralAttribute`, or an `HtmlAttribute` built with its third
-argument), building an `Html` value directly, and `ablaHtmlRaw`, which inserts
-markup verbatim; an audit searches for those names. The exemption that lets
+`trusted` one. The other ways past the checks are building an `Html` value
+directly and `ablaHtmlRaw`, which inserts markup verbatim; an audit searches for
+those names. An attribute with a source quote (`ablaHtmlLiteralAttribute`, or an
+`HtmlAttribute` built with its third argument) is checked like any value from Abla. The exemption that lets
 `ablaHtmlTrustedAttribute`'s value past covers only the exact name and value it
 was made for.
 
