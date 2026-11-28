@@ -15,6 +15,20 @@ out=build/frozen
 rm -rf "$out"
 mkdir -p "$out"
 fail() { echo "frozen: $1" >&2; exit 1; }
+# A program that never freezes loads frozen-idle.ab in place of frozen.ab (bootstrapNativeGraphNeedsFrozen); one that
+# freezes loads the freeze itself. Both modes, read from the compiler's trace.
+printf 'import "abla/io"\nfun main: int { println("hello"); 0 }\n' > "$out/hello.ab"
+for mode in release fast; do
+    flags=(--no-cache)
+    [[ $mode == fast ]] && flags+=(--fast)
+    ABLA_COMPILER_MEMORY_TRACE=1 "$compiler" build "$out/hello.ab" -o "$out/hello.$mode" "${flags[@]}" > "$out/hello.$mode.trace" 2>&1 \
+        || { cat "$out/hello.$mode.trace" >&2; fail "hello ($mode) did not build"; }
+    grep -F frontend.runtime.frozen-idle "$out/hello.$mode.trace" > /dev/null || fail "hello ($mode) loaded the freeze"
+    [[ $("$out/hello.$mode") == hello ]] || fail "hello ($mode) did not print hello"
+    ABLA_COMPILER_MEMORY_TRACE=1 "$compiler" build tests/cases/frozen/graph.ab -o "$out/graph-trace.$mode" "${flags[@]}" \
+        > "$out/graph.$mode.trace" 2>&1 || { cat "$out/graph.$mode.trace" >&2; fail "graph ($mode) did not build"; }
+    ! grep -F frontend.runtime.frozen-idle "$out/graph.$mode.trace" > /dev/null || fail "graph ($mode) loaded frozen-idle.ab"
+done
 for mode in release fast; do
     flags=(--no-cache)
     [[ $mode == fast ]] && flags+=(--fast)

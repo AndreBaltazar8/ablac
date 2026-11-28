@@ -101,3 +101,14 @@ sequence), against option 0, for CPU (instructions and wall) and peak RSS.
 Order of work: (1) measure option 0 and, with ablac-89's help, find out what the cache mutates after construction (a write
 counter on a read-only mapping answers it); (2) build A in the runtime and test it standalone; (3) have the service
 freeze its caches and measure; (4) only if (1) shows the cache is mutated pervasively, revisit B.
+
+## Where the code lives
+
+The collector's side (the window, the group table, marking a pointer into the window, returning unreached groups, the live-
+byte count) is in `stdlib/abla/runtime/platform/host.ab`, with the API entry `__ablaRuntimePlatformMemoryFreeze`. The freeze
+itself, copying a graph into a new group, is `stdlib/abla/runtime/platform/frozen.ab`, which host.ab imports. A program that
+names no freeze entry point (`bootstrapNativeGraphNeedsFrozen`, `src/toolchain.ab`) loads `frozen-idle.ab` in its place, a
+one-line identity `__ablaRuntimeHostFreezeBody`: a cold build of such a program parses about 520 fewer runtime lines (a cold
+release hello world was 2.9% fewer instructions in the #1204 measurement). The collector's side is the same in both, so the
+prebuilt release collector serves either. A `--fast` program that freezes calls the prebuilt fast runtime's copy through
+`abla_ro_freeze` (`bootstrapFastRuntimeFrozenBridge`). A compiler that predates the substitution follows the plain import.

@@ -4563,6 +4563,19 @@ private fun bootstrapNativeGraphNeedsStm(graph: BootstrapModuleGraph): bool {
     false
 }
 
+// Whether the program can reach a freeze (abla/runtime/memory's Frozen, docs/design/frozen-heap.md): only then does host.ab
+// load frozen.ab, the freeze itself; otherwise frozen-idle.ab. Any module naming a freeze entry point counts, as does one a
+// raw provider could make call it, so a miss only ever costs the build the parse of frozen.ab.
+private fun bootstrapNativeGraphNeedsFrozen(graph: BootstrapModuleGraph): bool {
+    for (snapshot in graph.orderedSnapshots) {
+        val source = snapshot.source
+        if (snapshot.mayUseRawProvider || source.contains("__ablaRuntimeFrozen") ||
+            source.contains("__ablaRuntimePlatformMemoryFreeze") || source.contains("__ablaRuntimeHostFreeze") ||
+            source.contains("abla_ro_freeze")) return true
+    }
+    false
+}
+
 private class BootstrapFastRuntimeArtifact(
     val objectPath: string = "",
     val sourcePath: string = "",
@@ -5022,17 +5035,21 @@ private fun bootstrapFastRuntimeApply(
     var snapshots: array<BootstrapModuleSnapshot>, hostPath: string, source: string,
     var state: BootstrapModuleState
 ): void {
+    // The freeze is the object's too (frozen.ab, exported as abla_ro_freeze): a program that loaded it calls the object.
+    val frozenPath = bootstrapNormalizeModulePath(Path(bootstrapStandardLibraryRoot()).child("abla/runtime/platform/frozen.ab").text)
     for (index in 0 until snapshots.size) {
         val original = snapshots[index]
-        if (original.path != hostPath) continue
-        val first = bootstrapModuleFingerprint(source, 17, 257, 1000000007)
-        val second = bootstrapModuleFingerprint(source, 97, 263, 1000000009)
+        var replacement = ""
+        if (original.path == hostPath) replacement = source
+        else if (original.path == frozenPath) replacement = bootstrapFastRuntimeFrozenBridge()
+        if (replacement == "") continue
+        val first = bootstrapModuleFingerprint(replacement, 17, 257, 1000000007)
+        val second = bootstrapModuleFingerprint(replacement, 97, 263, 1000000009)
         snapshots[index] = BootstrapModuleSnapshot(
-            original.path, source, original.importEdges, original.importErrors, true,
-            source.size, original.revision, first, second,
-            state.discover(source, original.path, original.importErrors, first, second, false)
+            original.path, replacement, original.importEdges, original.importErrors, true,
+            replacement.size, original.revision, first, second,
+            state.discover(replacement, original.path, original.importErrors, first, second, false)
         )
-        return
     }
 }
 
@@ -5148,6 +5165,9 @@ trusted fun bootstrapNativeBuildWithEmitterStateCache(
     graph.index.runtimeStmIdle = libcPlatform && target.hosted &&
         bootstrapLlvmTargetIsX8664Linux(target.llvmTriple) && artifact == "executable" &&
         cacheProfile == "inprocess-o2" && !bootstrapNativeGraphNeedsStm(graph)
+    // Any profile: the idle file only drops the freeze itself, which nothing in such a program calls.
+    graph.index.runtimeFrozenIdle = libcPlatform && artifact == "executable" && !bootstrapNativeGraphNeedsFrozen(graph)
+    if (graph.index.runtimeFrozenIdle) bootstrapLlvmTraceMemory("frontend.runtime.frozen-idle")
     bootstrapLlvmTraceMemory(
         "frontend.graph-load.source:${orderedSnapshots.size}"
     )
