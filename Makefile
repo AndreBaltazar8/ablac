@@ -637,6 +637,7 @@ test-serial: ablac
 	tools/test-gc-native-pressure.sh $(COMPILER)
 	tools/test-gc-root-plan.sh $(COMPILER)
 	tools/test-gc-native-skip.sh $(COMPILER)
+	tools/test-gc-trace-text.sh $(COMPILER)
 	tools/test-gc-callback-roots.sh $(COMPILER)
 	tools/test-gc-blocking-roots.sh $(COMPILER)
 	tools/test-emutls.sh $(COMPILER)
