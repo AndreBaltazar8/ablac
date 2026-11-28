@@ -139,8 +139,11 @@ fun invalid(page: string): Html = $html <iframe srcdoc={page}></iframe>
 Authored (quoted) attribute values are not checked. For a value the program
 wrote or fully checked, such as a `data:` image or a handler of its own,
 `ablaHtmlTrustedAttribute(name, value)` in an attribute group skips both
-checks; its value is still escaped. It is the only way past them, so a search
-for that name finds every exception.
+checks; its value is still escaped. It is an ordinary function, not a
+`trusted` one. The other ways past the checks are building an `HtmlAttribute`
+with its fourth argument `true`, building an `Html` value directly, and
+`ablaHtmlRaw`, which inserts markup verbatim; an audit searches for all four
+names.
 
 ```abla
 import "abla/html"
