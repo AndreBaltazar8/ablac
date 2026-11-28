@@ -18,6 +18,7 @@ everything else.
 | abla-postgres authentication and `sslMode` | connection refused, or TLS where there was none | [7](#7-abla-postgres-password-authentication-and-sslmode) |
 | abla-one session ids leave the URL | nothing, unless you wrote your own host script or proxy | [8](#8-abla-one-session-ids-leave-the-url) |
 | `memoryCheckpoint` and `memoryReset` are trusted-only | `native.trust:` build error | [9](#9-memorycheckpoint-and-memoryreset-are-trusted-only) |
+| The runtime's own functions are for the standard library | `native.trust:` build error | [10](#10-the-runtimes-own-functions-are-for-the-standard-library) |
 
 ## 1. Raw-memory classes are made by their factories
 
@@ -408,3 +409,51 @@ fun main {
 
 Code that manages this memory itself, such as an allocator, keeps the
 calls inside a `trusted fun`.
+
+## 10. The runtime's own functions are for the standard library
+
+The functions of the runtime's modules (`abla/runtime/...`, the
+`runtime...` and `__abla...` names) do what the runtime needs: allocate,
+free, reset and reuse memory without the checks ordinary code relies on.
+Code outside the standard library, a dependency's included, could call
+them. A call to one, or a reference to one as a value, is now
+`native.trust:<name>` unless it is in a trusted function. An
+`import "abla/runtime/..."` still builds; only its functions are refused.
+
+Before, this built:
+
+```abla error
+import "abla/io"
+import "abla/runtime/memory"
+
+fun main {
+    println("${runtimeMemoryLiveBytes()}")
+    // error: native.trust:runtimeMemoryLiveBytes
+}
+```
+
+**Fix:** use `abla/memory`, which has the same calls under the
+`memory...` name: `runtimeMemoryLiveBytes` becomes `memoryLiveBytes`, and
+likewise `Collect`, `Limit`, `HeapStat`, `SetLimit`,
+`SetCollectionGrowth`, `SetFreeBlockLimit`, `SetManualCollection`,
+`SetBackgroundFree`, `SetGcWorkers`, `SetStress`, `SetStressStride` and
+`SetTrace`:
+
+```abla
+import "abla/io"
+import "abla/memory"
+
+fun main {
+    val live = memoryLiveBytes()
+    println(if (live >= 0) "measured" else "unknown")
+}
+// output:
+// measured
+```
+
+`memoryCheckpoint`, `memoryReset` and `memoryDebugHold` stay
+trusted-only; use `region { ... }` instead of a checkpoint
+([regions.md](regions.md)). The runtime functions with no `abla/memory`
+form are for code that keeps the runtime's invariants itself, inside a
+`trusted fun`; a dependency that does this needs a grant line in your
+manifest ([packages.md](packages.md)).
