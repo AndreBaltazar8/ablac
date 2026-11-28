@@ -7,7 +7,10 @@
 #     directory with ABLA_SYSROOT=. and ABLA_STDLIB, the object is edited ("out of memory" -> "PLANTED-OBJ!!") and its record
 #     rewritten;
 #   - a build there without ABLA_SYSROOT must not link it (before, it did: the program carried "PLANTED-OBJ!!");
-#   - the same build with an explicit ABLA_SYSROOT=. does link it (the planted entry is valid, and an explicit root still counts).
+#   - the same build with an explicit ABLA_SYSROOT=. does link it (the planted entry is valid, and an explicit root still counts);
+#   - runtime/, whose package-index helper the compiler runs: with a toolchain beside the image, `package search` without
+#     ABLA_SYSROOT runs that toolchain's helper, never a ./runtime/package-index-fetch.ab planted in the working directory
+#     (before, it ran the planted one), and runs the planted one with ABLA_SYSROOT=.
 #
 #   tools/test-shipped-root.sh [compiler]
 set -euo pipefail
@@ -55,4 +58,28 @@ sed -i "3s/.*/$digest/" "$entry/record"
 [[ $("$out/checkout/explicit") == hello ]] || fail "the build with ABLA_SYSROOT=. does not print hello"
 grep -a -F 'PLANTED-OBJ!!' "$out/checkout/explicit" > /dev/null ||
     fail "the planted entry was not used even with ABLA_SYSROOT=. (the test's plant is not valid)"
-echo "shipped-root: a fast runtime planted in the working directory is linked only with an explicit ABLA_SYSROOT=."
+# runtime/, which the compiler runs: `package search` builds and runs runtime/package-index-fetch.ab. A raw compiler with a
+# toolchain beside it (a flat one: stdlib and runtime/ next to the image) runs that toolchain's helper, here a stub that
+# writes a marker; a helper planted in the working directory writes a canary and must run only with ABLA_SYSROOT=.
+tool=$out/tool
+mkdir -p "$tool/runtime" "$out/checkout/runtime" "$out/home"
+cp "$payload" "$tool/ablac"
+ln -s "$stdlib" "$tool/stdlib"
+helper() { # <marker file>: a package-index helper that writes the marker and answers 200 with an empty catalog
+    printf 'import "abla/sys/linux/fs"\nimport "abla/sys/linux/io"\n\nfun main(): int {\n    val _written = Path("%s").writeText("ran")\n    if (linuxWriteStandardOutputAll("200\\n")) 0 else 1\n}\n' "$1"
+}
+helper "$out/trusted-helper-ran" > "$tool/runtime/package-index-fetch.ab"
+helper "$out/planted-helper-ran" > "$out/checkout/runtime/package-index-fetch.ab"
+search() { # <name> [environment...]: `package search` in the checkout with the toolchain-beside-the-image compiler
+    local name=$1
+    shift
+    (cd "$out/checkout" && env -u ABLA_SYSROOT HOME="$out/home" XDG_CACHE_HOME= ABLA_PACKAGE_CACHE="$out/package-$name" \
+        ABLA_PACKAGE_INDEX_URL= ABLA_STDLIB="$stdlib" "$@" "$tool/ablac" package search anything > "$out/search-$name.log" 2>&1) || true
+}
+search implicit
+[[ ! -e $out/planted-helper-ran ]] || fail "package search without ABLA_SYSROOT ran the runtime/ helper planted in its working directory"
+[[ -e $out/trusted-helper-ran ]] || fail "package search without ABLA_SYSROOT did not run its own toolchain's helper: $(tail -4 "$out/search-implicit.log")"
+search explicit ABLA_SYSROOT=.
+[[ -e $out/planted-helper-ran ]] ||
+    fail "package search with ABLA_SYSROOT=. did not run ./runtime's helper (the test's plant is not valid): $(tail -4 "$out/search-explicit.log")"
+echo "shipped-root: a fast runtime or runtime/ helper planted in the working directory is used only with an explicit ABLA_SYSROOT=."
