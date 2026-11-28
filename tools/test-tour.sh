@@ -33,7 +33,7 @@ for doc in docs/tour/*.md; do
         count=$((count + 1))
     done < "$blocks/index"
 done
-[[ $count == 19 ]] || { echo "tour: expected 18 programs and one helper, got $count" >&2; exit 1; }
+[[ $count == 21 ]] || { echo "tour: expected 20 programs and one helper, got $count" >&2; exit 1; }
 # Keep the visible transcript tied to the actual REPL input as well.
 awk '/^```text$/ {inside=1; next} inside && /^```$/ {inside=0; next} inside {print}' docs/tour/13-repl.md > "$out/repl.input"
 cmp "$out/repl.input" tests/cases/tour/repl.in

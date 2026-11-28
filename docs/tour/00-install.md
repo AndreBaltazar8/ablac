@@ -1,7 +1,7 @@
 # Install and choose your compiler
 
-Abla releases provide toolchains for Linux x86-64, macOS Apple Silicon and
-macOS Intel. Start with the matching **toolchain archive** on the
+Abla releases provide toolchains for Linux x86-64, macOS Apple Silicon and Intel,
+and Windows x86-64 and ARM64. Start with the matching **toolchain archive** on the
 [release page](https://github.com/AndreBaltazar8/ablac/releases), check its
 published checksum, extract it, and put its `bin` directory on your `PATH`.
 Use the packaged `bin/ablac` wrapper, which locates the toolchain's libraries
@@ -34,7 +34,7 @@ first program.
 
 ## Start a project
 
-On a compiler that supports `ablac new`, create and run a starter app
+With v0.2.79 or a current build, create and run a starter app
 from a directory you own:
 
 ```sh

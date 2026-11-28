@@ -4,10 +4,10 @@ This path is for someone who has programmed before and wants to write their
 first Abla program. Read the chapters in order; each introduces one small idea
 and points to the reference when you need more detail.
 
-This tour follows the development compiler. In particular, v0.2.65 can run
-the basic examples and the JSON buffer example. For the newer project and
-package commands, regex/XML/SQL literals, REPL loading and debugger variables,
-use a current source build as described in the installation chapter.
+This tour follows the development compiler. The released v0.2.79 runs every
+example and the REPL sessions; the shared `is` arms of the sealed-interface
+step need v0.2.80 or a current source build, as described in the installation
+chapter.
 
 1. [Install and choose your compiler](00-install.md)
 2. [Hello, Abla](01-hello.md)

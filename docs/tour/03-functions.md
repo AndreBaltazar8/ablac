@@ -34,4 +34,36 @@ fun main {
 // 6 is small
 ```
 
+## Updating a flag: `&&=` and `||=`
+
+`ready &&= check()` keeps `ready` true only while every check passes, and it
+calls `check()` only while `ready` is still true: once the network check fails,
+the printer is never checked. `warned ||= cond` sets a flag once a condition
+holds. See [operators](../language.md#expressions-and-operators).
+
+[Runnable source](../../tests/cases/tour/03-logical.ab):
+
+```abla run source=../../tests/cases/tour/03-logical.ab
+import "abla/io"
+
+fun check(name: string, ok: bool): bool {
+    println("checking $name")
+    ok
+}
+
+fun main {
+    var ready = true
+    ready &&= check("disk", true)
+    ready &&= check("network", false)
+    ready &&= check("printer", true)
+    var warned = false
+    warned ||= !ready
+    println("ready $ready, warned $warned")
+}
+// output:
+// checking disk
+// checking network
+// ready false, warned true
+```
+
 [Previous](02-values.md) · [Tour](README.md) · [Next](04-classes.md)
