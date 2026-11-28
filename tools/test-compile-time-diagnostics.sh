@@ -2,7 +2,8 @@
 # What a failed build says: a compile-time evaluation failure names its file,
 # line and column and is the whole diagnosis (no code-generation noise after
 # it); positions count characters; a missing entry file and a program with
-# no main each say so once, with the error count matching the error lines;
+# no main each say so once, with the error count matching the error lines; a
+# main with parameters is refused (main.parameters) with help;
 # compile-time effects follow scope.
 set -euo pipefail
 
@@ -86,6 +87,13 @@ log=$output/no-main.log
 build_fails no-main.ab "$log"
 [[ $(grep -c '^error\[' "$log") -eq 1 ]] || fail "no-main: not one error" "$log"
 grep -q '^error\[E_NO_MAIN\]' "$log" || fail "no-main: no E_NO_MAIN" "$log"
+
+# A main with parameters (the entry calls it with none, so it built and trapped at start) is refused once, with the help.
+log=$output/main-parameters.log
+build_fails main-parameters.ab "$log"
+[[ $(grep -c '^error\[' "$log") -eq 1 ]] || fail "main-parameters: not one error" "$log"
+grep -q 'main.parameters' "$log" || fail "main-parameters: no main.parameters" "$log"
+grep -q 'help: read the program.s arguments with processArgument' "$log" || fail "main-parameters: no help" "$log"
 
 log=$output/missing.log
 build_fails missing.ab "$log"

@@ -44,7 +44,9 @@ Contents: [design rules](#design-rules) ·
 
 ## Programs
 
-A program is a module with a `fun main`. `main` takes no parameters. If it
+A program is a module with a `fun main`. `main` takes no parameters
+(`main.parameters` otherwise): the arguments come from `processArgument(index)`,
+index 0 the first, and `processArgumentCount()` in `abla/process/arguments`. If it
 returns an `int`, that is the process exit status; without a result type
 (or with `: void`) the program exits with 0. Printing comes from the
 standard library's `abla/io`:
