@@ -29,6 +29,12 @@ if "$out/mma-cpu" > "$out/mma-cpu.out" 2>&1 || ! grep -q "kernelMmaF16 needs a G
     fail "mma-cpu: $(cat "$out/mma-cpu.out")"
 fi
 
+# Dynamic shared memory kept past its launch (#1139 K1): writes through the kept buffers change no live array.
+"$compiler" build "$cases/shared-kept.ab" -o "$out/shared-kept" --fast --no-cache > "$out/shared-kept.log" 2>&1 ||
+    fail "shared-kept did not build: $(head -4 "$out/shared-kept.log")"
+"$out/shared-kept" > "$out/shared-kept.out" 2>&1 && grep -qx "words changed in live arrays: 0" "$out/shared-kept.out" &&
+    grep -qx "read back: 1094795585" "$out/shared-kept.out" || fail "shared-kept: $(cat "$out/shared-kept.out")"
+
 # The half-precision conversions (#1302) on the CPU backend give CUDA C's bits on the 4090 for every input of the set
 # (tools/probe-kernel-half.cu printed the hashes half-cpu.ab records).
 "$compiler" build "$cases/half-cpu.ab" -o "$out/half-cpu" --fast --no-cache > "$out/half-cpu.log" 2>&1 ||
@@ -136,4 +142,4 @@ if [[ -n $library ]]; then
         cuda="vadd, the NVFP4 and Q8_0 matvecs (and Q8_0 on the unchecked fast path), rmsnorm (shared memory, barriers), kernelExp, kernelTanh, kernelSigmoid, the buffer edges and the half-precision conversions agree on the GPU and the CPU"
     fi
 fi
-echo "kernels: the NVFP4 matvec kernel matches its reference on the CPU; the half-precision conversions give CUDA C's bits on the CPU; a string, recursion, a result, native code and an untrusted unchecked load are refused; the CPU backend stops an unchecked load past the end; CUDA: $cuda"
+echo "kernels: the NVFP4 matvec kernel matches its reference on the CPU; the half-precision conversions give CUDA C's bits on the CPU; a string, recursion, a result, native code and an untrusted unchecked load are refused; the CPU backend stops an unchecked load past the end and keeps dynamic shared memory alive past its launch; CUDA: $cuda"

@@ -375,12 +375,14 @@ private class KernelCpuState(
     var group: int, var groupY: int, var local: int, var groupSize: int,
     // The group's shared memory: slot n is the n-th kernelShared call of the thread being run (sharedNext counts them).
     var sharedNext: int, val sharedAddresses: array<int>, val sharedBytes: array<int>,
-    // The launch's dynamic shared memory (kernelRunCpuShared): its bytes and where they are.
-    var dynamicBytes: int, var dynamicAddress: int
+    // The launch's dynamic shared memory (kernelRunCpuShared): its bytes (0 outside such a launch), where they are, and how
+    // many that memory holds. Like the static slots it is never freed: a buffer a kernel kept (in a module var, a captured
+    // array) still points at memory of its own after the launch, never at what the heap gave to something else (#1139 K1).
+    var dynamicBytes: int, var dynamicAddress: int, var dynamicCapacity: int
 )
 
 // The CPU backend's launch position.
-private val kernelCpuState = KernelCpuState(0, 0, 0, 1, 0, [], [], 0, 0)
+private val kernelCpuState = KernelCpuState(0, 0, 0, 1, 0, [], [], 0, 0, 0)
 
 /** The thread's index in the whole launch: group * group size + local index. */
 fun kernelGlobalId(): int = kernelCpuState.group * kernelCpuState.groupSize + kernelCpuState.local
@@ -818,13 +820,16 @@ trusted fun kernelRunCpuShared(groups: int, groupSize: int, sharedBytes: int, bo
     if (sharedBytes < 0 || sharedBytes > KERNEL_SHARED_MAX_ELEMENTS * 4) {
         panic("kernelRunCpuShared: a group has 0 to ${KERNEL_SHARED_MAX_ELEMENTS * 4} bytes of dynamic shared memory, not $sharedBytes")
     }
-    val memory = ablaUnsafeAllocate(if (sharedBytes > 0) sharedBytes else 4)
-    kernelCpuState.dynamicAddress = nativePointerAddress(memory)
+    // Grown by doubling, the smaller memory left where it is (a kept buffer may point at it), never freed.
+    if (sharedBytes > kernelCpuState.dynamicCapacity) {
+        var capacity = if (kernelCpuState.dynamicCapacity > 0) kernelCpuState.dynamicCapacity * 2 else 256
+        while (capacity < sharedBytes) capacity = capacity * 2
+        kernelCpuState.dynamicAddress = nativePointerAddress(ablaUnsafeAllocate(capacity))
+        kernelCpuState.dynamicCapacity = capacity
+    }
     kernelCpuState.dynamicBytes = sharedBytes
     kernelRunCpuGrid(groups, 1, groupSize, body)
     kernelCpuState.dynamicBytes = 0
-    kernelCpuState.dynamicAddress = 0
-    ablaUnsafeFree(memory)
 }
 
 /** The PTX of every `@kernel` function of the program, one entry per kernel under its name, for the CUDA driver
