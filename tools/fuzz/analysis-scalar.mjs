@@ -2,10 +2,16 @@
 // project whose dep.ab holds explicitly typed scalar functions of the shapes the replay admits (expression and block
 // bodies, inferred and written locals, guard returns, the arithmetic and bit operators, parentheses, string parameters'
 // size and bytes, direct calls to call-free scalar helpers in the module, a public nullary provider read by callers in
-// another module) and then edits one function at a time: a new well-typed body, a literal changed, a local added or
-// taken away, a type error, an unknown name, a provider whose result width or value changes, a helper that gains a
-// call, and the original put back. Two services follow the same edits: one with ABLA_ANALYSIS_INCREMENTAL_TYPING=2 and
-// ABLA_ANALYSIS_CHECK=1 (its own cold comparison after every analysis), one with replay off. After every edit their
+// another module), and the later slices: loop bodies (a `var` of the result type, assignments, `if`, `while`, `do … while`, `for`
+// over a range with `break`/`continue`), an int array parameter's size, elements and iteration, an array of a plain class read
+// through its elements' field chains, a class parameter's record-field chains, constructors of the module's plain classes and
+// calls of another module's functions (lib.ab). A constructor with another class's constructor as an argument, and a chain
+// through a class-typed field of an array's or a loop's element, are outside the slice (full typing): they come less often.
+// It then edits one function at a time (half the edits go to those slices' functions): a new well-typed body, a literal
+// changed, a local added or taken away, a type error, an unknown name, a provider whose result width or value changes, a
+// helper that gains a call, and the original put back.
+// Two services follow the same edits: one with ABLA_ANALYSIS_INCREMENTAL_TYPING=2 and ABLA_ANALYSIS_CHECK=1 (its own cold
+// comparison after every analysis), one with replay off. After every edit their
 // analyze answers, their `since` answers and definition, hover and references at each name in the edited function
 // must be equal, and the replaying one must not report a difference from its cold analysis. A difference is minimised to
 // the shortest edit sequence that still shows it (the failing text alone after the original, then after the text
@@ -13,11 +19,12 @@
 //
 //   node tools/fuzz/analysis-scalar.mjs COMPILER --seeds A-B [--edits N] [--work DIR]
 //   node tools/fuzz/analysis-scalar.mjs COMPILER --control    the replaying service is told to differ from its cold analysis
-//     (ABLA_ANALYSIS_CHECK=2, the service's own self-test) on one seed: the run must report it and exit 0 only then
+//     (ABLA_ANALYSIS_CHECK=2, the service's own self-test) on one seed: the run must report it; then, for each later slice, three
+//     edits of its function must agree without the plant with at least one rechecked alone, and be reported with it
 //
 // It prints one line per seed and, at the end, how many edits each replay path took (rechecked one scalar body,
-// rechecked an interface and dependents, a type-inert replay) so a run that never reached the replay is visible: it
-// fails when no edit of the whole run was rechecked as a scalar body.
+// rechecked an interface and dependents, a type-inert replay) and, by family, how many edits were rechecked alone, so a run
+// that never reached the replay is visible: it fails when no edit of the whole run was rechecked as a scalar body.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -89,7 +96,16 @@ class Session {
 // ---- the project and its functions
 // A function: name, parameter list, result type, and its body text (after the signature: `= expr` or `{ ... }`).
 const HELPERS = ['step', 'shift', 'mix'];
+// The families whose slices the replay gained after the scalar forms: loops (var, assignments, if, while, do, for over a range,
+// break/continue), scalar-array parameters, arrays of a class, and record-field chains with constructors and calls of another module.
+const SLICES = { loopSample: 'loop', arraySample: 'array', recordSample: 'record', pairSample: 'pair' };
 const initialFunctions = () => [
+    { name: 'loopSample', params: 'left: int, right: int', result: 'int', body: '{\n    var s = 0\n    for (i in 0 until left) s += i\n    s + right\n}', shape: { form: 4, stmts: ['forRange'], typed: false, locals: [], brace: false, helpers: true } },
+    { name: 'arraySample', params: 'left: int, right: int, xs: array<int>', result: 'int', body: '{\n    var s = xs.size\n    for (x in xs) s += x\n    s + left\n}', shape: { form: 4, stmts: ['forXs'], typed: false, locals: [], brace: false, helpers: true } },
+    { name: 'recordSample', params: 'left: int, right: int, ps: array<Pair>', result: 'int', body: '{\n    var s = ps.size\n    for (e in ps) s += e.a\n    s + left\n}', shape: { form: 4, stmts: ['forPs'], typed: false, locals: [], brace: false, helpers: true } },
+    { name: 'pairSample', params: 'left: int, right: int, q: Pair', result: 'int', body: '= q.inner.k + cellArea(Cell(left, right, "t")) + twice(left)', shape: { form: 0, locals: [], brace: false, helpers: true } },
+    { name: 'area', params: 'q: Pair', result: 'int', body: '= q.a * q.b', shape: { form: 0, locals: [], brace: false, helpers: false } },
+    { name: 'cellArea', params: 'c: Cell', result: 'int', body: '= c.a - c.b', shape: { form: 0, locals: [], brace: false, helpers: false } },
     { name: 'answer', params: 'left: int, right: int', result: 'int', body: '= left + right', shape: { form: 0, locals: [], brace: false, helpers: true } },
     { name: 'blockSample', params: 'left: int, right: int', result: 'int', body: '{\n    val t = left * 2\n    t + right\n}', shape: { form: 1, locals: [false], brace: false, helpers: true } },
     { name: 'guardSample', params: 'left: int, right: int', result: 'int', body: '{\n    if (left < 0) return right\n    left - right\n}', shape: { form: 2, locals: [], brace: false, helpers: true } },
@@ -107,14 +123,19 @@ const readerText = 'import "./provider.ab"\nfun readLater(): int = later() + 1\n
 const mainText = 'import "./dep.ab"\nimport "./reader.ab"\n' +
     'fun main: int = answer(2, 3) + blockSample(1, 2) + guardSample(3, 4) + textSample(1, 2, "abc") + int(narrowSample(i32(1), i32(2))) + ' +
     'step(1) + shift(2) + mix(3, 4) + readLater() + (if (sameLater()) 0 else 1) + (if (testSample(1, 2)) 1 else 0) + ' +
-    '(if (floatSample(1.0, 2.0) + mixedSample(0.5, 1) > 1.0) 1 else 0)\n';
-const depText = (functions) => functions.map((f) => `fun ${f.name}(${f.params}): ${f.result} ${f.body}\n`).join('');
+    '(if (floatSample(1.0, 2.0) + mixedSample(0.5, 1) > 1.0) 1 else 0) + loopSample(1, 2) + arraySample(1, 2, [1, 2, 3]) + ' +
+    'recordSample(1, 2, [Pair(4, 5, Inner(1, "i"))]) + pairSample(1, 2, Pair(3, 4, Inner(2, "j"))) + cellArea(Cell(1, 2, "c"))\n';
+// Another module's functions (a cross-module call is in the replay's slice) and two plain classes, one a field of the other.
+const libText = 'fun twice(n: int): int = n * 2\nfun less(n: int): int = n - 1\n';
+const depHead = 'import "./lib.ab"\nclass Inner(val k: int, val tag: string)\nclass Pair(val a: int, val b: int, val inner: Inner)\nclass Cell(val a: int, val b: int, val name: string)\n';
+const depText = (functions) => depHead + functions.map((f) => `fun ${f.name}(${f.params}): ${f.result} ${f.body}\n`).join('');
 
 // ---- expressions over a function's parameters
 const paramNames = (f) => f.params.split(', ').map((p) => p.split(': '));
 /** An expression of `ty` (int, i32, f64 or bool) over `f`'s parameters of that type and `locals` (of `f.result`'s type). */
 function typedExpr(f, ty, depth, locals, helpersAllowed) {
-    const names = paramNames(f).filter(([, t]) => t === ty).map(([n]) => n).concat(f.result === ty ? locals : []);
+    // A local written `e:Pair` is a loop's element of the class (read through its fields); the others are of f.result's type.
+    const names = paramNames(f).filter(([, t]) => t === ty).map(([n]) => n).concat(f.result === ty ? locals.filter((l) => !l.includes(':')) : []);
     const lit = () => ty === 'i32' ? `i32(${below(300)})` : ty === 'f64' ? pick(['0.5', '1.0', '2.25', '1.0e3', '0.0', '3.0']) :
         ty === 'bool' ? pick(['true', 'false']) : `${below(1000)}`;
     if (depth <= 0 || chance(0.2)) return names.length > 0 && chance(0.6) ? pick(names) : lit();
@@ -147,7 +168,42 @@ function typedExpr(f, ty, depth, locals, helpersAllowed) {
         return helper === 'mix' ? `mix(${sub()}, ${lit()})` : `${helper}(${sub()})`;
     }
     if (c < 0.86 && f.params.includes('text: string') && ty === 'int') return chance(0.5) ? 'text.size' : `text[${pick(['0', '1', 'left % 3', '(right & 1)'])}]`;
+    if (c < 0.95 && ty === 'int') {
+        const atoms = memberAtoms(f, sub, locals, helpersAllowed);
+        if (atoms.length > 0) return pick(atoms)();
+    }
     return pick(names.length ? names : [lit()]);
+}
+
+/** Int expressions of the newer slices that `f` can write: field chains of a Pair (a parameter, an array's element, a loop's
+ *  element), an int array's size and elements, a Pair built and passed to `area`, and calls of lib.ab's functions. */
+function memberAtoms(f, sub, locals, helpersAllowed) {
+    const atoms = [];
+    const pairs = paramNames(f).filter(([, t]) => t === 'Pair').map(([n]) => n)
+        .concat(locals.filter((l) => l.endsWith(':Pair')).map((l) => l.split(':')[0]));
+    if (paramNames(f).some(([n, t]) => n === 'ps' && t === 'array<Pair>')) {
+        atoms.push(() => 'ps.size');
+        pairs.push(`ps[${pick(['0', 'left % ps.size', '(right & 0)'])}]`);
+    }
+    // A chain through `inner` from an array's element or a loop's is not in the slice (full typing): one draw in four of those.
+    for (const p of pairs) {
+        const direct = !p.includes('[') && paramNames(f).some(([n]) => n === p);
+        atoms.push(() => `${p}.${pick(['a', 'b'])}`,
+            () => (direct || chance(0.25) ? `${p}.${pick(['inner.k', 'inner.tag.size'])}` : `${p}.${pick(['a', 'b'])}`));
+        if (helpersAllowed && f.name !== 'area') atoms.push(() => `area(${p})`);
+    }
+    for (const [n, t] of paramNames(f)) {
+        if (t === 'Cell') atoms.push(() => `${n}.${pick(['a', 'b', 'name.size'])}`);
+    }
+    if (paramNames(f).some(([n, t]) => n === 'xs' && t === 'array<int>')) atoms.push(() => 'xs.size', () => `xs[${sub()}]`);
+    // Constructors: of a class of scalar and string fields (in the slice), or now and then a class whose field is another class's
+    // constructor call (full typing).
+    if (helpersAllowed && f.name !== 'area' && f.name !== 'cellArea') {
+        atoms.push(() => `${pick(['twice', 'less'])}(${sub()})`,
+            () => (chance(0.75) ? `cellArea(Cell(${sub()}, ${sub()}, ${pick(['"t"', '"tag"', '""'])}))`
+                : `area(Pair(${sub()}, ${sub()}, Inner(${sub()}, ${pick(['"t"', '"tag"', '""'])})))`));
+    }
+    return atoms;
 }
 const intExpr = (f, depth, locals, helpersAllowed) => typedExpr(f, f.result, depth, locals, helpersAllowed);
 /** A guard's condition. */
@@ -157,6 +213,14 @@ const boolExpr = (f, locals) => typedExpr(f, 'bool', 2, locals, false);
  *  (whether each has a written type), and the guard's braces. Edits that keep a shape change only expressions: the
  *  replay needs the same symbols (locals are symbols). */
 function newShape(f) {
+    // Form 4, a loop body (a `var s` of the result type, one to three statements over it, then a result), for int functions: the
+    // loop families mostly, the others now and then.
+    if (f.result === 'int' && !HELPERS.includes(f.name) && f.name !== 'area' && f.name !== 'cellArea' && chance(f.name in SLICES && f.name !== 'pairSample' ? 0.8 : 0.15)) {
+        const kinds = ['forRange', 'forRangeControl', 'while', 'do', 'if', 'assign'];
+        if (f.params.includes('xs: array<int>')) kinds.push('forXs', 'forXs');
+        if (f.params.includes('ps: array<Pair>')) kinds.push('forPs', 'forPs', 'forPsIf');
+        return { form: 4, stmts: Array.from({ length: 1 + below(3) }, () => pick(kinds)), typed: chance(0.3), locals: [], brace: chance(0.5), helpers: true };
+    }
     const form = below(4);
     const locals = form > 0 ? Array.from({ length: below(3) }, () => chance(0.4)) : [];
     return { form, locals, brace: chance(0.5), helpers: !HELPERS.includes(f.name) || chance(0.2) };
@@ -164,6 +228,7 @@ function newShape(f) {
 
 /** A new body for `f` of `shape` (a new shape when none), well typed unless `broken` names how not to be. */
 function newBody(f, broken, shape = newShape(f)) {
+    if (shape.form === 4) return loopBody(f, broken, shape);
     const helpersAllowed = shape.helpers;   // a helper that calls another is no longer call-free
     const locals = [];
     const lines = [];
@@ -189,6 +254,37 @@ function newBody(f, broken, shape = newShape(f)) {
     return '{\n' + lines.map((line) => '    ' + line + '\n').join('') + '}';
 }
 
+/** A loop body of `shape` (form 4): `var s`, the statements its `stmts` name, and a result over `s`. A loop's variable is in scope
+ *  in its own body only; `broken` "unknown" reads it after the loop (there is no global `i`), "type" adds a bool, "assign" makes
+ *  `s` a `val` that a statement assigns. */
+function loopBody(f, broken, shape) {
+    const h = shape.helpers;
+    const locals = [];
+    const e = (depth, extra = []) => intExpr(f, depth, locals.concat(extra), h);
+    const test = (extra = []) => typedExpr(f, 'bool', 1, locals.concat(extra), h);
+    const lines = [`${broken === 'assign' ? 'val' : 'var'} s${shape.typed ? ': int' : ''} = ${e(2)}`];
+    locals.push('s');
+    for (const kind of shape.stmts) {
+        if (kind === 'forRange') lines.push(`for (i in ${e(1)} ${pick(['until', '..'])} ${e(1)}) s ${pick(['+=', '-=', '*=', '='])} ${e(2, ['i'])}`);
+        else if (kind === 'forRangeControl') {
+            lines.push(`for (i in ${e(1)}..${e(1)}) {`, `    if (${test(['i'])}) continue`, `    s = s + ${e(2, ['i'])}`,
+                `    if (s > ${below(1000)}) break`, '}');
+        } else if (kind === 'while') lines.push(`while (s > ${e(1)}) s -= ${1 + below(9)}`);
+        else if (kind === 'do') lines.push(`do { s += ${e(1)} } while (s < ${e(1)})`);
+        else if (kind === 'if') lines.push(`if (${test()}) s = ${e(2)}${chance(0.5) ? ` else s += ${e(1)}` : ''}`);
+        else if (kind === 'assign') lines.push(`s ${pick(['+=', '-=', '*=', '='])} ${e(2)}`);
+        else if (kind === 'forXs') lines.push(`for (x in xs) s += ${e(2, ['x'])}`);
+        else if (kind === 'forPs') lines.push(`for (e in ps) s += ${e(2, ['e:Pair'])}`);
+        else lines.push(`for (e in ps) if (${test(['e:Pair'])}) s += 1`);
+    }
+    let result = e(2);
+    if (broken === 'type') result = pick([`${result} + true`, `"x"`, 'true']);
+    if (broken === 'unknown') result = pick([`${result} + missingName`, 's + i', `missingCall(${result})`]);
+    if (broken === 'local') lines.unshift(`val ${paramNames(f)[0][0]} = 1`);
+    lines.push(shape.brace ? `return ${result}` : result);
+    return '{\n' + lines.map((line) => '    ' + line + '\n').join('') + '}';
+}
+
 /** A literal in the body changed, if it has one. */
 function changeLiteral(body) {
     const literals = [...body.matchAll(/(?<![A-Za-z_0-9])\d+(?![A-Za-z_0-9])/g)];
@@ -211,19 +307,25 @@ function firstDifference(a, b, where = '') {
 }
 
 const counts = { scalar: 0, interface: 0, inert: 0, analyses: 0 };
+// By step family (SLICES, 'loop' for a loop body elsewhere, 'scalar'): edits, and edits the replay rechecked as one scalar body.
+const families = {};
+// The families the last sequence rechecked, whether tallied or not (the controls read it).
+let lastRechecked = {};
 
 /** Runs one sequence of (file, text) edits through both services; the first difference found, or null. */
-async function runSequence(project, steps, tally) {
+async function runSequence(project, steps, tally, plant = control) {
     const trace = { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TRACE: '1' };
     delete trace.ABLA_ANALYSIS_INCREMENTAL_TYPING;
     delete trace.ABLA_ANALYSIS_CHECK;
-    const replay = await new Session(project, { ...trace, ABLA_ANALYSIS_INCREMENTAL_TYPING: '2', ABLA_ANALYSIS_CHECK: control ? '2' : '1' }, 'replay.stderr').start();
+    const replay = await new Session(project, { ...trace, ABLA_ANALYSIS_INCREMENTAL_TYPING: '2', ABLA_ANALYSIS_CHECK: plant ? '2' : '1' }, 'replay.stderr').start();
     const full = await new Session(project, { ...trace, ABLA_ANALYSIS_INCREMENTAL_TYPING: '0', ABLA_ANALYSIS_CHECK: '0' }, 'full.stderr').start();
     const sessions = [replay, full];
     const versions = new Map();
     let revision;
     let problem = null;
     let seen = 0;
+    let rechecks = 0;
+    lastRechecked = {};
     try {
         for (let at = 0; at <= steps.length && problem === null; at++) {
             if (at > 0) {
@@ -238,6 +340,18 @@ async function runSequence(project, steps, tally) {
             }
             const [actual, expected] = await Promise.all(sessions.map((s) => s.rpc('analyze', {})));
             counts.analyses += tally ? 1 : 0;
+            // the replay's trace line for this step (written while it answered `analyze`)
+            const now = (replay.stderr().match(/rechecked one scalar body/g) ?? []).length;
+            if (at > 0) {
+                const family = steps[at - 1].family ?? 'scalar';
+                if (now > rechecks) lastRechecked[family] = (lastRechecked[family] ?? 0) + 1;
+                if (tally) {
+                    families[family] ??= { edits: 0, rechecked: 0 };
+                    families[family].edits += 1;
+                    if (now > rechecks) families[family].rechecked += 1;
+                }
+            }
+            rechecks = now;
             const difference = firstDifference(actual, expected);
             if (difference) { problem = `step ${at}: analyze ${difference}`; break; }
             if (revision !== undefined) {
@@ -249,7 +363,7 @@ async function runSequence(project, steps, tally) {
             // queries at each name of the edited text (or of dep.ab at the start)
             const file = at > 0 ? steps[at - 1].file : path.join(project, 'dep.ab');
             const text = at > 0 ? steps[at - 1].text : fs.readFileSync(file, 'utf8');
-            const names = [...text.matchAll(/[A-Za-z_][A-Za-z_0-9]*/g)].filter((m) => !/^(fun|val|var|if|return|int|i32|string|bool|true|false|import)$/.test(m[0]));
+            const names = [...text.matchAll(/[A-Za-z_][A-Za-z_0-9]*/g)].filter((m) => !/^(fun|val|var|if|else|return|int|i32|string|bool|true|false|import|class|for|in|until|while|do|break|continue)$/.test(m[0]));
             const chosen = names.length <= 6 ? names : Array.from({ length: 6 }, () => pick(names));
             for (const name of chosen) {
                 const editor = { uri: uri(file), offset: bytes(text.slice(0, name.index)), revision };
@@ -291,6 +405,7 @@ function writeProject(directory, functions) {
     fs.writeFileSync(path.join(directory, 'main.ab'), mainText);
     fs.writeFileSync(path.join(directory, 'reader.ab'), readerText);
     fs.writeFileSync(path.join(directory, 'provider.ab'), providerInitial);
+    fs.writeFileSync(path.join(directory, 'lib.ab'), libText);
     fs.writeFileSync(path.join(directory, 'dep.ab'), depText(functions));
 }
 
@@ -306,15 +421,17 @@ function makeSteps(project, count) {
             provider = pick(['fun later(): int = 7\n', 'fun later(): int = 8\n', 'fun later(): int = 2+2\n', 'fun later(): i32 = i32(7)\n',
                 'fun later(): i64 = 7\n', 'fun later(): i64 = 2+2\n', 'fun later(): i64 = 7\n', 'fun later(): int = 7\n',
                 'fun later(): int = 7 * 3\n', 'fun later(): bool = true\n', 'fun later(): int = missing\n']);
-            steps.push({ file: path.join(project, 'provider.ab'), text: provider, label: `provider ${provider.trim()}` });
+            steps.push({ file: path.join(project, 'provider.ab'), text: provider, label: `provider ${provider.trim()}`, family: 'provider' });
             // a provider its readers cannot use is put right in the next step: an answer with errors sends every later edit to full typing
             if (/bool|missing/.test(provider)) {
                 provider = providerInitial;
-                steps.push({ file: path.join(project, 'provider.ab'), text: provider, label: 'provider repaired' });
+                steps.push({ file: path.join(project, 'provider.ab'), text: provider, label: 'provider repaired', family: 'provider' });
             }
             continue;
         }
-        const at = below(functions.length);
+        // half the edits go to the newer slices' functions
+        const sliced = functions.map((g, k) => (g.name in SLICES ? k : -1)).filter((k) => k >= 0);
+        const at = chance(0.5) ? pick(sliced) : below(functions.length);
         const f = functions[at];
         let body;
         let shape = f.shape;
@@ -323,19 +440,30 @@ function makeSteps(project, count) {
         if (kind < 0.55) body = newBody(f, null, shape);
         else if (kind < 0.65) body = changeLiteral(f.body) ?? newBody(f, null, shape);
         else if (kind < 0.72) { shape = newShape(f); body = newBody(f, null, shape); }
-        else if (kind < 0.76) body = newBody(f, 'type', shape);
+        else if (kind < 0.76) body = newBody(f, shape.form === 4 && chance(0.4) ? 'assign' : 'type', shape);
         else if (kind < 0.80) body = newBody(f, 'unknown', shape);
         else if (kind < 0.83) { shape = { ...shape, form: Math.max(shape.form, 1) }; body = newBody(f, 'local', shape); }
         else if (kind < 0.92) { shape = original[at].shape; body = original[at].body; }
         else body = f.body.startsWith('= ') ? `= (${f.body.slice(2)})` : f.body + ' // trailing';
         const before = functions;
         functions = functions.map((g, k) => (k === at ? { ...g, body, shape } : g));
-        steps.push({ file: path.join(project, 'dep.ab'), text: depText(functions), label: `${label} ${body.replace(/\n\s*/g, ' ')}` });
+        steps.push({ file: path.join(project, 'dep.ab'), text: depText(functions), label: `${label} ${body.replace(/\n\s*/g, ' ')}`, family: SLICES[f.name] ?? (shape.form === 4 ? 'loop' : 'scalar') });
         // an error is put right in the next step, as an editor user does (and so the edits after it can replay again)
         if (/^(type-error|unknown|shadow)/.test(label)) {
             functions = before;
-            steps.push({ file: path.join(project, 'dep.ab'), text: depText(functions), label: `repaired:${f.name}` });
+            steps.push({ file: path.join(project, 'dep.ab'), text: depText(functions), label: `repaired:${f.name}`, family: 'repair' });
         }
+    }
+    return steps;
+}
+
+/** `count` edits of function `name` that keep its first shape and change its expressions (what the replay admits). */
+function sliceSteps(project, name, count) {
+    let functions = initialFunctions();
+    const steps = [];
+    for (let i = 0; i < count; i++) {
+        functions = functions.map((g) => (g.name === name ? { ...g, body: newBody(g, null, g.shape) } : g));
+        steps.push({ file: path.join(project, 'dep.ab'), text: depText(functions), label: `expressions:${name}`, family: SLICES[name] });
     }
     return steps;
 }
@@ -367,9 +495,25 @@ for (let seed = seeds[0]; seed <= seeds[1]; seed++) {
     console.log(`  kept ${kept.length} of ${steps.length} edits in ${out}`);
 }
 console.log(`analysis-scalar: ${counts.analyses} analyses; replay rechecked ${counts.scalar} scalar bodies, ${counts.interface} interfaces with dependents, ${counts.inert} type-inert edits; ${failed} seeds differ`);
+console.log(`analysis-scalar: rechecked alone, by family: ${Object.entries(families).map(([name, n]) => `${name} ${n.rechecked}/${n.edits}`).join(', ')}`);
 if (control) {
     if (failed === 0) { console.error('analysis-scalar: control: a planted difference was not reported'); process.exit(1); }
     console.log('analysis-scalar: control: a planted difference is reported');
+    // Each newer slice: three edits of its function that keep the body's shape. Without the plant they agree with full typing and
+    // the replay rechecks at least one alone (so the slice is reached); with it, the difference is reported at that edit.
+    for (const [name, family] of Object.entries(SLICES)) {
+        state = 0x9e3779b9;
+        const project = path.join(work, `control-${family}`);
+        writeProject(project, initialFunctions());
+        const steps = sliceSteps(project, name, 3);
+        const clean = await runSequence(project, steps, false, false);
+        if (clean !== null) { console.error(`analysis-scalar: control: ${family} edits differ without the plant: ${clean.slice(0, 400)}`); process.exit(1); }
+        if (!(lastRechecked[family] > 0)) { console.error(`analysis-scalar: control: no ${family} edit was rechecked alone (the slice is not reached)`); process.exit(1); }
+        writeProject(project, initialFunctions());
+        const planted = await runSequence(project, steps, false, true);
+        if (planted === null) { console.error(`analysis-scalar: control: a planted difference in a ${family} edit was not reported`); process.exit(1); }
+    }
+    console.log(`analysis-scalar: control: ${Object.values(SLICES).join(', ')} edits are rechecked alone and a planted difference in each is reported`);
     process.exit(0);
 }
 if (counts.scalar === 0) { console.error('analysis-scalar: no edit was rechecked as a scalar body (the run reached nothing)'); process.exit(1); }
