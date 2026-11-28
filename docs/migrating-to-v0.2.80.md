@@ -82,8 +82,12 @@ that came from outside the region, such as the result of `Map.get` or a
 function's result, and so outlive the region. A store into a receiver or a
 retaining argument now needs that object to be surely the region's own: made in the region by a
 constructor, a literal, a lambda or a task, or returned by a function that
-returns only such objects. Two more cases are refused:
+returns only such objects, and only from values that are themselves the
+region's, scalars or strings. These are refused too:
 
+- a store through an object constructed around one from outside the
+  region: `Keeper(outer).keep(value)` stores into `outer`, so `Keeper(outer)`
+  is not the region's own;
 - a lambda made in the region storing its parameters out of it;
 - a `for` loop variable over the region's array, including over
   `text.split(...)`, stored out of it.
