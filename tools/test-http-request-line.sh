@@ -18,4 +18,4 @@ for mode in --fast ""; do
         [[ $status -eq 42 ]] || { echo "http request line: status $status (mode '$mode', stress $stress)" >&2; exit 1; }
     done
 done
-echo "HTTP request line: a request line that is not method SP target SP HTTP/1.x with a token method is refused by the shared check and the blocking reader"
+echo "HTTP request line: a request line that is not method SP target SP HTTP/1.x with a token method is refused by the shared check and the blocking reader, and a header end past the input is refused before the line is read"
