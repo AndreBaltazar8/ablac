@@ -144,8 +144,9 @@ release_assets() {
         json_check "$data/fuzz.json" 'type == "array" and all(.[]; (.command | type == "string") and (.revision | type == "string") and (.recordedAt | type == "string") and (.agree | type == "number" and . >= 0 and floor == .) and (.disagree | type == "number" and . >= 0 and floor == .) and (.exitStatus | type == "number" and floor == .))'
         evidence "$data/fuzz.json"
         if [[ $(jq 'length' "$data/fuzz.json") == 0 ]]; then missing 'recorded fuzz campaigns'; fi
-        jq -r '.[] | "Revision: \(.revision)\nRecorded: \(.recordedAt)\nCommand: \(.command)\nAgreeing seeds: \(.agree); disagreeing seeds: \(.disagree); exit status: \(.exitStatus)\n"' "$data/fuzz.json" | sed 's/^/    /'
-        printf '\nExit status 124 means timeout; a partial campaign with zero disagreements is not a completed clean campaign.\n\n'
+        # Records from tools/fuzz/run --record also carry the campaign, families, seeds, modes and the compiler hash.
+        jq -r '.[] | "Revision: \(.revision)\(if .revisionDirty == true then " (checkout had changes)" else "" end)\nRecorded: \(.recordedAt)\nCommand: \(.command)\n" + (if .campaign then "Campaign: \(.campaign); seeds run \(.seeds) (\(.seedCount); planned \(.plannedSeeds)), \(.checksPerSeed) checks each\nModes: \(.modes | join(", "))\nFamilies: \(.families | length) (\(.families | join(", ")))\nCompiler: \(.compilerVersion), SHA-256 \(.compilerSha256)\n" else "" end) + "Agreeing seeds: \(.agree); disagreeing seeds: \(.disagree)\(if (.disagreeingSeeds // []) != [] then " (\(.disagreeingSeeds | map(tostring) | join(", ")))" else "" end); exit status: \(.exitStatus)\(if .complete == false then " (not finished)" else "" end)\n"' "$data/fuzz.json" | sed 's/^/    /'
+        printf '\nExit status 124 means timeout (a recorded campaign that never finished keeps 124); a partial campaign with zero disagreements is not a completed clean campaign.\n\n'
     else
         missing 'structured campaign totals and disagreement counts (fuzz.json)'
     fi

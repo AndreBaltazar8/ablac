@@ -54,7 +54,15 @@ fi
 [[ $output == *"build-paths"* ]] || { echo "fuzz: build-paths bytes control: $output" >&2; exit 1; }
 echo "fuzz: the build-paths axis agrees with the other modes and reports a planted difference in behaviour and in bytes"
 
-fuzz --seeds 100000-100001 --checks 12
+# The campaign record (--record, read by tools/readiness.sh as fuzz.json): both seeds counted, the run finished, its modes named.
+rm -f "$controls/fuzz.json"
+fuzz --seeds 100000-100001 --checks 12 --record "$controls/fuzz.json"
+record=$(cat "$controls/fuzz.json")
+for expected in '"campaign":"default"' '"seeds":"100000-100001"' '"agree":2' '"disagree":0' '"exitStatus":0' '"complete":true' '"modes":["fast","release","ct","ct-jit"'; do
+    [[ $record == *"$expected"* ]] || { echo "fuzz: the campaign record lacks $expected: $record" >&2; exit 1; }
+done
+if fuzz --selftest --record "$controls/fuzz.json" 2>/dev/null; then echo "fuzz: --record was accepted without a seed campaign" >&2; exit 1; fi
+echo "fuzz: the campaign record counts its seeds and modes"
 fuzz --replay
 fuzz --control-oracle default_owner_check,ownership_lifetime_check,fresh_select_check,json_check,yaml_check,gzip_check,region_member_check,logical_assign_check,static_concat_check,gc_churn_check,sealed_when_check,dense_local_check
 fuzz --hosted-tasks --seeds 100000 --checks 8

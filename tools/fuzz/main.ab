@@ -8,6 +8,9 @@
 //   ABLA_FUZZ_WASI=1 and ABLA_FUZZ_RISCV64=1 add wasm32-wasi (wasmtime) and riscv64-linux (qemu-riscv64).
 //   The default corpus compares portable language values exactly; it does not generate pointer addresses or ABI sizes.
 //   The libc campaign is native ABI-specific, and WASI is excluded from the hosted task/thread campaign.
+//   tools/fuzz/run --seeds ... --record FILE        also the campaign record in FILE (a JSON array, record.ab): compiler
+//                                                  revision and SHA-256, campaign, families, seeds, modes, agree and
+//                                                  disagree counts, exit status; tools/readiness.sh reads it as fuzz.json
 //   tools/fuzz/run --seeds ... --panics             also one panicking program per seed (native and Wasm)
 //   tools/fuzz/run --seeds ... --hosted-tasks       task_check only, the four hosted modes (Wasm has no tasks)
 //   tools/fuzz/run --seeds ... --libc               libc_check only (strtod, strtof, strtol, libm): native run vs compile-time jit, no interpreter, no Wasm
@@ -48,6 +51,7 @@ import "./strictflat.ab"
 import "./campaigns.ab"
 import "./gen_libc.ab"
 import "./prng.ab"
+import "./record.ab"
 
 class FuzzOptions(
     var seeds: array<int>,
@@ -78,7 +82,14 @@ class FuzzOptions(
     var integerStores: bool,
     var compileTimeTiers: bool,
     var strictFlat: bool,
-    var libc: bool
+    var libc: bool,
+    var record: string,
+    var recordRevision: string,
+    var recordDirty: bool,
+    var recordCompilerSha256: string,
+    var recordCompilerVersion: string,
+    var recordCommand: string,
+    var recordCompiler: string
 )
 
 val FUZZ_WORK = "build/fuzz-abla"
@@ -111,7 +122,7 @@ fun fuzzSeedRange(text: string, var into: array<int>): void {
 }
 
 fun fuzzOptions(root: string): FuzzOptions {
-    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false, "", false, false, false, false, false, false, false, false, false, false, 2000, "", false, false, false, false)
+    val options = FuzzOptions([], 24, "$root/build/ablac", 120, "", false, "", false, false, false, false, false, "", false, false, false, false, false, false, false, false, false, false, 2000, "", false, false, false, false, "", "unknown", false, "", "", "", "")
     var seedText = "1"
     var index = 0
     val count = processArgumentCount()
@@ -137,6 +148,20 @@ fun fuzzOptions(root: string): FuzzOptions {
             options.regexCases = fuzzParseInt(value)
         } else if (argument == "--regex-corpus") {
             options.regexCorpus = value
+        } else if (argument == "--record") {
+            options.record = value
+        } else if (argument == "--record-revision") {
+            options.recordRevision = value
+        } else if (argument == "--record-dirty") {
+            options.recordDirty = value == "1"
+        } else if (argument == "--record-compiler-sha256") {
+            options.recordCompilerSha256 = value
+        } else if (argument == "--record-compiler-version") {
+            options.recordCompilerVersion = value
+        } else if (argument == "--record-command") {
+            options.recordCommand = value
+        } else if (argument == "--record-compiler") {
+            options.recordCompiler = value
         } else {
             takes = false
             if (argument == "--keep") {
@@ -485,6 +510,42 @@ fun fuzzAbsolute(path: string): string {
     if (here == "") path else "$here/$path"
 }
 
+var fuzzRecordFailed = false
+
+/** Reports the first record write that failed; the campaign goes on, and exits 2 at the end if it would have exited 0. */
+fun fuzzRecordNote(problem: string): void {
+    if (problem != "" && !fuzzRecordFailed) {
+        eprintln("fuzz: --record: $problem")
+        fuzzRecordFailed = true
+    }
+    return
+}
+
+fun fuzzRecordEnd(var record: FuzzRecord, status: int): int {
+    fuzzRecordNote(record.finish(status))
+    if (fuzzRecordFailed && status == 0) 2 else status
+}
+
+/** The seed campaign the options select, as the record names it. */
+fun fuzzCampaignName(options: FuzzOptions): string =
+    if (options.moduleGraphs) "module-graphs" else if (options.subparserGraphs) "subparser-graphs"
+    else if (options.crossTargetTiers) "cross-target-tiers" else if (options.integerStores) "integer-stores"
+    else if (options.compileTimeTiers) "compile-time-tiers" else if (options.strictFlat) "strict-flat"
+    else if (options.sharedGlobals) "shared-globals" else if (options.regex) "regex"
+    else if (options.hostedTasks) "hosted-tasks" else if (options.libc) "libc"
+    else if (options.panics) "default+panics" else "default"
+
+/** The families a campaign's checks are drawn from: the focused one, the whole mix, or the campaign's own generator. */
+fun fuzzCampaignFamilies(options: FuzzOptions, campaign: string): array<string> {
+    if (options.focus != "") return [options.focus]
+    if (campaign != "default" && campaign != "default+panics" && campaign != "compile-time-tiers") return [campaign]
+    val families: array<string> = []
+    for (family in FUZZ_FAMILIES) {
+        if (!(options.noAny && family == "any_pool_check")) families.append(family)
+    }
+    families
+}
+
 fun main: int {
     val root = processEnvironment("ABLA_FUZZ_ROOT") ?? ""
     if (root == "") {
@@ -492,9 +553,28 @@ fun main: int {
         return 2
     }
     val options = fuzzOptions(root)
+    if (options.record != "" && (options.selftest || options.controlRegex || options.regexCorpus != "" || options.replay ||
+        options.program != "" || options.checkHostless || options.checkRefusals || options.controlMinimise ||
+        options.controlOracle != "") && fuzzUsageError == "") {
+        fuzzUsageError = "--record records seed campaigns only"
+    }
     if (fuzzUsageError != "") {
         eprintln("fuzz: $fuzzUsageError")
         return 2
+    }
+    val campaign = fuzzCampaignName(options)
+    var record = fuzzRecordStart(if (options.record == "") "" else fuzzAbsolute(options.record),
+        if (options.recordCommand == "") "tools/fuzz/run" else options.recordCommand, options.recordRevision,
+        options.recordDirty, if (options.recordCompiler == "") fuzzAbsolute(options.compiler) else options.recordCompiler,
+        options.recordCompilerSha256, options.recordCompilerVersion,
+        campaign, fuzzCampaignFamilies(options, campaign), if (options.regex) options.regexCases else options.checks,
+        options.seeds)
+    if (options.record != "") {
+        val problem = fuzzRecordWrite(record)
+        if (problem != "") {
+            eprintln("fuzz: --record: $problem")
+            return 2
+        }
     }
     if (options.selftest) {
         val prng = prngSelftest()
@@ -542,8 +622,10 @@ fun main: int {
             val report = rxRun(seed, options.regexCases, 0)
             println(report.text)
             failed = failed + report.failures
+            fuzzSawMode("regex oracle")
+            fuzzRecordNote(record.seed(seed, report.failures == 0))
         }
-        return if (failed == 0) 0 else 1
+        return fuzzRecordEnd(record, if (failed == 0) 0 else 1)
     }
     if (options.checkHostless) return fuzzCheckHostlessCapabilities(runner)
     if (options.checkRefusals) return fuzzCheckSubparserRefusals(runner)
@@ -559,13 +641,15 @@ fun main: int {
                 if (found == "") println("subparser seed $seed: no-cache, cached cold/warm/helper-hit and provider edit agree in all six modes")
             } else {
                 found = fuzzRunCrossTargetTiers(runner, seed, options.keep)
+                for (tier in ["interp", "jit", "auto"]) fuzzSawMode(tier)
             }
+            fuzzRecordNote(record.seed(seed, found == ""))
             if (found != "") {
                 failed = failed + 1
                 println(found)
             }
         }
-        return if (failed == 0) 0 else 1
+        return fuzzRecordEnd(record, if (failed == 0) 0 else 1)
     }
     if (options.integerStores || options.compileTimeTiers || options.strictFlat) {
         var failed = 0
@@ -574,6 +658,7 @@ fun main: int {
             if (options.integerStores) found = fuzzRunStores(runner, seed, options.keep)
             else if (options.compileTimeTiers) found = fuzzRunTiers(runner, options, fuzzPrelude(root), seed)
             else found = fuzzRunStrictFlat(runner, seed, options.keep)
+            fuzzRecordNote(record.seed(seed, found == ""))
             if (found != "") {
                 failed = failed + 1
                 println(found)
@@ -585,12 +670,15 @@ fun main: int {
                 println("strict-flat seed $seed: the graph builds and runs the same flat and with --strict-imports after fix-imports")
             }
         }
-        return if (failed == 0) 0 else 1
+        return fuzzRecordEnd(record, if (failed == 0) 0 else 1)
     }
     if (options.sharedGlobals) {
+        // (its tiers, as the record names them: the campaign does not go through modesOf)
+        for (tier in ["interp", "jit", "auto"]) fuzzSawMode(tier)
         var failed = 0
         for (seed in options.seeds) {
             val found = fuzzRunSharedGlobals(runner, seed, options.keep)
+            fuzzRecordNote(record.seed(seed, found == ""))
             if (found != "") {
                 failed = failed + 1
                 println(found)
@@ -598,7 +686,7 @@ fun main: int {
                 println("shared globals seed $seed: ${FUZZ_SHARED_KINDS.size} shapes agree with their expected lines in interp/jit/auto")
             }
         }
-        return if (failed == 0) 0 else 1
+        return fuzzRecordEnd(record, if (failed == 0) 0 else 1)
     }
     val prelude = if (options.libc) fuzzLibcPrelude() else if (options.hostedTasks) FUZZ_PRELUDE_TASK else fuzzPrelude(root)
     if (options.controlMinimise) return fuzzControlMinimise(runner, options, prelude)
@@ -614,6 +702,7 @@ fun main: int {
     var failures = 0
     for (seed in options.seeds) {
         val found = fuzzRunSeed(runner, options, prelude, seed)
+        fuzzRecordNote(record.seed(seed, found == ""))
         if (found != "") {
             failures = failures + 1
             println(found)
@@ -624,5 +713,5 @@ fun main: int {
             println("seed $seed: ${options.checks} checks agree in $modes$wasiMode$riscvMode")
         }
     }
-    if (failures == 0) 0 else 1
+    fuzzRecordEnd(record, if (failures == 0) 0 else 1)
 }

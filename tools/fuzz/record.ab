@@ -1,0 +1,118 @@
+// The campaign record (--record FILE): one entry per run in a JSON array that tools/readiness.sh reads as fuzz.json.
+// The entry is written when the campaign starts and again after every seed, with exitStatus 124 and complete false
+// until the campaign ends; a run that is killed (a timeout, a lost slot) keeps that, so it never reads as clean.
+// tools/fuzz/run adds the compiler's revision, whether its checkout had changes, the compiler binary's SHA-256 and
+// its --version line (the --record-* arguments). Other entries in the file are kept as they are: each write reads the
+// file again and replaces only this run's entry (by its id), through a temporary file and a rename.
+import "abla/text"
+import "abla/fs"
+import "abla/json"
+import "abla/date"
+import "abla/process/time"
+
+class FuzzRecord(
+    val path: string,
+    val id: string,
+    val command: string,
+    val revision: string,
+    val dirty: bool,
+    val compilerPath: string,
+    val compilerSha256: string,
+    val compilerVersion: string,
+    val campaign: string,
+    val families: array<string>,
+    val checks: int,
+    val planned: array<int>,
+    val recordedAt: string,
+    var seeds: array<int>,
+    var agree: int,
+    var disagree: int,
+    var disagreeing: array<int>,
+    var modes: array<string>,
+    var exitStatus: int,
+    var complete: bool
+)
+
+// Every mode a comparison saw, in first-seen order: fuzzVerdict adds them, the record lists them.
+var fuzzSeenModes: array<string> = []
+
+fun fuzzSawMode(mode: string): void {
+    for (seen in fuzzSeenModes) {
+        if (seen == mode) return
+    }
+    fuzzSeenModes.append(mode)
+    return
+}
+
+/** Seeds as ranges: 5-9,12. */
+fun fuzzSeedText(seeds: array<int>): string {
+    val parts: array<string> = []
+    var index = 0
+    while (index < seeds.size) {
+        var end = index
+        while (end + 1 < seeds.size && seeds[end + 1] == seeds[end] + 1) end = end + 1
+        parts.append(if (end == index) "${seeds[index]}" else "${seeds[index]}-${seeds[end]}")
+        index = end + 1
+    }
+    textJoin(parts, ",")
+}
+
+fun fuzzRecordJson(record: FuzzRecord): Json = jsonObject(
+    ["id", "command", "revision", "revisionDirty", "compiler", "compilerSha256", "compilerVersion", "campaign",
+        "families", "checksPerSeed", "plannedSeeds", "seeds", "seedCount", "modes", "agree", "disagree",
+        "disagreeingSeeds", "recordedAt", "finishedAt", "exitStatus", "complete"],
+    [jsonString(record.id), jsonString(record.command), jsonString(record.revision), jsonBoolean(record.dirty),
+        jsonString(record.compilerPath), jsonString(record.compilerSha256), jsonString(record.compilerVersion),
+        jsonString(record.campaign), ablaJsonValue(record.families), jsonInteger(record.checks),
+        jsonString(fuzzSeedText(record.planned)), jsonString(fuzzSeedText(record.seeds)), jsonInteger(record.seeds.size),
+        ablaJsonValue(fuzzSeenModes), jsonInteger(record.agree), jsonInteger(record.disagree),
+        ablaJsonValue(record.disagreeing), jsonString(record.recordedAt),
+        if (record.complete) jsonString(utcNow().iso8601()) else jsonNull(), jsonInteger(record.exitStatus),
+        jsonBoolean(record.complete)])
+
+/** Writes the file with this run's entry in place of its last copy, after the entries already there. "" or why not. */
+fun fuzzRecordWrite(record: FuzzRecord): string {
+    val entries: array<Json> = []
+    if (Path(record.path).exists()) {
+        val text = Path(record.path).readText()
+        if (text.trim() != "") {
+            val parsed = jsonParse(text)
+            if (!parsed.succeeded || !parsed.value.isArray()) return "${record.path} is not a JSON array"
+            for (index in 0 until parsed.value.size()) {
+                val entry = parsed.value.at(index)
+                if (!(entry.isObject() && entry.has("id") && entry.get("id").asString() == record.id)) entries.append(entry)
+            }
+        }
+    }
+    entries.append(fuzzRecordJson(record))
+    val temporary = "${record.path}.${record.id}.tmp"
+    Path(temporary).writeText(jsonStringify(jsonArray(entries)) + "\n")
+    if (!Path(temporary).moveTo(Path(record.path))) return "cannot rename $temporary to ${record.path}"
+    ""
+}
+
+/** Counts one seed and writes the entry: "" or why the file could not be written. */
+fun FuzzRecord.seed(seed: int, agreed: bool): string {
+    this.seeds.append(seed)
+    if (agreed) this.agree = this.agree + 1
+    else {
+        this.disagree = this.disagree + 1
+        this.disagreeing.append(seed)
+    }
+    if (this.path == "") "" else fuzzRecordWrite(this)
+}
+
+/** The final entry: the exit status the campaign returns, and complete. */
+fun FuzzRecord.finish(status: int): string {
+    this.exitStatus = status
+    this.complete = true
+    if (this.path == "") "" else fuzzRecordWrite(this)
+}
+
+fun fuzzRecordStart(path: string, command: string, revision: string, dirty: bool, compilerPath: string,
+    compilerSha256: string, compilerVersion: string, campaign: string, families: array<string>, checks: int,
+    planned: array<int>): FuzzRecord {
+    val now = realtimeNanoseconds()
+    FuzzRecord(path, "$now", command, revision, dirty, compilerPath, compilerSha256, compilerVersion, campaign,
+        families, checks, planned, utcDate(now / 1000000).iso8601(), [], 0, 0, [], [], 124, false)
+}

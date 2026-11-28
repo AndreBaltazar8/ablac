@@ -34,8 +34,14 @@ prints evidence hashes for traceability, not as proof of freshness.
 - `release-check.log`: optional captured verification for the published
   assets, including any failed checks. Preserve the release and command beside
   the log.
-- `fuzz.json`: a hand-recorded array of campaign summaries:
+- `fuzz.json`: an array of campaign summaries, written by
+  `tools/fuzz/run --seeds ... --record DIR/fuzz.json` (one entry per run, added to
+  what the file holds) or by hand with at least
   `[{"revision":"<sha>","recordedAt":"<timestamp>","command":"tools/fuzz/run ...","agree":20,"disagree":0,"exitStatus":0}]`.
+  A written entry also names the campaign, families, seeds run and planned,
+  modes, disagreeing seeds, the compiler's version and SHA-256, and whether its
+  checkout had changes; it keeps exit status 124 and `complete: false` until
+  the campaign ends, so a killed run is never read as clean.
   Counts are seeds, not generated checks. Preserve stdout and the actual exit
   status. A timeout is 124 and does not complete the campaign. Fuzzer scratch
   directories are deliberately ignored. The shared fuzzer note is included as

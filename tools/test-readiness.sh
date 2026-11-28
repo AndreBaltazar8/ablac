@@ -30,7 +30,8 @@ cat > "$work/data/releases.json" <<'JSON'
 ]
 JSON
 cat > "$work/data/fuzz.json" <<'JSON'
-[{"revision":"fuzz-revision","recordedAt":"recorded-time","command":"fuzz --seeds 1-4","agree":3,"disagree":1,"exitStatus":1}]
+[{"revision":"fuzz-revision","recordedAt":"recorded-time","command":"fuzz --seeds 1-4","agree":3,"disagree":1,"exitStatus":1},
+ {"id":"7","revision":"recorded-revision","revisionDirty":true,"recordedAt":"t2","command":"tools/fuzz/run --seeds 5-9 --record x","compiler":"/c","compilerSha256":"abc123","compilerVersion":"ablac 9.9.9","campaign":"default","families":["plain_check","json_check"],"checksPerSeed":24,"plannedSeeds":"5-9","seeds":"5-7","seedCount":3,"modes":["fast","release"],"agree":2,"disagree":1,"disagreeingSeeds":[6],"finishedAt":null,"exitStatus":124,"complete":false}]
 JSON
 cat > "$work/data/coverage.json" <<'JSON'
 {"schemaVersion":1,"modules":[],"totals":{"documented":3,"undocumented":1,"total":4}}
@@ -52,6 +53,12 @@ has '| v1.0.1 | 0 |'
 has '| v1.0.2 | Missing |'
 ! has '| v2.0.0 |'
 has 'Agreeing seeds: 3; disagreeing seeds: 1; exit status: 1'
+has 'Revision: recorded-revision (checkout had changes)'
+has 'Campaign: default; seeds run 5-7 (3; planned 5-9), 24 checks each'
+has 'Modes: fast, release'
+has 'Families: 2 (plain_check, json_check)'
+has 'Compiler: ablac 9.9.9, SHA-256 abc123'
+has 'Agreeing seeds: 2; disagreeing seeds: 1 (6); exit status: 124 (not finished)'
 has '**3/4** (75%)'
 has 'Fixed point: Missing'
 has 'Gate completion: Missing (unfinished)'
