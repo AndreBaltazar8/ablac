@@ -727,6 +727,12 @@ fun bootstrapModuleSnapshotFrozen(snapshot: BootstrapModuleSnapshot): BootstrapM
         !bootstrapAnalysisBudgetExpired())
         Frozen(snapshot).get() else snapshot
 
+// A held parse is frozen only to check that nothing writes into it (ABLA_ANALYSIS_FREEZE_HELD=1, every size): the copy
+// costs a cold analyze about 8% of its instructions on abla-one and saves nothing per edit.
+fun bootstrapModuleHeldParseFrozen(held: BootstrapModuleHeldParse): BootstrapModuleHeldParse =
+    if (linuxEnvironment("ABLA_ANALYSIS_FREEZE_HELD").value == "1" && !bootstrapAnalysisBudgetExpired())
+        Frozen(held).get() else held
+
 class BootstrapModuleSnapshot(
     val path: string,
     val source: string,
@@ -750,6 +756,141 @@ fun bootstrapRawHostTokens(source: string): array<BootstrapToken> =
 fun bootstrapModuleTokens(snapshot: BootstrapModuleSnapshot): array<BootstrapToken> =
     if (snapshot.hostSource == "") bootstrapLexShared(snapshot.source)
     else bootstrapRawHostTokens(snapshot.hostSource)
+
+// What the editor holds of a module it parses raw (acquireParsed, syntax-only), across analyses while the module's source
+// and host source stay the same: one per module path of the last graph (bootstrapModuleHeldParseFrozen). Its parse, as sema
+// leaves it: sema ends a void body that ends in an assignment with a return (done here, before the parse is held:
+// bootstrapModuleEndVoidBodies), and fills in a lambda's contextual parameter types and void return from the call it is
+// passed to, which another module can change, so sema types a fresh copy of each declaration with a lambda
+// (bootstrapModuleParseForSema) and the held one stays as parsed.
+class BootstrapModuleHeldParse(
+    val source: string,
+    val hostSource: string,
+    val parsed: BootstrapParseResult,
+    val hasLambda: bool
+)
+
+// What sema's bootstrapEndVoidBodyAfterAssignment does to each function and method it types, ahead of time, so the
+// held parse is the one sema leaves as it is.
+fun bootstrapModuleEndVoidBodies(parsed: BootstrapParseResult): void {
+    for (declaration in parsed.declarations) {
+        if ((declaration.kind == "fun" || declaration.kind == "compile.fun") && declaration.expression.kind != "missing") {
+            bootstrapEndVoidBodyAfterAssignment(declaration.resultType, declaration.expression)
+        }
+        for (method in declaration.methods) bootstrapEndVoidBodyAfterAssignment(method.resultType, method.expression)
+    }
+}
+
+fun bootstrapModuleExpressionHasLambda(expression: BootstrapExpression): bool {
+    if (expression.kind == "lambda" || expression.kind == "lambda.move") return true
+    for (child in expression.children) {
+        if (bootstrapModuleExpressionHasLambda(child)) return true
+    }
+    false
+}
+
+fun bootstrapModuleDeclarationHasLambda(declaration: BootstrapDeclaration): bool {
+    if (bootstrapModuleExpressionHasLambda(declaration.expression)) return true
+    for (value in declaration.parameterDefaults) {
+        if (bootstrapModuleExpressionHasLambda(value)) return true
+    }
+    for (value in declaration.annotationArguments) {
+        if (bootstrapModuleExpressionHasLambda(value)) return true
+    }
+    for (method in declaration.methods) {
+        if (bootstrapModuleDeclarationHasLambda(method)) return true
+    }
+    false
+}
+
+/** Whether sema writes into this parse (see BootstrapModuleHeldParse) once bootstrapModuleEndVoidBodies ran: a lambda. */
+fun bootstrapModuleParseHasLambda(parsed: BootstrapParseResult): bool {
+    for (declaration in parsed.declarations) {
+        if (bootstrapModuleDeclarationHasLambda(declaration)) return true
+    }
+    for (action in parsed.actions) {
+        if (bootstrapModuleExpressionHasLambda(action)) return true
+    }
+    false
+}
+
+/** A mutable copy of `expression` and everything under it. */
+fun bootstrapModuleExpressionCopy(expression: BootstrapExpression): BootstrapExpression {
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapModuleExpressionCopy(child))
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
+fun bootstrapModuleExpressionsCopy(expressions: array<BootstrapExpression>): array<BootstrapExpression> {
+    val copies: array<BootstrapExpression> = []
+    for (expression in expressions) copies.append(bootstrapModuleExpressionCopy(expression))
+    copies
+}
+
+/** `declaration` with its expressions and methods copied (bootstrapModuleExpressionCopy): every other field is shared. */
+fun bootstrapModuleDeclarationCopy(declaration: BootstrapDeclaration): BootstrapDeclaration {
+    val methods: array<BootstrapDeclaration> = []
+    for (method in declaration.methods) methods.append(bootstrapModuleDeclarationCopy(method))
+    BootstrapDeclaration(
+        declaration.kind,
+        declaration.name,
+        declaration.begin,
+        declaration.end,
+        bootstrapModuleExpressionCopy(declaration.expression),
+        declaration.parameters,
+        declaration.parameterTypes,
+        declaration.resultType,
+        methods,
+        bootstrapModuleExpressionsCopy(declaration.parameterDefaults),
+        declaration.externalLibrary,
+        declaration.parameterKinds,
+        declaration.extensionOwner,
+        declaration.isTrusted,
+        declaration.isResource,
+        declaration.isNoEscape,
+        declaration.generatedNamespace,
+        declaration.generatedOriginBegin,
+        declaration.generatedOriginEnd,
+        declaration.annotations,
+        bootstrapModuleExpressionsCopy(declaration.annotationArguments),
+        declaration.annotationBegins,
+        declaration.annotationEnds,
+        declaration.sourceIdentity,
+        declaration.conformances,
+        declaration.isSealed,
+        declaration.isPrivate,
+        declaration.typeParameters
+    )
+}
+
+/** The parse sema types for a held one: the held parse, with each declaration and action that has a lambda copied. */
+fun bootstrapModuleParseForSema(held: BootstrapModuleHeldParse): BootstrapParseResult {
+    val parsed = held.parsed
+    if (!held.hasLambda) return parsed
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) {
+        declarations.append(if (bootstrapModuleDeclarationHasLambda(declaration)) bootstrapModuleDeclarationCopy(declaration)
+            else declaration)
+    }
+    val actions: array<BootstrapExpression> = []
+    for (action in parsed.actions) {
+        actions.append(if (bootstrapModuleExpressionHasLambda(action)) bootstrapModuleExpressionCopy(action) else action)
+    }
+    BootstrapParseResult(
+        declarations,
+        actions,
+        parsed.errors,
+        parsed.extensionErrors,
+        parsed.compileInputPaths,
+        parsed.compileInputContents,
+        parsed.diagnostics,
+        parsed.declarationEdits,
+        parsed.stackDepthStoppedSources,
+        parsed.subparserSpans,
+        parsed.subparserUses,
+        parsed.actionSources
+    )
+}
 
 class BootstrapModuleFrontendSnapshot(
     val path: string,
@@ -861,6 +1002,11 @@ class BootstrapModuleState(
     var overlays: array<BootstrapModuleOverlay> = [],
     val overlaySnapshots: Map<string, bool> = Map(),
     var syntaxOnly: bool = false,
+    // The editor's held tokens by module path (BootstrapModuleHeldParse); BootstrapModuleGraph.parse drops the paths
+    // its graph no longer has.
+    val heldParses: Map<string, BootstrapModuleHeldParse> = Map(),
+    // Of the modules reusedParsed counts in the editor, those whose parse was held too.
+    var copiedParses: int = 0,
     val rawDiscoveredIn: Map<string, int> = Map(),
     var syntaxInputs: BootstrapModuleSyntaxInputs = BootstrapModuleSyntaxInputs(),
     var captureSyntaxInputs: bool = false
@@ -879,6 +1025,7 @@ class BootstrapModuleState(
         this.refreshed = 0
         this.reusedParsed = 0
         this.refreshedParsed = 0
+        this.copiedParses = 0
         this.build = this.build + 1
         return
     }
@@ -1107,7 +1254,22 @@ class BootstrapModuleState(
         // standard library is expanded (the staged parse, no cache); the others are parsed raw.
         if (this.syntaxOnly) {
             if (!bootstrapSourceUsesSubparser(snapshot.source, registry, snapshot.hostSource)) {
-                return bootstrapParseWithTokens(snapshot.source, snapshot.path, bootstrapModuleTokens(snapshot))
+                // A raw parse reads only the source and its host source: an unchanged module is not lexed or parsed again.
+                val held = this.heldParses.get(snapshot.path)
+                if (held != null && held.source == snapshot.source && held.hostSource == snapshot.hostSource) {
+                    this.reusedParsed = this.reusedParsed + 1
+                    if (held.hasLambda) this.copiedParses = this.copiedParses + 1
+                    return bootstrapModuleParseForSema(held)
+                }
+                val parsed = bootstrapParseWithTokens(snapshot.source, snapshot.path, bootstrapModuleTokens(snapshot))
+                bootstrapModuleEndVoidBodies(parsed)
+                val stored = bootstrapModuleHeldParseFrozen(BootstrapModuleHeldParse(snapshot.source,
+                    snapshot.hostSource, parsed, bootstrapModuleParseHasLambda(parsed)))
+                this.heldParses.set(snapshot.path, stored)
+                this.refreshedParsed = this.refreshedParsed + 1
+                // Sema types a copy of what has a lambda even the first time: a small module's held parse is not
+                // frozen, and is the one parsed.
+                return bootstrapModuleParseForSema(stored)
             }
             val expanded = bootstrapParseStagedRegistered(
                 snapshot.source, snapshot.path, declarations, currentDeclarationBegin, currentDeclarationCount, registry,
@@ -5782,6 +5944,14 @@ class BootstrapModuleGraph(
                 preparedSnapshots.append(bootstrapContractTwinSnapshot(prepared))
             }
             preparedIndex = preparedIndex + 1
+        }
+        // The editor's held tokens keep only this graph's modules: a module no longer imported, or a file removed, goes.
+        if (this.state.syntaxOnly) {
+            val present: Map<string, bool> = Map()
+            for (prepared in preparedSnapshots) present.set(prepared.path, true)
+            for (path in this.state.heldParses.keys()) {
+                if (!present.has(path)) this.state.heldParses.remove(path)
+            }
         }
         if (this.state.captureSyntaxInputs) {
             for (prepared in preparedSnapshots) {

@@ -1734,6 +1734,63 @@ async function outsideEdits(mode) {
     await s.close();
 }
 
+// The editor holds each module's parse across analyses (BootstrapModuleHeldParse): an edit parses only what changed,
+// the answers are the ones a new service gives, sema types a copy of a declaration with a lambda (its parameter's type
+// comes from a call another module declares, so the held one must stay as parsed), and a module the graph no longer has
+// is dropped.
+async function heldParses(mode) {
+    const lib = (type) => `fun apply(f: (${type}) -> int, x: ${type}): int = f(x)\nclass Counter(var n: int)\nfun reset(var counter: Counter): void {\n    counter.n = 3\n}\n`;
+    const files = {
+        'main.ab': 'import "lib.ab"\nimport "user.ab"\nfun main: int = run()\n',
+        'lib.ab': lib('int'),
+        'user.ab': 'import "lib.ab"\nfun run(): int = apply({ v -> v + 1 }, 2)\n',
+    };
+    const name = `held-parses-${mode}`;
+    fs.rmSync(path.join(root, name), { recursive: true, force: true });
+    const p = fixture(name, files);
+    const log = 'held.stderr';
+    // Every held parse is frozen: a write into one faults (ABLA_ANALYSIS_FREEZE_HELD).
+    const s = await start(p, { mode, log, env: { ...process.env, ABLA_ANALYSIS_INCREMENTAL_TRACE: '1', ABLA_ANALYSIS_FREEZE_HELD: '1' } });
+    const trace = () => {
+        const lines = fs.readFileSync(path.join(p, log), 'utf8').match(/^abla-analysis-parse .*$/gm) ?? [];
+        assert.ok(lines.length > 0, 'no abla-analysis-parse trace');
+        return Object.fromEntries(lines.at(-1).split(' ').slice(1).map((pair) => pair.split('=')).map(([k, v]) => [k, Number(v)]));
+    };
+    const shape = (result) => result.documents.filter((d) => d.uri.startsWith(uri(p)))
+        .map((d) => [d.uri, d.diagnostics.map((x) => [x.code, x.message, x.range.start, x.range.end]),
+            d.symbols.map((x) => [x.name, x.kind, x.detail])]).sort();
+    const fresh = async () => {
+        const other = await start(p, { mode, log: 'fresh.stderr' });
+        const result = await other.analyze();
+        await other.close();
+        return shape(result);
+    };
+    const a = await s.analyze();
+    noErrors(a);
+    // A body edit in main.ab: lib.ab and user.ab are not parsed again; sema types a copy of user.ab's lambda declaration.
+    fs.writeFileSync(path.join(p, 'main.ab'), 'import "lib.ab"\nimport "user.ab"\nfun main: int = run() + 0\n');
+    const b = await s.analyze();
+    const afterBody = trace();
+    assert.ok(afterBody.reused >= 2, JSON.stringify(afterBody));
+    assert.ok(afterBody.copied >= 1, JSON.stringify(afterBody));
+    assert.deepEqual(shape(b), await fresh(), 'a body edit answers as a new service does');
+    // lib.ab's apply now takes a string: user.ab, unchanged, is typed against it (the lambda's v is a string now).
+    fs.writeFileSync(path.join(p, 'lib.ab'), lib('string'));
+    const c = await s.analyze();
+    assert.deepEqual(shape(c), await fresh(), 'an edit to the callee answers as a new service does');
+    assert.notDeepEqual(shape(c), shape(b), 'the callee edit changed the answer');
+    // user.ab leaves the graph: its held parse goes.
+    fs.writeFileSync(path.join(p, 'main.ab'), 'import "lib.ab"\nfun main: int = apply({ v -> 1 }, "a")\n');
+    const d = await s.analyze();
+    assert.deepEqual(shape(d), await fresh());
+    const before = trace().held;
+    assert.ok(Number.isInteger(before));
+    fs.writeFileSync(path.join(p, 'main.ab'), 'fun main: int = 0\n');
+    await s.analyze();
+    assert.ok(trace().held < before, `a module the graph no longer has stays held: ${before} -> ${trace().held}`);
+    await s.close();
+}
+
 async function unchangedInputs() {
     const rev = '1'.repeat(40);
     const digest = '2'.repeat(40);
@@ -1783,7 +1840,7 @@ async function unchangedInputs() {
     await s.close();
 }
 
-const tests = { unchanged_inputs: unchangedInputs, outside_edits: () => outsideEdits('graph-v1'), outside_edits_v2: () => outsideEdits('graph-v2'), compound_assignment: () => compoundAssignmentFix('graph-v1'), compound_assignment_v2: () => compoundAssignmentFix('graph-v2'), index_loop: () => indexLoopFix('graph-v1'), index_loop_v2: () => indexLoopFix('graph-v2'), logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
+const tests = { unchanged_inputs: unchangedInputs, held_parses: () => heldParses('graph-v1'), held_parses_v2: () => heldParses('graph-v2'), outside_edits: () => outsideEdits('graph-v1'), outside_edits_v2: () => outsideEdits('graph-v2'), compound_assignment: () => compoundAssignmentFix('graph-v1'), compound_assignment_v2: () => compoundAssignmentFix('graph-v2'), index_loop: () => indexLoopFix('graph-v1'), index_loop_v2: () => indexLoopFix('graph-v2'), logical_assignment: () => logicalAssignmentFix('graph-v1'), logical_assignment_v2: () => logicalAssignmentFix('graph-v2'), idiom_mapped_visibility: idiomMappedVisibility, idiom_hints: () => idiomHints('graph-v1'), idiom_hints_v2: () => idiomHints('graph-v2'), body_replay: incrementalBodyReplay, unused_import_replay: incrementalUnusedImportReplay, regex_definitions: typedRegexDefinitions, validate_occurrences: validateOccurrences, sql: sqlSubparsers, subparsers, documentation: () => documentation('graph-v1'), documentation_v2: () => documentation('graph-v2'), field_assign: () => fieldAssign('graph-v1'), field_assign_v2: () => fieldAssign('graph-v2'), builtins: () => builtins('graph-v1'), builtins_v2: () => builtins('graph-v2'), local_names: () => localNames('graph-v1'), local_names_v2: () => localNames('graph-v2'), type_names: () => typeNames('graph-v1'), type_names_v2: () => typeNames('graph-v2'), since, edit_sequence: editSequence, edit_sequence_v2: () => editSequence('graph-v2'), stable_ids: stableIds, simple, alias_private: aliasPrivate, generic_fields: genericFields, no_eval: noEval, strict, symlinks, negative_protocol: negativeProtocol, packages, contract_surface: contractSurface, disk_revision: diskRevision, queries, projections, named_calls: namedCalls };
 async function checkedScalarBody(calls = false, operators = false, locals = false, returns = false, strings = false, fields = false, extended = false, parens = false, loops = false, imported = false, globals = false, arrays = false, importedCalls = false, constructors = false, records = false) {
     // An imported class: declared in its own module. Imported functions: of two modules of the project and the standard library.
     const head = (imported ? 'import "./point.ab"\n' : '') + (importedCalls ? 'import "./lib.ab"\nimport "./other.ab"\nimport "abla/bits"\n' : '') + (constructors ? 'import "./box.ab"\n' : '') + (records ? 'fun answer(left: int, right: int, ps: array<Pair>): int ' : arrays ? 'fun answer(left: int, right: int, xs: array<int>, names: array<string>): int ' : locals || returns || loops ? 'fun answer(left: int, right: int): int ' : strings ? 'fun answer(left: int, right: int, text: string): int = '
