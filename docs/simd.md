@@ -20,8 +20,10 @@ and why; [stdlib/simd.md](stdlib/simd.md) is the reference for using them.
 ## Decisions
 
 **Types.** A lane type (`i8`...`u64`, `f32`, `f64`) and a count making 128, 256, or 512 bits. They
-are primitive names, known to the compiler (`src/simd_types.ab`), and no other width exists:
-what a program does with them doesn't depend on the target, only how fast it is. At 512 bits, LLVM splits the value on targets without a 512-bit vector instruction. With AVX2 it can use two 256-bit halves.
+are primitive names, known to the compiler (`src/simd_types.ab`), and no other width exists but one 64-bit
+vector, `u32x2`: a pair of words, with `u32x2(a, b)`, `get`, `with`, `bytes`, `text`, `u32x2Splat` and
+`u32x2Load`, for GPU kernels' 8-byte loads (abla/kernel's `loadU32x2`, CUDA's `uint2`). For
+every one, what a program does with it doesn't depend on the target, only how fast it is. At 512 bits, LLVM splits the value on targets without a 512-bit vector instruction. With AVX2 it can use two 256-bit halves.
 
 **Masks are ordinary unsigned vectors.** A comparison gives `u32x4` with all-ones or
 all-zeros lanes, and `select` is bitwise: any bit pattern means something, there's one fewer

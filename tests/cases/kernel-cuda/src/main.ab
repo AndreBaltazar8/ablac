@@ -204,6 +204,45 @@ trusted fun main: int {
     for (k in 0 until (wordThreads - 1) * 4) if (alignedBuffer.load(k) != checkedBuffer.load(k)) wordsEqual = false
     println("words4: $wordThreads u32x4 quads, byte quads and signed-byte sums at offsets 0 and 1, and the aligned forms, GPU equal to CPU ${wordsEqual && negativeSums > 0}")
 
+    // pairs2 (#1301's u32x2) over the same words and bytes, 2000 threads: the last one's byte pair and store run past the
+    // ends; pairs2Aligned gives the checked kernel's words wherever it runs.
+    val pairThreads = 2000
+    val pairCount = pairThreads * 2 - 1
+    val dpairs = device.allocate(pairCount * 4)
+    if (dpairs == null) { println("kernel-cuda: ${device.error}"); return 1 }
+    var pairsEqual = true
+    val checkedPairs = nativeByteBuffer(pairCount * 4)
+    for (offset in [0, 1]) {
+        val cpuPairs = nativeByteBuffer(pairCount * 4)
+        for (k in 0 until pairCount) storeWord(cpuPairs, k * 4, 0x55555555)
+        val cpuPairsBuffer = KernelU32Buffer(nativePointerAddress(cpuPairs.address), pairCount)
+        kernelRunCpu((pairThreads + 255) / 256, 256) { pairs2(cpuSrc, cpuBytes, cpuPairsBuffer, pairThreads, offset) }
+        val gpuPairs = nativeByteBuffer(pairCount * 4)
+        if (!device.upload(dpairs, cpuPairs) || !device.launch("pairs2", (pairThreads + 255) / 256, 256,
+            cudaKernelArguments().buffer(dsrc.words()).buffer(dbytes.raw()).buffer(dpairs.words()).integer(pairThreads)
+                .integer(offset)) || !device.download(dpairs, gpuPairs)) {
+            println("kernel-cuda: pairs2: ${device.error}")
+            return 1
+        }
+        val gpuPairsBuffer = KernelU32Buffer(nativePointerAddress(gpuPairs.address), pairCount)
+        for (k in 0 until pairCount) if (gpuPairsBuffer.load(k) != cpuPairsBuffer.load(k)) pairsEqual = false
+        if (cpuPairsBuffer.load(pairCount - 1) == 0x55555555) pairsEqual = false
+        if (offset == 0) for (k in 0 until pairCount) storeWord(checkedPairs, k * 4, cpuPairsBuffer.load(k))
+    }
+    val alignedPairs = nativeByteBuffer(pairCount * 4)
+    for (k in 0 until pairCount) storeWord(alignedPairs, k * 4, 0x55555555)
+    if (!device.upload(dpairs, alignedPairs) || !device.launch("pairs2Aligned", (pairThreads + 255) / 256, 256,
+        cudaKernelArguments().buffer(dsrc.words()).buffer(dbytes.raw()).buffer(dpairs.words()).integer(pairThreads)) ||
+        !device.download(dpairs, alignedPairs)) {
+        println("kernel-cuda: pairs2Aligned: ${device.error}")
+        return 1
+    }
+    val alignedPairsBuffer = KernelU32Buffer(nativePointerAddress(alignedPairs.address), pairCount)
+    val checkedPairsBuffer = KernelU32Buffer(nativePointerAddress(checkedPairs.address), pairCount)
+    // Every thread but the last (whose bytes run past the end) takes the one-load path on device memory.
+    for (k in 0 until (pairThreads - 1) * 2) if (alignedPairsBuffer.load(k) != checkedPairsBuffer.load(k)) pairsEqual = false
+    println("pairs2: $pairThreads u32x2 pairs and byte pairs at offsets 0 and 1, and the aligned forms, GPU equal to CPU $pairsEqual")
+
     // Atomics: countThreads over vadd's 100000 threads, and sumGroups (the last group adds the partials), twice each.
     val words = nativeByteBuffer(4 * 400)
     val counterCpu = KernelU32Buffer(nativePointerAddress(words.address), 1)

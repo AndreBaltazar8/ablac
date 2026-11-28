@@ -143,7 +143,7 @@ for tier in interp jit auto; do
 done
 native_sites=$(awk '/^note\[ct-jit\]: native at .*compile-time\.ab:/ { count++ } END { print count+0 }' \
     "$out/compile-time-jit.log")
-[[ $native_sites == 4 ]] || { cat "$out/compile-time-jit.log" >&2; exit 1; }
+[[ $native_sites == 5 ]] || { cat "$out/compile-time-jit.log" >&2; exit 1; }
 echo "ok   compile-time vectors: interp, jit and auto"
 
 for invalid in "$cases"/invalid-*.ab; do

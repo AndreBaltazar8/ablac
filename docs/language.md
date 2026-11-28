@@ -3079,12 +3079,15 @@ Besides one element at a time:
   `KernelU32Buffer.loadU32x4(i)` and `storeU32x4(i, v)` move four words as a
   `u32x4`, each one 16-byte access on a GPU when the four are inside the buffer
   and aligned;
+- `KernelU32Buffer.loadU32x2(i)` and `storeU32x2(i, v)` move two words as a
+  `u32x2`, one 8-byte access when the two are inside and aligned;
 - `KernelU8Buffer` reads packed data such as GGML blocks at any alignment with
-  `loadU16`, `loadU32` and `loadU32x4`, and a signed byte with `loadS8`.
+  `loadU16`, `loadU32`, `loadU32x2` and `loadU32x4`, and a signed byte with
+  `loadS8`.
 
-A kernel also makes its own vectors with `f32x4(a, b, c, d)` and
-`u32x4(a, b, c, d)`, and passes and returns them as any value. Ordinary code
-does not make a buffer from an address: abla/kernel/cuda's
+A kernel also makes its own vectors with `f32x4(a, b, c, d)`,
+`u32x4(a, b, c, d)` and `u32x2(a, b)`, and passes and returns them as any
+value. Ordinary code does not make a buffer from an address: abla/kernel/cuda's
 `CudaKernelMemory.floats()`, `words()`, `halves()` and `raw()` give the device
 memory's, and a trusted function that owns host memory and keeps it alive
 builds one for the CPU (the raw constructors are trusted-only,
@@ -3101,8 +3104,9 @@ builds one for the CPU (the raw constructors are trusted-only,
 
 A kernel, and every function it calls, may use:
 
-- `bool`, the integer types, `f32` and `f64` scalars and the `f32x4` and
-  `u32x4` vectors; arithmetic, comparison and bit operators; `if`/`when`, loops
+- `bool`, the integer types, `f32` and `f64` scalars and the `f32x4`,
+  `u32x4` and `u32x2` vectors; arithmetic, comparison and bit operators;
+  `if`/`when`, loops
   (also with [`@unroll`](#annotations)) and `return`; calls to other such
   functions (not recursive); the buffers, also in `val` locals;
 - the ids `kernelGlobalId`, `kernelLocalId`, `kernelGroupId`, `kernelGroupIdY`
@@ -3160,8 +3164,9 @@ that strides by `kernelGroupSize()` runs on both.
 Every buffer access above is checked, which costs a compare and a branch per
 load. A kernel that shows its indexes are inside can skip them on the unchecked
 fast path: `loadUnchecked(index)` on every buffer, `KernelF32Buffer.load4Aligned`
-(one 16-byte load at a 16-byte-aligned address), `loadU32x4Aligned` on
-`KernelU32Buffer` and `KernelU8Buffer` (the same for four words), and
+(one 16-byte load at a 16-byte-aligned address), `loadU32x4Aligned` and
+`loadU32x2Aligned` on `KernelU32Buffer` and `KernelU8Buffer` (the same for
+four and two words), and
 `KernelU8Buffer.loadU16Aligned` and `loadU32Aligned`. They are trusted-only
 ([#1226](#trusted-native-implementations)), so the kernel, and any function
 of it that calls one, is a `trusted fun` whose comment gives the argument. On
