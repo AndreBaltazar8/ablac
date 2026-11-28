@@ -54,6 +54,7 @@ only its parse errors.
 | `E_PARSE_PARAMETER_SEPARATOR`, `E_PARSE_ARGUMENT_SEPARATOR`, `E_PARSE_ARRAY_SEPARATOR` | a missing `,` |
 | `E_PARSE_UNCLOSED_DELIMITER` | an unclosed `(`, `[` or `{` |
 | `E_PARSE_UNTERMINATED_COMMENT` | a block comment reaches the end of the file with no matching `*/` |
+| `E_PARSE_SOURCE_TOO_LARGE` | a source file of 256 MiB or more: the compiler's tokens name offsets below that |
 | `E_PARSE_STRING_PART` | a malformed string or template |
 | `E_PARSE_INVALID_UTF8` | a quoted string contains a byte sequence that isn't UTF-8 |
 | `E_PARSE_RAW_OPEN_LINE` | the opening `"""` of a multiline raw string is followed by text on the same line |
