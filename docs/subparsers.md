@@ -77,7 +77,8 @@ fun main {
 `Html.render()` emits the tree as HTML. It escapes ordinary text and dynamic
 attribute values. Literal text and quoted attributes retain authored character
 references. A child expression of type `Html` inserts its subtree. Use
-`ablaHtmlRaw(markup)` to insert a trusted, already-rendered fragment verbatim.
+`ablaHtmlRaw(markup)` to insert a trusted, already-rendered fragment verbatim;
+it is the only way to.
 Void elements such as `img` and `meta` have no closing tag. SVG and MathML elements
 can use the self-closing syntax inside their corresponding roots.
 
@@ -140,12 +141,13 @@ Attribute values authored in the `$html` source are not checked. For a value
 the program wrote or fully checked, such as a `data:` image or a handler of its own,
 `ablaHtmlTrustedAttribute(name, value)` in an attribute group skips both
 checks; its value is still escaped. It is an ordinary function, not a
-`trusted` one. The other ways past the checks are building an `Html` value
-directly and `ablaHtmlRaw`, which inserts markup verbatim; an audit searches for
-those names. An attribute with a source quote (`ablaHtmlLiteralAttribute`, or an
-`HtmlAttribute` built with its third argument) is checked like any value from Abla. The exemption that lets
-`ablaHtmlTrustedAttribute`'s value past covers only the exact name and value it
-was made for.
+`trusted` one. It, `ablaHtmlRaw` and authored source are the only ways past
+the checks, so an audit searches for those two names. An `HtmlAttribute` or
+`Html` built with its constructor is checked like any value from Abla (an
+attribute with a source quote too): a raw node from anywhere but `ablaHtmlRaw`
+is written as escaped text (and left out inside `script` or `style`), and the
+exemption that lets an attribute or node past covers only the exact name and
+value it was made for.
 
 ```abla
 import "abla/html"

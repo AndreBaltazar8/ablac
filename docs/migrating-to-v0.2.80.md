@@ -199,8 +199,9 @@ The ways past these checks are explicit:
 - `ablaHtmlTrustedAttribute(name, value)` writes one attribute without
   them (the old `HtmlAttribute(name, value, "", true)` no longer
   compiles: the fourth argument is an exemption only `abla/html` makes);
-- `ablaHtmlRaw(markup)` inserts markup as it is;
-- an `Html` value can be built with its constructor.
+- `ablaHtmlRaw(markup)` inserts markup as it is (a raw node built with
+  the `Html` constructor is written as escaped text, and left out inside
+  `script` and `style`).
 
 An attribute with a source quote (`ablaHtmlLiteralAttribute`) is checked like
 any other value from Abla; only attributes written in the `$html` source are
